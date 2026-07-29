@@ -174,7 +174,6 @@ if should_run "AB2" || should_run "AB3" || should_run "AB4" || should_run "AB8";
   check_optional MARKET_URL
   check_header ROUTER_API_TOKEN_HEADER
   check_header MARKET_API_TOKEN_HEADER
-  check_header SHARE_MARKET_GRANT_TOKEN_HEADER
   check_stream_probe
 fi
 
@@ -238,10 +237,10 @@ if should_run "AB7"; then
 fi
 
 if should_run "AB8"; then
-  echo "== AB8 share-market grant =="
-  check_group "AB8 share-market grant add/revoke" SHARE_MARKET_URL SHARE_MARKET_GRANT_TOKEN SHARE_MARKET_BUYER_EMAIL SHARE_MARKET_LISTING_ID SHARE_MARKET_ORDER_ID
-  check_optional SHARE_MARKET_APP_TYPE
-  check_optional SHARE_MARKET_GRANT_POLL_SECONDS
+  echo "== AB8 release readiness =="
+  check_group "AB8 direct share acceptance" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID DIRECT_SHARE_URL
+  check_group "AB8 router/market acceptance" ROUTER_API_TOKEN MARKET_API_URL
+  check_group "AB8 real provider tokens" CLAUDE_PROVIDER_TOKEN CODEX_PROVIDER_TOKEN GEMINI_PROVIDER_TOKEN
 fi
 
 echo "== summary =="

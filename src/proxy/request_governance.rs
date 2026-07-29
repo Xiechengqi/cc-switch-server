@@ -53,7 +53,7 @@ pub(super) fn govern_request_body(
     }
 }
 
-pub(super) fn decode_request_body_for_proxy(
+pub(crate) fn decode_request_body_for_proxy(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Bytes, ProxyError> {
@@ -74,7 +74,7 @@ pub(super) fn decode_request_body_for_proxy(
     })
 }
 
-pub(super) fn decode_request_body_for_proxy_with_limit(
+pub(crate) fn decode_request_body_for_proxy_with_limit(
     headers: &HeaderMap,
     body: Bytes,
     decoded_limit: usize,

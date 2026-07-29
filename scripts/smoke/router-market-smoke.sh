@@ -430,7 +430,6 @@ let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => {
     accountEmail: share.accountEmail,
     subscriptionLevel: share.subscriptionLevel,
     quotaPercent: share.quotaPercent,
-    marketGrant: share.marketGrant,
     runtimeSnapshot: share.runtimeSnapshot
   })), null, 2));
 });'

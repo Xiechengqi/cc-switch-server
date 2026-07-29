@@ -275,6 +275,13 @@ impl AccountManager for ManualTokenAccountManager {
     }
 
     fn start_login(&self, provider_type: ProviderType) -> Result<LoginStart, AccountManagerError> {
+        if provider_type == ProviderType::CursorOAuth {
+            return Ok(LoginStart {
+                provider_type,
+                method: "cursor_deep_control",
+                message: "start Cursor OAuth through the server account login endpoint".to_string(),
+            });
+        }
         Err(AccountManagerError::Unsupported(match provider_type {
             ProviderType::ClaudeOAuth => {
                 "claude oauth browser login is disabled until real account validation; use login exchange/import preview"
@@ -294,9 +301,7 @@ impl AccountManager for ManualTokenAccountManager {
             ProviderType::KiroOAuth => {
                 "kiro device import is available via /api/accounts/kiro/device/start|poll; native login remains disabled until real proxy validation"
             }
-            ProviderType::CursorOAuth => {
-                "cursor oauth browser login is disabled until real Cursor AgentService validation; use login exchange/import preview"
-            }
+            ProviderType::CursorOAuth => unreachable!(),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 "antigravity oauth browser login is disabled until real account validation; use login exchange/import preview"
             }
@@ -325,6 +330,21 @@ impl AccountManager for ManualTokenAccountManager {
                         input.provider_type.as_str()
                     )));
                 }
+            }
+        }
+        if matches!(
+            input.provider_type,
+            ProviderType::CursorOAuth | ProviderType::CursorApiKey
+        ) {
+            if let Some(existing) = store.accounts.iter().find(|account| {
+                account.provider_type == input.provider_type
+                    && input.id.as_deref() != Some(account.id.as_str())
+            }) {
+                return Err(AccountManagerError::CredentialUnavailable(format!(
+                    "{} supports one proxy credential; update or remove account {} before adding another",
+                    input.provider_type.as_str(),
+                    existing.id
+                )));
             }
         }
         if input.provider_type == ProviderType::CodexOAuth {
@@ -810,6 +830,28 @@ mod tests {
             capability.subscription_expiry_capability,
             SubscriptionExpiryCapability::Automatic
         );
+    }
+
+    #[test]
+    fn cursor_account_manager_rejects_a_second_proxy_credential() {
+        for provider_type in [ProviderType::CursorOAuth, ProviderType::CursorApiKey] {
+            let manager = ManualTokenAccountManager;
+            let mut store = AccountStore::default();
+            let mut first = codex_account_input("cursor-1", "refresh-1");
+            first.provider_type = provider_type;
+            first.api_key =
+                (provider_type == ProviderType::CursorApiKey).then(|| "cursor-key-1".to_string());
+            manager.finish_login(&mut store, first.clone()).unwrap();
+
+            let mut second = first.clone();
+            second.id = Some("cursor-2".to_string());
+            let error = manager.finish_login(&mut store, second).unwrap_err();
+            assert!(error.to_string().contains("supports one proxy credential"));
+
+            first.email = Some("updated@example.com".to_string());
+            let updated = manager.finish_login(&mut store, first).unwrap();
+            assert_eq!(updated.email.as_deref(), Some("updated@example.com"));
+        }
     }
 
     #[test]

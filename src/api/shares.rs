@@ -685,87 +685,13 @@ pub(in crate::api) async fn replace_share_acl(
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
 
-pub(in crate::api) async fn update_share_market_grant(
+pub(in crate::api) async fn list_token_markets(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<UpdateShareMarketGrantRequest>,
-) -> Result<Json<UpsertShareResponse>, ApiError> {
+) -> Result<Json<ListTokenMarketsResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let market_grant = input
-        .market_grant
-        .map(normalize_share_market_grant)
-        .transpose()?;
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let share = state
-        .mutate_shares_immediate(|store| {
-            store
-                .update_market_grant(&id, market_grant)
-                .ok_or_else(|| ApiError::not_found("share not found"))?;
-            store.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
-            store
-                .shares
-                .iter()
-                .find(|share| share.id == id)
-                .cloned()
-                .ok_or_else(|| ApiError::not_found("share not found"))
-        })
-        .await
-        .map_err(ApiError::internal)??;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(&state, "share.changed", &share, "market_grant_updated");
-    Ok(Json(UpsertShareResponse { ok: true, share }))
-}
-
-pub(in crate::api) async fn list_share_markets(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<ListShareMarketsResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let markets = fetch_public_markets_from_router(&state).await?;
-    Ok(Json(ListShareMarketsResponse { ok: true, markets }))
-}
-
-pub(in crate::api) async fn authorize_share_market(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<AuthorizeShareMarketRequest>,
-) -> Result<Json<UpsertShareResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let market_email = crate::clients::router::email_auth::normalize_email(&input.market_email)
-        .map_err(map_email_auth_error)?;
-    let markets = fetch_public_markets_from_router(&state).await?;
-    let public_market_emails = markets
-        .iter()
-        .map(|market| market.email.trim().to_ascii_lowercase())
-        .collect::<std::collections::BTreeSet<_>>();
-    let selected_market = markets.iter().find(|market| {
-        market.email.eq_ignore_ascii_case(&market_email) && market.market_kind == "share"
-    });
-    if selected_market.is_none() {
-        return Err(ApiError::bad_request(
-            "marketEmail must belong to a registered share market",
-        ));
-    }
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let share = state
-        .mutate_shares_immediate(|store| {
-            let share = store
-                .authorize_share_market(&id, market_email, &public_market_emails)
-                .map_err(map_share_patch_error)?;
-            store.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
-            Ok::<_, ApiError>(store.get(&id).cloned().unwrap_or(share))
-        })
-        .await
-        .map_err(ApiError::internal)??;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(&state, "share.changed", &share, "share_market_authorized");
-    Ok(Json(UpsertShareResponse { ok: true, share }))
+    let markets = fetch_public_token_markets_from_router(&state).await?;
+    Ok(Json(ListTokenMarketsResponse { ok: true, markets }))
 }
 
 pub(in crate::api) async fn refresh_share_snapshots(
@@ -907,9 +833,9 @@ pub(in crate::api) fn router_domain_from_url(url: Option<&str>) -> Option<String
         .map(str::to_string)
 }
 
-pub(in crate::api) async fn fetch_public_markets_from_router(
+pub(in crate::api) async fn fetch_public_token_markets_from_router(
     state: &ServerState,
-) -> Result<Vec<PublicShareMarket>, ApiError> {
+) -> Result<Vec<PublicTokenMarket>, ApiError> {
     let config = state.config.read().await.clone();
     let api_base = config
         .router_api_base()
@@ -921,19 +847,23 @@ pub(in crate::api) async fn fetch_public_markets_from_router(
         .get(format!("{api_base}/v1/markets"))
         .send()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("fetch share markets failed: {error}")))?;
+        .map_err(|error| ApiError::bad_gateway(format!("fetch token markets failed: {error}")))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(ApiError::bad_gateway(format!(
-            "fetch share markets failed: {status}: {body}"
+            "fetch token markets failed: {status}: {body}"
         )));
     }
     let response = response
-        .json::<ListShareMarketsResponse>()
+        .json::<ListTokenMarketsResponse>()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("parse share markets failed: {error}")))?;
-    Ok(response.markets)
+        .map_err(|error| ApiError::bad_gateway(format!("parse token markets failed: {error}")))?;
+    Ok(response
+        .markets
+        .into_iter()
+        .filter(|market| market.market_kind == "usage")
+        .collect())
 }
 
 #[cfg(test)]

@@ -638,8 +638,8 @@ function ProviderFormFull({
   // Codex OAuth 认证状态（ChatGPT Plus/Pro 反代）
   const {
     isAuthenticated: isCodexOauthAuthenticated,
-    accounts: codexOauthAccounts,
     defaultAccountId: defaultCodexAccountId,
+    codexSelection,
   } = useCodexOauth();
   const {
     isAuthenticated: isGrokOauthAuthenticated,
@@ -680,7 +680,7 @@ function ProviderFormFull({
     string | null
   >(() => resolveManagedAccountId(initialData?.meta, "github_copilot"));
 
-  // 选中的 ChatGPT 账号 ID（Codex OAuth 多账号支持）
+  // 当前用于 Codex OAuth 反代的 ChatGPT 账号 ID
   const [selectedCodexAccountId, setSelectedCodexAccountId] = useState<
     string | null
   >(() => resolveManagedAccountId(initialData?.meta, "codex_oauth"));
@@ -769,17 +769,17 @@ function ProviderFormFull({
       PROVIDER_TYPES.OLLAMA_CLOUD;
 
   useEffect(() => {
-    if (!isCodexOfficialPreset || selectedCodexAccountId) {
+    if (!isCodexOfficialPreset) {
       return;
     }
 
     const preferredAccountId =
-      defaultCodexAccountId ?? codexOauthAccounts[0]?.id ?? null;
-    if (preferredAccountId) {
+      codexSelection?.activeAccountId ?? defaultCodexAccountId ?? null;
+    if (preferredAccountId && preferredAccountId !== selectedCodexAccountId) {
       setSelectedCodexAccountId(preferredAccountId);
     }
   }, [
-    codexOauthAccounts,
+    codexSelection?.activeAccountId,
     defaultCodexAccountId,
     isCodexOfficialPreset,
     selectedCodexAccountId,
@@ -1914,7 +1914,10 @@ function ProviderFormFull({
         );
         return;
       }
-      if (!selectedCodexAccountId) {
+      if (
+        codexSelection?.status === "needs_selection" ||
+        !selectedCodexAccountId
+      ) {
         toast.error(
           t("codexOauth.selectAccountRequired", {
             defaultValue: "OpenAI OAuth 必须绑定一个 ChatGPT 账号",

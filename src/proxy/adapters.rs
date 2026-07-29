@@ -5345,6 +5345,7 @@ mod tests {
         account.auth_identity_generation = 2;
         let accounts = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
 
         let error = adapter_for(AppKind::Codex, ProviderType::CodexOAuth)

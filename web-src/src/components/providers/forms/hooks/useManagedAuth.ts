@@ -178,6 +178,14 @@ export function useManagedAuth(
         provider: authProvider,
         authenticated: false,
         default_account_id: null,
+        codex_oauth:
+          authProvider === "codex_oauth"
+            ? {
+                status: "unconfigured",
+                accountCount: 0,
+                activeAccountId: null,
+              }
+            : null,
         accounts: [],
       });
       await invalidateManagedAccountViews();
@@ -209,6 +217,7 @@ export function useManagedAuth(
     mutationFn: (accountId: string) =>
       authApi.authSetDefaultAccount(authProvider, accountId),
     onSuccess: async () => {
+      setError(null);
       await refetchStatus();
       await invalidateManagedAccountViews();
     },
@@ -224,8 +233,9 @@ export function useManagedAuth(
         authProvider,
         params.accountId,
         params.workspaceId,
-      ),
+    ),
     onSuccess: async () => {
+      setError(null);
       await refetchStatus();
       await invalidateManagedAccountViews();
     },
@@ -333,6 +343,7 @@ export function useManagedAuth(
   }, [importCursorLocalMutation, stopPolling]);
 
   const accounts = authStatus?.accounts ?? [];
+  const codexSelection = authStatus?.codex_oauth ?? null;
 
   return {
     authStatus,
@@ -341,6 +352,10 @@ export function useManagedAuth(
     hasAnyAccount: accounts.length > 0,
     isAuthenticated: authStatus?.authenticated ?? false,
     defaultAccountId: authStatus?.default_account_id ?? null,
+    codexSelection,
+    activeCodexAccountId: codexSelection?.activeAccountId ?? null,
+    needsCodexAccountSelection:
+      codexSelection?.status === "needs_selection",
     migrationError: authStatus?.migration_error ?? null,
     pollingState,
     deviceCode,
@@ -358,7 +373,9 @@ export function useManagedAuth(
     cancelAuth,
     logout,
     removeAccount,
+    removeAccountAsync: removeAccountMutation.mutateAsync,
     setDefaultAccount,
+    selectActiveCodexAccount: setDefaultAccountMutation.mutateAsync,
     setWorkspace,
     submitOauthCallback: submitOauthCallbackMutation.mutateAsync,
     importCursorLocalAuth,

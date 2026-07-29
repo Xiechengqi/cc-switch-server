@@ -24,6 +24,7 @@ use crate::domain::grok_cli::{
 use crate::domain::providers::model::ProviderType;
 
 pub const QUOTA_FAILURE_COOLDOWN_MS: i64 = 2 * 60 * 1000;
+const MAX_QUOTA_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 fn quota_request_timeout(timeout_ms: i64) -> Duration {
     Duration::from_millis(timeout_ms.clamp(1_000, 120_000) as u64)
@@ -111,6 +112,27 @@ impl QuotaRefreshFailure {
             message: format!("{} quota request failed: {error}", provider_type.as_str()),
             retryable: true,
             next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+        }
+    }
+
+    fn response_body(
+        provider_type: ProviderType,
+        error: crate::infra::http::BoundedResponseBodyError,
+        now_ms: i64,
+    ) -> Self {
+        match error {
+            crate::infra::http::BoundedResponseBodyError::Request(error) => {
+                Self::network(provider_type, error, now_ms)
+            }
+            error @ crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => Self {
+                status_code: 502,
+                message: format!(
+                    "{} quota response could not be read: {error}",
+                    provider_type.as_str()
+                ),
+                retryable: false,
+                next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+            },
         }
     }
 
@@ -2067,7 +2089,7 @@ async fn request_json(
     request: reqwest::RequestBuilder,
     now_ms: i64,
 ) -> Result<Value, QuotaRefreshFailure> {
-    let response = request
+    let mut response = request
         .send()
         .await
         .map_err(|error| QuotaRefreshFailure::network(provider_type, error, now_ms))?;
@@ -2077,20 +2099,40 @@ async fn request_json(
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = response
-        .text()
-        .await
-        .map_err(|error| QuotaRefreshFailure::network(provider_type, error, now_ms))?;
+    let body = match crate::infra::http::read_response_body_limited(
+        &mut response,
+        MAX_QUOTA_RESPONSE_BODY_BYTES,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) if !status.is_success() => {
+            return Err(QuotaRefreshFailure::upstream(
+                provider_type,
+                status,
+                error.to_string(),
+                retry_after,
+                now_ms,
+            ));
+        }
+        Err(error) => {
+            return Err(QuotaRefreshFailure::response_body(
+                provider_type,
+                error,
+                now_ms,
+            ))
+        }
+    };
     if !status.is_success() {
         return Err(QuotaRefreshFailure::upstream(
             provider_type,
             status,
-            body,
+            String::from_utf8_lossy(&body).into_owned(),
             retry_after,
             now_ms,
         ));
     }
-    serde_json::from_str(&body)
+    serde_json::from_slice(&body)
         .map_err(|error| QuotaRefreshFailure::parse(provider_type, error, now_ms))
 }
 
@@ -2826,6 +2868,29 @@ enum ChatGptProbeStatus {
     ParseError,
 }
 
+async fn read_chatgpt_probe_json(
+    response: &mut reqwest::Response,
+) -> Result<Value, ChatGptProbeStatus> {
+    let body =
+        crate::infra::http::read_response_body_limited(response, MAX_QUOTA_RESPONSE_BODY_BYTES)
+            .await
+            .map_err(|error| {
+                tracing::debug!(error = %error, "ChatGPT probe response body could not be read");
+                match error {
+                    crate::infra::http::BoundedResponseBodyError::Request(_) => {
+                        ChatGptProbeStatus::NetworkError
+                    }
+                    crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
+                        ChatGptProbeStatus::ParseError
+                    }
+                }
+            })?;
+    serde_json::from_slice(&body).map_err(|error| {
+        tracing::debug!(error = %error, "ChatGPT probe response was invalid JSON");
+        ChatGptProbeStatus::ParseError
+    })
+}
+
 impl ChatGptProbeStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -2878,7 +2943,7 @@ async fn fetch_chatgpt_account_lookup(
     now_ms: i64,
     request_timeout: Duration,
 ) -> ChatGptSubscriptionProbe {
-    let response = match http
+    let mut response = match http
         .get(CHATGPT_ACCOUNTS_CHECK_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header("Origin", "https://chatgpt.com")
@@ -2908,12 +2973,11 @@ async fn fetch_chatgpt_account_lookup(
         };
     }
     let status = response.status().as_u16();
-    let body = match response.json::<Value>().await {
+    let body = match read_chatgpt_probe_json(&mut response).await {
         Ok(body) => body,
-        Err(error) => {
-            tracing::debug!(error = %error, "ChatGPT accounts/check response was invalid JSON");
+        Err(probe_status) => {
             return ChatGptSubscriptionProbe {
-                status: ChatGptProbeStatus::ParseError,
+                status: probe_status,
                 http_status: Some(status),
                 lookup: None,
                 workspace_candidates: Vec::new(),
@@ -2943,7 +3007,7 @@ async fn fetch_chatgpt_subscription_lookup(
     let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) else {
         return ChatGptSubscriptionProbe::skipped_no_trusted_workspace();
     };
-    let response = match http
+    let mut response = match http
         .get(CHATGPT_SUBSCRIPTIONS_URL)
         .query(&[("account_id", account_id)])
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
@@ -2974,12 +3038,11 @@ async fn fetch_chatgpt_subscription_lookup(
         };
     }
     let status = response.status().as_u16();
-    let body = match response.json::<Value>().await {
+    let body = match read_chatgpt_probe_json(&mut response).await {
         Ok(body) => body,
-        Err(error) => {
-            tracing::debug!(error = %error, "ChatGPT subscriptions response was invalid JSON");
+        Err(probe_status) => {
             return ChatGptSubscriptionProbe {
-                status: ChatGptProbeStatus::ParseError,
+                status: probe_status,
                 http_status: Some(status),
                 lookup: None,
                 workspace_candidates: Vec::new(),
@@ -4224,6 +4287,55 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_oversized_json_response() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_QUOTA_RESPONSE_BODY_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}/quota"), server)
+    }
+
+    #[tokio::test]
+    async fn quota_response_body_limit_is_enforced_before_json_parsing() {
+        let (url, server) = serve_oversized_json_response().await;
+        let failure = request_json(
+            ProviderType::CodexOAuth,
+            reqwest::Client::new().get(url),
+            1_000,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.status_code, 502);
+        assert!(!failure.retryable);
+        assert!(failure.message.contains("response body exceeds"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chatgpt_probe_response_body_limit_is_enforced() {
+        let (url, server) = serve_oversized_json_response().await;
+        let mut response = reqwest::Client::new().get(url).send().await.unwrap();
+        let status = read_chatgpt_probe_json(&mut response).await.unwrap_err();
+
+        assert_eq!(status, ChatGptProbeStatus::ParseError);
+        server.await.unwrap();
+    }
 
     #[test]
     fn quota_upstream_errors_redact_reflected_credentials() {

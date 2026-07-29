@@ -848,7 +848,11 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
 fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
     matches!(
         provider_type,
-        ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
+        ProviderType::ClaudeOAuth
+            | ProviderType::CodexOAuth
+            | ProviderType::GrokOAuth
+            | ProviderType::CursorOAuth
+            | ProviderType::CursorApiKey
     )
 }
 
@@ -1115,6 +1119,7 @@ mod tests {
             &stored,
             &AccountStore {
                 accounts: vec![account],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1160,6 +1165,7 @@ mod tests {
             &stored,
             &AccountStore {
                 accounts: vec![account],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1269,6 +1275,16 @@ mod tests {
                 AppKind::Codex,
                 ProviderType::GrokOAuth,
                 "https://api.x.ai/v1",
+            ),
+            (
+                AppKind::Codex,
+                ProviderType::CursorOAuth,
+                "https://api2.cursor.sh",
+            ),
+            (
+                AppKind::Codex,
+                ProviderType::CursorApiKey,
+                "https://api.cursor.com",
             ),
         ] {
             let mut stored = provider("codex.openai_oauth", provider_type);

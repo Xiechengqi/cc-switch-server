@@ -618,8 +618,8 @@ async fn web_invoke_dispatch(
                 .ok_or_else(|| ApiError::not_found("share not found"))?;
             Ok(json!(connect_info_for_share(&config, &share)?))
         }
-        "list_share_markets" => {
-            let markets = fetch_public_markets_from_router(state).await?;
+        "list_token_markets" => {
+            let markets = fetch_public_token_markets_from_router(state).await?;
             Ok(json!(markets))
         }
         "create_share" => {
@@ -716,20 +716,6 @@ async fn web_invoke_dispatch(
         "transfer_share_owner" => {
             let share = web_transfer_share_owner(state, headers, &args).await?;
             Ok(json!(share))
-        }
-        "authorize_share_market" => {
-            let id = web_arg_share_id(&args)?;
-            let value = web_payload(&args, &["params", "input"]);
-            let market_email = web_arg_string_any(value, &["marketEmail", "market_email"])?;
-            let response = authorize_share_market(
-                State(state.clone()),
-                headers.clone(),
-                Path(id),
-                Json(AuthorizeShareMarketRequest { market_email }),
-            )
-            .await?
-            .0;
-            Ok(json!(response.share))
         }
         "start_share_tunnel" => {
             let id = web_arg_share_id(&args)?;
@@ -997,7 +983,10 @@ async fn web_invoke_dispatch(
                 .iter()
                 .filter(|account| account.provider_type == provider_type)
                 .collect::<Vec<_>>();
-            let default_account_id = matching.first().map(|account| account.id.clone());
+            let default_account_id =
+                managed_auth_default_account_id(&accounts, provider_type).map(str::to_string);
+            let codex_oauth = (provider_type == ProviderType::CodexOAuth)
+                .then(|| accounts.codex_oauth_selection());
             let authenticated = matching
                 .iter()
                 .any(|account| account_is_authenticated(account));
@@ -1012,6 +1001,7 @@ async fn web_invoke_dispatch(
                 "authenticated": authenticated,
                 "default_account_id": default_account_id,
                 "migration_error": Value::Null,
+                "codex_oauth": codex_oauth,
                 "accounts": mapped_accounts
             }))
         }
@@ -1027,11 +1017,8 @@ async fn web_invoke_dispatch(
                         .unwrap_or(true)
                 })
                 .map(|account| {
-                    let default_account_id = accounts
-                        .accounts
-                        .iter()
-                        .find(|candidate| candidate.provider_type == account.provider_type)
-                        .map(|candidate| candidate.id.as_str());
+                    let default_account_id =
+                        managed_auth_default_account_id(&accounts, account.provider_type);
                     map_managed_auth_account(
                         account,
                         managed_auth_provider_label(account.provider_type),
@@ -1432,6 +1419,7 @@ async fn web_invoke_dispatch(
         }
         "stream_check_provider" => {
             let stored = web_resolve_stored_provider(state, &args).await?;
+            ensure_stored_provider_outbound_allowed(state, &stored).await?;
             let config = web_stream_check_config(state).await;
             let http_client = state.http_client().await;
             let result = crate::domain::stream_check::check_provider_reachability(
@@ -1463,6 +1451,12 @@ async fn web_invoke_dispatch(
                 if allowed_ids
                     .as_ref()
                     .is_some_and(|ids| !ids.contains(&stored.provider.id))
+                {
+                    continue;
+                }
+                if ensure_stored_provider_outbound_allowed(state, &stored)
+                    .await
+                    .is_err()
                 {
                     continue;
                 }
@@ -1792,14 +1786,8 @@ async fn web_invoke_dispatch(
         | "clear_claude_onboarding_skip" => Ok(Value::Null),
         "codex_banked_reset_status" => {
             let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
-            let account_id = {
-                let accounts = state.accounts_snapshot().await;
-                let account = accounts
-                    .find_for_provider(ProviderType::CodexOAuth, account_id.as_deref())
-                    .filter(|account| account.provider_type == ProviderType::CodexOAuth)
-                    .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
-                account.id.clone()
-            };
+            let (account_id, _) =
+                resolve_codex_oauth_account_for_banked_reset(state, account_id.as_deref()).await?;
             let _response = account_quota(
                 State(state.clone()),
                 headers.clone(),
@@ -1826,31 +1814,40 @@ async fn web_invoke_dispatch(
             let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
             let credit_id =
                 web_optional_string_any(&args, &["creditId", "credit_id"]).unwrap_or_default();
-            let (account_id, account) =
+            let (account_id, _) =
                 resolve_codex_oauth_account_for_banked_reset(state, account_id.as_deref()).await?;
-            let access_token = account
-                .access_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ApiError::bad_request("codex oauth account requires an access token")
-                })?;
-            let workspace_id =
-                crate::domain::accounts::store::effective_codex_workspace_id(&account);
-            let http = state.http_client().await;
-            let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
-            let timeout = std::time::Duration::from_millis(timeout_ms.max(1_000) as u64);
-            let result = crate::clients::oauth::codex_reset_credits::consume_reset_credit(
-                &http,
-                access_token,
-                workspace_id.as_deref(),
-                &credit_id,
-                timeout,
-            )
-            .await
-            .map_err(|error| ApiError::bad_gateway(error.message()))?;
-            let _ = account_quota(
+            let result = {
+                let _refresh_guard = state
+                    .account_refresh_locks
+                    .lock(ProviderType::CodexOAuth, &account_id)
+                    .await;
+                let (_, account) =
+                    resolve_codex_oauth_account_for_banked_reset(state, Some(account_id.as_str()))
+                        .await?;
+                let access_token = account
+                    .access_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::bad_request("codex oauth account requires an access token")
+                    })?;
+                let workspace_id =
+                    crate::domain::accounts::store::effective_codex_workspace_id(&account);
+                let http = state.http_client().await;
+                let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
+                let timeout = std::time::Duration::from_millis(timeout_ms.max(1_000) as u64);
+                crate::clients::oauth::codex_reset_credits::consume_reset_credit(
+                    &http,
+                    access_token,
+                    workspace_id.as_deref(),
+                    &credit_id,
+                    timeout,
+                )
+                .await
+                .map_err(|error| ApiError::bad_gateway(error.message()))?
+            };
+            if let Err(error) = account_quota(
                 State(state.clone()),
                 headers.clone(),
                 Path(account_id.clone()),
@@ -1859,7 +1856,14 @@ async fn web_invoke_dispatch(
                     force: Some(true),
                 }),
             )
-            .await?;
+            .await
+            {
+                tracing::warn!(
+                    account_id = %account_id,
+                    error = %error.message,
+                    "banked reset credit was consumed but the follow-up quota refresh failed"
+                );
+            }
             Ok(json!({
                 "code": result.code,
                 "creditId": result.credit_id,
@@ -1882,11 +1886,35 @@ async fn resolve_codex_oauth_account_for_banked_reset(
     state: &ServerState,
     account_id: Option<&str>,
 ) -> Result<(String, crate::domain::accounts::store::Account), ApiError> {
+    if state.credential_persistence_degraded() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed account credentials are waiting for durable persistence",
+        ));
+    }
     let accounts = state.accounts_snapshot().await;
-    let account = accounts
-        .find_for_provider(ProviderType::CodexOAuth, account_id)
-        .filter(|account| account.provider_type == ProviderType::CodexOAuth)
-        .ok_or_else(|| ApiError::not_found("codex oauth account not found"))?;
+    if !accounts
+        .accounts
+        .iter()
+        .any(|account| account.provider_type == ProviderType::CodexOAuth)
+    {
+        return Err(ApiError::not_found("codex oauth account not found"));
+    }
+    let account = accounts.active_codex_oauth_account().ok_or_else(|| {
+        ApiError::conflict_code(
+            "cc_switch_codex_inactive_account",
+            "select the active Codex OAuth account before using banked reset credits",
+        )
+    })?;
+    if account_id
+        .map(str::trim)
+        .is_some_and(|requested| requested != account.id)
+    {
+        return Err(ApiError::conflict_code(
+            "cc_switch_codex_inactive_account",
+            "Codex OAuth account is not active",
+        ));
+    }
     Ok((account.id.clone(), account.clone()))
 }
 

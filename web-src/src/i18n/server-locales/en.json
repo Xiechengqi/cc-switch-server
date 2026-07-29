@@ -2,6 +2,13 @@
   "common": {
     "copied": "Copied"
   },
+  "server": {
+    "auth": {
+      "inferenceTokenTitle": "Claude inference token",
+      "inferenceTokenOneTime": "This token is shown only once. Store it securely before continuing to the console.",
+      "continueToConsole": "I saved it, continue to console"
+    }
+  },
   "providers": {
     "addProvider": "Add provider"
   },
@@ -36,18 +43,8 @@
     "validation": {
       "invalidEmail": "Invalid email address"
     },
-    "saleMarketKind": {
-      "title": "Market type",
-      "token": "Token Market",
-      "share": "Share Market"
-    },
     "market": {
       "allSelected": "All Markets selected"
-    },
-    "accountMarket": {
-      "title": "Share Market",
-      "select": "Select Share Market",
-      "required": "Select a Share Market"
     },
     "permanent": "Permanent",
     "expiration": "Expires",
@@ -118,7 +115,12 @@
       "description": "Directory containing providers, shares, UI settings, and other persistent files. The listen address and port come from process arguments."
     },
     "serverSecurity": {
-      "currentPasswordRequired": "Enter the current password"
+      "currentPasswordRequired": "Enter the current password",
+      "inferenceTokenRotated": "Inference token rotated",
+      "inferenceTokenTitle": "Claude inference token",
+      "inferenceTokenDescription": "Used for local Claude API requests and isolated from administrator access",
+      "rotateInferenceToken": "Rotate token",
+      "rotateInferenceTokenConfirm": "Rotate the inference token? Existing clients will stop authenticating immediately."
     },
     "share": {
       "health": {

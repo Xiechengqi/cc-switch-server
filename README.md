@@ -40,13 +40,14 @@ market or direct share URL
 - Provider API 导出仅返回脱敏视图；受控导入按 server 当前分类和凭据补丁契约执行，不提供跨 store 的通用配置导入导出。
 - 已实现 Codex Chat Completions 与 Responses 的直接互转，保留 max/reasoning/response_format/tool/usage 等 Codex bridge 关键字段。
 - 已接入 Claude/Codex/Gemini/OpenAI-compatible/Gemini-native/Anthropic-native 之间的主要跨协议 adapter contract，并把 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset 纳入 coverage。
-- Cursor 三入口保持 AgentService planned；已移植协议、请求、事件、tool、h2、session、identity、image 前置层，并在显式 opt-in 下接入 Claude/Codex/Gemini AgentService driver。
+- Cursor AgentService 已默认接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；Provider maturity 保持 Experimental，直到 OAuth/API key 真实验收矩阵通过。
 - GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
 - Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
-- Managed OAuth Provider 必须显式绑定账号；Codex 等非 Claude 路由可按各自策略结合占用、quota/cooldown/concurrency 和 session affinity 选择候选。Claude 直连始终固定 `currentProviderClaude` 及其绑定账号，首个 401 只在同账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
-- Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接或首业务事件前的传输失败/超时可回退到同账号 HTTP/SSE，首事件后切换为空闲超时并且绝不透明重放。
+- Managed OAuth Provider 必须显式绑定账号。Codex OAuth 在全局只允许一个当前反代账号：单账号自动生效，多账号必须由管理员显式选择，并原子重绑未被 Share 占用的 Codex OAuth Provider；请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude 直连始终固定 `currentProviderClaude` 及其绑定账号；Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
+- Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
+- Codex context overflow 自动压缩可通过 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 显式启用；它只在业务输出提交前使用同一账号做一次有界摘要和重试，默认关闭且摘要 usage 独立记录。
 - 支持 router installation register、client tunnel、share tunnel、share batch sync、direct share request log sync、pending share edit pull/ack/event 监听。
-- 支持 share-market grant add/revoke 通过 router pending edit 应用到 server share，并同步 per-app 授权展示状态。
+- 支持 Router 内建 Share Market entitlement add/revoke 通过 pending edit 幂等应用到 Server Share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
 - usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。
 - JSON 写入使用 temp file fsync、atomic rename 和父目录 fsync；`/api/backup` 支持创建、列出、恢复主要 store，恢复前自动 pre-restore 快照。
@@ -66,7 +67,7 @@ market or direct share URL
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
-| **Cursor** | 作为 Claude/Codex 上游桥（非 IDE MITM） | ⚠️ Planned | AgentService h2/protobuf 静态 driver 已接线，需显式 opt-in；待真实验收 |
+| **Cursor** | 作为 Claude/Codex 上游桥（非 IDE MITM） | 🧪 Experimental | AgentService h2/protobuf 默认接线；固定单凭据，待真实验收 |
 | **GitHub Copilot** | 作为 Claude 上游桥 | ⚠️ Fallback | 静态 preflight 与 model map 已接入；token 交换与 live 回归待验收 |
 | **Kiro** | 作为 Claude 上游桥 | ⚠️ Planned | CodeWhisperer 协议桥已静态接线；仅 Claude app，待真实验收 |
 | **DeepSeek Account** | 作为 Claude 上游桥 | ⚠️ Planned | 账密协议桥与 PoW 已接线；Codex/Gemini 路径仍为 skeleton |
@@ -85,7 +86,7 @@ market or direct share URL
 | Gemini / Gemini CLI OAuth | ✅ | ✅ | ✅ | Native |
 | OpenRouter / Ollama / Nvidia / DeepSeek API | ✅ | ✅ | ✅ | Native |
 | Antigravity / Agy OAuth | ✅ | — | ✅ | Native（经预设映射） |
-| Cursor OAuth / API Key | ⚠️ | ⚠️ | ⚠️ | Planned（AgentService opt-in） |
+| Cursor OAuth / API Key | 🧪 | 🧪 | 🧪 | Experimental（AgentService 默认接线，live-unverified） |
 | AWS Bedrock | ⚠️ | ⚠️ | ⚠️ | Planned（SigV4 合同已生成） |
 | GitHub Copilot | ⚠️ | ⚠️ | ⚠️ | Fallback |
 | Kiro OAuth | ⚠️ | — | — | Planned（仅 Claude） |
@@ -131,7 +132,7 @@ curl -fsS -X POST http://127.0.0.1:15721/api/setup/bootstrap \
 2. 浏览器授权后会跳转到本机 `localhost:1455`；页面不可达是远程部署下的预期现象。
 3. 从地址栏提交完整的 `http://localhost:1455/auth/callback?code=...&state=...` URL，Server 校验固定 scheme/host/port/path、state、当前管理员主体和会话期限后交换 token。
 
-只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
+只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。存在一条凭据时该账号自动成为当前反代账号；存在多条凭据时必须在 Web 管理面显式选择唯一账号，`needs_selection` 期间所有 Codex OAuth 出站均被阻断。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
 
 或使用 CLI 在启动 HTTP 前写本地配置：
 
@@ -192,7 +193,7 @@ scripts/smoke/smoke-local.sh
 RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```
 
-有真实 router、market、provider、OAuth 或 share-market grant 输入时，把变量写入私有 env 文件后运行：
+有真实 router、market、provider、OAuth 或 Router 内建 Share Market 端到端环境时，把变量写入私有 env 文件后运行：
 
 ```bash
 set -a
@@ -242,7 +243,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 4. 添加 provider 或 account 后创建 share；未填写 share subdomain 时，server 会自动生成。
 5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
 6. share descriptor 会在创建、修改、删除时自动同步，并在 client 启动或重新注册 router 后自动校准，无需人工全量同步。
-7. share-market grant 会通过 router pending share edit 下发；server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
+7. Router 内建 Share Market entitlement 会通过 pending share edit 下发；Server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
 8. router 可经 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime`、`/_share-router/model-health` 拉取 runtime。
 9. `/_ctl/apply_share_settings` 和 `/_ctl/refresh_share_usage` 使用 router `control_secret` HMAC、timestamp、nonce 防重放。
 10. direct share URL 请求会按 `X-CC-Switch-Share-Id` 选择 share binding，并将 `dataSource=direct` 的 request log 同步到 router；market source 日志不由 server 回传，避免与 market 侧计费日志重复。
@@ -253,7 +254,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - router share 表能看到 server share 的 owner、subdomain、app runtime、provider 和 quota 展示字段。
 - market API URL 能调度 server share。
 - direct share API URL 能直接调用 server share，router request log 不重复且保留 country/IP/source。
-- share-market grant add/revoke 能通过 pending share edit 应用到 server share。
+- Router 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 Server Share。
 
 ## 关键配置
 
@@ -272,9 +273,10 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | Streaming 超时 | Provider 默认首业务事件超时 120 秒、后续事件空闲超时 300 秒；`STREAM_FIRST_BYTE_TIMEOUT_MS` / `UPSTREAM_STREAM_FIRST_BYTE_TIMEOUT_MS` 和 `STREAM_IDLE_TIMEOUT_MS` / `UPSTREAM_STREAM_IDLE_TIMEOUT_MS` 可覆盖，设为 `0` 关闭对应超时 |
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
+| Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
 | OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
 | Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
-| 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_MARKET_GRANT_TOKEN` |
+| 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`DIRECT_SHARE_URL` 及各真实 Provider token |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
 
@@ -284,7 +286,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - `providers.json`：Claude / Codex / Gemini 供应商配置（按应用维度管理）。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
-- `shares.json` / `tunnels.json`：share、binding、ACL、market grant 和 tunnel runtime。
+- `shares.json` / `tunnels.json`：Share、binding、ACL、Router 管理的 Share Market entitlement 和 tunnel runtime。
 - `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
 - `email-auth.json` 及运行时生成的日志/备份目录。
 
@@ -347,5 +349,7 @@ cc-switch-server config migrate-provider-store --cleanup-snapshot
 - [UI 人工验收清单](docs/manual-ui-checklist.md)
 - [部署](docs/deployment.md)
 - [真实验收 runbook](docs/real-acceptance-runbook.md)
+- [Cursor AgentService 验收](docs/cursor-agentservice-acceptance.md)
+- [Codex OAuth 单账号反代](docs/codex-oauth-single-account.md)
 - [provider 覆盖](docs/provider-coverage.md)
 - [usage token accounting](docs/usage-token-accounting.md)

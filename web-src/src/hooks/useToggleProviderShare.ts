@@ -77,7 +77,6 @@ export function useToggleProviderShare(
       await createMutation.mutateAsync({
         bindings: { [appId]: providerId },
         forSale: "Yes",
-        saleMarketKind: "token",
         tokenLimit: UNLIMITED_TOKEN_LIMIT,
         parallelLimit: UNLIMITED_PARALLEL_LIMIT,
         expiresInSecs: permanentExpiresInSecs(),
@@ -89,7 +88,6 @@ export function useToggleProviderShare(
         appSettings: {
           [appId]: {
             forSale: "Yes",
-            saleMarketKind: "token",
             marketAccessMode: "all",
             sharedWithEmails: [],
             tokenLimit: UNLIMITED_TOKEN_LIMIT,

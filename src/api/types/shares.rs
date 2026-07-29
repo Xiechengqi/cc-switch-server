@@ -1,5 +1,5 @@
 use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::sharing::shares::{Share, ShareAcl, ShareMarketGrantStatus};
+use crate::domain::sharing::shares::{Share, ShareAcl};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -81,20 +81,14 @@ pub(in crate::api) struct ReplaceShareAclRequest {
     pub(in crate::api) acl: ShareAcl,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UpdateShareMarketGrantRequest {
-    pub(in crate::api) market_grant: Option<ShareMarketGrantStatus>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct PublicShareMarket {
+pub(in crate::api) struct PublicTokenMarket {
     pub(in crate::api) id: String,
     pub(in crate::api) display_name: String,
     pub(in crate::api) email: String,
     pub(in crate::api) subdomain: String,
-    public_base_url: Option<String>,
+    pub(in crate::api) public_base_url: Option<String>,
     pub(in crate::api) market_kind: String,
     pub(in crate::api) status: String,
     #[serde(default)]
@@ -103,14 +97,8 @@ pub(in crate::api) struct PublicShareMarket {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ListShareMarketsResponse {
+pub(in crate::api) struct ListTokenMarketsResponse {
     #[serde(default)]
     pub(in crate::api) ok: bool,
-    pub(in crate::api) markets: Vec<PublicShareMarket>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct AuthorizeShareMarketRequest {
-    pub(in crate::api) market_email: String,
+    pub(in crate::api) markets: Vec<PublicTokenMarket>,
 }

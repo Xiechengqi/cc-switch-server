@@ -1,4 +1,4 @@
-import type { ShareBindings, ShareRecord, ShareSaleMarketKind } from "@/lib/api";
+import type { ShareBindings, ShareRecord } from "@/lib/api";
 import { SHARE_APP_TYPES } from "@/lib/api/share";
 import {
   normalizeShareLimitValue,
@@ -102,11 +102,6 @@ function normalizeForSale(raw: RawRecord): ShareRecord["forSale"] {
   return "No";
 }
 
-function normalizeSaleMarketKind(raw: RawRecord): ShareSaleMarketKind {
-  const value = readString(raw, "saleMarketKind", "sale_market_kind");
-  return value === "share" ? "share" : "token";
-}
-
 function normalizeExpiresAt(raw: RawRecord): string {
   const iso = readString(raw, "expiresAt", "expires_at");
   if (iso) return iso;
@@ -190,7 +185,6 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
       {},
     description: readString(record, "description") ?? null,
     forSale: normalizeForSale(record),
-    saleMarketKind: normalizeSaleMarketKind(record),
     bindings,
     apiKey: readString(record, "apiKey", "api_key") ?? "",
     settingsConfig:

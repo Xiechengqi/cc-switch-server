@@ -772,7 +772,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     All: "全部",
     Apply: "应用",
     "API token copied": "API token 已复制",
-    "Authorize Share Market": "授权 Share Market",
     "Auto start tunnel": "自动启动隧道",
     "Avg latency": "平均延迟",
     "Avg/request": "平均/请求",
@@ -904,7 +903,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Save Share": "保存 Share",
     "Select market": "选择市场",
     "Select provider": "选择供应商",
-    "Share market": "Share 市场",
     "Share must be paused before binding changes are accepted.":
       "必须先暂停 Share，才能修改绑定。",
     "Share routes expose selected providers through router and market flows.":
@@ -1004,7 +1002,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     All: "全部",
     Apply: "套用",
     "API token copied": "API token 已複製",
-    "Authorize Share Market": "授權 Share Market",
     "Auto start tunnel": "自動啟動隧道",
     "Avg latency": "平均延遲",
     "Avg/request": "平均/請求",
@@ -1136,7 +1133,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Save Share": "儲存 Share",
     "Select market": "選擇市場",
     "Select provider": "選擇供應商",
-    "Share market": "Share 市場",
     "Share must be paused before binding changes are accepted.":
       "必須先暫停 Share，才能修改綁定。",
     "Share routes expose selected providers through router and market flows.":
@@ -1237,7 +1233,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     All: "すべて",
     Apply: "適用",
     "API token copied": "API token をコピーしました",
-    "Authorize Share Market": "Share Market を認可",
     "Auto start tunnel": "トンネルを自動開始",
     "Avg latency": "平均レイテンシー",
     "Avg/request": "平均/リクエスト",
@@ -1371,7 +1366,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Save Share": "Share を保存",
     "Select market": "マーケットを選択",
     "Select provider": "プロバイダーを選択",
-    "Share market": "Share マーケット",
     "Share must be paused before binding changes are accepted.":
       "バインド変更には先に Share を一時停止する必要があります。",
     "Share routes expose selected providers through router and market flows.":

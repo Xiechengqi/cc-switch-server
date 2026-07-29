@@ -12,7 +12,9 @@
 //! before closing the request side. The response body is parsed incrementally
 //! through `ConnectFrameParser`.
 
-use super::agent_proto::{ConnectFrame, ConnectFrameParser, ProtoError};
+use super::agent_proto::{
+    is_end_stream, parse_trailers, ConnectFrame, ConnectFrameParser, ProtoError,
+};
 use crate::proxy::ProxyError;
 use async_stream::stream;
 use axum::http::StatusCode;
@@ -47,25 +49,29 @@ pub struct CursorH2Stream {
     pending: std::collections::VecDeque<ConnectFrame>,
     closed: bool,
     received_any_frame: bool,
+    timeouts: CursorH2Timeouts,
+    connect_grpc_status: Option<u32>,
+    connect_grpc_message: Option<String>,
 }
 
-/// Default per-call deadline. The session manager arms its own idle timer,
-/// so this is just a backstop against an upstream stall.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Timeout for the *first* server frame. Cursor's AgentService should start
-/// producing output within seconds; if it hasn't after this deadline the
-/// upstream is almost certainly waiting for a client-stream EOF we never
-/// sent. A short timeout here lets the caller emit a compliant terminal
-/// error event instead of hanging for 600s.
-const FIRST_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Timeout between subsequent server frames after the handshake. A bad
-/// RequestContext ack or upstream stall used to fall through to
-/// `DEFAULT_TIMEOUT` (600s); this shorter deadline surfaces errors to the
-/// client within a minute.
-const INTER_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy)]
+pub struct CursorH2Timeouts {
+    pub request: Duration,
+    pub first_frame: Option<Duration>,
+    pub inter_frame: Option<Duration>,
+}
+
+impl Default for CursorH2Timeouts {
+    fn default() -> Self {
+        Self {
+            request: Duration::from_secs(300),
+            first_frame: Some(Duration::from_secs(120)),
+            inter_frame: Some(Duration::from_secs(300)),
+        }
+    }
+}
 
 impl CursorH2Stream {
     /// Open a fresh h2 stream to Cursor's AgentService endpoint,
@@ -76,6 +82,7 @@ impl CursorH2Stream {
         base_url: &str,
         headers: Vec<(String, String)>,
         first_frame: Bytes,
+        timeouts: CursorH2Timeouts,
     ) -> Result<Self, ProxyError> {
         let url = agentservice_url(base_url);
         let uri = url
@@ -126,7 +133,7 @@ impl CursorH2Stream {
         let client: Client<_, http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>> =
             builder.build(https);
 
-        let response = tokio::time::timeout(DEFAULT_TIMEOUT, client.request(req))
+        let response = tokio::time::timeout(timeouts.request, client.request(req))
             .await
             .map_err(|_| cursor_forward_error("Cursor AgentService 请求超时"))?
             .map_err(|e| cursor_forward_error(format!("Cursor AgentService 请求失败: {e}")))?;
@@ -139,6 +146,9 @@ impl CursorH2Stream {
             pending: std::collections::VecDeque::new(),
             closed: false,
             received_any_frame: false,
+            timeouts,
+            connect_grpc_status: None,
+            connect_grpc_message: None,
         })
     }
 
@@ -205,28 +215,32 @@ impl CursorH2Stream {
             return Ok(Some(frame));
         }
         if self.closed {
-            return Ok(None);
+            return self.terminal_result();
         }
 
         loop {
             let timeout = if self.received_any_frame {
-                INTER_FRAME_IDLE_TIMEOUT
+                self.timeouts.inter_frame
             } else {
-                FIRST_FRAME_IDLE_TIMEOUT
+                self.timeouts.first_frame
             };
-            let frame_result = tokio::time::timeout(timeout, self.response.body_mut().frame())
-                .await
-                .map_err(|_| {
-                    if !self.received_any_frame {
-                        cursor_forward_error(
-                            "Cursor AgentService 首帧超时：上游在 30s 内未返回任何帧".to_string(),
-                        )
-                    } else {
-                        cursor_forward_error(
-                            "Cursor AgentService 响应超时：上游在 60s 内未返回后续帧".to_string(),
-                        )
-                    }
-                })?;
+            let frame_result = match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, self.response.body_mut().frame())
+                    .await
+                    .map_err(|_| {
+                        let timeout_ms = timeout.as_millis();
+                        if !self.received_any_frame {
+                            cursor_forward_error(format!(
+                                "Cursor AgentService first frame timed out after {timeout_ms}ms"
+                            ))
+                        } else {
+                            cursor_forward_error(format!(
+                                "Cursor AgentService stream idled for {timeout_ms}ms"
+                            ))
+                        }
+                    })?,
+                None => self.response.body_mut().frame().await,
+            };
 
             let body_frame = match frame_result {
                 Some(Ok(f)) => f,
@@ -235,7 +249,7 @@ impl CursorH2Stream {
                 }
                 None => {
                     self.closed = true;
-                    return Ok(None);
+                    return self.terminal_result();
                 }
             };
 
@@ -248,11 +262,19 @@ impl CursorH2Stream {
             if let Ok(data) = body_frame.into_data() {
                 let new_frames = self.parser.feed(&data).map_err(map_proto_err)?;
                 for f in new_frames {
-                    self.pending.push_back(f);
+                    if is_end_stream(&f) {
+                        self.capture_connect_end_stream(&f);
+                        self.closed = true;
+                    } else {
+                        self.pending.push_back(f);
+                    }
                 }
                 if let Some(f) = self.pending.pop_front() {
                     self.received_any_frame = true;
                     return Ok(Some(f));
+                }
+                if self.closed {
+                    return self.terminal_result();
                 }
                 // Empty data frame — keep reading.
                 continue;
@@ -273,19 +295,57 @@ impl CursorH2Stream {
 
     /// Connect-RPC grpc-status code from trailers. `0` = OK.
     pub fn grpc_status(&self) -> Option<u32> {
-        self.trailers
-            .as_ref()
-            .and_then(|t| t.get("grpc-status"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse().ok())
+        self.connect_grpc_status.or_else(|| {
+            self.trailers
+                .as_ref()
+                .and_then(|t| t.get("grpc-status"))
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse().ok())
+        })
     }
 
     pub fn grpc_message(&self) -> Option<String> {
-        self.trailers
-            .as_ref()
-            .and_then(|t| t.get("grpc-message"))
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
+        self.connect_grpc_message
+            .clone()
+            .or_else(|| {
+                self.trailers
+                    .as_ref()
+                    .and_then(|t| t.get("grpc-message"))
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .map(|message| {
+                crate::logging::redact_sensitive_text(&message)
+                    .chars()
+                    .take(512)
+                    .collect()
+            })
+    }
+
+    fn capture_connect_end_stream(&mut self, frame: &ConnectFrame) {
+        for (name, value) in parse_trailers(&frame.payload) {
+            match name.as_str() {
+                "grpc-status" | "connect-error-code" => {
+                    self.connect_grpc_status = value.trim().parse().ok();
+                }
+                "grpc-message" | "connect-error-message" => {
+                    self.connect_grpc_message = Some(value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn terminal_result(&self) -> Result<Option<ConnectFrame>, ProxyError> {
+        match self.grpc_status() {
+            Some(0) | None => Ok(None),
+            Some(status) => Err(cursor_forward_error(format!(
+                "Cursor AgentService terminated with grpc-status {status}: {}",
+                self.grpc_message()
+                    .as_deref()
+                    .unwrap_or("upstream returned no grpc-message")
+            ))),
+        }
     }
 }
 

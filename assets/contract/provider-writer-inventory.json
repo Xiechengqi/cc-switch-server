@@ -9,15 +9,15 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "35be0ee1a15b94d5243c4761d7275d0d0436a9368ed6252693291220fe73531a"
+      "sha256": "ef74336cdd570c7f7de5cdffc5e9179203e1ff48884fa7478c4aef8175e94491"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "58ff476ae72f593013d17f520503a3000d65d45341555302231556409fe8ef5c"
+      "sha256": "9009be52e06214d4bd38e2a3b17b1e3ae95fb0e9c79e323333e488063f9cabf8"
     },
     {
       "path": "src/api/types/providers.rs",
-      "sha256": "ef8da5725e971c7d9f2b9fb18c47f6cb8b581aeba5ce1ddf4ebf6e5735a7f888"
+      "sha256": "5a546dfaa2828e748dc1dcfe885a64a9b61d6872e6dcbcaaa1605d19417b5e3a"
     },
     {
       "path": "src/domain/providers/credentials.rs",
@@ -45,11 +45,11 @@
     },
     {
       "path": "src/infra/credentials.rs",
-      "sha256": "024db12dd220ecd65c2b9e9fc386e8782f84b211883e2b945cddea43674df7e1"
+      "sha256": "2d77f5cccdbe7e532c0a131f76a10e1703e45765ffb1856d16dc502e69d2fb5e"
     },
     {
       "path": "src/state.rs",
-      "sha256": "b4ffff5b9888eca7fbd015127d0a629d8fa6ade9f0229811db48704939ccd6fc"
+      "sha256": "065b5d7b79d0864173fe0d026adfbeb425ead7aef01cca53af92d2c070b97378"
     }
   ],
   "entries": [

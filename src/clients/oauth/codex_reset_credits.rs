@@ -11,11 +11,14 @@ pub(crate) const CHATGPT_RESET_CREDIT_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_RESET_CREDIT_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_RESET_CREDIT_ERROR_MESSAGE_CHARS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResetCreditDetailsError {
     Timeout,
     RequestFailed,
+    ResponseTooLarge,
     UpstreamHttp(u16),
     InvalidJson,
     MissingFields,
@@ -26,6 +29,7 @@ impl ResetCreditDetailsError {
         match self {
             Self::Timeout => "timeout".to_string(),
             Self::RequestFailed => "request_failed".to_string(),
+            Self::ResponseTooLarge => "response_too_large".to_string(),
             Self::UpstreamHttp(status) => format!("upstream_http_{status}"),
             Self::InvalidJson => "invalid_json".to_string(),
             Self::MissingFields => "missing_fields".to_string(),
@@ -79,7 +83,7 @@ async fn fetch_reset_credit_details_from_url(
     request_timeout: Duration,
 ) -> Result<ParsedResetCreditDetails, ResetCreditDetailsError> {
     let timeout = request_timeout.min(DETAILS_TIMEOUT);
-    let response = codex_authenticated_get(http, url, access_token, workspace_id, timeout)
+    let mut response = codex_authenticated_get(http, url, access_token, workspace_id, timeout)
         .send()
         .await
         .map_err(|error| {
@@ -94,13 +98,12 @@ async fn fetch_reset_credit_details_from_url(
             response.status().as_u16(),
         ));
     }
-    let body = response.bytes().await.map_err(|error| {
-        if error.is_timeout() {
-            ResetCreditDetailsError::Timeout
-        } else {
-            ResetCreditDetailsError::RequestFailed
-        }
-    })?;
+    let body = crate::infra::http::read_response_body_limited(
+        &mut response,
+        MAX_RESET_CREDIT_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(reset_credit_details_body_error)?;
     let value =
         serde_json::from_slice::<Value>(&body).map_err(|_| ResetCreditDetailsError::InvalidJson)?;
     let parsed = parse_reset_credit_details(&value)?;
@@ -163,6 +166,7 @@ pub(crate) fn codex_authenticated_post(
 pub(crate) enum BankedResetActionError {
     Timeout,
     RequestFailed,
+    ResponseTooLarge,
     UpstreamHttp(u16, String),
     InvalidJson,
 }
@@ -172,6 +176,7 @@ impl BankedResetActionError {
         match self {
             Self::Timeout => "upstream request timed out".to_string(),
             Self::RequestFailed => "upstream request failed".to_string(),
+            Self::ResponseTooLarge => "upstream response body is too large".to_string(),
             Self::UpstreamHttp(status, body) => format!("upstream returned {status}: {body}"),
             Self::InvalidJson => "upstream returned invalid json".to_string(),
         }
@@ -206,8 +211,9 @@ fn generate_redeem_request_id() -> String {
 
 async fn request_upstream_json(
     request: reqwest::RequestBuilder,
+    sensitive_values: &[&str],
 ) -> Result<Value, BankedResetActionError> {
-    let response = request.send().await.map_err(|error| {
+    let mut response = request.send().await.map_err(|error| {
         if error.is_timeout() {
             BankedResetActionError::Timeout
         } else {
@@ -215,13 +221,12 @@ async fn request_upstream_json(
         }
     })?;
     let status = response.status();
-    let body = response.bytes().await.map_err(|error| {
-        if error.is_timeout() {
-            BankedResetActionError::Timeout
-        } else {
-            BankedResetActionError::RequestFailed
-        }
-    })?;
+    let body = crate::infra::http::read_response_body_limited(
+        &mut response,
+        MAX_RESET_CREDIT_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(banked_reset_action_body_error)?;
     if body.is_empty() {
         return if status.is_success() {
             Ok(Value::Object(Map::new()))
@@ -245,6 +250,7 @@ async fn request_upstream_json(
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
+        let message = sanitize_reset_credit_error_message(&message, sensitive_values);
         Err(BankedResetActionError::UpstreamHttp(
             status.as_u16(),
             if message.is_empty() {
@@ -254,6 +260,45 @@ async fn request_upstream_json(
             },
         ))
     }
+}
+
+fn reset_credit_details_body_error(
+    error: crate::infra::http::BoundedResponseBodyError,
+) -> ResetCreditDetailsError {
+    match error {
+        crate::infra::http::BoundedResponseBodyError::Request(error) if error.is_timeout() => {
+            ResetCreditDetailsError::Timeout
+        }
+        crate::infra::http::BoundedResponseBodyError::Request(_) => {
+            ResetCreditDetailsError::RequestFailed
+        }
+        crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
+            ResetCreditDetailsError::ResponseTooLarge
+        }
+    }
+}
+
+fn banked_reset_action_body_error(
+    error: crate::infra::http::BoundedResponseBodyError,
+) -> BankedResetActionError {
+    match error {
+        crate::infra::http::BoundedResponseBodyError::Request(error) if error.is_timeout() => {
+            BankedResetActionError::Timeout
+        }
+        crate::infra::http::BoundedResponseBodyError::Request(_) => {
+            BankedResetActionError::RequestFailed
+        }
+        crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
+            BankedResetActionError::ResponseTooLarge
+        }
+    }
+}
+
+fn sanitize_reset_credit_error_message(message: &str, sensitive_values: &[&str]) -> String {
+    crate::logging::redact_sensitive_text_with_values(message, sensitive_values.iter().copied())
+        .chars()
+        .take(MAX_RESET_CREDIT_ERROR_MESSAGE_CHARS)
+        .collect()
 }
 
 pub(crate) async fn consume_reset_credit(
@@ -282,7 +327,7 @@ pub(crate) async fn consume_reset_credit(
         Value::Object(payload),
         timeout,
     );
-    let raw = request_upstream_json(request).await?;
+    let raw = request_upstream_json(request, &[access_token]).await?;
     let available_count = raw
         .get("available_count")
         .or_else(|| raw.get("availableCount"))
@@ -813,6 +858,14 @@ mod tests {
         status: &str,
         body: &str,
     ) -> (String, tokio::task::JoinHandle<String>) {
+        serve_one_http_response_with_length(status, body, body.len()).await
+    }
+
+    async fn serve_one_http_response_with_length(
+        status: &str,
+        body: &str,
+        content_length: usize,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let status = status.to_string();
@@ -833,7 +886,7 @@ mod tests {
             }
             let response = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
+                content_length
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             String::from_utf8(request).unwrap()
@@ -908,6 +961,63 @@ mod tests {
         assert_eq!(error, ResetCreditDetailsError::UpstreamHttp(404));
         assert_eq!(error.code(), "upstream_http_404");
         assert!(!error.code().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn reset_credit_response_body_limits_are_enforced() {
+        let (details_url, details_task) = serve_one_http_response_with_length(
+            "200 OK",
+            "",
+            MAX_RESET_CREDIT_RESPONSE_BODY_BYTES + 1,
+        )
+        .await;
+        let details_error = fetch_reset_credit_details_from_url(
+            &reqwest::Client::new(),
+            &details_url,
+            "test-token",
+            Some("workspace-a"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        let _ = details_task.await.unwrap();
+
+        let (action_url, action_task) = serve_one_http_response_with_length(
+            "200 OK",
+            "",
+            MAX_RESET_CREDIT_RESPONSE_BODY_BYTES + 1,
+        )
+        .await;
+        let action_error = request_upstream_json(
+            codex_authenticated_post(
+                &reqwest::Client::new(),
+                &action_url,
+                "test-token",
+                Some("workspace-a"),
+                json!({}),
+                Duration::from_secs(1),
+            ),
+            &["test-token"],
+        )
+        .await
+        .unwrap_err();
+        let _ = action_task.await.unwrap();
+
+        assert_eq!(details_error, ResetCreditDetailsError::ResponseTooLarge);
+        assert_eq!(action_error, BankedResetActionError::ResponseTooLarge);
+    }
+
+    #[test]
+    fn reset_credit_upstream_errors_are_redacted_and_bounded() {
+        let message = format!("upstream echoed secret-token {}", "x".repeat(1_024));
+        let sanitized = sanitize_reset_credit_error_message(&message, &["secret-token"]);
+
+        assert!(!sanitized.contains("secret-token"));
+        assert!(sanitized.contains("[REDACTED]"));
+        assert_eq!(
+            sanitized.chars().count(),
+            MAX_RESET_CREDIT_ERROR_MESSAGE_CHARS
+        );
     }
 
     #[test]

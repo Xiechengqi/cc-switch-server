@@ -59,7 +59,6 @@ scripts/smoke/router-market-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 scripts/smoke/oauth-readiness-check.sh
 node scripts/smoke/grok-oauth-real.mjs
-scripts/smoke/share-market-grant-smoke.sh
 RUN_REAL=1 scripts/release-readiness.sh
 ```
 
@@ -184,10 +183,11 @@ Codex OAuth 专项补充：
 13. 从配置中的非 loopback HTTPS Client URL 发起 CLI OAuth，确认授权请求仍使用 `http://localhost:1455/auth/callback`。浏览器本地回调失败后提交完整地址栏 URL 应完成同一管理员主体的会话；裸 code、`127.0.0.1`、错误端口/path、重复 state、过期/取消会话、另一管理员会话、非同源页面、未配置的 host 和远程 HTTP Client URL 都必须拒绝。另以 `0.0.0.0` 或 `::` 启动 Server，确认携带伪造 `Host: 127.0.0.1` 的远程请求仍被拒绝；只有 Server 实际绑定 loopback 时才允许本机例外。Device OAuth 同时保持可用。
 14. Provider 中伪造 OAuth authorize/token、quota 或 inference endpoint 后保存/转发必须被固定 endpoint policy 拒绝或覆盖，OAuth token 不得发往自定义 host；managed OAuth Provider 缺少显式账号绑定时必须拒绝保存，不能隐式选同类型第一个账号。
 15. `GET /api/accounts`、账号 upsert/refresh/quota 响应及兼容 invoke 响应不得包含 access/refresh/id token、API key、extra headers、profile、raw 或 refresh error 原文；只允许 `has*`/状态/配额/脱敏身份字段。
-16. HTTP non-stream、SSE、Images、image-tool 去除后的二次请求、WebSocket handshake 与 WS→HTTP fallback 分别模拟首次 401：同一账号只强刷一次并重物化 Authorization/workspace header；仍为 401 时才记录 cooldown/选择未固定的下一 Provider。显式 `x-cc-provider-id` 和 Share binding 不得跨 Provider。
-17. 至少配置两个绑定不同账号、并发上限不同的同类型 Codex OAuth Provider。自动请求应优先选占用比例较低且未 cooldown/耗尽的账号；同负载下同一 session 应稳定落到同一 Provider，达到上限后跳过，SSE/WS 结束或断连后 inflight 必须归零。
+16. HTTP non-stream、SSE、Images、image-tool 去除后的二次请求、WebSocket handshake 与 WS→HTTP fallback 分别模拟首次 401：同一账号只强刷一次并重物化 Authorization/workspace header；仍为 401 时直接返回并只记录原账号 cooldown。current Provider、显式 `x-cc-provider-id` 和 Share binding 都不得跨 Provider/账号；为其他 Provider/账号设置 mock 后断言其上游请求数为零。
+17. 分别以 0、1、2 个 Codex OAuth 账号启动，确认 `GET /api/accounts`/`auth_get_status` 返回 `unconfigured`、自动 `ready`、`needs_selection`。`needs_selection` 时 HTTP/SSE/WS/Images/models/alpha-search/quota/Provider test 均应零上游请求。调用 `POST /api/accounts/codex/active` 后，所有未共享 Codex OAuth Provider 必须原子重绑到目标账号并增加 revision，重启后选择保持；另创建引用旧账号 Provider 的 Share，确认切换返回 409 且三个 store 无部分变化。把活动账号置于 cooldown、quota 耗尽和并发上限时请求应直接失败，其他账号/Provider 请求数始终为零，SSE/WS 结束或断连后原账号 inflight 必须归零。
 18. 同一 Codex session 连续两个 WS response 应只建立一个上游连接；更换 Provider/runtime/workspace/credential 必须生成新 pool key。用 `CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 缩短参数验证 capacity/idle TTL/max age，并验证 `codexWebsocketEnabled=false` 的禁用行为。
-19. 分别模拟 WS connect refused/timeout、握手 5xx、stale cached socket、首事件前 send/read/close 1009，确认只在首个业务 JSON 事件前通过同账号 HTTP/SSE 回退；握手 400/401/403/429 不得作为传输 fallback。缩短 `STREAM_FIRST_BYTE_TIMEOUT_MS` 验证首事件超时可回退，再缩短 `STREAM_IDLE_TIMEOUT_MS` 验证已收到 `response.created` 后只终止流且不重放。`cc_switch_codex_websocket_fallback_total{source,result}` 与 cache/retry 指标应对应增加。
+19. 分别模拟 WS connect refused/timeout、握手 5xx、stale cached socket 和发送 `response.create` 前的 send failure，确认仅这些阶段可通过同账号 HTTP/SSE 回退；握手 400/401/403/429 不得作为传输 fallback。成功发送 `response.create` 后再模拟 read failure、close 1009 和缩短 `STREAM_FIRST_BYTE_TIMEOUT_MS` 导致的首事件超时，均应只终止流且不重放；缩短 `STREAM_IDLE_TIMEOUT_MS` 验证首业务事件后的空闲超时同样不重放。`cc_switch_codex_websocket_fallback_total{source,result}` 与 cache/retry 指标应对应增加。
+20. 保持 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT` 未设置或为 `0`，模拟 HTTP 400 和 SSE `response.failed/context_length_exceeded`，确认无内部摘要和重放。设置为 `1` 后确认同一 Provider/账号按“原请求 → 摘要 → 压缩后请求”最多执行一次，摘要 usage 的 `dataSource=codex_overflow_compact_summary`；摘要失败应使用省略标记继续一次，压缩后再次 overflow 直接返回。首个业务事件前的 SSE overflow 可压缩，已提交业务事件后的 overflow 必须保持原错误且绝不重放。
 
 Grok OAuth 单账号专项补充：
 
@@ -233,18 +233,7 @@ Claude OAuth 专项补充：
 22. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出其固定 Provider 内的账号调度；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
 23. `GET /metrics` 应能看到账号 inflight/max、Claude retry、Provider outcome、warm-refresh、CLI version-gate、beta decision、count_tokens outcome 与 stream protocol error 指标；labels 必须保持固定枚举。该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
 
-Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。
-
-### share-market grant
-
-| 变量 | 用途 | 记录方式 |
-| --- | --- | --- |
-| `SHARE_MARKET_URL` | 真实 share-market base | 可完整记录 |
-| `SHARE_MARKET_GRANT_TOKEN` | 创建 grant 的 token | 不记录明文 |
-| `SHARE_MARKET_BUYER_EMAIL` | grant buyer | 记录脱敏 email |
-| `SHARE_MARKET_LISTING_ID` | listing id | 可完整记录 |
-| `SHARE_MARKET_ORDER_ID` | order id | 可完整记录 |
-| `SHARE_MARKET_APP_TYPE` | grant 应用范围，默认 `codex` | 可完整记录 |
+Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Market 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-market-acceptance.md)。
 
 ## 脱敏 Evidence
 
@@ -256,7 +245,6 @@ Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不
 - `scripts/smoke/code-agent-regression.sh`
 - `scripts/smoke/oauth-readiness-check.sh`
 - `scripts/smoke/grok-oauth-real.mjs`
-- `scripts/smoke/share-market-grant-smoke.sh`
 - `scripts/release-readiness.sh`
 
 检查 evidence 是否包含密钥形态：

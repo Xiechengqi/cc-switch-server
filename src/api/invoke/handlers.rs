@@ -306,7 +306,12 @@ pub(in crate::api) async fn web_provider_quota(
         Some(account_id) => account_id,
         None => {
             let accounts = state.accounts.read().await;
-            let Some(account) = accounts.find_for_provider(provider_type, None) else {
+            let account = if provider_type == ProviderType::CodexOAuth {
+                accounts.active_codex_oauth_account()
+            } else {
+                accounts.find_for_provider(provider_type, None)
+            };
+            let Some(account) = account else {
                 return Ok(subscription_quota_not_found(managed_auth_provider_label(
                     provider_type,
                 )));
@@ -466,9 +471,12 @@ pub(in crate::api) async fn web_resolve_account_id(
     let provider_type = web_optional_auth_provider_type(args)?;
     if let Some(provider_type) = provider_type {
         let accounts = state.accounts.read().await;
-        return Ok(accounts
-            .find_for_provider(provider_type, None)
-            .map(|account| account.id.clone()));
+        let account = if provider_type == ProviderType::CodexOAuth {
+            accounts.active_codex_oauth_account()
+        } else {
+            accounts.find_for_provider(provider_type, None)
+        };
+        return Ok(account.map(|account| account.id.clone()));
     }
 
     Ok(None)
@@ -557,7 +565,6 @@ pub(in crate::api) async fn web_share_upsert_input(
             let (_, free_access) = web_share_for_sale_flags(value);
             free_access
         },
-        sale_market_kind: web_optional_string_any(value, &["saleMarketKind", "sale_market_kind"]),
         access_by_app,
         app_settings,
         for_sale_official_price_percent_by_app,
@@ -566,7 +573,6 @@ pub(in crate::api) async fn web_share_upsert_input(
         description: web_optional_string_any(value, &["description"]),
         bindings,
         runtime_snapshot: None,
-        market_grant: None,
         user_grants,
     })
 }
@@ -900,7 +906,6 @@ pub(in crate::api) async fn web_update_share_acl(
         market_access_mode: web_optional_string_any(value, &["marketAccessMode"]),
         access_by_app: web_optional_deserialize(value, "accessByApp")?,
         app_settings: web_optional_deserialize(value, "appSettings")?,
-        sale_market_kind: web_optional_string_any(value, &["saleMarketKind"]),
         ..ShareSettingsPatch::default()
     };
     let share = state
@@ -928,7 +933,6 @@ pub(in crate::api) async fn web_save_provider_share(
     let subdomain = web_arg_string_any(value, &["subdomain"])?;
     let description = web_optional_string_any(value, &["description"]);
     let for_sale = web_arg_string_any(value, &["forSale", "for_sale"])?;
-    let sale_market_kind = web_arg_string_any(value, &["saleMarketKind", "sale_market_kind"])?;
     let market_access_mode =
         web_arg_string_any(value, &["marketAccessMode", "market_access_mode"])?;
     let shared_with_emails =
@@ -973,7 +977,6 @@ pub(in crate::api) async fn web_save_provider_share(
             ShareSettingsPatch {
                 description: Some(description),
                 for_sale: Some(for_sale),
-                sale_market_kind: Some(sale_market_kind),
                 market_access_mode: Some(market_access_mode),
                 shared_with_emails: Some(shared_with_emails),
                 access_by_app: Some(access_by_app),
@@ -2086,6 +2089,22 @@ pub(in crate::api) fn account_authenticated_at(account: &Account) -> i64 {
     account.quota_refreshed_at.unwrap_or(0)
 }
 
+pub(in crate::api) fn managed_auth_default_account_id(
+    accounts: &AccountStore,
+    provider_type: ProviderType,
+) -> Option<&str> {
+    if provider_type == ProviderType::CodexOAuth {
+        return accounts
+            .active_codex_oauth_account()
+            .map(|account| account.id.as_str());
+    }
+    accounts
+        .accounts
+        .iter()
+        .find(|account| account.provider_type == provider_type)
+        .map(|account| account.id.as_str())
+}
+
 fn subscription_expiry_rfc3339(timestamp_ms: Option<i64>) -> Option<String> {
     timestamp_ms.and_then(|timestamp_ms| {
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms)
@@ -2263,12 +2282,7 @@ pub(in crate::api) async fn web_managed_auth_account_by_id(
         .find(|account| account.id == account_id)
         .map(|account| account.provider_type)
         .ok_or_else(|| ApiError::not_found("account not found"))?;
-    let default_account_id = accounts
-        .accounts
-        .iter()
-        .filter(|account| account.provider_type == provider_type)
-        .map(|account| account.id.as_str())
-        .next();
+    let default_account_id = managed_auth_default_account_id(&accounts, provider_type);
     let account = accounts
         .accounts
         .iter()
@@ -2740,6 +2754,14 @@ pub(in crate::api) async fn web_managed_auth_set_default_account(
     require_session(&state, &headers).await?;
     let provider_type = web_auth_provider_type(args)?;
     let account_id = web_arg_string_any(args, &["accountId", "account_id"])?;
+    if provider_type == ProviderType::CodexOAuth {
+        state
+            .select_active_codex_oauth_account_command(&account_id)
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(map_codex_active_account_selection_error)?;
+        return Ok(Value::Null);
+    }
     let default_changed = state
         .try_mutate_accounts_immediate(|store| {
             let default_changed = store

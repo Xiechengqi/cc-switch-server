@@ -1,6 +1,7 @@
 pub mod codex_device;
 pub(crate) mod codex_reset_credits;
 pub mod copilot_device;
+pub mod cursor;
 pub mod grok_device;
 pub mod grok_jwks;
 pub mod grok_models;

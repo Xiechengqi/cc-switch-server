@@ -1,5 +1,8 @@
 use super::*;
 
+const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
 pub(in crate::api) async fn list_providers(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -676,12 +679,14 @@ pub(in crate::api) async fn test_provider_inner(
     }
 
     if query.network.unwrap_or(false) {
+        ensure_provider_outbound_allowed(state, &execution).await?;
         if let Some((provider_type, account_id)) = execution.managed_account_target() {
             state
                 .refresh_managed_account_if_needed(provider_type, Some(account_id))
                 .await
                 .map_err(map_managed_account_refresh_error)?;
         }
+        ensure_provider_outbound_allowed(state, &execution).await?;
     }
     let accounts = state.accounts_snapshot().await;
     let body = provider_test_body(stored.app, stored, Some(&model), requested_stream);
@@ -771,21 +776,47 @@ pub(in crate::api) async fn test_provider_inner(
             .map(std::time::Duration::from_millis)
             .unwrap_or_else(|| execution.request_timeout());
         match request.timeout(timeout).send().await {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status = response.status().as_u16();
                 network_status_code = Some(status);
                 network_latency_ms = Some(started.elapsed().as_millis());
                 if !response.status().is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    network_error = Some(redact_provider_test_error(&body));
+                    match read_provider_control_response_body(
+                        &mut response,
+                        PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(body) => {
+                            network_error =
+                                Some(redact_provider_test_error(&String::from_utf8_lossy(&body)));
+                        }
+                        Err(error) => network_error = Some(error),
+                    }
                 } else if stream {
-                    let body = response.text().await.unwrap_or_default();
-                    let completed = provider_test_stream_completed(stored.app, &body);
-                    network_stream_completed = Some(completed);
-                    if !completed {
-                        network_error = Some(
-                            "stream probe did not observe a provider completion marker".to_string(),
-                        );
+                    match read_provider_control_response_body(
+                        &mut response,
+                        PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(body) => {
+                            let completed = provider_test_stream_completed(
+                                stored.app,
+                                &String::from_utf8_lossy(&body),
+                            );
+                            network_stream_completed = Some(completed);
+                            if !completed {
+                                network_error = Some(
+                                    "stream probe did not observe a provider completion marker"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            network_stream_completed = Some(false);
+                            network_error = Some(error);
+                        }
                     }
                 }
             }
@@ -977,6 +1008,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .ensure_operation_supported(proxy::provider_ops::ProviderOperation::Discovery)
         .map_err(ApiError::proxy)?;
+    ensure_provider_outbound_allowed(state, execution).await?;
     if stored.provider_type == ProviderType::GrokOAuth {
         let managed_binding = match &execution.plan.auth_ref {
             crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
@@ -1087,23 +1119,26 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or_else(|| execution.request_timeout());
-    let response = request.timeout(timeout).send().await.map_err(|error| {
+    let mut response = request.timeout(timeout).send().await.map_err(|error| {
         ApiError::bad_gateway(format!(
             "fetch provider models failed: {}",
             redact_provider_test_error(&error.to_string())
         ))
     })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    let status = response.status();
+    let body = read_provider_control_response_body(
+        &mut response,
+        PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES,
+    )
+    .await
+    .map_err(|error| ApiError::bad_gateway(format!("fetch provider models failed: {error}")))?;
+    if !status.is_success() {
         return Err(ApiError::bad_gateway(format!(
             "fetch provider models failed: {status}: {}",
-            redact_provider_test_error(&body)
+            redact_provider_test_error(&String::from_utf8_lossy(&body))
         )));
     }
-    let raw = response
-        .json::<Value>()
-        .await
+    let raw = serde_json::from_slice::<Value>(&body)
         .map_err(|error| ApiError::bad_gateway(format!("parse provider models failed: {error}")))?;
     Ok(ProviderModelsFetchResult {
         url,
@@ -1112,6 +1147,43 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         stale: Some(false),
         fetched_at_ms: Some(chrono::Utc::now().timestamp_millis()),
     })
+}
+
+async fn read_provider_control_response_body(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, String> {
+    crate::infra::http::read_response_body_limited(response, limit)
+        .await
+        .map_err(|error| redact_provider_test_error(&error.to_string()))
+}
+
+pub(in crate::api) async fn ensure_stored_provider_outbound_allowed(
+    state: &ServerState,
+    stored: &StoredProvider,
+) -> Result<(), ApiError> {
+    let has_managed_binding = stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref())
+        .is_some_and(|account_id| !account_id.trim().is_empty());
+    if has_managed_binding && state.credential_persistence_degraded() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "managed account credentials are waiting for durable persistence",
+        ));
+    }
+    let accounts = state.accounts_snapshot().await;
+    proxy::ensure_codex_oauth_active_account(stored, &accounts).map_err(ApiError::proxy)
+}
+
+async fn ensure_provider_outbound_allowed(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+) -> Result<(), ApiError> {
+    ensure_stored_provider_outbound_allowed(state, &execution.stored).await
 }
 
 fn grok_provider_models_fetch_result(
@@ -1723,6 +1795,14 @@ fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshE
             ),
         ),
         ManagedAccountRefreshError::NotFound => ApiError::not_found("managed account not found"),
+        ManagedAccountRefreshError::InactiveCodexAccount => ApiError::conflict_code(
+            "cc_switch_codex_inactive_account",
+            "Codex OAuth account is not active",
+        ),
+        ManagedAccountRefreshError::CredentialPersistenceDegraded => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed account credentials are waiting for durable persistence",
+        ),
         ManagedAccountRefreshError::Refresh {
             status_code,
             message: _,
@@ -1742,6 +1822,7 @@ fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshE
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::domain::providers::model::{
@@ -1770,6 +1851,42 @@ mod tests {
             )),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_control_response_body_limit_is_enforced() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let mut response = reqwest::Client::new()
+            .get(format!("http://{address}/probe"))
+            .send()
+            .await
+            .unwrap();
+
+        let error = read_provider_control_response_body(
+            &mut response,
+            PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("response body exceeds"));
+        server.await.unwrap();
     }
 
     #[test]

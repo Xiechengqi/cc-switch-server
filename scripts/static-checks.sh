@@ -103,9 +103,11 @@ if rg -n -U 'state\s*\.\s*save_(providers|accounts|usage|ui_settings)\s*\(\s*\)\
   echo 'state store persistence must stay encapsulated in ServerStateInner domain methods'; exit 1
 fi
 
-echo "== direct outbound HTTP policy =="
-if rg -n 'reqwest::Proxy|\.proxy\s*\(' src; then
-  echo 'server outbound HTTP must remain direct; explicit proxy construction is forbidden'; exit 1
+echo "== outbound HTTP proxy policy =="
+proxy_construction="$(rg -n 'reqwest::Proxy|\.proxy\s*\(' src | rg -v '^src/infra/http\.rs:' || true)"
+if [[ -n "$proxy_construction" ]]; then
+  printf '%s\n' "$proxy_construction"
+  echo 'explicit outbound proxy construction must stay centralized in src/infra/http.rs'; exit 1
 fi
 if ! rg -U -q 'reqwest::Client::builder\(\)\s*\.no_proxy\(\)' src/infra/http.rs; then
   echo 'central HTTP client builder must explicitly disable environment/system proxies'; exit 1

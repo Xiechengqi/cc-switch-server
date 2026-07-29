@@ -1,6 +1,7 @@
 use super::*;
 use crate::api::{oauth_error_public_message, redact_account_public_diagnostic};
 use crate::domain::accounts::store::Account;
+use crate::domain::providers::model::ProviderType;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -330,6 +331,34 @@ pub(crate) async fn refresh_share_usage_item(
         };
     };
     active_account = latest_account;
+    let codex_inactive = if active_account.provider_type == ProviderType::CodexOAuth {
+        state
+            .accounts_snapshot()
+            .await
+            .active_codex_oauth_account()
+            .is_none_or(|active| active.id != active_account.id)
+    } else {
+        false
+    };
+    if codex_inactive || state.credential_persistence_degraded() {
+        return ControlRefreshShareUsageItem {
+            app: app.as_str().to_string(),
+            provider_id: Some(provider_id),
+            provider_name,
+            auth_provider,
+            account_id: Some(account_id),
+            refreshed: false,
+            error: Some(
+                if codex_inactive {
+                    "codex_account_inactive"
+                } else {
+                    "credential_persistence_degraded"
+                }
+                .to_string(),
+            ),
+            message: None,
+        };
+    }
     let account_before_refresh = active_account.clone();
     let now = now_ms() as i64;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
@@ -427,6 +456,18 @@ pub(crate) async fn refresh_share_usage_item(
         }
     }
 
+    if state.credential_persistence_degraded() {
+        return ControlRefreshShareUsageItem {
+            app: app.as_str().to_string(),
+            provider_id: Some(provider_id),
+            provider_name,
+            auth_provider,
+            account_id: Some(account_id),
+            refreshed: false,
+            error: Some("credential_persistence_degraded".to_string()),
+            message: None,
+        };
+    }
     let http_client = state.http_client().await;
     let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
     match refresh_account_quota(

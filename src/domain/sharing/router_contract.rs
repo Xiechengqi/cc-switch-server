@@ -14,7 +14,7 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::runtime::ProviderRuntimePlan;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
-use crate::domain::sharing::shares::{share_router_for_sale_label, Share, ShareMarketGrantStatus};
+use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
 use crate::domain::usage::store::UsageStore;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,8 +26,6 @@ pub struct ShareSettingsPatch {
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sale_market_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_access_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +46,28 @@ pub struct ShareSettingsPatch {
     pub auto_start: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_grant: Option<ShareManagedGrantOperation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareManagedGrantAction {
+    Upsert,
+    Revoke,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareManagedGrantOperation {
+    pub operation_id: String,
+    pub entitlement_id: String,
+    pub share_sequence: i64,
+    pub expected_config_revision: u64,
+    pub action: ShareManagedGrantAction,
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ShareUserPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +166,19 @@ pub struct ShareUserGrant {
     pub revoked_at_ms: Option<u128>,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default)]
+    pub manager: ShareGrantManager,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareGrantManager {
+    Owner,
+    #[default]
+    Manual,
+    RouterShareMarket,
 }
 
 fn default_true() -> bool {
@@ -171,12 +204,8 @@ pub struct ShareDescriptor {
     pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub market_grant: Option<ShareMarketGrantStatus>,
     #[serde(default)]
     pub for_sale: String,
-    #[serde(default = "default_sale_market_kind")]
-    pub sale_market_kind: String,
     pub subdomain: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,8 +273,6 @@ pub struct ShareAppAccess {
 pub struct ShareAppSettings {
     #[serde(default)]
     pub for_sale: String,
-    #[serde(default = "default_sale_market_kind")]
-    pub sale_market_kind: String,
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
     #[serde(default)]
@@ -262,7 +289,6 @@ impl Default for ShareAppSettings {
     fn default() -> Self {
         Self {
             for_sale: default_share_for_sale(),
-            sale_market_kind: default_sale_market_kind(),
             market_access_mode: default_market_access_mode(),
             shared_with_emails: Vec::new(),
             token_limit: -1,
@@ -594,7 +620,6 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                 .cloned()
                 .unwrap_or_else(|| ShareAppSettings {
                     for_sale: share_router_for_sale_label(share),
-                    sale_market_kind: share.sale_market_kind.clone(),
                     market_access_mode: market_access_mode.clone(),
                     shared_with_emails: shared_with_emails.clone(),
                     token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
@@ -690,9 +715,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             .for_sale_official_price_percent_by_app
             .clone(),
         description: share.description.clone(),
-        market_grant: share.market_grant.clone(),
         for_sale: share_router_for_sale_label(share),
-        sale_market_kind: share.sale_market_kind.clone(),
         subdomain: share
             .tunnel_subdomain
             .clone()
@@ -1385,10 +1408,6 @@ fn default_market_access_mode() -> String {
     "selected".to_string()
 }
 
-fn default_sale_market_kind() -> String {
-    "token".to_string()
-}
-
 fn default_parallel_limit() -> i64 {
     -1
 }
@@ -1528,6 +1547,7 @@ mod tests {
         };
         let accounts = AccountStore {
             accounts: vec![test_account(ProviderType::CodexOAuth)],
+            ..Default::default()
         };
 
         let descriptor =
@@ -1563,6 +1583,7 @@ mod tests {
         account.manual_subscription_expiry_updated_at_ms = Some(1_784_000_000_000);
         let accounts = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
 
         let descriptor =
@@ -1619,6 +1640,7 @@ mod tests {
             .to_rfc3339();
         let accounts = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
 
         let descriptor =
@@ -1660,6 +1682,7 @@ mod tests {
         });
         let accounts = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
 
         let descriptor =
@@ -1669,27 +1692,6 @@ mod tests {
 
         assert_eq!(quota.tiers[0].label, "5h");
         assert_eq!(quota.tiers[0].utilization, 1.0);
-    }
-
-    #[test]
-    fn descriptor_includes_market_grant_when_present() {
-        let mut share = test_share(ProviderType::Codex, Some(42.0));
-        share.market_grant = Some(ShareMarketGrantStatus {
-            status: "applied".to_string(),
-            grant_id: Some("grant-1".to_string()),
-            last_error: None,
-            updated_at_ms: Some(123),
-        });
-        let providers = ProviderStore {
-            providers: vec![test_provider(ProviderType::Codex)],
-            ..Default::default()
-        };
-
-        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
-        let value = serde_json::to_value(&descriptor).unwrap();
-
-        assert_eq!(value["marketGrant"]["status"], "applied");
-        assert_eq!(value["marketGrant"]["grantId"], "grant-1");
     }
 
     #[test]
@@ -1870,6 +1872,7 @@ mod tests {
         }));
         let accounts = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
         let usage = UsageStore::default();
 
@@ -2020,7 +2023,6 @@ mod tests {
             created_at_ms: 0,
             for_sale: false,
             free_access: false,
-            sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -2034,7 +2036,6 @@ mod tests {
             }],
             binding_history: Vec::new(),
             runtime_snapshot: None,
-            market_grant: None,
             last_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,

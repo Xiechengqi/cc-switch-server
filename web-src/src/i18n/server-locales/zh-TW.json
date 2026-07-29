@@ -2,6 +2,13 @@
   "common": {
     "copied": "已複製"
   },
+  "server": {
+    "auth": {
+      "inferenceTokenTitle": "Claude 推理 Token",
+      "inferenceTokenOneTime": "此 Token 僅顯示一次，請在進入主控台前妥善儲存。",
+      "continueToConsole": "我已儲存，進入主控台"
+    }
+  },
   "providers": {
     "addProvider": "新增供應商"
   },
@@ -36,18 +43,8 @@
     "validation": {
       "invalidEmail": "電子郵件格式無效"
     },
-    "saleMarketKind": {
-      "title": "Market 類型",
-      "token": "Token Market",
-      "share": "Share Market"
-    },
     "market": {
       "allSelected": "已選取所有 Market"
-    },
-    "accountMarket": {
-      "title": "Share Market",
-      "select": "選擇 Share Market",
-      "required": "請選擇一個 Share Market"
     },
     "permanent": "永久",
     "expiration": "到期",
@@ -118,7 +115,12 @@
       "description": "providers、shares、ui-settings 等持久化檔案所在目錄。監聽位址與連接埠由程序啟動參數決定。"
     },
     "serverSecurity": {
-      "currentPasswordRequired": "請輸入目前密碼"
+      "currentPasswordRequired": "請輸入目前密碼",
+      "inferenceTokenRotated": "推理 Token 已輪換",
+      "inferenceTokenTitle": "Claude 推理 Token",
+      "inferenceTokenDescription": "用於本機 Claude API 請求，並與管理員登入權限隔離",
+      "rotateInferenceToken": "輪換 Token",
+      "rotateInferenceTokenConfirm": "確定要輪換推理 Token？現有用戶端將立即無法繼續驗證。"
     },
     "share": {
       "health": {

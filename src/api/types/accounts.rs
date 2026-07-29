@@ -2,7 +2,7 @@ use crate::domain::accounts::login::{OAuthLoginCancellation, OAuthLoginFinish, O
 use crate::domain::accounts::oauth::{
     OAuthErrorKind, OAuthHttpRequest, OAuthQuotaStrategy, OAuthSupportStage,
 };
-use crate::domain::accounts::store::{Account, AccountQuota};
+use crate::domain::accounts::store::{Account, AccountQuota, CodexOAuthAccountSelection};
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRule;
 use crate::domain::providers::model::ProviderType;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,21 @@ use serde_json::Value;
 pub(in crate::api) struct ListAccountsResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) accounts: Vec<AccountPublicView>,
+    pub(in crate::api) codex_oauth: CodexOAuthAccountSelection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct SelectActiveCodexOAuthAccountRequest {
+    pub(in crate::api) account_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct SelectActiveCodexOAuthAccountResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountPublicView,
+    pub(in crate::api) codex_oauth: CodexOAuthAccountSelection,
 }
 
 #[derive(Debug, Serialize)]

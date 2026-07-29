@@ -23,6 +23,7 @@ import {
   User,
   X,
   Image,
+  TriangleAlert,
 } from "lucide-react";
 import { useCodexOauth } from "./hooks/useCodexOauth";
 import { copyText } from "@/lib/clipboard";
@@ -38,8 +39,6 @@ interface CodexOAuthSectionProps {
   selectedAccountId?: string | null;
   /** 账号选择回调 */
   onAccountSelect?: (accountId: string | null) => void;
-  /** 是否允许选择“使用默认账号” */
-  allowDefaultAccountOption?: boolean;
   /** 是否显示已登录账号管理列表 */
   showLoggedInAccounts?: boolean;
   /** 是否开启 Codex FAST mode */
@@ -74,7 +73,6 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   className,
   selectedAccountId,
   onAccountSelect,
-  allowDefaultAccountOption = true,
   showLoggedInAccounts = false,
   fastModeEnabled = false,
   onFastModeChange,
@@ -106,10 +104,13 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     isSettingWorkspace,
     isSubmittingOauthCallback,
     defaultAccountId,
+    codexSelection,
+    activeCodexAccountId,
+    needsCodexAccountSelection,
     cancelAuth,
     logout,
-    removeAccount,
-    setDefaultAccount,
+    removeAccountAsync,
+    selectActiveCodexAccount,
     setWorkspace,
     addAccountWithMode,
     submitOauthCallback,
@@ -130,15 +131,35 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     setCallbackUrl("");
   }, [deviceCode?.device_code]);
 
+  const effectiveActiveAccountId = codexSelection
+    ? activeCodexAccountId
+    : (defaultAccountId ?? null);
+
+  React.useEffect(() => {
+    if (
+      onAccountSelect &&
+      codexSelection &&
+      selectedAccountId !== effectiveActiveAccountId
+    ) {
+      onAccountSelect(effectiveActiveAccountId);
+    }
+  }, [
+    codexSelection,
+    effectiveActiveAccountId,
+    onAccountSelect,
+    selectedAccountId,
+  ]);
+
   const finishCliLogin = async () => {
     const value = callbackUrl.trim();
     if (!value) return;
     await submitOauthCallback(value);
   };
-  const activeAccount =
-    accounts.find((account) => account.id === selectedAccountId) ??
-    accounts.find((account) => account.id === defaultAccountId) ??
-    accounts[0];
+  const activeAccount = effectiveActiveAccountId
+    ? accounts.find((account) => account.id === effectiveActiveAccountId)
+    : accounts.length === 1
+      ? accounts[0]
+      : undefined;
   const activeWorkspaceId =
     activeAccount?.selected_workspace_id ?? activeAccount?.workspaces?.[0]?.id;
 
@@ -157,16 +178,31 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     setTimeout(() => setLinkCopied(false), 2000);
   };
 
-  const handleAccountSelect = (value: string) => {
-    onAccountSelect?.(value === "none" ? null : value);
+  const handleActiveAccountSelect = async (accountId: string) => {
+    try {
+      await selectActiveCodexAccount(accountId);
+      onAccountSelect?.(accountId);
+    } catch {
+      return;
+    }
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
+    try {
+      await removeAccountAsync(accountId);
+      if (
+        selectedAccountId === accountId ||
+        effectiveActiveAccountId === accountId
+      ) {
+        onAccountSelect?.(null);
+      }
+    } catch {
+      return;
     }
   };
 
@@ -176,17 +212,84 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       <div className="flex items-center justify-between">
         <Label>{t("codexOauth.authStatus", "认证状态")}</Label>
         <Badge
-          variant={hasAnyAccount ? "default" : "secondary"}
-          className={hasAnyAccount ? "bg-green-500 hover:bg-green-600" : ""}
+          variant={
+            needsCodexAccountSelection
+              ? "destructive"
+              : hasAnyAccount
+                ? "default"
+                : "secondary"
+          }
+          className={
+            hasAnyAccount && !needsCodexAccountSelection
+              ? "bg-green-500 hover:bg-green-600"
+              : ""
+          }
         >
-          {hasAnyAccount
-            ? t("codexOauth.accountCount", {
-                count: accounts.length,
-                defaultValue: `${accounts.length} 个账号`,
-              })
-            : t("codexOauth.notAuthenticated", "未认证")}
+          {needsCodexAccountSelection
+            ? t("codexOauth.selectionRequiredBadge", "Selection required")
+            : activeAccount
+              ? t("codexOauth.activeAccountBadge", {
+                  login: activeAccount.login,
+                  defaultValue: `Active: ${activeAccount.login}`,
+                })
+              : hasAnyAccount
+                ? t("codexOauth.accountCount", {
+                    count: accounts.length,
+                    defaultValue: `${accounts.length} 个账号`,
+                  })
+                : t("codexOauth.notAuthenticated", "未认证")}
         </Badge>
       </div>
+
+      {hasAnyAccount &&
+        (needsCodexAccountSelection || accounts.length > 1) && (
+          <div
+            className={`space-y-2 rounded-md border p-3 ${
+              needsCodexAccountSelection
+                ? "border-amber-500/60 bg-amber-500/10"
+                : "bg-muted/30"
+            }`}
+          >
+            <Label className="flex items-center gap-2 text-sm font-medium">
+              {needsCodexAccountSelection && (
+                <TriangleAlert className="h-4 w-4 text-amber-600" />
+              )}
+              {t("codexOauth.activeProxyAccount", "Active proxy account")}
+            </Label>
+            <Select
+              value={effectiveActiveAccountId ?? undefined}
+              onValueChange={handleActiveAccountSelect}
+              disabled={isSettingDefaultAccount}
+            >
+              <SelectTrigger>
+                <SelectValue
+                  placeholder={t(
+                    "codexOauth.selectAccountPlaceholder",
+                    "Choose a ChatGPT account",
+                  )}
+                />
+              </SelectTrigger>
+              <SelectContent>
+                {accounts.map((account) => (
+                  <SelectItem key={account.id} value={account.id}>
+                    <div className="flex items-center gap-2">
+                      <User className="h-4 w-4 text-muted-foreground" />
+                      <span>{account.login}</span>
+                    </div>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {needsCodexAccountSelection && (
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                {t(
+                  "codexOauth.selectionRequired",
+                  "Select the ChatGPT account used for proxying.",
+                )}
+              </p>
+            )}
+          </div>
+        )}
 
       {onFastModeChange && (
         <div className="flex items-center justify-between rounded-md border bg-muted/30 p-3">
@@ -310,28 +413,23 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                   <span className="truncate text-sm font-medium">
                     {account.login}
                   </span>
-                  {defaultAccountId === account.id && (
+                  {effectiveActiveAccountId === account.id && (
                     <Badge variant="secondary" className="text-xs">
-                      {t("codexOauth.defaultAccount", "默认")}
-                    </Badge>
-                  )}
-                  {selectedAccountId === account.id && (
-                    <Badge variant="outline" className="text-xs">
-                      {t("codexOauth.selected", "已选中")}
+                      {t("codexOauth.defaultAccount", "Active proxy")}
                     </Badge>
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                  {defaultAccountId !== account.id && (
+                  {effectiveActiveAccountId !== account.id && (
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
                       className="h-7 px-2 text-xs text-muted-foreground"
-                      onClick={() => setDefaultAccount(account.id)}
+                      onClick={() => handleActiveAccountSelect(account.id)}
                       disabled={isSettingDefaultAccount}
                     >
-                      {t("codexOauth.setAsDefault", "设为默认")}
+                      {t("codexOauth.setAsDefault", "Use for proxy")}
                     </Button>
                   )}
                   <Button
@@ -350,48 +448,6 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
               </div>
             ))}
           </div>
-        </div>
-      )}
-
-      {/* 账号选择器 */}
-      {hasAnyAccount && onAccountSelect && (
-        <div className="space-y-2">
-          <Label className="text-sm text-muted-foreground">
-            {t("codexOauth.selectAccount", "选择账号")}
-          </Label>
-          <Select
-            value={
-              selectedAccountId ??
-              (allowDefaultAccountOption ? "none" : undefined)
-            }
-            onValueChange={handleAccountSelect}
-          >
-            <SelectTrigger>
-              <SelectValue
-                placeholder={t(
-                  "codexOauth.selectAccountPlaceholder",
-                  "选择一个 ChatGPT 账号",
-                )}
-              />
-            </SelectTrigger>
-            <SelectContent>
-              {allowDefaultAccountOption && (
-                <SelectItem value="none">
-                  <span className="text-muted-foreground">
-                    {t("codexOauth.useDefaultAccount", "使用默认账号")}
-                  </span>
-                </SelectItem>
-              )}
-              {accounts.map((account) => (
-                <SelectItem key={account.id} value={account.id}>
-                  <div className="flex items-center gap-2">
-                    <User className="h-4 w-4 text-muted-foreground" />
-                    <span>{account.login}</span>
-                  </div>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
         </div>
       )}
 
@@ -463,7 +519,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         </div>
       )}
 
-      {/* 已有账号 - 添加更多按钮 */}
+      {/* 已有授权 */}
       {hasAnyAccount && pollingState === "idle" && (
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <Button
@@ -474,7 +530,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             title={cliLoginTitle}
           >
             <Plus className="mr-2 h-4 w-4" />
-            {t("codexOauth.addCliAccount", "添加 CLI OAuth")}
+            {t("codexOauth.addCliAccount", "Authorize with CLI OAuth")}
           </Button>
           <Button
             type="button"
@@ -483,7 +539,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             disabled={isAddingAccount}
           >
             <Plus className="mr-2 h-4 w-4" />
-            {t("codexOauth.addDeviceAccount", "添加 Device Code")}
+            {t("codexOauth.addDeviceAccount", "Authorize with Device Code")}
           </Button>
         </div>
       )}
@@ -616,31 +672,33 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       )}
 
       {/* 错误状态 */}
-      {pollingState === "error" && error && (
+      {error && (
         <div className="space-y-2">
           <p className="text-sm text-red-500">{error}</p>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              onClick={() =>
-                !canUseCliOauth
-                  ? addAccountWithMode?.("device")
-                  : startCliLogin()
-              }
-              variant="outline"
-              size="sm"
-            >
-              {t("codexOauth.retry", "重试")}
-            </Button>
-            <Button
-              type="button"
-              onClick={cancelAuth}
-              variant="ghost"
-              size="sm"
-            >
-              {t("common.cancel", "取消")}
-            </Button>
-          </div>
+          {pollingState === "error" && (
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={() =>
+                  !canUseCliOauth
+                    ? addAccountWithMode?.("device")
+                    : startCliLogin()
+                }
+                variant="outline"
+                size="sm"
+              >
+                {t("codexOauth.retry", "重试")}
+              </Button>
+              <Button
+                type="button"
+                onClick={cancelAuth}
+                variant="ghost"
+                size="sm"
+              >
+                {t("common.cancel", "取消")}
+              </Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -653,7 +711,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           className="w-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
         >
           <LogOut className="mr-2 h-4 w-4" />
-          {t("codexOauth.logoutAll", "注销所有账号")}
+          {t("codexOauth.logoutAll", "Remove all authorizations")}
         </Button>
       )}
     </div>

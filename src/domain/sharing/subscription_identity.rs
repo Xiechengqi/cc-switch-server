@@ -809,7 +809,6 @@ mod tests {
             expires_at: None,
             for_sale: None,
             free_access: None,
-            sale_market_kind: None,
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -822,7 +821,6 @@ mod tests {
                 provider_type: ProviderType::CodexOAuth,
             }],
             runtime_snapshot: None,
-            market_grant: None,
             user_grants: BTreeMap::new(),
         };
         store.upsert(input).unwrap()
@@ -870,6 +868,7 @@ mod tests {
                 account("account-a", "subject-1", "workspace-1"),
                 account("account-b", "subject-1", "workspace-1"),
             ],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![
@@ -898,6 +897,7 @@ mod tests {
                 account("account-a", "subject-1", "workspace-1"),
                 account("account-b", "subject-1", "workspace-2"),
             ],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![
@@ -929,6 +929,7 @@ mod tests {
                 claude_account("account-a", "CLAUDE-ACCOUNT-UUID"),
                 claude_account("account-b", "claude-account-uuid"),
             ],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![
@@ -959,6 +960,7 @@ mod tests {
         }));
         let accounts = AccountStore {
             accounts: vec![unverified],
+            ..Default::default()
         };
         let mut providers = ProviderStore {
             providers: vec![provider("provider-a", "account-a")],
@@ -991,6 +993,7 @@ mod tests {
     fn oauth_share_rejects_a_static_credential_profile_even_with_an_account_binding() {
         let accounts = AccountStore {
             accounts: vec![account("account-a", "subject-1", "workspace-1")],
+            ..Default::default()
         };
         let mut incompatible = provider("provider-a", "account-a");
         incompatible.resource.profile_id = Some(ProfileId::parse("codex.openai_api_key").unwrap());
@@ -1036,6 +1039,7 @@ mod tests {
     fn subscription_oauth_share_without_bindings_remains_fail_closed() {
         let accounts = AccountStore {
             accounts: vec![account("account-a", "subject-1", "workspace-1")],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![provider("provider-a", "account-a")],
@@ -1064,6 +1068,7 @@ mod tests {
                 account("account-a", "subject-1", "workspace-1"),
                 account("account-b", "subject-1", "workspace-1"),
             ],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![
@@ -1107,6 +1112,7 @@ mod tests {
     fn historical_graph_error_allows_only_non_worsening_provider_changes() {
         let accounts = AccountStore {
             accounts: vec![account("account-a", "subject-1", "workspace-1")],
+            ..Default::default()
         };
         let mut providers = ProviderStore {
             providers: vec![provider("provider-a", "account-a")],
@@ -1157,6 +1163,7 @@ mod tests {
     fn malformed_historical_share_still_pins_its_primary_provider() {
         let accounts = AccountStore {
             accounts: vec![account("account-a", "subject-a", "workspace-a")],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![provider("provider-a", "account-a")],
@@ -1185,6 +1192,7 @@ mod tests {
                 account("account-a", "subject-a", "workspace-a"),
                 account("account-b", "subject-b", "workspace-b"),
             ],
+            ..Default::default()
         };
         let mut providers = ProviderStore {
             providers: vec![
@@ -1237,6 +1245,7 @@ mod tests {
     fn ordinary_account_write_cannot_move_a_reserved_subscription_identity() {
         let accounts = AccountStore {
             accounts: vec![account("account-a", "subject-a", "workspace-a")],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![provider("provider-a", "account-a")],
@@ -1282,6 +1291,7 @@ mod tests {
                 account("account-a", "shared-subject", "shared-workspace"),
                 account("account-b", "shared-subject", "shared-workspace"),
             ],
+            ..Default::default()
         };
         let mut providers = ProviderStore {
             providers: vec![
@@ -1327,6 +1337,7 @@ mod tests {
                 account("account-c", "subject", "workspace"),
                 account("account-d", "subject", "workspace"),
             ],
+            ..Default::default()
         };
         let providers = ProviderStore {
             providers: vec![

@@ -34,6 +34,7 @@ hkdf = "0.12"
 jsonwebtoken = "9"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+multer = "3"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

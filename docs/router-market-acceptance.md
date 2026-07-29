@@ -89,9 +89,9 @@ Ollama Cloud 等无百分比 quota 的 provider 不应显示伪造 `0%`，也不
 
 server 只自动同步 `dataSource=direct` 的 share request log 到 router；market source 日志应由 market 侧负责，避免重复。
 
-### Share edit / marketGrant
+### Share edit / managed grant
 
-share-market grant 会在 router 中转成 pending share edit。server 侧通过两种方式处理：
+Router 内建 Share Market 会将单个 entitlement 的增删转换成 pending share edit。server 侧通过两种方式处理：
 
 - 后台监听 `/v1/shares/edit-events`。
 - 手动调用 `POST /api/router/share-edits/pull`。
@@ -102,15 +102,7 @@ share-market grant 会在 router 中转成 pending share edit。server 侧通过
 2. 将 `ShareSettingsPatch` 应用到本地 share 的 ACL、appSettings、forSale、price、limits、expiresAt、autoStart；`ownerEmail` patch 必须由 router 和 server 双方拒绝。
 3. 同步更新后的 share descriptor 到 router。
 4. 回写 `/v1/shares/edit-ack` 为 `applied` 或 `rejected`。
-5. 更新本地 `marketGrant.status/grantId/lastError/updatedAtMs`，供 Web Share 页和 router descriptor 展示。
-
-真实 add/revoke smoke 使用：
-
-```bash
-scripts/smoke/share-market-grant-smoke.sh
-```
-
-该脚本只调用 router 的 share-market grant API 和 server 的 share edit pull/API，不修改 router、market 或 cc-switch 代码。缺少 `SHARE_MARKET_GRANT_TOKEN`、buyer/listing/order 等真实输入时，它输出 `[BLOCKED]` 并写入脱敏 evidence；不会把 add/revoke 标记为通过。
+5. 以 `operationId` 幂等记录已执行操作；`routerShareMarket` grant 只能由 managed grant 修改，普通 Share 编辑不能覆盖。
 
 ## 通过标准
 
@@ -122,7 +114,7 @@ scripts/smoke/share-market-grant-smoke.sh
 - market admin Shares 页能看到 app runtime、provider、model、quota、health。
 - direct share URL 和 market api URL 都能命中正确 binding。
 - request log 国家/IP/source 不丢，direct/market 不重复。
-- share-market grant add/revoke 能通过 pending share edit 应用到 server share，并回写 ack。
+- 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 server share，并回写 ack。
 
 ## 阻断记录
 

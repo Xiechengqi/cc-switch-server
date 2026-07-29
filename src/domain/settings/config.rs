@@ -474,7 +474,6 @@ impl ServerConfig {
             },
             owner: OwnerConfig {
                 email: Some(owner_email),
-                ..OwnerConfig::default()
             },
             router,
             client: ClientConfig {

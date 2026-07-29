@@ -6,6 +6,7 @@
 
 pub mod agent_driver;
 pub mod agent_proto;
+pub mod credential_cache;
 pub mod event_emitter;
 pub mod h2_client;
 pub mod identity;

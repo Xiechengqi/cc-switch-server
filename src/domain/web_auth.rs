@@ -439,7 +439,6 @@ mod tests {
             auth: AuthConfig::default(),
             owner: OwnerConfig {
                 email: Some("owner@example.com".to_string()),
-                ..OwnerConfig::default()
             },
             router: RouterConfig {
                 url: Some("https://router.example.com".to_string()),

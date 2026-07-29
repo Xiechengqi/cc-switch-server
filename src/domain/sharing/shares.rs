@@ -13,8 +13,9 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339,
-    ShareAnchoredUsageBucket, ShareAppAccess, ShareAppSettings, ShareSettingsPatch,
-    ShareTokenPeriod, ShareUserGrant, ShareUserPolicy, ShareUserUsage, ShareUserUsageBucket,
+    ShareAnchoredUsageBucket, ShareAppAccess, ShareAppSettings, ShareGrantManager,
+    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareTokenPeriod,
+    ShareUserGrant, ShareUserPolicy, ShareUserUsage, ShareUserUsageBucket,
 };
 use crate::domain::sharing::token_period::{token_period_window, validate_user_policy};
 use crate::domain::usage::store::UsageStore;
@@ -59,19 +60,54 @@ impl ShareUserUsage {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     fn record(&mut self, tokens: u64, now_ms: i64) {
-        record_bucket(&mut self.lifetime, 0, tokens);
-        record_bucket(&mut self.day, utc_day_start_ms(now_ms), tokens);
-        record_bucket(&mut self.week, utc_week_start_ms(now_ms), tokens);
+        self.record_inner(tokens, now_ms, true);
+    }
+
+    fn record_inner(&mut self, tokens: u64, now_ms: i64, count_request: bool) {
+        record_bucket(&mut self.lifetime, 0, tokens, count_request);
+        record_bucket(
+            &mut self.day,
+            utc_day_start_ms(now_ms),
+            tokens,
+            count_request,
+        );
+        record_bucket(
+            &mut self.week,
+            utc_week_start_ms(now_ms),
+            tokens,
+            count_request,
+        );
         record_bucket(
             &mut self.calendar_month,
             utc_calendar_month_start_ms(now_ms),
             tokens,
+            count_request,
         );
     }
 
     fn record_for_policy(&mut self, policy: &ShareUserPolicy, tokens: u64, now_ms: i64) {
-        self.record(tokens, now_ms);
+        self.record_for_policy_inner(policy, tokens, now_ms, true);
+    }
+
+    fn record_supplemental_for_policy(
+        &mut self,
+        policy: &ShareUserPolicy,
+        tokens: u64,
+        now_ms: i64,
+    ) {
+        self.record_for_policy_inner(policy, tokens, now_ms, false);
+    }
+
+    fn record_for_policy_inner(
+        &mut self,
+        policy: &ShareUserPolicy,
+        tokens: u64,
+        now_ms: i64,
+        count_request: bool,
+    ) {
+        self.record_inner(tokens, now_ms, count_request);
         if !policy.token_period.requires_anchor() {
             return;
         }
@@ -99,7 +135,9 @@ impl ShareUserUsage {
         }
         if let Some(bucket) = self.anchored.as_mut() {
             bucket.tokens_used = bucket.tokens_used.saturating_add(tokens);
-            bucket.requests_count = bucket.requests_count.saturating_add(1);
+            if count_request {
+                bucket.requests_count = bucket.requests_count.saturating_add(1);
+            }
         }
     }
 
@@ -138,7 +176,12 @@ fn current_bucket_tokens(bucket: &ShareUserUsageBucket, expected_start_ms: i64) 
     }
 }
 
-fn record_bucket(bucket: &mut ShareUserUsageBucket, start_ms: i64, tokens: u64) {
+fn record_bucket(
+    bucket: &mut ShareUserUsageBucket,
+    start_ms: i64,
+    tokens: u64,
+    count_request: bool,
+) {
     if bucket.started_at_ms != start_ms {
         *bucket = ShareUserUsageBucket {
             started_at_ms: start_ms,
@@ -146,7 +189,9 @@ fn record_bucket(bucket: &mut ShareUserUsageBucket, start_ms: i64, tokens: u64) 
         };
     }
     bucket.tokens_used = bucket.tokens_used.saturating_add(tokens);
-    bucket.requests_count = bucket.requests_count.saturating_add(1);
+    if count_request {
+        bucket.requests_count = bucket.requests_count.saturating_add(1);
+    }
 }
 
 fn utc_datetime(now_ms: i64) -> chrono::DateTime<Utc> {
@@ -211,6 +256,15 @@ pub struct ShareStore {
     pub router_descriptor_sync_mode: RouterDescriptorSyncMode,
     #[serde(default)]
     pub router_descriptor_sync_diagnostic: Option<String>,
+    #[serde(default)]
+    pub applied_router_control_operations: BTreeMap<String, AppliedRouterControlOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedRouterControlOperation {
+    applied_at_ms: u128,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,8 +355,6 @@ pub struct Share {
     pub for_sale: bool,
     #[serde(default)]
     pub free_access: bool,
-    #[serde(default = "default_sale_market_kind")]
-    pub sale_market_kind: String,
     #[serde(default)]
     pub access_by_app: BTreeMap<String, ShareAppAccess>,
     #[serde(default)]
@@ -321,8 +373,6 @@ pub struct Share {
     pub binding_history: Vec<ShareBindingHistory>,
     #[serde(default)]
     pub runtime_snapshot: Option<Value>,
-    #[serde(default)]
-    pub market_grant: Option<ShareMarketGrantStatus>,
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
@@ -418,8 +468,6 @@ pub struct UpsertShareInput {
     #[serde(default)]
     pub free_access: Option<bool>,
     #[serde(default)]
-    pub sale_market_kind: Option<String>,
-    #[serde(default)]
     pub access_by_app: BTreeMap<String, ShareAppAccess>,
     #[serde(default)]
     pub app_settings: BTreeMap<String, ShareAppSettings>,
@@ -436,21 +484,7 @@ pub struct UpsertShareInput {
     #[serde(default)]
     pub runtime_snapshot: Option<Value>,
     #[serde(default)]
-    pub market_grant: Option<ShareMarketGrantStatus>,
-    #[serde(default)]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShareMarketGrantStatus {
-    pub status: String,
-    #[serde(default)]
-    pub grant_id: Option<String>,
-    #[serde(default)]
-    pub last_error: Option<String>,
-    #[serde(default)]
-    pub updated_at_ms: Option<u128>,
 }
 
 impl ShareStore {
@@ -620,9 +654,6 @@ impl ShareStore {
             created_at_ms,
             for_sale: input.for_sale.unwrap_or(false),
             free_access: input.free_access.unwrap_or(false),
-            sale_market_kind: input
-                .sale_market_kind
-                .unwrap_or_else(default_sale_market_kind),
             access_by_app: input.access_by_app,
             app_settings: input.app_settings,
             for_sale_official_price_percent_by_app: input.for_sale_official_price_percent_by_app,
@@ -632,7 +663,6 @@ impl ShareStore {
             bindings: input.bindings,
             binding_history,
             runtime_snapshot: input.runtime_snapshot,
-            market_grant: input.market_grant,
             last_error,
             router_last_synced_at_ms,
             router_last_sync_error,
@@ -968,8 +998,31 @@ impl ShareStore {
         tokens: u64,
         recorded_at_ms: i64,
     ) -> Option<Share> {
+        self.record_user_usage(share_id, user_email, tokens, recorded_at_ms, true)
+    }
+
+    pub fn record_user_supplemental_usage(
+        &mut self,
+        share_id: &str,
+        user_email: Option<&str>,
+        tokens: u64,
+        recorded_at_ms: i64,
+    ) -> Option<Share> {
+        self.record_user_usage(share_id, user_email, tokens, recorded_at_ms, false)
+    }
+
+    fn record_user_usage(
+        &mut self,
+        share_id: &str,
+        user_email: Option<&str>,
+        tokens: u64,
+        recorded_at_ms: i64,
+        count_request: bool,
+    ) -> Option<Share> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
-        share.requests_count = share.requests_count.saturating_add(1);
+        if count_request {
+            share.requests_count = share.requests_count.saturating_add(1);
+        }
         share.tokens_used = share.tokens_used.saturating_add(tokens);
         if share
             .token_limit
@@ -985,9 +1038,15 @@ impl ShareStore {
         {
             if let Some(grant) = share.user_grants.get_mut(&email) {
                 let policy = grant.policy.clone();
-                grant
-                    .usage
-                    .record_for_policy(&policy, tokens, recorded_at_ms);
+                if count_request {
+                    grant
+                        .usage
+                        .record_for_policy(&policy, tokens, recorded_at_ms);
+                } else {
+                    grant
+                        .usage
+                        .record_supplemental_for_policy(&policy, tokens, recorded_at_ms);
+                }
                 grant.updated_at_ms = now_ms();
             }
         }
@@ -1149,99 +1208,6 @@ impl ShareStore {
         }
     }
 
-    pub fn authorize_share_market(
-        &mut self,
-        share_id: &str,
-        market_email: String,
-        public_market_emails: &BTreeSet<String>,
-    ) -> Result<Share, SharePatchError> {
-        let share = self
-            .shares
-            .iter_mut()
-            .find(|item| item.id == share_id)
-            .ok_or(SharePatchError::NotFound)?;
-        let market_email = normalize_verified_email(&market_email)?;
-        share.for_sale = true;
-        share.sale_market_kind = "share".to_string();
-        share.acl.market_access_mode = Some("selected".to_string());
-        share
-            .acl
-            .shared_with_emails
-            .retain(|email| !public_market_emails.contains(&email.trim().to_ascii_lowercase()));
-        insert_email(&mut share.acl.shared_with_emails, market_email.clone());
-
-        let mut app_keys = if share.bindings.is_empty() {
-            vec![share.app.as_str().to_string()]
-        } else {
-            share
-                .bindings
-                .iter()
-                .map(|binding| binding.app.as_str().to_string())
-                .collect::<Vec<_>>()
-        };
-        app_keys.sort();
-        app_keys.dedup();
-        for app in app_keys {
-            let access = share
-                .access_by_app
-                .entry(app.clone())
-                .or_insert_with(|| ShareAppAccess {
-                    shared_with_emails: Vec::new(),
-                    market_access_mode: "selected".to_string(),
-                });
-            access
-                .shared_with_emails
-                .retain(|email| !public_market_emails.contains(&email.trim().to_ascii_lowercase()));
-            insert_email(&mut access.shared_with_emails, market_email.clone());
-            access.market_access_mode = "selected".to_string();
-
-            let settings = share.app_settings.entry(app).or_default();
-            settings.for_sale = "Yes".to_string();
-            settings.sale_market_kind = "share".to_string();
-            settings.market_access_mode = "selected".to_string();
-            settings
-                .shared_with_emails
-                .retain(|email| !public_market_emails.contains(&email.trim().to_ascii_lowercase()));
-            insert_email(&mut settings.shared_with_emails, market_email.clone());
-        }
-        if let Some(snapshot) = share.runtime_snapshot.as_mut() {
-            if let Some(object) = snapshot.as_object_mut() {
-                object.insert("forSale".to_string(), json!(share.for_sale));
-                object.insert("saleMarketKind".to_string(), json!(share.sale_market_kind));
-                object.insert("accessByApp".to_string(), json!(share.access_by_app));
-                object.insert("appSettings".to_string(), json!(share.app_settings));
-            }
-        }
-        mark_share_config_pending(share);
-        Ok(share.clone())
-    }
-
-    pub fn update_market_grant(
-        &mut self,
-        share_id: &str,
-        market_grant: Option<ShareMarketGrantStatus>,
-    ) -> Option<Share> {
-        let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
-        share.market_grant = market_grant;
-        if let Some(snapshot) = share.runtime_snapshot.as_mut() {
-            if let Some(object) = snapshot.as_object_mut() {
-                match &share.market_grant {
-                    Some(grant) => {
-                        object.insert(
-                            "marketGrant".to_string(),
-                            serde_json::to_value(grant).expect("serialize share market grant"),
-                        );
-                    }
-                    None => {
-                        object.remove("marketGrant");
-                    }
-                }
-            }
-        }
-        mark_share_config_pending(share);
-        Some(share.clone())
-    }
-
     pub fn apply_settings_patch(
         &mut self,
         share_id: &str,
@@ -1254,6 +1220,33 @@ impl ShareStore {
             .ok_or(SharePatchError::NotFound)?;
         let mut share = self.shares[index].clone();
         let pricing_was_explicit = patch.for_sale_official_price_percent_by_app.is_some();
+        let managed_grant = patch.managed_grant.clone();
+        let mut managed_grant_fingerprint = None;
+
+        if let Some(operation) = managed_grant.as_ref() {
+            validate_managed_grant_operation(operation)?;
+            let fingerprint = serde_json::to_string(&(share_id, operation)).map_err(|error| {
+                SharePatchError::Invalid(format!("managed grant operation is invalid: {error}"))
+            })?;
+            if let Some(applied) = self
+                .applied_router_control_operations
+                .get(&operation.operation_id)
+            {
+                if applied.fingerprint != fingerprint {
+                    return Err(SharePatchError::Invalid(
+                        "managed grant operationId was reused with a different payload".to_string(),
+                    ));
+                }
+                return Ok(share);
+            }
+            managed_grant_fingerprint = Some(fingerprint);
+            if operation.expected_config_revision != share.config_revision {
+                return Err(SharePatchError::Invalid(format!(
+                    "managed grant expected config revision {}, current revision is {}",
+                    operation.expected_config_revision, share.config_revision
+                )));
+            }
+        }
 
         if let Some(owner_email) = patch.owner_email {
             let owner_email = normalize_optional_email(Some(owner_email))
@@ -1274,9 +1267,6 @@ impl ShareStore {
         }
         if let Some(for_sale) = patch.for_sale {
             apply_router_for_sale_patch(&mut share, &for_sale);
-        }
-        if let Some(sale_market_kind) = patch.sale_market_kind {
-            share.sale_market_kind = normalize_non_empty(sale_market_kind, "token");
         }
         if let Some(market_access_mode) = patch.market_access_mode {
             share.acl.market_access_mode =
@@ -1318,15 +1308,15 @@ impl ShareStore {
         }
 
         reconcile_user_grants(&mut share, explicit_user_grants.as_ref());
+        if let Some(operation) = managed_grant.as_ref() {
+            apply_managed_grant_operation(&mut share, operation)?;
+        }
 
-        let pricing_eligible = share.for_sale
-            && !share.free_access
-            && share.sale_market_kind.trim().eq_ignore_ascii_case("token");
+        let pricing_eligible = share.for_sale && !share.free_access;
         if !pricing_eligible {
             if pricing_was_explicit && !share.for_sale_official_price_percent_by_app.is_empty() {
                 return Err(SharePatchError::Invalid(
-                    "share official price percent requires forSale=Yes and saleMarketKind=token"
-                        .to_string(),
+                    "share official price percent requires forSale=Yes".to_string(),
                 ));
             }
             share.for_sale_official_price_percent_by_app.clear();
@@ -1334,6 +1324,27 @@ impl ShareStore {
         crate::domain::sharing::invariants::validate_share_import(&share)?;
         mark_share_config_pending(&mut share);
         self.shares[index] = share.clone();
+        if let Some(operation) = managed_grant {
+            self.applied_router_control_operations.insert(
+                operation.operation_id,
+                AppliedRouterControlOperation {
+                    applied_at_ms: now_ms(),
+                    fingerprint: managed_grant_fingerprint
+                        .expect("managed operation fingerprint is populated after validation"),
+                },
+            );
+            while self.applied_router_control_operations.len() > 2_048 {
+                let Some(oldest) = self
+                    .applied_router_control_operations
+                    .iter()
+                    .min_by_key(|(_, operation)| operation.applied_at_ms)
+                    .map(|(operation_id, _)| operation_id.clone())
+                else {
+                    break;
+                };
+                self.applied_router_control_operations.remove(&oldest);
+            }
+        }
 
         Ok(share)
     }
@@ -1423,7 +1434,6 @@ impl ShareStore {
             app,
             ShareAppSettings {
                 for_sale: share_router_for_sale_label(share),
-                sale_market_kind: share.sale_market_kind.clone(),
                 market_access_mode,
                 shared_with_emails,
                 token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
@@ -1805,7 +1815,6 @@ fn runtime_snapshot_for_share(
         "requestsCount": share.requests_count,
         "health": health,
         "lastRequest": last_request,
-        "marketGrant": share.market_grant,
         "upstreamProvider": descriptor.upstream_provider,
         "appRuntimes": descriptor.app_runtimes,
         "appProviders": descriptor.app_providers,
@@ -1987,10 +1996,6 @@ fn mark_share_config_pending(share: &mut Share) {
     share.router_last_sync_error = None;
 }
 
-fn default_sale_market_kind() -> String {
-    "token".to_string()
-}
-
 fn share_expired(expires_at: i64, now_ms: i64) -> bool {
     let expires_at_ms = if expires_at > 0 && expires_at < 10_000_000_000 {
         expires_at.saturating_mul(1000)
@@ -2114,6 +2119,171 @@ fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
         updated_at_ms: now,
         revoked_at_ms: None,
         revision: 1,
+        manager: if role == "owner" {
+            ShareGrantManager::Owner
+        } else {
+            ShareGrantManager::Manual
+        },
+        entitlement_id: None,
+    }
+}
+
+fn validate_managed_grant_operation(
+    operation: &ShareManagedGrantOperation,
+) -> Result<(), SharePatchError> {
+    if operation.operation_id.trim().is_empty() || operation.operation_id.len() > 128 {
+        return Err(SharePatchError::Invalid(
+            "managed grant operationId must contain 1-128 characters".to_string(),
+        ));
+    }
+    if operation.entitlement_id.trim().is_empty() || operation.entitlement_id.len() > 128 {
+        return Err(SharePatchError::Invalid(
+            "managed grant entitlementId must contain 1-128 characters".to_string(),
+        ));
+    }
+    if operation.share_sequence < 1 {
+        return Err(SharePatchError::Invalid(
+            "managed grant shareSequence must be positive".to_string(),
+        ));
+    }
+    match operation.action {
+        ShareManagedGrantAction::Upsert if operation.policy.is_none() => Err(
+            SharePatchError::Invalid("managed grant upsert requires policy".to_string()),
+        ),
+        ShareManagedGrantAction::Revoke if operation.policy.is_some() => Err(
+            SharePatchError::Invalid("managed grant revoke must not include policy".to_string()),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn apply_managed_grant_operation(
+    share: &mut Share,
+    operation: &ShareManagedGrantOperation,
+) -> Result<(), SharePatchError> {
+    let email = normalize_verified_email(&operation.email)?;
+    if share
+        .owner_email
+        .as_deref()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(&email))
+    {
+        return Err(SharePatchError::Invalid(
+            "share owner cannot receive a market entitlement".to_string(),
+        ));
+    }
+
+    match operation.action {
+        ShareManagedGrantAction::Upsert => {
+            let policy = operation.policy.clone().ok_or_else(|| {
+                SharePatchError::Invalid("managed grant upsert requires policy".to_string())
+            })?;
+            if policy.parallel_limit == Some(0) || policy.token_limit == Some(0) {
+                return Err(SharePatchError::Invalid(
+                    "user limits must be positive or unlimited".to_string(),
+                ));
+            }
+            validate_user_policy(&policy, now_ms() as i64).map_err(SharePatchError::Invalid)?;
+            if share.user_grants.values().any(|grant| {
+                grant.active
+                    && grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
+                    && !grant.email.eq_ignore_ascii_case(&email)
+            }) {
+                return Err(SharePatchError::Invalid(
+                    "market entitlement is already assigned to another user".to_string(),
+                ));
+            }
+            if let Some(existing) = share.user_grants.get(&email).filter(|grant| grant.active) {
+                let same_entitlement = existing.manager == ShareGrantManager::RouterShareMarket
+                    && existing.entitlement_id.as_deref()
+                        == Some(operation.entitlement_id.as_str());
+                if !same_entitlement {
+                    return Err(SharePatchError::Invalid(
+                        "user already has Share access outside this market entitlement".to_string(),
+                    ));
+                }
+            }
+
+            let now = now_ms();
+            let previous = share.user_grants.get(&email).cloned();
+            share.user_grants.insert(
+                email.clone(),
+                ShareUserGrant {
+                    email: email.clone(),
+                    role: "shareto".to_string(),
+                    active: true,
+                    policy,
+                    usage: previous
+                        .as_ref()
+                        .map(|grant| grant.usage.clone())
+                        .unwrap_or_default(),
+                    created_at_ms: previous
+                        .as_ref()
+                        .map(|grant| grant.created_at_ms)
+                        .filter(|created_at| *created_at > 0)
+                        .unwrap_or(now),
+                    updated_at_ms: now,
+                    revoked_at_ms: None,
+                    revision: previous
+                        .as_ref()
+                        .map(|grant| grant.revision.saturating_add(1))
+                        .unwrap_or(1)
+                        .max(1),
+                    manager: ShareGrantManager::RouterShareMarket,
+                    entitlement_id: Some(operation.entitlement_id.clone()),
+                },
+            );
+            add_grant_email_to_acl(share, &email);
+        }
+        ShareManagedGrantAction::Revoke => {
+            let Some((grant_email, grant)) = share.user_grants.iter().find(|(_, grant)| {
+                grant.manager == ShareGrantManager::RouterShareMarket
+                    && grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
+            }) else {
+                return Ok(());
+            };
+            if !grant.email.eq_ignore_ascii_case(&email) {
+                return Err(SharePatchError::Invalid(
+                    "managed grant revoke email does not match the entitlement owner".to_string(),
+                ));
+            }
+            let grant_email = grant_email.clone();
+            let now = now_ms();
+            if let Some(grant) = share.user_grants.get_mut(&grant_email) {
+                grant.active = false;
+                grant.updated_at_ms = now;
+                grant.revoked_at_ms = Some(now);
+                grant.revision = grant.revision.saturating_add(1).max(1);
+            }
+            remove_grant_email_from_acl(share, &grant_email);
+        }
+    }
+    Ok(())
+}
+
+fn add_grant_email_to_acl(share: &mut Share, email: &str) {
+    insert_email(&mut share.acl.shared_with_emails, email.to_string());
+    for access in share.access_by_app.values_mut() {
+        insert_email(&mut access.shared_with_emails, email.to_string());
+    }
+    for settings in share.app_settings.values_mut() {
+        insert_email(&mut settings.shared_with_emails, email.to_string());
+    }
+}
+
+fn remove_grant_email_from_acl(share: &mut Share, email: &str) {
+    share
+        .acl
+        .shared_with_emails
+        .retain(|value| !value.eq_ignore_ascii_case(email));
+    for access in share.access_by_app.values_mut() {
+        access
+            .shared_with_emails
+            .retain(|value| !value.eq_ignore_ascii_case(email));
+    }
+    for settings in share.app_settings.values_mut() {
+        settings
+            .shared_with_emails
+            .retain(|value| !value.eq_ignore_ascii_case(email));
     }
 }
 
@@ -2126,7 +2296,10 @@ fn normalize_user_grants(
     let owner = owner_email.map(|value| value.trim().to_ascii_lowercase());
     let mut normalized = existing.clone();
     for grant in normalized.values_mut() {
-        if grant.role != "owner" && grant.active {
+        if grant.role != "owner"
+            && grant.manager != ShareGrantManager::RouterShareMarket
+            && grant.active
+        {
             grant.active = false;
             grant.revoked_at_ms = Some(now);
             grant.updated_at_ms = now;
@@ -2155,6 +2328,23 @@ fn normalize_user_grants(
         validate_user_policy(&incoming_grant.policy, now as i64)
             .map_err(SharePatchError::Invalid)?;
         let previous = existing.get(&email);
+        if let Some(previous) = previous {
+            if previous.manager == ShareGrantManager::RouterShareMarket {
+                if incoming_grant.active != previous.active
+                    || !email.eq_ignore_ascii_case(&previous.email)
+                    || incoming_grant.role != previous.role
+                    || incoming_grant.policy != previous.policy
+                    || incoming_grant.manager != ShareGrantManager::RouterShareMarket
+                    || incoming_grant.entitlement_id != previous.entitlement_id
+                {
+                    return Err(SharePatchError::Invalid(
+                        "Share Market managed users are read-only".to_string(),
+                    ));
+                }
+                normalized.insert(email, previous.clone());
+                continue;
+            }
+        }
         let mut grant = incoming_grant.clone();
         grant.email = email.clone();
         grant.role = if owner.as_deref() == Some(email.as_str()) {
@@ -2174,6 +2364,12 @@ fn normalize_user_grants(
             .map(|item| item.revision.saturating_add(1))
             .unwrap_or(1)
             .max(1);
+        grant.manager = if grant.role == "owner" {
+            ShareGrantManager::Owner
+        } else {
+            ShareGrantManager::Manual
+        };
+        grant.entitlement_id = None;
         normalized.insert(email, grant);
     }
     Ok(normalized)
@@ -2205,6 +2401,8 @@ fn reconcile_user_grants(
                 updated_at_ms: now_ms(),
                 revoked_at_ms: None,
                 revision: 1,
+                manager: ShareGrantManager::Owner,
+                entitlement_id: None,
             });
         if grant.email != *owner
             || grant.role != "owner"
@@ -2218,6 +2416,8 @@ fn reconcile_user_grants(
         grant.role = "owner".to_string();
         grant.active = true;
         grant.revoked_at_ms = None;
+        grant.manager = ShareGrantManager::Owner;
+        grant.entitlement_id = None;
 
         for (email, grant) in &mut share.user_grants {
             if email != owner && grant.role == "owner" {
@@ -2233,6 +2433,9 @@ fn reconcile_user_grants(
         let now = now_ms();
         for email in &desired_emails {
             if let Some(grant) = share.user_grants.get_mut(email) {
+                if grant.manager == ShareGrantManager::RouterShareMarket {
+                    continue;
+                }
                 if grant.role == "shareto" && !grant.active {
                     grant.active = true;
                     grant.revoked_at_ms = None;
@@ -2246,16 +2449,29 @@ fn reconcile_user_grants(
                 );
             }
         }
-        for grant in share
-            .user_grants
-            .values_mut()
-            .filter(|grant| grant.role == "shareto" && grant.active)
-        {
+        for grant in share.user_grants.values_mut().filter(|grant| {
+            grant.role == "shareto"
+                && grant.active
+                && grant.manager != ShareGrantManager::RouterShareMarket
+        }) {
             if !desired_emails.contains(&grant.email) {
                 grant.active = false;
                 grant.revoked_at_ms = Some(now);
                 grant.updated_at_ms = now;
                 grant.revision = grant.revision.saturating_add(1).max(1);
+            }
+        }
+        let managed_grants = share
+            .user_grants
+            .values()
+            .filter(|grant| grant.manager == ShareGrantManager::RouterShareMarket)
+            .map(|grant| (grant.email.clone(), grant.active))
+            .collect::<Vec<_>>();
+        for (email, active) in managed_grants {
+            if active {
+                add_grant_email_to_acl(share, &email);
+            } else {
+                remove_grant_email_from_acl(share, &email);
             }
         }
     } else {
@@ -2294,6 +2510,13 @@ fn reconcile_user_grants(
         }
         let desired_emails = share_acl_emails(share);
         for email in desired_emails {
+            if share
+                .user_grants
+                .get(&email)
+                .is_some_and(|grant| grant.manager == ShareGrantManager::RouterShareMarket)
+            {
+                continue;
+            }
             if share
                 .user_grants
                 .get(&email)
@@ -2402,7 +2625,6 @@ fn normalize_app_settings(
             continue;
         }
         setting.for_sale = normalize_router_for_sale_setting(&setting.for_sale);
-        setting.sale_market_kind = normalize_non_empty(setting.sale_market_kind, "token");
         setting.market_access_mode = normalize_non_empty(setting.market_access_mode, "selected");
         setting.shared_with_emails = normalize_email_list(&setting.shared_with_emails, owner_email);
         normalized.insert(app, setting);
@@ -2413,6 +2635,30 @@ fn normalize_app_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_operation(
+        operation_id: &str,
+        entitlement_id: &str,
+        expected_config_revision: u64,
+        action: ShareManagedGrantAction,
+        email: &str,
+    ) -> ShareManagedGrantOperation {
+        ShareManagedGrantOperation {
+            operation_id: operation_id.to_string(),
+            entitlement_id: entitlement_id.to_string(),
+            share_sequence: 1,
+            expected_config_revision,
+            action,
+            email: email.to_string(),
+            policy: (action == ShareManagedGrantAction::Upsert).then_some(ShareUserPolicy {
+                parallel_limit: Some(2),
+                token_limit: Some(10_000),
+                token_period: ShareTokenPeriod::Day,
+                token_period_anchor_at_ms: None,
+                expires_at: None,
+            }),
+        }
+    }
 
     #[test]
     fn legacy_share_store_defaults_router_delete_outbox() {
@@ -2425,6 +2671,293 @@ mod tests {
         )
         .unwrap();
         assert!(tombstone.has_legacy_router_target());
+    }
+
+    #[test]
+    fn managed_grant_is_idempotent_payload_bound_and_protected_from_ordinary_edits() {
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("managed-grant")).unwrap();
+        let operation = managed_operation(
+            "operation-upsert",
+            "entitlement-1",
+            original.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        let updated = store
+            .apply_settings_patch(
+                "managed-grant",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation.clone()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        let grant = updated.user_grants.get("renter@example.com").unwrap();
+        assert!(grant.active);
+        assert_eq!(grant.manager, ShareGrantManager::RouterShareMarket);
+        assert_eq!(grant.entitlement_id.as_deref(), Some("entitlement-1"));
+        assert_eq!(grant.policy.token_limit, Some(10_000));
+        assert!(updated
+            .acl
+            .shared_with_emails
+            .contains(&"renter@example.com".to_string()));
+
+        let persisted = serde_json::to_string(&store).unwrap();
+        let mut store: ShareStore = serde_json::from_str(&persisted).unwrap();
+        let repeated = store
+            .apply_settings_patch(
+                "managed-grant",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation.clone()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(repeated.config_revision, updated.config_revision);
+
+        let acl_edit = store
+            .apply_settings_patch(
+                "managed-grant",
+                ShareSettingsPatch {
+                    shared_with_emails: Some(Vec::new()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(acl_edit.user_grants["renter@example.com"].active);
+        assert!(acl_edit
+            .acl
+            .shared_with_emails
+            .contains(&"renter@example.com".to_string()));
+
+        let mut reused = operation;
+        reused.action = ShareManagedGrantAction::Revoke;
+        reused.policy = None;
+        reused.expected_config_revision = repeated.config_revision;
+        let error = store
+            .apply_settings_patch(
+                "managed-grant",
+                ShareSettingsPatch {
+                    managed_grant: Some(reused),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reused with a different payload"));
+
+        let mut ordinary_grants = repeated.user_grants.clone();
+        ordinary_grants
+            .get_mut("renter@example.com")
+            .unwrap()
+            .policy
+            .token_limit = Some(1);
+        let error = store
+            .apply_settings_patch(
+                "managed-grant",
+                ShareSettingsPatch {
+                    user_grants: Some(ordinary_grants),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("managed users are read-only"));
+        assert_eq!(
+            store
+                .get("managed-grant")
+                .unwrap()
+                .user_grants
+                .get("renter@example.com")
+                .unwrap()
+                .policy
+                .token_limit,
+            Some(10_000)
+        );
+    }
+
+    #[test]
+    fn managed_grant_operation_id_cannot_replay_against_another_share() {
+        let mut store = ShareStore::default();
+        let first = store.upsert(codex_share_input("managed-first")).unwrap();
+        let mut second_input = codex_share_input("managed-second");
+        second_input.provider_id = "p2".to_string();
+        let second = store.upsert(second_input).unwrap();
+        assert_eq!(first.config_revision, second.config_revision);
+        let operation = managed_operation(
+            "operation-cross-share",
+            "entitlement-cross-share",
+            first.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        store
+            .apply_settings_patch(
+                "managed-first",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation.clone()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .apply_settings_patch(
+                "managed-second",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reused with a different payload"));
+        let second = store.get("managed-second").unwrap();
+        assert_eq!(second.config_revision, 1);
+        assert!(!second.user_grants.contains_key("renter@example.com"));
+    }
+
+    #[test]
+    fn managed_revoke_requires_matching_email_and_does_not_reactivate_later() {
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("managed-revoke")).unwrap();
+        let granted = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    managed_grant: Some(managed_operation(
+                        "operation-upsert",
+                        "entitlement-1",
+                        original.config_revision,
+                        ShareManagedGrantAction::Upsert,
+                        "renter@example.com",
+                    )),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        let mismatch = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    managed_grant: Some(managed_operation(
+                        "operation-wrong-email",
+                        "entitlement-1",
+                        granted.config_revision,
+                        ShareManagedGrantAction::Revoke,
+                        "other@example.com",
+                    )),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("does not match"));
+        assert!(
+            store
+                .get("managed-revoke")
+                .unwrap()
+                .user_grants
+                .get("renter@example.com")
+                .unwrap()
+                .active
+        );
+
+        let revoked = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    managed_grant: Some(managed_operation(
+                        "operation-revoke",
+                        "entitlement-1",
+                        granted.config_revision,
+                        ShareManagedGrantAction::Revoke,
+                        "renter@example.com",
+                    )),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        let grant = revoked.user_grants.get("renter@example.com").unwrap();
+        assert!(!grant.active);
+        assert!(!revoked
+            .acl
+            .shared_with_emails
+            .contains(&"renter@example.com".to_string()));
+
+        let ordinary = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    description: Some(Some("ordinary edit".to_string())),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            !ordinary
+                .user_grants
+                .get("renter@example.com")
+                .unwrap()
+                .active
+        );
+
+        let acl_attempt = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    shared_with_emails: Some(vec!["renter@example.com".to_string()]),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(!acl_attempt.user_grants["renter@example.com"].active);
+        assert!(!acl_attempt
+            .acl
+            .shared_with_emails
+            .contains(&"renter@example.com".to_string()));
+
+        let mut reactivated = acl_attempt.user_grants.clone();
+        reactivated.get_mut("renter@example.com").unwrap().active = true;
+        let error = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    user_grants: Some(reactivated),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("managed users are read-only"));
+    }
+
+    #[test]
+    fn managed_grant_revision_conflict_has_no_partial_effect() {
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("managed-conflict")).unwrap();
+        let error = store
+            .apply_settings_patch(
+                "managed-conflict",
+                ShareSettingsPatch {
+                    managed_grant: Some(managed_operation(
+                        "operation-conflict",
+                        "entitlement-conflict",
+                        original.config_revision + 1,
+                        ShareManagedGrantAction::Upsert,
+                        "renter@example.com",
+                    )),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("expected config revision"));
+        let unchanged = store.get("managed-conflict").unwrap();
+        assert_eq!(unchanged.config_revision, original.config_revision);
+        assert!(!unchanged.user_grants.contains_key("renter@example.com"));
+        assert!(store.applied_router_control_operations.is_empty());
     }
 
     #[test]
@@ -2568,7 +3101,6 @@ mod tests {
             expires_at: None,
             for_sale: Some(true),
             free_access: None,
-            sale_market_kind: Some("share".to_string()),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -2577,7 +3109,6 @@ mod tests {
             description: None,
             bindings: Vec::new(),
             runtime_snapshot: None,
-            market_grant: None,
             user_grants: BTreeMap::new(),
         }
     }
@@ -2588,7 +3119,6 @@ mod tests {
             "codex".to_string(),
             ShareAppSettings {
                 for_sale: "Yes".to_string(),
-                sale_market_kind: "share".to_string(),
                 market_access_mode: "selected".to_string(),
                 shared_with_emails: emails.into_iter().map(str::to_string).collect(),
                 token_limit: 5000,
@@ -2770,6 +3300,87 @@ mod tests {
     }
 
     #[test]
+    fn anchored_usage_rebuild_counts_summary_tokens_without_a_second_request() {
+        let now = test_timestamp_ms(2026, 7, 28, 12, 0);
+        let mut input = codex_share_input("anchored-summary");
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["user@example.com".to_string()],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+
+        let mut invocation = crate::domain::usage::store::UsageLog::new(
+            AppKind::Codex,
+            "provider-codex".to_string(),
+            "Provider".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            crate::domain::usage::store::UsageModelMetadata::default(),
+            crate::domain::usage::store::TokenUsage {
+                total_tokens: Some(7),
+                ..Default::default()
+            },
+        );
+        invocation.request_id = "anchored-invocation".to_string();
+        invocation.share_id = Some("anchored-summary".to_string());
+        invocation.user_email = Some("USER@example.com".to_string());
+        invocation.created_at_ms = test_timestamp_ms(2026, 7, 24, 8, 0) as u128;
+
+        let mut summary = crate::domain::usage::store::UsageLog::new(
+            AppKind::Codex,
+            "provider-codex".to_string(),
+            "Provider".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            crate::domain::usage::store::UsageModelMetadata::default(),
+            crate::domain::usage::store::TokenUsage {
+                total_tokens: Some(10),
+                ..Default::default()
+            },
+        );
+        summary.request_id = "anchored-summary".to_string();
+        summary.share_id = Some("anchored-summary".to_string());
+        summary.user_email = Some("user@example.com".to_string());
+        summary.data_source = Some(
+            crate::domain::usage::store::CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE.to_string(),
+        );
+        summary.created_at_ms = test_timestamp_ms(2026, 7, 24, 8, 1) as u128;
+
+        let mut usage = UsageStore::default();
+        usage.push(invocation);
+        usage.push(summary);
+
+        let mut grants = store.get("anchored-summary").unwrap().user_grants.clone();
+        grants.get_mut("user@example.com").unwrap().policy = ShareUserPolicy {
+            token_limit: Some(100),
+            token_period: ShareTokenPeriod::SevenDays,
+            token_period_anchor_at_ms: Some(test_timestamp_ms(2026, 7, 1, 12, 0)),
+            ..ShareUserPolicy::default()
+        };
+        let updated = store
+            .apply_settings_patch_with_usage(
+                "anchored-summary",
+                ShareSettingsPatch {
+                    user_grants: Some(grants),
+                    ..ShareSettingsPatch::default()
+                },
+                &usage,
+                now,
+            )
+            .unwrap();
+        let anchored = updated.user_grants["user@example.com"]
+            .usage
+            .anchored
+            .as_ref()
+            .unwrap();
+        assert_eq!(anchored.tokens_used, 17);
+        assert_eq!(anchored.requests_count, 1);
+    }
+
+    #[test]
     fn user_quota_isolated_from_other_users_and_total_quota_remains_authoritative() {
         let now = test_timestamp_ms(2026, 7, 19, 12, 0);
         let mut input = codex_share_input("user-quota");
@@ -2827,6 +3438,43 @@ mod tests {
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Inactive);
         assert_eq!(store.get("user-quota").unwrap().status, "exhausted");
+    }
+
+    #[test]
+    fn supplemental_usage_counts_tokens_without_a_second_request() {
+        let now = test_timestamp_ms(2026, 7, 19, 12, 0);
+        let mut input = codex_share_input("supplemental-usage");
+        input.token_limit = Some(10);
+        input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["alice@example.com".to_string()],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+
+        store.record_user_supplemental_usage(
+            "supplemental-usage",
+            Some("alice@example.com"),
+            4,
+            now,
+        );
+        store.record_user_invocation_result(
+            "supplemental-usage",
+            Some("alice@example.com"),
+            6,
+            now,
+        );
+
+        let share = store.get("supplemental-usage").unwrap();
+        assert_eq!(share.requests_count, 1);
+        assert_eq!(share.tokens_used, 10);
+        assert_eq!(share.status, "exhausted");
+        let usage = &share.user_grants["alice@example.com"].usage;
+        assert_eq!(usage.lifetime.requests_count, 1);
+        assert_eq!(usage.day.requests_count, 1);
+        assert_eq!(usage.week.requests_count, 1);
+        assert_eq!(usage.calendar_month.requests_count, 1);
+        assert_eq!(usage.tokens_for(ShareTokenPeriod::Lifetime, now), 10);
     }
 
     #[test]
@@ -2966,8 +3614,7 @@ mod tests {
     #[test]
     fn apply_settings_patch_persists_valid_token_market_pricing() {
         let mut store = ShareStore::default();
-        let mut input = codex_share_input("share-priced");
-        input.sale_market_kind = Some("token".to_string());
+        let input = codex_share_input("share-priced");
         let share = store.upsert(input).expect("upsert");
 
         let updated = store
@@ -2992,8 +3639,7 @@ mod tests {
     #[test]
     fn apply_settings_patch_rejects_invalid_pricing_without_partial_mutation() {
         let mut store = ShareStore::default();
-        let mut input = codex_share_input("share-invalid-price");
-        input.sale_market_kind = Some("token".to_string());
+        let input = codex_share_input("share-invalid-price");
         let share = store.upsert(input).expect("upsert");
 
         for pricing in [
@@ -3020,7 +3666,6 @@ mod tests {
     fn sale_mode_transition_clears_pricing_and_rejects_contradictory_payload() {
         let mut store = ShareStore::default();
         let mut input = codex_share_input("share-price-transition");
-        input.sale_market_kind = Some("token".to_string());
         input.for_sale_official_price_percent_by_app = BTreeMap::from([("codex".to_string(), 75)]);
         let share = store.upsert(input).expect("upsert");
 
@@ -3049,11 +3694,11 @@ mod tests {
             .apply_settings_patch(
                 &share.id,
                 ShareSettingsPatch {
-                    sale_market_kind: Some("share".to_string()),
+                    for_sale: Some("No".to_string()),
                     ..ShareSettingsPatch::default()
                 },
             )
-            .expect("switch market kind");
+            .expect("disable market sale");
         assert!(updated.for_sale_official_price_percent_by_app.is_empty());
     }
 
@@ -3080,7 +3725,6 @@ mod tests {
                 expires_at: None,
                 for_sale: Some(true),
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -3089,7 +3733,6 @@ mod tests {
                 description: Some("test".to_string()),
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -3217,7 +3860,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -3226,7 +3868,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -3258,7 +3899,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -3267,7 +3907,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -3376,7 +4015,6 @@ mod tests {
             created_at_ms: 0,
             for_sale: false,
             free_access: false,
-            sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -3390,7 +4028,6 @@ mod tests {
             }],
             binding_history: Vec::new(),
             runtime_snapshot: None,
-            market_grant: None,
             last_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
@@ -3423,7 +4060,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_share_market_app_settings_patch() {
+    fn applies_app_settings_patch() {
         let mut store = ShareStore::default();
         store
             .upsert(UpsertShareInput {
@@ -3445,7 +4082,6 @@ mod tests {
                 expires_at: None,
                 for_sale: Some(true),
                 free_access: None,
-                sale_market_kind: Some("share".to_string()),
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -3454,7 +4090,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -3464,7 +4099,6 @@ mod tests {
             "codex".to_string(),
             ShareAppSettings {
                 for_sale: "Yes".to_string(),
-                sale_market_kind: "share".to_string(),
                 market_access_mode: "selected".to_string(),
                 shared_with_emails: vec![
                     "buyer@example.com".to_string(),
@@ -3488,7 +4122,6 @@ mod tests {
             .unwrap();
 
         let setting = share.app_settings.get("codex").unwrap();
-        assert_eq!(setting.sale_market_kind, "share");
         assert_eq!(setting.shared_with_emails, vec!["buyer@example.com"]);
 
         let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
@@ -3500,115 +4133,8 @@ mod tests {
                 .app_settings
                 .get("codex")
                 .unwrap()
-                .sale_market_kind,
-            "share"
-        );
-    }
-
-    #[test]
-    fn authorize_share_market_marks_app_settings_for_sale() {
-        let mut store = ShareStore::default();
-        store
-            .upsert(UpsertShareInput {
-                id: Some("s1".to_string()),
-                owner_email: Some("owner@example.com".to_string()),
-                app: AppKind::Codex,
-                provider_id: "p1".to_string(),
-                provider_type: ProviderType::Codex,
-                display_name: None,
-                enabled: None,
-                status: None,
-                subscription_level: None,
-                account_email: None,
-                quota_percent: None,
-                tunnel_subdomain: None,
-                acl: None,
-                token_limit: None,
-                parallel_limit: None,
-                expires_at: None,
-                for_sale: None,
-                free_access: None,
-                sale_market_kind: None,
-                access_by_app: BTreeMap::new(),
-                app_settings: BTreeMap::new(),
-                for_sale_official_price_percent_by_app: BTreeMap::new(),
-                official_price_percent: None,
-                auto_start: None,
-                description: None,
-                bindings: Vec::new(),
-                runtime_snapshot: Some(json!({"shareId": "s1"})),
-                market_grant: None,
-                user_grants: BTreeMap::new(),
-            })
-            .unwrap();
-        let stored = store
-            .shares
-            .iter_mut()
-            .find(|share| share.id == "s1")
-            .unwrap();
-        stored.acl.shared_with_emails = vec![
-            "old-market@example.com".to_string(),
-            "user@example.com".to_string(),
-        ];
-        stored.access_by_app.insert(
-            "codex".to_string(),
-            ShareAppAccess {
-                shared_with_emails: vec![
-                    "old-market@example.com".to_string(),
-                    "buyer@example.com".to_string(),
-                ],
-                market_access_mode: "all".to_string(),
-            },
-        );
-        stored.app_settings.insert(
-            "codex".to_string(),
-            ShareAppSettings {
-                for_sale: "No".to_string(),
-                sale_market_kind: "token".to_string(),
-                market_access_mode: "all".to_string(),
-                shared_with_emails: vec![
-                    "old-market@example.com".to_string(),
-                    "buyer@example.com".to_string(),
-                ],
-                token_limit: 5000,
-                parallel_limit: 2,
-                expires_at: "1893456000".to_string(),
-            },
-        );
-
-        let mut public_markets = BTreeSet::new();
-        public_markets.insert("old-market@example.com".to_string());
-        let share = store
-            .authorize_share_market("s1", "market@example.com".to_string(), &public_markets)
-            .unwrap();
-
-        assert!(share.for_sale);
-        assert_eq!(share.sale_market_kind, "share");
-        assert_eq!(
-            share.acl.shared_with_emails,
-            vec!["user@example.com", "market@example.com"]
-        );
-        let access = share.access_by_app.get("codex").unwrap();
-        assert_eq!(access.market_access_mode, "selected");
-        assert_eq!(
-            access.shared_with_emails,
-            vec!["buyer@example.com", "market@example.com"]
-        );
-        let settings = share.app_settings.get("codex").unwrap();
-        assert_eq!(settings.for_sale, "Yes");
-        assert_eq!(settings.sale_market_kind, "share");
-        assert_eq!(settings.market_access_mode, "selected");
-        assert_eq!(
-            settings.shared_with_emails,
-            vec!["buyer@example.com", "market@example.com"]
-        );
-        assert_eq!(
-            share
-                .runtime_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.pointer("/appSettings/codex/forSale"))
-                .and_then(Value::as_str),
-            Some("Yes")
+                .shared_with_emails,
+            vec!["buyer@example.com"]
         );
     }
 
@@ -3635,7 +4161,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -3644,7 +4169,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -3730,74 +4254,6 @@ mod tests {
     }
 
     #[test]
-    fn share_market_grant_status_is_persisted_for_web_display() {
-        let mut store = ShareStore::default();
-        let share = store
-            .upsert(UpsertShareInput {
-                id: Some("s1".to_string()),
-                owner_email: None,
-                app: AppKind::Codex,
-                provider_id: "p1".to_string(),
-                provider_type: ProviderType::Codex,
-                display_name: None,
-                enabled: None,
-                status: None,
-                subscription_level: None,
-                account_email: None,
-                quota_percent: None,
-                tunnel_subdomain: None,
-                acl: None,
-                token_limit: None,
-                parallel_limit: None,
-                expires_at: None,
-                for_sale: None,
-                free_access: None,
-                sale_market_kind: None,
-                access_by_app: BTreeMap::new(),
-                app_settings: BTreeMap::new(),
-                for_sale_official_price_percent_by_app: BTreeMap::new(),
-                official_price_percent: None,
-                auto_start: None,
-                description: None,
-                bindings: Vec::new(),
-                runtime_snapshot: None,
-                market_grant: Some(ShareMarketGrantStatus {
-                    status: "pending".to_string(),
-                    grant_id: Some("grant-1".to_string()),
-                    last_error: None,
-                    updated_at_ms: Some(123),
-                }),
-                user_grants: BTreeMap::new(),
-            })
-            .unwrap();
-
-        assert_eq!(
-            share
-                .market_grant
-                .as_ref()
-                .map(|grant| grant.status.as_str()),
-            Some("pending")
-        );
-
-        let providers = ProviderStore::default();
-        let usage = UsageStore::default();
-        let snapshot = runtime_snapshot_for_share(&share, &providers, None, &usage);
-
-        assert_eq!(
-            snapshot
-                .pointer("/marketGrant/status")
-                .and_then(Value::as_str),
-            Some("pending")
-        );
-        assert_eq!(
-            snapshot
-                .pointer("/marketGrant/grantId")
-                .and_then(Value::as_str),
-            Some("grant-1")
-        );
-    }
-
-    #[test]
     fn runtime_snapshot_includes_model_health_summary() {
         let mut store = ShareStore::default();
         let share = store.upsert(codex_share_input("s1")).unwrap();
@@ -3817,88 +4273,7 @@ mod tests {
     }
 
     #[test]
-    fn updates_market_grant_and_keeps_existing_snapshot_consistent() {
-        let mut store = ShareStore::default();
-        store
-            .upsert(UpsertShareInput {
-                id: Some("s1".to_string()),
-                owner_email: None,
-                app: AppKind::Codex,
-                provider_id: "p1".to_string(),
-                provider_type: ProviderType::Codex,
-                display_name: None,
-                enabled: None,
-                status: None,
-                subscription_level: None,
-                account_email: None,
-                quota_percent: None,
-                tunnel_subdomain: None,
-                acl: None,
-                token_limit: None,
-                parallel_limit: None,
-                expires_at: None,
-                for_sale: None,
-                free_access: None,
-                sale_market_kind: None,
-                access_by_app: BTreeMap::new(),
-                app_settings: BTreeMap::new(),
-                for_sale_official_price_percent_by_app: BTreeMap::new(),
-                official_price_percent: None,
-                auto_start: None,
-                description: None,
-                bindings: Vec::new(),
-                runtime_snapshot: Some(json!({
-                    "shareId": "s1",
-                    "marketGrant": {"status": "pending"}
-                })),
-                market_grant: Some(ShareMarketGrantStatus {
-                    status: "pending".to_string(),
-                    grant_id: None,
-                    last_error: None,
-                    updated_at_ms: Some(100),
-                }),
-                user_grants: BTreeMap::new(),
-            })
-            .unwrap();
-
-        let updated = store
-            .update_market_grant(
-                "s1",
-                Some(ShareMarketGrantStatus {
-                    status: "applied".to_string(),
-                    grant_id: Some("grant-2".to_string()),
-                    last_error: None,
-                    updated_at_ms: Some(200),
-                }),
-            )
-            .unwrap();
-        assert_eq!(
-            updated
-                .market_grant
-                .as_ref()
-                .map(|grant| grant.status.as_str()),
-            Some("applied")
-        );
-        assert_eq!(
-            updated
-                .runtime_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.pointer("/marketGrant/grantId"))
-                .and_then(Value::as_str),
-            Some("grant-2")
-        );
-
-        let cleared = store.update_market_grant("s1", None).unwrap();
-        assert!(cleared.market_grant.is_none());
-        assert!(cleared
-            .runtime_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.get("marketGrant"))
-            .is_none());
-    }
-
-    #[test]
-    fn share_market_grant_app_settings_add_and_revoke_target_buyer() {
+    fn app_settings_add_and_revoke_target_user() {
         let mut store = ShareStore::default();
         let _ = store.upsert(codex_share_input("s1")).unwrap();
 
@@ -3942,91 +4317,7 @@ mod tests {
     }
 
     #[test]
-    fn share_market_grant_duplicate_status_update_is_idempotent_for_display() {
-        let mut store = ShareStore::default();
-        let _ = store.upsert(codex_share_input("s1")).unwrap();
-
-        let first = ShareMarketGrantStatus {
-            status: "applied".to_string(),
-            grant_id: Some("grant-1".to_string()),
-            last_error: None,
-            updated_at_ms: Some(100),
-        };
-        store
-            .update_market_grant("s1", Some(first.clone()))
-            .unwrap();
-        let second = store
-            .update_market_grant("s1", Some(first.clone()))
-            .unwrap();
-
-        assert_eq!(
-            second
-                .market_grant
-                .as_ref()
-                .map(|grant| grant.status.as_str()),
-            Some(first.status.as_str())
-        );
-        assert_eq!(
-            second
-                .market_grant
-                .as_ref()
-                .and_then(|grant| grant.grant_id.as_deref()),
-            first.grant_id.as_deref()
-        );
-        assert_eq!(
-            second
-                .runtime_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.pointer("/marketGrant/status"))
-                .and_then(Value::as_str),
-            None
-        );
-    }
-
-    #[test]
-    fn share_market_grant_rejected_error_is_display_only() {
-        let mut store = ShareStore::default();
-        let _ = store.upsert(codex_share_input("s1")).unwrap();
-        store
-            .apply_settings_patch(
-                "s1",
-                ShareSettingsPatch {
-                    app_settings: Some(codex_app_settings(vec!["buyer@example.com"])),
-                    ..ShareSettingsPatch::default()
-                },
-            )
-            .unwrap();
-
-        let errored = store
-            .update_market_grant(
-                "s1",
-                Some(ShareMarketGrantStatus {
-                    status: "error".to_string(),
-                    grant_id: Some("edit-1".to_string()),
-                    last_error: Some("invalid patch".to_string()),
-                    updated_at_ms: Some(200),
-                }),
-            )
-            .unwrap();
-
-        assert_eq!(
-            errored
-                .app_settings
-                .get("codex")
-                .map(|settings| settings.shared_with_emails.clone()),
-            Some(vec!["buyer@example.com".to_string()])
-        );
-        assert_eq!(
-            errored
-                .market_grant
-                .as_ref()
-                .and_then(|grant| grant.last_error.as_deref()),
-            Some("invalid patch")
-        );
-    }
-
-    #[test]
-    fn sequential_share_market_patches_are_deterministic() {
+    fn sequential_app_settings_patches_are_deterministic() {
         let mut store = ShareStore::default();
         let _ = store.upsert(codex_share_input("s1")).unwrap();
 
@@ -4092,7 +4383,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -4101,7 +4391,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -4364,7 +4653,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -4373,7 +4661,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();

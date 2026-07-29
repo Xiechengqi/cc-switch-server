@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,8 @@ const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEVICE_CODE_DEFAULT_EXPIRES_IN: u64 = 900;
 const POLLING_SAFETY_MARGIN_SECS: u64 = 3;
 const CODEX_USER_AGENT: &str = "cc-switch-server-codex-oauth";
+const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_OAUTH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct CodexDeviceFlowStore {
@@ -225,11 +228,12 @@ pub async fn start_device_flow(
     http: &reqwest::Client,
     now_ms: i64,
 ) -> Result<(CodexDeviceCodeResponse, PendingCodexDeviceFlow), CodexDeviceError> {
-    let response = http
+    let mut response = http
         .post(DEVICE_AUTH_USERCODE_URL)
         .header("Content-Type", "application/json")
         .header("User-Agent", CODEX_USER_AGENT)
         .json(&json!({ "client_id": CODEX_CLIENT_ID }))
+        .timeout(OAUTH_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|error| {
@@ -238,7 +242,10 @@ pub async fn start_device_flow(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let body =
+            read_codex_oauth_response_body(&mut response, "codex device code error response")
+                .await?;
+        let text = String::from_utf8_lossy(&body);
         return Err(CodexDeviceError::upstream(
             "codex device code request failed",
             status,
@@ -246,7 +253,8 @@ pub async fn start_device_flow(
         ));
     }
 
-    let device: DeviceCodeResponse = response.json().await.map_err(|error| {
+    let body = read_codex_oauth_response_body(&mut response, "codex device code response").await?;
+    let device: DeviceCodeResponse = serde_json::from_slice(&body).map_err(|error| {
         CodexDeviceError::bad_gateway(format!("codex device code response parse failed: {error}"))
     })?;
 
@@ -282,7 +290,7 @@ pub async fn poll_device_flow(
         ));
     }
 
-    let poll_response = http
+    let mut poll_response = http
         .post(DEVICE_AUTH_TOKEN_URL)
         .header("Content-Type", "application/json")
         .header("User-Agent", CODEX_USER_AGENT)
@@ -290,6 +298,7 @@ pub async fn poll_device_flow(
             "device_auth_id": device_code,
             "user_code": flow.user_code,
         }))
+        .timeout(OAUTH_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|error| {
@@ -311,7 +320,10 @@ pub async fn poll_device_flow(
         ));
     }
     if !status.is_success() {
-        let text = poll_response.text().await.unwrap_or_default();
+        let body =
+            read_codex_oauth_response_body(&mut poll_response, "codex device poll error response")
+                .await?;
+        let text = String::from_utf8_lossy(&body);
         return Err(CodexDeviceError::upstream(
             "codex device poll failed",
             status,
@@ -319,7 +331,9 @@ pub async fn poll_device_flow(
         ));
     }
 
-    let success: DevicePollSuccess = poll_response.json().await.map_err(|error| {
+    let body =
+        read_codex_oauth_response_body(&mut poll_response, "codex device poll response").await?;
+    let success: DevicePollSuccess = serde_json::from_slice(&body).map_err(|error| {
         CodexDeviceError::bad_gateway(format!("codex device poll response parse failed: {error}"))
     })?;
 
@@ -366,7 +380,7 @@ async fn exchange_code_for_tokens(
     code: &str,
     code_verifier: &str,
 ) -> Result<OAuthTokenResponse, CodexDeviceError> {
-    let response = http
+    let mut response = http
         .post(OAUTH_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("User-Agent", CODEX_USER_AGENT)
@@ -377,6 +391,7 @@ async fn exchange_code_for_tokens(
             ("client_id", CODEX_CLIENT_ID),
             ("code_verifier", code_verifier),
         ])
+        .timeout(OAUTH_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|error| {
@@ -385,7 +400,10 @@ async fn exchange_code_for_tokens(
 
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let body =
+            read_codex_oauth_response_body(&mut response, "codex OAuth token error response")
+                .await?;
+        let text = String::from_utf8_lossy(&body);
         return Err(CodexDeviceError::upstream(
             "codex oauth token exchange failed",
             status,
@@ -393,9 +411,19 @@ async fn exchange_code_for_tokens(
         ));
     }
 
-    response.json().await.map_err(|error| {
+    let body = read_codex_oauth_response_body(&mut response, "codex OAuth token response").await?;
+    serde_json::from_slice(&body).map_err(|error| {
         CodexDeviceError::bad_gateway(format!("codex oauth token response parse failed: {error}"))
     })
+}
+
+async fn read_codex_oauth_response_body(
+    response: &mut reqwest::Response,
+    context: &str,
+) -> Result<bytes::Bytes, CodexDeviceError> {
+    crate::infra::http::read_response_body_limited(response, MAX_OAUTH_RESPONSE_BODY_BYTES)
+        .await
+        .map_err(|error| CodexDeviceError::bad_gateway(format!("{context} read failed: {error}")))
 }
 
 fn parse_interval(value: Option<&Value>) -> u64 {
@@ -427,6 +455,40 @@ mod tests {
         assert!(!error.message.contains("secret-provider-detail"));
         assert!(!error.message.contains("invalid_grant"));
         assert!(error.message.contains("upstream HTTP 400"));
+    }
+
+    #[tokio::test]
+    async fn oauth_response_body_is_bounded() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/oversized",
+                    axum::routing::get(|| async {
+                        vec![b'x'; MAX_OAUTH_RESPONSE_BODY_BYTES.saturating_add(1)]
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let mut response = reqwest::Client::new()
+            .get(format!("http://{address}/oversized"))
+            .send()
+            .await
+            .unwrap();
+
+        let error = read_codex_oauth_response_body(&mut response, "test response")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("exceeds"));
+        server.abort();
     }
     use axum::http::HeaderMap;
     use axum::routing::post;

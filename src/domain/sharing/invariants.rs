@@ -5,12 +5,8 @@ fn app_key(app: AppKind) -> String {
     app.as_str().to_string()
 }
 
-fn share_sale_pricing_is_eligible(
-    for_sale: bool,
-    free_access: bool,
-    sale_market_kind: &str,
-) -> bool {
-    for_sale && !free_access && sale_market_kind.trim().eq_ignore_ascii_case("token")
+fn share_sale_pricing_is_eligible(for_sale: bool, free_access: bool) -> bool {
+    for_sale && !free_access
 }
 
 fn validate_sale_pricing(
@@ -68,11 +64,10 @@ pub fn validate_and_normalize_upsert_input(
     let pricing_eligible = share_sale_pricing_is_eligible(
         input.for_sale.unwrap_or(false),
         input.free_access.unwrap_or(false),
-        input.sale_market_kind.as_deref().unwrap_or("token"),
     );
     if !pricing_eligible && !input.for_sale_official_price_percent_by_app.is_empty() {
         return Err(SharePatchError::Invalid(
-            "share official price percent requires forSale=Yes and saleMarketKind=token".into(),
+            "share official price percent requires forSale=Yes".into(),
         ));
     }
 
@@ -109,11 +104,11 @@ pub fn validate_share_import(share: &Share) -> Result<(), SharePatchError> {
         ));
     }
     validate_sale_pricing(&share.for_sale_official_price_percent_by_app, &app_name)?;
-    if !share_sale_pricing_is_eligible(share.for_sale, share.free_access, &share.sale_market_kind)
+    if !share_sale_pricing_is_eligible(share.for_sale, share.free_access)
         && !share.for_sale_official_price_percent_by_app.is_empty()
     {
         return Err(SharePatchError::Invalid(
-            "share official price percent requires forSale=Yes and saleMarketKind=token".into(),
+            "share official price percent requires forSale=Yes".into(),
         ));
     }
 

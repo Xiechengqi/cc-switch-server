@@ -1730,6 +1730,7 @@ mod tests {
         assert!(without_id.id_token.is_none());
         let mut store = crate::domain::accounts::store::AccountStore {
             accounts: vec![existing.clone()],
+            ..Default::default()
         };
         let refreshed = store
             .mark_refresh_success(&existing.id, without_id)

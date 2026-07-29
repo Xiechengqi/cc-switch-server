@@ -47,6 +47,8 @@ pub enum SessionState {
 /// Live state of a single AgentService run.
 pub struct CursorSession {
     pub conversation_id: String,
+    /// Provider/principal/credential generation bound to this live h2 stream.
+    pub identity_key: String,
     pub stream: Option<CursorH2Stream>,
     /// MCP tool names declared on the inbound turn (for shell→MCP bridging).
     pub declared_tool_names: Vec<String>,
@@ -113,7 +115,11 @@ impl CursorSessionManager {
 
     /// Try to reacquire a parked session. Returns `Some` only when the entry
     /// exists, is `AwaitingToolResult`, and hasn't passed its idle TTL.
-    pub async fn acquire(&self, conversation_id: &str) -> Option<Arc<Mutex<CursorSession>>> {
+    pub async fn acquire(
+        &self,
+        conversation_id: &str,
+        identity_key: &str,
+    ) -> Option<Arc<Mutex<CursorSession>>> {
         self.evict_expired().await;
         let map = self.inner.sessions.read().await;
         let entry = map.get(conversation_id)?.clone();
@@ -121,6 +127,28 @@ impl CursorSessionManager {
 
         let mut session = entry.lock().await;
         if session.state != SessionState::AwaitingToolResult {
+            return None;
+        }
+        if session.identity_key != identity_key {
+            session.state = SessionState::Closed;
+            session.stream = None;
+            drop(session);
+
+            let removed = {
+                let mut map = self.inner.sessions.write().await;
+                if map
+                    .get(conversation_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
+                    map.remove(conversation_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                self.remove_indexes_for_session(conversation_id).await;
+            }
             return None;
         }
         session.state = SessionState::Running;
@@ -135,6 +163,7 @@ impl CursorSessionManager {
     pub async fn open(
         &self,
         conversation_id: String,
+        identity_key: String,
         stream: CursorH2Stream,
         blob_store: HashMap<String, Bytes>,
         declared_tools: Vec<McpToolDef>,
@@ -158,6 +187,7 @@ impl CursorSessionManager {
         let declared_tool_names = declared_tools.iter().map(|t| t.name.clone()).collect();
         let session = CursorSession {
             conversation_id: conversation_id.clone(),
+            identity_key,
             stream: Some(stream),
             declared_tool_names,
             declared_tools,
@@ -194,9 +224,21 @@ impl CursorSessionManager {
                 }
             }
         };
-        let mut map = self.inner.sessions.write().await;
-        map.remove(&conversation_id);
-        self.remove_indexes_for_session(&conversation_id).await;
+        let removed = {
+            let mut map = self.inner.sessions.write().await;
+            if map
+                .get(&conversation_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                map.remove(&conversation_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.remove_indexes_for_session(&conversation_id).await;
+        }
     }
 
     pub async fn bind_response_id(&self, response_id: &str, conversation_id: &str) {
@@ -399,5 +441,77 @@ mod tests {
         mgr.remove_indexes_for_session("session_1").await;
         assert!(mgr.resolve_response_id("resp_1").await.is_none());
         assert!(mgr.resolve_tool_call_id("call_1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_closes_parked_session_and_indexes() {
+        let mgr = CursorSessionManager::default();
+        let entry = Arc::new(Mutex::new(CursorSession {
+            conversation_id: "session-1".to_string(),
+            identity_key: "provider-a:credential-1".to_string(),
+            stream: None,
+            declared_tool_names: Vec::new(),
+            declared_tools: Vec::new(),
+            working_directory: String::new(),
+            pending_tool_calls: HashMap::new(),
+            blob_store: HashMap::new(),
+            state: SessionState::AwaitingToolResult,
+            last_activity: Instant::now(),
+        }));
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert("session-1".to_string(), entry.clone());
+        mgr.bind_response_id("response-1", "session-1").await;
+        mgr.bind_tool_call_id("call-1", "session-1").await;
+
+        assert!(mgr
+            .acquire("session-1", "provider-a:credential-2")
+            .await
+            .is_none());
+        assert_eq!(entry.lock().await.state, SessionState::Closed);
+        assert!(!mgr.has("session-1").await);
+        assert!(mgr.resolve_response_id("response-1").await.is_none());
+        assert!(mgr.resolve_tool_call_id("call-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_release_cannot_remove_replacement_session() {
+        fn session_entry(identity_key: &str) -> Arc<Mutex<CursorSession>> {
+            Arc::new(Mutex::new(CursorSession {
+                conversation_id: "session-1".to_string(),
+                identity_key: identity_key.to_string(),
+                stream: None,
+                declared_tool_names: Vec::new(),
+                declared_tools: Vec::new(),
+                working_directory: String::new(),
+                pending_tool_calls: HashMap::new(),
+                blob_store: HashMap::new(),
+                state: SessionState::Running,
+                last_activity: Instant::now(),
+            }))
+        }
+
+        let mgr = CursorSessionManager::default();
+        let stale = session_entry("credential-1");
+        let replacement = session_entry("credential-2");
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert("session-1".to_string(), replacement.clone());
+
+        mgr.release(stale, SessionState::Closed).await;
+
+        let current = mgr
+            .inner
+            .sessions
+            .read()
+            .await
+            .get("session-1")
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&current, &replacement));
     }
 }

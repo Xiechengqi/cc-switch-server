@@ -374,7 +374,7 @@ mod tests {
     use crate::domain::accounts::store::AccountQuota;
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::sharing::shares::{ShareAcl, ShareBinding, ShareMarketGrantStatus};
+    use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
     use crate::domain::usage::store::{UsageLogContext, UsageModelMetadata};
 
     #[test]
@@ -770,7 +770,6 @@ mod tests {
             created_at_ms: 0,
             for_sale: false,
             free_access: false,
-            sale_market_kind: "token".to_string(),
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -784,7 +783,6 @@ mod tests {
             }],
             binding_history: Vec::new(),
             runtime_snapshot: None,
-            market_grant: None::<ShareMarketGrantStatus>,
             last_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
@@ -841,6 +839,7 @@ mod tests {
                 refresh_consecutive_failures: 0,
                 needs_relogin: false,
             }],
+            ..Default::default()
         }
     }
 

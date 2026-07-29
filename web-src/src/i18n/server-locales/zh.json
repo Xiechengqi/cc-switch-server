@@ -2,6 +2,13 @@
   "common": {
     "copied": "已复制"
   },
+  "server": {
+    "auth": {
+      "inferenceTokenTitle": "Claude 推理 Token",
+      "inferenceTokenOneTime": "此 Token 仅显示一次，请在进入控制台前妥善保存。",
+      "continueToConsole": "我已保存，进入控制台"
+    }
+  },
   "providers": {
     "addProvider": "添加供应商"
   },
@@ -36,18 +43,8 @@
     "validation": {
       "invalidEmail": "邮箱格式无效"
     },
-    "saleMarketKind": {
-      "title": "Market 类型",
-      "token": "Token Market",
-      "share": "Share Market"
-    },
     "market": {
       "allSelected": "已选中所有 Market"
-    },
-    "accountMarket": {
-      "title": "Share Market",
-      "select": "选择 Share Market",
-      "required": "请选择一个 Share Market"
     },
     "permanent": "永久",
     "expiration": "到期",
@@ -118,7 +115,12 @@
       "description": "providers、shares、ui-settings 等持久化文件所在目录。监听地址与端口由进程启动参数决定。"
     },
     "serverSecurity": {
-      "currentPasswordRequired": "请输入当前密码"
+      "currentPasswordRequired": "请输入当前密码",
+      "inferenceTokenRotated": "推理 Token 已轮换",
+      "inferenceTokenTitle": "Claude 推理 Token",
+      "inferenceTokenDescription": "用于本机 Claude API 请求，与管理员登录权限隔离",
+      "rotateInferenceToken": "轮换 Token",
+      "rotateInferenceTokenConfirm": "确定轮换推理 Token？现有客户端将立即无法继续认证。"
     },
     "share": {
       "health": {

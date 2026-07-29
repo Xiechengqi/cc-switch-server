@@ -71,11 +71,23 @@ export interface ManagedAuthSubscriptionExpiry {
   kind: "subscription" | "recurring_billing_period" | "billing_period" | null;
 }
 
+export type CodexOAuthAccountSelectionStatus =
+  | "unconfigured"
+  | "ready"
+  | "needs_selection";
+
+export interface CodexOAuthAccountSelection {
+  status: CodexOAuthAccountSelectionStatus;
+  accountCount: number;
+  activeAccountId?: string | null;
+}
+
 export interface ManagedAuthStatus {
   provider: ManagedAuthProvider;
   authenticated: boolean;
   default_account_id: string | null;
   migration_error?: string | null;
+  codex_oauth?: CodexOAuthAccountSelection | null;
   accounts: ManagedAuthAccount[];
 }
 

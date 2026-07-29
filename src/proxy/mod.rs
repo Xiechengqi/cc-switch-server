@@ -14,6 +14,7 @@ mod forwarder;
 mod grok;
 pub(crate) mod kiro;
 mod outbound_identity;
+mod overflow_compact;
 pub(crate) mod provider_ops;
 pub(crate) mod reasoning_bridge;
 mod remote_image;
@@ -32,9 +33,14 @@ mod usage;
 use serde_json::Value;
 
 pub use forwarder::forward;
+pub use forwarder::forward_codex_alpha_search;
+pub use forwarder::forward_codex_models_manifest;
 pub use forwarder::forward_codex_responses_ws;
 pub use forwarder::forward_grok_media;
+pub use forwarder::forward_images_edits;
 pub use forwarder::forward_images_generations;
+pub(crate) use request_governance::decode_request_body_for_proxy_with_limit;
+pub(crate) use router::ensure_codex_oauth_active_account;
 pub use router::ProxyRoute;
 
 pub const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
@@ -70,6 +76,7 @@ impl std::error::Error for ProxyError {}
 impl ProxyError {
     const TOOL_JSON_INVALID_PREFIX: &'static str = "[TOOL_JSON_INVALID] ";
     const TOOL_JSON_INCOMPLETE_PREFIX: &'static str = "[TOOL_JSON_INCOMPLETE] ";
+    const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
 
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
@@ -90,6 +97,13 @@ impl ProxyError {
         Self {
             status: axum::http::StatusCode::CONFLICT,
             message: message.into(),
+        }
+    }
+
+    pub(super) fn cursor_session_lost(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!("{}{}", Self::CURSOR_SESSION_LOST_PREFIX, message.into()),
         }
     }
 
@@ -123,6 +137,7 @@ impl ProxyError {
         message
             .strip_prefix(Self::TOOL_JSON_INVALID_PREFIX)
             .or_else(|| message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
+            .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
             .unwrap_or(message)
     }
 
@@ -146,6 +161,9 @@ impl ProxyError {
         }
         if message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX) {
             return "TOOL_JSON_INCOMPLETE";
+        }
+        if message.starts_with(Self::CURSOR_SESSION_LOST_PREFIX) {
+            return "cursor_session_lost";
         }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "cc_switch_invalid_request",

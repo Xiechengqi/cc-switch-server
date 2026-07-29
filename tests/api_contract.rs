@@ -29,12 +29,18 @@ use cc_switch_server::api::{
     control_signature, control_signature_for_method, refresh_share_usage_items,
 };
 use cc_switch_server::cli::Cli;
+use cc_switch_server::clients::oauth::cursor::{
+    CursorApiKeyVerifier, CursorPublicApiError, VerifiedCursorApiKey,
+};
 use cc_switch_server::domain::accounts::store::{
     AccountQuota, AccountRefreshUpdate, UpsertAccountInput,
 };
 use cc_switch_server::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
 use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
+};
+use cc_switch_server::domain::sharing::router_contract::{
+    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch,
 };
 use cc_switch_server::domain::sharing::shares::{ShareBinding, UpsertShareInput};
 use cc_switch_server::domain::usage::store::{
@@ -43,6 +49,24 @@ use cc_switch_server::domain::usage::store::{
 use cc_switch_server::state::{ServerState, ServerStateInner};
 
 const TEST_INFERENCE_TOKEN: &str = "test-inference-token-0123456789";
+
+#[derive(Debug)]
+struct AcceptCursorApiKeyVerifier;
+
+#[async_trait::async_trait]
+impl CursorApiKeyVerifier for AcceptCursorApiKeyVerifier {
+    async fn verify(
+        &self,
+        _client: &reqwest::Client,
+        _api_key: &str,
+    ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
+        Ok(VerifiedCursorApiKey {
+            account_id: "cursor_apikey_contract_fixture".to_string(),
+            email: Some("fixture@example.com".to_string()),
+            profile: json!({"source": "api_contract_fixture"}),
+        })
+    }
+}
 
 struct StreamDropCounter(Arc<AtomicUsize>);
 
@@ -527,6 +551,58 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
         .as_str()
         .unwrap()
         .contains("replay control request"));
+}
+
+#[tokio::test]
+async fn ordinary_share_settings_entrypoint_rejects_managed_grants() {
+    let state = test_state();
+    let share = state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-managed-boundary",
+                    "provider-managed-boundary",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let error = state
+        .apply_share_settings_patch_immediate(
+            &share.id,
+            ShareSettingsPatch {
+                managed_grant: Some(ShareManagedGrantOperation {
+                    operation_id: "forged-managed-operation".to_string(),
+                    entitlement_id: "forged-entitlement".to_string(),
+                    share_sequence: 1,
+                    expected_config_revision: share.config_revision,
+                    action: ShareManagedGrantAction::Revoke,
+                    email: "renter@example.com".to_string(),
+                    policy: None,
+                }),
+                ..ShareSettingsPatch::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("reserved for Router Share Market"));
+    let has_managed_grant = state
+        .mutate_shares_immediate(|store| {
+            store
+                .get(&share.id)
+                .unwrap()
+                .user_grants
+                .values()
+                .any(|grant| grant.entitlement_id.is_some())
+        })
+        .await
+        .unwrap();
+    assert!(!has_managed_grant);
 }
 
 #[tokio::test]
@@ -1645,104 +1721,6 @@ async fn remote_manual_codex_login_uses_fixed_localhost_redirect_and_https_gate(
         .insert("origin", "https://client.example".parse().unwrap());
     let response = app.oneshot(unsigned_submit).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn share_market_grant_route_updates_snapshot_and_can_clear_status() {
-    let state = test_state();
-    upsert_test_provider(
-        &state,
-        AppKind::Codex,
-        Provider {
-            id: "p1".to_string(),
-            name: "Grant Provider".to_string(),
-            settings_config: json!({
-                "env": {
-                    "OPENAI_BASE_URL": "https://api.openai.com",
-                    "OPENAI_API_KEY": "grant-test-secret"
-                }
-            }),
-            category: None,
-            meta: None,
-            extra: Default::default(),
-        },
-    )
-    .await;
-    let app = app_router(state.clone());
-    let token = setup_and_login(&app).await;
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/shares",
-            json!({
-                "id": "share-grant",
-                "app": "codex",
-                "providerId": "p1",
-                "providerType": "codex",
-                "displayName": "Grant Test"
-            }),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/shares/share-grant/market-grant",
-            json!({
-                "marketGrant": {
-                    "status": "Applied",
-                    "grantId": "grant-1",
-                    "lastError": ""
-                }
-            }),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-
-    assert_eq!(body["share"]["marketGrant"]["status"], "applied");
-    assert_eq!(body["share"]["marketGrant"]["grantId"], "grant-1");
-    assert!(body["share"]["marketGrant"]["lastError"].is_null());
-    assert!(body["share"]["marketGrant"]["updatedAtMs"].is_u64());
-    assert_eq!(
-        body["share"]["runtimeSnapshot"]["marketGrant"]["status"],
-        "applied"
-    );
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/shares/share-grant/market-grant",
-            json!({"marketGrant": {"status": "unknown"}}),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/shares/share-grant/market-grant",
-            json!({"marketGrant": null}),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert!(body["share"]["marketGrant"].is_null());
-    assert!(body["share"]["runtimeSnapshot"]["marketGrant"].is_null());
 }
 
 #[tokio::test]
@@ -4833,7 +4811,6 @@ async fn provider_share_settings_are_saved_atomically() {
                     "subdomain": "after-save",
                     "description": "Provider-scoped share",
                     "forSale": "Yes",
-                    "saleMarketKind": "token",
                     "marketAccessMode": "selected",
                     "sharedWithEmails": ["friend@example.com"],
                     "accessByApp": {
@@ -4845,7 +4822,6 @@ async fn provider_share_settings_are_saved_atomically() {
                     "appSettings": {
                         "codex": {
                             "forSale": "Yes",
-                            "saleMarketKind": "token",
                             "marketAccessMode": "selected",
                             "sharedWithEmails": ["friend@example.com"],
                             "tokenLimit": 123,
@@ -4872,7 +4848,6 @@ async fn provider_share_settings_are_saved_atomically() {
     assert_eq!(saved["tunnelSubdomain"].as_str(), Some("after-save"));
     assert_eq!(saved["description"].as_str(), Some("Provider-scoped share"));
     assert_eq!(saved["forSale"].as_bool(), Some(true));
-    assert_eq!(saved["saleMarketKind"].as_str(), Some("token"));
     assert_eq!(saved["tokenLimit"].as_u64(), Some(123));
     assert_eq!(saved["parallelLimit"].as_u64(), Some(4));
     assert_eq!(
@@ -4919,7 +4894,6 @@ async fn provider_share_settings_are_saved_atomically() {
                         "subdomain": "stale-save",
                         "description": "stale editor",
                         "forSale": "No",
-                        "saleMarketKind": "token",
                         "marketAccessMode": "selected",
                         "sharedWithEmails": [],
                         "accessByApp": {},
@@ -6102,7 +6076,7 @@ async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
         provider_registry, CreationPolicy, CredentialPolicy,
     };
 
-    let state = test_state();
+    let state = test_state_with_cursor_api_key_verifier();
     let mut managed_types = provider_registry()
         .profiles
         .iter()
@@ -6848,6 +6822,220 @@ async fn provider_identity_actions_and_account_binding_migration_are_previewed_a
 }
 
 #[tokio::test]
+async fn codex_active_account_selection_is_exposed_and_enforced_by_provider_writes() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            for (account_id, workspace_id) in [
+                ("api-codex-account-a", "api-workspace-a"),
+                ("api-codex-account-b", "api-workspace-b"),
+            ] {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "codex_oauth",
+                        "accessToken": format!("{account_id}-token"),
+                        "tokenType": "Bearer",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": format!("{account_id}-subject"),
+                                "chatgpt_account_id": workspace_id
+                            },
+                            "codexWorkspaceProvenance": {
+                                "workspaceId": workspace_id,
+                                "source": "test_fixture"
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                );
+            }
+        })
+        .await
+        .unwrap();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let accounts = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/accounts",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accounts.status(), StatusCode::OK);
+    let accounts = json_body(accounts).await;
+    assert_eq!(accounts["codexOauth"]["status"], "needs_selection");
+    assert_eq!(accounts["codexOauth"]["accountCount"], 2);
+    assert!(accounts["codexOauth"].get("activeAccountId").is_none());
+
+    let selected = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/codex/active",
+            json!({"accountId": "api-codex-account-b"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::OK);
+    let selected = json_body(selected).await;
+    assert_eq!(selected["account"]["id"], "api-codex-account-b");
+    assert_eq!(selected["codexOauth"]["status"], "ready");
+    assert_eq!(
+        selected["codexOauth"]["activeAccountId"],
+        "api-codex-account-b"
+    );
+
+    let inactive_provider = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/from-preset",
+            json!({
+                "app": "codex",
+                "profileId": "codex.openai_oauth",
+                "clientRequestId": "inactive-codex-provider-create",
+                "accountId": "api-codex-account-a"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(inactive_provider.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(inactive_provider).await["code"],
+        "cc_switch_codex_inactive_account"
+    );
+}
+
+#[tokio::test]
+async fn codex_banked_reset_and_manual_refresh_reject_non_active_accounts_without_outbound_io() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "banked-reset-codex-a",
+                ProviderType::CodexOAuth,
+            ));
+            accounts.upsert(test_account_input(
+                "banked-reset-codex-b",
+                ProviderType::CodexOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let outbound_requests = Arc::new(AtomicUsize::new(0));
+    let observed_requests = Arc::clone(&outbound_requests);
+    let proxy_task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            observed_requests.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 2_048];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+    *state.http_client.write().await = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(proxy_url).unwrap())
+        .build()
+        .unwrap();
+
+    let needs_selection = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/codex_banked_reset_consume",
+            json!({"creditId": "credit-a"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(needs_selection.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(needs_selection).await["code"],
+        "cc_switch_codex_inactive_account"
+    );
+
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.select_active_codex_oauth_account("banked-reset-codex-b")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    for uri in [
+        "/web-api/invoke/codex_banked_reset_consume",
+        "/api/accounts/banked-reset-codex-a/refresh",
+    ] {
+        let body = if uri.contains("banked_reset") {
+            json!({
+                "accountId": "banked-reset-codex-a",
+                "creditId": "credit-a"
+            })
+        } else {
+            Value::Null
+        };
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, uri, body, Some(&token)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+        assert_eq!(
+            json_body(response).await["code"],
+            "cc_switch_codex_inactive_account",
+            "{uri}"
+        );
+    }
+
+    assert_eq!(outbound_requests.load(Ordering::SeqCst), 0);
+    proxy_task.abort();
+}
+
+#[tokio::test]
+async fn models_routes_dispatch_codex_manifest_only_for_codex_client_requests() {
+    let app = app_router(test_state());
+
+    for path in ["/v1/models", "/models"] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, path, Value::Null, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(json_body(response).await["object"], "list", "{path}");
+    }
+
+    for path in [
+        "/v1/models?client_version=0.144.1",
+        "/models?client_version=0.144.1",
+        "/backend-api/codex/models?client_version=0.144.1",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, path, Value::Null, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn account_delete_preview_blocks_bound_account() {
     let state = test_state();
     state
@@ -7229,6 +7417,34 @@ async fn client_web_streams_require_authorization_headers() {
 
 fn test_state() -> ServerState {
     test_state_with_host(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn test_state_with_cursor_api_key_verifier() -> ServerState {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let config_dir =
+        std::env::temp_dir().join(format!("cc-switch-server-http-cursor-test-{nanos}"));
+    let mut config = cc_switch_server::domain::settings::config::ServerConfig::empty();
+    config.set_inference_token(TEST_INFERENCE_TOKEN).unwrap();
+    config.save(&config_dir).unwrap();
+    let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
+        cc_switch_server::logging::RING_BUFFER_CAPACITY,
+    ));
+    ServerStateInner::load_with_cursor_api_key_verifier(
+        Cli {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: Some(config_dir),
+            web_dist_dir: None,
+            log_level: "warn".to_string(),
+            command: None,
+        },
+        log_capture,
+        Arc::new(AcceptCursorApiKeyVerifier),
+    )
+    .unwrap()
 }
 
 fn test_state_with_host(host: IpAddr) -> ServerState {
@@ -9338,6 +9554,7 @@ fn is_direct_inference_test_uri(uri: &str) -> bool {
         path,
         "/v1/models"
             | "/models"
+            | "/backend-api/codex/models"
             | "/v1/messages"
             | "/claude/v1/messages"
             | "/v1/messages/count_tokens"
@@ -9356,6 +9573,11 @@ fn is_direct_inference_test_uri(uri: &str) -> bool {
             | "/codex/v1/responses/compact"
             | "/backend-api/codex/responses"
             | "/backend-api/codex/responses/compact"
+            | "/v1/responses/input_tokens"
+            | "/responses/input_tokens"
+            | "/alpha/search"
+            | "/v1/alpha/search"
+            | "/backend-api/codex/alpha/search"
             | "/v1/images/generations"
             | "/images/generations"
             | "/v1/images/edits"
@@ -9519,7 +9741,6 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
         expires_at: None,
         for_sale: None,
         free_access: None,
-        sale_market_kind: None,
         access_by_app: BTreeMap::new(),
         app_settings: BTreeMap::new(),
         for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -9528,7 +9749,6 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
         description: None,
         bindings: Vec::new(),
         runtime_snapshot: None,
-        market_grant: None,
         user_grants: BTreeMap::new(),
     }
 }

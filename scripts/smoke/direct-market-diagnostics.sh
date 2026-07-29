@@ -125,12 +125,10 @@ function pick(value) {
       providerType: share.providerType,
       status: share.status,
       routerUrl: share.routerUrl,
-      marketGrant: share.marketGrant,
       runtimeSnapshot: share.runtimeSnapshot && {
         health: share.runtimeSnapshot.health,
         providerType: share.runtimeSnapshot.providerType,
-        quotaPercent: share.runtimeSnapshot.quotaPercent,
-        marketGrant: share.runtimeSnapshot.marketGrant
+        quotaPercent: share.runtimeSnapshot.quotaPercent
       }
     }));
   }

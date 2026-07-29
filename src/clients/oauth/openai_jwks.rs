@@ -11,6 +11,7 @@ const DEFAULT_OPENAI_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_OPENAI_ACCESS_TOKEN_AUDIENCE: &str = "https://api.openai.com/v1";
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_JWKS_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiJwtError {
@@ -205,7 +206,7 @@ async fn cached_key(kid: &str) -> Option<Jwk> {
 }
 
 async fn refresh_jwks(http: &reqwest::Client) -> Result<(), OpenAiJwtError> {
-    let response = http
+    let mut response = http
         .get(openai_jwks_url())
         .timeout(Duration::from_secs(10))
         .send()
@@ -215,9 +216,11 @@ async fn refresh_jwks(http: &reqwest::Client) -> Result<(), OpenAiJwtError> {
     if !status.is_success() {
         return Err(OpenAiJwtError::Fetch(format!("HTTP {status}")));
     }
-    let set = response
-        .json::<JwkSet>()
-        .await
+    let body =
+        crate::infra::http::read_response_body_limited(&mut response, MAX_JWKS_RESPONSE_BODY_BYTES)
+            .await
+            .map_err(|error| OpenAiJwtError::Fetch(error.to_string()))?;
+    let set = serde_json::from_slice::<JwkSet>(&body)
         .map_err(|error| OpenAiJwtError::Fetch(error.to_string()))?;
     if set.keys.is_empty() {
         return Err(OpenAiJwtError::Fetch("empty key set".to_string()));
@@ -230,42 +233,19 @@ async fn refresh_jwks(http: &reqwest::Client) -> Result<(), OpenAiJwtError> {
 }
 
 fn openai_jwks_url() -> String {
-    std::env::var("CC_SWITCH_OPENAI_JWKS_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_OPENAI_JWKS_URL.to_string())
+    DEFAULT_OPENAI_JWKS_URL.to_string()
 }
 
 fn openai_issuer() -> String {
-    std::env::var("CC_SWITCH_OPENAI_TOKEN_ISSUER")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_OPENAI_ISSUER.to_string())
+    DEFAULT_OPENAI_ISSUER.to_string()
 }
 
 fn openai_client_id() -> String {
-    std::env::var("CODEX_OAUTH_CLIENT_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_OPENAI_CLIENT_ID.to_string())
+    DEFAULT_OPENAI_CLIENT_ID.to_string()
 }
 
 fn openai_access_token_audiences() -> Vec<String> {
-    std::env::var("CC_SWITCH_OPENAI_ACCESS_TOKEN_AUDIENCES")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| vec![DEFAULT_OPENAI_ACCESS_TOKEN_AUDIENCE.to_string()])
+    vec![DEFAULT_OPENAI_ACCESS_TOKEN_AUDIENCE.to_string()]
 }
 
 #[cfg(test)]
@@ -317,6 +297,17 @@ mod tests {
         assert!(validation.validate_exp);
         assert!(validation.validate_aud);
         assert!(validation.required_spec_claims.contains("aud"));
+        assert_eq!(
+            openai_access_token_audiences(),
+            vec![DEFAULT_OPENAI_ACCESS_TOKEN_AUDIENCE.to_string()]
+        );
+    }
+
+    #[test]
+    fn trust_policy_is_pinned_to_openai_production() {
+        assert_eq!(openai_jwks_url(), DEFAULT_OPENAI_JWKS_URL);
+        assert_eq!(openai_issuer(), DEFAULT_OPENAI_ISSUER);
+        assert_eq!(openai_client_id(), DEFAULT_OPENAI_CLIENT_ID);
         assert_eq!(
             openai_access_token_audiences(),
             vec![DEFAULT_OPENAI_ACCESS_TOKEN_AUDIENCE.to_string()]

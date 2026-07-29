@@ -80,6 +80,7 @@ impl SetupOutcome {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_provision(
         config: &ServerConfig,
         claim_status: &str,

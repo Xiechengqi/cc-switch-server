@@ -9,7 +9,9 @@ use zeroize::Zeroize;
 
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
 use crate::domain::accounts::oauth::oauth_provider_spec;
-use crate::domain::accounts::store::{effective_codex_workspace_id, Account, AccountStore};
+use crate::domain::accounts::store::{
+    effective_codex_workspace_id, Account, AccountStore, CodexOAuthAccountSelectionStatus,
+};
 use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::registry::{
     provider_registry, AuthScheme, OperationSupport, UpstreamProtocol,
@@ -334,6 +336,9 @@ impl ProviderExecution {
                 expected_provider_type,
                 auth_identity_generation,
             } => {
+                if *expected_provider_type == ProviderType::CodexOAuth {
+                    ensure_codex_managed_account_active(accounts, account_id)?;
+                }
                 let account = exact_account(accounts, account_id).ok_or_else(|| {
                     ProxyError::bad_request(format!("bound account {account_id} does not exist"))
                 })?;
@@ -638,6 +643,37 @@ impl ProviderExecution {
             .stream_idle_timeout_ms
             .map(std::time::Duration::from_millis)
     }
+}
+
+fn ensure_codex_managed_account_active(
+    accounts: &AccountStore,
+    account_id: &str,
+) -> Result<(), ProxyError> {
+    let selection = accounts.codex_oauth_selection();
+    let Some(active_account_id) = selection.active_account_id.as_deref() else {
+        let message = match selection.status {
+            CodexOAuthAccountSelectionStatus::Unconfigured => {
+                "Codex OAuth account is not configured"
+            }
+            CodexOAuthAccountSelectionStatus::NeedsSelection => {
+                "multiple Codex OAuth accounts exist; select the active account before using managed credentials"
+            }
+            CodexOAuthAccountSelectionStatus::Ready => {
+                "Codex OAuth active account is unavailable"
+            }
+        };
+        return Err(ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.to_string(),
+        });
+    };
+    if active_account_id != account_id {
+        return Err(ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("Codex OAuth account {account_id} is not active"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1334,6 +1370,7 @@ mod tests {
         let error = stale_identity
             .materialize_auth(&AccountStore {
                 accounts: vec![account],
+                ..Default::default()
             })
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
@@ -1567,6 +1604,7 @@ mod tests {
         .unwrap();
         let accounts = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
         let mut client_headers = HeaderMap::new();
         client_headers.insert(

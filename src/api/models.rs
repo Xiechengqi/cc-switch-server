@@ -83,6 +83,7 @@ pub(in crate::api) fn openai_model_list(
                     .iter()
                     .map(|capability| capability.id.to_string()),
             );
+            provider_models.extend(crate::proxy::codex_models::manifest_model_ids(provider));
         }
         for model_id in dedupe_non_empty(provider_models) {
             let capability = (provider.app == AppKind::Codex)

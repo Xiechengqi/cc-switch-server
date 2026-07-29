@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant};
@@ -10,6 +10,8 @@ use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::header::{ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
@@ -47,9 +49,9 @@ use super::deepseek;
 use super::kiro;
 use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
-    content_encoding_value, decode_request_body_for_proxy,
-    decode_request_body_for_proxy_with_limit, decode_response_body_for_proxy,
-    decode_response_body_for_proxy_with_limit, ResponseDecodeResult,
+    content_encoding_value, decode_request_body_for_proxy_with_limit,
+    decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
+    ResponseDecodeResult,
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesSseInspector, SemanticFailure, SemanticObservation,
@@ -59,8 +61,8 @@ use super::router::{
     account_concurrency_for_provider, codex_image_generation_provider,
     ensure_provider_account_does_not_need_relogin, ensure_provider_account_usage_available,
     provider_supports_claude_count_tokens, select_exact_provider_with_account_inflight,
-    select_failover_provider, select_failover_provider_matching,
-    select_provider_for_codex_image_generation, select_provider_with_account_inflight, ProxyRoute,
+    select_failover_provider, select_provider_for_codex_image_generation,
+    select_provider_with_account_inflight, ProxyRoute,
 };
 use super::streaming::{ClaudeSseError, ClaudeSseErrorDetector, StreamUsageAccumulator};
 use super::usage::{log_usage, update_stream_usage};
@@ -73,11 +75,21 @@ const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_CONNECTIONS: usize = 64;
+const DEFAULT_CODEX_WEBSOCKET_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_IDLE_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_AGE_MS: u64 = 55 * 60 * 1000;
 const MAX_CODEX_HTTP_FALLBACK_SSE_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES: usize = 32;
 const MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES: usize = 1024 * 1024;
+const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const CODEX_RESPONSES_LITE_WS_METADATA: &str =
+    "ws_request_header_x_openai_internal_codex_responses_lite";
+const CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const CODEX_ALPHA_SEARCH_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const CODEX_OVERFLOW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+const PROXY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+const PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 type ResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -194,6 +206,47 @@ fn responses_websocket_pool() -> &'static StdMutex<ResponsesWebSocketPool> {
     POOL.get_or_init(|| StdMutex::new(ResponsesWebSocketPool::default()))
 }
 
+struct ResponsesDownstreamConnectionGuard;
+
+fn responses_downstream_connections() -> &'static AtomicUsize {
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    &ACTIVE
+}
+
+fn acquire_responses_downstream_connection(
+) -> Result<ResponsesDownstreamConnectionGuard, ProxyError> {
+    let limit = std::env::var("CC_SWITCH_CODEX_WS_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CODEX_WEBSOCKET_MAX_CONNECTIONS)
+        .clamp(1, 4096);
+    let active = responses_downstream_connections();
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return Err(ProxyError::rate_limited(
+                "responses websocket connection limit has been reached",
+                1,
+            ));
+        }
+        match active.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(ResponsesDownstreamConnectionGuard),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+impl Drop for ResponsesDownstreamConnectionGuard {
+    fn drop(&mut self) {
+        responses_downstream_connections().fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn codex_websocket_cache_max_connections() -> usize {
     std::env::var("CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS")
         .ok()
@@ -229,6 +282,8 @@ struct ForwardAttemptContext {
     body_retry_stage: Option<ClaudeBodyRetryStage>,
     execution: Option<ProviderExecution>,
     auth_refresh_attempted: bool,
+    codex_overflow_compact_attempted: bool,
+    codex_body_override: Option<Bytes>,
     excluded_provider_ids: BTreeSet<String>,
     grok_session_id: Option<String>,
 }
@@ -241,6 +296,8 @@ impl Default for ForwardAttemptContext {
             body_retry_stage: None,
             execution: None,
             auth_refresh_attempted: false,
+            codex_overflow_compact_attempted: false,
+            codex_body_override: None,
             excluded_provider_ids: BTreeSet::new(),
             grok_session_id: None,
         }
@@ -280,6 +337,14 @@ impl ForwardAttemptContext {
         next.excluded_provider_ids
             .insert(failed.stored.provider.id.clone());
         next.auth_refresh_attempted = false;
+        next.codex_body_override = None;
+        next
+    }
+
+    fn after_codex_overflow_compact(&self, execution: &ProviderExecution, body: Bytes) -> Self {
+        let mut next = self.next(execution, self.body_retry_stage);
+        next.codex_overflow_compact_attempted = true;
+        next.codex_body_override = Some(body);
         next
     }
 }
@@ -302,6 +367,581 @@ pub async fn forward(
     .await
 }
 
+struct CodexAuthContext {
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    http_client: reqwest::Client,
+    headers: Vec<(String, String)>,
+    url: String,
+}
+
+async fn select_codex_oauth_surface_execution(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<ProviderExecution, ProxyError> {
+    let request_context = request_context_from_headers(headers);
+    let accounts = state.accounts_snapshot().await;
+    let providers = state.providers.read().await;
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+        let shares = state.shares.read().await.clone();
+        select_share_execution(&providers, &shares, &accounts, AppKind::Codex, share_id)?.0
+    } else {
+        let ui_settings = state.ui_settings.read().await.for_frontend();
+        let configured_provider_id =
+            current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
+        super::router::select_provider(
+            &providers,
+            &accounts,
+            AppKind::Codex,
+            headers,
+            configured_provider_id.as_deref(),
+        )?
+        .execution
+    };
+    if !execution.driver_is("oauth.openai_codex") {
+        return Err(ProxyError::bad_request(
+            "this endpoint requires the current provider to be codex_oauth",
+        ));
+    }
+    Ok(execution)
+}
+
+async fn materialize_codex_auth_context(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    client_headers: &HeaderMap,
+    endpoint: String,
+) -> Result<CodexAuthContext, ProxyError> {
+    ensure_managed_credential_persistence_available(state, execution)?;
+    refresh_execution_managed_account_if_needed(state, execution).await?;
+    ensure_managed_credential_persistence_available(state, execution)?;
+    let stored = execution.runtime_stored_view();
+    let accounts = state.accounts_snapshot().await;
+    super::router::ensure_codex_oauth_active_account(&stored, &accounts)?;
+    let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
+    let mut headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
+    append_codex_client_request_headers(&mut headers, client_headers, false);
+    crate::codex_identity::finalize_headers(&mut headers);
+    let mut headers = owned_headers(headers);
+    let mut url = endpoint;
+    let materialized_auth = execution.materialize_auth(&accounts)?;
+    execution.apply_auth(&mut headers, &mut url, materialized_auth.as_ref())?;
+    apply_account_header_overrides(&mut headers, &stored, &accounts)?;
+    execution.finalize_outbound_identity(&mut headers)?;
+    Ok(CodexAuthContext {
+        execution: execution.clone(),
+        http_client: forward_http_client(state, &stored).await?,
+        stored,
+        headers,
+        url,
+    })
+}
+
+async fn force_refresh_codex_auth_context(
+    state: &ServerState,
+    execution: &ProviderExecution,
+) -> Result<(), ProxyError> {
+    let (provider_type, account_id) = execution.managed_account_target().ok_or_else(|| {
+        ProxyError::bad_request("codex_oauth provider is missing a managed account binding")
+    })?;
+    state
+        .refresh_managed_account_now(provider_type, Some(account_id))
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)?;
+    ensure_managed_credential_persistence_available(state, execution)
+}
+
+pub async fn forward_codex_models_manifest(
+    state: ServerState,
+    headers: HeaderMap,
+    client_version: Option<String>,
+) -> Result<Response, ProxyError> {
+    let request_context = request_context_from_headers(&headers);
+    let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
+        Some(
+            validate_and_acquire_share_invocation(
+                &state,
+                share_id,
+                request_context.user_email.as_deref(),
+            )
+            .await?
+            .1,
+        )
+    } else {
+        None
+    };
+    let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
+    let accounts = state.accounts_snapshot().await;
+    let snapshot = state.account_in_flight.snapshot();
+    let _account_in_flight_guard =
+        acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
+    let endpoint = codex_models_manifest_url(&execution);
+    let version = client_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::codex_identity::configured_version);
+    let mut auth_refresh_attempted = false;
+    loop {
+        let context =
+            materialize_codex_auth_context(&state, &execution, &headers, endpoint.clone()).await?;
+        let mut url = url::Url::parse(&context.url).map_err(|error| {
+            ProxyError::bad_gateway(format!("invalid Codex models URL: {error}"))
+        })?;
+        url.query_pairs_mut()
+            .append_pair("client_version", &version);
+        let mut request = context
+            .http_client
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .header("accept-encoding", "identity")
+            .header("version", &version)
+            .timeout(Duration::from_secs(15));
+        if let Some(etag) = optional_header(&headers, "if-none-match") {
+            request = request.header("if-none-match", etag);
+        }
+        for (name, value) in &context.headers {
+            request = request.header(name, value);
+        }
+        let mut upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
+        if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
+            drop(upstream);
+            force_refresh_codex_auth_context(&state, &execution).await?;
+            auth_refresh_attempted = true;
+            continue;
+        }
+        if upstream.status() == StatusCode::UNAUTHORIZED {
+            mark_managed_account_auth_cooldown(
+                &state,
+                &execution,
+                "models_unauthorized_after_refresh",
+            )
+            .await;
+        }
+        let status = upstream.status();
+        let response_headers = upstream.headers().clone();
+        let content_encoding = content_encoding_value(&response_headers);
+        let decoded = if status == StatusCode::NOT_MODIFIED {
+            ResponseDecodeResult {
+                body: Bytes::new(),
+                preserve_content_encoding: false,
+            }
+        } else {
+            let body = crate::infra::http::read_response_body_limited(
+                &mut upstream,
+                CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES,
+            )
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+            decode_response_body_for_proxy_with_limit(
+                &response_headers,
+                body,
+                CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES,
+            )?
+        };
+        if status.is_success() && !decoded.preserve_content_encoding {
+            super::codex_models::update_manifest_models(
+                &execution.runtime_stored_view(),
+                &decoded.body,
+            );
+        }
+        let mut response = Response::new(Body::from(decoded.body));
+        *response.status_mut() = status;
+        if let Some(etag) = response_headers.get("etag").cloned() {
+            response.headers_mut().insert("etag", etag);
+        }
+        if let Some(content_type) = response_headers.get(CONTENT_TYPE).cloned() {
+            response.headers_mut().insert(CONTENT_TYPE, content_type);
+        } else {
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+        if decoded.preserve_content_encoding {
+            if let Some(content_encoding) = content_encoding {
+                response
+                    .headers_mut()
+                    .insert(CONTENT_ENCODING, content_encoding);
+            }
+        }
+        copy_safe_upstream_response_headers(&response_headers, &mut response);
+        return Ok(response);
+    }
+}
+
+pub async fn forward_codex_alpha_search(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    let body = prepare_codex_alpha_search_body(&headers, body)?;
+    let request_context = request_context_from_headers(&headers);
+    let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
+        Some(
+            validate_and_acquire_share_invocation(
+                &state,
+                share_id,
+                request_context.user_email.as_deref(),
+            )
+            .await?
+            .1,
+        )
+    } else {
+        None
+    };
+    let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
+    let accounts = state.accounts_snapshot().await;
+    let snapshot = state.account_in_flight.snapshot();
+    let _account_in_flight_guard =
+        acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
+    let endpoint = codex_alpha_search_url(&execution);
+    let mut auth_refresh_attempted = false;
+    loop {
+        let context =
+            materialize_codex_auth_context(&state, &execution, &headers, endpoint.clone()).await?;
+        let mut request = context
+            .http_client
+            .post(&context.url)
+            .header(ACCEPT, "application/json")
+            .header("accept-encoding", "identity")
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .timeout(Duration::from_secs(120));
+        for (name, value) in &context.headers {
+            request = request.header(name, value);
+        }
+        let mut upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
+        if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
+            drop(upstream);
+            force_refresh_codex_auth_context(&state, &execution).await?;
+            auth_refresh_attempted = true;
+            continue;
+        }
+        if upstream.status() == StatusCode::UNAUTHORIZED {
+            mark_managed_account_auth_cooldown(
+                &state,
+                &execution,
+                "alpha_search_unauthorized_after_refresh",
+            )
+            .await;
+        }
+        let status = upstream.status();
+        let response_headers = upstream.headers().clone();
+        let content_encoding = content_encoding_value(&response_headers);
+        let response_body = crate::infra::http::read_response_body_limited(
+            &mut upstream,
+            CODEX_ALPHA_SEARCH_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+        .map_err(ProxyError::bad_gateway)?;
+        let decoded = decode_response_body_for_proxy_with_limit(
+            &response_headers,
+            response_body,
+            CODEX_ALPHA_SEARCH_RESPONSE_BODY_LIMIT_BYTES,
+        )?;
+        maybe_mark_upstream_rate_limited(
+            &state,
+            &context.execution,
+            status,
+            &response_headers,
+            &decoded.body,
+        )
+        .await;
+        record_provider_outcome(
+            &state,
+            &context.stored,
+            provider_outcome_from_status(status.as_u16()),
+        )
+        .await;
+        record_share_invocation_result(
+            &state,
+            request_context.share_id.as_deref(),
+            request_context.user_email.as_deref(),
+            TokenUsage::default(),
+        )
+        .await;
+        let mut response = Response::new(Body::from(decoded.body));
+        *response.status_mut() = status;
+        if let Some(content_type) = response_headers.get(CONTENT_TYPE).cloned() {
+            response.headers_mut().insert(CONTENT_TYPE, content_type);
+        }
+        if decoded.preserve_content_encoding {
+            if let Some(content_encoding) = content_encoding {
+                response
+                    .headers_mut()
+                    .insert(CONTENT_ENCODING, content_encoding);
+            }
+        }
+        copy_safe_upstream_response_headers(&response_headers, &mut response);
+        return Ok(response);
+    }
+}
+
+fn prepare_codex_alpha_search_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, ProxyError> {
+    let body =
+        decode_request_body_for_proxy_with_limit(headers, body, PROXY_REQUEST_BODY_LIMIT_BYTES)?;
+    normalize_codex_alpha_search_body(&body)
+}
+
+fn normalize_codex_alpha_search_body(body: &[u8]) -> Result<Bytes, ProxyError> {
+    if body.len() > PROXY_REQUEST_BODY_LIMIT_BYTES {
+        return Err(ProxyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "Codex alpha search request exceeds the 2 MiB limit".to_string(),
+        });
+    }
+    let mut value = serde_json::from_slice::<Value>(body)
+        .map_err(|error| ProxyError::bad_request(format!("invalid alpha search JSON: {error}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("prompt_cache_key");
+    }
+    let body = serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("encode alpha search JSON: {error}")))?;
+    Ok(body)
+}
+
+fn codex_models_manifest_url(_execution: &ProviderExecution) -> String {
+    #[cfg(test)]
+    if let Some(url) = _execution
+        .plan
+        .driver_options
+        .get("testCodexModelsUrl")
+        .and_then(Value::as_str)
+    {
+        return url.to_string();
+    }
+    "https://chatgpt.com/backend-api/codex/models".to_string()
+}
+
+fn codex_alpha_search_url(_execution: &ProviderExecution) -> String {
+    #[cfg(test)]
+    if let Some(url) = _execution
+        .plan
+        .driver_options
+        .get("testCodexAlphaSearchUrl")
+        .and_then(Value::as_str)
+    {
+        return url.to_string();
+    }
+    "https://chatgpt.com/backend-api/codex/alpha/search".to_string()
+}
+
+fn codex_overflow_compact_eligible(
+    route: ProxyRoute,
+    execution: &ProviderExecution,
+    attempt_context: &ForwardAttemptContext,
+) -> bool {
+    if !execution.driver_is("oauth.openai_codex")
+        || !matches!(
+            route,
+            ProxyRoute::CodexResponses | ProxyRoute::CodexChatCompletions
+        )
+        || attempt_context.codex_overflow_compact_attempted
+        || !attempt_context.retry_allowed()
+    {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(enabled) = execution
+        .plan
+        .driver_options
+        .get("testCodexOverflowAutoCompact")
+        .and_then(Value::as_bool)
+    {
+        return enabled;
+    }
+    super::overflow_compact::enabled()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn next_codex_overflow_attempt(
+    state: &ServerState,
+    route: ProxyRoute,
+    execution: &ProviderExecution,
+    stored: &StoredProvider,
+    attempt_context: &ForwardAttemptContext,
+    adapter_request: &adapters::AdapterRequest,
+    http_client: &reqwest::Client,
+    url: &str,
+    target_headers: &[(String, String)],
+    request_context: &UsageLogContext,
+) -> Option<ForwardAttemptContext> {
+    if !codex_overflow_compact_eligible(route, execution, attempt_context) {
+        return None;
+    }
+    let plan = super::overflow_compact::prepare(&adapter_request.body)?;
+    let removed_items = plan.removed_items();
+    let retained_items = plan.retained_items();
+    let summary = match plan.summary_request_body() {
+        Some(summary_body) => {
+            summarize_codex_overflow(
+                state,
+                stored,
+                http_client,
+                url,
+                target_headers,
+                summary_body,
+                request_context,
+            )
+            .await
+        }
+        None => None,
+    };
+    let compacted = plan.finish(summary.as_deref())?;
+    tracing::info!(
+        provider_id = %stored.provider.id,
+        account_id = ?execution.managed_account_id(),
+        removed_items,
+        retained_items,
+        summarized = summary.is_some(),
+        compacted_bytes = compacted.len(),
+        "retrying Codex request after context overflow compaction"
+    );
+    Some(attempt_context.after_codex_overflow_compact(execution, compacted))
+}
+
+async fn summarize_codex_overflow(
+    state: &ServerState,
+    stored: &StoredProvider,
+    http_client: &reqwest::Client,
+    url: &str,
+    target_headers: &[(String, String)],
+    summary_body: Bytes,
+    request_context: &UsageLogContext,
+) -> Option<String> {
+    let summary_body = match normalize_codex_oauth_responses_body_bytes(
+        &summary_body,
+        None,
+        CodexImageToolStripPolicy::Always,
+    ) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!("failed to normalize Codex overflow summary request: {error}");
+            return None;
+        }
+    };
+    let model = serde_json::from_slice::<Value>(&summary_body)
+        .ok()
+        .and_then(|body| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let started = Instant::now();
+    let mut client_headers = HeaderMap::new();
+    client_headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    client_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let call = async {
+        let mut response = build_upstream_post_request(
+            http_client,
+            url,
+            summary_body,
+            &client_headers,
+            target_headers,
+            CODEX_OVERFLOW_SUMMARY_TIMEOUT,
+            true,
+        )
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let body = crate::infra::http::read_response_body_limited(
+            &mut response,
+            CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let body = decode_response_body_for_proxy_with_limit(
+            &response_headers,
+            body,
+            CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+        )
+        .map_err(|error| error.to_string())?
+        .body;
+        Ok::<_, String>((status, body))
+    };
+
+    let (status, body, stream_status) =
+        match tokio::time::timeout(CODEX_OVERFLOW_SUMMARY_TIMEOUT, call).await {
+            Ok(Ok((status, body))) => {
+                let stream_status = if status.is_success() {
+                    "completed"
+                } else {
+                    "upstream_error"
+                };
+                (status.as_u16(), body, stream_status)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("Codex overflow summary request failed: {error}");
+                (
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    Bytes::new(),
+                    "upstream_error",
+                )
+            }
+            Err(_) => {
+                tracing::warn!("Codex overflow summary request timed out");
+                (
+                    StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                    Bytes::new(),
+                    "timeout",
+                )
+            }
+        };
+    let mut usage = StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
+        stored,
+        ProxyRoute::CodexResponses,
+    ));
+    usage.push(&body);
+    let usage = usage.finish();
+    log_usage(
+        state,
+        stored,
+        status,
+        started.elapsed().as_millis(),
+        UsageModelMetadata {
+            model: model.clone(),
+            requested_model: model.clone(),
+            actual_model: model,
+            actual_model_source: Some("codex_overflow_compact_summary".to_string()),
+        },
+        usage,
+        UsageLogContext {
+            share_id: request_context.share_id.clone(),
+            share_name: request_context.share_name.clone(),
+            user_email: request_context.user_email.clone(),
+            session_id: request_context.session_id.clone(),
+            data_source: Some(super::overflow_compact::SUMMARY_DATA_SOURCE.to_string()),
+            user_country: request_context.user_country.clone(),
+            user_country_iso3: request_context.user_country_iso3.clone(),
+            is_streaming: true,
+            stream_status: Some(stream_status.to_string()),
+            ..UsageLogContext::default()
+        },
+    )
+    .await;
+    record_share_supplemental_usage(
+        state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        usage,
+    )
+    .await;
+
+    if status != StatusCode::OK.as_u16() {
+        return None;
+    }
+    let output = super::overflow_compact::extract_summary_output(&body);
+    if output.is_none() {
+        tracing::warn!("Codex overflow summary response contained no text output");
+    }
+    output
+}
+
 async fn forward_with_attempt(
     state: ServerState,
     route: ProxyRoute,
@@ -314,7 +954,11 @@ async fn forward_with_attempt(
     let retry_gemini_path = gemini_path;
     'attempt: loop {
         let gemini_path = retry_gemini_path.clone();
-        let body = decode_request_body_for_proxy(&headers, raw_body_for_retry.clone())?;
+        let body = decode_request_body_for_proxy_with_limit(
+            &headers,
+            raw_body_for_retry.clone(),
+            PROXY_REQUEST_BODY_LIMIT_BYTES,
+        )?;
         let app = route.app();
         let claude_body_retry_stage = attempt_context.body_retry_stage;
         let mut request_context = request_context_from_headers(&headers);
@@ -411,7 +1055,8 @@ async fn forward_with_attempt(
             }
         };
         let stored = execution.runtime_stored_view();
-        ensure_grok_credential_persistence_available(&state, &execution)?;
+        ensure_managed_credential_persistence_available(&state, &execution)?;
+        super::router::ensure_codex_oauth_active_account(&stored, &accounts_for_selection)?;
         validate_codex_allowed_client(
             &stored,
             route,
@@ -439,6 +1084,11 @@ async fn forward_with_attempt(
                 request_context,
                 account_in_flight_guard,
                 share_invocation_guard,
+                timeouts: cursor::h2_client::CursorH2Timeouts {
+                    request: execution.request_timeout(),
+                    first_frame: execution.stream_first_byte_timeout(),
+                    inter_frame: execution.stream_idle_timeout(),
+                },
             })
             .await;
         }
@@ -487,6 +1137,9 @@ async fn forward_with_attempt(
             &copilot_metadata,
         )?;
         let mut adapter_request = adapter_request;
+        let codex_responses_lite = execution.driver_is("oauth.openai_codex")
+            && route == ProxyRoute::CodexResponses
+            && codex_responses_lite_requested(&headers, &adapter_request.body);
         if execution.driver_is("oauth.openai_codex")
             && matches!(
                 route,
@@ -508,9 +1161,21 @@ async fn forward_with_attempt(
                     codex_oauth_session_id.as_deref(),
                     codex_image_tool_strip_policy(&stored),
                 )?;
+                if codex_responses_lite {
+                    adapter_request.body = normalize_codex_responses_lite_body_bytes(
+                        &adapter_request.body,
+                        true,
+                        true,
+                    )?;
+                }
             }
             adapter_request.body =
                 super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
+        }
+        if execution.driver_is("oauth.openai_codex") {
+            if let Some(body) = attempt_context.codex_body_override.clone() {
+                adapter_request.body = body;
+            }
         }
         execution.enforce_model_policy(&mut adapter_request)?;
         let grok_contract = if execution.driver_is("oauth.grok_responses") {
@@ -589,6 +1254,11 @@ async fn forward_with_attempt(
                 let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
                 target_headers.extend(adapter_request.upstream_headers.iter().cloned());
                 if execution.driver_is("oauth.openai_codex") {
+                    append_codex_client_request_headers(
+                        &mut target_headers,
+                        &headers,
+                        codex_responses_lite,
+                    );
                     append_codex_oauth_session_headers(
                         &mut target_headers,
                         codex_oauth_session_id.as_deref(),
@@ -761,6 +1431,7 @@ async fn forward_with_attempt(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let mut content_encoding = content_encoding_value(&response_headers);
+        let mut buffered_upstream_body = None;
 
         if codex_image_tool_strip_policy(&stored) == CodexImageToolStripPolicy::OnError
             && execution.driver_is("oauth.openai_codex")
@@ -771,9 +1442,17 @@ async fn forward_with_attempt(
             && !status.is_success()
             && status != StatusCode::TOO_MANY_REQUESTS
         {
-            let original_bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
-            let original_decoded =
-                decode_response_body_for_proxy(&response_headers, original_bytes);
+            let original_bytes = crate::infra::http::read_response_body_limited(
+                &mut upstream,
+                CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+            )
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+            let original_decoded = decode_response_body_for_proxy_with_limit(
+                &response_headers,
+                original_bytes,
+                CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+            )?;
             if codex_image_tool_rejection_body(&original_decoded.body) {
                 if let Some(retry_body) =
                     codex_image_tool_stripped_body_bytes(&adapter_request.body)?
@@ -887,36 +1566,60 @@ async fn forward_with_attempt(
                     ));
                 }
             } else {
-                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
-                    .await;
-                log_usage(
-                    &state,
-                    &stored,
-                    status_code,
-                    started.elapsed().as_millis(),
-                    model_metadata(&adapter_request),
-                    TokenUsage::default(),
-                    UsageLogContext {
-                        is_streaming: adapter_request.stream_requested,
-                        stream_status: adapter_request
-                            .stream_requested
-                            .then(|| "upstream_error".to_string()),
-                        ..request_context
-                    },
-                )
-                .await;
-                return Ok(decoded_upstream_response(
-                    status,
-                    &response_headers,
-                    content_type,
-                    content_encoding,
-                    original_decoded,
-                ));
+                buffered_upstream_body = Some(original_decoded);
             }
         }
 
+        if status == StatusCode::BAD_REQUEST
+            && codex_overflow_compact_eligible(route, &execution, &attempt_context)
+        {
+            let decoded = match buffered_upstream_body.take() {
+                Some(decoded) => decoded,
+                None => {
+                    let bytes = crate::infra::http::read_response_body_limited(
+                        &mut upstream,
+                        CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+                    )
+                    .await
+                    .map_err(ProxyError::bad_gateway)?;
+                    decode_response_body_for_proxy_with_limit(
+                        &response_headers,
+                        bytes,
+                        CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+                    )?
+                }
+            };
+            if super::overflow_compact::is_context_length_exceeded_body(&decoded.body) {
+                if let Some(next_attempt) = next_codex_overflow_attempt(
+                    &state,
+                    route,
+                    &execution,
+                    &stored,
+                    &attempt_context,
+                    &adapter_request,
+                    &http_client,
+                    &url,
+                    &target_headers,
+                    &request_context,
+                )
+                .await
+                {
+                    attempt_context = next_attempt;
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
+            }
+            buffered_upstream_body = Some(decoded);
+        }
+
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let bytes = match upstream.bytes().await {
+            let bytes = match crate::infra::http::read_response_body_limited(
+                &mut upstream,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            )
+            .await
+            {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     record_provider_outcome(
@@ -944,7 +1647,11 @@ async fn forward_with_attempt(
                     return Err(ProxyError::bad_gateway(error));
                 }
             };
-            let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+            let decoded = decode_response_body_for_proxy_with_limit(
+                &response_headers,
+                bytes,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            )?;
             maybe_mark_upstream_rate_limited(
                 &state,
                 &execution,
@@ -1018,7 +1725,7 @@ async fn forward_with_attempt(
             return Ok(response);
         }
 
-        if adapter_request.stream_requested {
+        if adapter_request.stream_requested && buffered_upstream_body.is_none() {
             let timeouts = StreamTimeoutConfig {
                 first_byte: execution.stream_first_byte_timeout(),
                 idle: execution.stream_idle_timeout(),
@@ -1031,7 +1738,8 @@ async fn forward_with_attempt(
                 adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
                     .unwrap_or_else(|| adapters::downstream_format_for_route(route));
             let inspect_responses_semantics = status.is_success()
-                && response_semantics::semantic_guard_enabled()
+                && (response_semantics::semantic_guard_enabled()
+                    || codex_overflow_compact_eligible(route, &execution, &attempt_context))
                 && upstream_format == UpstreamFormat::OpenAiResponses;
             let inspect_anthropic_semantics = status.is_success()
                 && response_semantics::semantic_guard_enabled()
@@ -1302,6 +2010,33 @@ async fn forward_with_attempt(
                             return Err(ProxyError::bad_gateway(error));
                         }
                         if let Some(SemanticObservation::Failure(failure)) = &semantic_decision {
+                            if !pending_chunk_saw_business_output
+                                && super::overflow_compact::is_context_length_failure(
+                                    &failure.code,
+                                    &failure.message,
+                                )
+                            {
+                                if let Some(next_attempt) = next_codex_overflow_attempt(
+                                    &state,
+                                    route,
+                                    &execution,
+                                    &stored,
+                                    &attempt_context,
+                                    &adapter_request,
+                                    &http_client,
+                                    &url,
+                                    &target_headers,
+                                    &request_context,
+                                )
+                                .await
+                                {
+                                    attempt_context = next_attempt;
+                                    drop(inner);
+                                    drop(account_in_flight_guard);
+                                    drop(share_invocation_guard);
+                                    continue 'attempt;
+                                }
+                            }
                             if failure.origin == FailureOrigin::Provider {
                                 record_provider_outcome(
                                     &state,
@@ -1905,33 +2640,46 @@ async fn forward_with_attempt(
             return Ok(response);
         }
 
-        let bytes = match upstream.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-                if route == ProxyRoute::ClaudeCountTokens {
-                    crate::metrics::record_claude_count_tokens_outcome("network_error");
+        let decoded = if let Some(decoded) = buffered_upstream_body {
+            decoded
+        } else {
+            let bytes = match crate::infra::http::read_response_body_limited(
+                &mut upstream,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                    if route == ProxyRoute::ClaudeCountTokens {
+                        crate::metrics::record_claude_count_tokens_outcome("network_error");
+                    }
+                    if let Some(next_attempt) = next_claude_transport_attempt(
+                        &state,
+                        route,
+                        &headers,
+                        &request_context,
+                        &attempt_context,
+                        &execution,
+                        "body_read_error",
+                    )
+                    .await
+                    {
+                        attempt_context = next_attempt;
+                        drop(account_in_flight_guard);
+                        drop(share_invocation_guard);
+                        continue 'attempt;
+                    }
+                    return Err(ProxyError::bad_gateway(error));
                 }
-                if let Some(next_attempt) = next_claude_transport_attempt(
-                    &state,
-                    route,
-                    &headers,
-                    &request_context,
-                    &attempt_context,
-                    &execution,
-                    "body_read_error",
-                )
-                .await
-                {
-                    attempt_context = next_attempt;
-                    drop(account_in_flight_guard);
-                    drop(share_invocation_guard);
-                    continue 'attempt;
-                }
-                return Err(ProxyError::bad_gateway(error));
-            }
+            };
+            decode_response_body_for_proxy_with_limit(
+                &response_headers,
+                bytes,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            )?
         };
-        let decoded = decode_response_body_for_proxy(&response_headers, bytes);
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
         let next_body_retry_stage = if route == ProxyRoute::ClaudeMessages
@@ -2044,6 +2792,30 @@ async fn forward_with_attempt(
             };
             crate::metrics::record_proxy_semantic_guard("http_document", observation.metric_kind());
             if let SemanticObservation::Failure(failure) = &observation {
+                if super::overflow_compact::is_context_length_failure(
+                    &failure.code,
+                    &failure.message,
+                ) {
+                    if let Some(next_attempt) = next_codex_overflow_attempt(
+                        &state,
+                        route,
+                        &execution,
+                        &stored,
+                        &attempt_context,
+                        &adapter_request,
+                        &http_client,
+                        &url,
+                        &target_headers,
+                        &request_context,
+                    )
+                    .await
+                    {
+                        attempt_context = next_attempt;
+                        drop(account_in_flight_guard);
+                        drop(share_invocation_guard);
+                        continue 'attempt;
+                    }
+                }
                 if failure.origin == FailureOrigin::Provider {
                     record_provider_outcome(
                         &state,
@@ -2164,6 +2936,7 @@ pub async fn forward_codex_responses_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ProxyError> {
+    let downstream_connection_guard = acquire_responses_downstream_connection()?;
     let route = ProxyRoute::CodexResponses;
     let app = route.app();
     let mut request_context = request_context_from_headers(&headers);
@@ -2186,36 +2959,23 @@ pub async fn forward_codex_responses_ws(
     let ui_settings = state.ui_settings.read().await.for_frontend();
     let configured_provider_id =
         current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
-    let (execution, account_in_flight_guard) = if let Some(share_id) =
-        request_context.share_id.as_deref()
-    {
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
         let (execution, _share_name) =
             select_share_execution(&providers, &shares, &accounts_for_selection, app, share_id)?;
-        let snapshot = state.account_in_flight.snapshot();
-        let guard = acquire_account_in_flight(
-            &state,
-            &execution.stored,
-            &accounts_for_selection,
-            &snapshot,
-        )?;
-        (execution, guard)
+        execution
     } else {
-        select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-            select_provider_with_account_inflight(
-                &providers,
-                &accounts_for_selection,
-                app,
-                &headers,
-                configured_provider_id.as_deref(),
-                snapshot,
-                request_context.session_id.as_deref(),
-            )
-            .map(|selection| selection.execution)
-        })?
+        super::router::select_provider(
+            &providers,
+            &accounts_for_selection,
+            app,
+            &headers,
+            configured_provider_id.as_deref(),
+        )?
+        .execution
     };
     drop(providers);
     let stored = execution.runtime_stored_view();
-    ensure_grok_credential_persistence_available(&state, &execution)?;
+    ensure_managed_credential_persistence_available(&state, &execution)?;
     if !execution.driver_is("oauth.openai_codex") && !execution.driver_is("oauth.grok_responses") {
         return Err(ProxyError::bad_request(
             "responses websocket is only available for codex_oauth or grok_oauth providers",
@@ -2257,7 +3017,7 @@ pub async fn forward_codex_responses_ws(
     } else {
         None
     };
-    let target = prepare_responses_websocket_target(
+    let mut target = prepare_responses_websocket_target(
         &state,
         &execution,
         ws_mode,
@@ -2265,6 +3025,7 @@ pub async fn forward_codex_responses_ws(
         grok_turn_index,
     )
     .await?;
+    append_codex_client_request_headers_owned(&mut target.headers, &headers, false);
     let websocket_upstream_model = match &execution.plan.model_policy {
         crate::domain::providers::runtime::RuntimeModelPolicy::Single { upstream_model } => {
             Some(upstream_model.clone())
@@ -2274,11 +3035,11 @@ pub async fn forward_codex_responses_ws(
     let request_timeout = execution.request_timeout();
     let first_byte_timeout = execution.stream_first_byte_timeout();
     let stream_idle_timeout = execution.stream_idle_timeout();
-    let provider_pinned = request_is_provider_pinned(&headers, &request_context);
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let state_for_share = state.clone();
     let response = ws.on_upgrade(move |socket| async move {
+        let _downstream_connection_guard = downstream_connection_guard;
         let _share_invocation_guard = share_invocation_guard;
         if let Err(error) = bridge_responses_websocket(
             socket,
@@ -2295,8 +3056,6 @@ pub async fn forward_codex_responses_ws(
                 single_upstream_model: websocket_upstream_model,
                 state: &state_for_share,
                 execution,
-                account_in_flight_guard,
-                provider_pinned,
             },
         )
         .await
@@ -2493,11 +3252,12 @@ pub async fn forward_images_generations(
         )
         .await
     } else if execution.driver_is("oauth.openai_codex") {
-        forward_codex_images_generations(
+        let prepared = codex_images_generation_request(&body)?;
+        forward_codex_images_request(
             state,
             execution,
             headers,
-            body,
+            prepared,
             request_context,
             account_in_flight_guard,
             share_invocation_guard,
@@ -2506,6 +3266,102 @@ pub async fn forward_images_generations(
     } else {
         Err(ProxyError::bad_request(
             "image generation requires a grok_oauth provider or codex_oauth provider with image generation enabled",
+        ))
+    }
+}
+
+pub async fn forward_images_edits(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    let body = decode_request_body_for_proxy_with_limit(
+        &headers,
+        body,
+        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+    )?;
+    let mut request_context = request_context_from_headers(&headers);
+    request_context.session_id =
+        session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
+    let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
+        let (share_name, guard) = validate_and_acquire_share_invocation(
+            &state,
+            &share_id,
+            request_context.user_email.as_deref(),
+        )
+        .await?;
+        request_context.share_name = Some(share_name);
+        Some(guard)
+    } else {
+        None
+    };
+    let shares = state.shares.read().await.clone();
+    let accounts_for_selection = state.accounts_snapshot().await;
+    let providers = state.providers.read().await;
+    let ui_settings = state.ui_settings.read().await.for_frontend();
+    let configured_provider_id =
+        current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
+    let (execution, account_in_flight_guard) =
+        if let Some(share_id) = request_context.share_id.as_deref() {
+            let (execution, _share_name) = select_share_image_generation_execution(
+                &providers,
+                &shares,
+                &accounts_for_selection,
+                share_id,
+            )?;
+            let snapshot = state.account_in_flight.snapshot();
+            let guard = acquire_account_in_flight(
+                &state,
+                &execution.stored,
+                &accounts_for_selection,
+                &snapshot,
+            )?;
+            (execution, guard)
+        } else {
+            select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
+                select_provider_for_codex_image_generation(
+                    &providers,
+                    &accounts_for_selection,
+                    &headers,
+                    configured_provider_id.as_deref(),
+                    snapshot,
+                    request_context.session_id.as_deref(),
+                )
+                .map(|selection| selection.execution)
+            })?
+        };
+    drop(providers);
+
+    if execution.driver_is("oauth.grok_responses") {
+        forward_grok_media_with_execution(
+            state,
+            execution,
+            Method::POST,
+            "/images/edits".to_string(),
+            headers,
+            body,
+            None,
+            request_context.share_id,
+            request_context.user_email,
+            account_in_flight_guard,
+            share_invocation_guard,
+        )
+        .await
+    } else if execution.driver_is("oauth.openai_codex") {
+        let prepared = codex_images_edit_request(&headers, body).await?;
+        forward_codex_images_request(
+            state,
+            execution,
+            headers,
+            prepared,
+            request_context,
+            account_in_flight_guard,
+            share_invocation_guard,
+        )
+        .await
+    } else {
+        Err(ProxyError::bad_request(
+            "image editing requires a grok_oauth provider or codex_oauth provider with image generation enabled",
         ))
     }
 }
@@ -2528,7 +3384,7 @@ async fn forward_grok_media_with_execution(
     if let Some(binding) = sticky_media_binding.as_ref() {
         ensure_grok_media_session_binding(&execution, binding)?;
     }
-    ensure_grok_credential_persistence_available(&state, &execution)?;
+    ensure_managed_credential_persistence_available(&state, &execution)?;
     let capability = grok_media_capability(&method, &upstream_path);
     ensure_grok_account_capability(&state, &execution, capability).await?;
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
@@ -2558,7 +3414,7 @@ async fn forward_grok_media_with_execution(
     let started = Instant::now();
     let mut auth_refresh_attempted = false;
     let mut upstream = loop {
-        ensure_grok_credential_persistence_available(&state, &execution)?;
+        ensure_managed_credential_persistence_available(&state, &execution)?;
         let accounts = state.accounts_snapshot().await;
         let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
         if let Some(session_id) = media_session_id.as_deref() {
@@ -2735,30 +3591,30 @@ fn ensure_grok_media_session_binding(
     })
 }
 
-async fn forward_codex_images_generations(
+async fn forward_codex_images_request(
     state: ServerState,
-    mut execution: ProviderExecution,
+    execution: ProviderExecution,
     headers: HeaderMap,
-    body: Bytes,
+    mut prepared: CodexImagesPreparedRequest,
     request_context: UsageLogContext,
-    mut _account_in_flight_guard: Option<AccountInFlightGuard>,
+    _account_in_flight_guard: Option<AccountInFlightGuard>,
     _share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
-    let prepared = codex_images_generation_request(&body)?;
-    let session_id = codex_oauth_session_id_from_request(&headers, &body);
+    let stored = execution.runtime_stored_view();
+    ensure_managed_credential_persistence_available(&state, &execution)?;
+    let accounts = state.accounts_snapshot().await;
+    super::router::ensure_codex_oauth_active_account(&stored, &accounts)?;
+    validate_codex_allowed_client(
+        &stored,
+        ProxyRoute::CodexResponses,
+        &headers,
+        request_context.share_id.is_some(),
+    )?;
+    prepared.body = super::remote_image::inline_codex_remote_images(&prepared.body).await?;
+    let session_id = codex_oauth_session_id_from_request(&headers, &prepared.body);
     let started = Instant::now();
-    let provider_pinned = request_is_provider_pinned(&headers, &request_context);
-    let mut excluded_provider_ids = BTreeSet::new();
-
-    'provider: loop {
-        let stored = execution.runtime_stored_view();
+    {
         refresh_execution_managed_account_if_needed(&state, &execution).await?;
-        validate_codex_allowed_client(
-            &stored,
-            ProxyRoute::CodexResponses,
-            &headers,
-            request_context.share_id.is_some(),
-        )?;
         let mut adapter_request = adapters::AdapterRequest {
             body: prepared.body.clone(),
             upstream_endpoint: None,
@@ -2774,7 +3630,7 @@ async fn forward_codex_images_generations(
         };
         execution.enforce_model_policy(&mut adapter_request)?;
         let mut auth_refresh_attempted = false;
-        let upstream = loop {
+        let mut upstream = loop {
             let upstream = match send_codex_images_attempt(
                 &state,
                 &execution,
@@ -2803,25 +3659,6 @@ async fn forward_codex_images_generations(
                             "images_forced_refresh_failed",
                         )
                         .await;
-                        if !provider_pinned
-                            && switch_to_ready_codex_provider(
-                                &state,
-                                &mut execution,
-                                &mut _account_in_flight_guard,
-                                &mut excluded_provider_ids,
-                                codex_oauth_image_failover_provider,
-                                "images_auth_refresh_failed",
-                            )
-                            .await
-                        {
-                            record_provider_outcome(
-                                &state,
-                                &stored,
-                                ProviderOutcome::Failure { status_code: 401 },
-                            )
-                            .await;
-                            continue 'provider;
-                        }
                         return Err(managed_account_refresh_error_to_proxy_error(error));
                     }
                     auth_refresh_attempted = true;
@@ -2840,22 +3677,6 @@ async fn forward_codex_images_generations(
                 "images_unauthorized_after_refresh",
             )
             .await;
-            if !provider_pinned
-                && switch_to_ready_codex_provider(
-                    &state,
-                    &mut execution,
-                    &mut _account_in_flight_guard,
-                    &mut excluded_provider_ids,
-                    codex_oauth_image_failover_provider,
-                    "images_unauthorized_after_refresh",
-                )
-                .await
-            {
-                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
-                    .await;
-                drop(upstream);
-                continue 'provider;
-            }
         }
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
@@ -2864,8 +3685,17 @@ async fn forward_codex_images_generations(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let content_encoding = content_encoding_value(&response_headers);
-        let bytes = upstream.bytes().await.map_err(ProxyError::bad_gateway)?;
-        let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+        let bytes = crate::infra::http::read_response_body_limited(
+            &mut upstream,
+            super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+        .map_err(ProxyError::bad_gateway)?;
+        let decoded = decode_response_body_for_proxy_with_limit(
+            &response_headers,
+            bytes,
+            super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+        )?;
         if status == StatusCode::TOO_MANY_REQUESTS {
             maybe_mark_upstream_rate_limited(
                 &state,
@@ -2905,6 +3735,11 @@ async fn forward_codex_images_generations(
             prepared.response_format.as_deref(),
             prepared.stream,
         )?;
+        let mut usage_accumulator = StreamUsageAccumulator::new(
+            adapters::usage_input_semantics_for(&stored, ProxyRoute::CodexResponses),
+        );
+        usage_accumulator.push(&decoded.body);
+        let usage = usage_accumulator.finish();
         log_usage(
             &state,
             &stored,
@@ -2916,7 +3751,7 @@ async fn forward_codex_images_generations(
                 actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
                 actual_model_source: Some("codex_image_generation_bridge".to_string()),
             },
-            TokenUsage::default(),
+            usage,
             UsageLogContext {
                 is_streaming: prepared.stream,
                 stream_status: Some("completed".to_string()),
@@ -2928,7 +3763,7 @@ async fn forward_codex_images_generations(
             &state,
             request_context.share_id.as_deref(),
             request_context.user_email.as_deref(),
-            TokenUsage::default(),
+            usage,
         )
         .await;
         let mut response = Response::new(Body::from(image_response.body));
@@ -2938,7 +3773,7 @@ async fn forward_codex_images_generations(
             HeaderValue::from_static(image_response.content_type),
         );
         copy_safe_upstream_response_headers(&response_headers, &mut response);
-        return Ok(response);
+        Ok(response)
     }
 }
 
@@ -3080,6 +3915,229 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         response_format,
         stream,
     })
+}
+
+async fn codex_images_edit_request(
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<CodexImagesPreparedRequest, ProxyError> {
+    let content_type = optional_header(headers, "content-type").unwrap_or_default();
+    let content_type = content_type.trim();
+    if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        let value = serde_json::from_slice::<Value>(&body).map_err(|error| ProxyError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("invalid OpenAI image edit request JSON: {error}"),
+        })?;
+        return codex_images_edit_request_from_value(value);
+    }
+
+    let boundary = multer::parse_boundary(content_type)
+        .map_err(|error| ProxyError::bad_request(format!("invalid multipart boundary: {error}")))?;
+    let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+    let mut fields = serde_json::Map::new();
+    let mut images = Vec::new();
+    let mut mask = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        ProxyError::bad_request(format!("invalid image edit multipart: {error}"))
+    })? {
+        let name = field.name().unwrap_or_default().to_string();
+        let claimed_content_type = field
+            .content_type()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        if matches!(name.as_str(), "image" | "image[]" | "mask") {
+            let bytes = field.bytes().await.map_err(|error| {
+                ProxyError::bad_request(format!("read multipart field {name}: {error}"))
+            })?;
+            if bytes.is_empty() {
+                return Err(ProxyError::bad_request(format!(
+                    "multipart field {name} is empty"
+                )));
+            }
+            let content_type = super::remote_image::validate_image_bytes(
+                &bytes,
+                Some(&claimed_content_type),
+                super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+            )?;
+            let data_url = format!("data:{content_type};base64,{}", STANDARD.encode(bytes));
+            if name == "mask" {
+                mask = Some(data_url);
+            } else {
+                images.push(data_url);
+            }
+            continue;
+        }
+        let value = field.text().await.map_err(|error| {
+            ProxyError::bad_request(format!("read multipart field {name}: {error}"))
+        })?;
+        fields.insert(name, Value::String(value));
+    }
+    fields.insert(
+        "images".to_string(),
+        Value::Array(
+            images
+                .into_iter()
+                .map(|image_url| json!({"image_url": image_url}))
+                .collect(),
+        ),
+    );
+    if let Some(mask) = mask {
+        fields.insert("mask".to_string(), json!({"image_url": mask}));
+    }
+    codex_images_edit_request_from_value(Value::Object(fields))
+}
+
+fn codex_images_edit_request_from_value(
+    value: Value,
+) -> Result<CodexImagesPreparedRequest, ProxyError> {
+    const MAX_EDIT_IMAGES: usize = 16;
+    let prompt = value
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("image edit prompt is required"))?;
+    let mut image_urls = Vec::new();
+    for field in ["images", "image"] {
+        let Some(images) = value.get(field) else {
+            continue;
+        };
+        let candidates = images
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(images));
+        for image in candidates {
+            let image_url = image
+                .as_str()
+                .or_else(|| image.get("image_url").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|image_url| !image_url.is_empty())
+                .ok_or_else(|| {
+                    ProxyError::bad_request(
+                        "image edit inputs must use image_url strings; file_id is unsupported",
+                    )
+                })?;
+            image_urls.push(image_url.to_string());
+        }
+    }
+    if image_urls.is_empty() {
+        return Err(ProxyError::bad_request(
+            "image edit input image is required",
+        ));
+    }
+    if image_urls.len() > MAX_EDIT_IMAGES {
+        return Err(ProxyError::bad_request(format!(
+            "image edit accepts at most {MAX_EDIT_IMAGES} input images"
+        )));
+    }
+    let tool_model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(CODEX_IMAGES_DEFAULT_TOOL_MODEL)
+        .to_string();
+    let response_format = value
+        .get("response_format")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|format| !format.is_empty())
+        .map(str::to_ascii_lowercase);
+    let stream = json_boolish(value.get("stream")).unwrap_or(false);
+    let mut tool = json!({
+        "type": "image_generation",
+        "action": "edit",
+        "model": tool_model,
+    });
+    for field in [
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "input_fidelity",
+        "moderation",
+    ] {
+        if let Some(text) = value
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            tool[field] = Value::String(text.to_string());
+        }
+    }
+    for field in ["output_compression", "partial_images", "n"] {
+        if let Some(number) = value.get(field).and_then(json_i64ish) {
+            tool[field] = Value::Number(number.into());
+        }
+    }
+    if let Some(mask) = value
+        .pointer("/mask/image_url")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("mask").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|mask| !mask.is_empty())
+    {
+        tool["input_image_mask"] = json!({"image_url": mask});
+    }
+    let mut content = vec![json!({"type": "input_text", "text": prompt})];
+    content.extend(
+        image_urls
+            .into_iter()
+            .map(|image_url| json!({"type": "input_image", "image_url": image_url})),
+    );
+    let request = json!({
+        "instructions": "",
+        "stream": true,
+        "reasoning": {"effort": "medium", "summary": "auto"},
+        "parallel_tool_calls": false,
+        "include": ["reasoning.encrypted_content"],
+        "model": CODEX_IMAGES_RESPONSES_MAIN_MODEL,
+        "store": false,
+        "tool_choice": {"type": "image_generation"},
+        "input": [{"type": "message", "role": "user", "content": content}],
+        "tools": [tool],
+    });
+    let body = serde_json::to_vec(&request)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("encode Codex image edit request failed: {error}"),
+        })?;
+    Ok(CodexImagesPreparedRequest {
+        body,
+        tool_model: request["tools"][0]["model"]
+            .as_str()
+            .unwrap_or(CODEX_IMAGES_DEFAULT_TOOL_MODEL)
+            .to_string(),
+        response_format,
+        stream,
+    })
+}
+
+fn json_boolish(value: Option<&Value>) -> Option<bool> {
+    value.and_then(|value| {
+        value.as_bool().or_else(|| {
+            value.as_str().map(str::trim).and_then(|value| {
+                match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => Some(true),
+                    "false" | "0" | "no" => Some(false),
+                    _ => None,
+                }
+            })
+        })
+    })
+}
+
+fn json_i64ish(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
 }
 
 fn codex_images_response_from_responses_body(
@@ -3289,6 +4347,15 @@ enum ResponsesWebsocketMode {
     Grok,
 }
 
+fn responses_websocket_http_replay_allowed(
+    mode: ResponsesWebsocketMode,
+    emitted_business_event: bool,
+    response_create_committed: bool,
+) -> bool {
+    !emitted_business_event
+        && (!response_create_committed || matches!(mode, ResponsesWebsocketMode::Grok))
+}
+
 struct ResponsesWebsocketBridgeOptions<'a> {
     headers: Vec<(String, String)>,
     connect_timeout: Duration,
@@ -3302,14 +4369,26 @@ struct ResponsesWebsocketBridgeOptions<'a> {
     single_upstream_model: Option<String>,
     state: &'a ServerState,
     execution: ProviderExecution,
-    account_in_flight_guard: Option<AccountInFlightGuard>,
-    provider_pinned: bool,
 }
 
 struct PreparedResponsesWebSocketTarget {
     headers: Vec<(String, String)>,
     ws_url: String,
     pool_key: Option<String>,
+}
+
+async fn ensure_responses_websocket_turn_allowed(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    mode: ResponsesWebsocketMode,
+) -> Result<(), ProxyError> {
+    ensure_managed_credential_persistence_available(state, execution)?;
+    if matches!(mode, ResponsesWebsocketMode::Codex) {
+        let stored = execution.runtime_stored_view();
+        let accounts = state.accounts_snapshot().await;
+        super::router::ensure_codex_oauth_active_account(&stored, &accounts)?;
+    }
+    Ok(())
 }
 
 async fn prepare_responses_websocket_target(
@@ -3319,7 +4398,7 @@ async fn prepare_responses_websocket_target(
     session_id: Option<&str>,
     grok_turn_index: Option<u64>,
 ) -> Result<PreparedResponsesWebSocketTarget, ProxyError> {
-    ensure_grok_credential_persistence_available(state, execution)?;
+    ensure_managed_credential_persistence_available(state, execution)?;
     let stored = execution.runtime_stored_view();
     let accounts = state.accounts_snapshot().await;
     let adapter = adapters::adapter_for(stored.app, stored.provider_type);
@@ -3429,14 +4508,13 @@ async fn bridge_responses_websocket(
         single_upstream_model,
         state,
         mut execution,
-        account_in_flight_guard: mut _account_in_flight_guard,
-        provider_pinned,
     } = options;
-    let mut excluded_provider_ids = BTreeSet::new();
+    let mut account_in_flight_guard = None;
     let mut entry = None;
     let mut entry_was_cached = false;
     let mut downstream = downstream;
     let mut response_in_flight = false;
+    let mut response_create_committed = false;
     let mut emitted_business_event = false;
     let mut pending_lifecycle_messages = Vec::new();
     let mut semantic_provider_outcome_recorded = false;
@@ -3473,12 +4551,15 @@ async fn bridge_responses_websocket(
                 ) else {
                     break;
                 };
+                let starts_response = responses_websocket_request_starts_response(&message);
+                if starts_response {
+                    ensure_responses_websocket_turn_allowed(state, &execution, mode).await?;
+                }
                 let message = if matches!(mode, ResponsesWebsocketMode::Codex) {
                     prepare_codex_responses_websocket_request(message).await?
                 } else {
                     message
                 };
-                let starts_response = responses_websocket_request_starts_response(&message);
                 if starts_response {
                     if response_in_flight {
                         return Err(ProxyError::bad_request(
@@ -3486,17 +4567,23 @@ async fn bridge_responses_websocket(
                         ));
                     }
                     active_response_body = Some(responses_websocket_http_body(&message)?);
+                    let accounts = state.accounts_snapshot().await;
+                    let snapshot = state.account_in_flight.snapshot();
+                    account_in_flight_guard = acquire_account_in_flight(
+                        state,
+                        &execution.stored,
+                        &accounts,
+                        &snapshot,
+                    )?;
                     response_in_flight = true;
+                    response_create_committed = false;
                     emitted_business_event = false;
                     pending_lifecycle_messages.clear();
                     semantic_provider_outcome_recorded = false;
                     auth_refresh_attempted = false;
-                    // A provider is excluded only for the active response. A later
-                    // response may retry it after its cooldown or transient failure.
-                    excluded_provider_ids.clear();
-
                     if entry.is_none() {
                         if refresh_target_before_connect {
+                            let forwarded_headers = codex_client_headers_from_owned(&headers);
                             let target = prepare_responses_websocket_target(
                                 state,
                                 &execution,
@@ -3506,6 +4593,7 @@ async fn bridge_responses_websocket(
                             )
                             .await?;
                             headers = target.headers;
+                            merge_owned_headers(&mut headers, forwarded_headers);
                             ws_url = target.ws_url;
                             pool_key = target.pool_key;
                             refresh_target_before_connect = false;
@@ -3523,9 +4611,6 @@ async fn bridge_responses_websocket(
                             &mut ws_url,
                             &mut pool_key,
                             &mut auth_refresh_attempted,
-                            &mut _account_in_flight_guard,
-                            provider_pinned,
-                            &mut excluded_provider_ids,
                         )
                         .await
                         {
@@ -3535,6 +4620,39 @@ async fn bridge_responses_websocket(
                             }
                             Err(failure) => {
                                 let Some(source) = failure.fallback_source else {
+                                    if response_in_flight {
+                                        let error_code = if failure.error.status
+                                            == StatusCode::UNAUTHORIZED
+                                        {
+                                            "upstream_auth_error"
+                                        } else if failure.error.status
+                                            == StatusCode::GATEWAY_TIMEOUT
+                                        {
+                                            "upstream_connect_timeout"
+                                        } else {
+                                            "upstream_connect_error"
+                                        };
+                                        let error_body = websocket_stream_error_body(
+                                            failure.error.client_message(),
+                                            error_code,
+                                        );
+                                        let provider_outcome = provider_outcome_from_status(
+                                            failure.error.status.as_u16(),
+                                        );
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            failure.error,
+                                            Some("connect_error"),
+                                            error_body,
+                                            Some(provider_outcome),
+                                        )
+                                        .await;
+                                    }
                                     return Err(failure.error);
                                 };
                                 let body = active_response_body.as_ref().ok_or_else(|| {
@@ -3554,9 +4672,6 @@ async fn bridge_responses_websocket(
                                     stream_idle_timeout,
                                     source,
                                     &mut auth_refresh_attempted,
-                                    &mut _account_in_flight_guard,
-                                    provider_pinned,
-                                    &mut excluded_provider_ids,
                                     &mut output_patcher,
                                 )
                                 .await?;
@@ -3564,6 +4679,8 @@ async fn bridge_responses_websocket(
                                     return Ok(());
                                 }
                                 response_in_flight = false;
+                                response_create_committed = false;
+                                account_in_flight_guard.take();
                                 active_response_body = None;
                                 refresh_target_before_connect = true;
                                 continue;
@@ -3584,7 +4701,13 @@ async fn bridge_responses_websocket(
                     .await;
                 if let Err(error) = send_result {
                     let _failed_entry = entry.take();
-                    if response_in_flight && !emitted_business_event {
+                    if response_in_flight
+                        && responses_websocket_http_replay_allowed(
+                            mode,
+                            emitted_business_event,
+                            response_create_committed,
+                        )
+                    {
                         let body = active_response_body.as_ref().ok_or_else(|| {
                             ProxyError::bad_request(
                                 "response.create body is unavailable for HTTP fallback",
@@ -3607,9 +4730,6 @@ async fn bridge_responses_websocket(
                             stream_idle_timeout,
                             source,
                             &mut auth_refresh_attempted,
-                            &mut _account_in_flight_guard,
-                            provider_pinned,
-                            &mut excluded_provider_ids,
                             &mut output_patcher,
                         )
                         .await?;
@@ -3617,6 +4737,8 @@ async fn bridge_responses_websocket(
                             return Ok(());
                         }
                         response_in_flight = false;
+                        response_create_committed = false;
+                        account_in_flight_guard.take();
                         active_response_body = None;
                         refresh_target_before_connect = true;
                         continue;
@@ -3644,6 +4766,7 @@ async fn bridge_responses_websocket(
                     return Err(error);
                 }
                 if starts_response {
+                    response_create_committed = true;
                     upstream_read_deadline = first_byte_timeout
                         .map(|timeout| tokio::time::Instant::now() + timeout);
                 }
@@ -3653,7 +4776,13 @@ async fn bridge_responses_websocket(
                     ResponsesWebsocketRead::Message(message) => message,
                     ResponsesWebsocketRead::TimedOut => {
                         let _timed_out_entry = entry.take();
-                        if response_in_flight && !emitted_business_event {
+                        if response_in_flight
+                            && responses_websocket_http_replay_allowed(
+                                mode,
+                                emitted_business_event,
+                                response_create_committed,
+                            )
+                        {
                             let body = active_response_body.as_ref().ok_or_else(|| {
                                 ProxyError::bad_request(
                                     "response.create body is unavailable for HTTP fallback",
@@ -3671,9 +4800,6 @@ async fn bridge_responses_websocket(
                                 stream_idle_timeout,
                                 "first_byte_timeout",
                                 &mut auth_refresh_attempted,
-                                &mut _account_in_flight_guard,
-                                provider_pinned,
-                                &mut excluded_provider_ids,
                                 &mut output_patcher,
                             )
                             .await?;
@@ -3681,6 +4807,8 @@ async fn bridge_responses_websocket(
                                 return Ok(());
                             }
                             response_in_flight = false;
+                            response_create_committed = false;
+                            account_in_flight_guard.take();
                             active_response_body = None;
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
@@ -3715,7 +4843,13 @@ async fn bridge_responses_websocket(
                 };
                 let Some(message) = upstream_message else {
                     let _closed_entry = entry.take();
-                    if response_in_flight && !emitted_business_event {
+                    if response_in_flight
+                        && responses_websocket_http_replay_allowed(
+                            mode,
+                            emitted_business_event,
+                            response_create_committed,
+                        )
+                    {
                         let body = active_response_body.as_ref().ok_or_else(|| {
                             ProxyError::bad_request(
                                 "response.create body is unavailable for HTTP fallback",
@@ -3738,9 +4872,6 @@ async fn bridge_responses_websocket(
                             stream_idle_timeout,
                             source,
                             &mut auth_refresh_attempted,
-                            &mut _account_in_flight_guard,
-                            provider_pinned,
-                            &mut excluded_provider_ids,
                             &mut output_patcher,
                         )
                         .await?;
@@ -3748,6 +4879,8 @@ async fn bridge_responses_websocket(
                             return Ok(());
                         }
                         response_in_flight = false;
+                        response_create_committed = false;
+                        account_in_flight_guard.take();
                         active_response_body = None;
                         refresh_target_before_connect = true;
                         continue;
@@ -3771,7 +4904,11 @@ async fn bridge_responses_websocket(
                     Ok(message) => message,
                     Err(error)
                         if response_in_flight
-                            && !emitted_business_event
+                            && responses_websocket_http_replay_allowed(
+                                mode,
+                                emitted_business_event,
+                                response_create_committed,
+                            )
                             && websocket_read_fallback_source(&error, entry_was_cached).is_some() =>
                     {
                         let source = websocket_read_fallback_source(&error, entry_was_cached)
@@ -3792,18 +4929,17 @@ async fn bridge_responses_websocket(
                             grok_turn_index,
                             first_byte_timeout,
                             stream_idle_timeout,
-                            source,
-                            &mut auth_refresh_attempted,
-                            &mut _account_in_flight_guard,
-                            provider_pinned,
-                            &mut excluded_provider_ids,
-                            &mut output_patcher,
+                                source,
+                                &mut auth_refresh_attempted,
+                                &mut output_patcher,
                         )
                         .await?;
                         if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
                             return Ok(());
                         }
                         response_in_flight = false;
+                        response_create_committed = false;
+                        account_in_flight_guard.take();
                         active_response_body = None;
                         refresh_target_before_connect = true;
                         continue;
@@ -3869,7 +5005,14 @@ async fn bridge_responses_websocket(
                     );
                     let _closed_entry = entry.take();
                     if let Some(source) = fallback_source
-                        .filter(|_| response_in_flight && !emitted_business_event)
+                        .filter(|_| {
+                            response_in_flight
+                                && responses_websocket_http_replay_allowed(
+                                    mode,
+                                    emitted_business_event,
+                                    response_create_committed,
+                                )
+                        })
                     {
                         let body = active_response_body.as_ref().ok_or_else(|| {
                             ProxyError::bad_request(
@@ -3888,9 +5031,6 @@ async fn bridge_responses_websocket(
                             stream_idle_timeout,
                             source,
                             &mut auth_refresh_attempted,
-                            &mut _account_in_flight_guard,
-                            provider_pinned,
-                            &mut excluded_provider_ids,
                             &mut output_patcher,
                         )
                         .await?;
@@ -3898,6 +5038,8 @@ async fn bridge_responses_websocket(
                             return Ok(());
                         }
                         response_in_flight = false;
+                        response_create_committed = false;
+                        account_in_flight_guard.take();
                         active_response_body = None;
                         refresh_target_before_connect = true;
                         continue;
@@ -3925,8 +5067,11 @@ async fn bridge_responses_websocket(
                                 "websocket",
                                 "protocol_error",
                             );
-                            let mut provider_outcome_recorded = false;
-                            if !emitted_business_event {
+                            if responses_websocket_http_replay_allowed(
+                                mode,
+                                emitted_business_event,
+                                response_create_committed,
+                            ) {
                                 let failed = execution.runtime_stored_view();
                                 record_provider_outcome(
                                     state,
@@ -3934,26 +5079,8 @@ async fn bridge_responses_websocket(
                                     ProviderOutcome::Failure { status_code: 502 },
                                 )
                                 .await;
-                                provider_outcome_recorded = true;
                                 let _failed_entry = entry.take();
-                                let fallback_ready = if matches!(
-                                    mode,
-                                    ResponsesWebsocketMode::Codex
-                                ) {
-                                    !provider_pinned
-                                        && switch_to_ready_codex_provider(
-                                        state,
-                                        &mut execution,
-                                        &mut _account_in_flight_guard,
-                                        &mut excluded_provider_ids,
-                                        codex_oauth_websocket_failover_provider,
-                                        "websocket_semantic_protocol_error",
-                                    )
-                                        .await
-                                } else {
-                                    true
-                                };
-                                if fallback_ready {
+                                {
                                     pending_lifecycle_messages.clear();
                                     output_patcher.clear();
                                     let body = active_response_body.as_ref().ok_or_else(|| {
@@ -3972,9 +5099,6 @@ async fn bridge_responses_websocket(
                                         stream_idle_timeout,
                                         "semantic_protocol_error",
                                         &mut auth_refresh_attempted,
-                                        &mut _account_in_flight_guard,
-                                        provider_pinned,
-                                        &mut excluded_provider_ids,
                                         &mut output_patcher,
                                     )
                                     .await?;
@@ -3982,6 +5106,8 @@ async fn bridge_responses_websocket(
                                         return Ok(());
                                     }
                                     response_in_flight = false;
+                                    response_create_committed = false;
+                                    account_in_flight_guard.take();
                                     active_response_body = None;
                                     upstream_read_deadline = None;
                                     refresh_target_before_connect = true;
@@ -4002,8 +5128,7 @@ async fn bridge_responses_websocket(
                                 error,
                                 None,
                                 error_body,
-                                (!provider_outcome_recorded)
-                                    .then_some(ProviderOutcome::Failure { status_code: 502 }),
+                                Some(ProviderOutcome::Failure { status_code: 502 }),
                             )
                             .await;
                         }
@@ -4054,7 +5179,13 @@ async fn bridge_responses_websocket(
                     continue;
                 }
                 if let Some(SemanticObservation::Failure(failure)) = &semantic_observation {
-                    if failure.origin == FailureOrigin::Provider && !emitted_business_event {
+                    if failure.origin == FailureOrigin::Provider
+                        && responses_websocket_http_replay_allowed(
+                            mode,
+                            emitted_business_event,
+                            response_create_committed,
+                        )
+                    {
                         let failed = execution.runtime_stored_view();
                         if !semantic_provider_outcome_recorded {
                             record_provider_outcome(
@@ -4066,21 +5197,7 @@ async fn bridge_responses_websocket(
                             semantic_provider_outcome_recorded = true;
                         }
                         let _failed_entry = entry.take();
-                        let fallback_ready = if matches!(mode, ResponsesWebsocketMode::Codex) {
-                            !provider_pinned
-                                && switch_to_ready_codex_provider(
-                                    state,
-                                    &mut execution,
-                                    &mut _account_in_flight_guard,
-                                    &mut excluded_provider_ids,
-                                    codex_oauth_websocket_failover_provider,
-                                    "websocket_semantic_failure",
-                                )
-                                .await
-                        } else {
-                            true
-                        };
-                        if fallback_ready {
+                        {
                             pending_lifecycle_messages.clear();
                             output_patcher.clear();
                             let body = active_response_body.as_ref().ok_or_else(|| {
@@ -4099,9 +5216,6 @@ async fn bridge_responses_websocket(
                                 stream_idle_timeout,
                                 "semantic_failure",
                                 &mut auth_refresh_attempted,
-                                &mut _account_in_flight_guard,
-                                provider_pinned,
-                                &mut excluded_provider_ids,
                                 &mut output_patcher,
                             )
                             .await?;
@@ -4109,6 +5223,8 @@ async fn bridge_responses_websocket(
                                 return Ok(());
                             }
                             response_in_flight = false;
+                            response_create_committed = false;
+                            account_in_flight_guard.take();
                             active_response_body = None;
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
@@ -4146,6 +5262,8 @@ async fn bridge_responses_websocket(
                         && responses_websocket_response_is_terminal(&message));
                 if terminal {
                     response_in_flight = false;
+                    response_create_committed = false;
+                    account_in_flight_guard.take();
                     active_response_body = None;
                     upstream_read_deadline = None;
                     match semantic_terminal {
@@ -4282,9 +5400,6 @@ async fn connect_responses_websocket(
     ws_url: &mut String,
     pool_key: &mut Option<String>,
     auth_refresh_attempted: &mut bool,
-    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
-    provider_pinned: bool,
-    excluded_provider_ids: &mut BTreeSet<String>,
 ) -> Result<CachedResponsesWebSocket, ResponsesWebsocketConnectFailure> {
     loop {
         let mut request = ws_url.clone().into_client_request().map_err(|error| {
@@ -4361,30 +5476,6 @@ async fn connect_responses_websocket(
                         "websocket_forced_refresh_failed",
                     )
                     .await;
-                    if matches!(mode, ResponsesWebsocketMode::Codex)
-                        && !provider_pinned
-                        && switch_codex_websocket_provider(
-                            state,
-                            execution,
-                            account_in_flight_guard,
-                            excluded_provider_ids,
-                            session_id,
-                            headers,
-                            ws_url,
-                            pool_key,
-                            "websocket_auth_refresh_failed",
-                        )
-                        .await
-                        .map_err(|error| {
-                            ResponsesWebsocketConnectFailure {
-                                error,
-                                fallback_source: None,
-                            }
-                        })?
-                    {
-                        *auth_refresh_attempted = false;
-                        continue;
-                    }
                     return Err(ResponsesWebsocketConnectFailure {
                         error: managed_account_refresh_error_to_proxy_error(error),
                         fallback_source: None,
@@ -4408,7 +5499,9 @@ async fn connect_responses_websocket(
                     error,
                     fallback_source: None,
                 })?;
+                let forwarded_headers = codex_client_headers_from_owned(headers);
                 *headers = target.headers;
+                merge_owned_headers(headers, forwarded_headers);
                 *ws_url = target.ws_url;
                 *pool_key = target.pool_key;
             }
@@ -4422,30 +5515,6 @@ async fn connect_responses_websocket(
                         "websocket_unauthorized_after_refresh",
                     )
                     .await;
-                    if matches!(mode, ResponsesWebsocketMode::Codex)
-                        && !provider_pinned
-                        && switch_codex_websocket_provider(
-                            state,
-                            execution,
-                            account_in_flight_guard,
-                            excluded_provider_ids,
-                            session_id,
-                            headers,
-                            ws_url,
-                            pool_key,
-                            "websocket_unauthorized_after_refresh",
-                        )
-                        .await
-                        .map_err(|error| {
-                            ResponsesWebsocketConnectFailure {
-                                error,
-                                fallback_source: None,
-                            }
-                        })?
-                    {
-                        *auth_refresh_attempted = false;
-                        continue;
-                    }
                 }
                 return Err(ResponsesWebsocketConnectFailure {
                     error,
@@ -4454,44 +5523,6 @@ async fn connect_responses_websocket(
             }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)] // A failover atomically replaces the authenticated WS target and its account lease.
-async fn switch_codex_websocket_provider(
-    state: &ServerState,
-    execution: &mut ProviderExecution,
-    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
-    excluded_provider_ids: &mut BTreeSet<String>,
-    session_id: Option<&str>,
-    headers: &mut Vec<(String, String)>,
-    ws_url: &mut String,
-    pool_key: &mut Option<String>,
-    reason: &'static str,
-) -> Result<bool, ProxyError> {
-    if !switch_to_ready_codex_provider(
-        state,
-        execution,
-        account_in_flight_guard,
-        excluded_provider_ids,
-        codex_oauth_websocket_failover_provider,
-        reason,
-    )
-    .await
-    {
-        return Ok(false);
-    }
-    let target = prepare_responses_websocket_target(
-        state,
-        execution,
-        ResponsesWebsocketMode::Codex,
-        session_id,
-        None,
-    )
-    .await?;
-    *headers = target.headers;
-    *ws_url = target.ws_url;
-    *pool_key = target.pool_key;
-    Ok(true)
 }
 
 fn websocket_connect_fallback_source(
@@ -4556,9 +5587,6 @@ async fn run_codex_websocket_http_fallback(
     stream_idle_timeout: Option<Duration>,
     source: &'static str,
     auth_refresh_attempted: &mut bool,
-    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
-    provider_pinned: bool,
-    excluded_provider_ids: &mut BTreeSet<String>,
     output_patcher: &mut CodexWebsocketOutputPatcher,
 ) -> Result<CodexHttpFallbackOutcome, ProxyError> {
     record_forward_retry(ProxyRoute::CodexResponses, "transport", source);
@@ -4586,20 +5614,6 @@ async fn run_codex_websocket_http_fallback(
                         },
                     )
                     .await;
-                    if switch_codex_http_fallback_provider(
-                        state,
-                        execution,
-                        account_in_flight_guard,
-                        excluded_provider_ids,
-                        provider_pinned,
-                        auth_refresh_attempted,
-                        output_patcher,
-                        "websocket_http_fallback_target_error",
-                    )
-                    .await
-                    {
-                        continue;
-                    }
                 }
                 return terminate_codex_http_fallback_with_error(
                     downstream,
@@ -4632,24 +5646,10 @@ async fn run_codex_websocket_http_fallback(
                 .map_err(|_| ()),
             None => Ok(request.send().await),
         };
-        let upstream = match send_result {
+        let mut upstream = match send_result {
             Ok(Ok(upstream)) => upstream,
             Ok(Err(error)) => {
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                if switch_codex_http_fallback_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    provider_pinned,
-                    auth_refresh_attempted,
-                    output_patcher,
-                    "websocket_http_fallback_send_error",
-                )
-                .await
-                {
-                    continue;
-                }
                 return terminate_codex_http_fallback_with_error(
                     downstream,
                     state,
@@ -4665,20 +5665,6 @@ async fn run_codex_websocket_http_fallback(
             }
             Err(_) => {
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                if switch_codex_http_fallback_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    provider_pinned,
-                    auth_refresh_attempted,
-                    output_patcher,
-                    "websocket_http_fallback_send_timeout",
-                )
-                .await
-                {
-                    continue;
-                }
                 let error = ProxyError {
                     status: StatusCode::GATEWAY_TIMEOUT,
                     message: format!(
@@ -4717,20 +5703,6 @@ async fn run_codex_websocket_http_fallback(
                     },
                 )
                 .await;
-                if switch_codex_http_fallback_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    provider_pinned,
-                    auth_refresh_attempted,
-                    output_patcher,
-                    "websocket_http_fallback_unmanaged_unauthorized",
-                )
-                .await
-                {
-                    continue;
-                }
                 return terminate_codex_http_fallback_with_error(
                     downstream,
                     state,
@@ -4764,20 +5736,6 @@ async fn run_codex_websocket_http_fallback(
                     },
                 )
                 .await;
-                if switch_codex_http_fallback_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    provider_pinned,
-                    auth_refresh_attempted,
-                    output_patcher,
-                    "websocket_http_fallback_refresh_failed",
-                )
-                .await
-                {
-                    continue;
-                }
                 return terminate_codex_http_fallback_with_error(
                     downstream,
                     state,
@@ -4806,32 +5764,19 @@ async fn run_codex_websocket_http_fallback(
                 "websocket_http_fallback_unauthorized_after_refresh",
             )
             .await;
-            if switch_codex_http_fallback_provider(
-                state,
-                execution,
-                account_in_flight_guard,
-                excluded_provider_ids,
-                provider_pinned,
-                auth_refresh_attempted,
-                output_patcher,
-                "websocket_http_fallback_unauthorized_after_refresh",
-            )
-            .await
-            {
-                record_provider_outcome(
-                    state,
-                    &stored,
-                    provider_outcome_from_status(status.as_u16()),
-                )
-                .await;
-                drop(upstream);
-                continue;
-            }
         }
         if !status.is_success() {
             let response_headers = upstream.headers().clone();
             let body_result = match first_event_deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, upstream.bytes()).await {
+                Some(deadline) => match tokio::time::timeout_at(
+                    deadline,
+                    crate::infra::http::read_response_body_limited(
+                        &mut upstream,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                    ),
+                )
+                .await
+                {
                     Ok(body) => body.map_err(ProxyError::bad_gateway),
                     Err(_) => Err(ProxyError {
                         status: StatusCode::GATEWAY_TIMEOUT,
@@ -4843,26 +5788,25 @@ async fn run_codex_websocket_http_fallback(
                         ),
                     }),
                 },
-                None => upstream.bytes().await.map_err(ProxyError::bad_gateway),
+                None => crate::infra::http::read_response_body_limited(
+                    &mut upstream,
+                    PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                )
+                .await
+                .map_err(ProxyError::bad_gateway),
             };
+            let body_result = body_result.and_then(|body| {
+                decode_response_body_for_proxy_with_limit(
+                    &response_headers,
+                    body,
+                    PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                )
+                .map(|decoded| decoded.body)
+            });
             let body = match body_result {
                 Ok(body) => body,
                 Err(error) => {
                     record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                    if switch_codex_http_fallback_provider(
-                        state,
-                        execution,
-                        account_in_flight_guard,
-                        excluded_provider_ids,
-                        provider_pinned,
-                        auth_refresh_attempted,
-                        output_patcher,
-                        "websocket_http_fallback_error_body_read",
-                    )
-                    .await
-                    {
-                        continue;
-                    }
                     let code = if error.status == StatusCode::GATEWAY_TIMEOUT {
                         "upstream_stream_timeout"
                     } else {
@@ -4890,21 +5834,6 @@ async fn run_codex_websocket_http_fallback(
                 provider_outcome_from_status(status.as_u16()),
             )
             .await;
-            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && switch_codex_http_fallback_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    provider_pinned,
-                    auth_refresh_attempted,
-                    output_patcher,
-                    "websocket_http_fallback_retryable_status",
-                )
-                .await
-            {
-                continue;
-            }
             let message = if execution.driver_is("oauth.grok_responses")
                 && is_grok_cli_version_gate_message(&upstream_error_message(&body))
             {
@@ -4980,20 +5909,6 @@ async fn run_codex_websocket_http_fallback(
                     ProviderOutcome::Failure { status_code: 502 },
                 )
                 .await;
-                if switch_codex_http_fallback_provider(
-                    state,
-                    execution,
-                    account_in_flight_guard,
-                    excluded_provider_ids,
-                    provider_pinned,
-                    auth_refresh_attempted,
-                    output_patcher,
-                    "websocket_http_fallback_semantic_failure",
-                )
-                .await
-                {
-                    continue;
-                }
                 tracing::debug!(
                     error = %failure.display_message(),
                     "forwarding Responses semantic failure after HTTP fallback failover exhausted"
@@ -5006,25 +5921,10 @@ async fn run_codex_websocket_http_fallback(
             }
             Ok(CodexHttpRelayOutcome::Interrupted {
                 error,
-                committed_business_event,
+                committed_business_event: _,
                 replay_payloads,
             }) => {
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                if !committed_business_event
-                    && switch_codex_http_fallback_provider(
-                        state,
-                        execution,
-                        account_in_flight_guard,
-                        excluded_provider_ids,
-                        provider_pinned,
-                        auth_refresh_attempted,
-                        output_patcher,
-                        "websocket_http_fallback_stream_interrupted",
-                    )
-                    .await
-                {
-                    continue;
-                }
                 let error_code = if error.status == StatusCode::GATEWAY_TIMEOUT {
                     "upstream_stream_timeout"
                 } else if error.status == StatusCode::PAYLOAD_TOO_LARGE {
@@ -5051,36 +5951,6 @@ async fn run_codex_websocket_http_fallback(
             }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn switch_codex_http_fallback_provider(
-    state: &ServerState,
-    execution: &mut ProviderExecution,
-    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
-    excluded_provider_ids: &mut BTreeSet<String>,
-    provider_pinned: bool,
-    auth_refresh_attempted: &mut bool,
-    output_patcher: &mut CodexWebsocketOutputPatcher,
-    reason: &'static str,
-) -> bool {
-    if execution.driver_is("oauth.grok_responses")
-        || provider_pinned
-        || !switch_to_ready_codex_provider(
-            state,
-            execution,
-            account_in_flight_guard,
-            excluded_provider_ids,
-            codex_oauth_websocket_failover_provider,
-            reason,
-        )
-        .await
-    {
-        return false;
-    }
-    *auth_refresh_attempted = false;
-    output_patcher.clear();
-    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5134,6 +6004,7 @@ async fn prepare_codex_http_fallback_target(
 ) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
     let stored = execution.runtime_stored_view();
     let grok = execution.driver_is("oauth.grok_responses");
+    let responses_lite = !grok && codex_responses_lite_requested_value(response_body);
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let body = serde_json::to_vec(response_body)
         .map(Bytes::from)
@@ -5148,6 +6019,10 @@ async fn prepare_codex_http_fallback_target(
             session_id,
             codex_image_tool_strip_policy(&stored),
         )?;
+        if responses_lite {
+            adapter_request.body =
+                normalize_codex_responses_lite_body_bytes(&adapter_request.body, true, true)?;
+        }
         adapter_request.body =
             super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
     }
@@ -5180,7 +6055,7 @@ async fn prepare_codex_http_fallback_target(
     }
 
     refresh_execution_managed_account_if_needed(state, execution).await?;
-    ensure_grok_credential_persistence_available(state, execution)?;
+    ensure_managed_credential_persistence_available(state, execution)?;
     let accounts = state.accounts_snapshot().await;
     let mut headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
     headers.extend(adapter_request.upstream_headers.iter().cloned());
@@ -5190,6 +6065,13 @@ async fn prepare_codex_http_fallback_target(
         }
     } else {
         append_codex_oauth_session_headers(&mut headers, session_id);
+        if responses_lite {
+            replace_or_push_header(
+                &mut headers,
+                CODEX_RESPONSES_LITE_HEADER,
+                "true".to_string(),
+            );
+        }
         crate::codex_identity::finalize_headers(&mut headers);
     }
     let mut headers = owned_headers(headers);
@@ -5265,6 +6147,9 @@ async fn prepare_codex_responses_websocket_request(
     };
     sanitize_codex_oauth_request_body(target);
     strip_codex_oauth_unsupported_responses_fields(target);
+    if codex_responses_lite_requested_value(target) {
+        normalize_codex_responses_lite_body(target, false, false);
+    }
     let target_body = serde_json::to_vec(target)
         .map(Bytes::from)
         .map_err(|error| {
@@ -7292,6 +8177,25 @@ pub(super) async fn record_share_invocation_result(
         .await;
 }
 
+async fn record_share_supplemental_usage(
+    state: &ServerState,
+    share_id: Option<&str>,
+    user_email: Option<&str>,
+    usage: TokenUsage,
+) {
+    let Some(share_id) = share_id else {
+        return;
+    };
+    state
+        .record_share_supplemental_usage(
+            share_id,
+            user_email,
+            share_usage_tokens(usage),
+            crate::infra::time::now_ms() as i64,
+        )
+        .await;
+}
+
 pub(super) async fn record_provider_outcome(
     _state: &ServerState,
     stored: &StoredProvider,
@@ -7585,17 +8489,17 @@ async fn refresh_execution_managed_account_if_needed(
         .refresh_managed_account_if_needed(provider_type, Some(account_id))
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)?;
-    ensure_grok_credential_persistence_available(state, execution)
+    ensure_managed_credential_persistence_available(state, execution)
 }
 
-fn ensure_grok_credential_persistence_available(
+fn ensure_managed_credential_persistence_available(
     state: &ServerState,
     execution: &ProviderExecution,
 ) -> Result<(), ProxyError> {
-    if execution.driver_is("oauth.grok_responses") && state.credential_persistence_degraded() {
+    if execution.managed_account_target().is_some() && state.credential_persistence_degraded() {
         return Err(ProxyError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Grok OAuth credentials are waiting for durable persistence".to_string(),
+            message: "managed account credentials are waiting for durable persistence".to_string(),
         });
     }
     Ok(())
@@ -7769,7 +8673,10 @@ async fn next_provider_failover(
     failed: &ProviderExecution,
     reason: &'static str,
 ) -> Option<ForwardAttemptContext> {
-    if route.app() == AppKind::Claude || !attempt_context.retry_allowed() {
+    if matches!(route.app(), AppKind::Claude | AppKind::Codex)
+        || failed.driver_is("oauth.openai_codex")
+        || !attempt_context.retry_allowed()
+    {
         return None;
     }
     if failed.driver_is("oauth.grok_responses") {
@@ -7790,133 +8697,6 @@ async fn next_provider_failover(
     );
     record_forward_retry(route, "provider", reason);
     Some(attempt_context.after_provider_failover(failed, &next))
-}
-
-async fn next_capability_provider_failover(
-    state: &ServerState,
-    route: ProxyRoute,
-    failed: &ProviderExecution,
-    excluded_provider_ids: &mut BTreeSet<String>,
-    provider_filter: fn(&StoredProvider) -> bool,
-    reason: &'static str,
-) -> Option<(ProviderExecution, Option<AccountInFlightGuard>)> {
-    excluded_provider_ids.insert(failed.stored.provider.id.clone());
-    loop {
-        let accounts = state.accounts_snapshot().await;
-        let in_flight = state.account_in_flight.snapshot();
-        let next = {
-            let providers = state.providers.read().await;
-            select_failover_provider_matching(
-                &providers,
-                &accounts,
-                route,
-                &in_flight,
-                excluded_provider_ids,
-                provider_filter,
-            )?
-            .execution
-        };
-        let guard = match acquire_capability_failover_candidate(
-            state,
-            &next.stored,
-            &accounts,
-            &in_flight,
-            excluded_provider_ids,
-        ) {
-            CapabilityFailoverAcquire::Ready(guard) => guard,
-            CapabilityFailoverAcquire::Saturated => {
-                tracing::debug!(
-                    provider_id = %next.stored.provider.id,
-                    "reselecting capability-compatible failover Provider after account saturation"
-                );
-                continue;
-            }
-        };
-        tracing::debug!(
-            reason,
-            from_provider_id = %failed.stored.provider.id,
-            to_provider_id = %next.stored.provider.id,
-            "switching request to capability-compatible failover Provider"
-        );
-        record_forward_retry(route, "provider", reason);
-        return Some((next, guard));
-    }
-}
-
-enum CapabilityFailoverAcquire {
-    Ready(Option<AccountInFlightGuard>),
-    Saturated,
-}
-
-fn acquire_capability_failover_candidate(
-    state: &ServerState,
-    stored: &StoredProvider,
-    accounts: &crate::domain::accounts::store::AccountStore,
-    snapshot: &AccountInFlightSnapshot,
-    excluded_provider_ids: &mut BTreeSet<String>,
-) -> CapabilityFailoverAcquire {
-    match try_acquire_account_in_flight(state, stored, accounts, snapshot) {
-        AccountInFlightAcquire::Acquired(guard) => CapabilityFailoverAcquire::Ready(Some(guard)),
-        AccountInFlightAcquire::NotManaged => CapabilityFailoverAcquire::Ready(None),
-        AccountInFlightAcquire::Saturated => {
-            excluded_provider_ids.insert(stored.provider.id.clone());
-            CapabilityFailoverAcquire::Saturated
-        }
-    }
-}
-
-async fn switch_to_ready_codex_provider(
-    state: &ServerState,
-    execution: &mut ProviderExecution,
-    account_in_flight_guard: &mut Option<AccountInFlightGuard>,
-    excluded_provider_ids: &mut BTreeSet<String>,
-    provider_filter: fn(&StoredProvider) -> bool,
-    reason: &'static str,
-) -> bool {
-    let mut failed = execution.clone();
-    loop {
-        let Some((next, next_guard)) = next_capability_provider_failover(
-            state,
-            ProxyRoute::CodexResponses,
-            &failed,
-            excluded_provider_ids,
-            provider_filter,
-            reason,
-        )
-        .await
-        else {
-            return false;
-        };
-        if let Err(error) = refresh_execution_managed_account_if_needed(state, &next).await {
-            mark_managed_account_auth_cooldown(state, &next, "failover_account_refresh_failed")
-                .await;
-            tracing::debug!(
-                provider_id = %next.stored.provider.id,
-                %error,
-                "skipping failover Provider after managed account refresh failure"
-            );
-            failed = next;
-            drop(next_guard);
-            continue;
-        }
-        *execution = next;
-        *account_in_flight_guard = next_guard;
-        return true;
-    }
-}
-
-fn codex_oauth_image_failover_provider(provider: &StoredProvider) -> bool {
-    provider.provider_type == ProviderType::CodexOAuth
-        && provider
-            .provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.codex_image_generation_enabled)
-            .unwrap_or(false)
-}
-
-fn codex_oauth_websocket_failover_provider(provider: &StoredProvider) -> bool {
-    provider.provider_type == ProviderType::CodexOAuth && codex_websocket_enabled(provider)
 }
 
 fn request_is_provider_pinned(headers: &HeaderMap, request_context: &UsageLogContext) -> bool {
@@ -8128,13 +8908,23 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
     }
 }
 
-fn managed_account_refresh_error_to_proxy_error(error: ManagedAccountRefreshError) -> ProxyError {
+pub(crate) fn managed_account_refresh_error_to_proxy_error(
+    error: ManagedAccountRefreshError,
+) -> ProxyError {
     match error {
         ManagedAccountRefreshError::Conflict { provider_type } => ProxyError::conflict(format!(
             "{} account refresh is already in progress",
             provider_type.as_str()
         )),
         ManagedAccountRefreshError::NotFound => ProxyError::not_found("managed account not found"),
+        ManagedAccountRefreshError::InactiveCodexAccount => ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Codex OAuth account is not active".to_string(),
+        },
+        ManagedAccountRefreshError::CredentialPersistenceDegraded => ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "managed account credentials are waiting for durable persistence".to_string(),
+        },
         ManagedAccountRefreshError::Refresh {
             status_code,
             message: _,
@@ -8421,6 +9211,65 @@ fn append_codex_oauth_session_headers(
     headers.push(("x-codex-window-id", format!("{session_id}:0")));
 }
 
+const CODEX_ALLOWED_CLIENT_REQUEST_HEADERS: &[&str] = &[
+    "x-codex-turn-state",
+    "x-codex-turn-metadata",
+    "x-client-request-id",
+    "x-codex-beta-features",
+    "x-responsesapi-include-timing-metrics",
+    "x-oai-attestation",
+];
+
+fn append_codex_client_request_headers(
+    target: &mut Vec<(&'static str, String)>,
+    client: &HeaderMap,
+    responses_lite: bool,
+) {
+    for &name in CODEX_ALLOWED_CLIENT_REQUEST_HEADERS {
+        if let Some(value) = optional_header(client, name) {
+            replace_or_push_header(target, name, value.to_string());
+        }
+    }
+    if responses_lite {
+        replace_or_push_header(target, CODEX_RESPONSES_LITE_HEADER, "true".to_string());
+    }
+}
+
+fn append_codex_client_request_headers_owned(
+    target: &mut Vec<(String, String)>,
+    client: &HeaderMap,
+    responses_lite: bool,
+) {
+    let forwarded = CODEX_ALLOWED_CLIENT_REQUEST_HEADERS
+        .iter()
+        .filter_map(|name| {
+            optional_header(client, name).map(|value| ((*name).to_string(), value.to_string()))
+        })
+        .chain(
+            responses_lite.then(|| (CODEX_RESPONSES_LITE_HEADER.to_string(), "true".to_string())),
+        )
+        .collect();
+    merge_owned_headers(target, forwarded);
+}
+
+fn codex_client_headers_from_owned(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            CODEX_ALLOWED_CLIENT_REQUEST_HEADERS
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        })
+        .cloned()
+        .collect()
+}
+
+fn merge_owned_headers(target: &mut Vec<(String, String)>, headers: Vec<(String, String)>) {
+    for (name, value) in headers {
+        replace_or_push_owned_header(target, name, value);
+    }
+}
+
 const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
     "max_tokens",
     "max_completion_tokens",
@@ -8463,6 +9312,69 @@ fn normalize_codex_oauth_responses_body_bytes(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("encode codex oauth responses body failed: {error}"),
         })
+}
+
+fn codex_responses_lite_requested(headers: &HeaderMap, body: &[u8]) -> bool {
+    optional_header(headers, CODEX_RESPONSES_LITE_HEADER)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        || serde_json::from_slice::<Value>(body)
+            .ok()
+            .as_ref()
+            .is_some_and(codex_responses_lite_requested_value)
+}
+
+fn codex_responses_lite_requested_value(body: &Value) -> bool {
+    body.pointer(&format!(
+        "/client_metadata/{CODEX_RESPONSES_LITE_WS_METADATA}"
+    ))
+    .and_then(Value::as_str)
+    .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+fn normalize_codex_responses_lite_body_bytes(
+    body: &Bytes,
+    strip_hosted_image_tools: bool,
+    remove_ws_metadata: bool,
+) -> Result<Bytes, ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| ProxyError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid Codex Responses Lite body: {error}"),
+    })?;
+    normalize_codex_responses_lite_body(&mut value, strip_hosted_image_tools, remove_ws_metadata);
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("encode Codex Responses Lite body failed: {error}"),
+        })
+}
+
+fn normalize_codex_responses_lite_body(
+    body: &mut Value,
+    strip_hosted_image_tools: bool,
+    remove_ws_metadata: bool,
+) {
+    body["parallel_tool_calls"] = Value::Bool(false);
+    if !body.get("reasoning").is_some_and(Value::is_object) {
+        body["reasoning"] = Value::Object(serde_json::Map::new());
+    }
+    body["reasoning"]["context"] = Value::String("all_turns".to_string());
+    if strip_hosted_image_tools {
+        strip_codex_image_generation_tools(body);
+    }
+    if remove_ws_metadata {
+        if let Some(metadata) = body
+            .get_mut("client_metadata")
+            .and_then(Value::as_object_mut)
+        {
+            metadata.remove(CODEX_RESPONSES_LITE_WS_METADATA);
+            if metadata.is_empty() {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("client_metadata");
+                }
+            }
+        }
+    }
 }
 
 fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<Bytes, ProxyError> {
@@ -9893,6 +10805,7 @@ fn select_share_execution(
         message: format!("[{}] {error}", error.code()),
     })?;
     let (stored, share_name) = select_share_provider(providers, shares, app, share_id)?;
+    super::router::ensure_codex_oauth_active_account(&stored, accounts)?;
     ensure_provider_account_does_not_need_relogin(&stored, accounts)?;
     ensure_provider_account_usage_available(&stored, accounts, current_time_ms())?;
     let execution = ProviderExecution::from_store(providers, stored)?;
@@ -10098,7 +11011,7 @@ mod tests {
     }
 
     #[test]
-    fn images_and_websocket_reselect_after_atomic_account_acquire_race() {
+    fn images_and_websocket_never_reselect_inactive_account_after_acquire_race() {
         let mut accounts = AccountStore::default();
         for account_id in ["race-account-1", "race-account-2"] {
             accounts.upsert(
@@ -10116,6 +11029,9 @@ mod tests {
                 .unwrap(),
             );
         }
+        accounts
+            .select_active_codex_oauth_account("race-account-1")
+            .unwrap();
         let mut first = stored_provider(
             AppKind::Codex,
             ProviderType::CodexOAuth,
@@ -10146,44 +11062,43 @@ mod tests {
             let state = forwarder_test_state(selection_kind);
             let mut competing_guard = None;
             let mut selection_calls = 0;
-            let (execution, selected_guard) =
-                select_and_acquire_account_in_flight(&state, &accounts, |snapshot| {
-                    let selection = if selection_kind == "images" {
-                        select_provider_for_codex_image_generation(
-                            &providers,
-                            &accounts,
-                            &HeaderMap::new(),
-                            Some("race-provider-1"),
-                            snapshot,
-                            None,
-                        )
-                    } else {
-                        select_provider_with_account_inflight(
-                            &providers,
-                            &accounts,
-                            AppKind::Codex,
-                            &HeaderMap::new(),
-                            Some("race-provider-1"),
-                            snapshot,
-                            None,
-                        )
-                    }?;
-                    if selection_calls == 0 {
-                        assert_eq!(selection.execution.stored.provider.id, "race-provider-1");
-                        competing_guard = state.account_in_flight.try_acquire(
-                            ProviderType::CodexOAuth,
-                            "race-account-1",
-                            1,
-                        );
-                        assert!(competing_guard.is_some());
-                    }
-                    selection_calls += 1;
-                    Ok(selection.execution)
-                })
-                .unwrap();
+            let error = select_and_acquire_account_in_flight(&state, &accounts, |snapshot| {
+                selection_calls += 1;
+                let selection = if selection_kind == "images" {
+                    select_provider_for_codex_image_generation(
+                        &providers,
+                        &accounts,
+                        &HeaderMap::new(),
+                        Some("race-provider-1"),
+                        snapshot,
+                        None,
+                    )
+                } else {
+                    select_provider_with_account_inflight(
+                        &providers,
+                        &accounts,
+                        AppKind::Codex,
+                        &HeaderMap::new(),
+                        Some("race-provider-1"),
+                        snapshot,
+                        None,
+                    )
+                }?;
+                if selection_calls == 1 {
+                    assert_eq!(selection.execution.stored.provider.id, "race-provider-1");
+                    competing_guard = state.account_in_flight.try_acquire(
+                        ProviderType::CodexOAuth,
+                        "race-account-1",
+                        1,
+                    );
+                    assert!(competing_guard.is_some());
+                }
+                Ok(selection.execution)
+            })
+            .unwrap_err();
 
             assert_eq!(selection_calls, 2, "{selection_kind}");
-            assert_eq!(execution.stored.provider.id, "race-provider-2");
+            assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
             let snapshot = state.account_in_flight.snapshot();
             assert_eq!(
                 snapshot.current(ProviderType::CodexOAuth, "race-account-1"),
@@ -10191,9 +11106,8 @@ mod tests {
             );
             assert_eq!(
                 snapshot.current(ProviderType::CodexOAuth, "race-account-2"),
-                1
+                0
             );
-            drop(selected_guard);
             drop(competing_guard);
             let snapshot = state.account_in_flight.snapshot();
             assert_eq!(
@@ -10205,112 +11119,6 @@ mod tests {
                 0
             );
         }
-    }
-
-    #[test]
-    fn capability_failover_excludes_candidate_lost_to_atomic_acquire_race() {
-        let mut accounts = AccountStore::default();
-        for account_id in ["failover-race-account-1", "failover-race-account-2"] {
-            accounts.upsert(
-                serde_json::from_value(json!({
-                    "id": account_id,
-                    "providerType": "codex_oauth",
-                    "accessToken": format!("{account_id}-token"),
-                    "profile": {
-                        "codexWorkspaceProvenance": {
-                            "workspaceId": format!("{account_id}-workspace"),
-                            "source": "test_fixture"
-                        }
-                    }
-                }))
-                .unwrap(),
-            );
-        }
-        let mut first = stored_provider(
-            AppKind::Codex,
-            ProviderType::CodexOAuth,
-            json!({"ACCOUNT_MAX_CONCURRENT": 1}),
-            Some("failover-race-account-1"),
-        );
-        first.provider.id = "failover-race-provider-1".to_string();
-        let mut second = stored_provider(
-            AppKind::Codex,
-            ProviderType::CodexOAuth,
-            json!({"ACCOUNT_MAX_CONCURRENT": 1}),
-            Some("failover-race-account-2"),
-        );
-        second.provider.id = "failover-race-provider-2".to_string();
-        let mut providers = ProviderStore {
-            providers: vec![first, second],
-            ..ProviderStore::default()
-        };
-        providers.rebuild_runtime_index(&accounts).unwrap();
-        let state = forwarder_test_state("capability-failover-acquire-race");
-        let mut excluded = BTreeSet::new();
-
-        let stale_snapshot = state.account_in_flight.snapshot();
-        let first = select_failover_provider_matching(
-            &providers,
-            &accounts,
-            ProxyRoute::CodexResponses,
-            &stale_snapshot,
-            &excluded,
-            |_| true,
-        )
-        .unwrap()
-        .execution;
-        assert_eq!(first.stored.provider.id, "failover-race-provider-1");
-        let competing_guard = state
-            .account_in_flight
-            .try_acquire(ProviderType::CodexOAuth, "failover-race-account-1", 1)
-            .unwrap();
-
-        assert!(matches!(
-            acquire_capability_failover_candidate(
-                &state,
-                &first.stored,
-                &accounts,
-                &stale_snapshot,
-                &mut excluded,
-            ),
-            CapabilityFailoverAcquire::Saturated
-        ));
-        assert!(excluded.contains("failover-race-provider-1"));
-
-        let fresh_snapshot = state.account_in_flight.snapshot();
-        let second = select_failover_provider_matching(
-            &providers,
-            &accounts,
-            ProxyRoute::CodexResponses,
-            &fresh_snapshot,
-            &excluded,
-            |_| true,
-        )
-        .unwrap()
-        .execution;
-        assert_eq!(second.stored.provider.id, "failover-race-provider-2");
-        let selected_guard = match acquire_capability_failover_candidate(
-            &state,
-            &second.stored,
-            &accounts,
-            &fresh_snapshot,
-            &mut excluded,
-        ) {
-            CapabilityFailoverAcquire::Ready(Some(guard)) => guard,
-            _ => panic!("second failover candidate should acquire its account lease"),
-        };
-
-        let snapshot = state.account_in_flight.snapshot();
-        assert_eq!(
-            snapshot.current(ProviderType::CodexOAuth, "failover-race-account-1"),
-            1
-        );
-        assert_eq!(
-            snapshot.current(ProviderType::CodexOAuth, "failover-race-account-2"),
-            1
-        );
-        drop(selected_guard);
-        drop(competing_guard);
     }
 
     #[tokio::test]
@@ -11359,11 +12167,6 @@ mod tests {
                 let target_headers = target.headers.clone();
                 let target_url = target.ws_url.clone();
                 async move {
-                    let accounts = state.accounts_snapshot().await;
-                    let snapshot = state.account_in_flight.snapshot();
-                    let account_in_flight_guard =
-                        acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)
-                            .expect("Grok websocket account lease");
                     ws.on_upgrade(move |socket| async move {
                         let _ = bridge_responses_websocket(
                             socket,
@@ -11380,8 +12183,6 @@ mod tests {
                                 single_upstream_model: Some("grok-4.5".to_string()),
                                 state: &state,
                                 execution,
-                                account_in_flight_guard,
-                                provider_pinned: false,
                             },
                         )
                         .await;
@@ -11562,6 +12363,406 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct TestOverflowReply {
+        status: StatusCode,
+        content_type: &'static str,
+        body: String,
+    }
+
+    #[derive(Debug)]
+    struct TestOverflowRequest {
+        authorization: String,
+        account_id: String,
+        accept_encoding: String,
+        body: Value,
+    }
+
+    struct TestOverflowUpstream {
+        address: std::net::SocketAddr,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<TestOverflowRequest>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_overflow_upstream(replies: Vec<TestOverflowReply>) -> TestOverflowUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let replies = std::sync::Arc::new(replies);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let replies = std::sync::Arc::clone(&replies);
+                async move {
+                    let body = serde_json::from_slice::<Value>(&body).unwrap();
+                    let mut requests = requests.lock().unwrap();
+                    let index = requests.len();
+                    requests.push(TestOverflowRequest {
+                        authorization: headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        account_id: headers
+                            .get("chatgpt-account-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        accept_encoding: headers
+                            .get(axum::http::header::ACCEPT_ENCODING)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        body,
+                    });
+                    drop(requests);
+                    let reply = replies.get(index).cloned().unwrap_or(TestOverflowReply {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        content_type: "application/json",
+                        body: json!({"error":{"message":"unexpected request"}}).to_string(),
+                    });
+                    Response::builder()
+                        .status(reply.status)
+                        .header(CONTENT_TYPE, reply.content_type)
+                        .body(Body::from(reply.body))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestOverflowUpstream {
+            address,
+            requests,
+            server,
+        }
+    }
+
+    fn test_overflow_request_body(stream: bool) -> Bytes {
+        let old_user = "u".repeat(120 * 1024);
+        let old_assistant = "a".repeat(120 * 1024);
+        Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.4",
+                "stream": stream,
+                "input": [
+                    {"type":"message","role":"developer","content":[{"type":"input_text","text":"keep rules"}]},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":old_user}]},
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":old_assistant}]},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"latest question"}]}
+                ]
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn set_test_overflow_compact(execution: &mut ProviderExecution, enabled: bool) {
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert(
+                "testCodexOverflowAutoCompact".to_string(),
+                Value::Bool(enabled),
+            );
+    }
+
+    fn context_overflow_reply() -> TestOverflowReply {
+        TestOverflowReply {
+            status: StatusCode::BAD_REQUEST,
+            content_type: "application/json",
+            body: json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Input exceeds the context window"
+                }
+            })
+            .to_string(),
+        }
+    }
+
+    fn summary_success_reply() -> TestOverflowReply {
+        TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"dense summary\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"dense summary\"}]}],\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_overflow_auto_compact_disabled_makes_no_internal_call() {
+        let upstream = spawn_test_overflow_upstream(vec![context_overflow_reply()]).await;
+        let name = "codex-overflow-disabled";
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        set_test_overflow_compact(&mut execution, false);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            test_overflow_request_body(false),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_overflow_compacts_once_on_same_provider_and_logs_summary_usage() {
+        let upstream = spawn_test_overflow_upstream(vec![
+            context_overflow_reply(),
+            summary_success_reply(),
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: json!({
+                    "id":"resp-overflow-recovered",
+                    "status":"completed",
+                    "model":"gpt-5.4",
+                    "output":[],
+                    "usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}
+                })
+                .to_string(),
+            },
+        ])
+        .await;
+        let name = "codex-overflow-http";
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        set_test_overflow_compact(&mut execution, true);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            test_overflow_request_body(false),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let requests = upstream.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1]
+                .body
+                .to_string()
+                .contains("conversation compaction assistant"));
+            assert_eq!(requests[1].accept_encoding, "identity");
+            assert!(requests[2].body.to_string().contains("dense summary"));
+            assert!(requests[2].body.to_string().contains("latest question"));
+            for request in requests.iter() {
+                assert_eq!(request.authorization, format!("Bearer {name}-access-token"));
+                assert_eq!(request.account_id, format!("{name}-workspace"));
+            }
+        }
+        let usage = state.usage_snapshot().await;
+        let summary_log = usage
+            .logs
+            .iter()
+            .find(|log| {
+                log.data_source.as_deref()
+                    == Some(crate::proxy::overflow_compact::SUMMARY_DATA_SOURCE)
+            })
+            .unwrap();
+        assert_eq!(summary_log.provider_id, format!("{name}-provider"));
+        assert_eq!(summary_log.status_code, StatusCode::OK.as_u16());
+        assert_eq!(summary_log.input_tokens, Some(7));
+        assert_eq!(summary_log.output_tokens, Some(3));
+        assert_eq!(summary_log.total_tokens, Some(10));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_overflow_summary_failure_falls_back_and_never_compacts_twice() {
+        let upstream = spawn_test_overflow_upstream(vec![
+            context_overflow_reply(),
+            TestOverflowReply {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                content_type: "application/json",
+                body: json!({"error":{"type":"server_error"}}).to_string(),
+            },
+            context_overflow_reply(),
+        ])
+        .await;
+        let name = "codex-overflow-summary-failure";
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        set_test_overflow_compact(&mut execution, true);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            test_overflow_request_body(false),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        {
+            let requests = upstream.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[2]
+                .body
+                .to_string()
+                .contains("Earlier conversation turns were omitted"));
+        }
+        let usage = state.usage_snapshot().await;
+        let summary_logs = usage
+            .logs
+            .iter()
+            .filter(|log| {
+                log.data_source.as_deref()
+                    == Some(crate::proxy::overflow_compact::SUMMARY_DATA_SOURCE)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(summary_logs.len(), 1);
+        assert_eq!(
+            summary_logs[0].status_code,
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+        );
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_overflow_retries_only_before_business_output_is_committed() {
+        let overflow_sse = TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-overflow\"}}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Input exceeds the context window\"}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        };
+        let upstream = spawn_test_overflow_upstream(vec![
+            overflow_sse,
+            summary_success_reply(),
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-recovered\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .to_string(),
+            },
+        ])
+        .await;
+        let name = "codex-overflow-sse";
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        set_test_overflow_compact(&mut execution, true);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            test_overflow_request_body(true),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("recovered"));
+        assert!(!body.contains("context_length_exceeded"));
+        assert_eq!(upstream.requests.lock().unwrap().len(), 3);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_overflow_after_business_output_does_not_replay() {
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-committed\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"already committed\"}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Input exceeds the context window\"}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let name = "codex-overflow-committed";
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        set_test_overflow_compact(&mut execution, true);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            test_overflow_request_body(true),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("already committed"));
+        assert!(body.contains("context_length_exceeded"));
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
     struct TestCodexProviderSpec {
         name: String,
         endpoint: String,
@@ -11623,6 +12824,7 @@ mod tests {
 
     async fn insert_static_codex_test_account(state: &ServerState, name: &str, access_token: &str) {
         let account_id = format!("{name}-account");
+        let active_account_id = account_id.clone();
         let workspace_id = format!("{name}-workspace");
         let email = format!("{name}@example.com");
         let access_token = access_token.to_string();
@@ -11660,6 +12862,11 @@ mod tests {
                     rate_limited_until: None,
                     last_refresh_error: None,
                 });
+                if accounts.active_codex_oauth_account_id.is_none() {
+                    accounts
+                        .select_active_codex_oauth_account(&active_account_id)
+                        .expect("inserted Codex test account must be selectable");
+                }
             })
             .await
             .unwrap();
@@ -11719,11 +12926,6 @@ mod tests {
                 let session_id = session_id.clone();
                 let upstream_headers = upstream_headers.clone();
                 async move {
-                    let accounts = state.accounts_snapshot().await;
-                    let in_flight = state.account_in_flight.snapshot();
-                    let account_in_flight_guard =
-                        acquire_account_in_flight(&state, &execution.stored, &accounts, &in_flight)
-                            .expect("test websocket account lease");
                     ws.on_upgrade(move |socket| async move {
                         let _ = bridge_responses_websocket(
                             socket,
@@ -11740,8 +12942,6 @@ mod tests {
                                 single_upstream_model: None,
                                 state: &state,
                                 execution,
-                                account_in_flight_guard,
-                                provider_pinned: false,
                             },
                         )
                         .await;
@@ -11813,7 +13013,16 @@ mod tests {
         (events, close_code)
     }
 
-    async fn run_codex_http_fallback_failover_case(
+    async fn unavailable_test_address() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    }
+
+    async fn run_codex_http_fallback_single_provider_case(
         case: &str,
         behavior: TestCodexWebSocketBehavior,
         first_event_timeout: Option<Duration>,
@@ -11849,10 +13058,11 @@ mod tests {
         )
         .await;
         let execution = executions.remove(0);
+        let unavailable_address = unavailable_test_address().await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
             state,
             execution,
-            format!("ws://{}/ws", primary.address),
+            format!("ws://{unavailable_address}/ws"),
             None,
             &format!("{case}-session"),
             first_event_timeout,
@@ -12410,6 +13620,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         token_url: String,
     ) {
         let account_id = format!("{name}-account");
+        let active_account_id = account_id.clone();
         let workspace_id = format!("{name}-workspace");
         let email = format!("{name}@example.com");
         let access_token = format!("{name}-access-token");
@@ -12448,6 +13659,11 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                     rate_limited_until: None,
                     last_refresh_error: None,
                 });
+                if accounts.active_codex_oauth_account_id.is_none() {
+                    accounts
+                        .select_active_codex_oauth_account(&active_account_id)
+                        .expect("inserted Codex refresh test account must be selectable");
+                }
             })
             .await
             .unwrap();
@@ -12522,6 +13738,48 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                     }
                 }),
             );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestUnauthorizedCodexUpstream {
+            address,
+            authorizations,
+            server,
+        }
+    }
+
+    async fn spawn_test_oversized_codex_upstream() -> TestUnauthorizedCodexUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |headers: HeaderMap| {
+                let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    authorizations.lock().unwrap().push(authorization);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .header(
+                            axum::http::header::CONTENT_LENGTH,
+                            (crate::proxy::MEDIA_RESPONSE_BODY_LIMIT_BYTES + 1).to_string(),
+                        )
+                        .body(Body::from_stream(futures_util::stream::pending::<
+                            Result<Bytes, std::io::Error>,
+                        >()))
+                        .unwrap()
+                }
+            }),
+        );
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -13457,6 +14715,104 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
+    fn codex_alpha_search_strips_only_internal_prompt_cache_key() {
+        let normalized = normalize_codex_alpha_search_body(
+            br#"{"query":"rust","prompt_cache_key":"internal","filters":{"path":"src"}}"#,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        assert_eq!(value["query"], "rust");
+        assert_eq!(value.pointer("/filters/path"), Some(&json!("src")));
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn codex_alpha_search_decodes_compressed_requests_before_normalizing() {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(br#"{"query":"rust","prompt_cache_key":"internal"}"#)
+            .unwrap();
+        let body = Bytes::from(encoder.finish().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+
+        let prepared = prepare_codex_alpha_search_body(&headers, body).unwrap();
+        let value: Value = serde_json::from_slice(&prepared).unwrap();
+        assert_eq!(value["query"], "rust");
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn codex_alpha_search_rejects_decompressed_requests_above_the_proxy_limit() {
+        use std::io::Write;
+
+        let oversized = json!({"query": "x".repeat(PROXY_REQUEST_BODY_LIMIT_BYTES)});
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&serde_json::to_vec(&oversized).unwrap())
+            .unwrap();
+        let body = Bytes::from(encoder.finish().unwrap());
+        assert!(body.len() < PROXY_REQUEST_BODY_LIMIT_BYTES);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+
+        let error = prepare_codex_alpha_search_body(&headers, body).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.message.contains("decoded request body exceeds"));
+        assert!(error.message.contains("2097152"));
+    }
+
+    #[test]
+    fn codex_responses_lite_normalizes_body_and_forwards_only_safe_headers() {
+        let metadata_key = CODEX_RESPONSES_LITE_WS_METADATA;
+        let mut body = json!({
+            "client_metadata": {(metadata_key): "true", "keep": "value"},
+            "tools": [
+                {"type": "image_generation"},
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+            ]
+        });
+        assert!(codex_responses_lite_requested_value(&body));
+        normalize_codex_responses_lite_body(&mut body, true, true);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(
+            body.pointer("/reasoning/context"),
+            Some(&json!("all_turns"))
+        );
+        assert_eq!(body.pointer("/client_metadata/keep"), Some(&json!("value")));
+        assert!(body
+            .pointer(&format!("/client_metadata/{metadata_key}"))
+            .is_none());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body.pointer("/tools/0/name"), Some(&json!("lookup")));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        headers.insert("x-codex-turn-state", HeaderValue::from_static("turn-1"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-secret"),
+        );
+        headers.insert("cookie", HeaderValue::from_static("private=value"));
+        headers.insert("x-untrusted", HeaderValue::from_static("drop"));
+        assert!(codex_responses_lite_requested(&headers, b"{}"));
+
+        let mut forwarded = Vec::new();
+        append_codex_client_request_headers(&mut forwarded, &headers, true);
+        assert!(forwarded.contains(&(CODEX_RESPONSES_LITE_HEADER, "true".to_string())));
+        assert!(forwarded.contains(&("x-codex-turn-state", "turn-1".to_string())));
+        assert!(!forwarded
+            .iter()
+            .any(|(name, _)| { matches!(*name, "authorization" | "cookie" | "x-untrusted") }));
+    }
+
+    #[test]
     fn normalize_codex_oauth_responses_body_preserves_existing_instructions() {
         let body = json!({
             "model": "gpt-5.5",
@@ -13543,6 +14899,71 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
                 .and_then(Value::as_str),
             Some("cat")
         );
+    }
+
+    #[test]
+    fn codex_images_edit_maps_images_mask_and_string_form_fields() {
+        let prepared = codex_images_edit_request_from_value(json!({
+            "prompt": "replace the sky",
+            "model": "gpt-image-2",
+            "image": {"image_url": "data:image/png;base64,aW1hZ2U="},
+            "mask": {"image_url": "data:image/png;base64,bWFzaw=="},
+            "stream": "true",
+            "n": "2",
+            "input_fidelity": "high"
+        }))
+        .unwrap();
+        let request: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert!(prepared.stream);
+        assert_eq!(request.pointer("/tools/0/action"), Some(&json!("edit")));
+        assert_eq!(request.pointer("/tools/0/n"), Some(&json!(2)));
+        assert_eq!(
+            request.pointer("/tools/0/input_fidelity"),
+            Some(&json!("high"))
+        );
+        assert_eq!(
+            request.pointer("/tools/0/input_image_mask/image_url"),
+            Some(&json!("data:image/png;base64,bWFzaw=="))
+        );
+        assert_eq!(
+            request.pointer("/input/0/content/1/image_url"),
+            Some(&json!("data:image/png;base64,aW1hZ2U="))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_images_edit_accepts_octet_stream_with_valid_image_signature() {
+        let boundary = "cc-switch-image-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nreplace the sky\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"input.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(b"\x89PNG\r\n\x1a\nfixture");
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+
+        let prepared = codex_images_edit_request(&headers, Bytes::from(body))
+            .await
+            .unwrap();
+        let request: Value = serde_json::from_slice(&prepared.body).unwrap();
+
+        assert!(request
+            .pointer("/input/0/content/1/image_url")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
     }
 
     #[test]
@@ -14439,6 +15860,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 format!("Bearer {refreshed_access_token}")
             ]
         );
+        let usage = state.usage.read().await;
+        let log = usage.logs.last().expect("Codex response usage log");
+        assert_eq!(log.input_tokens, Some(1));
+        assert_eq!(log.output_tokens, Some(1));
+        assert_eq!(log.total_tokens, Some(2));
 
         upstream.server.abort();
         refresh.server.abort();
@@ -14508,6 +15934,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 format!("Bearer {refreshed_access_token}")
             ]
         );
+        let usage = state.usage.read().await;
+        let log = usage.logs.last().expect("Codex SSE usage log");
+        assert_eq!(log.input_tokens, Some(1));
+        assert_eq!(log.output_tokens, Some(1));
+        assert_eq!(log.total_tokens, Some(2));
 
         upstream.server.abort();
         refresh.server.abort();
@@ -14665,13 +16096,15 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let response = forward_codex_images_generations(
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"cat","response_format":"b64_json"}"#,
+        )
+        .unwrap();
+        let response = forward_codex_images_request(
             state.clone(),
             execution,
             headers,
-            Bytes::from_static(
-                br#"{"model":"gpt-image-2","prompt":"cat","response_format":"b64_json"}"#,
-            ),
+            prepared,
             UsageLogContext::default(),
             None,
             None,
@@ -14695,13 +16128,55 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 format!("Bearer {refreshed_access_token}")
             ]
         );
+        let usage = state.usage.read().await;
+        let log = usage.logs.last().expect("Codex image usage log");
+        assert_eq!(log.input_tokens, Some(1));
+        assert_eq!(log.output_tokens, Some(1));
+        assert_eq!(log.total_tokens, Some(2));
 
         upstream.server.abort();
         refresh.server.abort();
     }
 
     #[tokio::test]
-    async fn codex_images_persistent_401_cools_account_and_fails_over() {
+    async fn codex_images_rejects_oversized_upstream_response_body() {
+        let name = "codex-images-oversized-response";
+        let upstream = spawn_test_oversized_codex_upstream().await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"bounded response"}"#,
+        )
+        .unwrap();
+
+        let error = forward_codex_images_request(
+            state,
+            execution,
+            headers,
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            format!(
+                "proxy upstream request failed: upstream response body exceeds the {} byte limit",
+                crate::proxy::MEDIA_RESPONSE_BODY_LIMIT_BYTES
+            )
+        );
+        assert_eq!(upstream.authorizations.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_persistent_401_stays_on_active_account() {
         let primary = "codex-images-persistent-primary";
         let fallback = "codex-images-persistent-fallback";
         let refreshed_access_token =
@@ -14753,13 +16228,15 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             acquire_account_in_flight(&state, &execution.stored, &accounts, &in_flight)
                 .expect("primary image account lease");
 
-        let response = forward_codex_images_generations(
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"stay pinned","response_format":"b64_json"}"#,
+        )
+        .unwrap();
+        let response = forward_codex_images_request(
             state.clone(),
             execution,
             headers,
-            Bytes::from_static(
-                br#"{"model":"gpt-image-2","prompt":"fail over","response_format":"b64_json"}"#,
-            ),
+            prepared,
             UsageLogContext::default(),
             account_in_flight_guard,
             None,
@@ -14767,13 +16244,13 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .await
         .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["data"][0]["b64_json"],
-            "ZmFpbG92ZXI="
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": {"type": "authentication_error"}})
         );
         assert_eq!(
             rejected.authorizations.lock().unwrap().as_slice(),
@@ -14782,10 +16259,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 format!("Bearer {refreshed_access_token}")
             ]
         );
-        assert_eq!(
-            accepted.authorizations.lock().unwrap().as_slice(),
-            [format!("Bearer {fallback_access_token}")]
-        );
+        assert!(accepted.authorizations.lock().unwrap().is_empty());
         let primary_account = state
             .find_account_by_id(&format!("{primary}-account"))
             .await
@@ -14809,7 +16283,191 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_websocket_persistent_handshake_401_fails_over_before_business_event() {
+    async fn codex_inactive_account_is_rejected_before_any_image_outbound() {
+        let active_name = "codex-active-outbound";
+        let inactive_name = "codex-inactive-outbound";
+        let active = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let inactive = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let state = forwarder_test_state("codex-inactive-zero-outbound");
+        insert_static_codex_test_account(&state, active_name, "active-token").await;
+        insert_static_codex_test_account(&state, inactive_name, "inactive-token").await;
+        let mut executions = install_codex_test_provider_set(
+            &state,
+            vec![
+                TestCodexProviderSpec {
+                    name: active_name.to_string(),
+                    endpoint: format!("http://{}", active.address),
+                    websocket_url: None,
+                },
+                TestCodexProviderSpec {
+                    name: inactive_name.to_string(),
+                    endpoint: format!("http://{}", inactive.address),
+                    websocket_url: None,
+                },
+            ],
+        )
+        .await;
+        let inactive_execution = executions.remove(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let prepared = codex_images_edit_request_from_value(json!({
+            "model": "gpt-image-2",
+            "prompt": "must not leave the server",
+            "image": "file:///must-not-be-inspected.png"
+        }))
+        .unwrap();
+
+        let error = forward_codex_images_request(
+            state,
+            inactive_execution,
+            headers,
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("inactive account"));
+        assert_eq!(
+            active
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            inactive
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        active.server.abort();
+        inactive.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_rechecks_active_account_before_each_response() {
+        let name = "codex-websocket-active-turn";
+        let (state, execution) =
+            codex_bridge_test_context(name, "http://127.0.0.1:9".to_string()).await;
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "codex-websocket-next-account",
+                        "providerType": "codex_oauth",
+                        "accessToken": "next-account-token",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "next-account-subject",
+                                "chatgpt_account_id": "next-account-workspace"
+                            },
+                            "codexWorkspaceProvenance": {
+                                "workspaceId": "next-account-workspace",
+                                "source": "test_fixture"
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                );
+                accounts
+                    .select_active_codex_oauth_account("codex-websocket-next-account")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+
+        let error = ensure_responses_websocket_turn_allowed(
+            &state,
+            &execution,
+            ResponsesWebsocketMode::Codex,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("inactive account"));
+    }
+
+    #[tokio::test]
+    async fn codex_images_rejects_disallowed_client_before_remote_image_processing() {
+        let (state, execution) = codex_bridge_test_context(
+            "codex-images-disallowed-before-remote-image",
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+        let prepared = codex_images_edit_request_from_value(json!({
+            "model": "gpt-image-2",
+            "prompt": "edit",
+            "image": "file:///must-not-be-inspected.png"
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("curl/8.0"));
+
+        let error = forward_codex_images_request(
+            state,
+            execution,
+            headers,
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(error.message.contains("allowed Codex client signature"));
+    }
+
+    #[tokio::test]
+    async fn codex_images_rejects_degraded_credentials_before_remote_image_processing() {
+        let name = "codex-images-degraded-before-remote-image";
+        let (state, execution) =
+            codex_bridge_test_context(name, "http://127.0.0.1:9".to_string()).await;
+        let account_id = execution.managed_account_id().unwrap();
+        let account = state.find_account_by_id(account_id).await.unwrap();
+        state.inject_account_refresh_persist_failures(1);
+        let commit = state
+            .commit_native_refresh_success(
+                &account,
+                crate::domain::accounts::store::AccountRefreshUpdate {
+                    access_token: Some(format!("{name}-rotated-access-token")),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(commit.is_err());
+        assert!(state.credential_persistence_degraded());
+        let prepared = codex_images_edit_request_from_value(json!({
+            "model": "gpt-image-2",
+            "prompt": "edit",
+            "image": "file:///must-not-be-inspected.png"
+        }))
+        .unwrap();
+
+        let error = forward_codex_images_request(
+            state,
+            execution,
+            HeaderMap::new(),
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("durable persistence"));
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_persistent_handshake_401_stays_on_active_account() {
         let primary = "codex-ws-persistent-primary";
         let fallback = "codex-ws-persistent-fallback";
         let refreshed_access_token =
@@ -14851,13 +16509,14 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
 
-        let events = send_test_bridge_request(bridge_address, "fail over auth").await;
+        let (events, close_code) =
+            send_test_bridge_request_with_close(bridge_address, "reject inactive fallback").await;
         wait_for_codex_account_leases_to_release(&state_for_assert, &[primary, fallback]).await;
 
         assert!(events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-auth-failover")
-                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_auth_error")
         }));
+        assert_eq!(close_code, Some(CloseCode::Error));
         assert_eq!(
             rejected.authorizations.lock().unwrap().as_slice(),
             [
@@ -14865,14 +16524,15 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 format!("Bearer {refreshed_access_token}")
             ]
         );
-        assert_eq!(
-            accepted.authorizations.lock().unwrap().as_slice(),
-            [format!("Bearer {fallback_access_token}")]
-        );
+        assert!(accepted.authorizations.lock().unwrap().is_empty());
         assert_eq!(
             accepted
                 .connections
                 .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
         let primary_account = state_for_assert
@@ -14909,10 +16569,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let (state, execution) =
             codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
         configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        let unavailable_address = unavailable_test_address().await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge(
             state,
             execution,
-            format!("ws://{}/ws", upstream.address),
+            format!("ws://{unavailable_address}/ws"),
             None,
             "ws-http-refresh-session",
         )
@@ -15051,7 +16712,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_websocket_size_close_falls_back_to_http_with_same_identity() {
+    async fn codex_websocket_size_close_after_commit_does_not_replay() {
         let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::CloseSize).await;
         let endpoint = format!("http://{}", upstream.address);
         let (state, execution) = codex_bridge_test_context("ws-size", endpoint).await;
@@ -15064,53 +16725,43 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
 
-        let events = send_test_bridge_request(bridge_address, "size fallback").await;
+        let events = send_test_bridge_request(bridge_address, "size close").await;
         assert!(events.iter().any(|event| {
-            event.get("type").and_then(Value::as_str) == Some("response.completed")
-                && event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+            event.pointer("/error/code").and_then(Value::as_str) == Some("message_too_big")
         }));
         assert_eq!(
             upstream
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
-        let observations = upstream.http_observations.lock().unwrap();
-        let (authorization, workspace, body) = &observations[0];
-        assert_eq!(authorization, "Bearer ws-size-access-token");
-        assert_eq!(workspace, "ws-size-workspace");
-        assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
-        assert_eq!(body.get("store"), Some(&Value::Bool(false)));
-        assert_eq!(
-            body.get("prompt_cache_key").and_then(Value::as_str),
-            Some("size-session")
-        );
-        assert!(body.get("type").is_none());
-        drop(observations);
 
         bridge_server.abort();
         upstream.server.abort();
     }
 
     #[tokio::test]
-    async fn codex_websocket_first_byte_timeout_falls_back_to_http() {
+    async fn codex_websocket_first_byte_timeout_after_commit_does_not_replay() {
         let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Silent).await;
         let endpoint = format!("http://{}", upstream.address);
         let (state, execution) = codex_bridge_test_context("ws-timeout", endpoint).await;
-        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
             state,
             execution,
             format!("ws://{}/ws", upstream.address),
             None,
             "timeout-session",
+            Some(Duration::from_millis(50)),
+            Some(Duration::from_secs(1)),
         )
         .await;
 
-        let events = send_test_bridge_request(bridge_address, "timeout fallback").await;
+        let (events, close_code) =
+            send_test_bridge_request_with_close(bridge_address, "timeout without replay").await;
         assert!(events.iter().any(|event| {
-            event.get("type").and_then(Value::as_str) == Some("response.completed")
-                && event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_timeout")
         }));
+        assert_eq!(close_code, Some(CloseCode::Error));
         assert_eq!(
             upstream
                 .websocket_requests
@@ -15121,7 +16772,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             upstream
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
 
         bridge_server.abort();
@@ -15136,10 +16787,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let endpoint = format!("http://{}", upstream.address);
         let (state, execution) =
             codex_bridge_test_context("ws-http-first-event-timeout", endpoint).await;
+        let unavailable_address = unavailable_test_address().await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
             state,
             execution,
-            format!("ws://{}/ws", upstream.address),
+            format!("ws://{unavailable_address}/ws"),
             None,
             "http-first-event-timeout-session",
             Some(Duration::from_millis(50)),
@@ -15163,7 +16815,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             upstream
                 .websocket_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
         assert_eq!(
             upstream
@@ -15184,10 +16836,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let endpoint = format!("http://{}", upstream.address);
         let (state, execution) =
             codex_bridge_test_context("ws-http-error-body-timeout", endpoint).await;
+        let unavailable_address = unavailable_test_address().await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
             state,
             execution,
-            format!("ws://{}/ws", upstream.address),
+            format!("ws://{unavailable_address}/ws"),
             None,
             "http-error-body-timeout-session",
             Some(Duration::from_millis(50)),
@@ -15209,7 +16862,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             upstream
                 .websocket_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
         assert_eq!(
             upstream
@@ -15264,7 +16917,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_websocket_stale_cached_socket_recovers_via_http() {
+    async fn codex_websocket_stale_cached_socket_after_send_does_not_replay() {
         let upstream =
             spawn_test_codex_upstream(TestCodexWebSocketBehavior::CompleteThenClose).await;
         let endpoint = format!("http://{}", upstream.address);
@@ -15291,15 +16944,16 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         }));
         wait_for_cached_responses_websocket(&pool_key).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let second = send_test_bridge_request(bridge_address, "recover stale").await;
+        let second = send_test_bridge_request(bridge_address, "reject stale replay").await;
         assert!(second.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
+            event.pointer("/error/code").and_then(Value::as_str)
+                == Some("upstream_closed_before_terminal")
         }));
         assert_eq!(
             upstream
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
         assert_eq!(
             upstream
@@ -15314,7 +16968,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_websocket_lifecycle_event_does_not_commit_before_http_fallback() {
+    async fn codex_websocket_lifecycle_event_after_request_commit_does_not_replay() {
         let upstream =
             spawn_test_codex_upstream(TestCodexWebSocketBehavior::EmitThenCloseSize).await;
         let endpoint = format!("http://{}", upstream.address);
@@ -15328,7 +16982,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
 
-        let events = send_test_bridge_request(bridge_address, "retry lifecycle").await;
+        let events = send_test_bridge_request(bridge_address, "preserve lifecycle").await;
         assert_eq!(
             events
                 .iter()
@@ -15339,14 +16993,13 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             1
         );
         assert!(events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
-                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            event.pointer("/error/code").and_then(Value::as_str) == Some("message_too_big")
         }));
         assert_eq!(
             upstream
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
 
         bridge_server.abort();
@@ -15422,7 +17075,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_http_fallback_provider_failure_switches_before_commit() {
+    async fn codex_http_fallback_provider_failure_stays_on_active_provider() {
         let primary_name = "ws-semantic-primary";
         let fallback_name = "ws-semantic-fallback";
         let primary =
@@ -15449,22 +17102,20 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
         let execution = executions.remove(0);
+        let unavailable_address = unavailable_test_address().await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge(
             state,
             execution,
-            format!("ws://{}/ws", primary.address),
+            format!("ws://{unavailable_address}/ws"),
             None,
             "semantic-provider-session",
         )
         .await;
 
-        let events = send_test_bridge_request(bridge_address, "provider failover").await;
-        assert!(!events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-provider-failed")
-        }));
+        let events = send_test_bridge_request(bridge_address, "provider failure").await;
         assert!(events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
-                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-provider-failed")
+                && event.get("type").and_then(Value::as_str) == Some("response.failed")
         }));
         assert_eq!(
             primary
@@ -15476,7 +17127,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             fallback
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
 
         bridge_server.abort();
@@ -15512,10 +17163,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
         let execution = executions.remove(0);
+        let unavailable_address = unavailable_test_address().await;
         let (bridge_address, bridge_server) = spawn_test_responses_bridge(
             state,
             execution,
-            format!("ws://{}/ws", primary.address),
+            format!("ws://{unavailable_address}/ws"),
             None,
             "semantic-client-session",
         )
@@ -15547,9 +17199,9 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_http_fallback_eof_after_business_reports_error_without_failover() {
+    async fn codex_http_fallback_eof_after_business_does_not_switch_provider() {
         let (events, close_code, primary, fallback, bridge_server) =
-            run_codex_http_fallback_failover_case(
+            run_codex_http_fallback_single_provider_case(
                 "fallback-eof-after-business",
                 TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenEof,
                 Some(Duration::from_secs(1)),
@@ -15587,9 +17239,9 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_http_fallback_idle_timeout_after_business_does_not_failover() {
+    async fn codex_http_fallback_idle_timeout_after_business_does_not_switch_provider() {
         let (events, close_code, primary, fallback, bridge_server) =
-            run_codex_http_fallback_failover_case(
+            run_codex_http_fallback_single_provider_case(
                 "fallback-idle-after-business",
                 TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenStall,
                 Some(Duration::from_secs(1)),
@@ -15623,21 +17275,21 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_http_fallback_malformed_event_switches_before_commit() {
-        let (events, _, primary, fallback, bridge_server) = run_codex_http_fallback_failover_case(
-            "fallback-malformed",
-            TestCodexWebSocketBehavior::CloseSizeThenHttpMalformed,
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(1)),
-        )
-        .await;
+    async fn codex_http_fallback_malformed_event_does_not_switch_provider() {
+        let (events, _, primary, fallback, bridge_server) =
+            run_codex_http_fallback_single_provider_case(
+                "fallback-malformed",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpMalformed,
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(1)),
+            )
+            .await;
 
-        assert!(!events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-malformed")
-        }));
         assert!(events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
-                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_error")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
         }));
         assert_eq!(
             primary
@@ -15649,7 +17301,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             fallback
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
 
         bridge_server.abort();
@@ -15658,23 +17310,22 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_http_fallback_same_batch_provider_failure_preempts_business() {
-        let (events, _, primary, fallback, bridge_server) = run_codex_http_fallback_failover_case(
-            "fallback-batch-provider-failure",
-            TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenProviderFailure,
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(1)),
-        )
-        .await;
+    async fn codex_http_fallback_same_batch_failure_preserves_events_without_switching() {
+        let (events, _, primary, fallback, bridge_server) =
+            run_codex_http_fallback_single_provider_case(
+                "fallback-batch-provider-failure",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenProviderFailure,
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(1)),
+            )
+            .await;
 
-        assert!(!events.iter().any(|event| {
-            event.get("delta").and_then(Value::as_str) == Some("discard-me")
-                || event.pointer("/response/id").and_then(Value::as_str)
-                    == Some("resp-batch-failed")
-        }));
+        assert!(events
+            .iter()
+            .any(|event| { event.get("delta").and_then(Value::as_str) == Some("discard-me") }));
         assert!(events.iter().any(|event| {
-            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
-                && event.get("type").and_then(Value::as_str) == Some("response.completed")
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-batch-failed")
+                && event.get("type").and_then(Value::as_str) == Some("response.failed")
         }));
         assert_eq!(
             primary
@@ -15686,7 +17337,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             fallback
                 .http_requests
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
 
         bridge_server.abort();
@@ -15695,7 +17346,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_http_fallback_retryable_status_switches_before_commit() {
+    async fn codex_http_fallback_retryable_status_does_not_switch_provider() {
         for (case, behavior) in [
             (
                 "fallback-rate-limit",
@@ -15707,7 +17358,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             ),
         ] {
             let (events, _, primary, fallback, bridge_server) =
-                run_codex_http_fallback_failover_case(
+                run_codex_http_fallback_single_provider_case(
                     case,
                     behavior,
                     Some(Duration::from_secs(1)),
@@ -15716,8 +17367,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 .await;
 
             assert!(events.iter().any(|event| {
-                event.pointer("/response/id").and_then(Value::as_str) == Some("resp-http")
-                    && event.get("type").and_then(Value::as_str) == Some("response.completed")
+                event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_http_error")
             }));
             assert_eq!(
                 primary
@@ -15729,7 +17379,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 fallback
                     .http_requests
                     .load(std::sync::atomic::Ordering::SeqCst),
-                1
+                0
             );
 
             bridge_server.abort();

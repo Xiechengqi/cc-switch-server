@@ -29,6 +29,25 @@ const ENCRYPTED_V2_PREFIX: &str = "ccenc:v2:";
 pub struct AccountStore {
     #[serde(default)]
     pub accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codex_oauth_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexOAuthAccountSelectionStatus {
+    Unconfigured,
+    Ready,
+    NeedsSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOAuthAccountSelection {
+    pub status: CodexOAuthAccountSelectionStatus,
+    pub account_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +477,60 @@ pub fn set_codex_workspace_provenance(
 }
 
 impl AccountStore {
+    pub fn codex_oauth_selection(&self) -> CodexOAuthAccountSelection {
+        let codex_accounts = self
+            .accounts
+            .iter()
+            .filter(|account| account.provider_type == ProviderType::CodexOAuth)
+            .collect::<Vec<_>>();
+        let account_count = codex_accounts.len();
+        let active_account_id = match codex_accounts.as_slice() {
+            [] => None,
+            [account] => Some(account.id.clone()),
+            _ => self
+                .active_codex_oauth_account_id
+                .as_deref()
+                .and_then(|selected| {
+                    codex_accounts
+                        .iter()
+                        .find(|account| account.id == selected)
+                        .map(|account| account.id.clone())
+                }),
+        };
+        let status = match (account_count, active_account_id.is_some()) {
+            (0, _) => CodexOAuthAccountSelectionStatus::Unconfigured,
+            (_, true) => CodexOAuthAccountSelectionStatus::Ready,
+            _ => CodexOAuthAccountSelectionStatus::NeedsSelection,
+        };
+        CodexOAuthAccountSelection {
+            status,
+            account_count,
+            active_account_id,
+        }
+    }
+
+    pub fn active_codex_oauth_account(&self) -> Option<&Account> {
+        let selection = self.codex_oauth_selection();
+        let account_id = selection.active_account_id.as_deref()?;
+        self.find_for_provider(ProviderType::CodexOAuth, Some(account_id))
+    }
+
+    pub fn select_active_codex_oauth_account(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Account, String> {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return Err("Codex OAuth account id is required".to_string());
+        }
+        let account = self
+            .find_for_provider(ProviderType::CodexOAuth, Some(account_id))
+            .cloned()
+            .ok_or_else(|| format!("Codex OAuth account not found: {account_id}"))?;
+        self.active_codex_oauth_account_id = Some(account.id.clone());
+        Ok(account)
+    }
+
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = accounts_path(config_dir);
         if !path.exists() {
@@ -745,7 +818,11 @@ impl AccountStore {
     pub fn delete(&mut self, account_id: &str) -> bool {
         let before = self.accounts.len();
         self.accounts.retain(|item| item.id != account_id);
-        self.accounts.len() != before
+        let deleted = self.accounts.len() != before;
+        if deleted && self.active_codex_oauth_account_id.as_deref() == Some(account_id) {
+            self.active_codex_oauth_account_id = None;
+        }
+        deleted
     }
 
     pub fn refresh_status(&mut self, account_id: &str, now_ms: i64) -> Option<Account> {
@@ -1129,6 +1206,7 @@ pub fn account_refresh_replaces_auth_identity(
     let previous = account_auth_identity_snapshot(account);
     let mut candidate_store = AccountStore {
         accounts: vec![account.clone()],
+        ..AccountStore::default()
     };
     let candidate = candidate_store
         .mark_refresh_success(&account.id, update.clone())
@@ -2130,6 +2208,7 @@ mod tests {
         );
         let mut store = AccountStore {
             accounts: vec![account],
+            ..Default::default()
         };
         store.mark_rate_limited_until("quota-account", now_ms + 60_000);
 
@@ -2511,6 +2590,7 @@ mod tests {
         ));
         let enriched = AccountStore {
             accounts: vec![codex.clone()],
+            ..Default::default()
         }
         .mark_refresh_success(&codex.id, codex_enrichment)
         .unwrap();

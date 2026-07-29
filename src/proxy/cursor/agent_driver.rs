@@ -12,10 +12,13 @@ use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use base64::Engine;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::{Account, AccountStore};
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
@@ -42,7 +45,7 @@ use super::agent_proto::{
 use super::event_emitter::{
     AgentEvent, AgentSseWriter, CapturedToolCall, ComposerMarkerFilter, MarkerEvent,
 };
-use super::h2_client::{CursorH2Stream, DEFAULT_AGENTSERVICE_BASE_URL};
+use super::h2_client::{CursorH2Stream, CursorH2Timeouts, DEFAULT_AGENTSERVICE_BASE_URL};
 use super::identity::{
     cursor_account_for_api_key, cursor_account_from_managed_account, cursor_agentservice_headers,
     CursorAccountData,
@@ -71,6 +74,7 @@ pub struct AgentServiceForwardOptions {
     pub request_context: UsageLogContext,
     pub account_in_flight_guard: Option<AccountInFlightGuard>,
     pub share_invocation_guard: Option<ShareInFlightGuard>,
+    pub timeouts: CursorH2Timeouts,
 }
 
 struct CursorCredential {
@@ -103,6 +107,10 @@ impl ExecDedup {
 struct CursorApiKeyExchangeResponse {
     #[serde(default, rename = "accessToken", alias = "access_token")]
     access_token: Option<String>,
+    #[serde(default, rename = "expiresIn", alias = "expires_in")]
+    expires_in: Option<i64>,
+    #[serde(default, rename = "expiresAt", alias = "expires_at")]
+    expires_at: Option<i64>,
 }
 
 pub async fn forward_agentservice(
@@ -116,7 +124,10 @@ pub async fn forward_agentservice(
         request_context,
         account_in_flight_guard,
         share_invocation_guard,
+        timeouts,
     } = options;
+    let mut request_context = request_context;
+    request_context.usage_estimated = true;
     let started = Instant::now();
     let Some((inbound_protocol, response_format, _protocol_label)) =
         super::protocol_for_route(route)
@@ -134,11 +145,38 @@ pub async fn forward_agentservice(
         ProxyError::bad_request(format!("invalid cursor tool result context: {message}"))
     })?;
 
+    let session_identity = cursor_session_identity(&state, &stored).await?;
     let session_key = resolve_session_key(&state, &plan).await?;
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_input_tokens(&plan.user_text);
-    let session_entry = acquire_or_open_session(&state, &stored, &plan, &session_key).await?;
-    let status = session_status(&session_entry).await?;
+    let mut session_entry = acquire_or_open_session(
+        &state,
+        &stored,
+        &plan,
+        &session_key,
+        &session_identity,
+        timeouts,
+    )
+    .await?;
+    let mut status = session_status(&session_entry).await?;
+    if status == StatusCode::UNAUTHORIZED && plan.tool_results.is_empty() {
+        state
+            .cursor_sessions
+            .release(session_entry, SessionState::Closed)
+            .await;
+        recover_cursor_unauthorized(&state, &stored).await?;
+        let refreshed_identity = cursor_session_identity(&state, &stored).await?;
+        session_entry = acquire_or_open_session(
+            &state,
+            &stored,
+            &plan,
+            &session_key,
+            &refreshed_identity,
+            timeouts,
+        )
+        .await?;
+        status = session_status(&session_entry).await?;
+    }
     if !status.is_success() {
         let upstream_error = read_cursor_upstream_error(&session_entry).await;
         maybe_mark_cursor_rate_limited(
@@ -159,14 +197,23 @@ pub async fn forward_agentservice(
             .cursor_sessions
             .release(session_entry.clone(), SessionState::Closed)
             .await;
-        let proxy_status = if status == StatusCode::TOO_MANY_REQUESTS {
-            StatusCode::TOO_MANY_REQUESTS
-        } else {
-            StatusCode::BAD_GATEWAY
-        };
+        let message = cursor_upstream_error_message(status, upstream_error.message);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let now = crate::infra::time::now_ms() as i64;
+            let until = cursor_rate_limit_until(&upstream_error.headers, &upstream_error.body, now);
+            let retry_after_seconds = u64::try_from(until.saturating_sub(now))
+                .unwrap_or(u64::MAX)
+                .saturating_add(999)
+                / 1_000;
+            return Err(ProxyError::rate_limited(message, retry_after_seconds));
+        }
         return Err(ProxyError {
-            status: proxy_status,
-            message: cursor_upstream_error_message(status, upstream_error.message),
+            status: match status {
+                StatusCode::UNAUTHORIZED => StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN => StatusCode::FORBIDDEN,
+                _ => StatusCode::BAD_GATEWAY,
+            },
+            message,
         });
     }
 
@@ -943,23 +990,34 @@ async fn acquire_or_open_session(
     stored: &StoredProvider,
     plan: &AgentRunPlan,
     session_key: &str,
+    session_identity: &str,
+    timeouts: CursorH2Timeouts,
 ) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
     if !plan.tool_results.is_empty() {
         let entry = state
             .cursor_sessions
-            .acquire(session_key)
+            .acquire(session_key, session_identity)
             .await
             .ok_or_else(|| {
-                ProxyError::conflict(format!(
-                    "Cursor AgentService session `{session_key}` is not parked or has expired"
+                ProxyError::cursor_session_lost(format!(
+                    "Cursor session `{session_key}` is unavailable, expired, or bound to a different credential"
                 ))
             })?;
         resume_tool_results(&entry, &plan.tool_results).await?;
         return Ok(entry);
     }
 
-    let credential = resolve_cursor_credential(state, stored).await?;
-    open_agent_stream(state, &credential, stored, plan, session_key).await
+    let credential = resolve_cursor_credential(state, stored, timeouts.request).await?;
+    open_agent_stream(
+        state,
+        &credential,
+        stored,
+        plan,
+        session_key,
+        session_identity,
+        timeouts,
+    )
+    .await
 }
 
 async fn resume_tool_results(
@@ -1074,12 +1132,18 @@ fn cursor_error_message_from_body(body: &[u8]) -> Option<String> {
         .or_else(|| cursor_error_field(&value, &["/details/0/message"]))
         .or_else(|| cursor_error_field(&value, &["/error", "/code"]));
     let code = cursor_error_field(&value, &["/error/code", "/code"]);
-    match (code, message) {
+    let detail = match (code, message) {
         (Some(code), Some(message)) if code != message => Some(format!("{code}: {message}")),
         (_, Some(message)) => Some(message),
         (Some(code), None) => Some(code),
         _ => None,
-    }
+    }?;
+    Some(
+        crate::logging::redact_sensitive_text(&detail)
+            .chars()
+            .take(512)
+            .collect(),
+    )
 }
 
 fn cursor_error_field(value: &Value, pointers: &[&str]) -> Option<String> {
@@ -1114,10 +1178,7 @@ async fn maybe_mark_cursor_rate_limited(
         return;
     };
     let now = crate::infra::time::now_ms() as i64;
-    let until = super::super::grok::retry_after_until_ms(headers, now)
-        .or_else(|| cursor_rate_limit_until_from_body(body, now))
-        .unwrap_or_else(|| now.saturating_add(60_000));
-    let until = super::super::bounded_upstream_rate_limit_until(now, until);
+    let until = cursor_rate_limit_until(headers, body, now);
     let detail = cursor_error_message_from_body(body)
         .map(|message| format!("; {message}"))
         .unwrap_or_default();
@@ -1125,6 +1186,13 @@ async fn maybe_mark_cursor_rate_limited(
     state
         .mark_account_rate_limited_until(&account_id, until, Some(message))
         .await;
+}
+
+fn cursor_rate_limit_until(headers: &HeaderMap, body: &[u8], now_ms: i64) -> i64 {
+    let until = super::super::grok::retry_after_until_ms(headers, now_ms)
+        .or_else(|| cursor_rate_limit_until_from_body(body, now_ms))
+        .unwrap_or_else(|| now_ms.saturating_add(60_000));
+    super::super::bounded_upstream_rate_limit_until(now_ms, until)
 }
 
 fn is_cursor_account_provider(provider_type: ProviderType) -> bool {
@@ -1321,6 +1389,8 @@ async fn open_agent_stream(
     stored: &StoredProvider,
     plan: &super::request_builder::AgentRunPlan,
     session_key: &str,
+    session_identity: &str,
+    timeouts: CursorH2Timeouts,
 ) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
     let images = load_images(plan.images.clone()).await?;
     let mut blob_store = HashMap::new();
@@ -1339,18 +1409,85 @@ async fn open_agent_stream(
         &cursor_agentservice_base_url(stored),
         cursor_agentservice_headers(&credential.account, &credential.access_token),
         wrap_connect_frame(&body),
+        timeouts,
     )
     .await?;
     Ok(state
         .cursor_sessions
         .open(
             session_key.to_string(),
+            session_identity.to_string(),
             stream,
             blob_store,
             plan.tools.clone(),
             plan.working_directory.clone(),
         )
         .await)
+}
+
+async fn cursor_session_identity(
+    state: &ServerState,
+    stored: &StoredProvider,
+) -> Result<String, ProxyError> {
+    let principal = match stored.provider_type {
+        ProviderType::CursorOAuth => {
+            let account_id = stored
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ProxyError::bad_request(
+                        "Cursor OAuth provider must bind one explicit managed account",
+                    )
+                })?;
+            let accounts = state.accounts.read().await;
+            let account = accounts
+                .find_for_provider(ProviderType::CursorOAuth, Some(account_id))
+                .ok_or_else(|| {
+                    ProxyError::bad_request("Cursor OAuth managed account is required")
+                })?;
+            format!(
+                "oauth:{}:{}:{}",
+                account.id, account.auth_identity_generation, account.token_refresh_generation
+            )
+        }
+        ProviderType::CursorApiKey => {
+            let accounts = state.accounts.read().await;
+            let api_key = cursor_api_key(stored, &accounts)?;
+            let account_generation = stored
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref())
+                .and_then(|account_id| {
+                    accounts.find_for_provider(ProviderType::CursorApiKey, Some(account_id))
+                })
+                .map(|account| account.auth_identity_generation)
+                .unwrap_or_default();
+            format!(
+                "apikey:{}:{}:{}",
+                cursor_api_key_hash(&api_key),
+                stored.resource.credential_generation,
+                account_generation
+            )
+        }
+        _ => {
+            return Err(ProxyError::bad_request(
+                "Cursor session identity requires a Cursor provider",
+            ));
+        }
+    };
+    Ok(format!(
+        "{}:{}:{}:{principal}",
+        stored.app.as_str(),
+        stored.provider.id,
+        stored.resource.revision
+    ))
 }
 
 fn random_uuid_like() -> String {
@@ -1517,6 +1654,7 @@ mod tests {
         };
         let session_entry = Arc::new(tokio::sync::Mutex::new(CursorSession {
             conversation_id: "cursor-stream-session".to_string(),
+            identity_key: "cursor-test-identity".to_string(),
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
@@ -1614,6 +1752,10 @@ mod tests {
             ),
             Some(now + 60_000)
         );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(cursor_rate_limit_until(&headers, b"{}", now), now + 7_000);
     }
 
     #[test]
@@ -1628,11 +1770,27 @@ mod tests {
         );
         assert!(!cursor_error_body_is_json_like(&headers));
     }
+
+    #[test]
+    fn cursor_exchange_expiry_uses_shortest_upstream_evidence() {
+        let now = 1_700_000_000_000;
+        let expiry = cursor_exchange_expiry("not-a-jwt", Some(now + 600_000), Some(1_200), now);
+        assert_eq!(expiry, now + 600_000);
+    }
+
+    #[test]
+    fn cursor_api_key_hash_never_contains_the_key() {
+        let key = "cursor-secret-key";
+        let hash = cursor_api_key_hash(key);
+        assert_eq!(hash.len(), 64);
+        assert!(!hash.contains(key));
+    }
 }
 
 async fn resolve_cursor_credential(
     state: &ServerState,
     stored: &StoredProvider,
+    request_timeout: std::time::Duration,
 ) -> Result<CursorCredential, ProxyError> {
     match stored.provider_type {
         ProviderType::CursorOAuth => {
@@ -1642,9 +1800,16 @@ async fn resolve_cursor_credential(
                 .meta
                 .as_ref()
                 .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref());
+                .and_then(|binding| binding.account_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ProxyError::bad_request(
+                        "Cursor OAuth provider must bind one explicit managed account",
+                    )
+                })?;
             let account = accounts
-                .find_for_provider(ProviderType::CursorOAuth, account_id)
+                .find_for_provider(ProviderType::CursorOAuth, Some(account_id))
                 .ok_or_else(|| {
                     ProxyError::bad_request("Cursor OAuth managed account is required")
                 })?;
@@ -1666,7 +1831,8 @@ async fn resolve_cursor_credential(
             let accounts = state.accounts.read().await;
             let api_key = cursor_api_key(stored, &accounts)?;
             drop(accounts);
-            let access_token = exchange_cursor_api_key(state, stored, &api_key).await?;
+            let access_token =
+                cached_cursor_api_key_token(state, stored, &api_key, request_timeout).await?;
             Ok(CursorCredential {
                 account: cursor_account_for_api_key(&api_key),
                 access_token,
@@ -1674,6 +1840,46 @@ async fn resolve_cursor_credential(
         }
         _ => Err(ProxyError::bad_request(
             "Cursor AgentService driver requires a Cursor provider",
+        )),
+    }
+}
+
+async fn recover_cursor_unauthorized(
+    state: &ServerState,
+    stored: &StoredProvider,
+) -> Result<(), ProxyError> {
+    match stored.provider_type {
+        ProviderType::CursorOAuth => {
+            let account_id = stored
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ProxyError::bad_request(
+                        "Cursor OAuth provider must bind one explicit managed account",
+                    )
+                })?;
+            state
+                .refresh_managed_account_now(ProviderType::CursorOAuth, Some(account_id))
+                .await
+                .map_err(super::super::forwarder::managed_account_refresh_error_to_proxy_error)
+        }
+        ProviderType::CursorApiKey => {
+            let accounts = state.accounts.read().await;
+            let api_key = cursor_api_key(stored, &accounts)?;
+            drop(accounts);
+            state
+                .cursor_api_key_tokens
+                .invalidate(&cursor_api_key_hash(&api_key))
+                .await;
+            Ok(())
+        }
+        _ => Err(ProxyError::bad_request(
+            "Cursor unauthorized recovery requires a Cursor provider",
         )),
     }
 }
@@ -1726,7 +1932,8 @@ async fn exchange_cursor_api_key(
     state: &ServerState,
     stored: &StoredProvider,
     api_key: &str,
-) -> Result<String, ProxyError> {
+    request_timeout: std::time::Duration,
+) -> Result<(String, i64), ProxyError> {
     let url = format!(
         "{}{}",
         cursor_backend_base_url(stored),
@@ -1739,56 +1946,184 @@ async fn exchange_cursor_api_key(
         .header("authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
         .json(&json!({}))
+        .timeout(request_timeout)
         .send()
         .await
         .map_err(ProxyError::bad_gateway)?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(ProxyError {
-            status,
-            message: format!("Cursor API key exchange failed: {body}"),
-        });
+        let headers = response.headers().clone();
+        let body = read_reqwest_body_limited(response, MAX_CURSOR_ERROR_BODY_BYTES)
+            .await
+            .unwrap_or_default();
+        let detail = cursor_error_message_from_body(&body)
+            .map(|detail| crate::logging::redact_sensitive_text_with_values(&detail, [api_key]))
+            .unwrap_or_else(|| "upstream rejected the exchange".to_string());
+        let message = format!("Cursor API key exchange failed: {detail}");
+        return match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ProxyError { status, message }),
+            StatusCode::TOO_MANY_REQUESTS => {
+                let now = crate::infra::time::now_ms() as i64;
+                let until = cursor_rate_limit_until(&headers, &body, now);
+                let retry_after_seconds = u64::try_from(until.saturating_sub(now))
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(999)
+                    / 1_000;
+                Err(ProxyError::rate_limited(message, retry_after_seconds))
+            }
+            _ => Err(ProxyError::bad_gateway(message)),
+        };
     }
-    let parsed = response
-        .json::<CursorApiKeyExchangeResponse>()
-        .await
+    let body = read_reqwest_body_limited(response, MAX_CURSOR_ERROR_BODY_BYTES).await?;
+    let parsed = serde_json::from_slice::<CursorApiKeyExchangeResponse>(&body)
         .map_err(ProxyError::bad_gateway)?;
-    parsed
+    let access_token = parsed
         .access_token
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             ProxyError::bad_request("Cursor API key exchange response missing access token")
-        })
+        })?;
+    let now = crate::infra::time::now_ms() as i64;
+    let expires_at =
+        cursor_exchange_expiry(&access_token, parsed.expires_at, parsed.expires_in, now);
+    Ok((access_token, expires_at))
+}
+
+async fn cached_cursor_api_key_token(
+    state: &ServerState,
+    stored: &StoredProvider,
+    api_key: &str,
+    request_timeout: std::time::Duration,
+) -> Result<String, ProxyError> {
+    let key_hash = cursor_api_key_hash(api_key);
+    let now = crate::infra::time::now_ms() as i64;
+    if let Some(token) = state.cursor_api_key_tokens.get(&key_hash, now).await {
+        return Ok(token);
+    }
+    let _flight = state.cursor_api_key_tokens.lock(&key_hash).await;
+    let now = crate::infra::time::now_ms() as i64;
+    if let Some(token) = state.cursor_api_key_tokens.get(&key_hash, now).await {
+        return Ok(token);
+    }
+    let (token, expires_at_ms) =
+        exchange_cursor_api_key(state, stored, api_key, request_timeout).await?;
+    state
+        .cursor_api_key_tokens
+        .insert(key_hash, token.clone(), expires_at_ms)
+        .await;
+    Ok(token)
+}
+
+async fn read_reqwest_body_limited(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Bytes, ProxyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(ProxyError::bad_gateway(
+            "Cursor upstream response exceeded the configured limit",
+        ));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ProxyError::bad_gateway)?;
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ProxyError::bad_gateway(
+                "Cursor upstream response exceeded the configured limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn cursor_api_key_hash(api_key: &str) -> String {
+    hex::encode(Sha256::digest(api_key.as_bytes()))
+}
+
+fn cursor_exchange_expiry(
+    token: &str,
+    expires_at: Option<i64>,
+    expires_in: Option<i64>,
+    now_ms: i64,
+) -> i64 {
+    let explicit = expires_at.map(normalize_epoch_ms).or_else(|| {
+        expires_in
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)))
+    });
+    let jwt = jwt_expiry_ms(token);
+    explicit
+        .into_iter()
+        .chain(jwt)
+        .min()
+        .unwrap_or_else(|| now_ms.saturating_add(10 * 60 * 1000))
+        .max(now_ms)
+}
+
+fn normalize_epoch_ms(value: i64) -> i64 {
+    if value < 10_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
+}
+
+fn jwt_expiry_ms(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("exp")?.as_i64().map(normalize_epoch_ms)
 }
 
 fn cursor_backend_base_url(stored: &StoredProvider) -> String {
-    setting(
-        &stored.provider,
+    cursor_test_endpoint_override(
+        stored,
         &["CURSOR_BACKEND_BASE_URL", "CURSOR_API_BASE_URL"],
+        "CC_SWITCH_CURSOR_BACKEND_BASE_URL",
     )
-    .or_else(|| std::env::var("CC_SWITCH_CURSOR_BACKEND_BASE_URL").ok())
-    .or_else(|| std::env::var("CURSOR_BACKEND_BASE_URL").ok())
-    .map(|value| value.trim().trim_end_matches('/').to_string())
-    .filter(|value| !value.is_empty())
     .unwrap_or_else(|| DEFAULT_CURSOR_BACKEND_BASE_URL.to_string())
 }
 
 fn cursor_agentservice_base_url(stored: &StoredProvider) -> String {
-    setting(
-        &stored.provider,
+    cursor_test_endpoint_override(
+        stored,
         &[
             "CURSOR_AGENT_SERVICE_BASE_URL",
             "CURSOR_AGENTSERVICE_BASE_URL",
             "CURSOR_AGENT_BASE_URL",
         ],
+        "CC_SWITCH_CURSOR_AGENT_SERVICE_BASE_URL",
     )
-    .or_else(|| std::env::var("CC_SWITCH_CURSOR_AGENT_SERVICE_BASE_URL").ok())
-    .or_else(|| std::env::var("CURSOR_AGENT_SERVICE_BASE_URL").ok())
-    .map(|value| value.trim().trim_end_matches('/').to_string())
-    .filter(|value| !value.is_empty())
     .unwrap_or_else(|| DEFAULT_AGENTSERVICE_BASE_URL.to_string())
+}
+
+#[cfg(test)]
+fn cursor_test_endpoint_override(
+    stored: &StoredProvider,
+    setting_names: &[&str],
+    env_name: &str,
+) -> Option<String> {
+    setting(&stored.provider, setting_names)
+        .or_else(|| std::env::var(env_name).ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(test))]
+fn cursor_test_endpoint_override(
+    _stored: &StoredProvider,
+    _setting_names: &[&str],
+    _env_name: &str,
+) -> Option<String> {
+    None
 }
 
 fn response_model(request: &AdapterRequest, plan_model: &str) -> String {

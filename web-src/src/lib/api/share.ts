@@ -18,8 +18,6 @@ export type ShareAccessByApp = Partial<
   Record<keyof ShareBindings, ShareAppAccess>
 >;
 
-export type ShareSaleMarketKind = "token" | "share";
-
 export type ShareTokenPeriod =
   | "lifetime"
   | "day"
@@ -65,13 +63,14 @@ export type ShareUserGrant = {
   updatedAtMs?: number;
   revokedAtMs?: number;
   revision?: number;
+  manager?: "owner" | "manual" | "routerShareMarket";
+  entitlementId?: string;
 };
 
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 
 export type ShareAppSettings = {
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind: ShareSaleMarketKind;
   marketAccessMode: "selected" | "all";
   sharedWithEmails: string[];
   tokenLimit: number;
@@ -94,7 +93,6 @@ export interface ShareRecord {
   forSaleOfficialPricePercentByApp: Record<string, number>;
   description?: string | null;
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind?: ShareSaleMarketKind;
   /** Exactly one entry for a valid share. */
   bindings: ShareBindings;
   apiKey: string;
@@ -126,7 +124,6 @@ export interface CreateShareParams {
   bindings: ShareBindings;
   description?: string;
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind?: ShareSaleMarketKind;
   tokenLimit: number;
   parallelLimit: number;
   expiresInSecs: number;
@@ -172,13 +169,13 @@ export function sharePrimaryProviderId(
   return app ? (share?.bindings?.[app] ?? null) : null;
 }
 
-export interface PublicMarket {
+export interface PublicTokenMarket {
   id: string;
   displayName: string;
   email: string;
   subdomain: string;
   publicBaseUrl: string;
-  marketKind?: "usage" | "share" | string;
+  marketKind: "usage";
   status: string;
 }
 
@@ -188,7 +185,6 @@ export interface UpdateShareAclParams {
   marketAccessMode: "selected" | "all";
   accessByApp?: ShareAccessByApp;
   appSettings?: ShareAppSettingsByApp;
-  saleMarketKind?: ShareSaleMarketKind;
   userGrants?: ShareUserGrantMap;
 }
 
@@ -199,7 +195,6 @@ export interface SaveProviderShareParams {
   subdomain: string;
   description?: string;
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind: ShareSaleMarketKind;
   marketAccessMode: "selected" | "all";
   sharedWithEmails: string[];
   accessByApp: ShareAccessByApp;
@@ -444,15 +439,8 @@ async function importMany(shares: ShareRecord[]): Promise<ImportSharesResult> {
   return invokeCommand<ImportSharesResult>("import_shares", { shares });
 }
 
-async function listMarkets(): Promise<PublicMarket[]> {
-  return invokeCommand<PublicMarket[]>("list_share_markets");
-}
-
-async function authorizeMarket(
-  shareId: string,
-  marketEmail: string,
-): Promise<ShareRecord> {
-  return invokeShareRecord("authorize_share_market", { shareId, marketEmail });
+async function listTokenMarkets(): Promise<PublicTokenMarket[]> {
+  return invokeCommand<PublicTokenMarket[]>("list_token_markets");
 }
 
 async function list(): Promise<ShareRecord[]> {
@@ -615,8 +603,7 @@ export const shareApi = {
   saveProviderShare,
   exportAll,
   importMany,
-  listMarkets,
-  authorizeMarket,
+  listTokenMarkets,
   list,
   getDetail,
   startTunnel,

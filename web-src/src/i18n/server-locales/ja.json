@@ -2,6 +2,13 @@
   "common": {
     "copied": "コピーしました"
   },
+  "server": {
+    "auth": {
+      "inferenceTokenTitle": "Claude 推論 Token",
+      "inferenceTokenOneTime": "この Token は一度だけ表示されます。コンソールに進む前に安全に保存してください。",
+      "continueToConsole": "保存しました。コンソールへ進む"
+    }
+  },
   "providers": {
     "addProvider": "プロバイダーを追加"
   },
@@ -36,18 +43,8 @@
     "validation": {
       "invalidEmail": "メールアドレスが無効です"
     },
-    "saleMarketKind": {
-      "title": "Market 種別",
-      "token": "Token Market",
-      "share": "Share Market"
-    },
     "market": {
       "allSelected": "すべての Market を選択済み"
-    },
-    "accountMarket": {
-      "title": "Share Market",
-      "select": "Share Market を選択",
-      "required": "Share Market を選択してください"
     },
     "permanent": "無期限",
     "expiration": "有効期限",
@@ -118,7 +115,12 @@
       "description": "providers、shares、ui-settings などの永続化ファイルを保存するディレクトリです。リッスンアドレスとポートはプロセス起動引数で指定します。"
     },
     "serverSecurity": {
-      "currentPasswordRequired": "現在のパスワードを入力してください"
+      "currentPasswordRequired": "現在のパスワードを入力してください",
+      "inferenceTokenRotated": "推論 Token を更新しました",
+      "inferenceTokenTitle": "Claude 推論 Token",
+      "inferenceTokenDescription": "ローカルの Claude API リクエストに使用し、管理者ログイン権限とは分離されています",
+      "rotateInferenceToken": "Token を更新",
+      "rotateInferenceTokenConfirm": "推論 Token を更新しますか？既存のクライアントは直ちに認証できなくなります。"
     },
     "share": {
       "health": {

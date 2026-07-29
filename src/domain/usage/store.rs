@@ -23,6 +23,8 @@ const USAGE_JOURNAL_VERSION: u8 = 2;
 const DEFAULT_USAGE_STATS_WINDOW_MS: u128 = 60 * 60 * 1000;
 const DEFAULT_USAGE_STATS_LIMIT: usize = 50;
 
+pub const CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE: &str = "codex_overflow_compact_summary";
+
 const fn legacy_usage_schema_version() -> u8 {
     1
 }
@@ -138,6 +140,8 @@ pub struct UsageLog {
     #[serde(default)]
     pub stream_status: Option<String>,
     #[serde(default)]
+    pub usage_estimated: bool,
+    #[serde(default)]
     pub share_name: Option<String>,
     #[serde(default)]
     pub user_country: Option<String>,
@@ -178,6 +182,7 @@ pub struct UsageLogContext {
     pub is_health_check: bool,
     pub is_streaming: bool,
     pub stream_status: Option<String>,
+    pub usage_estimated: bool,
 }
 
 impl UsageStore {
@@ -342,7 +347,7 @@ impl UsageStore {
             .fold((0u64, 0u64), |(tokens, requests), bucket| {
                 (
                     tokens.saturating_add(bucket.stats.quota_tokens),
-                    requests.saturating_add(bucket.stats.rollup.requests),
+                    requests.saturating_add(bucket.share_quota_requests()),
                 )
             })
     }
@@ -707,6 +712,7 @@ impl UsageLog {
             is_health_check: false,
             is_streaming: false,
             stream_status: None,
+            usage_estimated: false,
             share_name: None,
             user_country: None,
             user_country_iso3: None,
@@ -731,6 +737,7 @@ impl UsageLog {
         self.user_country_iso3 = context.user_country_iso3;
         self.is_streaming = context.is_streaming;
         self.stream_status = context.stream_status;
+        self.usage_estimated = context.usage_estimated;
     }
 }
 
@@ -971,6 +978,14 @@ struct UsageRollupBucket {
 }
 
 impl UsageRollupBucket {
+    fn share_quota_requests(&self) -> u64 {
+        if self.data_source.as_deref() == Some(CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE) {
+            0
+        } else {
+            self.stats.rollup.requests
+        }
+    }
+
     fn new(log: &UsageLog) -> Self {
         let bucket_start_ms = log.created_at_ms - (log.created_at_ms % USAGE_ROLLUP_BUCKET_MS);
         let day_start_ms = log.created_at_ms - (log.created_at_ms % USAGE_DAY_MS);
@@ -2402,6 +2417,61 @@ mod tests {
                 (starts_at_ms + 60_000) as i64,
             ),
             (7 * (MAX_USAGE_LOGS as u64 + 1), MAX_USAGE_LOGS as u64 + 1)
+        );
+    }
+
+    #[test]
+    fn share_user_quota_counts_summary_tokens_without_a_second_request() {
+        let starts_at_ms = 1_800_000_000_000u128;
+        let mut invocation = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                total_tokens: Some(7),
+                ..TokenUsage::default()
+            },
+        );
+        invocation.request_id = "req_invocation".to_string();
+        invocation.share_id = Some("share-1".to_string());
+        invocation.user_email = Some("user@example.com".to_string());
+        invocation.created_at_ms = starts_at_ms;
+
+        let mut summary = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                total_tokens: Some(10),
+                ..TokenUsage::default()
+            },
+        );
+        summary.request_id = "req_summary".to_string();
+        summary.share_id = Some("share-1".to_string());
+        summary.user_email = Some("user@example.com".to_string());
+        summary.data_source = Some(CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE.to_string());
+        summary.created_at_ms = starts_at_ms + 1;
+
+        let mut store = UsageStore::default();
+        store.push(invocation);
+        store.push(summary);
+
+        assert_eq!(
+            store.share_user_quota_usage(
+                "share-1",
+                "user@example.com",
+                starts_at_ms as i64,
+                (starts_at_ms + 60_000) as i64,
+            ),
+            (17, 1)
         );
     }
 

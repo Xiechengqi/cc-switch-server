@@ -572,7 +572,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
             "diagnostic capability only; Kiro forwarding is Claude-only on server"
         }
         (_, ProviderType::CursorOAuth | ProviderType::CursorApiKey) => {
-            "Cursor AgentService h2/protobuf static driver is available behind explicit opt-in; capability remains planned until real Cursor non-stream/stream validation"
+            "Cursor AgentService h2/protobuf driver is wired by default with one fixed credential; profile maturity remains experimental until real OAuth/API-key validation"
         }
         (
             _,

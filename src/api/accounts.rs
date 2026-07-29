@@ -8,14 +8,36 @@ pub(in crate::api) async fn list_accounts(
     headers: HeaderMap,
 ) -> Result<Json<ListAccountsResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let accounts = state
-        .accounts_snapshot()
-        .await
+    let snapshot = state.accounts_snapshot().await;
+    let accounts = snapshot
         .accounts
         .iter()
         .map(AccountPublicView::from)
         .collect();
-    Ok(Json(ListAccountsResponse { ok: true, accounts }))
+    Ok(Json(ListAccountsResponse {
+        ok: true,
+        accounts,
+        codex_oauth: snapshot.codex_oauth_selection(),
+    }))
+}
+
+pub(in crate::api) async fn select_active_codex_oauth_account(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<SelectActiveCodexOAuthAccountRequest>,
+) -> Result<Json<SelectActiveCodexOAuthAccountResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let account = state
+        .select_active_codex_oauth_account_command(&input.account_id)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_codex_active_account_selection_error)?;
+    let codex_oauth = state.accounts_snapshot().await.codex_oauth_selection();
+    Ok(Json(SelectActiveCodexOAuthAccountResponse {
+        ok: true,
+        account: account.into(),
+        codex_oauth,
+    }))
 }
 
 pub(in crate::api) async fn upsert_account(
@@ -1725,6 +1747,25 @@ async fn verify_and_mark_managed_account_input(
             .map_err(ApiError::bad_request)?;
             apply_verified_grok_identity(input, verified);
         }
+        ProviderType::CursorApiKey => {
+            let api_key = input
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::bad_request("Cursor API key is required"))?;
+            let verified =
+                crate::clients::oauth::cursor::verify_api_key(&state.http_client().await, api_key)
+                    .await
+                    .map_err(|error| {
+                        let status = StatusCode::from_u16(error.status_code)
+                            .unwrap_or(StatusCode::BAD_GATEWAY);
+                        ApiError::new(status, error.message)
+                    })?;
+            input.id = Some(verified.account_id);
+            input.email = verified.email;
+            input.profile = Some(verified.profile);
+        }
         _ => {}
     }
     Ok(())
@@ -1985,6 +2026,7 @@ pub(in crate::api) async fn refresh_account(
         .ok_or_else(|| ApiError::not_found("account not found"))?;
 
     if provider_native_refresh_available(existing.provider_type) {
+        ensure_managed_account_outbound_allowed(&state, &existing).await?;
         let now = now_ms() as i64;
         let _refresh_guard = state
             .account_refresh_locks
@@ -1995,6 +2037,7 @@ pub(in crate::api) async fn refresh_account(
             .await
             .filter(|account| account.provider_type == existing.provider_type)
             .ok_or_else(|| ApiError::not_found("account not found"))?;
+        ensure_managed_account_outbound_allowed(&state, &existing).await?;
         let http_client = state.http_client().await;
         let interval_ms = state.oauth_quota_refresh_interval_ms().await;
         let update =
@@ -2187,6 +2230,7 @@ pub(in crate::api) async fn account_quota(
         .find_account_by_id(&id)
         .await
         .ok_or_else(|| ApiError::not_found("account not found"))?;
+    ensure_managed_account_outbound_allowed(&state, &active_account).await?;
     if waited_for_in_flight && quota_refresh_satisfied_by_in_flight(&existing, &active_account) {
         return Ok(Json(AccountQuotaResponse {
             ok: true,
@@ -2262,6 +2306,7 @@ pub(in crate::api) async fn account_quota(
             })?;
     }
 
+    ensure_managed_account_outbound_allowed(&state, &active_account).await?;
     let http_client = state.http_client().await;
     let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
     match refresh_account_quota(
@@ -2347,6 +2392,32 @@ pub(in crate::api) async fn account_quota(
             ))
         }
     }
+}
+
+async fn ensure_managed_account_outbound_allowed(
+    state: &ServerState,
+    account: &Account,
+) -> Result<(), ApiError> {
+    if state.credential_persistence_degraded() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed account credentials are waiting for durable persistence",
+        ));
+    }
+    if account.provider_type != ProviderType::CodexOAuth {
+        return Ok(());
+    }
+    let accounts = state.accounts_snapshot().await;
+    if accounts
+        .active_codex_oauth_account()
+        .is_some_and(|active| active.id == account.id)
+    {
+        return Ok(());
+    }
+    Err(ApiError::conflict_code(
+        "cc_switch_codex_inactive_account",
+        "Codex OAuth account is not active",
+    ))
 }
 
 fn quota_refresh_satisfied_by_in_flight(before: &Account, after: &Account) -> bool {

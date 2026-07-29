@@ -286,19 +286,21 @@ pub(super) fn select_provider_for_codex_image_generation(
     account_in_flight: &AccountInFlightSnapshot,
     affinity_key: Option<&str>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_with_optional_filter(
+    let selection = select_provider_with_account_inflight(
         store,
         accounts,
         AppKind::Codex,
         headers,
         current_provider_id,
-        ProviderSelectionOptions {
-            provider_filter: Some(codex_image_generation_provider),
-            account_in_flight: Some(account_in_flight),
-            affinity_key,
-            ..ProviderSelectionOptions::default()
-        },
-    )
+        account_in_flight,
+        affinity_key,
+    )?;
+    if !codex_image_generation_provider(&selection.execution.stored) {
+        return Err(ProxyError::bad_request(
+            "selected Codex provider does not support image generation",
+        ));
+    }
+    Ok(selection)
 }
 
 fn select_provider_inner(
@@ -366,7 +368,13 @@ fn select_provider_with_optional_filter(
         .cloned()
         .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
     let automatic_managed_selection = explicit_provider_id.is_none()
-        && provider.provider_type != ProviderType::GrokOAuth
+        && !matches!(
+            provider.provider_type,
+            ProviderType::CodexOAuth
+                | ProviderType::GrokOAuth
+                | ProviderType::CursorOAuth
+                | ProviderType::CursorApiKey
+        )
         && bound_account_for_provider(&provider, accounts).is_some();
     if let Some(account_in_flight) = account_in_flight.filter(|_| automatic_managed_selection) {
         if let Some(selection) = select_managed_provider_candidate(
@@ -470,6 +478,7 @@ fn finalize_provider_selection(
     account_in_flight: Option<&AccountInFlightSnapshot>,
     now: u128,
 ) -> Result<ProviderRouteSelection, ProxyError> {
+    ensure_codex_oauth_active_account(&provider, accounts)?;
     ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
     ensure_provider_account_usage_available(&provider, accounts, now)?;
     if account_in_flight
@@ -481,6 +490,58 @@ fn finalize_provider_selection(
     let execution = ProviderExecution::from_store(store, provider)?;
     execution.ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)?;
     Ok(ProviderRouteSelection { execution })
+}
+
+pub(crate) fn ensure_codex_oauth_active_account(
+    provider: &StoredProvider,
+    accounts: &AccountStore,
+) -> Result<(), ProxyError> {
+    if provider.provider_type != ProviderType::CodexOAuth {
+        return Ok(());
+    }
+    let selection = accounts.codex_oauth_selection();
+    let active_account_id = selection.active_account_id.as_deref().ok_or_else(|| {
+        ProxyError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: match selection.status {
+                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::Unconfigured => {
+                    "Codex OAuth account is not configured".to_string()
+                }
+                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::NeedsSelection => {
+                    "multiple Codex OAuth accounts exist; select the active account before proxying"
+                        .to_string()
+                }
+                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::Ready => {
+                    "Codex OAuth active account is unavailable".to_string()
+                }
+            },
+        }
+    })?;
+    let bound_account_id = provider
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "Codex OAuth provider {} is not bound to the active account",
+                provider.provider.id
+            ),
+        })?;
+    if bound_account_id != active_account_id {
+        return Err(ProxyError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "Codex OAuth provider {} is bound to an inactive account",
+                provider.provider.id
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn account_concurrency_for_provider(
@@ -1001,6 +1062,9 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", Some(now + 60_000)));
         accounts.upsert(codex_oauth_account("acct-2", None));
+        accounts
+            .select_active_codex_oauth_account("acct-1")
+            .unwrap();
         let error = select_provider(
             &store,
             &accounts,
@@ -1078,6 +1142,9 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
+        accounts
+            .select_active_codex_oauth_account("acct-1")
+            .unwrap();
         accounts.accounts[0].needs_relogin = true;
         let error = select_provider(
             &store,
@@ -1244,7 +1311,85 @@ mod tests {
     }
 
     #[test]
-    fn automatic_managed_selection_prefers_lower_occupancy_ratio_for_all_oauth_types() {
+    fn codex_images_honor_explicit_provider_bound_to_active_account() {
+        let mut current = codex_oauth_provider("p1", "acct-1");
+        current
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .codex_image_generation_enabled = Some(true);
+        let mut requested = codex_oauth_provider("p2", "acct-1");
+        requested
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .codex_image_generation_enabled = Some(true);
+        let store = runtime_store(vec![current, requested]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(codex_oauth_account("acct-1", None));
+        accounts
+            .select_active_codex_oauth_account("acct-1")
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
+
+        let selected = select_provider_for_codex_image_generation(
+            &store,
+            &accounts,
+            &headers,
+            Some("p1"),
+            &AccountInFlightTracker::default().snapshot(),
+            Some("image-session"),
+        )
+        .unwrap();
+
+        assert_eq!(selected.execution.stored.provider.id, "p2");
+    }
+
+    #[test]
+    fn codex_images_reject_explicit_provider_bound_to_inactive_account() {
+        let mut current = codex_oauth_provider("p1", "acct-1");
+        current
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .codex_image_generation_enabled = Some(true);
+        let mut requested = codex_oauth_provider("p2", "acct-2");
+        requested
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .codex_image_generation_enabled = Some(true);
+        let store = runtime_store(vec![current, requested]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(codex_oauth_account("acct-1", None));
+        accounts.upsert(codex_oauth_account("acct-2", None));
+        accounts
+            .select_active_codex_oauth_account("acct-1")
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
+
+        let error = select_provider_for_codex_image_generation(
+            &store,
+            &accounts,
+            &headers,
+            Some("p1"),
+            &AccountInFlightTracker::default().snapshot(),
+            Some("image-session"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("inactive account"));
+    }
+
+    #[test]
+    fn codex_selection_does_not_switch_from_active_account_for_load() {
         let mut first = codex_oauth_provider("p1", "acct-1");
         first.provider.settings_config["ACCOUNT_MAX_CONCURRENT"] = json!(8);
         let mut second = codex_oauth_provider("p2", "acct-2");
@@ -1253,6 +1398,9 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
+        accounts
+            .select_active_codex_oauth_account("acct-2")
+            .unwrap();
         let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
         let _first_guards = [
             tracker
@@ -1277,7 +1425,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected.execution.stored.provider.id, "p1");
+        assert_eq!(selected.execution.stored.provider.id, "p2");
         assert_eq!(
             account_concurrency_for_provider(
                 &selected.execution.stored,
@@ -1286,7 +1434,7 @@ mod tests {
             )
             .unwrap()
             .max_concurrent,
-            8
+            2
         );
     }
 

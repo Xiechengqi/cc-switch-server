@@ -1,10 +1,10 @@
 import type {
-  PublicMarket,
+  PublicTokenMarket,
   ShareAccessByApp,
   ShareAppSettingsByApp,
   ShareBindings,
-  ShareSaleMarketKind,
 } from "@/lib/api";
+import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 import {
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
@@ -28,7 +28,53 @@ export function normalizeShareEmails(emails: string[]): string[] {
   );
 }
 
-export function formatMarketSelectLabel(market: PublicMarket): string {
+export function buildShareUserGrantsForAcl({
+  source,
+  ownerEmail,
+  aclEmails,
+  defaultPolicy,
+}: {
+  source: ShareUserGrantMap;
+  ownerEmail: string;
+  aclEmails: string[];
+  defaultPolicy: ShareUserPolicy;
+}): ShareUserGrantMap {
+  const normalizedOwnerEmail = ownerEmail.trim().toLowerCase();
+  const allowedEmails = new Set(
+    normalizeShareEmails([normalizedOwnerEmail, ...aclEmails]),
+  );
+  const sourceByEmail = new Map(
+    Object.values(source).map((grant) => [
+      grant.email.trim().toLowerCase(),
+      grant,
+    ]),
+  );
+  const next: ShareUserGrantMap = {};
+
+  for (const [email, grant] of sourceByEmail) {
+    if (email && grant.manager === "routerShareMarket") {
+      next[email] = grant;
+    }
+  }
+  for (const email of allowedEmails) {
+    const previous = sourceByEmail.get(email);
+    if (previous?.manager === "routerShareMarket") {
+      next[email] = previous;
+      continue;
+    }
+    next[email] = {
+      ...previous,
+      email,
+      role: email === normalizedOwnerEmail ? "owner" : "shareto",
+      active: true,
+      policy: previous?.policy ?? { ...defaultPolicy },
+    };
+  }
+
+  return next;
+}
+
+export function formatMarketSelectLabel(market: PublicTokenMarket): string {
   return market.displayName.replace(/^https?:\/\//i, "");
 }
 
@@ -41,11 +87,9 @@ export function shareAppDisplayLabel(app: keyof ShareBindings): string {
 export interface BuildShareAclPayloadInput {
   app: keyof ShareBindings;
   forSale: "Yes" | "No" | "Free";
-  saleMarketKind: ShareSaleMarketKind;
   marketAccessMode: "selected" | "all";
   shareToEmails: string[];
   selectedTokenMarketEmails: string[];
-  selectedShareMarketEmail: string;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;
@@ -54,48 +98,36 @@ export interface BuildShareAclPayloadInput {
 export function buildShareAclPayload({
   app,
   forSale,
-  saleMarketKind,
   marketAccessMode,
   shareToEmails,
   selectedTokenMarketEmails,
-  selectedShareMarketEmail,
   tokenLimit,
   parallelLimit,
   expiresAt,
 }: BuildShareAclPayloadInput): {
   sharedWithEmails: string[];
   marketAccessMode: "selected" | "all";
-  saleMarketKind: ShareSaleMarketKind;
   accessByApp: ShareAccessByApp;
   appSettings: ShareAppSettingsByApp;
 } {
   const marketEmails =
     forSale !== "Yes"
       ? []
-      : saleMarketKind === "share"
-        ? selectedShareMarketEmail
-          ? [selectedShareMarketEmail]
-          : []
-        : marketAccessMode === "all"
-          ? []
-          : selectedTokenMarketEmails;
+      : marketAccessMode === "all"
+        ? []
+        : selectedTokenMarketEmails;
   const emails = normalizeShareEmails([...shareToEmails, ...marketEmails]);
-  const effectiveMarketAccessMode =
-    forSale === "Yes" && saleMarketKind === "share"
-      ? "selected"
-      : marketAccessMode;
 
   const accessByApp: ShareAccessByApp = {
     [app]: {
       sharedWithEmails: emails,
-      marketAccessMode: effectiveMarketAccessMode,
+      marketAccessMode,
     },
   };
   const appSettings: ShareAppSettingsByApp = {
     [app]: {
       forSale,
-      saleMarketKind,
-      marketAccessMode: effectiveMarketAccessMode,
+      marketAccessMode,
       sharedWithEmails: emails,
       tokenLimit: tokenLimit ?? UNLIMITED_TOKEN_LIMIT,
       parallelLimit: parallelLimit ?? UNLIMITED_PARALLEL_LIMIT,
@@ -105,8 +137,7 @@ export function buildShareAclPayload({
 
   return {
     sharedWithEmails: emails,
-    marketAccessMode: effectiveMarketAccessMode,
-    saleMarketKind,
+    marketAccessMode,
     accessByApp,
     appSettings,
   };

@@ -302,16 +302,6 @@ export interface ShareBinding {
   providerType: string;
 }
 
-export interface ShareMarketGrantStatus {
-  status: string;
-  grantId?: string | null;
-  buyerEmail?: string | null;
-  marketEmail?: string | null;
-  message?: string | null;
-  updatedAtMs?: number | null;
-  [key: string]: unknown;
-}
-
 export interface ShareRecord {
   id: string;
   ownerEmail?: string | null;
@@ -336,7 +326,6 @@ export interface ShareRecord {
   created_at?: number | string | null;
   expiresAt?: number | null;
   forSale: boolean;
-  saleMarketKind: string;
   accessByApp?: Record<string, unknown>;
   appSettings?: Record<string, unknown>;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
@@ -346,7 +335,6 @@ export interface ShareRecord {
   bindings?: ShareBinding[];
   bindingHistory?: unknown[];
   runtimeSnapshot?: unknown;
-  marketGrant?: ShareMarketGrantStatus | null;
   lastError?: string | null;
   routerLastSyncedAtMs?: number | null;
   routerLastSyncError?: string | null;
@@ -372,7 +360,6 @@ export interface UpsertShareInput {
   parallelLimit?: number;
   expiresAt?: number;
   forSale?: boolean;
-  saleMarketKind?: string;
   accessByApp?: Record<string, unknown>;
   appSettings?: Record<string, unknown>;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
@@ -381,7 +368,6 @@ export interface UpsertShareInput {
   description?: string | null;
   bindings?: ShareBinding[];
   runtimeSnapshot?: unknown;
-  marketGrant?: ShareMarketGrantStatus | null;
   userGrants?: import("@/lib/api/share").ShareUserGrantMap;
 }
 
@@ -397,17 +383,6 @@ export interface ShareConnectInfo {
     env: Record<string, string>;
   }>;
   note: string;
-}
-
-export interface PublicShareMarket {
-  id: string;
-  displayName: string;
-  email: string;
-  subdomain: string;
-  publicBaseUrl?: string | null;
-  marketKind: string;
-  status: string;
-  scopes?: string[];
 }
 
 export interface RouterShareEditPullResponse {

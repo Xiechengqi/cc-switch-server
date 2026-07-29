@@ -4,20 +4,11 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   Check,
   Copy,
   Download,
   ExternalLink,
   Loader2,
-  LogOut,
-  Plus,
   Sparkles,
   User,
   X,
@@ -47,28 +38,27 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
     deviceCode,
     error,
     isPolling,
-    isAddingAccount,
     isImportingCursorLocalAuth,
     isRemovingAccount,
-    isSettingDefaultAccount,
-    defaultAccountId,
     addAccount,
     cancelAuth,
     importCursorLocalAuth,
-    logout,
     removeAccount,
-    setDefaultAccount,
   } = useCursorOauth();
 
-  const handleAccountSelect = (value: string) => {
-    onAccountSelect?.(value === "none" ? null : value);
-  };
+  React.useEffect(() => {
+    const account = accounts.length === 1 ? accounts[0] : undefined;
+    if (account && selectedAccountId !== account.id) {
+      onAccountSelect?.(account.id);
+    } else if (!account && selectedAccountId) {
+      onAccountSelect?.(null);
+    }
+  }, [accounts, onAccountSelect, selectedAccountId]);
 
   const accountDisplayName = (account: {
     email?: string | null;
     login: string;
-  }) =>
-    account.email || account.login;
+  }) => account.email || account.login;
 
   const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -109,6 +99,15 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
         </Badge>
       </div>
 
+      {accounts.length > 1 && (
+        <p className="text-sm text-destructive">
+          {t("cursorOauth.multipleAccountsConflict", {
+            defaultValue:
+              "检测到旧版多账号配置。请移除多余账号，只保留一个 Cursor 反代账号。",
+          })}
+        </p>
+      )}
+
       {hasAnyAccount && showLoggedInAccounts && (
         <div className="space-y-2">
           <Label className="text-sm text-muted-foreground">
@@ -127,13 +126,6 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
                   <span className="truncate text-sm font-medium">
                     {accountDisplayName(account)}
                   </span>
-                  {defaultAccountId === account.id && (
-                    <Badge variant="secondary" className="text-xs">
-                      {t("cursorOauth.defaultAccount", {
-                        defaultValue: "默认",
-                      })}
-                    </Badge>
-                  )}
                   {selectedAccountId === account.id && (
                     <Badge variant="outline" className="text-xs">
                       {t("cursorOauth.selected", {
@@ -143,20 +135,6 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                  {defaultAccountId !== account.id && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 px-2 text-xs text-muted-foreground"
-                      onClick={() => setDefaultAccount(account.id)}
-                      disabled={isSettingDefaultAccount}
-                    >
-                      {t("cursorOauth.setAsDefault", {
-                        defaultValue: "设为默认",
-                      })}
-                    </Button>
-                  )}
                   <Button
                     type="button"
                     variant="ghost"
@@ -177,45 +155,6 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
         </div>
       )}
 
-      {hasAnyAccount && onAccountSelect && (
-        <div className="space-y-2">
-          <Label className="text-sm text-muted-foreground">
-            {t("cursorOauth.selectAccount", {
-              defaultValue: "选择账号",
-            })}
-          </Label>
-          <Select
-            value={selectedAccountId || "none"}
-            onValueChange={handleAccountSelect}
-          >
-            <SelectTrigger>
-              <SelectValue
-                placeholder={t("cursorOauth.selectAccountPlaceholder", {
-                  defaultValue: "选择一个 Cursor 账号",
-                })}
-              />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="none">
-                <span className="text-muted-foreground">
-                  {t("cursorOauth.useDefaultAccount", {
-                    defaultValue: "使用默认账号",
-                  })}
-                </span>
-              </SelectItem>
-              {accounts.map((account) => (
-                <SelectItem key={account.id} value={account.id}>
-                  <div className="flex items-center gap-2">
-                    <User className="h-4 w-4 text-muted-foreground" />
-                    <span>{accountDisplayName(account)}</span>
-                  </div>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      )}
-
       {!hasAnyAccount && pollingState === "idle" && (
         <Button
           type="button"
@@ -230,22 +169,7 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
         </Button>
       )}
 
-      {hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={addAccount}
-          className="w-full"
-          variant="outline"
-          disabled={isAddingAccount}
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          {t("cursorOauth.addAnotherAccount", {
-            defaultValue: "添加其他账号",
-          })}
-        </Button>
-      )}
-
-      {pollingState === "idle" && (
+      {!hasAnyAccount && pollingState === "idle" && (
         <Button
           type="button"
           onClick={importCursorLocalAuth}
@@ -364,20 +288,6 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
             </Button>
           </div>
         </div>
-      )}
-
-      {hasAnyAccount && accounts.length > 1 && (
-        <Button
-          type="button"
-          variant="outline"
-          onClick={logout}
-          className="w-full text-red-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950"
-        >
-          <LogOut className="mr-2 h-4 w-4" />
-          {t("cursorOauth.logoutAll", {
-            defaultValue: "注销所有账号",
-          })}
-        </Button>
       )}
     </div>
   );

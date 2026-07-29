@@ -10,7 +10,7 @@ import {
   Trash2,
 } from "lucide-react";
 import type {
-  PublicMarket,
+  PublicTokenMarket,
   ShareRecord,
   TunnelConfig,
   TunnelInfo,
@@ -25,7 +25,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { useProviderHealth } from "@/lib/query/providerHealth";
-import { useShareMarketsQuery } from "@/lib/query";
+import { useTokenMarketsQuery } from "@/lib/query";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { formatShareRouterDisplay } from "@/utils/shareRouter";
@@ -82,7 +82,7 @@ export function ShareCard({
   const { t } = useTranslation();
   const [connectionExpanded, setConnectionExpanded] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
-  const { data: markets = [] } = useShareMarketsQuery(settingsExpanded);
+  const { data: markets = [] } = useTokenMarketsQuery(settingsExpanded);
   const ratio = getShareUsageRatio(share);
   // P8：多 app share。胸标里渲染每个已绑定 slot 的 chip + 健康色点。
   // primaryApp/primaryProvider 用于摘要标题、健康轮询等仍按"单值"逻辑的入口。
@@ -103,9 +103,7 @@ export function ShareCard({
     tunnelConfigured,
     tunnelStatus,
   );
-  const usageMarkets = markets.filter(
-    (market: PublicMarket) => (market.marketKind ?? "usage") !== "share",
-  );
+  const usageMarkets = markets;
   const marketEmailSet = new Set<string>(
     usageMarkets.map((market) => market.email.toLowerCase()),
   );
@@ -457,7 +455,7 @@ function MarketSummary({
   marketAccessMode,
   selectedMarketEmails,
 }: {
-  markets: PublicMarket[];
+  markets: PublicTokenMarket[];
   marketAccessMode: "selected" | "all";
   selectedMarketEmails: string[];
 }) {

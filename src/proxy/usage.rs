@@ -220,7 +220,6 @@ mod tests {
                         expires_at: None,
                         for_sale: None,
                         free_access: None,
-                        sale_market_kind: None,
                         access_by_app: BTreeMap::new(),
                         app_settings: BTreeMap::new(),
                         for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -233,7 +232,6 @@ mod tests {
                             provider_type: stored.provider_type,
                         }],
                         runtime_snapshot: None,
-                        market_grant: None,
                         user_grants: BTreeMap::new(),
                     })
                     .unwrap()

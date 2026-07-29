@@ -160,7 +160,7 @@ export function ShareUserGrantsEditor({
       : undefined;
     if (
       !isValidShareEmail(email) ||
-      (editingEmail == null && Boolean(value[email]?.active)) ||
+      (editingEmail == null && (Boolean(value[email]?.active) || protectedEmails?.has(email))) ||
       parallelLimit === 0 ||
       tokenLimit === 0 ||
       (parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
@@ -168,7 +168,7 @@ export function ShareUserGrantsEditor({
       (expiresAt != null && !Number.isFinite(expiresAt)) ||
       (anchored && (
         tokenPeriodAnchorAtMs == null ||
-        !Number.isFinite(tokenPeriodAnchorAtMs) ||
+          !Number.isFinite(tokenPeriodAnchorAtMs) ||
         tokenPeriodAnchorAtMs > Math.floor(Date.now() / 60_000) * 60_000
       ))
     ) {
@@ -247,6 +247,9 @@ export function ShareUserGrantsEditor({
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="truncate">{grant.email}</span>
                     {grant.role === "owner" ? <Badge variant="secondary">Owner</Badge> : null}
+                    {grant.manager === "routerShareMarket" ? (
+                      <Badge variant="secondary">Share Market</Badge>
+                    ) : null}
                   </div>
                 </TableCell>
                 <TableCell className="px-3 py-2">{displayLimit(grant.policy.parallelLimit, unlimited)}</TableCell>
@@ -256,15 +259,17 @@ export function ShareUserGrantsEditor({
                 <TableCell className="px-3 py-2">{displayExpiry(grant.policy.expiresAt, permanent)}</TableCell>
                 <TableCell className="px-3 py-2">
                   <div className="flex justify-end gap-1">
-                    <Button type="button" variant="ghost" size="icon" disabled={disabled} onClick={() => openEdit(grant)} title={t("common.edit", { defaultValue: "编辑" })}>
-                      <Pencil className="h-4 w-4" />
-                    </Button>
+                    {!protectedEmails?.has(grant.email) ? (
+                      <Button type="button" variant="ghost" size="icon" disabled={disabled} onClick={() => openEdit(grant)} title={t("common.edit", { defaultValue: "编辑" })}>
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                    ) : null}
                     {grant.role !== "owner" && !protectedEmails?.has(grant.email) ? (
                       <Button type="button" variant="ghost" size="icon" disabled={disabled} onClick={() => {
-                        const updated = { ...value };
-                        delete updated[grant.email];
-                        onChange(updated);
-                      }} title={t("common.delete", { defaultValue: "删除" })}>
+                          const updated = { ...value };
+                          delete updated[grant.email];
+                          onChange(updated);
+                        }} title={t("common.delete", { defaultValue: "删除" })}>
                         <Trash2 className="h-4 w-4 text-destructive" />
                       </Button>
                     ) : null}

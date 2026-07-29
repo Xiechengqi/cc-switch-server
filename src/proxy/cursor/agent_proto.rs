@@ -18,6 +18,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+pub const CURSOR_AGENT_PROTOCOL_REVISION: &str = "cursor-agent/2026.06.02-8c11d9f";
+
 // ─── Wire types ────────────────────────────────────────────────────────────
 
 pub(crate) const WT_VARINT: u8 = 0;
@@ -596,13 +598,7 @@ impl ConnectFrameParser {
             self.buf.advance(5);
             let raw = self.buf.split_to(length).freeze();
             let payload = if flags & FLAG_GZIP != 0 {
-                match gunzip(&raw) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!("[CursorProto] skip undecodable gzip frame: {e}");
-                        continue;
-                    }
-                }
+                gunzip(&raw)?
             } else {
                 raw
             };
@@ -620,8 +616,16 @@ fn gunzip(src: &[u8]) -> ProtoResult<Bytes> {
     let mut decoder = flate2::read::GzDecoder::new(src);
     let mut out = Vec::new();
     decoder
+        .by_ref()
+        .take((CONNECT_MAX_FRAME_BYTES + 1) as u64)
         .read_to_end(&mut out)
         .map_err(|e| ProtoError::Gzip(e.to_string()))?;
+    if out.len() > CONNECT_MAX_FRAME_BYTES {
+        return Err(ProtoError::FrameTooLarge {
+            size: out.len(),
+            max: CONNECT_MAX_FRAME_BYTES,
+        });
+    }
     Ok(Bytes::from(out))
 }
 
@@ -1853,6 +1857,39 @@ mod tests {
         let second = parser.feed(&frame[3..]).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(&second[0].payload[..], b"streamed");
+    }
+
+    #[test]
+    fn invalid_gzip_frame_fails_closed() {
+        let invalid = [FLAG_GZIP, 0, 0, 0, 3, 1, 2, 3];
+        let error = ConnectFrameParser::new().feed(&invalid).unwrap_err();
+        assert!(matches!(error, ProtoError::Gzip(_)));
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_before_payload_allocation() {
+        let length = (CONNECT_MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+        let header = [0, length[0], length[1], length[2], length[3]];
+        let error = ConnectFrameParser::new().feed(&header).unwrap_err();
+        assert!(matches!(error, ProtoError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn reviewed_descriptor_fingerprint_is_stable() {
+        let reviewed_fields = format!(
+            "{}|{ACM_RUN_REQUEST},{ACM_EXEC_CLIENT_MESSAGE},{ACM_KV_CLIENT_MESSAGE}|\
+             {ARR_CONVERSATION_STATE},{ARR_ACTION},{ARR_MODEL_DETAILS},{ARR_MCP_TOOLS},{ARR_CONVERSATION_ID},{ARR_REQUESTED_MODEL},{ARR_UNKNOWN_12},{ARR_REQUEST_ID}|\
+             {ASM_INTERACTION_UPDATE},{ASM_EXEC_SERVER_MESSAGE},{ASM_KV_SERVER_MESSAGE}|\
+             {IU_TEXT_DELTA},{IU_TOOL_CALL_STARTED},{IU_TOOL_CALL_COMPLETED},{IU_THINKING_DELTA},{IU_THINKING_COMPLETED},{IU_TOKEN_DELTA},{IU_HEARTBEAT},{IU_TURN_ENDED}|\
+             {ESM_SHELL_ARGS},{ESM_WRITE_ARGS},{ESM_GREP_ARGS},{ESM_READ_ARGS},{ESM_LS_ARGS},{ESM_DIAGNOSTICS_ARGS},{ESM_REQUEST_CONTEXT_ARGS},{ESM_MCP_ARGS},{ESM_SHELL_STREAM_ARGS},{ESM_BACKGROUND_SHELL_SPAWN},{ESM_FETCH_ARGS},{ESM_WRITE_SHELL_STDIN_ARGS}|\
+             {CONNECT_MAX_FRAME_BYTES}",
+            CURSOR_AGENT_PROTOCOL_REVISION
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(reviewed_fields.as_bytes())),
+            "f4079225e38e8a2733538f9ee868c93eb1395948064369942741bd31a9b363c6",
+            "Cursor AgentService field numbers drifted; review a current cursor-agent descriptor before updating this fingerprint"
+        );
     }
 
     #[test]

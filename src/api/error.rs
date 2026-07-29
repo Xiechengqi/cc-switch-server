@@ -276,6 +276,23 @@ pub(crate) fn map_account_write_error(error: anyhow::Error) -> ApiError {
     ApiError::internal(error)
 }
 
+pub(crate) fn map_codex_active_account_selection_error(
+    error: crate::state::CodexActiveAccountSelectionError,
+) -> ApiError {
+    let code = error.code();
+    let message = error.to_string();
+    match error {
+        crate::state::CodexActiveAccountSelectionError::AccountNotFound(_) => {
+            let mut api_error = ApiError::not_found(message);
+            api_error.code = Some(code);
+            api_error
+        }
+        crate::state::CodexActiveAccountSelectionError::ShareConflict { .. } => {
+            ApiError::conflict_code(code, message)
+        }
+    }
+}
+
 #[cfg(test)]
 mod retry_response_tests {
     use axum::response::IntoResponse;
@@ -372,6 +389,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn cursor_session_loss_has_a_stable_conflict_code() {
+        let response = ApiError::proxy(crate::proxy::ProxyError::cursor_session_lost(
+            "Cursor session is unavailable",
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "cursor_session_lost");
+        assert_eq!(body["error"], "Cursor session is unavailable");
+        assert_eq!(body["retryable"], false);
     }
 
     #[tokio::test]

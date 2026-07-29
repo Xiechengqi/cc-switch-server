@@ -96,11 +96,3 @@ curl -fsS -X POST \
   -d "{\"id\":\"smoke-share\",\"app\":\"codex\",\"providerId\":\"$PROVIDER_ID\",\"providerType\":\"codex\",\"displayName\":\"Smoke Share\"}" \
   "$SERVER_URL/api/shares"
 echo
-
-echo "== update share market grant =="
-curl -fsS -X POST \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"marketGrant":{"status":"pending","grantId":"smoke-grant"}}' \
-  "$SERVER_URL/api/shares/smoke-share/market-grant"
-echo

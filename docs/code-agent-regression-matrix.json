@@ -25,9 +25,10 @@
       "providerFamilies": ["claude", "claude_auth", "claude_oauth", "codex", "codex_oauth", "gemini", "gemini_cli", "openrouter", "cursor_oauth", "cursor_apikey", "antigravity_oauth", "agy_oauth", "ollama_cloud", "aws_bedrock", "nvidia", "deepseek_api", "github_copilot", "kiro_oauth", "deepseek_account"],
       "staticCoverage": {
         "nativeFamilies": ["claude", "claude_auth", "claude_oauth", "codex", "codex_oauth", "gemini", "gemini_cli", "openrouter", "antigravity_oauth", "agy_oauth", "ollama_cloud", "nvidia", "deepseek_api"],
-        "plannedFamilies": ["cursor_oauth", "cursor_apikey", "aws_bedrock", "kiro_oauth"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "plannedFamilies": ["aws_bedrock", "kiro_oauth"],
         "remainingFallbackFamilies": ["github_copilot", "deepseek_account"],
-        "notes": "Local static adapter contracts are native for listed families; Kiro Claude->CodeWhisperer bridge and native refresh are wired but remain planned until real Kiro validation; GitHub Copilot static preflight covers model normalization, /chat/completions endpoint and optimizer headers/body handling but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService opt-in text/image/tool driver exists for Claude/Codex/Gemini, including MCP/built-in tool bridge and tool_result park-resume, but capability remains planned until real Cursor validation."
+        "notes": "Local static adapter contracts are native for listed families; Kiro Claude->CodeWhisperer bridge and native refresh are wired but remain planned until real Kiro validation; GitHub Copilot static preflight covers model normalization, /chat/completions endpoint and optimizer headers/body handling but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService is wired by default with one fixed credential and remains Experimental/live-unverified until real Cursor validation."
       },
       "shareEnv": "CLAUDE_SHARE_ID",
       "urlEnv": "SERVER_URL",
@@ -43,9 +44,10 @@
       "providerFamilies": ["codex", "codex_oauth", "openrouter", "cursor_oauth", "cursor_apikey", "ollama_cloud", "claude", "claude_auth", "claude_oauth", "gemini", "gemini_cli", "antigravity_oauth", "agy_oauth", "aws_bedrock", "nvidia", "deepseek_api", "github_copilot", "kiro_oauth", "deepseek_account"],
       "staticCoverage": {
         "nativeFamilies": ["codex", "codex_oauth", "openrouter", "ollama_cloud", "claude", "claude_auth", "claude_oauth", "gemini", "gemini_cli", "antigravity_oauth", "agy_oauth", "nvidia", "deepseek_api"],
-        "plannedFamilies": ["cursor_oauth", "cursor_apikey", "aws_bedrock"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "plannedFamilies": ["aws_bedrock"],
         "remainingFallbackFamilies": ["github_copilot", "kiro_oauth", "deepseek_account"],
-        "notes": "Responses and Chat share the same provider family support; /chat/completions is normalized through the Codex/OpenAI-compatible adapter path; GitHub Copilot static OpenAI Chat preflight is present but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService opt-in text/image/tool driver exists for Claude/Codex/Gemini, including MCP/built-in tool bridge and tool_result park-resume, but capability remains planned until real Cursor validation."
+        "notes": "Responses and Chat share the same provider family support; /chat/completions is normalized through the Codex/OpenAI-compatible adapter path; GitHub Copilot static OpenAI Chat preflight is present but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService is wired by default with one fixed credential and remains Experimental/live-unverified until real Cursor validation."
       },
       "shareEnv": "CODEX_SHARE_ID",
       "shareFallbackEnv": "SHARE_ID",
@@ -62,7 +64,8 @@
       "providerFamilies": ["codex", "codex_oauth", "openrouter", "cursor_oauth", "cursor_apikey", "ollama_cloud", "claude", "claude_auth", "claude_oauth", "gemini", "gemini_cli", "antigravity_oauth", "agy_oauth", "aws_bedrock", "nvidia", "deepseek_api", "github_copilot", "kiro_oauth", "deepseek_account"],
       "staticCoverage": {
         "nativeFamilies": ["codex", "codex_oauth", "openrouter", "ollama_cloud", "claude", "claude_auth", "claude_oauth", "gemini", "gemini_cli", "antigravity_oauth", "agy_oauth", "nvidia", "deepseek_api"],
-        "plannedFamilies": ["cursor_oauth", "cursor_apikey", "aws_bedrock"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "plannedFamilies": ["aws_bedrock"],
         "remainingFallbackFamilies": ["github_copilot", "kiro_oauth", "deepseek_account"],
         "notes": "Chat endpoint must stay in the matrix because Codex OAuth Chat->Responses routing is a production regression target; GitHub Copilot static OpenAI Chat preflight is present but remains fallback until real token/live models/non-stream/stream validation."
       },
@@ -81,9 +84,10 @@
       "providerFamilies": ["gemini", "gemini_cli", "antigravity_oauth", "agy_oauth", "openrouter", "claude", "claude_auth", "claude_oauth", "codex", "codex_oauth", "cursor_oauth", "cursor_apikey", "ollama_cloud", "aws_bedrock", "nvidia", "deepseek_api", "github_copilot", "kiro_oauth", "deepseek_account"],
       "staticCoverage": {
         "nativeFamilies": ["gemini", "gemini_cli", "antigravity_oauth", "agy_oauth", "openrouter", "claude", "claude_auth", "claude_oauth", "codex", "codex_oauth", "ollama_cloud", "nvidia", "deepseek_api"],
-        "plannedFamilies": ["cursor_oauth", "cursor_apikey", "aws_bedrock"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "plannedFamilies": ["aws_bedrock"],
         "remainingFallbackFamilies": ["github_copilot", "kiro_oauth", "deepseek_account"],
-        "notes": "streamGenerateContent bridge is covered statically for native OpenAI-compatible upstreams; GitHub Copilot static OpenAI Chat preflight is present but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService opt-in text/image/tool driver exists for Claude/Codex/Gemini, including MCP/built-in tool bridge and tool_result park-resume, but capability remains planned until real Cursor validation; real stream evidence remains required."
+        "notes": "streamGenerateContent bridge is covered statically for native OpenAI-compatible upstreams; GitHub Copilot static OpenAI Chat preflight is present but remains fallback until real token/live models/non-stream/stream validation; Cursor AgentService is wired by default with one fixed credential and remains Experimental/live-unverified until real Cursor validation; real stream evidence remains required."
       },
       "shareEnv": "GEMINI_SHARE_ID",
       "urlEnv": "SERVER_URL",

@@ -37,9 +37,10 @@ pub use control::{
 pub(in crate::api) use debug::*;
 pub use error::ApiError;
 pub(crate) use error::{
-    map_account_write_error, map_codex_device_error, map_codex_workspace_rebind_error,
-    map_copilot_device_error, map_email_auth_error, map_grok_device_error, map_kiro_device_error,
-    map_share_patch_error, map_subscription_binding_error, map_web_auth_error, ErrorResponse,
+    map_account_write_error, map_codex_active_account_selection_error, map_codex_device_error,
+    map_codex_workspace_rebind_error, map_copilot_device_error, map_email_auth_error,
+    map_grok_device_error, map_kiro_device_error, map_share_patch_error,
+    map_subscription_binding_error, map_web_auth_error, ErrorResponse,
 };
 pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;
@@ -67,7 +68,7 @@ use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::Request;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -76,6 +77,7 @@ use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use sha2::Digest;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -120,8 +122,7 @@ use crate::domain::settings::config::{
 };
 use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
-    Share, ShareAcl, ShareBinding, ShareDeleteTombstone, ShareMarketGrantStatus, ShareStore,
-    UpsertShareInput,
+    Share, ShareAcl, ShareBinding, ShareDeleteTombstone, ShareStore, UpsertShareInput,
 };
 use crate::domain::usage::store::{UsageStatsFilter, UsageStore};
 use crate::proxy::adapters::ProviderAdapter;
@@ -251,6 +252,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/provider-matrix", get(provider_matrix))
         .route("/api/provider-type", post(provider_type))
         .route("/api/accounts", get(list_accounts).post(upsert_account))
+        .route(
+            "/api/accounts/codex/active",
+            post(select_active_codex_oauth_account),
+        )
         .route("/api/accounts/capabilities", get(account_capabilities))
         .route(
             "/api/accounts/import-templates",
@@ -365,15 +370,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/shares/tunnels/restore", post(restore_share_tunnels))
         .route("/api/shares/:id/reset-usage", post(reset_share_usage))
         .route("/api/shares/:id/acl", post(replace_share_acl))
-        .route(
-            "/api/shares/:id/market-grant",
-            post(update_share_market_grant),
-        )
-        .route("/api/share-markets", get(list_share_markets))
-        .route(
-            "/api/shares/:id/authorize-market",
-            post(authorize_share_market),
-        )
+        .route("/api/token-markets", get(list_token_markets))
         .route(
             "/api/shares/runtime-snapshot",
             post(refresh_share_snapshots),
@@ -468,8 +465,12 @@ pub fn app_router(state: ServerState) -> Router {
             "/web-api/admin/logs/tail",
             get(crate::api::logs::admin_logs_tail),
         )
-        .route("/v1/models", get(proxy_models))
-        .route("/models", get(proxy_models))
+        .route("/v1/models", get(proxy_models_or_manifest))
+        .route("/models", get(proxy_models_or_manifest))
+        .route(
+            "/backend-api/codex/models",
+            get(proxy_codex_models_manifest),
+        )
         .route("/v1/messages", post(proxy_claude_messages))
         .route("/claude/v1/messages", post(proxy_claude_messages))
         .route("/v1/messages/count_tokens", post(proxy_claude_count_tokens))
@@ -525,6 +526,20 @@ pub fn app_router(state: ServerState) -> Router {
             post(proxy_codex_responses_compact),
         )
         .route(
+            "/v1/responses/input_tokens",
+            post(proxy_responses_input_tokens),
+        )
+        .route(
+            "/responses/input_tokens",
+            post(proxy_responses_input_tokens),
+        )
+        .route("/alpha/search", post(proxy_codex_alpha_search))
+        .route("/v1/alpha/search", post(proxy_codex_alpha_search))
+        .route(
+            "/backend-api/codex/alpha/search",
+            post(proxy_codex_alpha_search),
+        )
+        .route(
             "/v1/images/generations",
             post(proxy_images_generations)
                 .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
@@ -536,12 +551,12 @@ pub fn app_router(state: ServerState) -> Router {
         )
         .route(
             "/v1/images/edits",
-            post(proxy_grok_images_edits)
+            post(proxy_images_edits)
                 .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/images/edits",
-            post(proxy_grok_images_edits)
+            post(proxy_images_edits)
                 .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
@@ -724,6 +739,7 @@ fn is_direct_inference_path(path: &str) -> bool {
         path,
         "/v1/models"
             | "/models"
+            | "/backend-api/codex/models"
             | "/v1/messages"
             | "/claude/v1/messages"
             | "/v1/messages/count_tokens"
@@ -742,6 +758,11 @@ fn is_direct_inference_path(path: &str) -> bool {
             | "/codex/v1/responses/compact"
             | "/backend-api/codex/responses"
             | "/backend-api/codex/responses/compact"
+            | "/v1/responses/input_tokens"
+            | "/responses/input_tokens"
+            | "/alpha/search"
+            | "/v1/alpha/search"
+            | "/backend-api/codex/alpha/search"
             | "/v1/images/generations"
             | "/images/generations"
             | "/v1/images/edits"
@@ -912,6 +933,14 @@ async fn proxy_models(
         .filter(|value| !value.is_empty());
     let providers = state.providers.read().await.clone();
     let mut data = openai_model_list(&providers.providers, query.app, provider_id);
+    let cursor_catalog = append_cursor_api_key_models(
+        &state,
+        &providers.providers,
+        query.app,
+        provider_id,
+        &mut data,
+    )
+    .await;
     let ui_settings = state.ui_settings.read().await.value.clone();
     let grok_provider =
         resolve_grok_catalog_provider(&providers, &ui_settings, query.app, provider_id).cloned();
@@ -1041,10 +1070,303 @@ async fn proxy_models(
         data,
         source: grok_catalog
             .as_ref()
-            .map(|catalog| catalog.source.to_string()),
-        stale: grok_catalog.as_ref().map(|catalog| catalog.stale),
-        fetched_at_ms: grok_catalog.and_then(|catalog| catalog.fetched_at_ms),
+            .map(|catalog| catalog.source.to_string())
+            .or_else(|| {
+                cursor_catalog
+                    .as_ref()
+                    .map(|_| "cursor_public_api".to_string())
+            }),
+        stale: grok_catalog
+            .as_ref()
+            .map(|catalog| catalog.stale)
+            .or_else(|| cursor_catalog.as_ref().map(|catalog| catalog.stale)),
+        fetched_at_ms: grok_catalog
+            .and_then(|catalog| catalog.fetched_at_ms)
+            .or_else(|| cursor_catalog.map(|catalog| catalog.fetched_at_ms)),
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorCatalogUse {
+    stale: bool,
+    fetched_at_ms: i64,
+}
+
+async fn append_cursor_api_key_models(
+    state: &ServerState,
+    providers: &[StoredProvider],
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+    data: &mut Vec<OpenAiModel>,
+) -> Option<CursorCatalogUse> {
+    const CURSOR_MODEL_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
+    let accounts = state.accounts_snapshot().await;
+    let mut used_catalog: Option<CursorCatalogUse> = None;
+    for provider in providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::CursorApiKey
+            && app.is_none_or(|app| provider.app == app)
+            && provider_id.is_none_or(|id| provider.provider.id == id)
+    }) {
+        let Some(api_key) = cursor_provider_api_key(provider, &accounts) else {
+            continue;
+        };
+        let key_hash = hex::encode(sha2::Sha256::digest(api_key.as_bytes()));
+        let now = crate::infra::time::now_ms() as i64;
+        let (catalog, stale) = if let Some(catalog) =
+            state.cursor_model_catalogs.fresh(&key_hash, now).await
+        {
+            (Some(catalog), false)
+        } else {
+            let _flight = state.cursor_model_catalogs.lock(&key_hash).await;
+            if let Some(catalog) = state.cursor_model_catalogs.fresh(&key_hash, now).await {
+                (Some(catalog), false)
+            } else {
+                match crate::clients::oauth::cursor::available_models(
+                    &state.http_client().await,
+                    &api_key,
+                )
+                .await
+                {
+                    Ok(models) if !models.is_empty() => (
+                        Some(
+                            state
+                                .cursor_model_catalogs
+                                .insert(key_hash.clone(), models, now, CURSOR_MODEL_CACHE_TTL_MS)
+                                .await,
+                        ),
+                        false,
+                    ),
+                    Ok(_) => (
+                        state.cursor_model_catalogs.last_known_good(&key_hash).await,
+                        true,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            provider_id = %provider.provider.id,
+                            status_code = error.status_code,
+                            error = %error,
+                            "Cursor model discovery failed; using last-known-good or configured models"
+                        );
+                        (
+                            state.cursor_model_catalogs.last_known_good(&key_hash).await,
+                            true,
+                        )
+                    }
+                }
+            }
+        };
+        let Some(catalog) = catalog else {
+            continue;
+        };
+        used_catalog = Some(match used_catalog {
+            Some(existing) => CursorCatalogUse {
+                stale: existing.stale || stale,
+                fetched_at_ms: existing.fetched_at_ms.min(catalog.fetched_at_ms),
+            },
+            None => CursorCatalogUse {
+                stale,
+                fetched_at_ms: catalog.fetched_at_ms,
+            },
+        });
+        let owner = model_owner(provider);
+        for model in catalog.models {
+            if data
+                .iter()
+                .any(|existing| existing.id == model && existing.owned_by == owner)
+            {
+                continue;
+            }
+            data.push(OpenAiModel {
+                id: model,
+                object: "model",
+                owned_by: owner.clone(),
+                reasoning_efforts: None,
+                input_modalities: None,
+            });
+        }
+    }
+    data.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.owned_by.cmp(&right.owned_by))
+    });
+    used_catalog
+}
+
+fn cursor_provider_api_key(provider: &StoredProvider, accounts: &AccountStore) -> Option<String> {
+    provider
+        .provider
+        .settings_config
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            [
+                "CURSOR_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "API_KEY",
+            ]
+            .iter()
+            .find_map(|key| {
+                provider
+                    .provider
+                    .settings_config
+                    .pointer(&format!("/env/{key}"))
+                    .or_else(|| provider.provider.settings_config.get(*key))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .or_else(|| {
+            let account_id = provider
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.auth_binding.as_ref())
+                .and_then(|binding| binding.account_id.as_deref())?;
+            accounts
+                .find_for_provider(ProviderType::CursorApiKey, Some(account_id))
+                .and_then(|account| account.api_key.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelsDispatchQuery {
+    #[serde(default)]
+    app: Option<AppKind>,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default, rename = "client_version")]
+    client_version: Option<String>,
+}
+
+async fn proxy_models_or_manifest(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ModelsDispatchQuery>,
+) -> Result<Response, ApiError> {
+    if query
+        .client_version
+        .as_deref()
+        .is_some_and(|version| !version.trim().is_empty())
+    {
+        return proxy::forward_codex_models_manifest(state, headers, query.client_version)
+            .await
+            .map_err(ApiError::proxy);
+    }
+
+    Ok(proxy_models(
+        State(state),
+        headers,
+        Query(ModelsQuery {
+            app: query.app,
+            provider_id: query.provider_id,
+        }),
+    )
+    .await
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelsManifestQuery {
+    client_version: Option<String>,
+}
+
+async fn proxy_codex_models_manifest(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<CodexModelsManifestQuery>,
+) -> Result<Response, ApiError> {
+    proxy::forward_codex_models_manifest(state, headers, query.client_version)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_codex_alpha_search(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_codex_alpha_search(state, headers, body)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_responses_input_tokens(
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    const BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+    let body =
+        crate::proxy::decode_request_body_for_proxy_with_limit(&headers, body, BODY_LIMIT_BYTES)
+            .map_err(ApiError::proxy)?;
+    let request = serde_json::from_slice::<Value>(&body)
+        .map_err(|error| ApiError::bad_request(format!("invalid token count JSON: {error}")))?;
+    let payload = json!({
+        "instructions": request.get("instructions"),
+        "input": request.get("input"),
+        "tools": request.get("tools"),
+    });
+    let characters = serde_json::to_string(&payload)
+        .map_err(ApiError::internal)?
+        .chars()
+        .count();
+    let input_tokens = if characters == 0 {
+        0
+    } else {
+        characters.saturating_add(2) / 3 + 8
+    };
+    let mut response = Json(json!({
+        "input_tokens": input_tokens,
+        "estimated": true,
+        "estimation_method": "json_characters_div_3_plus_8"
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        "x-cc-switch-token-count",
+        HeaderValue::from_static("estimated"),
+    );
+    Ok(response)
+}
+
+#[cfg(test)]
+mod responses_input_token_tests {
+    use std::io::Write;
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn compressed_input_token_request_is_bounded_after_decode() {
+        let oversized = json!({"input": "x".repeat(2 * 1024 * 1024)}).to_string();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(oversized.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+
+        let error = proxy_responses_input_tokens(headers, Bytes::from(compressed))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.message.contains("2097152 byte limit"));
+    }
 }
 
 fn resolve_grok_catalog_provider<'a>(
@@ -1828,20 +2150,14 @@ async fn proxy_images_generations(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_grok_images_edits(
+async fn proxy_images_edits(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    proxy::forward_grok_media(
-        state,
-        Method::POST,
-        "/images/edits".to_string(),
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
+    proxy::forward_images_edits(state, headers, body)
+        .await
+        .map_err(ApiError::proxy)
 }
 
 async fn proxy_grok_videos_generations(
@@ -1966,36 +2282,6 @@ fn oauth_login_api_error(error: OAuthLoginError) -> ApiError {
         | OAuthLoginError::InvalidTransition) => ApiError::conflict(error.to_string()),
         OAuthLoginError::NotFound => ApiError::not_found(error.to_string()),
     }
-}
-
-fn normalize_share_market_grant(
-    mut grant: ShareMarketGrantStatus,
-) -> Result<ShareMarketGrantStatus, ApiError> {
-    let status = grant.status.trim().to_ascii_lowercase();
-    if !matches!(status.as_str(), "pending" | "applied" | "error") {
-        return Err(ApiError::bad_request(
-            "marketGrant.status must be pending, applied, or error",
-        ));
-    }
-    grant.status = status;
-    if grant
-        .grant_id
-        .as_ref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        grant.grant_id = None;
-    }
-    if grant
-        .last_error
-        .as_ref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        grant.last_error = None;
-    }
-    if grant.updated_at_ms.is_none() {
-        grant.updated_at_ms = Some(now_ms());
-    }
-    Ok(grant)
 }
 
 fn fixtures_for_app(

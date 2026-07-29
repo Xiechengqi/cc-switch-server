@@ -7,7 +7,7 @@ import {
   type ClientTunnelUpdateParams,
   type ConnectInfo,
   type CreateShareParams,
-  type PublicMarket,
+  type PublicTokenMarket,
   type SaveProviderShareParams,
   type ShareRecord,
   type ShareHealthStatus,
@@ -30,7 +30,7 @@ export const shareKeys = {
     [...shareKeys.all, "tunnel-status", shareId] as const,
   connectInfo: (shareId: string) =>
     [...shareKeys.all, "connect-info", shareId] as const,
-  markets: () => [...shareKeys.all, "markets"] as const,
+  tokenMarkets: () => [...shareKeys.all, "token-markets"] as const,
   clientTunnel: () => [...shareKeys.all, "client-tunnel"] as const,
   clientTunnelStatus: () => [...shareKeys.all, "client-tunnel-status"] as const,
   health: () => [...shareKeys.all, "health"] as const,
@@ -111,10 +111,10 @@ export function useShareConnectInfoQuery(
   });
 }
 
-export function useShareMarketsQuery(enabled = true) {
-  return useQuery<PublicMarket[]>({
-    queryKey: shareKeys.markets(),
-    queryFn: shareApi.listMarkets,
+export function useTokenMarketsQuery(enabled = true) {
+  return useQuery<PublicTokenMarket[]>({
+    queryKey: shareKeys.tokenMarkets(),
+    queryFn: shareApi.listTokenMarkets,
     enabled,
     staleTime: 60_000,
   });
@@ -645,14 +645,12 @@ export function useUpdateShareAclMutation() {
       marketAccessMode,
       accessByApp,
       appSettings,
-      saleMarketKind,
     }: {
       shareId: string;
       sharedWithEmails: string[];
       marketAccessMode: "selected" | "all";
       accessByApp?: import("@/lib/api").ShareAccessByApp;
       appSettings?: import("@/lib/api").ShareAppSettingsByApp;
-      saleMarketKind?: import("@/lib/api").ShareSaleMarketKind;
     }) =>
       shareApi.updateAcl({
         shareId,
@@ -660,27 +658,12 @@ export function useUpdateShareAclMutation() {
         marketAccessMode,
         accessByApp,
         appSettings,
-        saleMarketKind,
       }),
     {
       successKey: "share.toast.updateAclSuccess",
       successDefault: "分享名单已更新",
       errorKey: "share.toast.updateAclError",
       errorDefault: "更新分享名单失败: {{error}}",
-    },
-    ({ shareId }) => shareId,
-  );
-}
-
-export function useAuthorizeShareMarketMutation() {
-  return useShareActionMutation(
-    ({ shareId, marketEmail }: { shareId: string; marketEmail: string }) =>
-      shareApi.authorizeMarket(shareId, marketEmail),
-    {
-      successKey: "share.toast.authorizeShareMarketSuccess",
-      successDefault: "账号市场委托已更新",
-      errorKey: "share.toast.authorizeShareMarketError",
-      errorDefault: "更新账号市场委托失败: {{error}}",
     },
     ({ shareId }) => shareId,
   );

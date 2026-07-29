@@ -261,7 +261,6 @@ export function CodexFormFields({
         <CodexOAuthSection
           selectedAccountId={selectedCodexAccountId}
           onAccountSelect={onCodexAccountSelect}
-          allowDefaultAccountOption={false}
           imageGenerationEnabled={codexImageGenerationEnabled}
           onImageGenerationChange={onCodexImageGenerationChange}
           imageToolStripPolicy={codexImageToolStripPolicy}

@@ -43,17 +43,11 @@ need_var MARKET_API_URL
 need_var CLAUDE_PROVIDER_TOKEN
 need_var CODEX_PROVIDER_TOKEN
 need_var GEMINI_PROVIDER_TOKEN
-need_var SHARE_MARKET_URL
-need_var SHARE_MARKET_GRANT_TOKEN
-need_var SHARE_MARKET_BUYER_EMAIL
-need_var SHARE_MARKET_LISTING_ID
-need_var SHARE_MARKET_ORDER_ID
 
 if [[ "$RUN_REAL" == "1" && "${#BLOCKERS[@]}" -eq 0 ]]; then
   echo "== real smoke =="
   scripts/smoke/router-market-smoke.sh || FAILURES=$((FAILURES + 1))
   scripts/smoke/code-agent-regression.sh || FAILURES=$((FAILURES + 1))
-  scripts/smoke/share-market-grant-smoke.sh || FAILURES=$((FAILURES + 1))
 else
   warn "real smoke skipped; RUN_REAL=${RUN_REAL}, blockers=${#BLOCKERS[@]}"
 fi

@@ -141,16 +141,6 @@
       "reason": "Server records only proxied usage"
     },
     {
-      "id": "codexResponsesWs",
-      "label": "codex_responses_ws",
-      "reason": "Server exposes HTTP proxy/API only"
-    },
-    {
-      "id": "codexImages",
-      "label": "Codex OAuth image generation",
-      "reason": "Out of current text/code-agent proxy scope"
-    },
-    {
       "id": "universalProviders",
       "label": "Universal providers",
       "reason": "Removed from token server; per-app providers are the source of truth"
@@ -265,7 +255,7 @@
       "implemented": true,
       "feature": "accounts",
       "endpoint": "GET /api/accounts",
-      "notes": "Maps server accounts.json into the legacy ManagedAuthStatus shape."
+      "notes": "Maps server accounts.json into the legacy ManagedAuthStatus shape and returns Codex unconfigured/ready/needs_selection plus the active account id."
     },
     {
       "name": "auth_list_accounts",
@@ -303,7 +293,8 @@
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Reorders provider accounts so the selected account is treated as default."
+      "endpoint": "POST /api/accounts/codex/active",
+      "notes": "For Codex, selects the unique active proxy account, atomically rebinds unshared Codex OAuth Providers, and rejects Share conflicts before partial mutation. Other providers retain legacy default ordering."
     },
     {
       "name": "auth_set_manual_subscription_expiry",
@@ -382,14 +373,6 @@
       "feature": "accounts",
       "endpoint": "POST /api/accounts/cursor/local/import",
       "notes": "Imports Cursor IDE state.vscdb or cursor-agent auth.json from the cc-switch-server host into the managed Cursor OAuth account store."
-    },
-    {
-      "name": "authorize_share_market",
-      "support": "native",
-      "implemented": true,
-      "feature": "shares",
-      "endpoint": "POST /api/shares/:id/authorize-market",
-      "notes": "Server-native Web compatibility command."
     },
     {
       "name": "check_client_tunnel_subdomain",
@@ -1375,12 +1358,12 @@
       "notes": "Server-native Web compatibility command."
     },
     {
-      "name": "list_share_markets",
+      "name": "list_token_markets",
       "support": "native",
       "implemented": true,
       "feature": "shares",
-      "endpoint": "GET /api/share-markets",
-      "notes": "Server-native Web compatibility command."
+      "endpoint": "GET /api/token-markets",
+      "notes": "Lists registered Token Usage Markets for share sale settings."
     },
     {
       "name": "list_shares",

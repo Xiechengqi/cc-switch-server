@@ -999,9 +999,7 @@ function ManagedAccountSection({
     case "claude_oauth":
       return <ClaudeOAuthSection {...common} />;
     case "codex_oauth":
-      return (
-        <CodexOAuthSection {...common} allowDefaultAccountOption={false} />
-      );
+      return <CodexOAuthSection {...common} />;
     case "grok_oauth":
       return <GrokOAuthSection {...common} allowDefaultAccountOption={false} />;
     case "github_copilot":

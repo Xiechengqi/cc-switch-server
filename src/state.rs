@@ -71,7 +71,7 @@ use crate::domain::sharing::router_contract::{
 };
 use crate::domain::sharing::shares::{
     RouterDescriptorSyncMode, Share, ShareDeleteTombstone, ShareInvocation,
-    ShareInvocationRejection, ShareMarketGrantStatus, ShareStore,
+    ShareInvocationRejection, ShareStore,
 };
 use crate::domain::usage::store::{UsageLog, UsageStore};
 use crate::logging::{LogTailAccessError, LogTailResponse, SharedLogCapture};
@@ -106,6 +106,26 @@ pub(crate) struct CodexWorkspaceRebindResult {
     pub(crate) account: Account,
     pub(crate) share: Share,
     pub(crate) identity_changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CodexActiveAccountSelectionError {
+    #[error("Codex OAuth account not found: {0}")]
+    AccountNotFound(String),
+    #[error(
+        "Codex OAuth account selection would rebind Provider(s) reserved by Share(s) {}",
+        .share_ids.join(", ")
+    )]
+    ShareConflict { share_ids: Vec<String> },
+}
+
+impl CodexActiveAccountSelectionError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::AccountNotFound(_) => "cc_switch_codex_active_account_not_found",
+            Self::ShareConflict { .. } => "cc_switch_codex_active_account_share_conflict",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -238,6 +258,9 @@ pub struct ServerStateInner {
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
+    pub cursor_api_key_tokens: crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache,
+    pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
+    cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
     pub account_refresh_locks: AccountRefreshLocks,
     pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
@@ -343,6 +366,8 @@ pub enum ManagedAccountRefreshError {
         provider_type: ProviderType,
     },
     NotFound,
+    InactiveCodexAccount,
+    CredentialPersistenceDegraded,
     Refresh {
         status_code: u16,
         message: String,
@@ -1275,6 +1300,7 @@ fn apply_provider_write_drafts(
     store: &mut ProviderStore,
     drafts: Vec<ProviderWriteDraft>,
     accounts: &AccountStore,
+    enforce_codex_active_account: bool,
 ) -> Result<(Vec<StoredProvider>, bool), ProviderCommandError> {
     let mut stored = Vec::with_capacity(drafts.len());
     let mut any_changed = false;
@@ -1376,7 +1402,12 @@ fn apply_provider_write_drafts(
             .to_string(),
             resource: resource.clone(),
         };
-        validate_and_resolve_provider_binding(&mut candidate, existing.as_ref(), accounts)?;
+        validate_and_resolve_provider_binding(
+            &mut candidate,
+            existing.as_ref(),
+            accounts,
+            enforce_codex_active_account,
+        )?;
         provider = candidate.provider.clone();
         let unchanged = existing
             .as_ref()
@@ -1421,6 +1452,7 @@ fn validate_and_resolve_provider_binding(
     candidate: &mut StoredProvider,
     existing: Option<&StoredProvider>,
     accounts: &AccountStore,
+    enforce_codex_active_account: bool,
 ) -> Result<(), ProviderCommandError> {
     let Some(profile_id) = candidate
         .resource
@@ -1428,6 +1460,29 @@ fn validate_and_resolve_provider_binding(
         .as_ref()
         .map(|profile_id| profile_id.as_str().to_string())
     else {
+        if candidate.provider_type == ProviderType::CodexOAuth {
+            let account_id = provider_account_id(candidate)
+                .map(str::trim)
+                .filter(|account_id| !account_id.is_empty())
+                .ok_or_else(|| ProviderCommandError::Conflict {
+                    code: "cc_switch_codex_inactive_account",
+                    message: "Codex OAuth Provider must be bound to the active account".to_string(),
+                })?;
+            if accounts
+                .find_for_provider(ProviderType::CodexOAuth, Some(account_id))
+                .is_none()
+            {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_codex_inactive_account",
+                    message: format!(
+                        "Codex OAuth Provider accountId {account_id} is not an available Codex OAuth account"
+                    ),
+                });
+            }
+            if enforce_codex_active_account {
+                validate_codex_provider_active_account(accounts, account_id)?;
+            }
+        }
         return Ok(());
     };
     let profile = profile_by_id(&profile_id)
@@ -1482,6 +1537,9 @@ fn validate_and_resolve_provider_binding(
             account_provider_type.as_str()
         )));
     }
+    if account_provider_type == ProviderType::CodexOAuth && enforce_codex_active_account {
+        validate_codex_provider_active_account(accounts, account_id)?;
+    }
     let binding_unchanged = existing.and_then(provider_account_id) == Some(account_id);
     let expected_generation = if binding_unchanged {
         provider_auth_identity_generation(candidate)
@@ -1510,6 +1568,30 @@ fn validate_and_resolve_provider_binding(
         auth_identity_generation: Some(expected_generation),
     });
     Ok(())
+}
+
+fn validate_codex_provider_active_account(
+    accounts: &AccountStore,
+    account_id: &str,
+) -> Result<(), ProviderCommandError> {
+    let active_account =
+        accounts
+            .active_codex_oauth_account()
+            .ok_or_else(|| ProviderCommandError::Conflict {
+                code: "cc_switch_codex_inactive_account",
+                message: "Codex OAuth Provider cannot be saved until an active account is selected"
+                    .to_string(),
+            })?;
+    if active_account.id == account_id {
+        return Ok(());
+    }
+    Err(ProviderCommandError::Conflict {
+        code: "cc_switch_codex_inactive_account",
+        message: format!(
+            "Codex OAuth Provider accountId {account_id} is not the active account {}",
+            active_account.id
+        ),
+    })
 }
 
 fn normalize_provider_outbound_identity(
@@ -1827,7 +1909,7 @@ fn prepare_provider_import(
     let preview_token = hex::encode(digest.finalize().into_bytes());
 
     let mut candidate = current.clone();
-    let (written, _) = apply_provider_write_drafts(&mut candidate, drafts, accounts)?;
+    let (written, _) = apply_provider_write_drafts(&mut candidate, drafts, accounts, true)?;
     candidate
         .validate_for_commit()
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
@@ -2056,7 +2138,7 @@ fn prepare_adopt_provider_profile(
             auth_identity_generation: None,
         });
     }
-    validate_and_resolve_provider_binding(&mut target, Some(&source), accounts)?;
+    validate_and_resolve_provider_binding(&mut target, Some(&source), accounts, true)?;
 
     let mut candidate = current.clone();
     let target_index = candidate
@@ -2296,7 +2378,8 @@ fn prepare_clone_provider_as_custom(
         credential_patches: BTreeMap::new(),
     };
     let mut candidate = current.clone();
-    let (mut written, _) = apply_provider_write_drafts(&mut candidate, vec![draft], accounts)?;
+    let (mut written, _) =
+        apply_provider_write_drafts(&mut candidate, vec![draft], accounts, true)?;
     let target = written
         .pop()
         .expect("clone-as-custom writes exactly one Provider");
@@ -2386,6 +2469,13 @@ fn prepare_account_binding_migration_preview(
             .filter(|account| account.provider_type == expected_provider_type)
             .map(|account| account.id.clone())
             .collect::<Vec<_>>();
+        let active_codex_account_id = (expected_provider_type == ProviderType::CodexOAuth)
+            .then(|| {
+                accounts
+                    .active_codex_oauth_account()
+                    .map(|account| account.id.as_str())
+            })
+            .flatten();
         let (status, selected_account_id, warning) = if let Some(account_id) =
             provider_account_id(stored)
         {
@@ -2403,6 +2493,24 @@ fn prepare_account_binding_migration_preview(
                         expected_provider_type.as_str()
                     )),
                 ),
+                Some(account)
+                    if expected_provider_type == ProviderType::CodexOAuth
+                        && active_codex_account_id != Some(account.id.as_str()) =>
+                {
+                    (
+                        ProviderAccountBindingMigrationStatus::InvalidAccount,
+                        Some(account_id.to_string()),
+                        Some(match active_codex_account_id {
+                            Some(active_account_id) => format!(
+                                "bound Codex OAuth account is not the active account {active_account_id}"
+                            ),
+                            None => {
+                                "select the active Codex OAuth account before migrating Provider bindings"
+                                    .to_string()
+                            }
+                        }),
+                    )
+                }
                 Some(account)
                     if provider_auth_identity_generation(stored).is_some_and(|generation| {
                         generation != account.auth_identity_generation
@@ -2430,6 +2538,33 @@ fn prepare_account_binding_migration_preview(
                     ProviderAccountBindingMigrationStatus::InvalidAccount,
                     Some(account_id.to_string()),
                     Some("bound account no longer exists".to_string()),
+                ),
+            }
+        } else if expected_provider_type == ProviderType::CodexOAuth {
+            match active_codex_account_id {
+                Some(account_id) => (
+                    ProviderAccountBindingMigrationStatus::Bindable,
+                    Some(account_id.to_string()),
+                    (matching_account_ids.len() > 1).then(|| {
+                        "migration uses the explicitly selected active Codex OAuth account"
+                            .to_string()
+                    }),
+                ),
+                None if matching_account_ids.is_empty() => (
+                    ProviderAccountBindingMigrationStatus::MissingAccount,
+                    None,
+                    Some(format!(
+                        "no {} account is available",
+                        expected_provider_type.as_str()
+                    )),
+                ),
+                None => (
+                    ProviderAccountBindingMigrationStatus::Ambiguous,
+                    None,
+                    Some(
+                        "select the active Codex OAuth account before migrating Provider bindings"
+                            .to_string(),
+                    ),
                 ),
             }
         } else {
@@ -2472,7 +2607,7 @@ fn prepare_account_binding_migration_preview(
                 item.status,
                 ProviderAccountBindingMigrationStatus::Bindable
                     | ProviderAccountBindingMigrationStatus::Ambiguous
-            )
+            ) && item.selected_account_id.is_some()
         })
         .count();
     let attention_count = items
@@ -2483,7 +2618,8 @@ fn prepare_account_binding_migration_preview(
                 ProviderAccountBindingMigrationStatus::MissingAccount
                     | ProviderAccountBindingMigrationStatus::InvalidAccount
                     | ProviderAccountBindingMigrationStatus::StaleIdentity
-            )
+            ) || (item.status == ProviderAccountBindingMigrationStatus::Ambiguous
+                && item.selected_account_id.is_none())
         })
         .count();
     let token_input = items
@@ -2514,6 +2650,19 @@ fn prepare_account_binding_migration_preview(
 
 impl ServerStateInner {
     pub fn load(cli: Cli, log_capture: SharedLogCapture) -> anyhow::Result<ServerState> {
+        Self::load_with_cursor_api_key_verifier(
+            cli,
+            log_capture,
+            Arc::new(crate::clients::oauth::cursor::OfficialCursorApiKeyVerifier),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn load_with_cursor_api_key_verifier(
+        cli: Cli,
+        log_capture: SharedLogCapture,
+        cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
+    ) -> anyhow::Result<ServerState> {
         let config_dir = cli.resolved_config_dir()?;
 
         std::fs::create_dir_all(&config_dir)
@@ -2627,6 +2776,11 @@ impl ServerStateInner {
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
+            cursor_api_key_tokens:
+                crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache::default(),
+            cursor_model_catalogs:
+                crate::proxy::cursor::credential_cache::CursorModelCatalogCache::default(),
+            cursor_api_key_verifier,
             account_refresh_locks: AccountRefreshLocks::default(),
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
@@ -3422,6 +3576,65 @@ impl ServerStateInner {
             .collect()
     }
 
+    async fn validate_cursor_api_key_provider_drafts(
+        &self,
+        drafts: &[ProviderWriteDraft],
+    ) -> Result<(), ProviderCommandError> {
+        let mut candidate_store =
+            self.providers
+                .read()
+                .await
+                .materialized_clone()
+                .map_err(|_| {
+                    ProviderCommandError::Invalid(
+                        "could not materialize Provider credentials for validation".to_string(),
+                    )
+                })?;
+        let accounts = self.accounts.read().await.clone();
+        let (candidates, _) =
+            apply_provider_write_drafts(&mut candidate_store, drafts.to_vec(), &accounts, false)?;
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.provider_type == ProviderType::CursorApiKey)
+        {
+            let api_key = [
+                "apiKey",
+                "CURSOR_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "API_KEY",
+            ]
+            .iter()
+            .find_map(|key| provider_setting(&candidate.provider, key))
+            .or_else(|| {
+                provider_account_id(candidate)
+                    .and_then(|account_id| {
+                        accounts.find_for_provider(ProviderType::CursorApiKey, Some(account_id))
+                    })
+                    .and_then(|account| account.api_key.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                ProviderCommandError::Invalid(
+                    "Cursor API-key Provider requires one API key".to_string(),
+                )
+            })?;
+            self.cursor_api_key_verifier
+                .verify(&self.http_client().await, &api_key)
+                .await
+                .map_err(|error| {
+                    ProviderCommandError::Invalid(format!(
+                        "Cursor API-key Provider validation failed: {}",
+                        error.message
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     pub async fn upsert_provider_command(
         self: &Arc<Self>,
         app: AppKind,
@@ -3463,16 +3676,31 @@ impl ServerStateInner {
         self: &Arc<Self>,
         drafts: Vec<ProviderWriteDraft>,
     ) -> anyhow::Result<Result<Vec<StoredProvider>, ProviderCommandError>> {
+        if let Err(error) = self.validate_cursor_api_key_provider_drafts(&drafts).await {
+            return Ok(Err(error));
+        }
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
         let shares = self.shares.read().await.clone();
         self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
             let current = store.clone();
-            let result = apply_provider_write_drafts(store, drafts, &accounts)?;
+            let result = apply_provider_write_drafts(store, drafts, &accounts, false)?;
             if result.1 {
                 validate_ordinary_provider_subscription_change(
                     &current, store, &accounts, &shares,
                 )?;
+            }
+            for provider in &result.0 {
+                if provider.provider_type == ProviderType::CodexOAuth {
+                    let account_id = provider_account_id(provider).ok_or_else(|| {
+                        ProviderCommandError::Conflict {
+                            code: "cc_switch_codex_inactive_account",
+                            message: "Codex OAuth Provider must be bound to the active account"
+                                .to_string(),
+                        }
+                    })?;
+                    validate_codex_provider_active_account(&accounts, account_id)?;
+                }
             }
             Ok(result)
         })
@@ -3499,6 +3727,9 @@ impl ServerStateInner {
         drafts: Vec<ProviderWriteDraft>,
         expected_preview_token: String,
     ) -> anyhow::Result<Result<ProviderImportPreview, ProviderCommandError>> {
+        if let Err(error) = self.validate_cursor_api_key_provider_drafts(&drafts).await {
+            return Ok(Err(error));
+        }
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
         let shares = self.shares.read().await.clone();
@@ -3774,10 +4005,9 @@ impl ServerStateInner {
                 ) {
                     continue;
                 }
-                let account_id = item
-                    .selected_account_id
-                    .as_deref()
-                    .expect("bindable migration item has a selected account");
+                let Some(account_id) = item.selected_account_id.as_deref() else {
+                    continue;
+                };
                 let account = accounts
                     .accounts
                     .iter()
@@ -4418,6 +4648,229 @@ impl ServerStateInner {
         }
         *accounts = candidate;
         Ok(Ok(result))
+    }
+
+    pub(crate) async fn select_active_codex_oauth_account_command(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> anyhow::Result<Result<Account, CodexActiveAccountSelectionError>> {
+        let state = Arc::clone(self);
+        let account_id = account_id.to_string();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = state
+                .select_active_codex_oauth_account_owned(account_id)
+                .await;
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .context("Codex active account coordinator stopped before reporting a result")?
+    }
+
+    async fn select_active_codex_oauth_account_owned(
+        self: &Arc<Self>,
+        account_id: String,
+    ) -> anyhow::Result<Result<Account, CodexActiveAccountSelectionError>> {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return Ok(Err(CodexActiveAccountSelectionError::AccountNotFound(
+                account_id.to_string(),
+            )));
+        }
+
+        let mut codex_account_ids = self
+            .accounts
+            .read()
+            .await
+            .accounts
+            .iter()
+            .filter(|account| account.provider_type == ProviderType::CodexOAuth)
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        codex_account_ids.push(account_id.to_string());
+        codex_account_ids.sort();
+        codex_account_ids.dedup();
+        let mut _refresh_guards = Vec::with_capacity(codex_account_ids.len());
+        for codex_account_id in &codex_account_ids {
+            _refresh_guards.push(
+                self.account_refresh_locks
+                    .lock(ProviderType::CodexOAuth, codex_account_id)
+                    .await,
+            );
+        }
+        let _references = self.reference_mutations.lock().await;
+        let _provider_commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Codex active account selection")?;
+
+        let mut providers = self.providers.write().await;
+        let mut accounts = self.accounts.write().await;
+        let shares = self.shares.read().await;
+        let Some(selected_account) = accounts
+            .accounts
+            .iter()
+            .find(|account| {
+                account.id == account_id && account.provider_type == ProviderType::CodexOAuth
+            })
+            .cloned()
+        else {
+            return Ok(Err(CodexActiveAccountSelectionError::AccountNotFound(
+                account_id.to_string(),
+            )));
+        };
+
+        let shared_provider_keys = shares
+            .shares
+            .iter()
+            .filter(|share| share.status != "deleted")
+            .flat_map(|share| {
+                std::iter::once((share.app, share.provider_id.clone())).chain(
+                    share
+                        .bindings
+                        .iter()
+                        .map(|binding| (binding.app, binding.provider_id.clone())),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let mut share_ids = shares
+            .shares
+            .iter()
+            .filter(|share| share.status != "deleted")
+            .filter(|share| {
+                std::iter::once((share.app, share.provider_id.as_str()))
+                    .chain(
+                        share
+                            .bindings
+                            .iter()
+                            .map(|binding| (binding.app, binding.provider_id.as_str())),
+                    )
+                    .any(|(app, provider_id)| {
+                        providers
+                            .providers
+                            .iter()
+                            .find(|provider| {
+                                provider.app == app && provider.provider.id == provider_id
+                            })
+                            .filter(|provider| provider.provider_type == ProviderType::CodexOAuth)
+                            .is_some_and(|provider| {
+                                provider_account_id(provider) != Some(account_id)
+                            })
+                    })
+            })
+            .map(|share| share.id.clone())
+            .collect::<Vec<_>>();
+        share_ids.sort();
+        share_ids.dedup();
+        if !share_ids.is_empty() {
+            return Ok(Err(CodexActiveAccountSelectionError::ShareConflict {
+                share_ids,
+            }));
+        }
+
+        let mut candidate_accounts = accounts.clone();
+        candidate_accounts
+            .select_active_codex_oauth_account(account_id)
+            .map_err(|_| {
+                anyhow::anyhow!("selected Codex OAuth account disappeared during transaction")
+            })?;
+        let accounts_changed =
+            accounts.active_codex_oauth_account_id.as_deref() != Some(account_id);
+        let mut candidate_providers = providers
+            .materialized_clone()
+            .context("materialize Provider credentials for Codex active account selection")?;
+        let mut providers_changed = false;
+        for provider in &mut candidate_providers.providers {
+            if provider.provider_type != ProviderType::CodexOAuth
+                || shared_provider_keys.contains(&(provider.app, provider.provider.id.clone()))
+            {
+                continue;
+            }
+            let meta = provider
+                .provider
+                .meta
+                .get_or_insert_with(ProviderMeta::default);
+            let binding_changed = meta.auth_binding.as_ref().is_none_or(|binding| {
+                binding.source.as_deref() != Some("account")
+                    || binding.auth_provider.as_deref() != Some("codex_oauth")
+                    || binding.account_id.as_deref() != Some(account_id)
+                    || binding.auth_identity_generation
+                        != Some(selected_account.auth_identity_generation)
+            });
+            if !binding_changed {
+                continue;
+            }
+            meta.auth_binding = Some(AuthBinding {
+                source: Some("account".to_string()),
+                auth_provider: Some("codex_oauth".to_string()),
+                account_id: Some(account_id.to_string()),
+                auth_identity_generation: Some(selected_account.auth_identity_generation),
+            });
+            provider.resource.revision = provider.resource.revision.saturating_add(1);
+            providers_changed = true;
+        }
+
+        if !providers_changed {
+            if accounts_changed {
+                if let Err(error) = candidate_accounts.save(&self.config_dir) {
+                    let disk_matches = AccountStore::load_or_default(&self.config_dir)
+                        .ok()
+                        .and_then(|store| serde_json::to_value(store).ok())
+                        .zip(serde_json::to_value(&candidate_accounts).ok())
+                        .is_some_and(|(disk, expected)| disk == expected);
+                    if !disk_matches {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        %error,
+                        "Codex active account selection reached the commit point despite a persistence error; reconciled live state"
+                    );
+                }
+                *accounts = candidate_accounts;
+            }
+            return Ok(Ok(selected_account));
+        }
+
+        let candidate_shares = shares.clone();
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+            &providers,
+            &accounts,
+            &shares,
+            &candidate_providers,
+            &candidate_accounts,
+            &candidate_shares,
+        )
+        .map_err(anyhow::Error::new)?;
+        candidate_providers.validate_for_commit()?;
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .context("compile Provider runtime index for Codex active account selection")?;
+        candidate_providers
+            .seal_for_commit(&self.config_dir)
+            .context("seal Provider credentials for Codex active account selection")?;
+        candidate_providers
+            .rebuild_runtime_index(&candidate_accounts)
+            .context("compile sealed Provider runtime index for Codex active account selection")?;
+
+        prepare_codex_workspace_rebind_transaction(
+            &self.config_dir,
+            &accounts,
+            &providers,
+            &shares,
+            &candidate_accounts,
+            &candidate_providers,
+            &candidate_shares,
+        )?;
+        if let Err(error) = apply_codex_workspace_rebind_transaction(&self.config_dir) {
+            tracing::error!(
+                %error,
+                marker = %codex_workspace_rebind_transaction_path(&self.config_dir).display(),
+                "Codex active account selection is committed but its file application remains pending"
+            );
+        }
+        *providers = candidate_providers;
+        *accounts = candidate_accounts;
+        Ok(Ok(selected_account))
     }
 
     pub(crate) async fn select_codex_workspace_command(
@@ -5314,9 +5767,19 @@ impl ServerStateInner {
         let now = crate::infra::time::now_ms() as i64;
         let account = {
             let accounts = self.accounts.read().await;
-            accounts
-                .find_for_provider(provider_type, account_id)
-                .cloned()
+            if provider_type == ProviderType::CodexOAuth {
+                let active = accounts.active_codex_oauth_account();
+                if account_id
+                    .is_some_and(|account_id| active.is_none_or(|active| active.id != account_id))
+                {
+                    return Err(ManagedAccountRefreshError::InactiveCodexAccount);
+                }
+                active.cloned()
+            } else {
+                accounts
+                    .find_for_provider(provider_type, account_id)
+                    .cloned()
+            }
         };
         let Some(account) = account else {
             return Ok(());
@@ -5333,9 +5796,17 @@ impl ServerStateInner {
 
         let account = {
             let accounts = self.accounts.read().await;
-            accounts
-                .find_for_provider(provider_type, account_id)
-                .cloned()
+            if provider_type == ProviderType::CodexOAuth {
+                let active = accounts.active_codex_oauth_account();
+                if active.is_none_or(|active| active.id != account.id) {
+                    return Err(ManagedAccountRefreshError::InactiveCodexAccount);
+                }
+                active.cloned()
+            } else {
+                accounts
+                    .find_for_provider(provider_type, account_id)
+                    .cloned()
+            }
         }
         .ok_or(ManagedAccountRefreshError::NotFound)?;
         if force && account.access_token != access_token_before_lock {
@@ -5343,6 +5814,9 @@ impl ServerStateInner {
         }
         if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
+        }
+        if self.credential_persistence_degraded() {
+            return Err(ManagedAccountRefreshError::CredentialPersistenceDegraded);
         }
 
         let http_client = self.http_client().await;
@@ -5955,6 +6429,22 @@ impl ServerStateInner {
         share_id: &str,
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
+        if patch.managed_grant.is_some() {
+            return Ok(Err(
+                crate::domain::sharing::shares::SharePatchError::Invalid(
+                    "managed grant operations are reserved for Router Share Market".to_string(),
+                ),
+            ));
+        }
+        self.apply_router_share_settings_patch_immediate(share_id, patch)
+            .await
+    }
+
+    pub(crate) async fn apply_router_share_settings_patch_immediate(
+        &self,
+        share_id: &str,
+        patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
+    ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
         self.try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
             shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
         })
@@ -5983,6 +6473,28 @@ impl ServerStateInner {
         let usage = self.usage.read().await.clone();
         self.mutate_shares_debounced(|shares| {
             shares.record_user_invocation_result(share_id, user_email, tokens, recorded_at_ms);
+            if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
+            {
+                tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
+            }
+        })
+        .await;
+    }
+
+    pub async fn record_share_supplemental_usage(
+        self: &Arc<Self>,
+        share_id: &str,
+        user_email: Option<&str>,
+        tokens: u64,
+        recorded_at_ms: i64,
+    ) {
+        if tokens == 0 {
+            return;
+        }
+        let _quota_mutation = self.share_quota_mutations.lock().await;
+        let usage = self.usage.read().await.clone();
+        self.mutate_shares_debounced(|shares| {
+            shares.record_user_supplemental_usage(share_id, user_email, tokens, recorded_at_ms);
             if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
             {
                 tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
@@ -6888,17 +7400,38 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
 }
 
 async fn refresh_due_native_account_tokens(state: &ServerState) {
+    if state.credential_persistence_degraded() {
+        return;
+    }
     let now = crate::infra::time::now_ms() as i64;
-    let accounts = state.accounts.read().await.accounts.clone();
-    for account in accounts
-        .into_iter()
-        .filter(|account| account_needs_native_refresh(account, now))
-    {
+    let accounts = state.accounts.read().await;
+    let candidates = due_native_refresh_candidates(&accounts, now);
+    drop(accounts);
+    for account in candidates {
         refresh_one_native_account_token(state, account, now).await;
     }
 }
 
+fn due_native_refresh_candidates(accounts: &AccountStore, now: i64) -> Vec<Account> {
+    let active_codex_account_id = accounts
+        .active_codex_oauth_account()
+        .map(|account| account.id.as_str());
+    accounts
+        .accounts
+        .iter()
+        .filter(|account| account_needs_native_refresh(account, now))
+        .filter(|account| {
+            account.provider_type != ProviderType::CodexOAuth
+                || active_codex_account_id == Some(account.id.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 async fn refresh_one_native_account_token(state: &ServerState, account: Account, now: i64) {
+    if state.credential_persistence_degraded() {
+        return;
+    }
     let Some(_guard) = state
         .account_refresh_locks
         .try_lock(account.provider_type, &account.id)
@@ -6909,11 +7442,17 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
         let accounts = state.accounts.read().await;
         accounts
             .find_for_provider(account.provider_type, Some(&account.id))
+            .filter(|account| {
+                account.provider_type != ProviderType::CodexOAuth
+                    || accounts
+                        .active_codex_oauth_account()
+                        .is_some_and(|active| active.id == account.id)
+            })
             .cloned()
     }) else {
         return;
     };
-    if !account_needs_native_refresh(&account, now) {
+    if state.credential_persistence_degraded() || !account_needs_native_refresh(&account, now) {
         return;
     }
 
@@ -7060,10 +7599,18 @@ fn managed_account_refresh_public_message(
 async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
     let now = crate::infra::time::now_ms() as i64;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-    let accounts = state.accounts.read().await.accounts.clone();
+    let accounts = state.accounts_snapshot().await;
+    let active_codex_account_id = accounts
+        .active_codex_oauth_account()
+        .map(|account| account.id.clone());
     let next_due = accounts
+        .accounts
         .iter()
         .filter(|account| account_quota_refresh_candidate(account))
+        .filter(|account| {
+            account.provider_type != ProviderType::CodexOAuth
+                || active_codex_account_id.as_deref() == Some(account.id.as_str())
+        })
         .filter_map(|account| account.quota_next_refresh_at)
         .min();
     let delay_ms = next_due
@@ -7108,10 +7655,18 @@ fn emit_oauth_quota_updated(state: &ServerState, account: &Account, success: boo
 
 async fn refresh_due_account_quotas(state: &ServerState) {
     let now = crate::infra::time::now_ms() as i64;
-    let accounts = state.accounts.read().await.accounts.clone();
+    let accounts = state.accounts_snapshot().await;
+    let active_codex_account_id = accounts
+        .active_codex_oauth_account()
+        .map(|account| account.id.clone());
     for account in accounts
+        .accounts
         .into_iter()
         .filter(|account| account_quota_refresh_due(account, now))
+        .filter(|account| {
+            account.provider_type != ProviderType::CodexOAuth
+                || active_codex_account_id.as_deref() == Some(account.id.as_str())
+        })
     {
         refresh_one_account_quota(state, account, now).await;
     }
@@ -7133,6 +7688,18 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     };
     if account.provider_type != locked_provider_type || !account_quota_refresh_due(&account, now) {
         return;
+    }
+    if state.credential_persistence_degraded() {
+        return;
+    }
+    if account.provider_type == ProviderType::CodexOAuth {
+        let accounts = state.accounts_snapshot().await;
+        if accounts
+            .active_codex_oauth_account()
+            .is_none_or(|active| active.id != account.id)
+        {
+            return;
+        }
     }
     let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
     let account_before_refresh = account.clone();
@@ -7188,6 +7755,9 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         }
     }
 
+    if state.credential_persistence_degraded() {
+        return;
+    }
     let http_client = state.http_client().await;
     let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
     match refresh_account_quota(
@@ -7802,17 +8372,6 @@ async fn apply_and_ack_share_edit(
         Err(error) => {
             summary.rejected += 1;
             let message = error.to_string();
-            mark_share_edit_market_grant(
-                state,
-                &edit.share_id,
-                ShareMarketGrantStatus {
-                    status: "error".to_string(),
-                    grant_id: Some(edit.id.clone()),
-                    last_error: Some(message.clone()),
-                    updated_at_ms: Some(crate::infra::time::now_ms()),
-                },
-            )
-            .await;
             ("rejected".to_string(), Some(message))
         }
     };
@@ -7838,45 +8397,22 @@ async fn apply_and_ack_share_edit(
 }
 
 async fn apply_share_edit_locally(state: &ServerState, edit: &ShareEditView) -> anyhow::Result<()> {
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    state
-        .apply_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())
-        .await??;
-    let usage = state.usage.read().await.clone();
+    if edit.patch.managed_grant.is_some() {
+        state
+            .apply_router_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())
+            .await??;
+    } else {
+        state
+            .apply_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())
+            .await??;
+    }
     state
         .mutate_shares_immediate(|shares| {
-            shares.update_market_grant(
-                &edit.share_id,
-                Some(ShareMarketGrantStatus {
-                    status: "applied".to_string(),
-                    grant_id: Some(edit.id.clone()),
-                    last_error: None,
-                    updated_at_ms: Some(crate::infra::time::now_ms()),
-                }),
-            );
-            shares.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
             shares.router_registered = true;
             shares.last_router_error = None;
         })
         .await?;
     Ok(())
-}
-
-async fn mark_share_edit_market_grant(
-    state: &ServerState,
-    share_id: &str,
-    market_grant: ShareMarketGrantStatus,
-) {
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    {
-        let mut shares = state.shares.write().await;
-        shares.update_market_grant(share_id, Some(market_grant));
-        shares.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
-    }
-    save_shares_debounced(state);
 }
 
 async fn record_share_edit_sync_error(state: &ServerState, message: String) {
@@ -9027,7 +9563,6 @@ mod tests {
             expires_at: None,
             for_sale: None,
             free_access: None,
-            sale_market_kind: None,
             access_by_app: BTreeMap::new(),
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -9036,7 +9571,6 @@ mod tests {
             description: None,
             bindings: Vec::new(),
             runtime_snapshot: None,
-            market_grant: None,
             user_grants: BTreeMap::new(),
         }
     }
@@ -9414,7 +9948,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: std::collections::BTreeMap::new(),
                 app_settings: std::collections::BTreeMap::new(),
                 for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
@@ -9423,7 +9956,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -9830,7 +10362,6 @@ mod tests {
                 expires_at: None,
                 for_sale: None,
                 free_access: None,
-                sale_market_kind: None,
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
@@ -9839,7 +10370,6 @@ mod tests {
                 description: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
-                market_grant: None,
                 user_grants: BTreeMap::new(),
             })
             .unwrap();
@@ -12310,6 +12840,418 @@ mod tests {
         fs::remove_dir_all(config_dir).unwrap();
     }
 
+    fn active_codex_test_account(
+        account_id: &str,
+        workspace_id: &str,
+    ) -> crate::domain::accounts::store::UpsertAccountInput {
+        serde_json::from_value(json!({
+            "id": account_id,
+            "providerType": "codex_oauth",
+            "accessToken": format!("{account_id}-token"),
+            "tokenType": "Bearer",
+            "profile": {
+                "verifiedOpenAiClaims": {
+                    "subject": format!("{account_id}-subject"),
+                    "chatgpt_account_id": workspace_id
+                },
+                "codexWorkspaceProvenance": {
+                    "workspaceId": workspace_id,
+                    "source": "test_fixture"
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    fn active_codex_test_provider(provider_id: &str, account_id: &str) -> Provider {
+        Provider {
+            id: provider_id.to_string(),
+            name: provider_id.to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("account".to_string()),
+                    auth_provider: Some("codex_oauth".to_string()),
+                    account_id: Some(account_id.to_string()),
+                    auth_identity_generation: Some(1),
+                }),
+                ..ProviderMeta::default()
+            }),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_write_rejects_codex_oauth_binding_until_account_is_selected() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account(
+                    "provider-selection-a",
+                    "workspace-a",
+                ));
+                accounts.upsert(active_codex_test_account(
+                    "provider-selection-b",
+                    "workspace-b",
+                ));
+            })
+            .await
+            .unwrap();
+
+        let error = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                active_codex_test_provider("provider-selection-required", "provider-selection-a"),
+                Some(ProfileId::parse("codex.openai_oauth").unwrap()),
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_codex_inactive_account",
+                ref message,
+            } if message.contains("until an active account is selected")
+        ));
+        assert!(state.providers_snapshot().await.providers.is_empty());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_write_rejects_inactive_codex_oauth_binding() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account(
+                    "provider-active-account",
+                    "workspace-active",
+                ));
+                accounts.upsert(active_codex_test_account(
+                    "provider-inactive-account",
+                    "workspace-inactive",
+                ));
+                accounts
+                    .select_active_codex_oauth_account("provider-active-account")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+
+        let error = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                active_codex_test_provider(
+                    "provider-inactive-binding",
+                    "provider-inactive-account",
+                ),
+                Some(ProfileId::parse("codex.openai_oauth").unwrap()),
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_codex_inactive_account",
+                ref message,
+            } if message.contains("provider-active-account")
+                && message.contains("provider-inactive-account")
+        ));
+        assert!(state.providers_snapshot().await.providers.is_empty());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatibility_provider_write_rejects_inactive_codex_oauth_binding() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account(
+                    "compatibility-active-account",
+                    "workspace-active",
+                ));
+                accounts.upsert(active_codex_test_account(
+                    "compatibility-inactive-account",
+                    "workspace-inactive",
+                ));
+                accounts
+                    .select_active_codex_oauth_account("compatibility-active-account")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+
+        let error = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                active_codex_test_provider(
+                    "compatibility-inactive-binding",
+                    "compatibility-inactive-account",
+                ),
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_codex_inactive_account",
+                ref message,
+            } if message.contains("compatibility-active-account")
+                && message.contains("compatibility-inactive-account")
+        ));
+        assert!(state.providers_snapshot().await.providers.is_empty());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatibility_provider_write_requires_codex_oauth_binding() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account(
+                    "compatibility-required-account",
+                    "workspace-active",
+                ));
+            })
+            .await
+            .unwrap();
+        let mut provider = active_codex_test_provider(
+            "compatibility-missing-binding",
+            "compatibility-required-account",
+        );
+        provider.meta.as_mut().unwrap().auth_binding = None;
+
+        let error = state
+            .upsert_provider_command(AppKind::Codex, provider, None, None, None, BTreeMap::new())
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_codex_inactive_account",
+                ref message,
+            } if message.contains("must be bound to the active account")
+        ));
+        assert!(state.providers_snapshot().await.providers.is_empty());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn codex_account_binding_migration_requires_the_active_account() {
+        let mut accounts = AccountStore::default();
+        accounts.upsert(active_codex_test_account(
+            "migration-account-a",
+            "migration-workspace-a",
+        ));
+        accounts.upsert(active_codex_test_account(
+            "migration-account-b",
+            "migration-workspace-b",
+        ));
+        let mut provider = active_codex_test_provider("migration-provider", "migration-account-a");
+        provider.meta.as_mut().unwrap().auth_binding = None;
+        let mut providers = ProviderStore::default();
+        providers.upsert(AppKind::Codex, provider);
+
+        let unresolved =
+            prepare_account_binding_migration_preview(&providers, &accounts, &[7; 32]).unwrap();
+        assert_eq!(unresolved.bindable_count, 0);
+        assert_eq!(unresolved.attention_count, 1);
+        assert_eq!(
+            unresolved.items[0].status,
+            ProviderAccountBindingMigrationStatus::Ambiguous
+        );
+        assert!(unresolved.items[0].selected_account_id.is_none());
+
+        accounts
+            .select_active_codex_oauth_account("migration-account-b")
+            .unwrap();
+        let selected =
+            prepare_account_binding_migration_preview(&providers, &accounts, &[7; 32]).unwrap();
+        assert_eq!(selected.bindable_count, 1);
+        assert_eq!(selected.attention_count, 0);
+        assert_eq!(
+            selected.items[0].selected_account_id.as_deref(),
+            Some("migration-account-b")
+        );
+
+        providers.providers[0]
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some("codex_oauth".to_string()),
+            account_id: Some("migration-account-a".to_string()),
+            auth_identity_generation: None,
+        });
+        let inactive =
+            prepare_account_binding_migration_preview(&providers, &accounts, &[7; 32]).unwrap();
+        assert_eq!(inactive.bindable_count, 0);
+        assert_eq!(inactive.attention_count, 1);
+        assert_eq!(
+            inactive.items[0].status,
+            ProviderAccountBindingMigrationStatus::InvalidAccount
+        );
+        assert_eq!(
+            inactive.items[0].selected_account_id.as_deref(),
+            Some("migration-account-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_codex_account_selection_rebinds_unshared_providers_atomically() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account("codex-a", "workspace-a"));
+                accounts.upsert(active_codex_test_account("codex-b", "workspace-b"));
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    active_codex_test_provider("codex-provider-a", "codex-a"),
+                );
+                providers.upsert(
+                    AppKind::Codex,
+                    active_codex_test_provider("codex-provider-b", "codex-a"),
+                );
+            })
+            .await
+            .unwrap();
+
+        let selected = state
+            .select_active_codex_oauth_account_command("codex-b")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.id, "codex-b");
+        let accounts = state.accounts_snapshot().await;
+        assert_eq!(
+            accounts.active_codex_oauth_account_id.as_deref(),
+            Some("codex-b")
+        );
+        let providers = state.providers_snapshot().await;
+        assert!(providers.providers.iter().all(|provider| {
+            provider.provider_type != ProviderType::CodexOAuth
+                || provider_account_id(provider) == Some("codex-b")
+        }));
+
+        let persisted_accounts = AccountStore::load_or_default(&config_dir).unwrap();
+        assert_eq!(
+            persisted_accounts.active_codex_oauth_account_id.as_deref(),
+            Some("codex-b")
+        );
+        let persisted_providers = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
+        assert!(persisted_providers.providers.iter().all(|provider| {
+            provider.provider_type != ProviderType::CodexOAuth
+                || provider_account_id(provider) == Some("codex-b")
+        }));
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_codex_account_selection_rejects_share_locked_provider() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account("shared-codex-a", "workspace-a"));
+                accounts.upsert(active_codex_test_account("shared-codex-b", "workspace-b"));
+                accounts
+                    .select_active_codex_oauth_account("shared-codex-a")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    active_codex_test_provider("shared-codex-provider", "shared-codex-a"),
+                )
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_shares_immediate(|shares| {
+                let mut input =
+                    router_sync_share_input("active-account-share", "shared-codex-provider");
+                input.provider_type = ProviderType::CodexOAuth;
+                shares.upsert(input).unwrap();
+            })
+            .await
+            .unwrap();
+        let providers_before = serde_json::to_value(state.providers_snapshot().await).unwrap();
+        let accounts_before = fs::read(accounts_path(&config_dir)).unwrap();
+        let providers_file_before = fs::read(providers_path(&config_dir)).unwrap();
+
+        let error = state
+            .select_active_codex_oauth_account_command("shared-codex-b")
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "cc_switch_codex_active_account_share_conflict"
+        );
+        assert!(matches!(
+            error,
+            CodexActiveAccountSelectionError::ShareConflict { ref share_ids }
+                if share_ids == &["active-account-share"]
+        ));
+        assert_eq!(
+            state
+                .accounts_snapshot()
+                .await
+                .active_codex_oauth_account_id
+                .as_deref(),
+            Some("shared-codex-a")
+        );
+        assert_eq!(
+            serde_json::to_value(state.providers_snapshot().await).unwrap(),
+            providers_before
+        );
+        assert_eq!(
+            fs::read(accounts_path(&config_dir)).unwrap(),
+            accounts_before
+        );
+        assert_eq!(
+            fs::read(providers_path(&config_dir)).unwrap(),
+            providers_file_before
+        );
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn accepted_codex_workspace_rebind_survives_caller_cancellation() {
         let state = test_state();
@@ -13602,6 +14544,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn warm_refresh_candidates_include_only_the_active_codex_account() {
+        let mut accounts = AccountStore::default();
+        accounts.upsert(refresh_test_account_input(
+            "warm-codex-a",
+            ProviderType::CodexOAuth,
+            Some("a@example.com"),
+            "access-a",
+            "refresh-a",
+            1,
+        ));
+        accounts.upsert(refresh_test_account_input(
+            "warm-codex-b",
+            ProviderType::CodexOAuth,
+            Some("b@example.com"),
+            "access-b",
+            "refresh-b",
+            1,
+        ));
+
+        assert!(due_native_refresh_candidates(&accounts, 1_000_000).is_empty());
+
+        accounts
+            .select_active_codex_oauth_account("warm-codex-b")
+            .unwrap();
+        let candidate_ids = due_native_refresh_candidates(&accounts, 1_000_000)
+            .into_iter()
+            .map(|account| account.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidate_ids, vec!["warm-codex-b"]);
+    }
+
     #[tokio::test]
     async fn inference_token_update_preserves_concurrent_config_changes() {
         let state = test_state();
@@ -14066,7 +15041,6 @@ mod tests {
             created_at_ms: 0,
             for_sale: false,
             free_access: false,
-            sale_market_kind: "token".to_string(),
             access_by_app: std::collections::BTreeMap::new(),
             app_settings: std::collections::BTreeMap::new(),
             for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
@@ -14076,7 +15050,6 @@ mod tests {
             bindings: Vec::new(),
             binding_history: Vec::new(),
             runtime_snapshot: None,
-            market_grant: None,
             last_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
