@@ -5921,6 +5921,24 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["profiles"].as_array().unwrap().len(),
         38
     );
+    let profiles = registry["registry"]["profiles"].as_array().unwrap();
+    let official = profiles
+        .iter()
+        .find(|profile| profile["profileId"] == "codex.openai_api_key")
+        .unwrap();
+    assert_eq!(official["modelPolicy"], "passthrough");
+    assert!(official.get("allowedModelPolicies").is_none());
+    assert!(official.get("defaultUpstreamModel").is_none());
+    let configurable = profiles
+        .iter()
+        .find(|profile| profile["profileId"] == "codex.openrouter")
+        .unwrap();
+    assert_eq!(configurable["modelPolicy"], "single");
+    assert_eq!(
+        configurable["allowedModelPolicies"],
+        json!(["single", "passthrough"])
+    );
+    assert_eq!(configurable["defaultUpstreamModel"], "gpt-5.4");
 
     let presets = app
         .clone()

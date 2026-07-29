@@ -55,6 +55,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import type {
   ProviderCredentialPatch,
@@ -71,10 +72,12 @@ import { isValidUserAgentHeader } from "@/lib/userAgent";
 import {
   customPolicyForProfile,
   driverForProfile,
+  modelPoliciesForProfile,
   providerRegistry,
   profileById,
   type CoreProviderApp,
   type ProviderAuthScheme,
+  type ProviderModelPolicy,
   type ProviderRegistryProfile,
   type ProviderUpstreamProtocol,
 } from "@/server/providerRegistry";
@@ -87,6 +90,7 @@ import {
   ensureObject,
   providerPresetForProfile,
   readEndpoint,
+  readModelPolicy,
   readUpstreamModel,
   setEndpoint,
   setPassthroughModel,
@@ -119,6 +123,7 @@ interface EditorState {
   profileId: string;
   draft: CoreProviderDraft;
   endpoint: string;
+  modelPolicy: ProviderModelPolicy;
   upstreamModel: string;
   accountId: string;
   awsRegion: string;
@@ -449,9 +454,9 @@ function buildEditorState(
     profileId: profile.profileId,
     draft,
     endpoint: readEndpoint(draft.settingsConfig, app),
+    modelPolicy: readModelPolicy(draft.settingsConfig, profile),
     upstreamModel:
-      readUpstreamModel(draft.settingsConfig) ??
-      defaultSingleModel(profile.profileId),
+      readUpstreamModel(draft.settingsConfig) ?? defaultSingleModel(profile),
     accountId: draft.meta.authBinding?.accountId ?? "",
     awsRegion,
     customBinding,
@@ -606,7 +611,7 @@ function prepareSettingsForSubmit(
   if (profile.formComposition === "aws") {
     ensureObject(settings, "env").AWS_REGION = state.awsRegion.trim();
   }
-  if (profile.modelPolicy === "single") {
+  if (state.modelPolicy === "single") {
     setSingleModel(settings, app, state.upstreamModel);
   } else {
     setPassthroughModel(settings);
@@ -641,7 +646,10 @@ function validateState(
   ) {
     return t("serverProviderForm.validation.endpointInvalid");
   }
-  if (profile.modelPolicy === "single" && !state.upstreamModel.trim()) {
+  if (
+    !modelPoliciesForProfile(profile).includes(state.modelPolicy) ||
+    (state.modelPolicy === "single" && !state.upstreamModel.trim())
+  ) {
     return t("serverProviderForm.validation.modelRequired");
   }
   if (profile.formComposition === "aws" && !state.awsRegion.trim()) {
@@ -1566,6 +1574,7 @@ export function ServerProviderForm({
       profile.endpointPolicy === "override_allowed");
   const showCodexOptions =
     driverForProfile(profile)?.driverId === "oauth.openai_codex";
+  const allowedModelPolicies = modelPoliciesForProfile(profile);
 
   return (
     <form
@@ -2125,32 +2134,72 @@ export function ServerProviderForm({
       ) : null}
 
       <Section title={t("serverProviderForm.model.title")}>
-        {profile.modelPolicy === "single" ? (
-          <div className="space-y-2">
-            <Label htmlFor="server-provider-model">
-              {t("serverProviderForm.model.upstreamModel")}
-            </Label>
-            <Input
-              id="server-provider-model"
-              value={state.upstreamModel}
-              onChange={(event) =>
+        <div className="space-y-3">
+          {allowedModelPolicies.length > 1 ? (
+            <Tabs
+              value={state.modelPolicy}
+              onValueChange={(value) => {
+                if (value !== "single" && value !== "passthrough") return;
+                if (!allowedModelPolicies.includes(value)) return;
                 setState((current) => ({
                   ...current,
-                  upstreamModel: event.target.value,
-                }))
-              }
-            />
-          </div>
-        ) : (
-          <div className="flex items-center gap-2 text-sm">
+                  modelPolicy: value,
+                  upstreamModel:
+                    value === "single" && !current.upstreamModel.trim()
+                      ? defaultSingleModel(profile)
+                      : current.upstreamModel,
+                }));
+              }}
+            >
+              <TabsList className="w-full justify-start sm:w-auto">
+                <TabsTrigger
+                  value="single"
+                  className="min-w-0 flex-1 sm:min-w-[10rem]"
+                >
+                  {t("serverProviderForm.model.single")}
+                </TabsTrigger>
+                <TabsTrigger
+                  value="passthrough"
+                  className="min-w-0 flex-1 sm:min-w-[10rem]"
+                >
+                  {t("serverProviderForm.model.passthrough")}
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+          ) : (
             <Badge variant="secondary">
               {t("serverProviderForm.model.passthrough")}
             </Badge>
-            <span className="text-muted-foreground">
-              {t("serverProviderForm.model.passthroughHint")}
-            </span>
-          </div>
-        )}
+          )}
+
+          {state.modelPolicy === "single" ? (
+            <div className="space-y-2">
+              <Label htmlFor="server-provider-model">
+                {t("serverProviderForm.model.upstreamModel")}
+              </Label>
+              <Input
+                id="server-provider-model"
+                value={state.upstreamModel}
+                onChange={(event) =>
+                  setState((current) => ({
+                    ...current,
+                    upstreamModel: event.target.value,
+                  }))
+                }
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("serverProviderForm.model.singleHint")}
+              </p>
+            </div>
+          ) : (
+            <div className="flex items-start gap-2 text-sm text-muted-foreground">
+              {allowedModelPolicies.length > 1 ? (
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+              ) : null}
+              <span>{t("serverProviderForm.model.passthroughHint")}</span>
+            </div>
+          )}
+        </div>
       </Section>
 
       {profile.formComposition === "custom" ? (

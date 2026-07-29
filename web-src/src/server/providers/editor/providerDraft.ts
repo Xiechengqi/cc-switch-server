@@ -20,7 +20,9 @@ import {
 import {
   driverForProfile,
   legacyPresetNameForProfile,
+  modelPoliciesForProfile,
   type CoreProviderApp,
+  type ProviderModelPolicy,
   type ProviderRegistryProfile,
   type ProviderUpstreamProtocol,
 } from "@/server/providerRegistry";
@@ -35,38 +37,6 @@ export interface CoreProviderDraft {
   icon?: string;
   iconColor?: string;
 }
-
-const DEFAULT_SINGLE_MODELS: Record<string, string> = {
-  "claude.openai_oauth": "gpt-5.6-sol",
-  "claude.grok_oauth": "grok-4.5",
-  "codex.grok_oauth": "grok-4.5",
-  "gemini.grok_oauth": "grok-4.5",
-  "claude.kiro_oauth": "claude-sonnet-4-8",
-  "claude.ollama_cloud": "kimi-k2.7-code",
-  "codex.ollama_cloud": "kimi-k2.7-code",
-  "claude.cursor_oauth": "composer-2.5",
-  "claude.cursor_api_key": "composer-2.5",
-  "claude.antigravity_oauth": "claude-sonnet-4-6",
-  "claude.antigravity_cli": "claude-sonnet-4-6",
-  "claude.github_copilot": "claude-sonnet-5",
-  "claude.deepseek_account": "deepseek-v4-flash",
-  "claude.deepseek_api": "deepseek-v4-flash",
-  "codex.deepseek_api": "deepseek-v4-flash",
-  "claude.aws_bedrock_aksk": "global.anthropic.claude-opus-4-8",
-  "claude.aws_bedrock_api_key": "global.anthropic.claude-opus-4-8",
-  "claude.openrouter": "anthropic/claude-sonnet-4.6",
-  "claude.nvidia": "moonshotai/kimi-k2.5",
-  "codex.nvidia": "moonshotai/kimi-k2.5",
-  "codex.cursor_api_key": "gpt-5.5",
-  "codex.cursor_oauth": "gpt-5.5",
-  "codex.openrouter": "gpt-5.4",
-  "gemini.antigravity_oauth": "gemini-3.5-flash-medium",
-  "gemini.antigravity_cli": "gemini-3.5-flash-medium",
-  "gemini.openrouter": "gemini-3.5-flash",
-  "claude.custom_http": "claude-sonnet-4-6",
-  "codex.custom_http": "gpt-5.4",
-  "gemini.custom_http": "gemini-3.5-flash",
-};
 
 const ENDPOINT_ENV_KEYS: Record<CoreProviderApp, string> = {
   claude: "ANTHROPIC_BASE_URL",
@@ -227,9 +197,7 @@ export function createDraftForProfile(
     settingsConfig.modelMapping = { mode: "passthrough" };
   } else {
     const upstreamModel =
-      readUpstreamModel(settingsConfig) ??
-      DEFAULT_SINGLE_MODELS[profile.profileId] ??
-      "";
+      profile.defaultUpstreamModel ?? readUpstreamModel(settingsConfig) ?? "";
     settingsConfig.modelMapping = { mode: "single", upstreamModel };
     setSingleModel(settingsConfig, profile.app, upstreamModel);
   }
@@ -332,8 +300,26 @@ export function setPassthroughModel(settings: Record<string, unknown>): void {
   settings.modelMapping = { mode: "passthrough" };
 }
 
-export function defaultSingleModel(profileId: string): string {
-  return DEFAULT_SINGLE_MODELS[profileId] ?? "";
+export function readModelPolicy(
+  settings: Record<string, unknown>,
+  profile: ProviderRegistryProfile,
+): ProviderModelPolicy {
+  const mapping = settings.modelMapping;
+  const mode =
+    mapping && typeof mapping === "object" && !Array.isArray(mapping)
+      ? (mapping as Record<string, unknown>).mode
+      : undefined;
+  if (
+    (mode === "single" || mode === "passthrough") &&
+    modelPoliciesForProfile(profile).includes(mode)
+  ) {
+    return mode;
+  }
+  return profile.modelPolicy;
+}
+
+export function defaultSingleModel(profile: ProviderRegistryProfile): string {
+  return profile.defaultUpstreamModel ?? "";
 }
 
 export function endpointEnvironmentKey(app: CoreProviderApp): string {

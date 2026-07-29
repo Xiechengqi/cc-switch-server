@@ -11,6 +11,7 @@ use crate::domain::accounts::store::{
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::runtime::ProviderRuntimePlan;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
@@ -1206,6 +1207,8 @@ fn share_created_at_rfc3339(share: &Share) -> String {
 
 fn provider_models(provider: &StoredProvider) -> Vec<ShareUpstreamModel> {
     let settings = &provider.provider.settings_config;
+    let passthrough = policy_from_settings(settings)
+        .is_some_and(|policy| policy.mode == ModelRoutingMode::Passthrough);
     if let Some(model) = single_upstream_model_from_settings(settings) {
         return vec![ShareUpstreamModel {
             slot: "model".to_string(),
@@ -1213,7 +1216,7 @@ fn provider_models(provider: &StoredProvider) -> Vec<ShareUpstreamModel> {
         }];
     }
 
-    if provider.app == AppKind::Codex {
+    if provider.app == AppKind::Codex && !passthrough {
         if let Some(model) = codex_model_from_settings(settings) {
             return vec![ShareUpstreamModel {
                 slot: "model".to_string(),
@@ -1964,6 +1967,57 @@ mod tests {
         assert_eq!(provider.models[0].actual_model, "moonshotai/kimi-k2.5");
         assert_eq!(runtime.models.len(), 1);
         assert_eq!(runtime.models[0].actual_model, "moonshotai/kimi-k2.5");
+    }
+
+    #[test]
+    fn descriptor_does_not_project_codex_config_model_as_fixed_in_passthrough_mode() {
+        let share = test_share(ProviderType::OpenRouter, None);
+        let providers = ProviderStore {
+            providers: vec![StoredProvider {
+                app: AppKind::Codex,
+                provider: Provider {
+                    id: "p1".to_string(),
+                    name: "OpenRouter".to_string(),
+                    settings_config: json!({
+                        "config": "model_provider = \"custom\"\nmodel = \"stale-fixed-model\"\n\n[model_providers.custom]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+                        "modelMapping": {"mode": "passthrough"},
+                        "models": ["gpt-5.4", {"id": "gpt-5.5"}]
+                    }),
+                    category: None,
+                    meta: None,
+                    extra: Default::default(),
+                },
+                provider_type: ProviderType::OpenRouter,
+                provider_type_id: ProviderType::OpenRouter.as_str().to_string(),
+                resource: Default::default(),
+            }],
+            ..Default::default()
+        };
+
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        let provider = descriptor.app_providers.codex.first().unwrap();
+        let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
+
+        assert_eq!(provider.models.len(), 2);
+        assert!(provider
+            .models
+            .iter()
+            .all(|model| model.slot == "available"));
+        assert!(provider
+            .models
+            .iter()
+            .all(|model| model.actual_model != "stale-fixed-model"));
+        let runtime_models = runtime
+            .models
+            .iter()
+            .map(|model| (&model.slot, &model.actual_model))
+            .collect::<Vec<_>>();
+        let provider_models = provider
+            .models
+            .iter()
+            .map(|model| (&model.slot, &model.actual_model))
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_models, provider_models);
     }
 
     fn test_provider(provider_type: ProviderType) -> StoredProvider {

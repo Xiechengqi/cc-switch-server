@@ -1368,11 +1368,6 @@ fn apply_provider_write_drafts(
         )
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
         provider.extra.remove("sortIndex");
-        crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
-            draft.app,
-            &mut provider,
-        )
-        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
         let mut resource = resolve_provider_resource_metadata(
             draft.app,
             draft.profile_id,
@@ -1380,6 +1375,16 @@ fn apply_provider_write_drafts(
             draft.client_request_id,
             existing.as_ref(),
         )?;
+        let profile = resource
+            .profile_id
+            .as_ref()
+            .and_then(|profile_id| profile_by_id(profile_id.as_str()));
+        crate::domain::providers::model_routing::normalize_and_validate_provider_model_routing(
+            draft.app,
+            &mut provider,
+            profile,
+        )
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
         resource.credential_generation = match existing.as_ref() {
             Some(existing) if credential_changed && !is_idempotent_replay => {
                 existing.resource.credential_generation.saturating_add(1)
@@ -12465,6 +12470,67 @@ mod tests {
                 code: "cc_switch_provider_idempotency_conflict",
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_command_enforces_profile_model_policy_capabilities() {
+        let state = test_state();
+        let mut official = test_provider("official-fixed-model", "OpenAI API Key");
+        official.settings_config = json!({
+            "modelMapping": {"mode": "single", "upstreamModel": "gpt-fixed"}
+        });
+
+        let rejected = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                official,
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("official-fixed-model-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            rejected,
+            ProviderCommandError::Invalid(message) if message.contains("does not allow modelMapping.mode=single")
+        ));
+        assert!(state.providers_snapshot().await.providers.is_empty());
+
+        let mut configurable = test_provider("configurable-passthrough", "OpenRouter");
+        configurable.settings_config = json!({
+            "modelMapping": {"mode": "passthrough"}
+        });
+        configurable.meta = Some(ProviderMeta {
+            provider_type: Some(ProviderType::OpenRouter.as_str().to_string()),
+            ..Default::default()
+        });
+        let stored = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                configurable,
+                Some(ProfileId::parse("codex.openrouter").unwrap()),
+                None,
+                Some("configurable-passthrough-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            stored.provider.settings_config["modelMapping"],
+            json!({"mode": "passthrough"})
+        );
+        assert!(matches!(
+            state
+                .provider_runtime_plan(AppKind::Codex, &stored.provider.id)
+                .await
+                .unwrap()
+                .model_policy,
+            crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough
         ));
     }
 

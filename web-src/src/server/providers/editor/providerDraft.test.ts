@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { providerRegistry } from "@/server/providerRegistry";
+import {
+  modelPoliciesForProfile,
+  providerRegistry,
+} from "@/server/providerRegistry";
 import {
   createDraftForProfile,
   providerPresetForProfile,
   readEndpoint,
+  readModelPolicy,
   readUpstreamModel,
   setEndpoint,
+  setPassthroughModel,
   setSingleModel,
 } from "./providerDraft";
 
@@ -57,7 +62,7 @@ describe("Server Provider profile drafts", () => {
         expect(
           readUpstreamModel(first.settingsConfig),
           profile.profileId,
-        ).toBeTruthy();
+        ).toBe(profile.defaultUpstreamModel);
       }
       expect(
         serializedSecrets(first.settingsConfig),
@@ -92,6 +97,42 @@ describe("Server Provider profile drafts", () => {
       mode: "single",
       upstreamModel: "model-x",
     });
+  });
+
+  it("lets configurable profiles persist passthrough without losing their default", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "codex.openrouter",
+    );
+    expect(profile).toBeDefined();
+    expect(modelPoliciesForProfile(profile!)).toEqual([
+      "single",
+      "passthrough",
+    ]);
+
+    const draft = createDraftForProfile(profile!);
+    const defaultModel = readUpstreamModel(draft.settingsConfig);
+    setPassthroughModel(draft.settingsConfig);
+
+    expect(readModelPolicy(draft.settingsConfig, profile!)).toBe("passthrough");
+    expect(draft.settingsConfig.modelMapping).toEqual({ mode: "passthrough" });
+    expect(readUpstreamModel(draft.settingsConfig)).toBe(defaultModel);
+  });
+
+  it("keeps official profiles locked to passthrough", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "codex.openai_api_key",
+    );
+    expect(profile).toBeDefined();
+    expect(modelPoliciesForProfile(profile!)).toEqual(["passthrough"]);
+
+    expect(
+      readModelPolicy(
+        {
+          modelMapping: { mode: "single", upstreamModel: "gpt-fixed" },
+        },
+        profile!,
+      ),
+    ).toBe("passthrough");
   });
 
   it("reads fixed Codex endpoints from the structured TOML provider section", () => {

@@ -2,6 +2,7 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use super::model::{classify_provider, AppKind, Provider, ProviderType};
+use super::registry::{FormComposition, ModelPolicyKind, ProfileSpec};
 
 pub const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 
@@ -25,12 +26,9 @@ pub struct ModelRoutingNormalization {
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[error(
-    "non-native {app} provider '{provider}' requires modelMapping.mode=single and a non-empty upstreamModel"
-)]
+#[error("{message}")]
 pub struct ModelRoutingValidationError {
-    app: &'static str,
-    provider: String,
+    message: String,
 }
 
 pub fn policy_from_settings(settings: &Value) -> Option<ModelRoutingPolicy> {
@@ -87,7 +85,12 @@ fn uses_native_endpoint(provider: &Provider, app: AppKind, native_hosts: &[&str]
 pub fn normalize_provider_model_routing(
     app: AppKind,
     provider: &mut Provider,
+    profile: Option<&ProfileSpec>,
 ) -> ModelRoutingNormalization {
+    if let Some(profile) = profile {
+        return normalize_profile_model_routing(app, provider, profile);
+    }
+
     if !matches!(app, AppKind::Claude | AppKind::Codex) {
         return ModelRoutingNormalization {
             changed: false,
@@ -141,15 +144,149 @@ pub fn normalize_provider_model_routing(
 pub fn normalize_and_validate_provider_model_routing(
     app: AppKind,
     provider: &mut Provider,
+    profile: Option<&ProfileSpec>,
 ) -> Result<ModelRoutingNormalization, ModelRoutingValidationError> {
-    let normalization = normalize_provider_model_routing(app, provider);
+    if let Some(profile) = profile {
+        validate_configured_profile_policy(provider, profile)?;
+    }
+    let normalization = normalize_provider_model_routing(app, provider, profile);
     if normalization.required && !normalization.resolved {
         return Err(ModelRoutingValidationError {
-            app: app.as_str(),
-            provider: provider.name.trim().to_string(),
+            message: format!(
+                "{} provider '{}' requires modelMapping.mode=single and a non-empty upstreamModel",
+                app.as_str(),
+                provider.name.trim()
+            ),
         });
     }
     Ok(normalization)
+}
+
+fn normalize_profile_model_routing(
+    app: AppKind,
+    provider: &mut Provider,
+    profile: &ProfileSpec,
+) -> ModelRoutingNormalization {
+    if profile.form_composition == FormComposition::Legacy {
+        return ModelRoutingNormalization {
+            changed: false,
+            required: false,
+            resolved: true,
+        };
+    }
+
+    let before = provider.settings_config.clone();
+    let configured = policy_from_settings(&provider.settings_config);
+    let mode = configured
+        .as_ref()
+        .map(|policy| policy.mode)
+        .filter(|mode| profile.allows_model_policy(model_policy_kind(*mode)))
+        .unwrap_or_else(|| model_routing_mode(profile.model_policy));
+
+    match mode {
+        ModelRoutingMode::Passthrough => {
+            set_model_mapping(provider, json!({"mode": "passthrough"}));
+            ModelRoutingNormalization {
+                changed: provider.settings_config != before,
+                required: true,
+                resolved: true,
+            }
+        }
+        ModelRoutingMode::Single => {
+            let upstream_model = configured
+                .and_then(|policy| policy.upstream_model)
+                .or_else(|| {
+                    provider
+                        .settings_config
+                        .get("modelMapping")
+                        .or_else(|| provider.settings_config.get("model_mapping"))
+                        .and_then(mapping_upstream_model)
+                })
+                .or_else(|| profile.default_upstream_model.clone())
+                .or_else(|| {
+                    (classify_provider(app, provider) == ProviderType::GrokOAuth)
+                        .then(|| DEFAULT_GROK_MODEL.to_string())
+                })
+                .or_else(|| infer_single_upstream_model(app, &provider.settings_config));
+            let resolved = upstream_model.is_some();
+            if let Some(upstream_model) = upstream_model {
+                set_model_mapping(
+                    provider,
+                    json!({
+                        "mode": "single",
+                        "upstreamModel": upstream_model,
+                    }),
+                );
+            }
+            ModelRoutingNormalization {
+                changed: provider.settings_config != before,
+                required: true,
+                resolved,
+            }
+        }
+    }
+}
+
+fn validate_configured_profile_policy(
+    provider: &Provider,
+    profile: &ProfileSpec,
+) -> Result<(), ModelRoutingValidationError> {
+    if profile.form_composition == FormComposition::Legacy {
+        return Ok(());
+    }
+    let Some(mapping) = provider
+        .settings_config
+        .get("modelMapping")
+        .or_else(|| provider.settings_config.get("model_mapping"))
+    else {
+        return Ok(());
+    };
+    let Some(mode) = mapping.get("mode") else {
+        return Ok(());
+    };
+    let Some(mode) = mode.as_str().map(str::trim) else {
+        return Err(ModelRoutingValidationError {
+            message: format!(
+                "Provider profile {} has a non-string modelMapping.mode",
+                profile.profile_id
+            ),
+        });
+    };
+    let policy = match mode {
+        "passthrough" => ModelPolicyKind::Passthrough,
+        "single" => ModelPolicyKind::Single,
+        _ => {
+            return Err(ModelRoutingValidationError {
+                message: format!(
+                    "Provider profile {} has unsupported modelMapping.mode '{mode}'",
+                    profile.profile_id
+                ),
+            });
+        }
+    };
+    if !profile.allows_model_policy(policy) {
+        return Err(ModelRoutingValidationError {
+            message: format!(
+                "Provider profile {} does not allow modelMapping.mode={mode}",
+                profile.profile_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn model_policy_kind(mode: ModelRoutingMode) -> ModelPolicyKind {
+    match mode {
+        ModelRoutingMode::Passthrough => ModelPolicyKind::Passthrough,
+        ModelRoutingMode::Single => ModelPolicyKind::Single,
+    }
+}
+
+fn model_routing_mode(policy: ModelPolicyKind) -> ModelRoutingMode {
+    match policy {
+        ModelPolicyKind::Passthrough => ModelRoutingMode::Passthrough,
+        ModelPolicyKind::Single => ModelRoutingMode::Single,
+    }
 }
 
 fn set_model_mapping(provider: &mut Provider, mapping: Value) {
@@ -401,7 +538,7 @@ mod tests {
             Some("codex_oauth"),
             json!({"modelMapping": {"mode": "single", "upstreamModel": "old"}}),
         );
-        let result = normalize_provider_model_routing(AppKind::Codex, &mut provider);
+        let result = normalize_provider_model_routing(AppKind::Codex, &mut provider, None);
 
         assert!(result.changed);
         assert!(result.resolved);
@@ -417,7 +554,7 @@ mod tests {
             Some("grok_oauth"),
             json!({"config": "model = \"grok-4.3\""}),
         );
-        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider).unwrap();
+        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider, None).unwrap();
 
         assert_eq!(
             provider.settings_config["modelMapping"],
@@ -431,7 +568,7 @@ mod tests {
             Some("grok_oauth"),
             json!({"modelMapping": {"upstreamModel": "grok-custom"}}),
         );
-        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider).unwrap();
+        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider, None).unwrap();
 
         assert_eq!(
             provider.settings_config["modelMapping"],
@@ -448,7 +585,7 @@ mod tests {
                 "modelCatalog": {"models": [{"model": "client-alias"}]}
             }),
         );
-        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider).unwrap();
+        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider, None).unwrap();
 
         assert_eq!(
             single_upstream_model(&provider.settings_config).as_deref(),
@@ -462,11 +599,70 @@ mod tests {
             Some("openrouter"),
             json!({"env": {"ANTHROPIC_BASE_URL": "https://openrouter.ai/api"}}),
         );
-        let error = normalize_and_validate_provider_model_routing(AppKind::Claude, &mut provider)
-            .unwrap_err();
+        let error =
+            normalize_and_validate_provider_model_routing(AppKind::Claude, &mut provider, None)
+                .unwrap_err();
 
         assert!(error
             .to_string()
             .contains("requires modelMapping.mode=single"));
+    }
+
+    #[test]
+    fn configurable_profile_honors_explicit_passthrough() {
+        let profile = super::super::registry::profile_by_id("codex.openrouter").unwrap();
+        let mut provider = provider(
+            Some("openrouter"),
+            json!({"modelMapping": {"mode": "passthrough", "upstreamModel": "stale"}}),
+        );
+
+        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut provider, Some(profile))
+            .unwrap();
+
+        assert_eq!(
+            provider.settings_config["modelMapping"],
+            json!({"mode": "passthrough"})
+        );
+    }
+
+    #[test]
+    fn configurable_profile_uses_registry_default_for_missing_mapping() {
+        let profile = super::super::registry::profile_by_id("claude.grok_oauth").unwrap();
+        let mut provider = provider(Some("grok_oauth"), json!({}));
+
+        normalize_and_validate_provider_model_routing(
+            AppKind::Claude,
+            &mut provider,
+            Some(profile),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider.settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+        );
+    }
+
+    #[test]
+    fn locked_official_profile_rejects_single_on_write_but_normalizes_on_load() {
+        let profile = super::super::registry::profile_by_id("codex.openai_oauth").unwrap();
+        let mut provider = provider(
+            Some("codex_oauth"),
+            json!({"modelMapping": {"mode": "single", "upstreamModel": "gpt-5.4"}}),
+        );
+
+        let error = normalize_and_validate_provider_model_routing(
+            AppKind::Codex,
+            &mut provider,
+            Some(profile),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not allow"));
+
+        normalize_provider_model_routing(AppKind::Codex, &mut provider, Some(profile));
+        assert_eq!(
+            provider.settings_config["modelMapping"],
+            json!({"mode": "passthrough"})
+        );
     }
 }

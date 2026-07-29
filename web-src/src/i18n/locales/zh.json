@@ -3366,8 +3366,10 @@
     "model": {
       "title": "模型策略",
       "upstreamModel": "实际上游模型",
-      "passthrough": "透传",
-      "passthroughHint": "使用请求中的模型"
+      "single": "固定实际上游模型（推荐）",
+      "singleHint": "无论请求使用什么模型，最终都调用这个上游模型。",
+      "passthrough": "请求模型透传",
+      "passthroughHint": "保留请求中的模型名；协议适配仍可能规范化模型别名，目标上游不支持该模型时请求会失败。"
     },
     "headers": {
       "title": "额外请求 Header",

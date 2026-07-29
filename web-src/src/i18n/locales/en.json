@@ -3362,8 +3362,10 @@
     "model": {
       "title": "Model policy",
       "upstreamModel": "Actual upstream model",
-      "passthrough": "Pass through",
-      "passthroughHint": "Use the model from the request"
+      "single": "Fixed upstream model (recommended)",
+      "singleHint": "Every request uses this upstream model, regardless of the requested model.",
+      "passthrough": "Pass through request model",
+      "passthroughHint": "Preserves the requested model name. Protocol adapters may still normalize aliases, and requests fail when the upstream does not support the model."
     },
     "headers": {
       "title": "Additional request Headers",

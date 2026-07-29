@@ -1,6 +1,7 @@
 import registrySnapshot from "../../../assets/contract/provider-registry.json";
 
 export type CoreProviderApp = "claude" | "codex" | "gemini";
+export type ProviderModelPolicy = "passthrough" | "single";
 
 export type ProviderFormComposition =
   | "managed_account"
@@ -75,7 +76,9 @@ export interface ProviderRegistryProfile {
     | "custom"
     | "frozen_legacy";
   credentialPolicy: ProviderCredentialPolicy;
-  modelPolicy: "passthrough" | "single";
+  modelPolicy: ProviderModelPolicy;
+  allowedModelPolicies?: ProviderModelPolicy[];
+  defaultUpstreamModel?: string;
   visibility: "visible" | "hidden";
   creationPolicy: "create_allowed" | "existing_only";
   maturity: "stable" | "experimental";
@@ -155,6 +158,14 @@ export function profileById(
   return providerRegistry.profiles.find(
     (profile) => profile.profileId === profileId,
   );
+}
+
+export function modelPoliciesForProfile(
+  profile: ProviderRegistryProfile,
+): ProviderModelPolicy[] {
+  return profile.allowedModelPolicies?.length
+    ? profile.allowedModelPolicies
+    : [profile.modelPolicy];
 }
 
 export function driverForProfile(

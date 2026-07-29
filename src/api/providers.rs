@@ -1393,7 +1393,11 @@ fn apply_s1_profile_creation_defaults(
             settings.insert("modelMapping".to_string(), json!({"mode": "passthrough"}));
         }
         ModelPolicyKind::Single => {
-            let upstream_model = s1_profile_default_upstream_model(profile.profile_id.as_str())
+            let upstream_model = profile
+                .default_upstream_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
                 .ok_or_else(|| {
                     ApiError::bad_request(format!(
                         "Provider profile {} has no S1 default upstream model",
@@ -1407,34 +1411,6 @@ fn apply_s1_profile_creation_defaults(
         }
     }
     Ok(())
-}
-
-fn s1_profile_default_upstream_model(profile_id: &str) -> Option<&'static str> {
-    Some(match profile_id {
-        "claude.openai_oauth" => "gpt-5.6-sol",
-        "claude.grok_oauth" | "codex.grok_oauth" | "gemini.grok_oauth" => "grok-4.5",
-        "claude.kiro_oauth" => "claude-sonnet-4-8",
-        "claude.ollama_cloud" | "codex.ollama_cloud" => "kimi-k2.7-code",
-        "claude.cursor_oauth" | "claude.cursor_api_key" => "composer-2.5",
-        "claude.antigravity_oauth" | "claude.antigravity_cli" => "claude-sonnet-4-6",
-        "claude.github_copilot" => "claude-sonnet-5",
-        "claude.deepseek_account" | "claude.deepseek_api" | "codex.deepseek_api" => {
-            "deepseek-v4-flash"
-        }
-        "claude.aws_bedrock_aksk" | "claude.aws_bedrock_api_key" => {
-            "global.anthropic.claude-opus-4-8"
-        }
-        "claude.openrouter" => "anthropic/claude-sonnet-4.6",
-        "claude.nvidia" | "codex.nvidia" => "moonshotai/kimi-k2.5",
-        "codex.cursor_api_key" | "codex.cursor_oauth" => "gpt-5.5",
-        "codex.openrouter" => "gpt-5.4",
-        "gemini.antigravity_oauth" | "gemini.antigravity_cli" => "gemini-3.5-flash-medium",
-        "gemini.openrouter" => "gemini-3.5-flash",
-        "claude.custom_http" => "claude-sonnet-4-6",
-        "codex.custom_http" => "gpt-5.4",
-        "gemini.custom_http" => "gemini-3.5-flash",
-        _ => return None,
-    })
 }
 
 pub(in crate::api) async fn provider_registry() -> Json<ProviderRegistryResponse> {

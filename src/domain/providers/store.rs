@@ -140,7 +140,13 @@ impl ProviderStore {
                 stored.provider_type_id = provider_type.as_str().to_string();
                 changed = true;
             }
-            let result = normalize_provider_model_routing(stored.app, &mut stored.provider);
+            let profile = stored
+                .resource
+                .profile_id
+                .as_ref()
+                .and_then(|profile_id| profile_by_id(profile_id.as_str()));
+            let result =
+                normalize_provider_model_routing(stored.app, &mut stored.provider, profile);
             if result.changed {
                 changed = true;
             }
@@ -387,7 +393,11 @@ impl ProviderStore {
             provider.id = generate_provider_id(app);
         }
 
-        let routing = normalize_provider_model_routing(app, &mut provider);
+        let profile = resource
+            .profile_id
+            .as_ref()
+            .and_then(|profile_id| profile_by_id(profile_id.as_str()));
+        let routing = normalize_provider_model_routing(app, &mut provider, profile);
         if routing.required && !routing.resolved {
             tracing::warn!(
                 app = app.as_str(),

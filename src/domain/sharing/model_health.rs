@@ -6,6 +6,7 @@ use crate::domain::accounts::store::{
 };
 use crate::domain::health::ProviderHealthStatus;
 use crate::domain::providers::model::AppKind;
+use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::runtime::ProviderRuntimePlan;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::Share;
@@ -256,32 +257,38 @@ fn actual_model_for_provider(provider: &StoredProvider, requested_model: &str) -
 
 fn default_model_for_provider(provider: &StoredProvider) -> Option<String> {
     let settings = &provider.provider.settings_config;
-    let env = settings.get("env");
-    [
-        "/modelMapping/upstreamModel",
-        "/env/ANTHROPIC_MODEL",
-        "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "/env/OPENAI_MODEL",
-        "/env/GEMINI_MODEL",
-        "/env/GOOGLE_GEMINI_MODEL",
-    ]
-    .into_iter()
-    .find_map(|pointer| {
-        settings
-            .pointer(pointer)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-    .or_else(|| {
-        env.and_then(|value| value.get("MODEL"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-    .or_else(|| {
+    let passthrough = policy_from_settings(settings)
+        .is_some_and(|policy| policy.mode == ModelRoutingMode::Passthrough);
+    let configured_model = if passthrough {
+        None
+    } else {
+        let env = settings.get("env");
+        [
+            "/modelMapping/upstreamModel",
+            "/env/ANTHROPIC_MODEL",
+            "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "/env/OPENAI_MODEL",
+            "/env/GEMINI_MODEL",
+            "/env/GOOGLE_GEMINI_MODEL",
+        ]
+        .into_iter()
+        .find_map(|pointer| {
+            settings
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            env.and_then(|value| value.get("MODEL"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    };
+    configured_model.or_else(|| {
         settings
             .get("models")
             .and_then(serde_json::Value::as_array)
@@ -456,6 +463,48 @@ mod tests {
         assert_eq!(result.actual_model, "glm-5.2");
         assert_eq!(result.status, "success");
         assert_eq!(result.recent_results, vec!["success", "success"]);
+    }
+
+    #[test]
+    fn passthrough_health_fallback_ignores_stale_fixed_model_environment() {
+        let share = test_share(
+            "share-1",
+            AppKind::Codex,
+            "p-codex",
+            ProviderType::OpenRouter,
+            None,
+        );
+        let mut provider = test_provider(AppKind::Codex, "p-codex", ProviderType::OpenRouter);
+        provider.provider.settings_config = json!({
+            "env": {"OPENAI_MODEL": "stale-fixed-model"},
+            "modelMapping": {"mode": "passthrough"}
+        });
+        let mut usage = UsageStore::default();
+        usage.provider_health.record(ProviderHealthObservation {
+            app: provider.app,
+            provider_id: provider.provider.id.clone(),
+            provider_revision: provider.resource.revision,
+            runtime_fingerprint: "runtime-test".to_string(),
+            status: ProviderHealthStatus::Healthy,
+            checked_at_ms: now_ms(),
+            source: "cc-switch-scheduled".to_string(),
+            status_code: Some(200),
+            latency_ms: Some(123),
+            model: None,
+            error_category: None,
+            error_message: None,
+            transient_failure: false,
+        });
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..Default::default()
+        };
+
+        let summary = summary_for_share(&share, &providers, None, Some(&usage));
+        let result = summary.codex.first().unwrap();
+
+        assert_eq!(result.requested_model, "codex");
+        assert_eq!(result.actual_model, "codex");
     }
 
     #[test]

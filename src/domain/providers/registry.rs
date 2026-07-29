@@ -101,6 +101,10 @@ pub struct ProfileSpec {
     pub endpoint_policy: EndpointPolicy,
     pub credential_policy: CredentialPolicy,
     pub model_policy: ModelPolicyKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_model_policies: Vec<ModelPolicyKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_upstream_model: Option<String>,
     pub visibility: ProfileVisibility,
     pub creation_policy: CreationPolicy,
     pub maturity: ProfileMaturity,
@@ -118,7 +122,7 @@ pub enum DriverBinding {
     Custom { custom_policy_id: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FormComposition {
     ManagedAccount,
@@ -160,11 +164,21 @@ pub enum CredentialPolicy {
     Legacy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelPolicyKind {
     Passthrough,
     Single,
+}
+
+impl ProfileSpec {
+    pub fn allows_model_policy(&self, policy: ModelPolicyKind) -> bool {
+        if self.allowed_model_policies.is_empty() {
+            self.model_policy == policy
+        } else {
+            self.allowed_model_policies.contains(&policy)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,6 +711,63 @@ fn validate_profile_contract(
     driver_ids: &BTreeSet<&str>,
     custom_policy_ids: &BTreeSet<&str>,
 ) -> anyhow::Result<()> {
+    let allowed_model_policies = if profile.allowed_model_policies.is_empty() {
+        vec![profile.model_policy]
+    } else {
+        profile.allowed_model_policies.clone()
+    };
+    if !allowed_model_policies.contains(&profile.model_policy) {
+        bail!(
+            "profile {} default model policy is not allowed",
+            profile.profile_id
+        );
+    }
+    if allowed_model_policies.iter().collect::<BTreeSet<_>>().len() != allowed_model_policies.len()
+    {
+        bail!(
+            "profile {} declares duplicate allowed model policies",
+            profile.profile_id
+        );
+    }
+    let default_upstream_model = profile
+        .default_upstream_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    if profile.default_upstream_model.is_some() && default_upstream_model.is_none() {
+        bail!(
+            "profile {} declares an empty default upstream model",
+            profile.profile_id
+        );
+    }
+    if profile.form_composition == FormComposition::Legacy
+        && (!profile.allowed_model_policies.is_empty() || profile.default_upstream_model.is_some())
+    {
+        bail!(
+            "legacy profile {} cannot declare configurable model policy fields",
+            profile.profile_id
+        );
+    }
+    match profile.model_policy {
+        ModelPolicyKind::Single => {
+            if default_upstream_model.is_none()
+                && profile.creation_policy == CreationPolicy::CreateAllowed
+            {
+                bail!(
+                    "single-model profile {} has no default upstream model",
+                    profile.profile_id
+                );
+            }
+        }
+        ModelPolicyKind::Passthrough if profile.default_upstream_model.is_some() => {
+            bail!(
+                "passthrough profile {} cannot declare a default upstream model",
+                profile.profile_id
+            );
+        }
+        ModelPolicyKind::Passthrough => {}
+    }
+
     match (&profile.form_composition, &profile.credential_policy) {
         (FormComposition::ManagedAccount, CredentialPolicy::ManagedAccount { .. })
         | (FormComposition::StaticSecret, CredentialPolicy::StaticSecret { .. })
@@ -894,6 +965,32 @@ mod tests {
             let profile = profile_for_legacy_preset(mapping.app, &mapping.legacy_name).unwrap();
             assert_eq!(profile.app, mapping.app);
             assert_eq!(profile.profile_id, mapping.profile_id);
+        }
+    }
+
+    #[test]
+    fn model_policy_capabilities_lock_native_profiles_and_configure_others() {
+        for profile in &provider_registry().profiles {
+            if profile.form_composition == FormComposition::Legacy {
+                assert!(profile.allowed_model_policies.is_empty());
+                assert!(profile.default_upstream_model.is_none());
+                continue;
+            }
+            match profile.model_policy {
+                ModelPolicyKind::Passthrough => {
+                    assert!(profile.allows_model_policy(ModelPolicyKind::Passthrough));
+                    assert!(!profile.allows_model_policy(ModelPolicyKind::Single));
+                    assert!(profile.default_upstream_model.is_none());
+                }
+                ModelPolicyKind::Single => {
+                    assert!(profile.allows_model_policy(ModelPolicyKind::Single));
+                    assert!(profile.allows_model_policy(ModelPolicyKind::Passthrough));
+                    assert!(profile
+                        .default_upstream_model
+                        .as_deref()
+                        .is_some_and(|model| !model.trim().is_empty()));
+                }
+            }
         }
     }
 

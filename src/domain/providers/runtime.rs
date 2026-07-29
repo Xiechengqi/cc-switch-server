@@ -16,7 +16,7 @@ use super::model_routing::{policy_from_settings, ModelRoutingMode};
 use super::registry::{
     profile_by_id, provider_registry, resolve_custom_binding, AuthScheme, CredentialPolicy,
     DriverBinding, DriverId, EndpointPolicy, ModelPolicyKind, OutboundIdentityPolicy, ProfileId,
-    UpstreamProtocol,
+    ProfileSpec, UpstreamProtocol,
 };
 use super::store::{ProviderStore, StoredProvider};
 
@@ -259,8 +259,7 @@ pub fn compile_runtime_plan(
         }
     };
 
-    let model_policy =
-        runtime_model_policy(stored, profile_policy.map(|profile| profile.model_policy));
+    let model_policy = runtime_model_policy(stored, profile_policy);
     let model_policy = match model_policy {
         Ok(policy) => policy,
         Err(error) => {
@@ -591,16 +590,34 @@ fn normalized_slots(declared: &[String], discovered: &[String]) -> Vec<String> {
 
 fn runtime_model_policy(
     stored: &StoredProvider,
-    declared: Option<ModelPolicyKind>,
+    profile: Option<&ProfileSpec>,
 ) -> anyhow::Result<RuntimeModelPolicy> {
     let configured = policy_from_settings(&stored.provider.settings_config);
-    let kind = declared.unwrap_or_else(|| match configured.as_ref().map(|policy| policy.mode) {
-        Some(ModelRoutingMode::Single) => ModelPolicyKind::Single,
-        _ => ModelPolicyKind::Passthrough,
+    let configured_kind = configured.as_ref().map(|policy| match policy.mode {
+        ModelRoutingMode::Passthrough => ModelPolicyKind::Passthrough,
+        ModelRoutingMode::Single => ModelPolicyKind::Single,
     });
+    let kind = match profile {
+        Some(profile) => {
+            let kind = configured_kind.unwrap_or(profile.model_policy);
+            if !profile.allows_model_policy(kind) {
+                anyhow::bail!(
+                    "Provider profile {} does not allow modelMapping.mode={}",
+                    profile.profile_id,
+                    match kind {
+                        ModelPolicyKind::Passthrough => "passthrough",
+                        ModelPolicyKind::Single => "single",
+                    }
+                );
+            }
+            kind
+        }
+        None => configured_kind.unwrap_or(ModelPolicyKind::Passthrough),
+    };
     match kind {
         ModelPolicyKind::Passthrough => Ok(RuntimeModelPolicy::Passthrough),
         ModelPolicyKind::Single => runtime_single_model(&stored.provider.settings_config)
+            .or_else(|| profile.and_then(|profile| profile.default_upstream_model.clone()))
             .map(|upstream_model| RuntimeModelPolicy::Single { upstream_model })
             .context("single-model Provider has no upstream model"),
     }
@@ -991,6 +1008,14 @@ mod tests {
     use crate::domain::providers::store::ProviderResourceMetadata;
 
     fn provider(profile_id: &str, provider_type: ProviderType) -> StoredProvider {
+        let profile = profile_by_id(profile_id).unwrap();
+        let model_mapping = match profile.model_policy {
+            ModelPolicyKind::Passthrough => json!({"mode": "passthrough"}),
+            ModelPolicyKind::Single => json!({
+                "mode": "single",
+                "upstreamModel": profile.default_upstream_model.as_deref().unwrap_or("gpt-test")
+            }),
+        };
         StoredProvider {
             app: AppKind::Codex,
             provider: Provider {
@@ -998,7 +1023,7 @@ mod tests {
                 name: "Runtime fixture".to_string(),
                 settings_config: json!({
                     "env": {"OPENAI_BASE_URL": "https://api.example.test/v1"},
-                    "modelMapping": {"mode": "single", "upstreamModel": "gpt-test"}
+                    "modelMapping": model_mapping
                 }),
                 category: None,
                 meta: Some(ProviderMeta {
@@ -1067,6 +1092,29 @@ mod tests {
             assert_eq!(plan.profile_id, profile.profile_id);
             assert!(!plan.runtime_fingerprint.is_empty());
             assert!(plan.transport_policy.direct_connection);
+        }
+    }
+
+    #[test]
+    fn every_non_legacy_profile_that_allows_passthrough_compiles_it() {
+        let mut accounts = AccountStore::default();
+        for (index, profile) in provider_registry().profiles.iter().enumerate() {
+            if profile.form_composition == super::super::registry::FormComposition::Legacy
+                || !profile.allows_model_policy(ModelPolicyKind::Passthrough)
+            {
+                continue;
+            }
+            let mut stored = provider_for_profile(profile, index, &mut accounts);
+            stored.provider.settings_config["modelMapping"] = json!({"mode": "passthrough"});
+
+            let plan = compile_runtime_plan(&stored, &accounts).unwrap();
+
+            assert_eq!(
+                plan.model_policy,
+                RuntimeModelPolicy::Passthrough,
+                "{}",
+                profile.profile_id
+            );
         }
     }
 
@@ -1255,6 +1303,22 @@ mod tests {
         let second = compile_runtime_plan(&stored, &accounts).unwrap();
         assert_eq!(second.endpoint, "https://openrouter.ai/api");
         assert_eq!(first.runtime_fingerprint, second.runtime_fingerprint);
+    }
+
+    #[test]
+    fn configurable_profile_compiles_explicit_passthrough_policy() {
+        let accounts = AccountStore::default();
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        stored.resource.credential_generation = 1;
+        let single = compile_runtime_plan(&stored, &accounts).unwrap();
+        stored.provider.settings_config["modelMapping"] = json!({"mode": "passthrough"});
+
+        let plan = compile_runtime_plan(&stored, &accounts).unwrap();
+
+        assert_eq!(plan.model_policy, RuntimeModelPolicy::Passthrough);
+        assert_eq!(plan.configuration_state, RuntimeConfigurationState::Ready);
+        assert_ne!(plan.runtime_fingerprint, single.runtime_fingerprint);
     }
 
     #[test]
@@ -1538,6 +1602,16 @@ mod tests {
             DriverBinding::Custom { .. } => Some(custom_binding_for_profile(profile)),
             DriverBinding::Fixed { .. } => None,
         };
+        let model_mapping = match profile.model_policy {
+            ModelPolicyKind::Passthrough => json!({"mode": "passthrough"}),
+            ModelPolicyKind::Single => json!({
+                "mode": "single",
+                "upstreamModel": profile
+                    .default_upstream_model
+                    .as_deref()
+                    .unwrap_or("fixture-model")
+            }),
+        };
         StoredProvider {
             app: profile.app,
             provider: Provider {
@@ -1548,10 +1622,7 @@ mod tests {
                         base_url_key: format!("https://provider-{index}.example.test/v1"),
                         "TEST_API_KEY": "secret"
                     },
-                    "modelMapping": {
-                        "mode": "single",
-                        "upstreamModel": "fixture-model"
-                    }
+                    "modelMapping": model_mapping
                 }),
                 category: None,
                 meta: Some(meta),

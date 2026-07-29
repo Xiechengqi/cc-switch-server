@@ -2924,8 +2924,10 @@
     "model": {
       "title": "模型策略",
       "upstreamModel": "實際上游模型",
-      "passthrough": "透傳",
-      "passthroughHint": "使用請求中的模型"
+      "single": "固定實際上游模型（建議）",
+      "singleHint": "無論請求使用什麼模型，最終都呼叫這個上游模型。",
+      "passthrough": "請求模型透傳",
+      "passthroughHint": "保留請求中的模型名稱；協定適配仍可能正規化模型別名，目標上游不支援該模型時請求會失敗。"
     },
     "headers": {
       "title": "額外請求 Header",
