@@ -29,8 +29,10 @@ pub(crate) async fn control_apply_share_settings(
             ));
         }
     }
+    // Control RPC is Router → Client only. Managed Share Market grants must be
+    // applied here too; the ordinary dashboard patch helper rejects them.
     let share = state
-        .apply_share_settings_patch_immediate(&input.share_id, input.patch)
+        .apply_router_share_settings_patch_immediate(&input.share_id, input.patch)
         .await
         .map_err(ApiError::internal)?
         .map_err(|error| match error {
