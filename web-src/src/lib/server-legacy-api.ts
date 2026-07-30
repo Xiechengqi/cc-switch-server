@@ -304,6 +304,7 @@ export interface ShareBinding {
 
 export interface ShareRecord {
   id: string;
+  capacityPoolId?: string;
   ownerEmail?: string | null;
   app: AppKind;
   providerId: string;
@@ -344,6 +345,7 @@ export interface ShareRecord {
 
 export interface UpsertShareInput {
   id?: string;
+  capacityPoolId?: string;
   ownerEmail?: string;
   app: AppKind;
   providerId: string;
@@ -422,6 +424,11 @@ export interface UsageLog {
   requestedModel?: string | null;
   actualModel?: string | null;
   actualModelSource?: string | null;
+  requestedReasoningEffort?: string | null;
+  effectiveReasoningEffort?: string | null;
+  clientServiceTier?: string | null;
+  effectiveServiceTier?: string | null;
+  serviceTierDecision?: string | null;
   statusCode: number;
   durationMs: number;
   firstTokenMs?: number | null;
@@ -444,6 +451,14 @@ export interface UsageLog {
   isHealthCheck: boolean;
   isStreaming: boolean;
   streamStatus?: string | null;
+  usageState?:
+    | "pending"
+    | "observed"
+    | "missing"
+    | "parse_error"
+    | "interrupted"
+    | string;
+  usageRevision?: number;
   userCountry?: string | null;
   userCountryIso3?: string | null;
   routerLastSyncedAtMs?: number | null;

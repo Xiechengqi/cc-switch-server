@@ -126,7 +126,15 @@
     },
     "share": {
       "ownerNotConfigured": "請先設定 Client Owner",
-      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。",
+  "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。",
+  "reuseTitle": "發現同一帳號或 API key 的遠端分享",
+  "reuseDescription": "可以將目前應用加入既有連結，也可以保留為新的獨立連結。",
+  "reuseTarget": "既有分享",
+  "reuseCheckbox": "復用既有 Share URL 和遠端分享設定",
+  "reuseSuccess": "已復用現有分享連結",
+  "reuseError": "復用分享連結失敗：{{error}}",
+  "removeBindingSuccess": "已停止該應用的遠端分享",
+  "removeBindingError": "停止遠端分享失敗：{{error}}",
       "deleteShort": "刪除 Share",
       "deleteConfirmTitle": "刪除 Share",
       "deleteConfirmMessage": "刪除後該 Share 將從 Share 頁面移除，且無法復原。",
@@ -1292,7 +1300,7 @@
     "addDeviceAccount": "透過 Device Code 授權",
     "selectAccountRequired": "OpenAI OAuth 必須綁定一個 ChatGPT 帳號",
     "fastMode": "FAST 模式",
-    "fastModeDescription": "發送 service_tier=\"priority\" 換取更低延遲。預設關閉——開啟後會以更高速率消耗 ChatGPT 配額。"
+    "fastModeDescription": "FAST 完全由伺服器控制。關閉時會移除用戶端提交的 service_tier；開啟時僅對明確支援的模型強制 priority，用戶端 FAST 設定無法覆寫伺服器策略。priority 可能更快消耗 ChatGPT 配額。"
   },
   "codexBankedReset": {
     "title": "Banked Reset",
@@ -1511,8 +1519,20 @@
     "outputTokens": "輸出",
     "cacheReadTokens": "快取命中",
     "cacheCreationTokens": "快取建立",
+    "imageOutput": "圖片輸出",
+    "imageCount": "圖片數量",
+    "imageBytes": "輸出位元組",
+    "imageFormat": "圖片格式",
+    "imageDimensions": "圖片尺寸",
     "timingInfo": "耗時/首字",
     "status": "狀態",
+    "usageState": {
+      "pending": "等待統計",
+      "observed": "已統計",
+      "missing": "未回傳用量",
+      "parse_error": "用量解析失敗",
+      "interrupted": "請求已中斷"
+    },
     "requestModel": "請求模型",
     "responseModel": "回傳模型",
     "noData": "暫無資料",
@@ -1603,7 +1623,21 @@
     "timeRangeTooLarge": "時間範圍過大，請縮小範圍",
     "modelPath": "模型路徑",
     "actualModel": "實際模型",
-    "firstToken": "首 Token"
+    "firstToken": "首 Token",
+    "requestPolicy": "請求策略",
+    "reasoningEffortShort": "推理等級",
+    "fastModeShort": "FAST",
+    "requestedReasoningEffort": "用戶請求推理等級",
+    "effectiveReasoningEffort": "實際推理等級",
+    "clientServiceTier": "用戶端 Service Tier",
+    "effectiveServiceTier": "實際 Service Tier",
+    "fastDecision": "FAST 決策",
+    "serviceTierDecision": {
+      "server_disabled": "伺服器已關閉",
+      "server_forced_priority": "伺服器強制 Priority",
+      "model_unsupported": "模型不支援 Priority",
+      "capability_unknown": "Priority 能力未知"
+    }
   },
   "dbUpgrade": {
     "title": "資料庫版本過新",

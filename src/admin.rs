@@ -413,18 +413,23 @@ fn check_share_provider_links(report: &mut DoctorReport, snapshot: &ConfigSnapsh
         .shares
         .shares
         .iter()
-        .filter(|share| {
-            !snapshot.providers.providers.iter().any(|provider| {
-                provider.app == share.app && provider.provider.id == share.provider_id
-            })
-        })
-        .map(|share| {
-            format!(
-                "{}:{}:{}",
-                share.id,
-                app_label(share.app),
-                share.provider_id
-            )
+        .flat_map(|share| {
+            share
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    !snapshot.providers.providers.iter().any(|provider| {
+                        provider.app == binding.app && provider.provider.id == binding.provider_id
+                    })
+                })
+                .map(|binding| {
+                    format!(
+                        "{}:{}:{}",
+                        share.id,
+                        app_label(binding.app),
+                        binding.provider_id
+                    )
+                })
         })
         .collect::<Vec<_>>();
 

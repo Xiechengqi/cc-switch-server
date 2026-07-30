@@ -103,7 +103,10 @@ pub struct AdapterRequest {
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
     pub actual_model_source: Option<String>,
+    /// Whether the downstream client expects a streaming response.
     pub stream_requested: bool,
+    /// Whether the selected upstream transport must be streaming.
+    pub upstream_stream_requested: bool,
     pub custom_tool_names: BTreeSet<String>,
     pub(crate) responses_tool_context: transforms::ResponsesToolContext,
     pub claude_tool_name_map: BTreeMap<String, String>,
@@ -267,6 +270,7 @@ impl GenericForwardingAdapter {
             actual_model: model.actual_model.clone(),
             actual_model_source: model.actual_model_source,
             stream_requested,
+            upstream_stream_requested: stream_requested,
             upstream_headers,
             custom_tool_names,
             responses_tool_context,
@@ -309,6 +313,7 @@ impl GenericForwardingAdapter {
     ) -> Result<(), ProxyError> {
         if route_implies_stream(route, gemini_path) {
             request.stream_requested = true;
+            request.upstream_stream_requested = true;
             if let Some(upstream_format) =
                 upstream_format_for_route(stored, Some(route), &request.body)
             {
@@ -457,6 +462,7 @@ pub(super) fn cursor_agentservice_request(
         actual_model: model.actual_model.clone(),
         actual_model_source: model.actual_model_source,
         stream_requested,
+        upstream_stream_requested: stream_requested,
         custom_tool_names,
         responses_tool_context,
         claude_tool_name_map: Default::default(),
@@ -1520,7 +1526,7 @@ fn upstream_path(
                 .as_deref()
                 .or(request.model.as_deref())
                 .unwrap_or("gemini-pro");
-            let method = if request.stream_requested {
+            let method = if request.upstream_stream_requested {
                 "streamGenerateContent"
             } else {
                 "generateContent"
@@ -1775,7 +1781,7 @@ fn apply_bedrock_bearer_forward_contract(
         .as_deref()
         .or(request.model.as_deref())
         .ok_or_else(|| ProxyError::bad_request("Bedrock model is required"))?;
-    let operation = if request.stream_requested {
+    let operation = if request.upstream_stream_requested {
         "converse-stream"
     } else {
         "converse"
@@ -1840,7 +1846,7 @@ fn bedrock_sigv4_request_plan(
         .as_deref()
         .or(request.model.as_deref())
         .unwrap_or("anthropic.claude-sonnet-4-6");
-    let operation = if request.stream_requested {
+    let operation = if request.upstream_stream_requested {
         "converse-stream"
     } else {
         "converse"
@@ -5836,6 +5842,7 @@ mod tests {
             actual_model: None,
             actual_model_source: None,
             stream_requested: true,
+            upstream_stream_requested: true,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -5906,6 +5913,7 @@ mod tests {
             actual_model: None,
             actual_model_source: None,
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -5992,6 +6000,7 @@ mod tests {
             actual_model: None,
             actual_model_source: None,
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -6101,6 +6110,7 @@ mod tests {
             actual_model: None,
             actual_model_source: None,
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),

@@ -180,8 +180,22 @@ fn failure_from_value(value: &Value, response: &Value, status: Option<&str>) -> 
             Some("cancelled") => "response generation was cancelled".to_string(),
             _ => "response generation failed".to_string(),
         });
+    let client_failure = [
+        error.get("code").and_then(Value::as_str),
+        error.get("type").and_then(Value::as_str),
+        status,
+        value.get("type").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|candidate| classify_failure_origin(candidate) == FailureOrigin::Client);
+    let origin = if client_failure {
+        FailureOrigin::Client
+    } else {
+        FailureOrigin::Provider
+    };
     SemanticFailure {
-        origin: classify_failure_origin(&code),
+        origin,
         code,
         message,
     }
@@ -205,7 +219,7 @@ pub(super) fn error_value_is_substantive(error: &Value) -> bool {
 }
 
 fn classify_failure_origin(code: &str) -> FailureOrigin {
-    let code = code.trim().to_ascii_lowercase().replace('-', "_");
+    let code = code.trim().to_ascii_lowercase().replace(['-', '.'], "_");
     if matches!(
         code.as_str(),
         "bad_request"
@@ -226,6 +240,8 @@ fn classify_failure_origin(code: &str) -> FailureOrigin {
             | "prompt_blocked"
             | "request_too_large"
             | "request_cancelled"
+            | "response_cancelled"
+            | "response_canceled"
             | "safety_violation"
             | "unsupported_parameter"
             | "unprocessable_entity"
@@ -608,6 +624,24 @@ mod tests {
         }));
         assert!(matches!(
             client,
+            SemanticObservation::Failure(SemanticFailure {
+                origin: FailureOrigin::Client,
+                ..
+            })
+        ));
+
+        let specific_client = classify_value(&json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unknown_specific_validation_code",
+                    "message": "bad tool schema"
+                }
+            }
+        }));
+        assert!(matches!(
+            specific_client,
             SemanticObservation::Failure(SemanticFailure {
                 origin: FailureOrigin::Client,
                 ..

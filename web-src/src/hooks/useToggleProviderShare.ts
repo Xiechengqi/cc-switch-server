@@ -1,13 +1,17 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
-import type { AppId } from "@/lib/api";
 import {
+  shareApi,
+  type AppId,
+  type ShareReuseCandidate,
+} from "@/lib/api";
+import {
+  useAddShareBindingMutation,
   useClientTunnelQuery,
   useCreateShareMutation,
-  useDeleteShareMutation,
-  useDisableShareMutation,
   useEnableShareMutation,
+  useRemoveShareBindingMutation,
 } from "@/lib/query";
 import {
   isShareableApp,
@@ -35,9 +39,12 @@ export function useToggleProviderShare(
   const { share, state } = providerShare;
   const { data: clientTunnel } = useClientTunnelQuery();
   const createMutation = useCreateShareMutation();
+  const addBindingMutation = useAddShareBindingMutation();
+  const removeBindingMutation = useRemoveShareBindingMutation();
   const enableMutation = useEnableShareMutation();
-  const disableMutation = useDisableShareMutation();
-  const deleteMutation = useDeleteShareMutation();
+  const [reuseCandidates, setReuseCandidates] = useState<
+    ShareReuseCandidate[] | null
+  >(null);
 
   const shareable = isShareableApp(appId) && Boolean(providerId);
   const sharePhase = getProviderSharePhase(share);
@@ -46,35 +53,19 @@ export function useToggleProviderShare(
 
   const isPending =
     createMutation.isPending ||
+    addBindingMutation.isPending ||
+    removeBindingMutation.isPending ||
     enableMutation.isPending ||
-    disableMutation.isPending ||
-    deleteMutation.isPending;
+    reuseCandidates !== null;
 
   const ownerEmail = useMemo(
     () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail),
     [clientTunnel?.config?.ownerEmail],
   );
 
-  const enableShare = async () => {
+  const createNewShare = async () => {
     if (!shareable || !providerId) return;
-    try {
-      if (share) {
-        if (!isShareRunning(share)) {
-          await enableMutation.mutateAsync(share.id);
-        }
-        return;
-      }
-
-      if (!ownerEmail) {
-        toast.error(
-          t("provider.share.ownerRequired", {
-            defaultValue: "请先在分享页配置 Client Tunnel Owner 邮箱",
-          }),
-        );
-        return;
-      }
-
-      await createMutation.mutateAsync({
+    await createMutation.mutateAsync({
         bindings: { [appId]: providerId },
         forSale: "Yes",
         tokenLimit: UNLIMITED_TOKEN_LIMIT,
@@ -95,7 +86,34 @@ export function useToggleProviderShare(
             expiresAt: "2099-12-31T23:59:59Z",
           },
         },
-      });
+    });
+  };
+
+  const enableShare = async () => {
+    if (!shareable || !providerId) return;
+    try {
+      if (share) {
+        if (!isShareRunning(share)) {
+          await enableMutation.mutateAsync(share.id);
+        }
+        return;
+      }
+
+      if (!ownerEmail) {
+        toast.error(
+          t("provider.share.ownerRequired", {
+            defaultValue: "请先在分享页配置 Client Tunnel Owner 邮箱",
+          }),
+        );
+        return;
+      }
+
+      const candidates = await shareApi.listReuseCandidates(appId, providerId);
+      if (candidates.length > 0) {
+        setReuseCandidates(candidates);
+        return;
+      }
+      await createNewShare();
     } catch (error) {
       toast.error(
         t("share.toggle.enableFailed", {
@@ -108,11 +126,14 @@ export function useToggleProviderShare(
   };
 
   const disableShare = async () => {
-    if (!share) return;
+    if (!share || !shareable || !providerId) return;
     try {
-      if (isShareRunning(share)) {
-        await disableMutation.mutateAsync(share.id);
-      }
+      await removeBindingMutation.mutateAsync({
+        shareId: share.id,
+        app: appId,
+        providerId,
+        expectedConfigRevision: share.configRevision,
+      });
     } catch (error) {
       toast.error(
         t("share.toggle.disableFailed", {
@@ -125,9 +146,14 @@ export function useToggleProviderShare(
   };
 
   const deleteShare = async () => {
-    if (!share) return;
+    if (!share || !shareable || !providerId) return;
     try {
-      await deleteMutation.mutateAsync(share.id);
+      await removeBindingMutation.mutateAsync({
+        shareId: share.id,
+        app: appId,
+        providerId,
+        expectedConfigRevision: share.configRevision,
+      });
     } catch (error) {
       toast.error(
         t("provider.share.deleteFailed", {
@@ -137,6 +163,22 @@ export function useToggleProviderShare(
       );
       throw error;
     }
+  };
+
+  const confirmShareReuse = async (reuse: boolean, shareId: string) => {
+    if (!shareable || !providerId || !reuseCandidates) return;
+    const candidate = reuseCandidates.find((item) => item.shareId === shareId);
+    setReuseCandidates(null);
+    if (!reuse || !candidate) {
+      await createNewShare();
+      return;
+    }
+    await addBindingMutation.mutateAsync({
+      shareId: candidate.shareId,
+      app: appId,
+      providerId,
+      expectedConfigRevision: candidate.configRevision,
+    });
   };
 
   const handleSharePrimaryAction = async () => {
@@ -165,6 +207,9 @@ export function useToggleProviderShare(
     enableShare,
     disableShare,
     deleteShare,
+    reuseCandidates,
+    confirmShareReuse,
+    dismissShareReuse: () => setReuseCandidates(null),
     handleSharePrimaryAction,
     handleShareResume,
     state,

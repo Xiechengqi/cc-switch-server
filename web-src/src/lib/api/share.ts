@@ -4,7 +4,7 @@ import {
   normalizeShareRecords,
 } from "@/utils/shareRecordNormalize";
 
-/** Wire representation of the share's single app/provider binding. */
+/** Wire representation of one provider binding per supported app. */
 export type ShareBindings = Partial<
   Record<"claude" | "codex" | "gemini", string>
 >;
@@ -84,6 +84,7 @@ export type ShareAppSettingsByApp = Partial<
 
 export interface ShareRecord {
   id: string;
+  capacityPoolId: string;
   name: string;
   ownerEmail: string;
   sharedWithEmails: string[];
@@ -93,7 +94,7 @@ export interface ShareRecord {
   forSaleOfficialPricePercentByApp: Record<string, number>;
   description?: string | null;
   forSale: "Yes" | "No" | "Free";
-  /** Exactly one entry for a valid share. */
+  /** One to three entries, with at most one provider per app. */
   bindings: ShareBindings;
   apiKey: string;
   settingsConfig?: string | null;
@@ -120,7 +121,7 @@ export interface ShareRecord {
 }
 
 export interface CreateShareParams {
-  /** 单 binding：仅允许当前 app 的一个 provider id。 */
+  /** New Shares start with one binding; more are attached after explicit reuse confirmation. */
   bindings: ShareBindings;
   description?: string;
   forSale: "Yes" | "No" | "Free";
@@ -135,13 +136,34 @@ export interface CreateShareParams {
   userGrants?: ShareUserGrantMap;
 }
 
+export interface ShareReuseCandidate {
+  shareId: string;
+  shareName: string;
+  subdomain?: string | null;
+  apps: Array<keyof ShareBindings>;
+  configRevision: number;
+}
+
+export interface ShareBindingMutationParams {
+  shareId: string;
+  app: keyof ShareBindings;
+  providerId: string;
+  expectedConfigRevision: number;
+}
+
+export interface RemoveShareBindingResult {
+  ok: boolean;
+  deletedShare: boolean;
+  share?: ShareRecord | null;
+}
+
 export const SHARE_APP_TYPES: ReadonlyArray<keyof ShareBindings> = [
   "claude",
   "codex",
   "gemini",
 ];
 
-/** Return the share's single bound app as a one-item list. */
+/** Return every app bound to this Share. */
 export function shareSupportedApps(
   share: Pick<ShareRecord, "bindings"> | null | undefined,
 ): Array<keyof ShareBindings> {
@@ -153,7 +175,7 @@ export function shareSupportedApps(
 }
 
 /**
- * The only app bound to this share.
+ * The first app in stable protocol order, used only for compact UI fallbacks.
  */
 export function sharePrimaryApp(
   share: Pick<ShareRecord, "bindings"> | null | undefined,
@@ -344,6 +366,36 @@ async function invokeShareRecord(
 
 async function create(params: CreateShareParams): Promise<ShareRecord> {
   return invokeShareRecord("create_share", { params });
+}
+
+async function listReuseCandidates(
+  app: keyof ShareBindings,
+  providerId: string,
+): Promise<ShareReuseCandidate[]> {
+  const response = await invokeCommand<{
+    ok: boolean;
+    candidates: ShareReuseCandidate[];
+  }>("list_share_reuse_candidates", { app, providerId });
+  return response.candidates ?? [];
+}
+
+async function addBinding(
+  params: ShareBindingMutationParams,
+): Promise<ShareRecord> {
+  return invokeShareRecord("add_share_binding", { params });
+}
+
+async function removeBinding(
+  params: ShareBindingMutationParams,
+): Promise<RemoveShareBindingResult> {
+  const response = await invokeCommand<RemoveShareBindingResult>(
+    "remove_share_binding",
+    { params },
+  );
+  return {
+    ...response,
+    share: response.share ? normalizeShareRecord(response.share) : null,
+  };
 }
 
 async function remove(shareId: string): Promise<void> {
@@ -586,6 +638,9 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
 
 export const shareApi = {
   create,
+  listReuseCandidates,
+  addBinding,
+  removeBinding,
   delete: remove,
   pause,
   resume,

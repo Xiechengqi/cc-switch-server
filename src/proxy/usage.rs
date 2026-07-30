@@ -1,8 +1,10 @@
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{
-    ImageUsageMetadata, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata,
+    ImageUsageMetadata, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageState,
 };
 use crate::state::{ServerEvent, ServerState};
+
+use super::streaming::StreamUsageResult;
 
 pub(super) async fn log_usage(
     state: &ServerState,
@@ -48,6 +50,57 @@ pub(super) async fn update_stream_usage(
     usage: TokenUsage,
     stream_status: Option<&str>,
 ) {
+    update_stream_usage_with_parse_status(
+        state,
+        stored,
+        request_id,
+        status_code,
+        duration_ms,
+        first_token_ms,
+        usage,
+        false,
+        stream_status,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn update_stream_usage_result(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_id: &str,
+    status_code: u16,
+    duration_ms: u128,
+    first_token_ms: Option<u128>,
+    result: StreamUsageResult,
+    stream_status: Option<&str>,
+) {
+    update_stream_usage_with_parse_status(
+        state,
+        stored,
+        request_id,
+        status_code,
+        duration_ms,
+        first_token_ms,
+        result.usage,
+        result.parse_error,
+        stream_status,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_stream_usage_with_parse_status(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_id: &str,
+    status_code: u16,
+    duration_ms: u128,
+    first_token_ms: Option<u128>,
+    usage: TokenUsage,
+    usage_parse_error: bool,
+    stream_status: Option<&str>,
+) {
     let persisted = state
         .update_usage_log(request_id, |log| {
             let router_visible_changed = apply_stream_usage_fields(
@@ -56,6 +109,7 @@ pub(super) async fn update_stream_usage(
                 duration_ms,
                 first_token_ms,
                 usage,
+                usage_parse_error,
                 stream_status,
             );
             if router_visible_changed {
@@ -100,6 +154,7 @@ pub(super) async fn update_image_stream_usage(
                 duration_ms,
                 first_token_ms,
                 usage,
+                false,
                 Some(stream_status),
             );
             let next_error = error_message.map(str::to_string);
@@ -140,12 +195,60 @@ pub(super) async fn update_image_stream_usage(
     crate::state::sync_latest_direct_share_log(state.clone()).await;
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn update_websocket_stream_usage(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_id: &str,
+    status_code: u16,
+    duration_ms: u128,
+    first_token_ms: Option<u128>,
+    usage: TokenUsage,
+    stream_status: &str,
+    error_message: Option<&str>,
+) {
+    let persisted = state
+        .update_usage_log(request_id, |log| {
+            let mut router_visible_changed = apply_stream_usage_fields(
+                log,
+                status_code,
+                duration_ms,
+                first_token_ms,
+                usage,
+                false,
+                Some(stream_status),
+            );
+            let next_error = error_message.map(str::to_string);
+            router_visible_changed |= log.error_message != next_error;
+            log.error_message = next_error;
+            if router_visible_changed {
+                log.router_last_synced_at_ms = None;
+                log.router_last_sync_error = None;
+                log.router_sync_attempt_count = 0;
+            }
+        })
+        .await;
+    match persisted {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => tracing::warn!("failed to persist websocket stream usage update: {error}"),
+    }
+    state.emit_event(
+        ServerEvent::new("usage.updated", "usage")
+            .id(request_id.to_string())
+            .app(stored.app)
+            .message(stream_status),
+    );
+    crate::state::sync_latest_direct_share_log(state.clone()).await;
+}
+
 fn apply_stream_usage_fields(
     log: &mut UsageLog,
     status_code: u16,
     duration_ms: u128,
     first_token_ms: Option<u128>,
     usage: TokenUsage,
+    usage_parse_error: bool,
     stream_status: Option<&str>,
 ) -> bool {
     let mut router_visible_changed =
@@ -177,12 +280,46 @@ fn apply_stream_usage_fields(
         log.cache_creation_tokens = Some(cache_creation_tokens);
     }
     if let Some(total_tokens) = usage.total_tokens {
+        router_visible_changed |= log.total_tokens != Some(total_tokens);
         log.total_tokens = Some(total_tokens);
     }
-    if let Some(stream_status) = stream_status {
-        log.stream_status = Some(stream_status.to_string());
+    let next_stream_status = stream_status
+        .map(str::to_string)
+        .or_else(|| log.stream_status.clone());
+    router_visible_changed |= log.stream_status != next_stream_status;
+    log.stream_status = next_stream_status;
+
+    let next_usage_state = usage_state_for_stream(usage, usage_parse_error, stream_status);
+    router_visible_changed |= log.usage_state != next_usage_state;
+    log.usage_state = next_usage_state;
+    if router_visible_changed {
+        log.usage_revision = log.usage_revision.saturating_add(1);
     }
     router_visible_changed
+}
+
+fn usage_state_for_stream(
+    usage: TokenUsage,
+    parse_error: bool,
+    stream_status: Option<&str>,
+) -> UsageState {
+    if parse_error {
+        return UsageState::ParseError;
+    }
+    if matches!(stream_status, Some("pending" | "streaming")) {
+        return UsageState::Pending;
+    }
+    if matches!(
+        stream_status,
+        Some("client_cancelled" | "interrupted" | "timeout")
+    ) {
+        return UsageState::Interrupted;
+    }
+    if usage.has_observation() {
+        UsageState::Observed
+    } else {
+        UsageState::Missing
+    }
 }
 
 #[cfg(test)]
@@ -201,7 +338,7 @@ mod tests {
 
     use super::*;
     use crate::cli::Cli;
-    use crate::domain::providers::model::{AppKind, Provider};
+    use crate::domain::providers::model::{AppKind, Provider, ProviderType};
     use crate::domain::settings::config::RouterIdentity;
     use crate::domain::sharing::shares::{ShareBinding, UpsertShareInput};
     use crate::logging::{LogCapture, RING_BUFFER_CAPACITY};
@@ -320,6 +457,7 @@ mod tests {
                 share_name: Some("Stream Usage Share".to_string()),
                 data_source: Some("direct".to_string()),
                 is_streaming: true,
+                stream_status: Some("pending".to_string()),
                 ..UsageLogContext::default()
             },
         )
@@ -350,6 +488,9 @@ mod tests {
         assert_eq!(payloads[0]["logs"][0]["requestId"], REQUEST_ID);
         assert_eq!(payloads[0]["logs"][0]["inputTokens"], 0);
         assert_eq!(payloads[0]["logs"][0]["latencyMs"], 5);
+        assert_eq!(payloads[0]["logs"][0]["usageState"], "pending");
+        assert_eq!(payloads[0]["logs"][0]["streamStatus"], "pending");
+        assert_eq!(payloads[0]["logs"][0]["usageRevision"], 1);
         assert_eq!(payloads[1]["logs"][0]["requestId"], REQUEST_ID);
         assert_eq!(payloads[1]["logs"][0]["statusCode"], 200);
         assert_eq!(payloads[1]["logs"][0]["latencyMs"], 321);
@@ -358,6 +499,9 @@ mod tests {
         assert_eq!(payloads[1]["logs"][0]["outputTokens"], 7);
         assert_eq!(payloads[1]["logs"][0]["cacheReadTokens"], 3);
         assert_eq!(payloads[1]["logs"][0]["cacheCreationTokens"], 2);
+        assert_eq!(payloads[1]["logs"][0]["usageState"], "observed");
+        assert_eq!(payloads[1]["logs"][0]["streamStatus"], "completed");
+        assert_eq!(payloads[1]["logs"][0]["usageRevision"], 2);
         drop(payloads);
 
         let usage = state.usage_snapshot().await;
@@ -367,9 +511,103 @@ mod tests {
             .find(|log| log.request_id == REQUEST_ID)
             .unwrap();
         assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        assert_eq!(log.usage_state, UsageState::Observed);
+        assert_eq!(log.usage_revision, 2);
         assert_eq!(log.router_sync_attempt_count, 1);
         assert!(log.router_last_synced_at_ms.is_some());
         assert!(log.router_last_sync_error.is_none());
+    }
+
+    fn pending_usage_log() -> UsageLog {
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "provider".to_string(),
+            "Provider".to_string(),
+            ProviderType::CodexOAuth,
+            200,
+            1,
+            UsageModelMetadata {
+                model: Some("gpt-5.4".to_string()),
+                ..UsageModelMetadata::default()
+            },
+            TokenUsage::default(),
+        );
+        log.apply_context(UsageLogContext {
+            is_streaming: true,
+            stream_status: Some("pending".to_string()),
+            ..UsageLogContext::default()
+        });
+        log
+    }
+
+    #[test]
+    fn stream_usage_state_distinguishes_explicit_zero_from_missing() {
+        let mut log = pending_usage_log();
+        assert_eq!(log.usage_state, UsageState::Pending);
+        assert_eq!(log.usage_revision, 1);
+
+        assert!(apply_stream_usage_fields(
+            &mut log,
+            200,
+            10,
+            Some(2),
+            TokenUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                ..TokenUsage::default()
+            },
+            false,
+            Some("completed"),
+        ));
+        assert_eq!(log.usage_state, UsageState::Observed);
+        assert_eq!(log.input_tokens, Some(0));
+        assert_eq!(log.output_tokens, Some(0));
+        assert_eq!(log.usage_revision, 2);
+
+        let mut missing = pending_usage_log();
+        apply_stream_usage_fields(
+            &mut missing,
+            200,
+            10,
+            None,
+            TokenUsage::default(),
+            false,
+            Some("completed"),
+        );
+        assert_eq!(missing.usage_state, UsageState::Missing);
+    }
+
+    #[test]
+    fn stream_usage_state_reports_parse_error_and_interruption() {
+        let mut parse_error = pending_usage_log();
+        apply_stream_usage_fields(
+            &mut parse_error,
+            200,
+            10,
+            None,
+            TokenUsage::default(),
+            true,
+            Some("completed"),
+        );
+        assert_eq!(parse_error.usage_state, UsageState::ParseError);
+        assert_eq!(parse_error.usage_revision, 2);
+
+        let mut interrupted = pending_usage_log();
+        apply_stream_usage_fields(
+            &mut interrupted,
+            200,
+            10,
+            None,
+            TokenUsage {
+                output_tokens: Some(4),
+                ..TokenUsage::default()
+            },
+            false,
+            Some("client_cancelled"),
+        );
+        assert_eq!(interrupted.usage_state, UsageState::Interrupted);
+        assert_eq!(interrupted.output_tokens, Some(4));
+        assert_eq!(interrupted.usage_revision, 2);
     }
 
     fn test_state() -> crate::state::ServerState {

@@ -6,7 +6,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useRequestDetail } from "@/lib/query/usage";
-import { getFreshInputTokens, getTotalTokens } from "@/types/usage";
+import {
+  getFreshInputTokens,
+  getTotalTokens,
+  hasObservedUsage,
+} from "@/types/usage";
 
 interface RequestDetailPanelProps {
   requestId: string;
@@ -54,6 +58,11 @@ export function RequestDetailPanel({
   }
 
   const freshInput = getFreshInputTokens(request);
+  const usageObserved = hasObservedUsage(request);
+  const usageStateLabel = t(
+    `usage.usageState.${request.usageState || "observed"}`,
+    { defaultValue: request.usageState || "observed" },
+  );
   const rawInput =
     request.rawInputTokens ??
     freshInput + request.cacheReadTokens + request.cacheCreationTokens;
@@ -68,6 +77,18 @@ export function RequestDetailPanel({
     request.imageWidth != null && request.imageHeight != null
       ? `${request.imageWidth} x ${request.imageHeight}`
       : request.imageSize;
+  const hasRequestPolicy = Boolean(
+    request.requestedReasoningEffort ||
+    request.effectiveReasoningEffort ||
+    request.clientServiceTier ||
+    request.effectiveServiceTier ||
+    request.serviceTierDecision,
+  );
+  const fastDecision = request.serviceTierDecision
+    ? t(`usage.serviceTierDecision.${request.serviceTierDecision}`, {
+        defaultValue: request.serviceTierDecision,
+      })
+    : null;
 
   return (
     <Dialog open onOpenChange={onClose}>
@@ -82,7 +103,8 @@ export function RequestDetailPanel({
             <h3 className="mb-3 font-semibold">
               {t("usage.basicInfo", "基本信息")}
             </h3>
-            <dl className="grid grid-cols-2 gap-3 text-sm">
+            {usageObserved ? (
+              <dl className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <dt className="text-muted-foreground">
                   {t("usage.requestId", "请求ID")}
@@ -123,7 +145,9 @@ export function RequestDetailPanel({
                   {t("usage.requestModel", "请求模型")}
                 </dt>
                 <dd className="font-mono">
-                  {request.requestedModel || request.requestModel || request.model}
+                  {request.requestedModel ||
+                    request.requestModel ||
+                    request.model}
                 </dd>
               </div>
               <div>
@@ -155,8 +179,72 @@ export function RequestDetailPanel({
                   </span>
                 </dd>
               </div>
-            </dl>
+              </dl>
+            ) : (
+              <div className="text-sm text-muted-foreground">
+                <div>{usageStateLabel}</div>
+                {request.streamStatus && (
+                  <div className="mt-1 font-mono text-xs">
+                    {request.streamStatus}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
+
+          {hasRequestPolicy && (
+            <div className="rounded-lg border p-4">
+              <h3 className="mb-3 font-semibold">{t("usage.requestPolicy")}</h3>
+              <dl className="grid grid-cols-2 gap-3 text-sm">
+                {request.requestedReasoningEffort && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.requestedReasoningEffort")}
+                    </dt>
+                    <dd className="font-mono">
+                      {request.requestedReasoningEffort}
+                    </dd>
+                  </div>
+                )}
+                {request.effectiveReasoningEffort && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.effectiveReasoningEffort")}
+                    </dt>
+                    <dd className="font-mono">
+                      {request.effectiveReasoningEffort}
+                    </dd>
+                  </div>
+                )}
+                {request.clientServiceTier && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.clientServiceTier")}
+                    </dt>
+                    <dd className="font-mono">{request.clientServiceTier}</dd>
+                  </div>
+                )}
+                {request.effectiveServiceTier && (
+                  <div>
+                    <dt className="text-muted-foreground">
+                      {t("usage.effectiveServiceTier")}
+                    </dt>
+                    <dd className="font-mono">
+                      {request.effectiveServiceTier}
+                    </dd>
+                  </div>
+                )}
+                {fastDecision && (
+                  <div className="col-span-2">
+                    <dt className="text-muted-foreground">
+                      {t("usage.fastDecision")}
+                    </dt>
+                    <dd>{fastDecision}</dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+          )}
 
           {/* Token 使用量 */}
           <div className="rounded-lg border p-4">

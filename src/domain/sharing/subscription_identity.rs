@@ -49,7 +49,7 @@ impl SubscriptionIdentityKey {
 pub enum SubscriptionBindingError {
     #[error("share not found: {0}")]
     ShareNotFound(String),
-    #[error("share {share_id} must have exactly one binding")]
+    #[error("share {share_id} must have between one and three valid bindings")]
     InvalidShareBinding { share_id: String },
     #[error("share {share_id} Provider is missing: {app}/{provider_id}")]
     ProviderMissing {
@@ -212,9 +212,8 @@ fn collect_subscription_reference_graph(
         .iter()
         .filter(|share| share.status != "deleted")
     {
-        let identities = match resolve_share_subscription_identity(share, providers, accounts) {
-            Ok(Some(identity)) => vec![identity],
-            Ok(None) => Vec::new(),
+        let identities = match resolve_share_subscription_identities(share, providers, accounts) {
+            Ok(identities) => identities,
             Err(error) => {
                 errors.push(SubscriptionGraphIssue {
                     share_id: share.id.clone(),
@@ -224,20 +223,7 @@ fn collect_subscription_reference_graph(
             }
         };
         for identity in identities {
-            if let Some(existing_share_id) = owners.get(&identity) {
-                if existing_share_id != &share.id {
-                    errors.push(SubscriptionGraphIssue {
-                        share_id: share.id.clone(),
-                        error: SubscriptionBindingError::IdentityConflict {
-                            fingerprint: identity.fingerprint(),
-                            existing_share_id: existing_share_id.clone(),
-                            conflicting_share_id: share.id.clone(),
-                        },
-                    });
-                }
-            } else {
-                owners.insert(identity, share.id.clone());
-            }
+            owners.entry(identity).or_insert_with(|| share.id.clone());
         }
     }
     (owners, errors)
@@ -254,26 +240,11 @@ pub fn validate_share_subscription_binding(
         .iter()
         .find(|share| share.id == share_id)
         .ok_or_else(|| SubscriptionBindingError::ShareNotFound(share_id.to_string()))?;
-    let Some(identity) = resolve_share_subscription_identity(share, providers, accounts)? else {
-        return Ok(None);
-    };
-
-    for other in shares
-        .shares
-        .iter()
-        .filter(|other| other.id != share.id && other.status != "deleted")
-    {
-        if subscription_identity_reservations_for_share(other, providers, accounts)
-            .contains(&identity)
-        {
-            return Err(SubscriptionBindingError::IdentityConflict {
-                fingerprint: identity.fingerprint(),
-                existing_share_id: other.id.clone(),
-                conflicting_share_id: share.id.clone(),
-            });
-        }
-    }
-    Ok(Some(identity))
+    Ok(
+        resolve_share_subscription_identities(share, providers, accounts)?
+            .into_iter()
+            .next(),
+    )
 }
 
 pub fn validate_shared_provider_bindings_unchanged(
@@ -506,13 +477,10 @@ pub fn share_ids_for_account(
         .iter()
         .filter(|share| share.status != "deleted")
     {
-        let referenced = std::iter::once((share.app, share.provider_id.as_str()))
-            .chain(
-                share
-                    .bindings
-                    .iter()
-                    .map(|binding| (binding.app, binding.provider_id.as_str())),
-            )
+        let referenced = share
+            .bindings
+            .iter()
+            .map(|binding| (binding.app, binding.provider_id.as_str()))
             .filter_map(|(app, provider_id)| find_provider(providers, app, provider_id))
             .any(|provider| provider_account_id(provider) == Some(account_id));
         if referenced {
@@ -524,41 +492,40 @@ pub fn share_ids_for_account(
     ids
 }
 
-fn resolve_share_subscription_identity(
+fn resolve_share_subscription_identities(
     share: &Share,
     providers: &ProviderStore,
     accounts: &AccountStore,
-) -> Result<Option<SubscriptionIdentityKey>, SubscriptionBindingError> {
-    let provider = find_provider(providers, share.app, &share.provider_id).ok_or_else(|| {
-        SubscriptionBindingError::ProviderMissing {
+) -> Result<Vec<SubscriptionIdentityKey>, SubscriptionBindingError> {
+    crate::domain::sharing::invariants::validate_share_import(share).map_err(|_| {
+        SubscriptionBindingError::InvalidShareBinding {
             share_id: share.id.clone(),
-            app: share.app.as_str(),
-            provider_id: share.provider_id.clone(),
         }
     })?;
-    if provider.provider_type != share.provider_type {
-        return Err(SubscriptionBindingError::ProviderTypeMismatch {
-            share_id: share.id.clone(),
-        });
-    }
-
-    match share.bindings.as_slice() {
-        [binding]
-            if binding.app == share.app
-                && binding.provider_id == share.provider_id
-                && binding.provider_type == share.provider_type => {}
-        [] if !is_subscription_oauth(provider.provider_type) => return Ok(None),
-        _ => {
-            return Err(SubscriptionBindingError::InvalidShareBinding {
+    let mut identities = Vec::new();
+    for binding in &share.bindings {
+        let provider =
+            find_provider(providers, binding.app, &binding.provider_id).ok_or_else(|| {
+                SubscriptionBindingError::ProviderMissing {
+                    share_id: share.id.clone(),
+                    app: binding.app.as_str(),
+                    provider_id: binding.provider_id.clone(),
+                }
+            })?;
+        if provider.provider_type != binding.provider_type {
+            return Err(SubscriptionBindingError::ProviderTypeMismatch {
                 share_id: share.id.clone(),
             });
         }
+        if is_subscription_oauth(provider.provider_type) {
+            if let Some(identity) = resolve_provider_subscription_identity(provider, accounts)? {
+                identities.push(identity);
+            }
+        }
     }
-
-    if !is_subscription_oauth(provider.provider_type) {
-        return Ok(None);
-    }
-    resolve_provider_subscription_identity(provider, accounts)
+    identities.sort();
+    identities.dedup();
+    Ok(identities)
 }
 
 fn is_subscription_oauth(provider_type: ProviderType) -> bool {
@@ -573,13 +540,10 @@ fn subscription_identity_reservations_for_share(
     providers: &ProviderStore,
     accounts: &AccountStore,
 ) -> Vec<SubscriptionIdentityKey> {
-    let mut identities = std::iter::once((share.app, share.provider_id.as_str()))
-        .chain(
-            share
-                .bindings
-                .iter()
-                .map(|binding| (binding.app, binding.provider_id.as_str())),
-        )
+    let mut identities = share
+        .bindings
+        .iter()
+        .map(|binding| (binding.app, binding.provider_id.as_str()))
         .filter_map(|(app, provider_id)| find_provider(providers, app, provider_id))
         .filter_map(|provider| subscription_identity_reservation(provider, accounts))
         .collect::<Vec<_>>();
@@ -853,6 +817,8 @@ mod tests {
         let mut share = share(id, provider_id);
         share.app = AppKind::Claude;
         share.provider_type = ProviderType::ClaudeOAuth;
+        share.access_by_app.clear();
+        share.app_settings.clear();
         share.bindings = vec![ShareBinding {
             app: AppKind::Claude,
             provider_id: provider_id.to_string(),
@@ -862,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_logical_subscription_is_rejected_across_local_accounts() {
+    fn duplicate_logical_subscription_can_back_multiple_share_urls() {
         let accounts = AccountStore {
             accounts: vec![
                 account("account-a", "subject-1", "workspace-1"),
@@ -885,9 +851,9 @@ mod tests {
             ..ShareStore::default()
         };
 
-        let error =
-            validate_subscription_reference_graph(&providers, &accounts, &shares).unwrap_err();
-        assert_eq!(error.code(), "cc_switch_subscription_identity_conflict");
+        let graph = validate_subscription_reference_graph(&providers, &accounts, &shares).unwrap();
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph.values().next().map(String::as_str), Some("share-a"));
     }
 
     #[test]
@@ -923,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_account_uuid_conflicts_are_case_insensitive() {
+    fn claude_account_uuid_can_back_multiple_share_urls() {
         let accounts = AccountStore {
             accounts: vec![
                 claude_account("account-a", "CLAUDE-ACCOUNT-UUID"),
@@ -946,9 +912,12 @@ mod tests {
             ..ShareStore::default()
         };
 
-        let error =
-            validate_subscription_reference_graph(&providers, &accounts, &shares).unwrap_err();
-        assert_eq!(error.code(), "cc_switch_subscription_identity_conflict");
+        assert_eq!(
+            validate_subscription_reference_graph(&providers, &accounts, &shares)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1004,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_non_subscription_share_without_bindings_keeps_its_primary_provider() {
+    fn share_without_bindings_is_rejected_in_fresh_schema() {
         let mut static_provider = provider("provider-a", "unused-account");
         static_provider.provider_type = ProviderType::Codex;
         static_provider.provider_type_id = ProviderType::Codex.as_str().to_string();
@@ -1024,15 +993,12 @@ mod tests {
         };
         let accounts = AccountStore::default();
 
-        assert_eq!(
-            validate_share_subscription_binding("share-a", &providers, &accounts, &shares).unwrap(),
-            None
-        );
-        assert!(
-            validate_subscription_reference_graph(&providers, &accounts, &shares)
-                .unwrap()
-                .is_empty()
-        );
+        let error = validate_share_subscription_binding("share-a", &providers, &accounts, &shares)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SubscriptionBindingError::InvalidShareBinding { .. }
+        ));
     }
 
     #[test]
@@ -1062,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn every_non_deleted_share_reserves_identity() {
+    fn every_non_deleted_share_can_share_one_capacity_identity() {
         let accounts = AccountStore {
             accounts: vec![
                 account("account-a", "subject-1", "workspace-1"),
@@ -1086,12 +1052,12 @@ mod tests {
                 shares: vec![first.clone(), second.clone()],
                 ..ShareStore::default()
             };
-            let error =
-                validate_subscription_reference_graph(&providers, &accounts, &shares).unwrap_err();
             assert_eq!(
-                error.code(),
-                "cc_switch_subscription_identity_conflict",
-                "status {status} must continue reserving the identity"
+                validate_subscription_reference_graph(&providers, &accounts, &shares)
+                    .unwrap()
+                    .len(),
+                1,
+                "status {status} must preserve the shared identity"
             );
         }
 
@@ -1285,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_share_still_reserves_its_verified_subscription_identity() {
+    fn stale_share_does_not_block_an_independent_url_for_same_identity() {
         let accounts = AccountStore {
             accounts: vec![
                 account("account-a", "shared-subject", "shared-workspace"),
@@ -1316,20 +1282,19 @@ mod tests {
         let mut candidate = current.clone();
         candidate.shares.push(share("share-b", "provider-b"));
 
-        let error = validate_subscription_reference_graph_transition(
+        validate_subscription_reference_graph_transition(
             &providers, &accounts, &current, &providers, &accounts, &candidate,
         )
-        .unwrap_err();
-
-        assert_eq!(error.code(), "cc_switch_subscription_identity_conflict");
-        let error =
+        .unwrap();
+        assert!(
             validate_share_subscription_binding("share-b", &providers, &accounts, &candidate)
-                .unwrap_err();
-        assert_eq!(error.code(), "cc_switch_subscription_identity_conflict");
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
-    fn reducing_an_identity_conflict_allows_the_owner_to_change() {
+    fn adding_and_removing_urls_for_one_identity_is_allowed() {
         let accounts = AccountStore {
             accounts: vec![
                 account("account-a", "subject", "workspace"),
@@ -1370,10 +1335,9 @@ mod tests {
         .unwrap();
 
         reduced.shares.push(share("share-d", "provider-d"));
-        let error = validate_subscription_reference_graph_transition(
+        validate_subscription_reference_graph_transition(
             &providers, &accounts, &shares, &providers, &accounts, &reduced,
         )
-        .unwrap_err();
-        assert_eq!(error.code(), "cc_switch_subscription_identity_conflict");
+        .unwrap();
     }
 }

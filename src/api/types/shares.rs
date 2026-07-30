@@ -39,6 +39,54 @@ pub(in crate::api) struct UpdateShareBindingRequest {
     pub(in crate::api) expected_config_revision: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ShareReuseCandidatesQuery {
+    pub(in crate::api) app: AppKind,
+    pub(in crate::api) provider_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ShareReuseCandidate {
+    pub(in crate::api) share_id: String,
+    pub(in crate::api) share_name: String,
+    pub(in crate::api) subdomain: Option<String>,
+    pub(in crate::api) apps: Vec<AppKind>,
+    pub(in crate::api) config_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ShareReuseCandidatesResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) candidates: Vec<ShareReuseCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct AddShareBindingRequest {
+    pub(in crate::api) app: AppKind,
+    pub(in crate::api) provider_id: String,
+    pub(in crate::api) expected_config_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct RemoveShareBindingRequest {
+    pub(in crate::api) app: AppKind,
+    pub(in crate::api) provider_id: String,
+    pub(in crate::api) expected_config_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct RemoveShareBindingResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) deleted_share: bool,
+    pub(in crate::api) share: Option<Share>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct ShareConnectInfoResponse {

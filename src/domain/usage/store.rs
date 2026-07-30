@@ -18,7 +18,7 @@ const MAX_USAGE_LOGS: usize = 2_000;
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
-const USAGE_SCHEMA_VERSION: u8 = 3;
+const USAGE_SCHEMA_VERSION: u8 = 4;
 const USAGE_JOURNAL_VERSION: u8 = 2;
 const DEFAULT_USAGE_STATS_WINDOW_MS: u128 = 60 * 60 * 1000;
 const DEFAULT_USAGE_STATS_LIMIT: usize = 50;
@@ -109,6 +109,16 @@ pub struct UsageLog {
     pub actual_model: Option<String>,
     #[serde(default)]
     pub actual_model_source: Option<String>,
+    #[serde(default)]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub effective_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub client_service_tier: Option<String>,
+    #[serde(default)]
+    pub effective_service_tier: Option<String>,
+    #[serde(default)]
+    pub service_tier_decision: Option<String>,
     pub status_code: u16,
     #[serde(default)]
     pub error_message: Option<String>,
@@ -152,6 +162,10 @@ pub struct UsageLog {
     #[serde(default)]
     pub stream_status: Option<String>,
     #[serde(default)]
+    pub usage_state: UsageState,
+    #[serde(default)]
+    pub usage_revision: u64,
+    #[serde(default)]
     pub usage_estimated: bool,
     #[serde(default)]
     pub share_name: Option<String>,
@@ -194,9 +208,15 @@ pub struct UsageLogContext {
     pub is_health_check: bool,
     pub is_streaming: bool,
     pub stream_status: Option<String>,
+    pub usage_state: Option<UsageState>,
     pub usage_estimated: bool,
     pub error_message: Option<String>,
     pub image: Option<ImageUsageMetadata>,
+    pub requested_reasoning_effort: Option<String>,
+    pub effective_reasoning_effort: Option<String>,
+    pub client_service_tier: Option<String>,
+    pub effective_service_tier: Option<String>,
+    pub service_tier_decision: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -207,6 +227,29 @@ pub struct ImageUsageMetadata {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub size: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageState {
+    Pending,
+    Observed,
+    #[default]
+    Missing,
+    ParseError,
+    Interrupted,
+}
+
+impl UsageState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Observed => "observed",
+            Self::Missing => "missing",
+            Self::ParseError => "parse_error",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 impl UsageStore {
@@ -720,6 +763,11 @@ impl UsageLog {
             requested_model: model.requested_model,
             actual_model: model.actual_model,
             actual_model_source: model.actual_model_source,
+            requested_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            client_service_tier: None,
+            effective_service_tier: None,
+            service_tier_decision: None,
             status_code,
             error_message: None,
             duration_ms,
@@ -742,6 +790,12 @@ impl UsageLog {
             is_health_check: false,
             is_streaming: false,
             stream_status: None,
+            usage_state: if usage.has_observation() {
+                UsageState::Observed
+            } else {
+                UsageState::Missing
+            },
+            usage_revision: 1,
             usage_estimated: false,
             share_name: None,
             user_country: None,
@@ -767,8 +821,20 @@ impl UsageLog {
         self.user_country_iso3 = context.user_country_iso3;
         self.is_streaming = context.is_streaming;
         self.stream_status = context.stream_status;
+        self.usage_state = context.usage_state.unwrap_or_else(|| {
+            if self.stream_status.as_deref() == Some("pending") {
+                UsageState::Pending
+            } else {
+                self.usage_state
+            }
+        });
         self.usage_estimated = context.usage_estimated;
         self.error_message = context.error_message;
+        self.requested_reasoning_effort = context.requested_reasoning_effort;
+        self.effective_reasoning_effort = context.effective_reasoning_effort;
+        self.client_service_tier = context.client_service_tier;
+        self.effective_service_tier = context.effective_service_tier;
+        self.service_tier_decision = context.service_tier_decision;
         if let Some(image) = context.image {
             self.image_count = Some(image.count);
             self.image_bytes = Some(image.bytes);
@@ -1174,6 +1240,17 @@ pub struct TokenUsage {
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    pub fn has_observation(self) -> bool {
+        self.raw_input_tokens.is_some()
+            || self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.total_tokens.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3107,6 +3184,61 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.request_id == "req_post_migration"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_logs_without_codex_policy_fields_migrate_to_v4() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-usage-policy-migration-test-{}",
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut legacy_log = serde_json::to_value(UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::CodexOAuth,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+        ))
+        .unwrap();
+        let object = legacy_log.as_object_mut().unwrap();
+        for field in [
+            "requestedReasoningEffort",
+            "effectiveReasoningEffort",
+            "clientServiceTier",
+            "effectiveServiceTier",
+            "serviceTierDecision",
+        ] {
+            object.remove(field);
+        }
+        fs::write(
+            usage_path(&dir),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 3,
+                "logs": [legacy_log]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = UsageStore::load_or_default(&dir).unwrap();
+
+        assert_eq!(loaded.schema_version, 4);
+        let log = loaded.logs.first().unwrap();
+        assert_eq!(log.requested_reasoning_effort, None);
+        assert_eq!(log.effective_reasoning_effort, None);
+        assert_eq!(log.client_service_tier, None);
+        assert_eq!(log.effective_service_tier, None);
+        assert_eq!(log.service_tier_decision, None);
+        let persisted =
+            serde_json::from_slice::<serde_json::Value>(&fs::read(usage_path(&dir)).unwrap())
+                .unwrap();
+        assert_eq!(persisted["schemaVersion"], 4);
 
         fs::remove_dir_all(&dir).unwrap();
     }

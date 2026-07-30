@@ -9,6 +9,7 @@ import {
   type CreateShareParams,
   type PublicTokenMarket,
   type SaveProviderShareParams,
+  type ShareBindingMutationParams,
   type ShareRecord,
   type ShareHealthStatus,
   type ShareTunnelStatus,
@@ -302,6 +303,32 @@ export function useCreateShareMutation() {
       );
     },
   });
+}
+
+export function useAddShareBindingMutation() {
+  return useShareActionMutation(
+    (params: ShareBindingMutationParams) => shareApi.addBinding(params),
+    {
+      successKey: "provider.share.reuseSuccess",
+      successDefault: "已复用现有分享链接",
+      errorKey: "provider.share.reuseError",
+      errorDefault: "复用分享链接失败: {{error}}",
+    },
+    ({ shareId }) => shareId,
+  );
+}
+
+export function useRemoveShareBindingMutation() {
+  return useShareActionMutation(
+    (params: ShareBindingMutationParams) => shareApi.removeBinding(params),
+    {
+      successKey: "provider.share.removeBindingSuccess",
+      successDefault: "已停止该应用的远程分享",
+      errorKey: "provider.share.removeBindingError",
+      errorDefault: "停止远程分享失败: {{error}}",
+    },
+    ({ shareId }) => shareId,
+  );
 }
 
 export function useSaveProviderShareMutation() {

@@ -28,6 +28,7 @@ import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
 import { ProviderInUseTag } from "@/components/providers/ProviderQuotaMetaRow";
 import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
+import { ProviderShareReuseDialog } from "@/components/providers/ProviderShareReuseDialog";
 import {
   extractCodexBaseUrl,
   extractCodexExperimentalBearerToken,
@@ -262,6 +263,9 @@ export function ProviderCard({
     handleSharePrimaryAction,
     handleShareResume,
     deleteShare,
+    reuseCandidates,
+    confirmShareReuse,
+    dismissShareReuse,
   } = useToggleProviderShare(appId, provider.id);
 
   const handleShareDeleteRequest = useCallback(() => {
@@ -638,6 +642,13 @@ export function ProviderCard({
         })}
         onConfirm={handleShareDeleteConfirm}
         onCancel={() => setShareDeleteConfirmOpen(false)}
+      />
+      <ProviderShareReuseDialog
+        candidates={reuseCandidates}
+        onConfirm={(reuse, shareId) => {
+          void confirmShareReuse(reuse, shareId);
+        }}
+        onCancel={dismissShareReuse}
       />
     </div>
   );

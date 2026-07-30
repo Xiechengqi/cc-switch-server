@@ -146,6 +146,14 @@
       "saveSuccess": "分享配置已保存",
       "saveError": "保存分享配置失败：{{error}}",
       "routerFromSettingsHint": "使用设置 → 分享中的默认 Router 节点创建 share。",
+      "reuseTitle": "发现同一账号或 API key 的远程分享",
+      "reuseDescription": "可以将当前应用加入已有链接，也可以保留为新的独立链接。",
+      "reuseTarget": "已有分享",
+      "reuseCheckbox": "复用已有 Share URL 和远程分享配置",
+      "reuseSuccess": "已复用现有分享链接",
+      "reuseError": "复用分享链接失败：{{error}}",
+      "removeBindingSuccess": "已停止该应用的远程分享",
+      "removeBindingError": "停止远程分享失败：{{error}}",
       "ownerNotConfigured": "请先配置 Client Owner",
       "ownerManagedHint": "Share Owner 与 Client Owner 保持一致。可在「设置 → 分享」通过安装签名的 Owner 换绑进行修改。",
       "officialPricePercent": "模型定价（官方价的百分比）",
@@ -1414,7 +1422,7 @@
     "addDeviceAccount": "通过 Device Code 授权",
     "selectAccountRequired": "OpenAI OAuth 必须绑定一个 ChatGPT 账号",
     "fastMode": "FAST 模式",
-    "fastModeDescription": "发送 service_tier=\"priority\" 换取更低延迟。默认关闭——开启后会按更高速率消耗 ChatGPT 配额。"
+    "fastModeDescription": "FAST 完全由服务端控制。关闭时会移除客户端提交的 service_tier；开启时仅对明确支持的模型强制 priority，客户端 FAST 设置无法覆盖服务端策略。priority 可能更快消耗 ChatGPT 配额。"
   },
   "codexBankedReset": {
     "title": "Banked Reset",
@@ -1633,8 +1641,20 @@
     "outputTokens": "输出",
     "cacheReadTokens": "缓存命中",
     "cacheCreationTokens": "缓存创建",
+    "imageOutput": "图片输出",
+    "imageCount": "图片数量",
+    "imageBytes": "输出字节",
+    "imageFormat": "图片格式",
+    "imageDimensions": "图片尺寸",
     "timingInfo": "用时/首字",
     "status": "状态",
+    "usageState": {
+      "pending": "等待统计",
+      "observed": "已统计",
+      "missing": "未返回用量",
+      "parse_error": "用量解析失败",
+      "interrupted": "请求已中断"
+    },
     "requestModel": "请求模型",
     "responseModel": "返回模型",
     "noData": "暂无数据",
@@ -1725,7 +1745,21 @@
     "timeRangeTooLarge": "时间范围过大，请缩小范围",
     "modelPath": "模型路径",
     "actualModel": "实际模型",
-    "firstToken": "首 Token"
+    "firstToken": "首 Token",
+    "requestPolicy": "请求策略",
+    "reasoningEffortShort": "推理等级",
+    "fastModeShort": "FAST",
+    "requestedReasoningEffort": "用户请求推理等级",
+    "effectiveReasoningEffort": "实际推理等级",
+    "clientServiceTier": "客户端 Service Tier",
+    "effectiveServiceTier": "实际 Service Tier",
+    "fastDecision": "FAST 决策",
+    "serviceTierDecision": {
+      "server_disabled": "服务端已关闭",
+      "server_forced_priority": "服务端强制 Priority",
+      "model_unsupported": "模型不支持 Priority",
+      "capability_unknown": "Priority 能力未知"
+    }
   },
   "dbUpgrade": {
     "title": "数据库版本过新",

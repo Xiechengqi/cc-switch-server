@@ -128,7 +128,15 @@
     },
     "share": {
       "ownerNotConfigured": "先に Client Owner を設定してください",
-      "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
+  "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
+  "reuseTitle": "同じアカウントまたは API キーの共有が見つかりました",
+  "reuseDescription": "このアプリを既存 URL に追加するか、新しい個別 URL を作成できます。",
+  "reuseTarget": "既存の共有",
+  "reuseCheckbox": "既存の Share URL とリモート設定を再利用する",
+  "reuseSuccess": "既存の共有 URL を再利用しました",
+  "reuseError": "共有 URL の再利用に失敗しました: {{error}}",
+  "removeBindingSuccess": "このアプリのリモート共有を停止しました",
+  "removeBindingError": "リモート共有の停止に失敗しました: {{error}}",
       "deleteShort": "Share を削除",
       "deleteConfirmTitle": "Share を削除",
       "deleteConfirmMessage": "削除すると Share ページから取り除かれ、元に戻せません。",
@@ -1335,7 +1343,7 @@
     "addDeviceAccount": "Device Code で認証",
     "selectAccountRequired": "OpenAI OAuth を ChatGPT アカウントに関連付けてください",
     "fastMode": "FAST モード",
-    "fastModeDescription": "低遅延のため service_tier=\"priority\" を送信します。既定ではオフ——オンにすると ChatGPT のクォータがより速く消費されます。"
+    "fastModeDescription": "FAST はサーバーが完全に制御します。オフの場合はクライアントの service_tier を削除します。オンの場合は対応が明示されたモデルにのみ priority を強制し、クライアントの FAST 設定では上書きできません。priority は ChatGPT クォータをより速く消費する可能性があります。"
   },
   "codexBankedReset": {
     "title": "Banked Reset",
@@ -1554,8 +1562,20 @@
     "outputTokens": "出力",
     "cacheReadTokens": "キャッシュヒット",
     "cacheCreationTokens": "キャッシュ作成",
+    "imageOutput": "画像出力",
+    "imageCount": "画像数",
+    "imageBytes": "出力バイト数",
+    "imageFormat": "画像形式",
+    "imageDimensions": "画像サイズ",
     "timingInfo": "応答時間/TTFT",
     "status": "ステータス",
+    "usageState": {
+      "pending": "集計待ち",
+      "observed": "集計済み",
+      "missing": "使用量なし",
+      "parse_error": "使用量の解析失敗",
+      "interrupted": "中断済み"
+    },
     "requestModel": "リクエストモデル",
     "responseModel": "レスポンスモデル",
     "noData": "データなし",
@@ -1646,7 +1666,21 @@
     "timeRangeTooLarge": "時間範囲が大きすぎます。範囲を縮小してください",
     "modelPath": "モデル経路",
     "actualModel": "実際のモデル",
-    "firstToken": "最初の Token"
+    "firstToken": "最初の Token",
+    "requestPolicy": "リクエストポリシー",
+    "reasoningEffortShort": "推論レベル",
+    "fastModeShort": "FAST",
+    "requestedReasoningEffort": "要求された推論レベル",
+    "effectiveReasoningEffort": "実際の推論レベル",
+    "clientServiceTier": "クライアント Service Tier",
+    "effectiveServiceTier": "実際の Service Tier",
+    "fastDecision": "FAST 判定",
+    "serviceTierDecision": {
+      "server_disabled": "サーバーで無効",
+      "server_forced_priority": "サーバーが Priority を強制",
+      "model_unsupported": "モデルは Priority 非対応",
+      "capability_unknown": "Priority 対応状況が不明"
+    }
   },
   "dbUpgrade": {
     "title": "データベースのバージョンが新しすぎます",

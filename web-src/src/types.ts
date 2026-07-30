@@ -155,7 +155,7 @@ export interface ProviderMeta {
   isFullUrl?: boolean;
   // Prompt cache key for OpenAI Responses-compatible endpoints (improves cache hit rate)
   promptCacheKey?: string;
-  // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
+  // Server-authoritative Codex OAuth FAST policy.
   codexFastMode?: boolean;
   // Codex OAuth image generation via ChatGPT Codex backend
   codexImageGenerationEnabled?: boolean;

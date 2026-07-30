@@ -87,27 +87,21 @@ pub(in crate::api) fn openai_model_list(
         }
         for model_id in dedupe_non_empty(provider_models) {
             let capability = (provider.app == AppKind::Codex)
-                .then(|| crate::proxy::codex_models::capability_for_model(&model_id))
+                .then(|| {
+                    crate::proxy::codex_models::resolved_capability_for_model(provider, &model_id)
+                })
                 .flatten();
             let key = format!("{model_id}\u{0}{owned_by}");
             models.entry(key).or_insert(OpenAiModel {
                 id: model_id,
                 object: "model",
                 owned_by: owned_by.clone(),
-                reasoning_efforts: capability.map(|capability| {
-                    capability
-                        .reasoning_efforts
-                        .iter()
-                        .map(|effort| (*effort).to_string())
-                        .collect()
-                }),
-                input_modalities: capability.map(|capability| {
-                    capability
-                        .input_modalities
-                        .iter()
-                        .map(|modality| (*modality).to_string())
-                        .collect()
-                }),
+                reasoning_efforts: capability
+                    .as_ref()
+                    .and_then(|capability| capability.reasoning_efforts.clone()),
+                input_modalities: capability
+                    .as_ref()
+                    .and_then(|capability| capability.input_modalities.clone()),
             });
         }
     }

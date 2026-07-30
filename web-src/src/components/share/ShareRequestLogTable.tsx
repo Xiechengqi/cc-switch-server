@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { useRequestLogs } from "@/lib/query/usage";
+import { hasObservedUsage } from "@/types/usage";
 import { formatUtcDateTime } from "@/utils/shareUtils";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -143,37 +144,94 @@ export function ShareRequestLogTable({
                       </TableCell>
                     </TableRow>
                   ) : logs.length ? (
-                    logs.map((log) => (
-                      <TableRow key={log.requestId}>
-                        <TableCell className="whitespace-nowrap">
-                          {formatUtcDateTime(log.createdAt * 1000)}
-                        </TableCell>
-                        <TableCell className="max-w-48 truncate">
-                          {log.userEmail || "-"}
-                        </TableCell>
-                        <TableCell>
-                          <div className="font-medium">
-                            {log.requestAgent || log.appType} ·{" "}
-                            {log.actualModel || log.model || "-"}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            {log.requestedModel || log.requestModel || "-"}
-                          </div>
-                        </TableCell>
-                        <TableCell>{log.inputTokens}</TableCell>
-                        <TableCell>{log.outputTokens}</TableCell>
-                        <TableCell>{log.cacheReadTokens}</TableCell>
-                        <TableCell>{log.cacheCreationTokens}</TableCell>
-                        <TableCell>
-                          {log.inputTokens +
-                            log.outputTokens +
-                            log.cacheReadTokens +
-                            log.cacheCreationTokens}
-                        </TableCell>
-                        <TableCell>{log.statusCode}</TableCell>
-                        <TableCell>{log.latencyMs} ms</TableCell>
-                      </TableRow>
-                    ))
+                    logs.map((log) => {
+                      const usageObserved = hasObservedUsage(log);
+                      const usageStateLabel = t(
+                        `usage.usageState.${log.usageState || "observed"}`,
+                        { defaultValue: log.usageState || "observed" },
+                      );
+                      const requestedEffort = log.requestedReasoningEffort;
+                      const effectiveEffort = log.effectiveReasoningEffort;
+                      const reasoningPath =
+                        requestedEffort &&
+                        effectiveEffort &&
+                        requestedEffort !== effectiveEffort
+                          ? `${requestedEffort} → ${effectiveEffort}`
+                          : requestedEffort || effectiveEffort;
+                      const clientTier = log.clientServiceTier;
+                      const effectiveTier = log.effectiveServiceTier;
+                      const tierPath =
+                        clientTier &&
+                        effectiveTier &&
+                        clientTier !== effectiveTier
+                          ? `${clientTier} → ${effectiveTier}`
+                          : effectiveTier || clientTier;
+                      const fastDecision = log.serviceTierDecision
+                        ? t(
+                            `usage.serviceTierDecision.${log.serviceTierDecision}`,
+                            {
+                              defaultValue: log.serviceTierDecision,
+                            },
+                          )
+                        : null;
+                      return (
+                        <TableRow key={log.requestId}>
+                          <TableCell className="whitespace-nowrap">
+                            {formatUtcDateTime(log.createdAt * 1000)}
+                          </TableCell>
+                          <TableCell className="max-w-48 truncate">
+                            {log.userEmail || "-"}
+                          </TableCell>
+                          <TableCell>
+                            <div className="font-medium">
+                              {log.requestAgent || log.appType} ·{" "}
+                              {log.actualModel || log.model || "-"}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {log.requestedModel || log.requestModel || "-"}
+                            </div>
+                            {(reasoningPath || fastDecision) && (
+                              <div className="mt-1 text-[10px] text-muted-foreground">
+                                {reasoningPath && (
+                                  <div>
+                                    {t("usage.reasoningEffortShort")}:{" "}
+                                    {reasoningPath}
+                                  </div>
+                                )}
+                                {fastDecision && (
+                                  <div>
+                                    {t("usage.fastModeShort")}: {fastDecision}
+                                    {tierPath ? ` (${tierPath})` : ""}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell title={log.streamStatus || undefined}>
+                            {usageObserved ? log.inputTokens : usageStateLabel}
+                          </TableCell>
+                          <TableCell>
+                            {usageObserved ? log.outputTokens : "-"}
+                          </TableCell>
+                          <TableCell>
+                            {usageObserved ? log.cacheReadTokens : "-"}
+                          </TableCell>
+                          <TableCell>
+                            {usageObserved ? log.cacheCreationTokens : "-"}
+                          </TableCell>
+                          <TableCell>
+                            {usageObserved
+                              ? log.inputTokens +
+                                log.outputTokens +
+                                log.cacheReadTokens +
+                                log.cacheCreationTokens
+                              : "-"}
+                          </TableCell>
+                          <TableCell>{log.statusCode}</TableCell>
+                          <TableCell>{log.latencyMs} ms</TableCell>
+                        </TableRow>
+                      );
+                    })
                   ) : (
                     <TableRow>
                       <TableCell

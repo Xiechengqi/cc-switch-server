@@ -357,12 +357,18 @@ pub fn app_router(state: ServerState) -> Router {
             post(retry_usage_router_sync),
         )
         .route("/api/shares", get(list_shares).post(upsert_share))
+        .route("/api/shares/reuse-candidates", get(share_reuse_candidates))
         .route("/api/shares/export", get(export_shares))
         .route("/api/shares/import", post(import_shares))
         .route("/api/shares/:id", delete(delete_share))
         .route("/api/shares/:id/connect-info", get(share_connect_info))
         .route("/api/shares/:id/subdomain", post(update_share_subdomain))
         .route("/api/shares/:id/binding", post(update_share_binding))
+        .route("/api/shares/:id/bindings", post(add_share_binding))
+        .route(
+            "/api/shares/:id/bindings/remove",
+            post(remove_share_binding),
+        )
         .route("/api/shares/:id/pause", post(pause_share))
         .route("/api/shares/:id/resume", post(resume_share))
         .route("/api/shares/:id/tunnel/start", post(start_share_tunnel))

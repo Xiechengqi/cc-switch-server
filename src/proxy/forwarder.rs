@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::http::header::{ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE, HOST};
+use axum::http::header::{
+    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use base64::engine::general_purpose::STANDARD;
@@ -33,7 +35,8 @@ use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, Provid
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{
-    ImageUsageMetadata, TokenUsage, UsageLogContext, UsageModelMetadata,
+    usage_from_json_with_semantics, ImageUsageMetadata, InputTokenSemantics, TokenUsage,
+    UsageLogContext, UsageModelMetadata, UsageState,
 };
 use crate::infra::time::now_ms as current_time_ms;
 use crate::state::{
@@ -66,8 +69,14 @@ use super::router::{
     select_failover_provider, select_provider_for_codex_image_generation,
     select_provider_with_account_inflight, ProxyRoute,
 };
-use super::streaming::{ClaudeSseError, ClaudeSseErrorDetector, StreamUsageAccumulator};
-use super::usage::{log_usage, update_image_stream_usage, update_stream_usage};
+use super::streaming::{
+    ClaudeSseError, ClaudeSseErrorDetector, ResponsesSseAggregationError,
+    ResponsesSseAggregationErrorKind, ResponsesSseAggregator, StreamUsageAccumulator,
+};
+use super::usage::{
+    log_usage, update_image_stream_usage, update_stream_usage, update_stream_usage_result,
+    update_websocket_stream_usage,
+};
 use super::{setting, ProxyError};
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
@@ -469,6 +478,7 @@ pub async fn forward_codex_models_manifest(
             validate_and_acquire_share_invocation(
                 &state,
                 share_id,
+                AppKind::Codex,
                 request_context.user_email.as_deref(),
             )
             .await?
@@ -589,6 +599,7 @@ pub async fn forward_codex_alpha_search(
             validate_and_acquire_share_invocation(
                 &state,
                 share_id,
+                AppKind::Codex,
                 request_context.user_email.as_deref(),
             )
             .await?
@@ -598,6 +609,7 @@ pub async fn forward_codex_alpha_search(
         None
     };
     let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
+    let body = apply_codex_alpha_search_policy(&body, &execution)?;
     let accounts = state.accounts_snapshot().await;
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
@@ -709,6 +721,22 @@ fn normalize_codex_alpha_search_body(body: &[u8]) -> Result<Bytes, ProxyError> {
     Ok(body)
 }
 
+fn apply_codex_alpha_search_policy(
+    body: &Bytes,
+    execution: &ProviderExecution,
+) -> Result<Bytes, ProxyError> {
+    let intent = super::codex_request_policy::extract_intent_from_bytes(body);
+    let final_model = codex_model_from_body(body);
+    super::codex_request_policy::apply_to_bytes(
+        body,
+        &execution.runtime_stored_view(),
+        final_model.as_deref(),
+        codex_fast_mode_enabled(execution),
+        &intent,
+    )
+    .map(|(body, _)| body)
+}
+
 fn codex_models_manifest_url(_execution: &ProviderExecution) -> String {
     #[cfg(test)]
     if let Some(url) = _execution
@@ -785,7 +813,7 @@ async fn next_codex_overflow_attempt(
         Some(summary_body) => {
             summarize_codex_overflow(
                 state,
-                stored,
+                execution,
                 http_client,
                 url,
                 target_headers,
@@ -811,13 +839,14 @@ async fn next_codex_overflow_attempt(
 
 async fn summarize_codex_overflow(
     state: &ServerState,
-    stored: &StoredProvider,
+    execution: &ProviderExecution,
     http_client: &reqwest::Client,
     url: &str,
     target_headers: &[(String, String)],
     summary_body: Bytes,
     request_context: &UsageLogContext,
 ) -> Option<String> {
+    let stored = execution.runtime_stored_view();
     let summary_body = match normalize_codex_oauth_responses_body_bytes(
         &summary_body,
         None,
@@ -829,13 +858,24 @@ async fn summarize_codex_overflow(
             return None;
         }
     };
-    let model = serde_json::from_slice::<Value>(&summary_body)
-        .ok()
-        .and_then(|body| {
-            body.get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
+    let model = codex_model_from_body(&summary_body);
+    let intent = super::codex_request_policy::CodexRequestIntent {
+        requested_reasoning_effort: request_context.requested_reasoning_effort.clone(),
+        client_service_tier: request_context.client_service_tier.clone(),
+    };
+    let (summary_body, policy_metadata) = match super::codex_request_policy::apply_to_bytes(
+        &summary_body,
+        &stored,
+        model.as_deref(),
+        codex_fast_mode_enabled(execution),
+        &intent,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!("failed to apply Codex overflow summary policy: {error}");
+            return None;
+        }
+    };
     let started = Instant::now();
     let mut client_headers = HeaderMap::new();
     client_headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -900,14 +940,27 @@ async fn summarize_codex_overflow(
             }
         };
     let mut usage = StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
-        stored,
+        &stored,
         ProxyRoute::CodexResponses,
     ));
     usage.push(&body);
     let usage = usage.finish();
+    let mut summary_context = UsageLogContext {
+        share_id: request_context.share_id.clone(),
+        share_name: request_context.share_name.clone(),
+        user_email: request_context.user_email.clone(),
+        session_id: request_context.session_id.clone(),
+        data_source: Some(super::overflow_compact::SUMMARY_DATA_SOURCE.to_string()),
+        user_country: request_context.user_country.clone(),
+        user_country_iso3: request_context.user_country_iso3.clone(),
+        is_streaming: true,
+        stream_status: Some(stream_status.to_string()),
+        ..UsageLogContext::default()
+    };
+    apply_codex_policy_metadata(&mut summary_context, policy_metadata);
     log_usage(
         state,
-        stored,
+        &stored,
         status,
         started.elapsed().as_millis(),
         UsageModelMetadata {
@@ -917,18 +970,7 @@ async fn summarize_codex_overflow(
             actual_model_source: Some("codex_overflow_compact_summary".to_string()),
         },
         usage,
-        UsageLogContext {
-            share_id: request_context.share_id.clone(),
-            share_name: request_context.share_name.clone(),
-            user_email: request_context.user_email.clone(),
-            session_id: request_context.session_id.clone(),
-            data_source: Some(super::overflow_compact::SUMMARY_DATA_SOURCE.to_string()),
-            user_country: request_context.user_country.clone(),
-            user_country_iso3: request_context.user_country_iso3.clone(),
-            is_streaming: true,
-            stream_status: Some(stream_status.to_string()),
-            ..UsageLogContext::default()
-        },
+        summary_context,
     )
     .await;
     record_share_supplemental_usage(
@@ -974,6 +1016,7 @@ async fn forward_with_attempt(
             let (share_name, guard) = validate_and_acquire_share_invocation(
                 &state,
                 &share_id,
+                app,
                 request_context.user_email.as_deref(),
             )
             .await?;
@@ -1062,6 +1105,11 @@ async fn forward_with_attempt(
             }
         };
         let stored = execution.runtime_stored_view();
+        let codex_request_intent = if execution.driver_is("oauth.openai_codex") {
+            super::codex_request_policy::extract_intent_from_bytes(&body)
+        } else {
+            super::codex_request_policy::CodexRequestIntent::default()
+        };
         ensure_managed_credential_persistence_available(&state, &execution)?;
         super::router::ensure_codex_oauth_active_account(&stored, &accounts_for_selection)?;
         validate_codex_allowed_client(
@@ -1147,44 +1195,19 @@ async fn forward_with_attempt(
         let codex_responses_lite = execution.driver_is("oauth.openai_codex")
             && route == ProxyRoute::CodexResponses
             && codex_responses_lite_requested(&headers, &adapter_request.body);
-        if execution.driver_is("oauth.openai_codex")
-            && matches!(
-                route,
-                ProxyRoute::CodexResponses
-                    | ProxyRoute::CodexResponsesCompact
-                    | ProxyRoute::CodexChatCompletions
-            )
-        {
-            let compact_request = route == ProxyRoute::CodexResponsesCompact
-                || (route == ProxyRoute::CodexResponses
-                    && codex_responses_body_has_compaction_trigger(&adapter_request.body));
-            if compact_request {
-                adapter_request.body =
-                    normalize_codex_oauth_compact_body_bytes(&adapter_request.body)?;
-                adapter_request.stream_requested = false;
-            } else {
-                adapter_request.body = normalize_codex_oauth_responses_body_bytes(
-                    &adapter_request.body,
-                    codex_oauth_session_id.as_deref(),
-                    codex_image_tool_strip_policy(&stored),
-                )?;
-                if codex_responses_lite {
-                    adapter_request.body = normalize_codex_responses_lite_body_bytes(
-                        &adapter_request.body,
-                        true,
-                        true,
-                    )?;
-                }
-            }
-            adapter_request.body =
-                super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
-        }
         if execution.driver_is("oauth.openai_codex") {
             if let Some(body) = attempt_context.codex_body_override.clone() {
                 adapter_request.body = body;
             }
         }
         execution.enforce_model_policy(&mut adapter_request)?;
+        if execution.driver_is("oauth.openai_codex")
+            && route != ProxyRoute::CodexResponsesCompact
+            && !codex_responses_body_has_compaction_trigger(&adapter_request.body)
+        {
+            adapter_request.body =
+                super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
+        }
         let grok_contract = if execution.driver_is("oauth.grok_responses") {
             let cli_profile = grok_cli_profile(&execution);
             let preserved_session_id = attempt_context.grok_session_id.as_deref();
@@ -1232,10 +1255,17 @@ async fn forward_with_attempt(
                     prepared.headers,
                 )
             } else {
-                if !execution.driver_is("oauth.grok_responses") {
-                    execution.enforce_model_policy(&mut adapter_request)?;
-                }
                 execution.finalize_request(&mut adapter_request)?;
+                if execution.driver_is("oauth.openai_codex") {
+                    let metadata = execution.apply_openai_codex_final_request_contract(
+                        route,
+                        &mut adapter_request,
+                        codex_oauth_session_id.as_deref(),
+                        codex_responses_lite,
+                        &codex_request_intent,
+                    )?;
+                    apply_codex_policy_metadata(&mut request_context, metadata);
+                }
                 let mut url = execution.resolve_endpoint(route, gemini_path, &adapter_request)?;
                 if execution.driver_is("oauth.grok_responses") {
                     url = super::grok::chat_upstream_url(&url, grok_cli_profile(&execution));
@@ -1279,6 +1309,7 @@ async fn forward_with_attempt(
                 if route == ProxyRoute::ClaudeCountTokens {
                     super::claude_oauth::normalize_count_tokens_body(&mut adapter_request.body)?;
                     adapter_request.stream_requested = false;
+                    adapter_request.upstream_stream_requested = false;
                     replace_or_push_header(
                         &mut target_headers,
                         "anthropic-beta",
@@ -1319,10 +1350,10 @@ async fn forward_with_attempt(
             &headers,
             &target_headers,
             execution.request_timeout(),
-            adapter_request.stream_requested,
+            adapter_request.upstream_stream_requested,
         );
 
-        let upstream_result = if adapter_request.stream_requested {
+        let upstream_result = if adapter_request.upstream_stream_requested {
             match execution.stream_first_byte_timeout() {
                 Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
                     Ok(result) => result,
@@ -1471,7 +1502,7 @@ async fn forward_with_attempt(
                         &headers,
                         &target_headers,
                         execution.request_timeout(),
-                        adapter_request.stream_requested,
+                        adapter_request.upstream_stream_requested,
                     );
                     match retry_request.send().await {
                         Ok(retry_upstream) => {
@@ -1730,6 +1761,101 @@ async fn forward_with_attempt(
             }
             copy_safe_upstream_response_headers(&response_headers, &mut response);
             return Ok(response);
+        }
+
+        if execution.driver_is("oauth.openai_codex")
+            && adapter_request.upstream_stream_requested
+            && !adapter_request.stream_requested
+            && status.is_success()
+            && buffered_upstream_body.is_none()
+        {
+            let aggregation = match aggregate_openai_responses_upstream(
+                &mut upstream,
+                execution.request_timeout(),
+            )
+            .await
+            {
+                Ok(aggregation) => aggregation,
+                Err(failure) => {
+                    if !failure.saw_business_output
+                        && failure.semantic_failure.as_ref().is_some_and(|failure| {
+                            super::overflow_compact::is_context_length_failure(
+                                &failure.code,
+                                &failure.message,
+                            )
+                        })
+                    {
+                        if let Some(next_attempt) = next_codex_overflow_attempt(
+                            &state,
+                            route,
+                            &execution,
+                            &stored,
+                            &attempt_context,
+                            &adapter_request,
+                            &http_client,
+                            &url,
+                            &target_headers,
+                            &request_context,
+                        )
+                        .await
+                        {
+                            attempt_context = next_attempt;
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                    }
+                    record_openai_responses_aggregation_failure(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &failure,
+                    )
+                    .await;
+                    return Err(failure.error);
+                }
+            };
+            request_context.stream_status = Some(aggregation.stream_status.to_string());
+            let body = match serde_json::to_vec(&aggregation.response).map(Bytes::from) {
+                Ok(body) => body,
+                Err(error) => {
+                    let failure = OpenAiResponsesAggregationFailure {
+                        error: ProxyError::bad_gateway(format!(
+                            "encode aggregated OpenAI Responses payload: {error}"
+                        )),
+                        usage: usage_from_json_with_semantics(
+                            &aggregation.response,
+                            InputTokenSemantics::Inclusive,
+                        ),
+                        usage_state: UsageState::ParseError,
+                        stream_status: "encode_error",
+                        provider_outcome: Some(ProviderOutcome::Failure { status_code: 502 }),
+                        semantic_failure: None,
+                        saw_business_output: false,
+                    };
+                    record_openai_responses_aggregation_failure(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &failure,
+                    )
+                    .await;
+                    return Err(failure.error);
+                }
+            };
+            buffered_upstream_body = Some(ResponseDecodeResult {
+                body,
+                preserve_content_encoding: false,
+            });
+            content_type = Some("application/json".to_string());
+            content_encoding = None;
+            response_headers.remove(CONTENT_ENCODING);
+            response_headers.remove(CONTENT_LENGTH);
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
 
         if adapter_request.stream_requested && buffered_upstream_body.is_none() {
@@ -2533,15 +2659,17 @@ async fn forward_with_attempt(
                                     .map(SemanticTerminal::stream_status)
                             })
                             .unwrap_or("completed");
-                        let usage = std::mem::take(&mut stream_state.usage).finish();
-                        update_stream_usage(
+                        let usage_result =
+                            std::mem::take(&mut stream_state.usage).finish_with_status();
+                        let usage = usage_result.usage;
+                        update_stream_usage_result(
                             &stream_state.state,
                             &stream_state.stored,
                             &stream_state.request_id,
                             stream_state.status_code,
                             stream_state.started.elapsed().as_millis(),
                             stream_state.first_token_ms,
-                            usage,
+                            usage_result,
                             Some(stream_status),
                         )
                         .await;
@@ -2594,17 +2722,19 @@ async fn forward_with_attempt(
                         Ok(None)
                     }
                     Err(error) => {
-                        let usage = std::mem::take(&mut stream_state.usage).finish();
+                        let usage_result =
+                            std::mem::take(&mut stream_state.usage).finish_with_status();
+                        let usage = usage_result.usage;
                         let status = error.status_code();
                         let stream_status = error.stream_status();
-                        update_stream_usage(
+                        update_stream_usage_result(
                             &stream_state.state,
                             &stream_state.stored,
                             &stream_state.request_id,
                             status,
                             stream_state.started.elapsed().as_millis(),
                             stream_state.first_token_ms,
-                            usage,
+                            usage_result,
                             Some(stream_status),
                         )
                         .await;
@@ -2952,6 +3082,7 @@ pub async fn forward_codex_responses_ws(
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
             &share_id,
+            app,
             request_context.user_email.as_deref(),
         )
         .await?;
@@ -3042,8 +3173,6 @@ pub async fn forward_codex_responses_ws(
     let request_timeout = execution.request_timeout();
     let first_byte_timeout = execution.stream_first_byte_timeout();
     let stream_idle_timeout = execution.stream_idle_timeout();
-    let share_id = request_context.share_id.clone();
-    let user_email = request_context.user_email.clone();
     let state_for_share = state.clone();
     let response = ws.on_upgrade(move |socket| async move {
         let _downstream_connection_guard = downstream_connection_guard;
@@ -3061,6 +3190,7 @@ pub async fn forward_codex_responses_ws(
                 grok_session_id: session_id,
                 grok_turn_index,
                 single_upstream_model: websocket_upstream_model,
+                request_context,
                 state: &state_for_share,
                 execution,
             },
@@ -3069,13 +3199,6 @@ pub async fn forward_codex_responses_ws(
         {
             tracing::warn!(error = %error, "responses websocket bridge failed");
         }
-        record_share_invocation_result(
-            &state_for_share,
-            share_id.as_deref(),
-            user_email.as_deref(),
-            TokenUsage::default(),
-        )
-        .await;
     });
     Ok(response)
 }
@@ -3088,6 +3211,45 @@ fn codex_websocket_enabled(stored: &StoredProvider) -> bool {
             .as_ref()
             .and_then(|meta| meta.codex_websocket_enabled)
             .unwrap_or(true)
+}
+
+fn codex_fast_mode_enabled(execution: &ProviderExecution) -> bool {
+    execution.driver_is("oauth.openai_codex")
+        && execution
+            .plan
+            .driver_options
+            .get("codexFastMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn codex_model_from_body(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_model_from_value(body: &Value) -> Option<String> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+fn apply_codex_policy_metadata(
+    context: &mut UsageLogContext,
+    metadata: super::codex_request_policy::CodexRequestPolicyMetadata,
+) {
+    context.requested_reasoning_effort = metadata.requested_reasoning_effort;
+    context.effective_reasoning_effort = metadata.effective_reasoning_effort;
+    context.client_service_tier = metadata.client_service_tier;
+    context.effective_service_tier = metadata.effective_service_tier;
+    context.service_tier_decision = metadata.service_tier_decision;
 }
 
 pub async fn forward_grok_media(
@@ -3108,6 +3270,7 @@ pub async fn forward_grok_media(
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
             &share_id,
+            AppKind::Codex,
             request_context.user_email.as_deref(),
         )
         .await?;
@@ -3199,6 +3362,7 @@ pub async fn forward_images_generations(
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
             &share_id,
+            AppKind::Codex,
             request_context.user_email.as_deref(),
         )
         .await?;
@@ -3297,6 +3461,7 @@ pub async fn forward_images_edits(
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
             &share_id,
+            AppKind::Codex,
             request_context.user_email.as_deref(),
         )
         .await?;
@@ -3625,7 +3790,7 @@ async fn forward_codex_images_request(
     execution: ProviderExecution,
     headers: HeaderMap,
     mut prepared: CodexImagesPreparedRequest,
-    request_context: UsageLogContext,
+    mut request_context: UsageLogContext,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
@@ -3648,6 +3813,7 @@ async fn forward_codex_images_request(
         actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
         actual_model_source: Some("codex_image_generation_bridge".to_string()),
         stream_requested: true,
+        upstream_stream_requested: true,
         custom_tool_names: Default::default(),
         responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
@@ -3656,6 +3822,19 @@ async fn forward_codex_images_request(
     prepared.body =
         super::remote_image::inline_codex_images_endpoint_images(&prepared.body).await?;
     adapter_request.body = prepared.body.clone();
+    let final_model = codex_model_from_body(&adapter_request.body)
+        .or_else(|| adapter_request.actual_model.clone())
+        .or_else(|| adapter_request.model.clone());
+    let (body, metadata) = super::codex_request_policy::apply_to_bytes(
+        &adapter_request.body,
+        &stored,
+        final_model.as_deref(),
+        codex_fast_mode_enabled(&execution),
+        &prepared.intent,
+    )?;
+    adapter_request.body = body.clone();
+    prepared.body = body;
+    apply_codex_policy_metadata(&mut request_context, metadata);
     let public_origin = if prepared.response_format == "url" {
         Some(codex_images_public_origin(&headers)?)
     } else {
@@ -4134,6 +4313,7 @@ async fn record_codex_images_prebody_failure(
 #[derive(Debug)]
 struct CodexImagesPreparedRequest {
     body: Bytes,
+    intent: super::codex_request_policy::CodexRequestIntent,
     operation: CodexImagesOperation,
     requested_model: String,
     response_format: String,
@@ -4199,10 +4379,15 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| ProxyError::bad_request("image generation prompt is required"))?;
     let common = codex_images_common_options(&value, prompt, CodexImagesOperation::Generation)?;
+    let intent = super::codex_request_policy::extract_intent(&value);
+    let reasoning_effort = intent
+        .requested_reasoning_effort
+        .as_deref()
+        .unwrap_or("medium");
     let request = json!({
         "instructions": "",
         "stream": true,
-        "reasoning": {"effort": "medium", "summary": "auto"},
+        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
         "parallel_tool_calls": false,
         "include": ["reasoning.encrypted_content"],
         "model": CODEX_IMAGES_RESPONSES_MAIN_MODEL,
@@ -4223,6 +4408,7 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         })?;
     Ok(CodexImagesPreparedRequest {
         body,
+        intent,
         operation: CodexImagesOperation::Generation,
         requested_model: common.requested_model,
         response_format: common.response_format,
@@ -4376,6 +4562,11 @@ fn codex_images_edit_request_from_value(
         )));
     }
     let mut common = codex_images_common_options(&value, prompt, CodexImagesOperation::Edit)?;
+    let intent = super::codex_request_policy::extract_intent(&value);
+    let reasoning_effort = intent
+        .requested_reasoning_effort
+        .as_deref()
+        .unwrap_or("medium");
     if let Some(mask) = value
         .pointer("/mask/image_url")
         .and_then(Value::as_str)
@@ -4394,7 +4585,7 @@ fn codex_images_edit_request_from_value(
     let request = json!({
         "instructions": "",
         "stream": true,
-        "reasoning": {"effort": "medium", "summary": "auto"},
+        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
         "parallel_tool_calls": false,
         "include": ["reasoning.encrypted_content"],
         "model": CODEX_IMAGES_RESPONSES_MAIN_MODEL,
@@ -4411,6 +4602,7 @@ fn codex_images_edit_request_from_value(
         })?;
     Ok(CodexImagesPreparedRequest {
         body,
+        intent,
         operation: CodexImagesOperation::Edit,
         requested_model: common.requested_model,
         response_format: common.response_format,
@@ -6012,8 +6204,201 @@ struct ResponsesWebsocketBridgeOptions<'a> {
     grok_session_id: Option<String>,
     grok_turn_index: Option<u64>,
     single_upstream_model: Option<String>,
+    request_context: UsageLogContext,
     state: &'a ServerState,
     execution: ProviderExecution,
+}
+
+struct ResponsesWebsocketUsageTurn {
+    state: ServerState,
+    stored: StoredProvider,
+    request_context: UsageLogContext,
+    request_id: String,
+    started: Instant,
+    first_token_ms: Option<u128>,
+    usage: TokenUsage,
+    accumulator: Option<StreamUsageAccumulator>,
+    armed: bool,
+}
+
+impl ResponsesWebsocketUsageTurn {
+    async fn start(
+        state: &ServerState,
+        stored: &StoredProvider,
+        model: UsageModelMetadata,
+        mut request_context: UsageLogContext,
+    ) -> Self {
+        request_context.is_streaming = true;
+        request_context.stream_status = Some("pending".to_string());
+        let started = Instant::now();
+        let request_id = log_usage(
+            state,
+            stored,
+            StatusCode::OK.as_u16(),
+            0,
+            model,
+            TokenUsage::default(),
+            request_context.clone(),
+        )
+        .await;
+        Self {
+            state: state.clone(),
+            stored: stored.clone(),
+            request_context,
+            request_id,
+            started,
+            first_token_ms: None,
+            usage: TokenUsage::default(),
+            accumulator: Some(StreamUsageAccumulator::new(
+                adapters::usage_input_semantics_for(stored, ProxyRoute::CodexResponses),
+            )),
+            armed: true,
+        }
+    }
+
+    fn observe_payload(&mut self, payload: &[u8], business: bool) {
+        if let Some(accumulator) = self.accumulator.as_mut() {
+            accumulator.push(payload);
+            self.usage = accumulator.push(b"\n");
+        }
+        if business && self.first_token_ms.is_none() {
+            self.first_token_ms = Some(self.started.elapsed().as_millis());
+        }
+    }
+
+    fn observe_message(&mut self, message: &TungsteniteMessage, business: bool) {
+        match message {
+            TungsteniteMessage::Text(text) => self.observe_payload(text.as_bytes(), business),
+            TungsteniteMessage::Binary(bytes) => self.observe_payload(bytes, business),
+            _ => {}
+        }
+    }
+
+    async fn finish_terminal(&mut self, terminal: &SemanticTerminal) {
+        match terminal {
+            SemanticTerminal::Success => self.finish(200, "completed", None).await,
+            SemanticTerminal::Incomplete => self.finish(200, "incomplete", None).await,
+            SemanticTerminal::Failure(failure) => {
+                let status = match failure.origin {
+                    FailureOrigin::Client => 400,
+                    FailureOrigin::Provider => 502,
+                };
+                self.finish(
+                    status,
+                    terminal.stream_status(),
+                    Some(failure.display_message()),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn finish(&mut self, status_code: u16, stream_status: &str, error: Option<String>) {
+        if !self.armed {
+            return;
+        }
+        if let Some(accumulator) = self.accumulator.take() {
+            self.usage = accumulator.finish();
+        }
+        update_websocket_stream_usage(
+            &self.state,
+            &self.stored,
+            &self.request_id,
+            status_code,
+            self.started.elapsed().as_millis(),
+            self.first_token_ms,
+            self.usage,
+            stream_status,
+            error.as_deref(),
+        )
+        .await;
+        record_share_invocation_result(
+            &self.state,
+            self.request_context.share_id.as_deref(),
+            self.request_context.user_email.as_deref(),
+            self.usage,
+        )
+        .await;
+        self.armed = false;
+    }
+}
+
+async fn finish_active_websocket_usage(
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
+    status_code: u16,
+    stream_status: &str,
+    error: Option<String>,
+) {
+    if let Some(mut turn) = active_usage_turn.take() {
+        turn.finish(status_code, stream_status, error).await;
+    }
+}
+
+async fn finish_active_websocket_terminal(
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
+    terminal: &SemanticTerminal,
+) {
+    if let Some(mut turn) = active_usage_turn.take() {
+        turn.finish_terminal(terminal).await;
+    }
+}
+
+fn codex_websocket_model_metadata(
+    requested_body: &Value,
+    effective_body: &Value,
+) -> UsageModelMetadata {
+    let requested_model = codex_model_from_value(requested_body);
+    let actual_model = codex_model_from_value(effective_body);
+    let actual_model_source = actual_model.as_ref().map(|actual| {
+        if requested_model.as_deref() == Some(actual.as_str()) {
+            "request"
+        } else {
+            "model_mapping"
+        }
+        .to_string()
+    });
+    UsageModelMetadata {
+        model: requested_model.clone().or_else(|| actual_model.clone()),
+        requested_model,
+        actual_model,
+        actual_model_source,
+    }
+}
+
+impl Drop for ResponsesWebsocketUsageTurn {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let stored = self.stored.clone();
+        let request_context = self.request_context.clone();
+        let request_id = self.request_id.clone();
+        let duration_ms = self.started.elapsed().as_millis();
+        let first_token_ms = self.first_token_ms;
+        let usage = self.usage;
+        tokio::spawn(async move {
+            update_websocket_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                502,
+                duration_ms,
+                first_token_ms,
+                usage,
+                "interrupted",
+                Some("responses websocket turn ended without a terminal event"),
+            )
+            .await;
+            record_share_invocation_result(
+                &state,
+                request_context.share_id.as_deref(),
+                request_context.user_email.as_deref(),
+                usage,
+            )
+            .await;
+        });
+    }
 }
 
 struct PreparedResponsesWebSocketTarget {
@@ -6151,6 +6536,7 @@ async fn bridge_responses_websocket(
         grok_session_id,
         grok_turn_index,
         single_upstream_model,
+        request_context,
         state,
         mut execution,
     } = options;
@@ -6164,6 +6550,9 @@ async fn bridge_responses_websocket(
     let mut pending_lifecycle_messages = Vec::new();
     let mut semantic_provider_outcome_recorded = false;
     let mut active_response_body = None;
+    let mut active_response_intent = None;
+    let mut active_usage_turn: Option<ResponsesWebsocketUsageTurn> = None;
+    let mut codex_session_model = single_upstream_model.clone();
     let mut auth_refresh_attempted = false;
     let mut refresh_target_before_connect = false;
     let mut upstream_read_deadline = None;
@@ -6172,15 +6561,31 @@ async fn bridge_responses_websocket(
         tokio::select! {
             downstream_message = downstream.next() => {
                 let Some(message) = downstream_message else {
+                    finish_active_websocket_usage(
+                        &mut active_usage_turn,
+                        499,
+                        "client_cancelled",
+                        Some("downstream websocket closed".to_string()),
+                    )
+                    .await;
                     break;
                 };
                 let message = message
                     .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-                match message {
-                    AxumWsMessage::Close(_) => break,
+                match &message {
+                    AxumWsMessage::Close(_) => {
+                        finish_active_websocket_usage(
+                            &mut active_usage_turn,
+                            499,
+                            "client_cancelled",
+                            Some("downstream websocket closed".to_string()),
+                        )
+                        .await;
+                        break;
+                    }
                     AxumWsMessage::Ping(bytes) => {
                         downstream
-                            .send(AxumWsMessage::Pong(bytes))
+                            .send(AxumWsMessage::Pong(bytes.clone()))
                             .await
                             .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
                         continue;
@@ -6188,6 +6593,10 @@ async fn bridge_responses_websocket(
                     AxumWsMessage::Pong(_) => continue,
                     AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {}
                 }
+                let original_response_body = matches!(mode, ResponsesWebsocketMode::Codex)
+                    .then(|| axum_responses_websocket_http_body(&message))
+                    .transpose()?
+                    .flatten();
                 let Some(message) = axum_ws_message_to_tungstenite(
                     message,
                     mode,
@@ -6200,10 +6609,26 @@ async fn bridge_responses_websocket(
                 if starts_response {
                     ensure_responses_websocket_turn_allowed(state, &execution, mode).await?;
                 }
-                let message = if matches!(mode, ResponsesWebsocketMode::Codex) {
-                    prepare_codex_responses_websocket_request(message).await?
+                if matches!(mode, ResponsesWebsocketMode::Codex) {
+                    if let Some(model) = codex_websocket_session_update_model(&message) {
+                        codex_session_model = Some(model);
+                    }
+                }
+                let intent = original_response_body
+                    .as_ref()
+                    .map(super::codex_request_policy::extract_intent)
+                    .unwrap_or_default();
+                let (message, policy_metadata) = if matches!(mode, ResponsesWebsocketMode::Codex) {
+                    prepare_codex_responses_websocket_request(
+                        message,
+                        &execution.runtime_stored_view(),
+                        codex_fast_mode_enabled(&execution),
+                        codex_session_model.as_deref(),
+                        &intent,
+                    )
+                    .await?
                 } else {
-                    message
+                    (message, None)
                 };
                 if starts_response {
                     if response_in_flight {
@@ -6211,7 +6636,35 @@ async fn bridge_responses_websocket(
                             "responses websocket received response.create while a response is in flight",
                         ));
                     }
-                    active_response_body = Some(responses_websocket_http_body(&message)?);
+                    let effective_response_body = responses_websocket_http_body(&message)?;
+                    if matches!(mode, ResponsesWebsocketMode::Codex) {
+                        if let Some(model) = codex_model_from_value(&effective_response_body) {
+                            codex_session_model = Some(model);
+                        }
+                    }
+                    active_response_body = Some(effective_response_body.clone());
+                    active_response_intent = Some(intent.clone());
+                    if matches!(mode, ResponsesWebsocketMode::Codex) {
+                        let mut turn_context = request_context.clone();
+                        if let Some(metadata) = policy_metadata {
+                            apply_codex_policy_metadata(&mut turn_context, metadata);
+                        }
+                        let requested_response_body = original_response_body
+                            .as_ref()
+                            .unwrap_or(&effective_response_body);
+                        active_usage_turn = Some(
+                            ResponsesWebsocketUsageTurn::start(
+                                state,
+                                &execution.runtime_stored_view(),
+                                codex_websocket_model_metadata(
+                                    requested_response_body,
+                                    &effective_response_body,
+                                ),
+                                turn_context,
+                            )
+                            .await,
+                        );
+                    }
                     let accounts = state.accounts_snapshot().await;
                     let snapshot = state.account_in_flight.snapshot();
                     account_in_flight_guard = acquire_account_in_flight(
@@ -6295,6 +6748,7 @@ async fn bridge_responses_websocket(
                                             Some("connect_error"),
                                             error_body,
                                             Some(provider_outcome),
+                                            &mut active_usage_turn,
                                         )
                                         .await;
                                     }
@@ -6318,6 +6772,8 @@ async fn bridge_responses_websocket(
                                     source,
                                     &mut auth_refresh_attempted,
                                     &mut output_patcher,
+                                    active_response_intent.as_ref().expect("active response intent"),
+                                    &mut active_usage_turn,
                                 )
                                 .await?;
                                 if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6327,6 +6783,7 @@ async fn bridge_responses_websocket(
                                 response_create_committed = false;
                                 account_in_flight_guard.take();
                                 active_response_body = None;
+                                active_response_intent = None;
                                 refresh_target_before_connect = true;
                                 continue;
                             }
@@ -6376,6 +6833,8 @@ async fn bridge_responses_websocket(
                             source,
                             &mut auth_refresh_attempted,
                             &mut output_patcher,
+                            active_response_intent.as_ref().expect("active response intent"),
+                            &mut active_usage_turn,
                         )
                         .await?;
                         if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6385,6 +6844,7 @@ async fn bridge_responses_websocket(
                         response_create_committed = false;
                         account_in_flight_guard.take();
                         active_response_body = None;
+                        active_response_intent = None;
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -6405,6 +6865,7 @@ async fn bridge_responses_websocket(
                             Some("transport_error"),
                             error_body,
                             Some(ProviderOutcome::NetworkFailure),
+                            &mut active_usage_turn,
                         )
                         .await;
                     }
@@ -6446,6 +6907,8 @@ async fn bridge_responses_websocket(
                                 "first_byte_timeout",
                                 &mut auth_refresh_attempted,
                                 &mut output_patcher,
+                                active_response_intent.as_ref().expect("active response intent"),
+                                &mut active_usage_turn,
                             )
                             .await?;
                             if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6455,6 +6918,7 @@ async fn bridge_responses_websocket(
                             response_create_committed = false;
                             account_in_flight_guard.take();
                             active_response_body = None;
+                            active_response_intent = None;
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
                             continue;
@@ -6482,6 +6946,7 @@ async fn bridge_responses_websocket(
                             Some("transport_error"),
                             error_body,
                             Some(ProviderOutcome::NetworkFailure),
+                            &mut active_usage_turn,
                         )
                         .await;
                     }
@@ -6518,6 +6983,8 @@ async fn bridge_responses_websocket(
                             source,
                             &mut auth_refresh_attempted,
                             &mut output_patcher,
+                            active_response_intent.as_ref().expect("active response intent"),
+                            &mut active_usage_turn,
                         )
                         .await?;
                         if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6527,6 +6994,7 @@ async fn bridge_responses_websocket(
                         response_create_committed = false;
                         account_in_flight_guard.take();
                         active_response_body = None;
+                        active_response_intent = None;
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -6539,6 +7007,7 @@ async fn bridge_responses_websocket(
                             &execution,
                             &mut pending_lifecycle_messages,
                             None,
+                            &mut active_usage_turn,
                         )
                         .await;
                     }
@@ -6577,6 +7046,8 @@ async fn bridge_responses_websocket(
                                 source,
                                 &mut auth_refresh_attempted,
                                 &mut output_patcher,
+                                active_response_intent.as_ref().expect("active response intent"),
+                                &mut active_usage_turn,
                         )
                         .await?;
                         if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6586,6 +7057,7 @@ async fn bridge_responses_websocket(
                         response_create_committed = false;
                         account_in_flight_guard.take();
                         active_response_body = None;
+                        active_response_intent = None;
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -6607,6 +7079,7 @@ async fn bridge_responses_websocket(
                                 Some("transport_error"),
                                 body,
                                 Some(ProviderOutcome::Failure { status_code: 413 }),
+                                &mut active_usage_turn,
                             )
                             .await;
                         }
@@ -6636,6 +7109,7 @@ async fn bridge_responses_websocket(
                                 Some("transport_error"),
                                 error_body,
                                 Some(ProviderOutcome::NetworkFailure),
+                                &mut active_usage_turn,
                             )
                             .await;
                         }
@@ -6677,6 +7151,8 @@ async fn bridge_responses_websocket(
                             source,
                             &mut auth_refresh_attempted,
                             &mut output_patcher,
+                            active_response_intent.as_ref().expect("active response intent"),
+                            &mut active_usage_turn,
                         )
                         .await?;
                         if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6686,6 +7162,7 @@ async fn bridge_responses_websocket(
                         response_create_committed = false;
                         account_in_flight_guard.take();
                         active_response_body = None;
+                        active_response_intent = None;
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -6701,6 +7178,7 @@ async fn bridge_responses_websocket(
                         &execution,
                         &mut pending_lifecycle_messages,
                         Some(&message),
+                        &mut active_usage_turn,
                     )
                     .await;
                 }
@@ -6745,6 +7223,8 @@ async fn bridge_responses_websocket(
                                         "semantic_protocol_error",
                                         &mut auth_refresh_attempted,
                                         &mut output_patcher,
+                                        active_response_intent.as_ref().expect("active response intent"),
+                                        &mut active_usage_turn,
                                     )
                                     .await?;
                                     if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6754,6 +7234,7 @@ async fn bridge_responses_websocket(
                                     response_create_committed = false;
                                     account_in_flight_guard.take();
                                     active_response_body = None;
+                                    active_response_intent = None;
                                     upstream_read_deadline = None;
                                     refresh_target_before_connect = true;
                                     continue;
@@ -6774,6 +7255,7 @@ async fn bridge_responses_websocket(
                                 None,
                                 error_body,
                                 Some(ProviderOutcome::Failure { status_code: 502 }),
+                                &mut active_usage_turn,
                             )
                             .await;
                         }
@@ -6786,6 +7268,9 @@ async fn bridge_responses_websocket(
                         "websocket",
                         observation.metric_kind(),
                     );
+                    if let Some(turn) = active_usage_turn.as_mut() {
+                        turn.observe_message(&message, observation.counts_as_business_output());
+                    }
                 }
                 if matches!(semantic_observation, Some(SemanticObservation::Lifecycle))
                     && !emitted_business_event
@@ -6817,6 +7302,7 @@ async fn bridge_responses_websocket(
                             Some("protocol_error"),
                             error_body,
                             Some(ProviderOutcome::Failure { status_code: 502 }),
+                            &mut active_usage_turn,
                         )
                         .await;
                     }
@@ -6862,6 +7348,8 @@ async fn bridge_responses_websocket(
                                 "semantic_failure",
                                 &mut auth_refresh_attempted,
                                 &mut output_patcher,
+                                active_response_intent.as_ref().expect("active response intent"),
+                                &mut active_usage_turn,
                             )
                             .await?;
                             if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
@@ -6871,6 +7359,7 @@ async fn bridge_responses_websocket(
                             response_create_committed = false;
                             account_in_flight_guard.take();
                             active_response_body = None;
+                            active_response_intent = None;
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
                             continue;
@@ -6905,11 +7394,27 @@ async fn bridge_responses_websocket(
                 let terminal = semantic_terminal.is_some()
                     || (semantic_observation.is_none()
                         && responses_websocket_response_is_terminal(&message));
+                if semantic_observation.is_none() {
+                    let usage_business = response_in_flight
+                        && !terminal
+                        && matches!(
+                            message,
+                            TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
+                        );
+                    if let Some(turn) = active_usage_turn.as_mut() {
+                        turn.observe_message(&message, usage_business);
+                    }
+                }
                 if terminal {
+                    let usage_terminal = semantic_terminal
+                        .clone()
+                        .unwrap_or(SemanticTerminal::Success);
+                    finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
                     response_in_flight = false;
                     response_create_committed = false;
                     account_in_flight_guard.take();
                     active_response_body = None;
+                    active_response_intent = None;
                     upstream_read_deadline = None;
                     match semantic_terminal {
                         Some(SemanticTerminal::Failure(failure))
@@ -7233,6 +7738,8 @@ async fn run_codex_websocket_http_fallback(
     source: &'static str,
     auth_refresh_attempted: &mut bool,
     output_patcher: &mut CodexWebsocketOutputPatcher,
+    intent: &super::codex_request_policy::CodexRequestIntent,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpFallbackOutcome, ProxyError> {
     record_forward_retry(ProxyRoute::CodexResponses, "transport", source);
     crate::metrics::record_codex_websocket_fallback(source, "attempt");
@@ -7245,6 +7752,7 @@ async fn run_codex_websocket_http_fallback(
             response_body,
             session_id,
             grok_turn_index,
+            intent,
         )
         .await
         {
@@ -7270,6 +7778,7 @@ async fn run_codex_websocket_http_fallback(
                     error,
                     "upstream_target_error",
                     Some("protocol_error"),
+                    active_usage_turn,
                 )
                 .await;
             }
@@ -7305,6 +7814,7 @@ async fn run_codex_websocket_http_fallback(
                     ProxyError::bad_gateway(error),
                     "upstream_stream_transport_error",
                     Some("transport_error"),
+                    active_usage_turn,
                 )
                 .await;
             }
@@ -7329,6 +7839,7 @@ async fn run_codex_websocket_http_fallback(
                     error,
                     "upstream_stream_timeout",
                     Some("transport_error"),
+                    active_usage_turn,
                 )
                 .await;
             }
@@ -7358,6 +7869,7 @@ async fn run_codex_websocket_http_fallback(
                     error,
                     "upstream_auth_error",
                     None,
+                    active_usage_turn,
                 )
                 .await;
             };
@@ -7391,6 +7903,7 @@ async fn run_codex_websocket_http_fallback(
                     error,
                     "upstream_auth_refresh_error",
                     None,
+                    active_usage_turn,
                 )
                 .await;
             }
@@ -7467,6 +7980,7 @@ async fn run_codex_websocket_http_fallback(
                         error,
                         code,
                         Some("transport_error"),
+                        active_usage_turn,
                     )
                     .await;
                 }
@@ -7501,6 +8015,7 @@ async fn run_codex_websocket_http_fallback(
                 error,
                 "upstream_http_error",
                 None,
+                active_usage_turn,
             )
             .await;
         }
@@ -7512,11 +8027,12 @@ async fn run_codex_websocket_http_fallback(
             first_event_timeout,
             stream_idle_timeout,
             output_patcher,
+            active_usage_turn,
         )
         .await
         {
             Ok(CodexHttpRelayOutcome::Completed(terminal)) => {
-                match terminal {
+                match &terminal {
                     SemanticTerminal::Failure(failure)
                         if failure.origin == FailureOrigin::Provider =>
                     {
@@ -7537,10 +8053,18 @@ async fn run_codex_websocket_http_fallback(
                         .await;
                     }
                 }
+                finish_active_websocket_terminal(active_usage_turn, &terminal).await;
                 crate::metrics::record_codex_websocket_fallback(source, "success");
                 return Ok(CodexHttpFallbackOutcome::Completed);
             }
             Ok(CodexHttpRelayOutcome::DownstreamClosed) => {
+                finish_active_websocket_usage(
+                    active_usage_turn,
+                    499,
+                    "client_cancelled",
+                    Some("downstream websocket closed during HTTP fallback".to_string()),
+                )
+                .await;
                 crate::metrics::record_codex_websocket_fallback(source, "success");
                 return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
             }
@@ -7561,6 +8085,11 @@ async fn run_codex_websocket_http_fallback(
                 for payload in replay_payloads {
                     relay_codex_http_fallback_event(downstream, output_patcher, payload).await?;
                 }
+                finish_active_websocket_terminal(
+                    active_usage_turn,
+                    &SemanticTerminal::Failure(failure),
+                )
+                .await;
                 crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
                 return Ok(CodexHttpFallbackOutcome::Completed);
             }
@@ -7587,11 +8116,23 @@ async fn run_codex_websocket_http_fallback(
                     error,
                     error_code,
                     Some("transport_error"),
+                    active_usage_turn,
                 )
                 .await;
             }
             Err(error) => {
                 crate::metrics::record_codex_websocket_fallback(source, "error");
+                finish_active_websocket_usage(
+                    active_usage_turn,
+                    error.status.as_u16(),
+                    if error.status.is_client_error() {
+                        "client_error"
+                    } else {
+                        "interrupted"
+                    },
+                    Some(error.client_message().to_string()),
+                )
+                .await;
                 return Err(error);
             }
         }
@@ -7609,11 +8150,24 @@ async fn terminate_codex_http_fallback_with_error(
     error: ProxyError,
     error_code: &'static str,
     metric_kind: Option<&'static str>,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpFallbackOutcome, ProxyError> {
     crate::metrics::record_codex_websocket_fallback(source, "error");
     if let Some(metric_kind) = metric_kind {
         crate::metrics::record_proxy_semantic_guard("websocket_http_fallback", metric_kind);
     }
+    let usage_status = if error.status.is_client_error() {
+        "client_error"
+    } else {
+        "interrupted"
+    };
+    finish_active_websocket_usage(
+        active_usage_turn,
+        error.status.as_u16(),
+        usage_status,
+        Some(error.client_message().to_string()),
+    )
+    .await;
     let error_body = websocket_stream_error_body(error.client_message(), error_code);
     let mut pending_messages = replay_payloads
         .into_iter()
@@ -7635,6 +8189,7 @@ async fn terminate_codex_http_fallback_with_error(
         None,
         error_body,
         None,
+        active_usage_turn,
     )
     .await
     .map(|()| CodexHttpFallbackOutcome::Completed)
@@ -7646,6 +8201,7 @@ async fn prepare_codex_http_fallback_target(
     response_body: &Value,
     session_id: Option<&str>,
     grok_turn_index: Option<u64>,
+    intent: &super::codex_request_policy::CodexRequestIntent,
 ) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
     let stored = execution.runtime_stored_view();
     let grok = execution.driver_is("oauth.grok_responses");
@@ -7672,6 +8228,7 @@ async fn prepare_codex_http_fallback_target(
             super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
     }
     adapter_request.stream_requested = true;
+    adapter_request.upstream_stream_requested = true;
     execution.enforce_model_policy(&mut adapter_request)?;
     let grok_contract = if grok {
         let mut contract = super::grok::apply_forward_contract(
@@ -7694,6 +8251,19 @@ async fn prepare_codex_http_fallback_target(
         execution.enforce_model_policy(&mut adapter_request)?;
     }
     execution.finalize_request(&mut adapter_request)?;
+    if !grok {
+        let final_model = codex_model_from_body(&adapter_request.body)
+            .or_else(|| adapter_request.actual_model.clone())
+            .or_else(|| adapter_request.model.clone());
+        let (body, _) = super::codex_request_policy::apply_to_bytes(
+            &adapter_request.body,
+            &stored,
+            final_model.as_deref(),
+            codex_fast_mode_enabled(execution),
+            intent,
+        )?;
+        adapter_request.body = body;
+    }
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
     if grok {
         url = super::grok::chat_upstream_url(&url, grok_cli_profile(execution));
@@ -7733,6 +8303,37 @@ async fn prepare_codex_http_fallback_target(
     })
 }
 
+fn axum_responses_websocket_http_body(
+    message: &AxumWsMessage,
+) -> Result<Option<Value>, ProxyError> {
+    let bytes = match message {
+        AxumWsMessage::Text(text) => text.as_bytes(),
+        AxumWsMessage::Binary(bytes) => bytes.as_ref(),
+        _ => return Ok(None),
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        return Ok(None);
+    };
+    if value.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Ok(None);
+    }
+    if value.get("response").is_some() {
+        return value
+            .get("response")
+            .filter(|response| response.is_object())
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| ProxyError::bad_request("response.create.response must be an object"));
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Err(ProxyError::bad_request(
+            "response.create payload must be an object",
+        ));
+    };
+    object.remove("type");
+    Ok(Some(value))
+}
+
 fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, ProxyError> {
     let bytes = match message {
         TungsteniteMessage::Text(text) => text.as_bytes(),
@@ -7769,15 +8370,25 @@ fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, 
 
 async fn prepare_codex_responses_websocket_request(
     message: TungsteniteMessage,
-) -> Result<TungsteniteMessage, ProxyError> {
+    stored: &StoredProvider,
+    fast_mode_enabled: bool,
+    inherited_model: Option<&str>,
+    intent: &super::codex_request_policy::CodexRequestIntent,
+) -> Result<
+    (
+        TungsteniteMessage,
+        Option<super::codex_request_policy::CodexRequestPolicyMetadata>,
+    ),
+    ProxyError,
+> {
     if websocket_message_json_type(&message).as_deref() != Some("response.create") {
-        return Ok(message);
+        return Ok((message, None));
     }
     let binary = matches!(message, TungsteniteMessage::Binary(_));
     let bytes = match &message {
         TungsteniteMessage::Text(text) => text.as_bytes(),
         TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
-        _ => return Ok(message),
+        _ => return Ok((message, None)),
     };
     let mut frame = serde_json::from_slice::<Value>(bytes).map_err(|error| {
         ProxyError::bad_request(format!("invalid response.create JSON: {error}"))
@@ -7806,8 +8417,36 @@ async fn prepare_codex_responses_websocket_request(
     .map_err(|error| {
         ProxyError::bad_request(format!("decode prepared response.create body: {error}"))
     })?;
+    let explicit_model = target
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let has_explicit_model = explicit_model.is_some();
+    let final_model = explicit_model.or_else(|| {
+        inherited_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+    });
+    if !has_explicit_model {
+        if let Some(model) = final_model.as_ref() {
+            target
+                .as_object_mut()
+                .expect("response.create target was validated as an object")
+                .insert("model".to_string(), Value::String(model.clone()));
+        }
+    }
+    let policy_metadata = super::codex_request_policy::apply(
+        target,
+        stored,
+        final_model.as_deref(),
+        fast_mode_enabled,
+        intent,
+    )?;
 
-    if binary {
+    let message = if binary {
         serde_json::to_vec(&frame)
             .map(TungsteniteMessage::Binary)
             .map_err(|error| {
@@ -7819,7 +8458,8 @@ async fn prepare_codex_responses_websocket_request(
             .map_err(|error| {
                 ProxyError::bad_request(format!("encode response.create frame: {error}"))
             })
-    }
+    }?;
+    Ok((message, Some(policy_metadata)))
 }
 
 async fn relay_codex_http_fallback_stream(
@@ -7829,6 +8469,7 @@ async fn relay_codex_http_fallback_stream(
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     output_patcher: &mut CodexWebsocketOutputPatcher,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpRelayOutcome, ProxyError> {
     let mut upstream = upstream.bytes_stream();
     let mut decoder = CodexHttpFallbackSseDecoder::default();
@@ -7912,6 +8553,7 @@ async fn relay_codex_http_fallback_stream(
                         payloads,
                         &mut pending_lifecycle_payloads,
                         &mut committed_business_event,
+                        active_usage_turn,
                     )
                     .await?
                     {
@@ -7932,6 +8574,7 @@ async fn relay_codex_http_fallback_stream(
                         payloads,
                         &mut pending_lifecycle_payloads,
                         &mut committed_business_event,
+                        active_usage_turn,
                     )
                     .await?
                     {
@@ -7964,7 +8607,17 @@ async fn relay_codex_http_fallback_payloads(
     payloads: Vec<String>,
     pending_lifecycle_payloads: &mut Vec<String>,
     committed_business_event: &mut bool,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<Option<CodexHttpRelayOutcome>, CodexHttpRelayFailure> {
+    if let Some(turn) = active_usage_turn.as_mut() {
+        for payload in &payloads {
+            let business = serde_json::from_str::<Value>(payload)
+                .ok()
+                .map(|value| response_semantics::classify_value(&value))
+                .is_some_and(|observation| observation.counts_as_business_output());
+            turn.observe_payload(payload.as_bytes(), business);
+        }
+    }
     if !*committed_business_event {
         if let Some((failure_index, failure)) =
             codex_http_fallback_batch_provider_failure(&payloads)
@@ -8281,6 +8934,24 @@ fn websocket_message_json_type(message: &TungsteniteMessage) -> Option<String> {
         .map(str::to_string)
 }
 
+fn codex_websocket_session_update_model(message: &TungsteniteMessage) -> Option<String> {
+    let bytes = match message {
+        TungsteniteMessage::Text(text) => text.as_bytes(),
+        TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
+        _ => return None,
+    };
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session.update") {
+        return None;
+    }
+    value
+        .pointer("/session/model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
 fn classify_responses_websocket_message(
     message: &TungsteniteMessage,
 ) -> Result<Option<SemanticObservation>, ProxyError> {
@@ -8345,6 +9016,7 @@ async fn send_responses_websocket_message(
     Ok(closes)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn terminate_responses_websocket_without_terminal(
     downstream: &mut WebSocket,
     output_patcher: &mut CodexWebsocketOutputPatcher,
@@ -8353,6 +9025,7 @@ async fn terminate_responses_websocket_without_terminal(
     execution: &ProviderExecution,
     pending_lifecycle_messages: &mut Vec<TungsteniteMessage>,
     close_message: Option<&TungsteniteMessage>,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<(), ProxyError> {
     const MESSAGE: &str = "upstream websocket closed before a terminal response event";
     let size_error = close_message.is_some_and(websocket_close_is_size);
@@ -8385,6 +9058,7 @@ async fn terminate_responses_websocket_without_terminal(
         Some("missing_terminal"),
         error_body,
         Some(outcome),
+        active_usage_turn,
     )
     .await
 }
@@ -8401,6 +9075,7 @@ async fn terminate_responses_websocket_with_error(
     metric_kind: Option<&'static str>,
     error_body: String,
     provider_outcome: Option<ProviderOutcome>,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<(), ProxyError> {
     if let Some(metric_kind) = metric_kind {
         crate::metrics::record_proxy_semantic_guard("websocket", metric_kind);
@@ -8408,6 +9083,17 @@ async fn terminate_responses_websocket_with_error(
     if let Some(outcome) = provider_outcome {
         record_provider_outcome(state, &execution.runtime_stored_view(), outcome).await;
     }
+    finish_active_websocket_usage(
+        active_usage_turn,
+        error.status.as_u16(),
+        if error.status.is_client_error() {
+            "client_error"
+        } else {
+            "interrupted"
+        },
+        Some(error.client_message().to_string()),
+    )
+    .await;
 
     for pending in pending_lifecycle_messages.drain(..) {
         if send_responses_websocket_message(downstream, output_patcher, mode, pending).await? {
@@ -8977,6 +9663,7 @@ async fn forward_claude_deepseek(
         actual_model: model_selection.actual_model.clone(),
         actual_model_source: model_selection.actual_model_source.clone(),
         stream_requested: false,
+        upstream_stream_requested: false,
         custom_tool_names: Default::default(),
         responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
@@ -9084,15 +9771,17 @@ async fn forward_claude_deepseek(
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        let usage = std::mem::take(&mut interrupt_guard.usage).finish();
-                        update_stream_usage(
+                        let usage_result = std::mem::take(&mut interrupt_guard.usage)
+                            .finish_with_status();
+                        let usage = usage_result.usage;
+                        update_stream_usage_result(
                             &state,
                             &stored,
                             &request_id,
                             StatusCode::BAD_GATEWAY.as_u16(),
                             started.elapsed().as_millis(),
                             first_token_ms,
-                            usage,
+                            usage_result,
                             Some("upstream_error"),
                         )
                         .await;
@@ -9115,15 +9804,17 @@ async fn forward_claude_deepseek(
                 }
                 yield Ok::<Bytes, std::io::Error>(chunk);
             }
-            let usage = std::mem::take(&mut interrupt_guard.usage).finish();
-            update_stream_usage(
+            let usage_result = std::mem::take(&mut interrupt_guard.usage)
+                .finish_with_status();
+            let usage = usage_result.usage;
+            update_stream_usage_result(
                 &state,
                 &stored,
                 &request_id,
                 status_code,
                 started.elapsed().as_millis(),
                 first_token_ms,
-                usage,
+                usage_result,
                 Some("completed"),
             )
             .await;
@@ -9224,6 +9915,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         actual_model: model_selection.actual_model.clone(),
         actual_model_source: model_selection.actual_model_source.clone(),
         stream_requested: false,
+        upstream_stream_requested: false,
         custom_tool_names: Default::default(),
         responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
@@ -9516,15 +10208,17 @@ async fn forward_claude_kiro_stream(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let usage = std::mem::take(&mut interrupt_guard.usage).finish();
-                    update_stream_usage(
+                    let usage_result = std::mem::take(&mut interrupt_guard.usage)
+                        .finish_with_status();
+                    let usage = usage_result.usage;
+                    update_stream_usage_result(
                         &state,
                         &stored,
                         &request_id,
                         StatusCode::BAD_GATEWAY.as_u16(),
                         started.elapsed().as_millis(),
                         first_token_ms,
-                        usage,
+                        usage_result,
                         Some("upstream_error"),
                     )
                     .await;
@@ -9559,15 +10253,17 @@ async fn forward_claude_kiro_stream(
             }
             yield Ok::<Bytes, std::io::Error>(chunk);
         }
-        let usage = std::mem::take(&mut interrupt_guard.usage).finish();
-        update_stream_usage(
+        let usage_result = std::mem::take(&mut interrupt_guard.usage)
+            .finish_with_status();
+        let usage = usage_result.usage;
+        update_stream_usage_result(
             &state,
             &stored,
             &request_id,
             status_code,
             started.elapsed().as_millis(),
             first_token_ms,
-            usage,
+            usage_result,
             Some("completed"),
         )
         .await;
@@ -9618,18 +10314,19 @@ impl Drop for ShareStreamInterruptGuard {
         let status_code = self.status_code;
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
-        let usage = std::mem::take(&mut self.usage).finish();
+        let usage_result = std::mem::take(&mut self.usage).finish_with_status();
+        let usage = usage_result.usage;
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms;
         tokio::spawn(async move {
-            update_stream_usage(
+            update_stream_usage_result(
                 &state,
                 &stored,
                 &request_id,
                 status_code,
                 duration_ms,
                 first_token_ms,
-                usage,
+                usage_result,
                 Some("client_cancelled"),
             )
             .await;
@@ -9743,10 +10440,16 @@ fn account_concurrency_proxy_error(stored: &StoredProvider) -> ProxyError {
 async fn validate_and_acquire_share_invocation(
     state: &ServerState,
     share_id: &str,
+    app: AppKind,
     user_email: Option<&str>,
 ) -> Result<(String, ShareInFlightGuard), ProxyError> {
     let validation = state
-        .validate_share_invocation(share_id, user_email, crate::infra::time::now_ms() as i64)
+        .validate_share_invocation(
+            share_id,
+            app,
+            user_email,
+            crate::infra::time::now_ms() as i64,
+        )
         .await;
 
     let invocation = match validation {
@@ -9784,6 +10487,7 @@ async fn validate_and_acquire_share_invocation(
 fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyError {
     let status = match rejection.reason {
         ShareRejectReason::NotFound => StatusCode::NOT_FOUND,
+        ShareRejectReason::UnsupportedApp => StatusCode::NOT_FOUND,
         ShareRejectReason::ParallelLimit | ShareRejectReason::UserParallelLimit => {
             StatusCode::TOO_MANY_REQUESTS
         }
@@ -10798,6 +11502,186 @@ fn decoded_upstream_response(
     response
 }
 
+#[derive(Debug)]
+struct OpenAiResponsesAggregationFailure {
+    error: ProxyError,
+    usage: TokenUsage,
+    usage_state: UsageState,
+    stream_status: &'static str,
+    provider_outcome: Option<ProviderOutcome>,
+    semantic_failure: Option<SemanticFailure>,
+    saw_business_output: bool,
+}
+
+impl OpenAiResponsesAggregationFailure {
+    fn from_aggregation_error(
+        error: ResponsesSseAggregationError,
+        usage: TokenUsage,
+        semantic_terminal: Option<SemanticTerminal>,
+        saw_business_output: bool,
+    ) -> Self {
+        let kind = error.kind;
+        let usage_state = match kind {
+            ResponsesSseAggregationErrorKind::ParseError => UsageState::ParseError,
+            ResponsesSseAggregationErrorKind::MissingTerminal
+            | ResponsesSseAggregationErrorKind::UpstreamFailure
+            | ResponsesSseAggregationErrorKind::Capacity => observed_or_missing_usage_state(usage),
+        };
+        let mut proxy_error = error.into_proxy_error();
+        let (stream_status, provider_outcome, semantic_failure) = match semantic_terminal {
+            Some(SemanticTerminal::Failure(failure)) => match failure.origin {
+                FailureOrigin::Client => {
+                    proxy_error.status = StatusCode::BAD_REQUEST;
+                    ("client_error", None, Some(failure))
+                }
+                FailureOrigin::Provider => (
+                    "provider_failed",
+                    Some(ProviderOutcome::Failure { status_code: 502 }),
+                    Some(failure),
+                ),
+            },
+            _ => {
+                let stream_status = match kind {
+                    ResponsesSseAggregationErrorKind::ParseError => "parse_error",
+                    ResponsesSseAggregationErrorKind::MissingTerminal => "missing_terminal",
+                    ResponsesSseAggregationErrorKind::UpstreamFailure => "provider_failed",
+                    ResponsesSseAggregationErrorKind::Capacity => "aggregate_too_large",
+                };
+                (
+                    stream_status,
+                    Some(ProviderOutcome::Failure { status_code: 502 }),
+                    None,
+                )
+            }
+        };
+        Self {
+            error: proxy_error,
+            usage,
+            usage_state,
+            stream_status,
+            provider_outcome,
+            semantic_failure,
+            saw_business_output,
+        }
+    }
+
+    fn interrupted(error: ProxyError, usage: TokenUsage, stream_status: &'static str) -> Self {
+        Self {
+            error,
+            usage,
+            usage_state: UsageState::Interrupted,
+            stream_status,
+            provider_outcome: Some(ProviderOutcome::NetworkFailure),
+            semantic_failure: None,
+            saw_business_output: false,
+        }
+    }
+}
+
+fn observed_or_missing_usage_state(usage: TokenUsage) -> UsageState {
+    if usage.has_observation() {
+        UsageState::Observed
+    } else {
+        UsageState::Missing
+    }
+}
+
+async fn record_openai_responses_aggregation_failure(
+    state: &ServerState,
+    stored: &StoredProvider,
+    adapter_request: &adapters::AdapterRequest,
+    request_context: &UsageLogContext,
+    started: Instant,
+    failure: &OpenAiResponsesAggregationFailure,
+) {
+    log_usage(
+        state,
+        stored,
+        failure.error.status.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(adapter_request),
+        failure.usage,
+        UsageLogContext {
+            is_streaming: false,
+            stream_status: Some(failure.stream_status.to_string()),
+            usage_state: Some(failure.usage_state),
+            error_message: Some(failure.error.client_message().to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        failure.usage,
+    )
+    .await;
+    if let Some(provider_outcome) = failure.provider_outcome {
+        record_provider_outcome(state, stored, provider_outcome).await;
+    }
+}
+
+async fn aggregate_openai_responses_upstream(
+    response: &mut reqwest::Response,
+    timeout: Duration,
+) -> Result<super::streaming::ResponsesSseAggregation, OpenAiResponsesAggregationFailure> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut aggregator = ResponsesSseAggregator::new();
+    let mut semantics = ResponsesSseInspector::default();
+    let mut usage = StreamUsageAccumulator::new(InputTokenSemantics::Inclusive);
+    loop {
+        let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => {
+                return Err(OpenAiResponsesAggregationFailure::interrupted(
+                    ProxyError::bad_gateway(error),
+                    usage.finish(),
+                    "interrupted",
+                ));
+            }
+            Err(_) => {
+                return Err(OpenAiResponsesAggregationFailure::interrupted(
+                    ProxyError {
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        message: format!(
+                            "OpenAI Responses aggregation timed out after {}ms",
+                            timeout.as_millis()
+                        ),
+                    },
+                    usage.finish(),
+                    "timeout",
+                ));
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        usage.push(&chunk);
+        let _ = semantics.push(&chunk);
+        if let Err(error) = aggregator.push(&chunk) {
+            return Err(OpenAiResponsesAggregationFailure::from_aggregation_error(
+                error,
+                usage.finish(),
+                semantics.terminal().cloned(),
+                semantics.saw_business(),
+            ));
+        }
+        if aggregator.is_terminal() {
+            break;
+        }
+    }
+    let _ = semantics.finish();
+    aggregator.finish().map_err(|error| {
+        OpenAiResponsesAggregationFailure::from_aggregation_error(
+            error,
+            usage.finish(),
+            semantics.terminal().cloned(),
+            semantics.saw_business(),
+        )
+    })
+}
+
 fn codex_oauth_session_id_from_request(headers: &HeaderMap, body: &[u8]) -> Option<String> {
     optional_header(headers, "session_id")
         .or_else(|| optional_header(headers, "x-session-id"))
@@ -10941,7 +11825,7 @@ const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
 
 const CODEX_OAUTH_SERVER_ITEM_ID_PREFIXES: &[&str] = &["rs_", "fc_", "resp_", "msg_"];
 
-fn normalize_codex_oauth_responses_body_bytes(
+pub(super) fn normalize_codex_oauth_responses_body_bytes(
     body: &Bytes,
     prompt_cache_key: Option<&str>,
     image_tool_strip_policy: CodexImageToolStripPolicy,
@@ -10976,7 +11860,7 @@ fn codex_responses_lite_requested_value(body: &Value) -> bool {
     .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
-fn normalize_codex_responses_lite_body_bytes(
+pub(super) fn normalize_codex_responses_lite_body_bytes(
     body: &Bytes,
     strip_hosted_image_tools: bool,
     remove_ws_metadata: bool,
@@ -11022,7 +11906,7 @@ fn normalize_codex_responses_lite_body(
     }
 }
 
-fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<Bytes, ProxyError> {
+pub(super) fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<Bytes, ProxyError> {
     let mut value = serde_json::from_slice::<Value>(body).map_err(|error| ProxyError {
         status: StatusCode::BAD_REQUEST,
         message: format!("invalid codex oauth compact body: {error}"),
@@ -11042,7 +11926,7 @@ fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<Bytes, Proxy
         })
 }
 
-fn codex_responses_body_has_compaction_trigger(body: &[u8]) -> bool {
+pub(super) fn codex_responses_body_has_compaction_trigger(body: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
@@ -11056,7 +11940,7 @@ fn codex_responses_body_has_compaction_trigger(body: &[u8]) -> bool {
         })
 }
 
-fn codex_compact_url(url: &str) -> String {
+pub(super) fn codex_compact_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     if trimmed.ends_with("/responses/compact") {
         trimmed.to_string()
@@ -11558,16 +12442,17 @@ impl StreamForwardState {
         mut self,
         error: ProxyError,
     ) -> Result<Option<(Bytes, Self)>, std::io::Error> {
-        let usage = std::mem::take(&mut self.usage).finish();
+        let usage_result = std::mem::take(&mut self.usage).finish_with_status();
+        let usage = usage_result.usage;
         let status = error.status.as_u16();
-        update_stream_usage(
+        update_stream_usage_result(
             &self.state,
             &self.stored,
             &self.request_id,
             status,
             self.started.elapsed().as_millis(),
             self.first_token_ms,
-            usage,
+            usage_result,
             Some("transform_error"),
         )
         .await;
@@ -12231,18 +13116,19 @@ impl Drop for StreamForwardState {
         let status_code = self.status_code;
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
-        let usage = std::mem::take(&mut self.usage).finish();
+        let usage_result = std::mem::take(&mut self.usage).finish_with_status();
+        let usage = usage_result.usage;
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms;
         tokio::spawn(async move {
-            update_stream_usage(
+            update_stream_usage_result(
                 &state,
                 &stored,
                 &request_id,
                 status_code,
                 duration_ms,
                 first_token_ms,
-                usage,
+                usage_result,
                 Some("client_cancelled"),
             )
             .await;
@@ -13826,6 +14712,7 @@ mod tests {
                                 grok_session_id: Some(session_id),
                                 grok_turn_index: turn_index,
                                 single_upstream_model: Some("grok-4.5".to_string()),
+                                request_context: UsageLogContext::default(),
                                 state: &state,
                                 execution,
                             },
@@ -14141,6 +15028,241 @@ mod tests {
             )
             .to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_non_stream_client_aggregates_required_upstream_sse() {
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-non-stream\"}}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-non-stream\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let name = "codex-required-upstream-sse";
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-5.4","input":"ping","stream":false,"store":true}"#,
+            ),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(body["id"], "resp-non-stream");
+        assert_eq!(body["output"][0]["id"], "msg-1");
+        assert_eq!(body["usage"]["total_tokens"], 15);
+
+        {
+            let requests = upstream.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].body["store"], false);
+            assert_eq!(requests[0].body["stream"], true);
+        }
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("aggregated Responses usage log");
+        assert_eq!(log.input_tokens, Some(12));
+        assert_eq!(log.output_tokens, Some(3));
+        assert_eq!(log.total_tokens, Some(15));
+        assert_eq!(
+            log.usage_state,
+            crate::domain::usage::store::UsageState::Observed
+        );
+        assert_eq!(log.usage_revision, 1);
+        assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        assert!(!log.is_streaming);
+
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_non_stream_aggregation_failures_are_terminally_logged() {
+        let cases = [
+            (
+                "parse-error",
+                "data: {not-json}\n\n",
+                crate::domain::usage::store::UsageState::ParseError,
+                "parse_error",
+                None,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                "missing-terminal",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-missing\"}}\n\n",
+                crate::domain::usage::store::UsageState::Missing,
+                "missing_terminal",
+                None,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                "upstream-failed",
+                "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"error\":{\"message\":\"busy\"},\"usage\":{\"input_tokens\":8,\"output_tokens\":0,\"total_tokens\":8}}}\n\n",
+                crate::domain::usage::store::UsageState::Observed,
+                "provider_failed",
+                Some(8),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                "client-failed",
+                "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-client-failed\",\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad tool\"}}}\n\n",
+                crate::domain::usage::store::UsageState::Missing,
+                "client_error",
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+
+        for (
+            suffix,
+            response_body,
+            expected_state,
+            expected_stream_status,
+            expected_total,
+            expected_status,
+        ) in cases
+        {
+            let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: response_body.to_string(),
+            }])
+            .await;
+            let name = format!("codex-required-sse-{suffix}");
+            let (state, execution) =
+                codex_bridge_test_context(&name, format!("http://{}", upstream.address)).await;
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+            let error = forward_with_attempt(
+                state.clone(),
+                ProxyRoute::CodexResponses,
+                None,
+                headers,
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.4","input":"ping","stream":false,"reasoning":{"effort":"high"}}"#,
+                ),
+                ForwardAttemptContext {
+                    execution: Some(execution),
+                    ..ForwardAttemptContext::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status, expected_status, "case {suffix}");
+            let usage = state.usage_snapshot().await;
+            let log = usage.logs.last().expect("terminal aggregation failure log");
+            assert_eq!(log.status_code, expected_status.as_u16());
+            assert_eq!(log.usage_state, expected_state, "case {suffix}");
+            assert_eq!(
+                log.stream_status.as_deref(),
+                Some(expected_stream_status),
+                "case {suffix}"
+            );
+            assert_eq!(log.total_tokens, expected_total, "case {suffix}");
+            assert_eq!(log.requested_reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(log.effective_reasoning_effort.as_deref(), Some("high"));
+            assert!(log.error_message.is_some());
+            assert!(!log.is_streaming);
+            assert_eq!(log.usage_revision, 1);
+
+            upstream.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_non_stream_context_failure_compacts_before_terminal_logging() {
+        let upstream = spawn_test_overflow_upstream(vec![
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-overflow\"}}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-overflow\",\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\",\"message\":\"Input exceeds the context window\"}}}\n\n"
+                )
+                .to_string(),
+            },
+            summary_success_reply(),
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-recovered\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-recovered\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n"
+                )
+                .to_string(),
+            },
+        ])
+        .await;
+        let name = "codex-non-stream-overflow-sse";
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        set_test_overflow_compact(&mut execution, true);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            test_overflow_request_body(false),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response_body).unwrap()["id"],
+            "resp-recovered"
+        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), 3);
+        let usage = state.usage_snapshot().await;
+        assert_eq!(usage.logs.len(), 2);
+        assert!(usage
+            .logs
+            .iter()
+            .all(|log| log.stream_status.as_deref() != Some("client_error")));
+        assert_eq!(usage.logs.last().unwrap().total_tokens, Some(7));
+
+        upstream.server.abort();
     }
 
     #[tokio::test]
@@ -14585,6 +15707,7 @@ mod tests {
                                 grok_session_id: Some(session_id),
                                 grok_turn_index: None,
                                 single_upstream_model: None,
+                                request_context: UsageLogContext::default(),
                                 state: &state,
                                 execution,
                             },
@@ -14608,18 +15731,26 @@ mod tests {
         address: std::net::SocketAddr,
         input: &str,
     ) -> (Vec<Value>, Option<CloseCode>) {
+        send_test_bridge_value_with_close(
+            address,
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.4",
+                "input": input
+            }),
+        )
+        .await
+    }
+
+    async fn send_test_bridge_value_with_close(
+        address: std::net::SocketAddr,
+        request: Value,
+    ) -> (Vec<Value>, Option<CloseCode>) {
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/bridge"))
             .await
             .unwrap();
         socket
-            .send(TungsteniteMessage::Text(
-                json!({
-                    "type": "response.create",
-                    "model": "gpt-5.4",
-                    "input": input
-                })
-                .to_string(),
-            ))
+            .send(TungsteniteMessage::Text(request.to_string()))
             .await
             .unwrap();
         let mut events = Vec::new();
@@ -14847,6 +15978,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         address: std::net::SocketAddr,
         websocket_connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         websocket_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        websocket_observations: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
         http_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         http_observations: std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>,
         server: tokio::task::JoinHandle<()>,
@@ -14931,11 +16063,13 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let address = listener.local_addr().unwrap();
         let websocket_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let websocket_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let websocket_observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let http_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let http_observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let ws_connections_for_route = std::sync::Arc::clone(&websocket_connections);
         let ws_requests_for_route = std::sync::Arc::clone(&websocket_requests);
+        let ws_observations_for_route = std::sync::Arc::clone(&websocket_observations);
         let http_requests_for_route = std::sync::Arc::clone(&http_requests);
         let http_observations_for_route = std::sync::Arc::clone(&http_observations);
         let app = axum::Router::new()
@@ -14944,6 +16078,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 axum::routing::get(move |ws: WebSocketUpgrade| {
                     let connections = std::sync::Arc::clone(&ws_connections_for_route);
                     let requests = std::sync::Arc::clone(&ws_requests_for_route);
+                    let observations = std::sync::Arc::clone(&ws_observations_for_route);
                     async move {
                         ws.on_upgrade(move |mut socket| async move {
                             connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -14956,6 +16091,18 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                     AxumWsMessage::Text(_) | AxumWsMessage::Binary(_)
                                 ) {
                                     continue;
+                                }
+                                let observed = match &message {
+                                    AxumWsMessage::Text(text) => {
+                                        serde_json::from_str::<Value>(text).ok()
+                                    }
+                                    AxumWsMessage::Binary(bytes) => {
+                                        serde_json::from_slice::<Value>(bytes).ok()
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(observed) = observed {
+                                    observations.lock().unwrap().push(observed);
                                 }
                                 let request_index = requests
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -15214,6 +16361,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             address,
             websocket_connections,
             websocket_requests,
+            websocket_observations,
             http_requests,
             http_observations,
             server,
@@ -16361,29 +17509,39 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
     #[tokio::test]
     async fn codex_websocket_request_uses_the_same_sanitizer() {
-        let prepared = prepare_codex_responses_websocket_request(TungsteniteMessage::Text(
-            json!({
-                "type": "response.create",
-                "response": {
-                    "model": "gpt-5.5",
-                    "input": [
-                        "msg_stored_message",
-                        {"type": "item_reference", "id": "item_1"},
-                        {"type": "message", "id": "msg_stored_message", "role": "system", "content": "be precise"}
-                    ],
-                    "previous_response_id": "resp_previous",
-                    "reasoning_effort": "max",
-                    "metadata": {"source": "cursor"},
-                    "tools": [{
-                        "type": "function",
-                        "function": {"name": "lookup", "parameters": {"type": "object"}}
-                    }]
-                }
-            })
-            .to_string(),
-        ))
+        let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
+        let request = json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.5",
+                "input": [
+                    "msg_stored_message",
+                    {"type": "item_reference", "id": "item_1"},
+                    {"type": "message", "id": "msg_stored_message", "role": "system", "content": "be precise"}
+                ],
+                "previous_response_id": "resp_previous",
+                "reasoning_effort": "max",
+                "metadata": {"source": "cursor"},
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {"type": "object"}}
+                }]
+            }
+        });
+        let intent = crate::proxy::codex_request_policy::extract_intent(&request["response"]);
+        let (prepared, metadata) = prepare_codex_responses_websocket_request(
+            TungsteniteMessage::Text(request.to_string()),
+            &provider,
+            false,
+            None,
+            &intent,
+        )
         .await
         .unwrap();
+        assert_eq!(
+            metadata.unwrap().requested_reasoning_effort.as_deref(),
+            Some("max")
+        );
         let TungsteniteMessage::Text(prepared) = prepared else {
             panic!("prepared request must remain a text frame");
         };
@@ -16395,14 +17553,70 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(prepared["response"].get("metadata").is_none());
         assert_eq!(
             prepared["response"].pointer("/reasoning/effort"),
-            Some(&json!("xhigh"))
+            Some(&json!("max"))
         );
         assert_eq!(prepared["response"]["tools"][0]["name"], "lookup");
         assert!(prepared["response"]["tools"][0].get("function").is_none());
     }
 
     #[tokio::test]
+    async fn codex_websocket_request_inherits_model_for_policy_and_replay() {
+        let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
+        let request = json!({
+            "type": "response.create",
+            "response": {
+                "input": "continue",
+                "reasoning": {"effort": "high"},
+                "service_tier": "default"
+            }
+        });
+        let intent = crate::proxy::codex_request_policy::extract_intent(&request["response"]);
+
+        let (prepared, metadata) = prepare_codex_responses_websocket_request(
+            TungsteniteMessage::Text(request.to_string()),
+            &provider,
+            true,
+            Some("gpt-5.4"),
+            &intent,
+        )
+        .await
+        .unwrap();
+
+        let TungsteniteMessage::Text(prepared) = prepared else {
+            panic!("prepared request must remain a text frame");
+        };
+        let prepared: Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(prepared["response"]["model"], "gpt-5.4");
+        assert_eq!(prepared["response"]["service_tier"], "priority");
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.client_service_tier.as_deref(), Some("default"));
+        assert_eq!(metadata.effective_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            metadata.service_tier_decision.as_deref(),
+            Some("server_forced_priority")
+        );
+    }
+
+    #[test]
+    fn codex_websocket_session_update_rotates_inherited_model() {
+        let message = TungsteniteMessage::Text(
+            json!({"type": "session.update", "session": {"model": " gpt-5.4-mini "}}).to_string(),
+        );
+        assert_eq!(
+            codex_websocket_session_update_model(&message).as_deref(),
+            Some("gpt-5.4-mini")
+        );
+        assert!(
+            codex_websocket_session_update_model(&TungsteniteMessage::Text(
+                json!({"type": "response.create", "model": "gpt-5.4"}).to_string()
+            ))
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn codex_websocket_request_enforces_remote_image_count_before_fetching() {
+        let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
         let content = (0..=crate::proxy::remote_image::MAX_IMAGES_PER_REQUEST)
             .map(|index| {
                 json!({
@@ -16411,13 +17625,19 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 })
             })
             .collect::<Vec<_>>();
-        let error = prepare_codex_responses_websocket_request(TungsteniteMessage::Text(
-            json!({
-                "type": "response.create",
-                "response": {"input": [{"type": "message", "content": content}]}
-            })
-            .to_string(),
-        ))
+        let error = prepare_codex_responses_websocket_request(
+            TungsteniteMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "response": {"input": [{"type": "message", "content": content}]}
+                })
+                .to_string(),
+            ),
+            &provider,
+            false,
+            None,
+            &crate::proxy::codex_request_policy::CodexRequestIntent::default(),
+        )
         .await
         .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -16477,6 +17697,32 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert_eq!(value["query"], "rust");
         assert_eq!(value.pointer("/filters/path"), Some(&json!("src")));
         assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_alpha_search_applies_server_authoritative_policy() {
+        let (_state, mut execution) =
+            codex_bridge_test_context("codex-alpha-policy", "http://127.0.0.1:9".to_string()).await;
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert("codexFastMode".to_string(), Value::Bool(true));
+        let body = Bytes::from_static(
+            br#"{"query":"rust","model":"gpt-5.4","reasoning_effort":"ultra","serviceTier":"default"}"#,
+        );
+
+        let prepared = apply_codex_alpha_search_policy(&body, &execution).unwrap();
+        let value: Value = serde_json::from_slice(&prepared).unwrap();
+        assert_eq!(value.pointer("/reasoning/effort"), Some(&json!("max")));
+        assert!(value.get("reasoning_effort").is_none());
+        assert!(value.get("serviceTier").is_none());
+        assert_eq!(value.get("service_tier"), Some(&json!("priority")));
+
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert("codexFastMode".to_string(), Value::Bool(false));
+        let prepared = apply_codex_alpha_search_policy(&prepared, &execution).unwrap();
+        let value: Value = serde_json::from_slice(&prepared).unwrap();
+        assert!(value.get("service_tier").is_none());
     }
 
     #[test]
@@ -16612,10 +17858,18 @@ data: {"type":"response.output_item.done","output_index":2,"item":{"type":"funct
     #[test]
     fn codex_images_generation_builds_responses_request_and_parses_fallback_output() {
         let prepared = codex_images_generation_request(
-            br#"{"prompt":"draw a cat","model":"gpt-image-2","response_format":"url","size":"1024x1024","stream":false}"#,
+            br#"{"prompt":"draw a cat","model":"gpt-image-2","response_format":"url","size":"1024x1024","stream":false,"reasoning":{"effort":"xhigh"},"reasoning_effort":"low"}"#,
         )
         .unwrap();
         let request: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(
+            prepared.intent.requested_reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            request.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("xhigh")
+        );
         assert_eq!(
             request.get("model").and_then(Value::as_str),
             Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL)
@@ -16725,11 +17979,17 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             "mask": {"image_url": "data:image/png;base64,bWFzaw=="},
             "stream": "true",
             "n": "1",
-            "input_fidelity": "high"
+            "input_fidelity": "high",
+            "reasoning_effort": "ultra"
         }))
         .unwrap();
         let request: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert!(prepared.stream);
+        assert_eq!(
+            prepared.intent.requested_reasoning_effort.as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(request.pointer("/reasoning/effort"), Some(&json!("ultra")));
         assert_eq!(request.pointer("/tools/0/action"), Some(&json!("edit")));
         assert_eq!(request.pointer("/tools/0/n"), None);
         assert_eq!(
@@ -18963,6 +20223,189 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
+    async fn codex_websocket_logs_each_response_create_with_effective_policy() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let (state, mut execution) =
+            codex_bridge_test_context("ws-usage-turns", format!("http://{}", upstream.address))
+                .await;
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert("codexFastMode".to_string(), Value::Bool(true));
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state.clone(),
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "ws-usage-turns-session",
+        )
+        .await;
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{bridge_address}/bridge"))
+                .await
+                .unwrap();
+
+        for request in [
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.4",
+                "input": "first",
+                "reasoning": {"effort": "max"},
+                "service_tier": "default"
+            }),
+            json!({
+                "type": "response.create",
+                "input": "second",
+                "reasoning": {"effort": "low"}
+            }),
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.4-mini",
+                "input": "third",
+                "reasoning": {"effort": "ultra"},
+                "service_tier": "priority"
+            }),
+        ] {
+            socket
+                .send(TungsteniteMessage::Text(request.to_string()))
+                .await
+                .unwrap();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let TungsteniteMessage::Text(text) = message else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    break;
+                }
+            }
+        }
+        let _ = socket.close(None).await;
+
+        let usage = state.usage_snapshot().await;
+        assert_eq!(usage.logs.len(), 3);
+        assert!(usage
+            .logs
+            .iter()
+            .all(|log| log.stream_status.as_deref() == Some("completed")));
+        let first = &usage.logs[0];
+        assert_eq!(first.requested_reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(first.effective_reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(first.client_service_tier.as_deref(), Some("default"));
+        assert_eq!(first.effective_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            first.service_tier_decision.as_deref(),
+            Some("server_forced_priority")
+        );
+        let second = &usage.logs[1];
+        assert_eq!(second.requested_model, None);
+        assert_eq!(second.actual_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(second.requested_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(second.effective_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(second.client_service_tier, None);
+        assert_eq!(second.effective_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            second.service_tier_decision.as_deref(),
+            Some("server_forced_priority")
+        );
+        let third = &usage.logs[2];
+        assert_eq!(third.requested_reasoning_effort.as_deref(), Some("ultra"));
+        assert_eq!(third.effective_reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(third.client_service_tier.as_deref(), Some("priority"));
+        assert_eq!(third.effective_service_tier, None);
+        assert_eq!(
+            third.service_tier_decision.as_deref(),
+            Some("model_unsupported")
+        );
+
+        let observations = upstream.websocket_observations.lock().unwrap();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0]["service_tier"], "priority");
+        assert_eq!(
+            observations[0].pointer("/reasoning/effort"),
+            Some(&json!("max"))
+        );
+        assert_eq!(observations[1]["model"], "gpt-5.4");
+        assert_eq!(observations[1]["service_tier"], "priority");
+        assert_eq!(
+            observations[1].pointer("/reasoning/effort"),
+            Some(&json!("low"))
+        );
+        assert!(observations[2].get("service_tier").is_none());
+        assert_eq!(
+            observations[2].pointer("/reasoning/effort"),
+            Some(&json!("max"))
+        );
+        drop(observations);
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_http_fallback_completes_the_existing_turn_log() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let (state, mut execution) =
+            codex_bridge_test_context("ws-fallback-usage", format!("http://{}", upstream.address))
+                .await;
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert("codexFastMode".to_string(), Value::Bool(true));
+        let unavailable_address = unavailable_test_address().await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state.clone(),
+            execution,
+            format!("ws://{unavailable_address}/ws"),
+            None,
+            "ws-fallback-usage-session",
+        )
+        .await;
+
+        let (events, _) = send_test_bridge_value_with_close(
+            bridge_address,
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.4",
+                "input": "fallback usage",
+                "reasoning": {"effort": "high"}
+            }),
+        )
+        .await;
+
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        let usage = state.usage_snapshot().await;
+        assert_eq!(usage.logs.len(), 1);
+        let log = usage.logs.first().unwrap();
+        assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        assert_ne!(log.stream_status.as_deref(), Some("pending"));
+        assert_eq!(log.requested_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(log.effective_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(log.effective_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            log.service_tier_decision.as_deref(),
+            Some("server_forced_priority")
+        );
+        assert!(log.first_token_ms.is_some());
+        let observations = upstream.http_observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].2["service_tier"], "priority");
+        assert_eq!(
+            observations[0].2.pointer("/reasoning/effort"),
+            Some(&json!("high"))
+        );
+        drop(observations);
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
     async fn codex_websocket_cache_reuses_same_session_connection() {
         let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
         let endpoint = format!("http://{}", upstream.address);
@@ -19939,6 +21382,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             }),
             Some("fallback-session"),
             Some(9),
+            &crate::proxy::codex_request_policy::CodexRequestIntent::default(),
         )
         .await
         .unwrap();

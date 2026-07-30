@@ -52,19 +52,43 @@ pub(in crate::api) async fn import_shares(
     let (providers, accounts) = {
         let providers = state.providers.read().await;
         for share in &input.shares {
-            validate_share_provider_reference(
-                &providers,
-                share.app,
-                &share.provider_id,
-                share.provider_type,
-            )?;
+            for binding in &share.bindings {
+                validate_share_provider_reference(
+                    &providers,
+                    binding.app,
+                    &binding.provider_id,
+                    binding.provider_type,
+                )?;
+            }
         }
         (providers.clone(), state.accounts.read().await.clone())
     };
+    let root_key =
+        crate::infra::credentials::load_root_key(&state.config_dir).map_err(ApiError::internal)?;
+    for share in &mut input.shares {
+        share.capacity_pool_id =
+            crate::domain::sharing::credential_source::capacity_pool_id_for_bindings(
+                &providers,
+                &accounts,
+                &share.bindings,
+                &root_key.key,
+            )
+            .map_err(map_credential_source_error)?;
+    }
     let mut imported_store = ShareStore {
         shares: std::mem::take(&mut input.shares),
         ..ShareStore::default()
     };
+    let imported_share_ids = imported_store
+        .shares
+        .iter()
+        .map(|share| share.id.clone())
+        .collect::<Vec<_>>();
+    for share_id in imported_share_ids {
+        imported_store
+            .canonicalize_primary_app_settings(&share_id)
+            .map_err(map_share_patch_error)?;
+    }
     let owner_normalized = imported_store
         .bind_all_to_client_owner(&owner_email)
         .map_err(map_share_patch_error)?
@@ -111,6 +135,8 @@ pub(in crate::api) async fn upsert_share(
         expected_config_revision,
         mut input,
     } = command;
+    crate::domain::sharing::invariants::validate_and_normalize_upsert_input(&mut input)
+        .map_err(map_share_patch_error)?;
     input.owner_email = Some(
         state
             .config
@@ -124,14 +150,26 @@ pub(in crate::api) async fn upsert_share(
     let reference_guard = state.lock_reference_mutations().await;
     let (providers, accounts) = {
         let providers = state.providers.read().await;
-        validate_share_provider_reference(
-            &providers,
-            input.app,
-            &input.provider_id,
-            input.provider_type,
-        )?;
+        for binding in &input.bindings {
+            validate_share_provider_reference(
+                &providers,
+                binding.app,
+                &binding.provider_id,
+                binding.provider_type,
+            )?;
+        }
         (providers.clone(), state.accounts.read().await.clone())
     };
+    let root_key =
+        crate::infra::credentials::load_root_key(&state.config_dir).map_err(ApiError::internal)?;
+    let capacity_pool_id =
+        crate::domain::sharing::credential_source::capacity_pool_id_for_bindings(
+            &providers,
+            &accounts,
+            &input.bindings,
+            &root_key.key,
+        )
+        .map_err(map_credential_source_error)?;
     let previous = {
         let shares = state.shares.read().await;
         input
@@ -194,7 +232,9 @@ pub(in crate::api) async fn upsert_share(
                 _ => {}
             }
             let mut candidate = store.clone();
-            let share = candidate.upsert(input).map_err(map_share_patch_error)?;
+            let share = candidate
+                .upsert_with_capacity(input, Some(capacity_pool_id))
+                .map_err(map_share_patch_error)?;
             crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
                 &providers,
                 &accounts,
@@ -257,6 +297,262 @@ fn validate_share_provider_reference(
     Ok(())
 }
 
+fn map_credential_source_error(
+    error: crate::domain::sharing::credential_source::CredentialSourceError,
+) -> ApiError {
+    use crate::domain::sharing::credential_source::CredentialSourceError;
+
+    match error {
+        CredentialSourceError::Resolution { .. }
+        | CredentialSourceError::CapacityPoolDerivation { .. } => ApiError::internal(error),
+        _ => ApiError::bad_request_code(error.code(), error.to_string()),
+    }
+}
+
+pub(in crate::api) async fn share_reuse_candidates(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareReuseCandidatesQuery>,
+) -> Result<Json<ShareReuseCandidatesResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let providers = state.providers.read().await.clone();
+    let accounts = state.accounts.read().await.clone();
+    validate_share_provider_reference(
+        &providers,
+        query.app,
+        &query.provider_id,
+        providers
+            .providers
+            .iter()
+            .find(|provider| provider.app == query.app && provider.provider.id == query.provider_id)
+            .map(|provider| provider.provider_type)
+            .ok_or_else(|| ApiError::not_found("share Provider not found"))?,
+    )?;
+    let Some(source) =
+        crate::domain::sharing::credential_source::resolve_provider_credential_source(
+            &providers,
+            &accounts,
+            query.app,
+            &query.provider_id,
+        )
+        .map_err(ApiError::internal)?
+    else {
+        return Ok(Json(ShareReuseCandidatesResponse {
+            ok: true,
+            candidates: Vec::new(),
+        }));
+    };
+    let shares = state.shares.read().await;
+    let mut candidates = Vec::new();
+    for share in shares
+        .shares
+        .iter()
+        .filter(|share| share.enabled && share.status == "active")
+    {
+        if share
+            .bindings
+            .iter()
+            .any(|binding| binding.app == query.app)
+        {
+            continue;
+        }
+        let existing_source =
+            crate::domain::sharing::credential_source::shared_credential_source_for_bindings(
+                &providers,
+                &accounts,
+                &share.bindings,
+            )
+            .map_err(map_credential_source_error)?;
+        if existing_source.as_ref() != Some(&source) {
+            continue;
+        }
+        candidates.push(ShareReuseCandidate {
+            share_id: share.id.clone(),
+            share_name: share
+                .display_name
+                .clone()
+                .unwrap_or_else(|| share.id.clone()),
+            subdomain: share.tunnel_subdomain.clone(),
+            apps: share.bindings.iter().map(|binding| binding.app).collect(),
+            config_revision: share.config_revision,
+        });
+    }
+    candidates.sort_by(|left, right| left.share_name.cmp(&right.share_name));
+    Ok(Json(ShareReuseCandidatesResponse {
+        ok: true,
+        candidates,
+    }))
+}
+
+pub(in crate::api) async fn add_share_binding(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<AddShareBindingRequest>,
+) -> Result<Json<UpsertShareResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let _references = state.lock_reference_mutations().await;
+    let providers = state.providers.read().await.clone();
+    let accounts = state.accounts.read().await.clone();
+    let stored = providers
+        .providers
+        .iter()
+        .find(|provider| provider.app == input.app && provider.provider.id == input.provider_id)
+        .ok_or_else(|| ApiError::not_found("share Provider not found"))?;
+    let binding = ShareBinding {
+        app: input.app,
+        provider_id: input.provider_id.clone(),
+        provider_type: stored.provider_type,
+    };
+    let current = state
+        .shares
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))?;
+    if current.config_revision != input.expected_config_revision {
+        return Err(ApiError::conflict_code(
+            "cc_switch_share_revision_conflict",
+            "Share changed since reuse was confirmed",
+        ));
+    }
+    let mut next_bindings = current.bindings.clone();
+    next_bindings.push(binding.clone());
+    next_bindings.sort_by_key(|binding| binding.app);
+    let root_key =
+        crate::infra::credentials::load_root_key(&state.config_dir).map_err(ApiError::internal)?;
+    let capacity_pool_id =
+        crate::domain::sharing::credential_source::capacity_pool_id_for_bindings(
+            &providers,
+            &accounts,
+            &next_bindings,
+            &root_key.key,
+        )
+        .map_err(map_credential_source_error)?;
+    let share = state
+        .try_mutate_shares_immediate(|store| {
+            let current = store
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            if current.config_revision != input.expected_config_revision {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    "Share changed since reuse was confirmed",
+                ));
+            }
+            let mut candidate = store.clone();
+            let share = candidate
+                .add_binding_with_capacity(&id, binding, capacity_pool_id)
+                .map_err(map_share_patch_error)?;
+            crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+                &providers,
+                &accounts,
+                store,
+                &providers,
+                &accounts,
+                &candidate,
+            )
+            .map_err(map_subscription_binding_error)?;
+            *store = candidate;
+            Ok::<_, ApiError>(share)
+        })
+        .await
+        .map_err(ApiError::internal)??;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(&state, "share.changed", &share, "binding_added");
+    Ok(Json(UpsertShareResponse { ok: true, share }))
+}
+
+pub(in crate::api) async fn remove_share_binding(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RemoveShareBindingRequest>,
+) -> Result<Json<RemoveShareBindingResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let _references = state.lock_reference_mutations().await;
+    let current = state
+        .shares
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))?;
+    if current.config_revision != input.expected_config_revision {
+        return Err(ApiError::conflict_code(
+            "cc_switch_share_revision_conflict",
+            "Share changed since this Provider page was loaded",
+        ));
+    }
+    if !current
+        .bindings
+        .iter()
+        .any(|binding| binding.app == input.app && binding.provider_id == input.provider_id)
+    {
+        return Err(ApiError::bad_request("provider is not bound to this Share"));
+    }
+    if current.bindings.len() == 1 {
+        let tombstone = match state
+            .delete_share_immediate_at_revision(&id, input.expected_config_revision)
+            .await
+            .map_err(ApiError::internal)?
+        {
+            Ok(tombstone) => tombstone,
+            Err(crate::state::ConditionalShareDeleteError::NotFound) => {
+                return Err(ApiError::not_found("share not found"));
+            }
+            Err(crate::state::ConditionalShareDeleteError::RevisionConflict {
+                current_revision,
+            }) => {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    format!(
+                        "Share changed since this Provider page was loaded (expected revision {}, current revision {current_revision})",
+                        input.expected_config_revision
+                    ),
+                ));
+            }
+        };
+        crate::state::stop_share_tunnel(&state, &id).await;
+        spawn_share_delete_sync(state.clone(), tombstone);
+        state.emit_event(
+            ServerEvent::new("share.deleted", "share")
+                .id(id)
+                .message("final binding removed"),
+        );
+        return Ok(Json(RemoveShareBindingResponse {
+            ok: true,
+            deleted_share: true,
+            share: None,
+        }));
+    }
+    let share = state
+        .try_mutate_shares_immediate(|store| {
+            let current = store
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found("share not found"))?;
+            if current.config_revision != input.expected_config_revision {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    "Share changed since this Provider page was loaded",
+                ));
+            }
+            store
+                .remove_binding(&id, input.app, &input.provider_id)
+                .map_err(map_share_patch_error)
+        })
+        .await
+        .map_err(ApiError::internal)??;
+    spawn_share_upsert_sync(state.clone(), share.clone());
+    emit_share_event(&state, "share.changed", &share, "binding_removed");
+    Ok(Json(RemoveShareBindingResponse {
+        ok: true,
+        deleted_share: false,
+        share: Some(share),
+    }))
+}
+
 pub(in crate::api) async fn update_share_binding(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -265,7 +561,7 @@ pub(in crate::api) async fn update_share_binding(
 ) -> Result<Json<UpsertShareResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let reference_guard = state.lock_reference_mutations().await;
-    let (providers, accounts, usage, app) = {
+    let (providers, accounts, usage, app, current_bindings) = {
         let providers = state.providers.read().await;
         let accounts = state.accounts.read().await;
         let usage = state.usage.read().await;
@@ -284,8 +580,30 @@ pub(in crate::api) async fn update_share_binding(
             accounts.clone(),
             usage.clone(),
             share.app,
+            share.bindings.clone(),
         )
     };
+    let binding = ShareBinding {
+        app,
+        provider_id: input.provider_id.clone(),
+        provider_type: input.provider_type,
+    };
+    let mut next_bindings = current_bindings;
+    let next_binding = next_bindings
+        .iter_mut()
+        .find(|candidate| candidate.app == app)
+        .ok_or_else(|| ApiError::bad_request("share binding app must match share.app"))?;
+    *next_binding = binding.clone();
+    let root_key =
+        crate::infra::credentials::load_root_key(&state.config_dir).map_err(ApiError::internal)?;
+    let capacity_pool_id =
+        crate::domain::sharing::credential_source::capacity_pool_id_for_bindings(
+            &providers,
+            &accounts,
+            &next_bindings,
+            &root_key.key,
+        )
+        .map_err(map_credential_source_error)?;
 
     let share = state
         .try_mutate_shares_immediate(|store| {
@@ -304,13 +622,10 @@ pub(in crate::api) async fn update_share_binding(
 
             let mut candidate = store.clone();
             candidate
-                .update_binding(
+                .update_binding_with_capacity(
                     &id,
-                    ShareBinding {
-                        app,
-                        provider_id: input.provider_id.clone(),
-                        provider_type: input.provider_type,
-                    },
+                    binding,
+                    capacity_pool_id,
                 )
                 .map_err(|error| match error {
                     crate::domain::sharing::shares::ShareUpdateError::NotFound => {
@@ -795,6 +1110,7 @@ pub(in crate::api) fn connect_info_for_share(
         ),
     ]
     .into_iter()
+    .filter(|(app, _, _)| share.bindings.iter().any(|binding| binding.app == *app))
     .map(|(app, title, values)| {
         let env = values
             .into_iter()

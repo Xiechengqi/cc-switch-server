@@ -188,6 +188,14 @@
       "notes": "Server-native Web compatibility command."
     },
     {
+      "name": "add_share_binding",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/bindings",
+      "notes": "Adds an explicitly confirmed same-credential app binding to an existing Share."
+    },
+    {
       "name": "adopt_provider_profile",
       "support": "native",
       "implemented": true,
@@ -1374,6 +1382,14 @@
       "notes": "Server-native Web compatibility command."
     },
     {
+      "name": "list_share_reuse_candidates",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/shares/reuse-candidates",
+      "notes": "Lists same-credential Shares eligible for explicit URL reuse without exposing credential identity."
+    },
+    {
       "name": "model_test_all_providers",
       "support": "shim",
       "implemented": true,
@@ -1472,6 +1488,14 @@
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim."
+    },
+    {
+      "name": "remove_share_binding",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /api/shares/:id/bindings/remove",
+      "notes": "Removes one app binding and deletes the Share only when its final binding is removed."
     },
     {
       "name": "remove_provider_from_live_config",

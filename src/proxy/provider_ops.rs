@@ -12,7 +12,7 @@ use crate::domain::accounts::oauth::oauth_provider_spec;
 use crate::domain::accounts::store::{
     effective_codex_workspace_id, Account, AccountStore, CodexOAuthAccountSelectionStatus,
 };
-use crate::domain::providers::model::ProviderType;
+use crate::domain::providers::model::{CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::registry::{
     provider_registry, AuthScheme, OperationSupport, UpstreamProtocol,
 };
@@ -265,6 +265,7 @@ impl ProviderExecution {
         let identity_seed = self.managed_account_id().unwrap_or(&stored.provider.id);
         let contract = if route == ProxyRoute::ClaudeCountTokens {
             request.stream_requested = false;
+            request.upstream_stream_requested = false;
             super::claude_oauth::apply_count_tokens_forward_contract(
                 &mut endpoint,
                 &mut request.body,
@@ -539,6 +540,74 @@ impl ProviderExecution {
         adapters::finalize_runtime_request(&self.plan, &self.stored, request)
     }
 
+    pub fn apply_openai_codex_final_request_contract(
+        &self,
+        route: ProxyRoute,
+        request: &mut AdapterRequest,
+        prompt_cache_key: Option<&str>,
+        responses_lite: bool,
+        intent: &super::codex_request_policy::CodexRequestIntent,
+    ) -> Result<super::codex_request_policy::CodexRequestPolicyMetadata, ProxyError> {
+        if !self.driver_is("oauth.openai_codex")
+            || self.plan.upstream_protocol != UpstreamProtocol::OpenAiResponses
+        {
+            return Err(ProxyError::bad_request(format!(
+                "driver {} does not implement the OpenAI Codex OAuth Responses contract",
+                self.plan.driver_id
+            )));
+        }
+
+        let compact_request = route == ProxyRoute::CodexResponsesCompact
+            || (route == ProxyRoute::CodexResponses
+                && super::forwarder::codex_responses_body_has_compaction_trigger(&request.body));
+        if compact_request {
+            request.body =
+                super::forwarder::normalize_codex_oauth_compact_body_bytes(&request.body)?;
+            request.stream_requested = false;
+            request.upstream_stream_requested = false;
+        } else {
+            let image_tool_strip_policy = self
+                .stored
+                .provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.codex_image_tool_strip_policy)
+                .unwrap_or(CodexImageToolStripPolicy::Never);
+            request.body = super::forwarder::normalize_codex_oauth_responses_body_bytes(
+                &request.body,
+                prompt_cache_key,
+                image_tool_strip_policy,
+            )?;
+            if responses_lite {
+                request.body = super::forwarder::normalize_codex_responses_lite_body_bytes(
+                    &request.body,
+                    true,
+                    true,
+                )?;
+            }
+            request.upstream_stream_requested = true;
+        }
+
+        let final_model = request_model(&request.body)
+            .or_else(|| request.actual_model.clone())
+            .or_else(|| request.model.clone());
+        let fast_mode_enabled = self
+            .plan
+            .driver_options
+            .get("codexFastMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (body, metadata) = super::codex_request_policy::apply_to_bytes(
+            &request.body,
+            &self.runtime_stored_view(),
+            final_model.as_deref(),
+            fast_mode_enabled,
+            intent,
+        )?;
+        request.body = body;
+        Ok(metadata)
+    }
+
     pub fn resolve_endpoint(
         &self,
         route: ProxyRoute,
@@ -611,6 +680,15 @@ impl ProviderExecution {
                 endpoint,
                 matches!(self.plan.auth_ref, RuntimeAuthRef::ManagedAccount { .. }),
             );
+        }
+        if self.driver_is("oauth.openai_codex") {
+            let intent = super::codex_request_policy::extract_intent_from_bytes(&request.body);
+            self.apply_openai_codex_final_request_contract(route, request, None, false, &intent)?;
+            if route == ProxyRoute::CodexResponses
+                && super::forwarder::codex_responses_body_has_compaction_trigger(&request.body)
+            {
+                *endpoint = super::forwarder::codex_compact_url(endpoint);
+            }
         }
         Ok(())
     }
@@ -1222,6 +1300,7 @@ mod tests {
             actual_model: None,
             actual_model_source: None,
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -1265,6 +1344,7 @@ mod tests {
             actual_model: None,
             actual_model_source: None,
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -1288,6 +1368,198 @@ mod tests {
         assert_eq!(
             request.actual_model.as_deref(),
             Some("grok-composer-2.5-fast")
+        );
+    }
+
+    #[test]
+    fn codex_test_contract_applies_server_authoritative_fast_policy() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "codex-account".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+        let plan = Arc::make_mut(&mut execution.plan);
+        plan.driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+        plan.driver_options
+            .insert("codexFastMode".to_string(), Value::Bool(true));
+
+        let mut request = AdapterRequest {
+            body: bytes::Bytes::from_static(
+                br#"{"model":"gpt-5.4","input":"ping","reasoning":{"effort":"ultra"},"service_tier":"default"}"#,
+            ),
+            upstream_endpoint: None,
+            upstream_headers: vec![],
+            model: Some("gpt-5.4".to_string()),
+            requested_model: Some("gpt-5.4".to_string()),
+            actual_model: Some("gpt-5.4".to_string()),
+            actual_model_source: Some("request".to_string()),
+            stream_requested: false,
+            upstream_stream_requested: false,
+            custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        let mut endpoint = "https://chatgpt.com/backend-api/codex/responses".to_string();
+
+        execution
+            .apply_test_forward_contract(
+                ProxyRoute::CodexResponses,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("max")));
+        assert!(!request.stream_requested);
+        assert!(request.upstream_stream_requested);
+    }
+
+    #[test]
+    fn openai_oauth_final_contract_is_shared_across_app_adapters() {
+        let cases = [
+            (
+                AppKind::Claude,
+                ProxyRoute::ClaudeMessages,
+                bytes::Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}],"output_config":{"effort":"max"},"stream":false}"#,
+                ),
+                None,
+                "max",
+            ),
+            (
+                AppKind::Codex,
+                ProxyRoute::CodexResponses,
+                bytes::Bytes::from_static(
+                    br#"{"model":"gpt-5.4","input":"ping","reasoning":{"effort":"high"},"stream":false}"#,
+                ),
+                None,
+                "high",
+            ),
+            (
+                AppKind::Gemini,
+                ProxyRoute::Gemini,
+                bytes::Bytes::from_static(
+                    br#"{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16,"thinkingConfig":{"thinkingLevel":"xhigh"}}}"#,
+                ),
+                Some("models/gpt-5.4:generateContent"),
+                "xhigh",
+            ),
+        ];
+
+        for (app, route, body, gemini_path, expected_effort) in cases {
+            let mut execution = execution_with_auth(
+                RuntimeAuthRef::ManagedAccount {
+                    account_id: "codex-account".to_string(),
+                    expected_provider_type: ProviderType::CodexOAuth,
+                    auth_identity_generation: 1,
+                },
+                UpstreamProtocol::OpenAiResponses,
+                json!({}),
+                1,
+            );
+            execution.stored.app = app;
+            execution.stored.provider_type = ProviderType::CodexOAuth;
+            execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+            let plan = Arc::make_mut(&mut execution.plan);
+            plan.driver_id =
+                crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+            plan.model_policy = RuntimeModelPolicy::Single {
+                upstream_model: "gpt-5.4".to_string(),
+            };
+
+            let stored = execution.runtime_stored_view();
+            let adapter = adapters::adapter_for(app, ProviderType::CodexOAuth);
+            let mut request = adapter
+                .transform_request_for_route(body, &stored, route, gemini_path)
+                .unwrap();
+            execution.enforce_model_policy(&mut request).unwrap();
+            execution.finalize_request(&mut request).unwrap();
+            let mut endpoint = "https://chatgpt.com/backend-api/codex/responses".to_string();
+            execution
+                .apply_test_forward_contract(route, &mut request, &mut endpoint, &mut Vec::new())
+                .unwrap();
+
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "gpt-5.4", "app={}", app.as_str());
+            assert_eq!(body["store"], false, "app={}", app.as_str());
+            assert_eq!(body["stream"], true, "app={}", app.as_str());
+            assert_eq!(
+                body.pointer("/reasoning/effort").and_then(Value::as_str),
+                Some(expected_effort),
+                "app={}",
+                app.as_str()
+            );
+            assert!(!request.stream_requested, "app={}", app.as_str());
+            assert!(request.upstream_stream_requested, "app={}", app.as_str());
+        }
+    }
+
+    #[test]
+    fn openai_oauth_final_contract_removes_client_fast_when_server_disables_it() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "codex-account".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+        Arc::make_mut(&mut execution.plan).driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+        let mut request = AdapterRequest {
+            body: bytes::Bytes::from_static(
+                br#"{"model":"gpt-5.4","input":"ping","reasoning":{"effort":"high"},"service_tier":"priority","stream":false}"#,
+            ),
+            upstream_endpoint: None,
+            upstream_headers: vec![],
+            model: Some("gpt-5.4".to_string()),
+            requested_model: Some("gpt-5.4".to_string()),
+            actual_model: Some("gpt-5.4".to_string()),
+            actual_model_source: Some("request".to_string()),
+            stream_requested: false,
+            upstream_stream_requested: false,
+            custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        let intent = super::super::codex_request_policy::extract_intent_from_bytes(&request.body);
+        let metadata = execution
+            .apply_openai_codex_final_request_contract(
+                ProxyRoute::CodexResponses,
+                &mut request,
+                None,
+                false,
+                &intent,
+            )
+            .unwrap();
+
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(body.get("service_tier").is_none());
+        assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
+        assert_eq!(metadata.requested_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(metadata.effective_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(metadata.client_service_tier.as_deref(), Some("priority"));
+        assert_eq!(metadata.effective_service_tier, None);
+        assert_eq!(
+            metadata.service_tier_decision.as_deref(),
+            Some("server_disabled")
         );
     }
 
@@ -1513,6 +1785,7 @@ mod tests {
             actual_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
             actual_model_source: Some("request".to_string()),
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -1541,6 +1814,7 @@ mod tests {
             actual_model: Some("claude-sonnet-4-6-1m".to_string()),
             actual_model_source: Some("request".to_string()),
             stream_requested: false,
+            upstream_stream_requested: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),

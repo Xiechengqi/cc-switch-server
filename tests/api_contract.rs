@@ -39,6 +39,8 @@ use cc_switch_server::domain::health::{ProviderHealthObservation, ProviderHealth
 use cc_switch_server::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
 };
+use cc_switch_server::domain::providers::registry::ProfileId;
+use cc_switch_server::domain::providers::store::ProviderResourceMetadata;
 use cc_switch_server::domain::sharing::router_contract::{
     ShareGrantManager, ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch,
 };
@@ -9025,7 +9027,322 @@ async fn paused_share_codex_workspace_rebind_updates_identity_and_history() {
 }
 
 #[tokio::test]
-async fn oauth_share_write_contracts_enforce_one_identity_and_control_rebinding() {
+async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let router_server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/v1/shares/batch-sync", post(|| async { StatusCode::OK })),
+        )
+        .await
+        .unwrap();
+    });
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    configure_share_router_identity(&state).await;
+    let mut config = state.config_snapshot().await;
+    config.router.url = Some(format!("http://{router_addr}"));
+    let identity = config.router.identity.as_mut().unwrap();
+    identity.public_key = BASE64_STANDARD.encode([8_u8; 32]);
+    identity.private_key = BASE64_STANDARD.encode([7_u8; 32]);
+    state.replace_config(config).await.unwrap();
+    state
+        .mutate_providers_immediate(|providers| {
+            for (provider_app, provider_id) in [
+                (AppKind::Claude, "share-reuse-claude"),
+                (AppKind::Codex, "share-reuse-codex-independent"),
+                (AppKind::Codex, "share-reuse-codex-joined"),
+            ] {
+                let (provider, resource) =
+                    openrouter_share_provider(provider_app, provider_id, "shared-openrouter-key");
+                providers.upsert_with_resource(provider_app, provider, resource);
+            }
+        })
+        .await
+        .unwrap();
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares",
+            json!({
+                "id": "share-reuse-multi",
+                "app": "claude",
+                "providerId": "share-reuse-claude",
+                "providerType": "openrouter",
+                "bindings": [{
+                    "app": "claude",
+                    "providerId": "share-reuse-claude",
+                    "providerType": "openrouter"
+                }],
+                "displayName": "Shared OpenRouter",
+                "tunnelSubdomain": "sharereusemulti",
+                "description": "created from Claude",
+                "enabled": true,
+                "status": "active",
+                "autoStart": false,
+                "tokenLimit": 123,
+                "parallelLimit": 2
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await["share"].clone();
+    let shared_capacity_pool_id = created["capacityPoolId"].as_str().unwrap().to_string();
+    assert!(shared_capacity_pool_id.starts_with("cp_"));
+
+    let independent = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares",
+            json!({
+                "id": "share-reuse-independent",
+                "app": "codex",
+                "providerId": "share-reuse-codex-independent",
+                "providerType": "openrouter",
+                "bindings": [{
+                    "app": "codex",
+                    "providerId": "share-reuse-codex-independent",
+                    "providerType": "openrouter"
+                }],
+                "tunnelSubdomain": "sharereuseindependent",
+                "enabled": false,
+                "status": "paused"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(independent.status(), StatusCode::OK);
+    let independent = json_body(independent).await["share"].clone();
+    assert_eq!(
+        independent["capacityPoolId"].as_str(),
+        Some(shared_capacity_pool_id.as_str())
+    );
+    assert_ne!(independent["id"], created["id"]);
+
+    state
+        .mutate_providers_immediate(|providers| {
+            let resource = providers
+                .providers
+                .iter()
+                .find(|provider| {
+                    provider.app == AppKind::Codex
+                        && provider.provider.id == "share-reuse-codex-independent"
+                })
+                .unwrap()
+                .resource
+                .clone();
+            let (provider, _) = openrouter_share_provider(
+                AppKind::Codex,
+                "share-reuse-codex-independent",
+                "rotated-openrouter-key",
+            );
+            providers.upsert_with_resource(AppKind::Codex, provider, resource);
+        })
+        .await
+        .unwrap();
+    let rotated_independent = state
+        .mutate_shares(|shares| shares.get("share-reuse-independent").unwrap().clone())
+        .await;
+    assert_ne!(
+        rotated_independent.capacity_pool_id,
+        shared_capacity_pool_id
+    );
+
+    let candidates = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/shares/reuse-candidates?app=codex&providerId=share-reuse-codex-joined",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(candidates.status(), StatusCode::OK);
+    let candidates = json_body(candidates).await["candidates"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["shareId"], "share-reuse-multi");
+    assert_eq!(candidates[0]["apps"], json!(["claude"]));
+
+    let joined = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares/share-reuse-multi/bindings",
+            json!({
+                "app": "codex",
+                "providerId": "share-reuse-codex-joined",
+                "expectedConfigRevision": candidates[0]["configRevision"]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), StatusCode::OK);
+    let joined = json_body(joined).await["share"].clone();
+    assert_eq!(joined["capacityPoolId"], shared_capacity_pool_id);
+    assert_eq!(joined["bindings"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        joined["appSettings"]["claude"],
+        joined["appSettings"]["codex"]
+    );
+
+    let mismatch = state
+        .mutate_providers_immediate(|providers| {
+            let resource = providers
+                .providers
+                .iter()
+                .find(|provider| {
+                    provider.app == AppKind::Codex
+                        && provider.provider.id == "share-reuse-codex-joined"
+                })
+                .unwrap()
+                .resource
+                .clone();
+            let (provider, _) = openrouter_share_provider(
+                AppKind::Codex,
+                "share-reuse-codex-joined",
+                "different-openrouter-key",
+            );
+            providers.upsert_with_resource(AppKind::Codex, provider, resource);
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch
+            .to_string()
+            .contains("cc_switch_share_credential_source_mismatch"),
+        "{mismatch}"
+    );
+
+    let saved = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_share",
+            json!({
+                "shareId": "share-reuse-multi",
+                "expectedConfigRevision": joined["configRevision"],
+                "subdomain": "sharereusemulti",
+                "description": "edited from Codex",
+                "forSale": "Yes",
+                "marketAccessMode": "selected",
+                "sharedWithEmails": ["friend@example.com"],
+                "accessByApp": {
+                    "codex": {
+                        "sharedWithEmails": ["friend@example.com"],
+                        "marketAccessMode": "selected"
+                    }
+                },
+                "appSettings": {
+                    "codex": {
+                        "forSale": "Yes",
+                        "marketAccessMode": "selected",
+                        "sharedWithEmails": ["friend@example.com"],
+                        "tokenLimit": 456,
+                        "parallelLimit": 3,
+                        "expiresAt": "2099-12-31T23:59:59Z"
+                    }
+                },
+                "forSaleOfficialPricePercentByApp": {"codex": 75},
+                "tokenLimit": 456,
+                "parallelLimit": 3,
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "userGrants": {}
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let saved_status = saved.status();
+    let saved = json_body(saved).await;
+    assert_eq!(saved_status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["description"], "edited from Codex");
+    assert_eq!(saved["tokenLimit"], 456);
+    assert_eq!(saved["parallelLimit"], 3);
+    assert_eq!(
+        saved["appSettings"]["claude"],
+        saved["appSettings"]["codex"]
+    );
+    assert_eq!(
+        saved["forSaleOfficialPricePercentByApp"],
+        json!({"claude": 75, "codex": 75})
+    );
+
+    let connect_info = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/shares/share-reuse-multi/connect-info",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(connect_info.status(), StatusCode::OK);
+    let connect_info = json_body(connect_info).await;
+    assert_eq!(
+        connect_info["snippets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|snippet| snippet["app"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["claude", "codex"]
+    );
+
+    let unbound = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::POST,
+            "/v1beta/models/gemini-pro:generateContent",
+            &["share-reuse-multi"],
+            "nonce-share-reuse-unbound-gemini",
+            serde_json::to_vec(&json!({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}]
+            }))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unbound.status(), StatusCode::NOT_FOUND);
+
+    let removed = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/shares/share-reuse-multi/bindings/remove",
+            json!({
+                "app": "codex",
+                "providerId": "share-reuse-codex-joined",
+                "expectedConfigRevision": saved["configRevision"]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::OK);
+    let removed = json_body(removed).await;
+    assert_eq!(removed["deletedShare"], false);
+    assert_eq!(removed["share"]["bindings"].as_array().unwrap().len(), 1);
+    assert_eq!(removed["share"]["bindings"][0]["app"], "claude");
+    router_server.abort();
+}
+
+#[tokio::test]
+async fn oauth_share_write_contracts_allow_independent_urls_and_control_rebinding() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
@@ -9059,6 +9376,7 @@ async fn oauth_share_write_contracts_enforce_one_identity_and_control_rebinding(
     for (provider_id, account_id) in [
         ("share-provider-a", "share-account-a"),
         ("share-provider-b", "share-account-b"),
+        ("share-provider-d", "share-account-b"),
         ("share-provider-c", "share-account-c"),
         ("share-provider-unverified", "share-account-unverified"),
     ] {
@@ -9124,16 +9442,12 @@ async fn oauth_share_write_contracts_enforce_one_identity_and_control_rebinding(
         ))
         .await
         .unwrap();
-    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(duplicate).await["code"],
-        "cc_switch_subscription_identity_conflict"
-    );
+    assert_eq!(duplicate.status(), StatusCode::OK);
 
     let mut imported_duplicate = created.clone();
     imported_duplicate["id"] = json!("oauth-share-import-duplicate");
-    imported_duplicate["providerId"] = json!("share-provider-b");
-    imported_duplicate["bindings"][0]["providerId"] = json!("share-provider-b");
+    imported_duplicate["providerId"] = json!("share-provider-d");
+    imported_duplicate["bindings"][0]["providerId"] = json!("share-provider-d");
     imported_duplicate["tunnelSubdomain"] = json!("oauthimportduplicate");
     let duplicate_import = app
         .clone()
@@ -9145,11 +9459,8 @@ async fn oauth_share_write_contracts_enforce_one_identity_and_control_rebinding(
         ))
         .await
         .unwrap();
-    assert_eq!(duplicate_import.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(duplicate_import).await["code"],
-        "cc_switch_subscription_identity_conflict"
-    );
+    assert_eq!(duplicate_import.status(), StatusCode::OK);
+    assert_eq!(json_body(duplicate_import).await["imported"], 1);
 
     let unverified = app
         .clone()
@@ -9292,6 +9603,33 @@ fn claude_api_key_test_provider(id: &str, base_url: &str) -> Provider {
         meta: None,
         extra: Default::default(),
     }
+}
+
+fn openrouter_share_provider(
+    app: AppKind,
+    id: &str,
+    api_key: &str,
+) -> (Provider, ProviderResourceMetadata) {
+    let settings_config = match app {
+        AppKind::Claude => json!({"env": {"ANTHROPIC_AUTH_TOKEN": api_key}}),
+        AppKind::Codex => json!({"env": {"OPENAI_API_KEY": api_key}}),
+        AppKind::Gemini => json!({"env": {"GEMINI_API_KEY": api_key}}),
+    };
+    (
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            settings_config,
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+        ProviderResourceMetadata {
+            profile_id: Some(ProfileId::parse(format!("{}.openrouter", app.as_str())).unwrap()),
+            profile_schema_revision: Some(1),
+            ..ProviderResourceMetadata::default()
+        },
+    )
 }
 
 fn legacy_claude_oauth_relay_test_provider(id: &str, base_url: &str, token: &str) -> Provider {

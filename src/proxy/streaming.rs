@@ -1,6 +1,15 @@
+use std::collections::BTreeMap;
+
+use axum::http::StatusCode;
+use serde_json::Value;
+
 use crate::domain::usage::store::{
     usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
 };
+
+use super::ProxyError;
+
+const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct SseLineBuffer {
@@ -37,9 +46,291 @@ impl SseLineBuffer {
 
 #[derive(Debug)]
 pub struct StreamUsageAccumulator {
-    buffer: String,
+    decoder: JsonStreamEventDecoder,
     usage: TokenUsage,
     input_semantics: InputTokenSemantics,
+    parse_error: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StreamUsageResult {
+    pub usage: TokenUsage,
+    pub parse_error: bool,
+}
+
+#[derive(Debug)]
+pub struct ResponsesSseAggregation {
+    pub response: Value,
+    pub stream_status: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesSseAggregationErrorKind {
+    ParseError,
+    MissingTerminal,
+    UpstreamFailure,
+    Capacity,
+}
+
+#[derive(Debug)]
+pub struct ResponsesSseAggregationError {
+    pub kind: ResponsesSseAggregationErrorKind,
+    error: ProxyError,
+}
+
+impl ResponsesSseAggregationError {
+    fn new(kind: ResponsesSseAggregationErrorKind, error: ProxyError) -> Self {
+        Self { kind, error }
+    }
+
+    pub fn into_proxy_error(self) -> ProxyError {
+        self.error
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> StatusCode {
+        self.error.status
+    }
+}
+
+#[derive(Debug)]
+pub struct ResponsesSseAggregator {
+    decoder: JsonStreamEventDecoder,
+    response: Option<Value>,
+    response_bytes: usize,
+    output_items: BTreeMap<u64, Value>,
+    output_item_bytes: usize,
+    next_output_index: u64,
+    stream_status: Option<&'static str>,
+    max_retained_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonStreamMode {
+    Unknown,
+    Sse,
+    Json,
+}
+
+#[derive(Debug)]
+struct JsonStreamEvent {
+    event: Option<String>,
+    value: Value,
+}
+
+#[derive(Debug)]
+struct JsonStreamEventDecoder {
+    mode: JsonStreamMode,
+    pending_line: Vec<u8>,
+    event_name: Option<String>,
+    event_data: Vec<u8>,
+    json_data: Vec<u8>,
+    max_event_bytes: usize,
+}
+
+impl JsonStreamEventDecoder {
+    fn new(max_event_bytes: usize) -> Self {
+        Self {
+            mode: JsonStreamMode::Unknown,
+            pending_line: Vec::new(),
+            event_name: None,
+            event_data: Vec::new(),
+            json_data: Vec::new(),
+            max_event_bytes: max_event_bytes.max(1),
+        }
+    }
+
+    fn reset(&mut self) {
+        let max_event_bytes = self.max_event_bytes;
+        *self = Self::new(max_event_bytes);
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<JsonStreamEvent>, String> {
+        let mut events = Vec::new();
+        let mut offset = 0;
+        while offset < chunk.len() {
+            if let Some(relative_newline) = chunk[offset..].iter().position(|byte| *byte == b'\n') {
+                let newline = offset + relative_newline;
+                self.append_pending(&chunk[offset..newline])?;
+                let mut line = std::mem::take(&mut self.pending_line);
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                self.process_line(&line, &mut events)?;
+                offset = newline + 1;
+            } else {
+                self.append_pending(&chunk[offset..])?;
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<JsonStreamEvent>, String> {
+        let mut events = Vec::new();
+        if !self.pending_line.is_empty() {
+            let mut line = std::mem::take(&mut self.pending_line);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.process_line(&line, &mut events)?;
+        }
+        if self.mode == JsonStreamMode::Sse {
+            self.flush_sse_event(&mut events)?;
+        } else if !trim_ascii_whitespace(&self.json_data).is_empty() {
+            self.flush_json_document(&mut events, true)?;
+        }
+        Ok(events)
+    }
+
+    fn append_pending(&mut self, bytes: &[u8]) -> Result<(), String> {
+        ensure_stream_event_bounded(self.pending_line.len(), bytes.len(), self.max_event_bytes)?;
+        self.pending_line.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn process_line(
+        &mut self,
+        line: &[u8],
+        events: &mut Vec<JsonStreamEvent>,
+    ) -> Result<(), String> {
+        let line = trim_ascii_start(line);
+        let sse_field =
+            line.starts_with(b"event:") || line.starts_with(b"data:") || line.starts_with(b":");
+        if self.mode == JsonStreamMode::Unknown && sse_field {
+            self.mode = JsonStreamMode::Sse;
+        } else if self.mode == JsonStreamMode::Unknown && !line.is_empty() {
+            self.mode = JsonStreamMode::Json;
+        }
+
+        match self.mode {
+            JsonStreamMode::Unknown => Ok(()),
+            JsonStreamMode::Sse => self.process_sse_line(line, events),
+            JsonStreamMode::Json => self.process_json_line(line, events),
+        }
+    }
+
+    fn process_sse_line(
+        &mut self,
+        line: &[u8],
+        events: &mut Vec<JsonStreamEvent>,
+    ) -> Result<(), String> {
+        if line.is_empty() {
+            return self.flush_sse_event(events);
+        }
+        if line.starts_with(b":") {
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix(b"event:") {
+            if !self.event_data.is_empty() {
+                self.flush_sse_event(events)?;
+            }
+            let value = trim_one_leading_space(value);
+            let event = std::str::from_utf8(value)
+                .map_err(|error| format!("stream event name is not UTF-8: {error}"))?;
+            self.event_name = (!event.trim().is_empty()).then(|| event.trim().to_string());
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix(b"data:") {
+            let value = trim_one_leading_space(value);
+            let separator = usize::from(!self.event_data.is_empty());
+            ensure_stream_event_bounded(
+                self.event_data.len(),
+                value.len().saturating_add(separator),
+                self.max_event_bytes,
+            )?;
+            if separator == 1 {
+                self.event_data.push(b'\n');
+            }
+            self.event_data.extend_from_slice(value);
+        }
+        Ok(())
+    }
+
+    fn flush_sse_event(&mut self, events: &mut Vec<JsonStreamEvent>) -> Result<(), String> {
+        let event = self.event_name.take();
+        let payload = std::mem::take(&mut self.event_data);
+        let payload = trim_ascii_whitespace(&payload);
+        if payload.is_empty() || payload == b"[DONE]" {
+            return Ok(());
+        }
+        let value = serde_json::from_slice::<Value>(payload)
+            .map_err(|error| format!("stream SSE data is not valid JSON: {error}"))?;
+        events.push(JsonStreamEvent { event, value });
+        Ok(())
+    }
+
+    fn process_json_line(
+        &mut self,
+        line: &[u8],
+        events: &mut Vec<JsonStreamEvent>,
+    ) -> Result<(), String> {
+        if line.is_empty() && self.json_data.is_empty() {
+            return Ok(());
+        }
+        let separator = usize::from(!self.json_data.is_empty());
+        ensure_stream_event_bounded(
+            self.json_data.len(),
+            line.len().saturating_add(separator),
+            self.max_event_bytes,
+        )?;
+        if separator == 1 {
+            self.json_data.push(b'\n');
+        }
+        self.json_data.extend_from_slice(line);
+        self.flush_json_document(events, false)
+    }
+
+    fn flush_json_document(
+        &mut self,
+        events: &mut Vec<JsonStreamEvent>,
+        finish: bool,
+    ) -> Result<(), String> {
+        let payload = trim_ascii_whitespace(&self.json_data);
+        if payload.is_empty() || payload == b"[DONE]" {
+            self.json_data.clear();
+            return Ok(());
+        }
+        match serde_json::from_slice::<Value>(payload) {
+            Ok(value) => {
+                self.json_data.clear();
+                events.push(JsonStreamEvent { event: None, value });
+                Ok(())
+            }
+            Err(error) if error.is_eof() && !finish => Ok(()),
+            Err(error) => Err(format!("stream JSON data is not valid JSON: {error}")),
+        }
+    }
+}
+
+fn ensure_stream_event_bounded(
+    current: usize,
+    additional: usize,
+    limit: usize,
+) -> Result<(), String> {
+    if additional <= limit.saturating_sub(current) {
+        return Ok(());
+    }
+    Err(format!("stream event exceeded {limit} bytes"))
+}
+
+fn trim_ascii_start(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    value
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    value = trim_ascii_start(value);
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn trim_one_leading_space(value: &[u8]) -> &[u8] {
+    value.strip_prefix(b" ").unwrap_or(value)
 }
 
 impl Default for StreamUsageAccumulator {
@@ -123,51 +414,274 @@ impl ClaudeSseErrorDetector {
 
 impl StreamUsageAccumulator {
     pub fn new(input_semantics: InputTokenSemantics) -> Self {
+        Self::with_max_event_bytes(input_semantics, DEFAULT_MAX_STREAM_EVENT_BYTES)
+    }
+
+    fn with_max_event_bytes(input_semantics: InputTokenSemantics, max_event_bytes: usize) -> Self {
         Self {
-            buffer: String::new(),
+            decoder: JsonStreamEventDecoder::new(max_event_bytes),
             usage: TokenUsage::default(),
             input_semantics,
+            parse_error: false,
         }
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> TokenUsage {
-        let text = String::from_utf8_lossy(chunk);
-        self.buffer.push_str(&text);
-        if self.buffer.len() > 64 * 1024 {
-            let keep_from = self.buffer.len().saturating_sub(32 * 1024);
-            self.buffer = self.buffer[keep_from..].to_string();
-        }
-
-        while let Some(index) = self.buffer.find('\n') {
-            let line = self.buffer[..index].trim().to_string();
-            self.buffer.drain(..=index);
-            self.parse_line(&line);
-        }
-
-        self.usage
-    }
-
-    pub fn finish(mut self) -> TokenUsage {
-        let line = self.buffer.trim().to_string();
-        if !line.is_empty() {
-            self.parse_line(&line);
+        match self.decoder.push(chunk) {
+            Ok(events) => self.merge_events(events),
+            Err(error) => {
+                self.parse_error = true;
+                self.decoder.reset();
+                tracing::debug!(error, "stream usage event parse failed");
+            }
         }
         self.usage
     }
 
-    fn parse_line(&mut self, line: &str) {
-        let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
-        if payload.is_empty() || payload == "[DONE]" || !payload.starts_with('{') {
-            return;
+    pub fn finish(self) -> TokenUsage {
+        self.finish_with_status().usage
+    }
+
+    pub fn finish_with_status(mut self) -> StreamUsageResult {
+        match self.decoder.finish() {
+            Ok(events) => self.merge_events(events),
+            Err(error) => {
+                self.parse_error = true;
+                tracing::debug!(error, "stream usage tail parse failed");
+            }
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            return;
+        StreamUsageResult {
+            usage: self.usage,
+            parse_error: self.parse_error,
+        }
+    }
+
+    fn merge_events(&mut self, events: Vec<JsonStreamEvent>) {
+        for event in events {
+            merge_usage(
+                &mut self.usage,
+                usage_from_json_with_semantics(&event.value, self.input_semantics),
+            );
+        }
+    }
+}
+
+impl ResponsesSseAggregator {
+    pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_STREAM_EVENT_BYTES,
+            DEFAULT_MAX_STREAM_EVENT_BYTES,
+        )
+    }
+
+    fn with_limits(max_event_bytes: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            decoder: JsonStreamEventDecoder::new(max_event_bytes),
+            response: None,
+            response_bytes: 0,
+            output_items: BTreeMap::new(),
+            output_item_bytes: 0,
+            next_output_index: 0,
+            stream_status: None,
+            max_retained_bytes: max_retained_bytes.max(1),
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), ResponsesSseAggregationError> {
+        let events = self.decoder.push(chunk).map_err(stream_aggregation_error)?;
+        self.process_events(events)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.stream_status.is_some()
+    }
+
+    pub fn finish(mut self) -> Result<ResponsesSseAggregation, ResponsesSseAggregationError> {
+        if !self.is_terminal() {
+            let events = self.decoder.finish().map_err(stream_aggregation_error)?;
+            self.process_events(events)?;
+        }
+        let stream_status = self.stream_status.ok_or_else(|| {
+            ResponsesSseAggregationError::new(
+                ResponsesSseAggregationErrorKind::MissingTerminal,
+                ProxyError::bad_gateway("OpenAI Responses stream ended before a terminal event"),
+            )
+        })?;
+        let mut response = self.response.ok_or_else(|| {
+            ResponsesSseAggregationError::new(
+                ResponsesSseAggregationErrorKind::MissingTerminal,
+                ProxyError::bad_gateway(
+                    "OpenAI Responses stream did not include a response payload",
+                ),
+            )
+        })?;
+        if !self.output_items.is_empty() {
+            let output = self.output_items.into_values().collect::<Vec<_>>();
+            let object = response.as_object_mut().ok_or_else(|| {
+                ResponsesSseAggregationError::new(
+                    ResponsesSseAggregationErrorKind::ParseError,
+                    ProxyError::bad_gateway("OpenAI Responses terminal payload is not an object"),
+                )
+            })?;
+            object.insert("output".to_string(), Value::Array(output));
+        }
+        Ok(ResponsesSseAggregation {
+            response,
+            stream_status,
+        })
+    }
+
+    fn process_events(
+        &mut self,
+        events: Vec<JsonStreamEvent>,
+    ) -> Result<(), ResponsesSseAggregationError> {
+        for event in events {
+            if self.stream_status.is_some() {
+                continue;
+            }
+            let event_type = event
+                .event
+                .as_deref()
+                .or_else(|| event.value.get("type").and_then(Value::as_str))
+                .unwrap_or_default();
+            match event_type {
+                "response.output_item.done" => self.retain_output_item(&event.value)?,
+                "response.completed" => self.retain_terminal_response(event.value, "completed")?,
+                "response.incomplete" => {
+                    self.retain_terminal_response(event.value, "incomplete")?
+                }
+                "response.failed" | "response.cancelled" | "response.canceled" | "error" => {
+                    return Err(stream_terminal_error(&event.value));
+                }
+                _ => match event.value.get("status").and_then(Value::as_str) {
+                    Some("completed") => self.retain_terminal_response(event.value, "completed")?,
+                    Some("incomplete") => {
+                        self.retain_terminal_response(event.value, "incomplete")?
+                    }
+                    Some("failed" | "cancelled" | "canceled") => {
+                        return Err(stream_terminal_error(&event.value));
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_output_item(&mut self, event: &Value) -> Result<(), ResponsesSseAggregationError> {
+        let Some(item) = event.get("item").cloned() else {
+            return Ok(());
         };
-        merge_usage(
-            &mut self.usage,
-            usage_from_json_with_semantics(&value, self.input_semantics),
-        );
+        let index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                let index = self.next_output_index;
+                self.next_output_index = self.next_output_index.saturating_add(1);
+                index
+            });
+        let item_bytes = encoded_value_len(&item)?;
+        let replaced_bytes = self
+            .output_items
+            .get(&index)
+            .map(encoded_value_len)
+            .transpose()?
+            .unwrap_or(0);
+        let next_output_bytes = self
+            .output_item_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(item_bytes);
+        ensure_aggregate_bounded(
+            self.response_bytes,
+            next_output_bytes,
+            self.max_retained_bytes,
+        )?;
+        self.output_item_bytes = next_output_bytes;
+        self.output_items.insert(index, item);
+        Ok(())
     }
+
+    fn retain_terminal_response(
+        &mut self,
+        event: Value,
+        stream_status: &'static str,
+    ) -> Result<(), ResponsesSseAggregationError> {
+        let response = event.get("response").cloned().unwrap_or(event);
+        if matches!(
+            response.get("status").and_then(Value::as_str),
+            Some("failed" | "cancelled" | "canceled")
+        ) || response
+            .get("error")
+            .is_some_and(super::response_semantics::error_value_is_substantive)
+        {
+            return Err(stream_terminal_error(&response));
+        }
+        let response_bytes = encoded_value_len(&response)?;
+        ensure_aggregate_bounded(
+            response_bytes,
+            self.output_item_bytes,
+            self.max_retained_bytes,
+        )?;
+        self.response = Some(response);
+        self.response_bytes = response_bytes;
+        self.stream_status = Some(stream_status);
+        Ok(())
+    }
+}
+
+impl Default for ResponsesSseAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn encoded_value_len(value: &Value) -> Result<usize, ResponsesSseAggregationError> {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .map_err(|error| {
+            ResponsesSseAggregationError::new(
+                ResponsesSseAggregationErrorKind::ParseError,
+                ProxyError::bad_gateway(format!("encode aggregated response: {error}")),
+            )
+        })
+}
+
+fn ensure_aggregate_bounded(
+    response_bytes: usize,
+    output_bytes: usize,
+    limit: usize,
+) -> Result<(), ResponsesSseAggregationError> {
+    if output_bytes <= limit.saturating_sub(response_bytes) {
+        return Ok(());
+    }
+    Err(ResponsesSseAggregationError::new(
+        ResponsesSseAggregationErrorKind::Capacity,
+        ProxyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!("aggregated OpenAI Responses payload exceeded {limit} bytes"),
+        },
+    ))
+}
+
+fn stream_aggregation_error(error: String) -> ResponsesSseAggregationError {
+    ResponsesSseAggregationError::new(
+        ResponsesSseAggregationErrorKind::ParseError,
+        ProxyError::bad_gateway(format!("invalid OpenAI Responses stream: {error}")),
+    )
+}
+
+fn stream_terminal_error(value: &Value) -> ResponsesSseAggregationError {
+    let message = value
+        .pointer("/response/error/message")
+        .or_else(|| value.pointer("/error/message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("OpenAI Responses stream reported failure");
+    ResponsesSseAggregationError::new(
+        ResponsesSseAggregationErrorKind::UpstreamFailure,
+        ProxyError::bad_gateway(message),
+    )
 }
 
 fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
@@ -350,6 +864,131 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.cache_read_tokens, Some(9));
+    }
+
+    #[test]
+    fn parses_large_codex_usage_event_without_prefix_truncation() {
+        let payload = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "padding": "x".repeat(70 * 1024),
+                "usage": {
+                    "input_tokens": 101,
+                    "output_tokens": 17,
+                    "input_tokens_details": {"cached_tokens": 41}
+                }
+            }
+        });
+        let event = format!("event: response.completed\ndata: {payload}\n\n");
+        let split = event.len() / 2;
+        let mut parser = StreamUsageAccumulator::default();
+        parser.push(&event.as_bytes()[..split]);
+        parser.push(&event.as_bytes()[split..]);
+        let result = parser.finish_with_status();
+
+        assert!(!result.parse_error);
+        assert_eq!(result.usage.input_tokens, Some(60));
+        assert_eq!(result.usage.cache_read_tokens, Some(41));
+        assert_eq!(result.usage.output_tokens, Some(17));
+    }
+
+    #[test]
+    fn parses_crlf_multiline_data_and_unterminated_tail() {
+        let mut parser = StreamUsageAccumulator::default();
+        parser.push(
+            b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\r\ndata: \"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\r\n",
+        );
+        let result = parser.finish_with_status();
+
+        assert!(!result.parse_error);
+        assert_eq!(result.usage.input_tokens, Some(12));
+        assert_eq!(result.usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn reports_oversized_usage_event_instead_of_fabricating_zero() {
+        let mut parser =
+            StreamUsageAccumulator::with_max_event_bytes(InputTokenSemantics::Inclusive, 64);
+        parser.push(format!("data: {{\"padding\":\"{}", "x".repeat(80)).as_bytes());
+        let result = parser.finish_with_status();
+
+        assert!(result.parse_error);
+        assert_eq!(result.usage.input_tokens, None);
+        assert_eq!(result.usage.output_tokens, None);
+    }
+
+    #[test]
+    fn explicit_zero_usage_is_observed_without_parse_error() {
+        let mut parser = StreamUsageAccumulator::default();
+        parser.push(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+        );
+        let result = parser.finish_with_status();
+
+        assert!(!result.parse_error);
+        assert_eq!(result.usage.input_tokens, Some(0));
+        assert_eq!(result.usage.output_tokens, Some(0));
+    }
+
+    #[test]
+    fn aggregates_responses_sse_output_and_terminal_usage() {
+        let stream = concat!(
+            "event: response.output_item.done\r\n",
+            "data: {\"type\":\"response.output_item.done\",\r\n",
+            "data: \"output_index\":1,\"item\":{\"id\":\"second\",\"type\":\"message\"}}\r\n\r\n",
+            "event: response.output_item.done\r\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"first\",\"type\":\"reasoning\"}}\r\n\r\n",
+            "event: response.completed\r\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":2}}}\r\n"
+        );
+        let mut aggregator = ResponsesSseAggregator::new();
+        for chunk in stream.as_bytes().chunks(17) {
+            aggregator.push(chunk).unwrap();
+        }
+        let result = aggregator.finish().unwrap();
+
+        assert_eq!(result.stream_status, "completed");
+        assert_eq!(result.response["output"][0]["id"], "first");
+        assert_eq!(result.response["output"][1]["id"], "second");
+        assert_eq!(result.response["usage"]["input_tokens"], 9);
+    }
+
+    #[test]
+    fn responses_aggregator_rejects_failure_and_retained_overflow() {
+        let mut failed = ResponsesSseAggregator::new();
+        failed
+            .push(
+                b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"busy\"}}}\n\n",
+            )
+            .unwrap_err();
+
+        let mut oversized = ResponsesSseAggregator::with_limits(1024, 96);
+        let event = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"padding\":\"{}\"}}}}\n\n",
+            "x".repeat(96)
+        );
+        let error = oversized.push(event.as_bytes()).unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn responses_aggregator_finishes_at_terminal_and_ignores_empty_error() {
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator
+            .push(
+                concat!(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\",\"status\":\"completed\",\"error\":{},\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+                    "data: {\"trailing\":"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        assert!(aggregator.is_terminal());
+        let result = aggregator.finish().unwrap();
+        assert_eq!(result.stream_status, "completed");
+        assert_eq!(result.response["id"], "resp-terminal");
     }
 
     #[test]

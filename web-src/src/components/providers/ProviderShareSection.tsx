@@ -10,7 +10,11 @@ import {
   Share2,
   X,
 } from "lucide-react";
-import type { AppId, PublicTokenMarket } from "@/lib/api";
+import type {
+  AppId,
+  PublicTokenMarket,
+  ShareReuseCandidate,
+} from "@/lib/api";
 import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,16 +33,19 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
+import { ProviderShareReuseDialog } from "@/components/providers/ProviderShareReuseDialog";
 import { shareApi } from "@/lib/api/share";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
+import { extractErrorMessage } from "@/utils/errorUtils";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
   useClientTunnelQuery,
+  useAddShareBindingMutation,
   useCreateShareMutation,
-  useDisableShareMutation,
   useEnableShareMutation,
+  useRemoveShareBindingMutation,
   useSaveProviderShareMutation,
   useSettingsQuery,
   useTokenMarketsQuery,
@@ -172,12 +179,16 @@ export function ProviderShareSection({
   );
 
   const createMutation = useCreateShareMutation();
+  const addBindingMutation = useAddShareBindingMutation();
+  const removeBindingMutation = useRemoveShareBindingMutation();
   const enableMutation = useEnableShareMutation();
-  const disableMutation = useDisableShareMutation();
   const saveMutation = useSaveProviderShareMutation();
 
   const [isShareOpen, setIsShareOpen] = useState(false);
   const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
+  const [reuseCandidates, setReuseCandidates] = useState<
+    ShareReuseCandidate[] | null
+  >(null);
   // Limit/expiry touched flags live in refs. Incrementing this signal guarantees
   // every same-value interaction still causes a fingerprint render.
   const [, setShareDraftRevision] = useState(0);
@@ -369,9 +380,11 @@ export function ProviderShareSection({
 
   const busy =
     createMutation.isPending ||
+    addBindingMutation.isPending ||
+    removeBindingMutation.isPending ||
     enableMutation.isPending ||
-    disableMutation.isPending ||
-    saveMutation.isPending;
+    saveMutation.isPending ||
+    reuseCandidates !== null;
 
   const shareDraftInitializationKey = `${appId}:${providerId}:${share?.id ?? "new"}`;
   const shareDraftFingerprint = stableStringify({
@@ -589,7 +602,7 @@ export function ProviderShareSection({
       expiresAt,
     });
 
-  const handleCreate = async () => {
+  const createConfiguredShare = async () => {
     if (ownerEmailInvalid) {
       toast.error(
         t("share.validation.invalidEmail", { defaultValue: "邮箱格式无效" }),
@@ -630,6 +643,47 @@ export function ProviderShareSection({
       userGrants: payloadUserGrants,
     });
     return created;
+  };
+
+  const handleCreate = async () => {
+    if (ownerEmailInvalid) {
+      toast.error(
+        t("share.validation.invalidEmail", { defaultValue: "邮箱格式无效" }),
+      );
+      return;
+    }
+    let candidates: ShareReuseCandidate[];
+    try {
+      candidates = await shareApi.listReuseCandidates(shareableApp, providerId);
+    } catch (error) {
+      toast.error(
+        t("share.toggle.enableFailed", {
+          defaultValue: "开启分享失败：{{error}}",
+          error: extractErrorMessage(error),
+        }),
+      );
+      return;
+    }
+    if (candidates.length > 0) {
+      setReuseCandidates(candidates);
+      return;
+    }
+    return createConfiguredShare();
+  };
+
+  const confirmShareReuse = async (reuse: boolean, shareId: string) => {
+    const candidate = reuseCandidates?.find((item) => item.shareId === shareId);
+    setReuseCandidates(null);
+    if (!reuse || !candidate) {
+      await createConfiguredShare();
+      return;
+    }
+    await addBindingMutation.mutateAsync({
+      shareId: candidate.shareId,
+      app: shareableApp,
+      providerId,
+      expectedConfigRevision: candidate.configRevision,
+    });
   };
 
   const handleSave = async (): Promise<boolean> => {
@@ -707,7 +761,12 @@ export function ProviderShareSection({
       setOfficialPricePercentInput(
         Number.isInteger(persistedPrice) ? String(persistedPrice) : "",
       );
-      await disableMutation.mutateAsync(share.id);
+      await removeBindingMutation.mutateAsync({
+        shareId: share.id,
+        app: shareableApp,
+        providerId,
+        expectedConfigRevision: share.configRevision,
+      });
     }
   };
 
@@ -1301,6 +1360,13 @@ export function ProviderShareSection({
           setConfirmFreeOpen(false);
         }}
         onCancel={() => setConfirmFreeOpen(false)}
+      />
+      <ProviderShareReuseDialog
+        candidates={reuseCandidates}
+        onConfirm={(reuse, shareId) => {
+          void confirmShareReuse(reuse, shareId);
+        }}
+        onCancel={() => setReuseCandidates(null)}
       />
     </div>
   );

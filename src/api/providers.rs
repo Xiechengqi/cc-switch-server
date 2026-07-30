@@ -749,7 +749,7 @@ pub(in crate::api) async fn test_provider_inner(
             .map_err(ApiError::proxy)?;
         (adapter_request, endpoint, target_headers)
     };
-    let stream = adapter_request.stream_requested || requested_stream;
+    let stream = adapter_request.upstream_stream_requested || requested_stream;
     let mut network_status_code = None;
     let mut network_latency_ms = None;
     let mut network_error = None;

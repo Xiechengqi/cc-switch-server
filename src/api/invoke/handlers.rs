@@ -496,8 +496,10 @@ pub(in crate::api) async fn web_share_upsert_input(
     })?;
     let binding_map = serde_json::from_value::<BTreeMap<String, String>>(bindings_value.clone())
         .map_err(ApiError::bad_request)?;
-    if binding_map.len() > 1 {
-        return Err(ApiError::bad_request("share must have exactly one binding"));
+    if binding_map.is_empty() || binding_map.len() > 3 {
+        return Err(ApiError::bad_request(
+            "share must have between one and three bindings",
+        ));
     }
     let app_name = web_optional_string_any(value, &["appType", "app", "app_type"])
         .or_else(|| binding_map.keys().next().cloned())
@@ -513,11 +515,21 @@ pub(in crate::api) async fn web_share_upsert_input(
         return Err(ApiError::bad_request("share providerId is required"));
     }
     let provider_type = web_provider_type_for_binding(state, app, &provider_id).await?;
-    let bindings = vec![ShareBinding {
-        app,
-        provider_id: provider_id.clone(),
-        provider_type,
-    }];
+    let mut bindings = Vec::with_capacity(binding_map.len());
+    for (binding_app, binding_provider_id) in binding_map {
+        let binding_app = parse_app_kind(&binding_app)?;
+        let binding_provider_id = binding_provider_id.trim().to_string();
+        if binding_provider_id.is_empty() {
+            return Err(ApiError::bad_request("share providerId is required"));
+        }
+        let binding_provider_type =
+            web_provider_type_for_binding(state, binding_app, &binding_provider_id).await?;
+        bindings.push(ShareBinding {
+            app: binding_app,
+            provider_id: binding_provider_id,
+            provider_type: binding_provider_type,
+        });
+    }
     let expires_at = web_optional_i64(value, &["expiresAt", "expires_at"]).or_else(|| {
         web_optional_i64(value, &["expiresInSecs", "expires_in_secs"]).and_then(|seconds| {
             (seconds > 0).then(|| (now_ms() as i64).saturating_add(seconds.saturating_mul(1000)))
@@ -1940,6 +1952,11 @@ pub(in crate::api) fn web_request_log_json(log: &UsageLog) -> Value {
         "requestedModel": requested_model,
         "actualModel": actual_model,
         "actualModelSource": log.actual_model_source.as_deref().unwrap_or("server"),
+        "requestedReasoningEffort": log.requested_reasoning_effort,
+        "effectiveReasoningEffort": log.effective_reasoning_effort,
+        "clientServiceTier": log.client_service_tier,
+        "effectiveServiceTier": log.effective_service_tier,
+        "serviceTierDecision": log.service_tier_decision,
         "rawInputTokens": log.raw_input_tokens,
         "inputTokens": web_request_log_token_count(log.input_tokens),
         "outputTokens": web_request_log_token_count(log.output_tokens),
@@ -1954,6 +1971,8 @@ pub(in crate::api) fn web_request_log_json(log: &UsageLog) -> Value {
         "imageSize": log.image_size,
         "isStreaming": log.is_streaming,
         "streamStatus": log.stream_status,
+        "usageState": log.usage_state.as_str(),
+        "usageRevision": log.usage_revision,
         "latencyMs": web_request_log_u128_to_u64(log.duration_ms),
         "firstTokenMs": log.first_token_ms.map(web_request_log_u128_to_u64),
         "durationMs": web_request_log_u128_to_u64(log.duration_ms),
@@ -1965,6 +1984,49 @@ pub(in crate::api) fn web_request_log_json(log: &UsageLog) -> Value {
         "userEmail": log.user_email,
         "dataSource": log.data_source,
     })
+}
+
+#[cfg(test)]
+mod request_log_policy_tests {
+    use super::*;
+    use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
+
+    #[test]
+    fn invoke_request_log_exposes_requested_and_effective_policy() {
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "codex-provider".to_string(),
+            "Codex".to_string(),
+            ProviderType::CodexOAuth,
+            200,
+            25,
+            UsageModelMetadata {
+                model: Some("gpt-5.4".to_string()),
+                requested_model: Some("gpt-5.4".to_string()),
+                actual_model: Some("gpt-5.4".to_string()),
+                actual_model_source: Some("request".to_string()),
+            },
+            TokenUsage::default(),
+        );
+        log.apply_context(UsageLogContext {
+            requested_reasoning_effort: Some("ultra".to_string()),
+            effective_reasoning_effort: Some("max".to_string()),
+            client_service_tier: Some("default".to_string()),
+            effective_service_tier: Some("priority".to_string()),
+            service_tier_decision: Some("server_forced_priority".to_string()),
+            ..UsageLogContext::default()
+        });
+
+        let value = web_request_log_json(&log);
+
+        assert_eq!(value["requestedReasoningEffort"], "ultra");
+        assert_eq!(value["effectiveReasoningEffort"], "max");
+        assert_eq!(value["clientServiceTier"], "default");
+        assert_eq!(value["effectiveServiceTier"], "priority");
+        assert_eq!(value["serviceTierDecision"], "server_forced_priority");
+        assert_eq!(value["usageState"], "missing");
+        assert_eq!(value["usageRevision"], 1);
+    }
 }
 
 fn web_request_log_token_count(value: Option<u64>) -> u64 {

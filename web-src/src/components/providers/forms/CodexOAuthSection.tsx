@@ -300,7 +300,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             <p className="text-xs text-muted-foreground">
               {t("codexOauth.fastModeDescription", {
                 defaultValue:
-                  'Send service_tier="priority" for lower latency. Turn it off if the ChatGPT Codex backend rejects the parameter.',
+                  "The server removes client service tiers when FAST is off and forces priority only for supported models when FAST is on.",
               })}
             </p>
           </div>

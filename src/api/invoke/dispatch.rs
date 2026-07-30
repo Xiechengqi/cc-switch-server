@@ -596,6 +596,16 @@ async fn web_invoke_dispatch(
                     .collect::<Result<Vec<_>, _>>()?,
             ))
         }
+        "list_share_reuse_candidates" => {
+            let value = web_payload(&args, &["params", "input"]);
+            let query = serde_json::from_value::<ShareReuseCandidatesQuery>(value.clone())
+                .map_err(ApiError::bad_request)?;
+            let response =
+                share_reuse_candidates(State(state.clone()), headers.clone(), Query(query))
+                    .await?
+                    .0;
+            Ok(json!(response))
+        }
         "get_share_detail" => {
             let id = web_arg_share_id(&args)?;
             let share = state.shares.read().await.get(&id).cloned();
@@ -638,6 +648,39 @@ async fn web_invoke_dispatch(
                 &state.config_snapshot().await,
                 &response.share,
             )?)
+        }
+        "add_share_binding" => {
+            let value = web_payload(&args, &["params", "input"]);
+            let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+            let input = serde_json::from_value::<AddShareBindingRequest>(value.clone())
+                .map_err(ApiError::bad_request)?;
+            let response = add_share_binding(
+                State(state.clone()),
+                headers.clone(),
+                Path(share_id),
+                Json(input),
+            )
+            .await?
+            .0;
+            Ok(web_share_json(
+                &state.config_snapshot().await,
+                &response.share,
+            )?)
+        }
+        "remove_share_binding" => {
+            let value = web_payload(&args, &["params", "input"]);
+            let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+            let input = serde_json::from_value::<RemoveShareBindingRequest>(value.clone())
+                .map_err(ApiError::bad_request)?;
+            let response = remove_share_binding(
+                State(state.clone()),
+                headers.clone(),
+                Path(share_id),
+                Json(input),
+            )
+            .await?
+            .0;
+            Ok(json!(response))
         }
         "delete_share" => {
             let id = web_arg_share_id(&args)?;

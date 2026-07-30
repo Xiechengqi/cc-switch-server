@@ -799,6 +799,7 @@ mod tests {
     ) -> Share {
         Share {
             id: id.to_string(),
+            capacity_pool_id: format!("cp-{id}"),
             owner_email: Some("owner@example.com".to_string()),
             app,
             provider_id: provider_id.to_string(),

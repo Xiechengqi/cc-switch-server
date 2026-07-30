@@ -79,6 +79,7 @@ use crate::proxy::cursor::session::CursorSessionManager;
 
 const ROUTER_INSTALLATION_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_SHARE_SYNC_BATCH_SIZE: usize = 100;
+const SHARE_EDIT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SETUP_COMPLETION_RETRY_BASE_MS: i64 = 30_000;
 const SETUP_COMPLETION_RETRY_MAX_MS: i64 = 30 * 60_000;
 const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
@@ -129,6 +130,12 @@ impl CodexActiveAccountSelectionError {
             Self::ShareConflict { .. } => "cc_switch_codex_active_account_share_conflict",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConditionalShareDeleteError {
+    NotFound,
+    RevisionConflict { current_revision: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -370,6 +377,7 @@ pub struct ServerStateInner {
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
     setup_flight: AsyncMutex<()>,
     router_share_sync: AsyncMutex<()>,
+    share_edit_sync: AsyncMutex<()>,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
     // Low bit marks degraded persistence; upper bits form a monotonic failure generation.
@@ -1552,7 +1560,25 @@ fn validate_ordinary_provider_subscription_change(
     .map_err(|error| ProviderCommandError::Conflict {
         code: error.code(),
         message: error.to_string(),
-    })
+    })?;
+
+    for share in shares
+        .shares
+        .iter()
+        .filter(|share| share.status != "deleted" && share.bindings.len() > 1)
+    {
+        crate::domain::sharing::credential_source::shared_credential_source_for_bindings(
+            candidate,
+            accounts,
+            &share.bindings,
+        )
+        .map_err(|error| ProviderCommandError::Conflict {
+            code: error.code(),
+            message: error.to_string(),
+        })?;
+    }
+
+    Ok(())
 }
 
 fn validate_and_resolve_provider_binding(
@@ -2803,6 +2829,18 @@ impl ServerStateInner {
         let usage = UsageStore::load_or_default(&config_dir)?;
         remove_obsolete_model_pricing_file(&config_dir)?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
+        let mut shares_changed = false;
+        let refreshed_capacity_pools = shares
+            .refresh_capacity_pool_ids(&providers, &accounts, &reasoning_root_key.key)
+            .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
+            .context("derive Share capacity pools during startup")?;
+        if !refreshed_capacity_pools.is_empty() {
+            shares_changed = true;
+            tracing::info!(
+                refreshed_shares = refreshed_capacity_pools.len(),
+                "refreshed Share capacity pools from current Provider credentials"
+            );
+        }
         for error in
             crate::domain::sharing::subscription_identity::subscription_reference_graph_errors(
                 &providers, &accounts, &shares,
@@ -2814,7 +2852,6 @@ impl ServerStateInner {
                 "subscription binding integrity check failed; affected Shares will remain fail-closed"
             );
         }
-        let mut shares_changed = false;
         if let Some(owner_email) = config.owner.email.as_deref() {
             let migrated = shares
                 .bind_all_to_client_owner(owner_email)
@@ -2896,6 +2933,7 @@ impl ServerStateInner {
             router_registration_flight: AsyncMutex::new(None),
             setup_flight: AsyncMutex::new(()),
             router_share_sync: AsyncMutex::new(()),
+            share_edit_sync: AsyncMutex::new(()),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
             credential_persistence_state: std::sync::atomic::AtomicU64::new(0),
@@ -3457,7 +3495,14 @@ impl ServerStateInner {
             .context("compile Provider runtime index")?;
         let usage = UsageStore::load_or_default(&self.config_dir)?;
         remove_obsolete_model_pricing_file(&self.config_dir)?;
-        let shares = ShareStore::load_or_default(&self.config_dir)?;
+        let mut shares = ShareStore::load_or_default(&self.config_dir)?;
+        let refreshed_capacity_pools = shares
+            .refresh_capacity_pool_ids(&providers, &accounts, &reasoning_root_key.key)
+            .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
+            .context("derive Share capacity pools during reload")?;
+        if !refreshed_capacity_pools.is_empty() {
+            shares.save(&self.config_dir)?;
+        }
         let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
         crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
             &providers, &accounts, &shares,
@@ -4360,6 +4405,20 @@ impl ServerStateInner {
         candidate
             .rebuild_runtime_index(&accounts)
             .context("compile sealed Provider runtime index before commit")?;
+        let capacity_pool_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
+            .context("resolve key for Share capacity pools")?;
+        let mut projected_shares = shares.clone();
+        let changed_capacity_share_ids = projected_shares
+            .refresh_capacity_pool_ids(&candidate, &accounts, &capacity_pool_root_key.key)
+            .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))?;
+        let capacity_pool_updates = changed_capacity_share_ids
+            .iter()
+            .filter_map(|share_id| {
+                projected_shares
+                    .get(share_id)
+                    .map(|share| (share_id.clone(), share.capacity_pool_id.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
 
         #[cfg(test)]
         {
@@ -4400,14 +4459,17 @@ impl ServerStateInner {
 
         let changed_projection_keys = provider_runtime_projection_changes(&current, &candidate);
         *self.providers.write().await = candidate;
+        let changed_capacity_share_ids = self
+            .apply_share_capacity_pool_updates_under_provider_commit(&capacity_pool_updates)
+            .await?;
         if let Err(error) = self.prune_provider_health_snapshots().await {
             tracing::warn!(
                 %error,
                 "Provider commit succeeded but stale health snapshots could not be pruned"
             );
         }
-        if !changed_projection_keys.is_empty() {
-            let share_ids = {
+        if !changed_projection_keys.is_empty() || !changed_capacity_share_ids.is_empty() {
+            let mut share_ids = {
                 let shares = self.shares.read().await;
                 changed_projection_keys
                     .iter()
@@ -4416,6 +4478,9 @@ impl ServerStateInner {
                     .into_iter()
                     .collect::<Vec<_>>()
             };
+            share_ids.extend(changed_capacity_share_ids);
+            share_ids.sort();
+            share_ids.dedup();
             if !share_ids.is_empty()
                 && self
                     .config_snapshot()
@@ -4435,6 +4500,37 @@ impl ServerStateInner {
             }
         }
         Ok(Ok(result))
+    }
+
+    async fn apply_share_capacity_pool_updates_under_provider_commit(
+        &self,
+        capacity_pool_updates: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<String>> {
+        if capacity_pool_updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut shares = self.shares.write().await;
+        let mut candidate = shares.clone();
+        let updated_ids = candidate.apply_capacity_pool_ids(capacity_pool_updates);
+        if updated_ids.is_empty() {
+            return Ok(updated_ids);
+        }
+        if let Err(error) = candidate.save(&self.config_dir) {
+            let disk_matches = ShareStore::load_or_default(&self.config_dir)
+                .ok()
+                .and_then(|store| serde_json::to_value(store).ok())
+                .zip(serde_json::to_value(&candidate).ok())
+                .is_some_and(|(disk, expected)| disk == expected);
+            if !disk_matches {
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                "shares file reached the commit point while refreshing capacity pools"
+            );
+        }
+        *shares = candidate;
+        Ok(updated_ids)
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {
@@ -5248,12 +5344,6 @@ impl ServerStateInner {
         if current_share.status != "paused" {
             return Ok(Err(CodexWorkspaceRebindError::MustBePaused));
         }
-        if current_share.app != AppKind::Codex
-            || current_share.provider_type != ProviderType::CodexOAuth
-            || current_share.bindings.len() != 1
-        {
-            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
-        }
         let account_exists = accounts.accounts.iter().any(|account| {
             account.id == account_id && account.provider_type == ProviderType::CodexOAuth
         });
@@ -5262,22 +5352,48 @@ impl ServerStateInner {
                 account_id.to_string(),
             )));
         }
-        let Some(current_provider) = providers.providers.iter().find(|provider| {
-            provider.app == current_share.app
-                && provider.provider.id == current_share.provider_id
-                && provider.provider_type == ProviderType::CodexOAuth
-        }) else {
+        let Some((workspace_app, workspace_provider_id, current_provider)) = current_share
+            .bindings
+            .iter()
+            .filter_map(|binding| {
+                if binding.provider_type != ProviderType::CodexOAuth {
+                    return None;
+                }
+                let provider = providers.providers.iter().find(|provider| {
+                    provider.app == binding.app
+                        && provider.provider.id == binding.provider_id
+                        && provider.provider_type == ProviderType::CodexOAuth
+                        && provider_account_id(provider) == Some(account_id)
+                })?;
+                Some((binding.app, binding.provider_id.as_str(), provider))
+            })
+            .min_by_key(|(app, _, _)| u8::from(*app != AppKind::Codex))
+        else {
             return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
         };
-        if provider_account_id(current_provider) != Some(account_id) {
-            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
+        let workspace_provider_id = workspace_provider_id.to_string();
+        let account_share_ids =
+            crate::domain::sharing::subscription_identity::share_ids_for_account(
+                account_id, &providers, &shares,
+            );
+        if account_share_ids.iter().any(|id| id != share_id) {
+            return Ok(Err(CodexWorkspaceRebindError::AccountInUse {
+                share_ids: account_share_ids,
+            }));
         }
-        let current_identity =
-            match validate_share_subscription_binding(share_id, &providers, &accounts, &shares) {
-                Ok(Some(identity)) => identity,
-                Ok(None) => return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch)),
-                Err(error) => return Ok(Err(error.into())),
-            };
+        if let Err(error) =
+            validate_share_subscription_binding(share_id, &providers, &accounts, &shares)
+        {
+            return Ok(Err(error.into()));
+        }
+        let current_identity = match crate::domain::sharing::subscription_identity::resolve_provider_subscription_identity(
+            current_provider,
+            &accounts,
+        ) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch)),
+            Err(error) => return Ok(Err(error.into())),
+        };
 
         let mut candidate_accounts = accounts.clone();
         let updated_account =
@@ -5288,24 +5404,38 @@ impl ServerStateInner {
         let mut candidate_providers = providers
             .materialized_clone()
             .context("materialize Provider credentials for Codex workspace rebind")?;
+        let mut provider_keys = BTreeSet::new();
+        for provider in &mut candidate_providers.providers {
+            if provider.provider_type != ProviderType::CodexOAuth
+                || provider_account_id(provider) != Some(account_id)
+            {
+                continue;
+            }
+            let Some(binding) = provider
+                .provider
+                .meta
+                .as_mut()
+                .and_then(|meta| meta.auth_binding.as_mut())
+            else {
+                return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
+            };
+            if binding.auth_identity_generation == Some(updated_account.auth_identity_generation) {
+                continue;
+            }
+            binding.auth_identity_generation = Some(updated_account.auth_identity_generation);
+            provider.resource.revision = provider.resource.revision.saturating_add(1);
+            provider_keys.insert((provider.app, provider.provider.id.clone()));
+        }
+
         let candidate_provider = candidate_providers
             .providers
-            .iter_mut()
+            .iter()
             .find(|provider| {
-                provider.app == current_share.app
-                    && provider.provider.id == current_share.provider_id
+                provider.app == workspace_app
+                    && provider.provider.id == workspace_provider_id
                     && provider.provider_type == ProviderType::CodexOAuth
             })
             .expect("validated Codex Share Provider exists in candidate store");
-        let Some(binding) = candidate_provider
-            .provider
-            .meta
-            .as_mut()
-            .and_then(|meta| meta.auth_binding.as_mut())
-        else {
-            return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch));
-        };
-        binding.auth_identity_generation = Some(updated_account.auth_identity_generation);
 
         let next_identity = match crate::domain::sharing::subscription_identity::resolve_provider_subscription_identity(
             candidate_provider,
@@ -5316,15 +5446,13 @@ impl ServerStateInner {
             Err(error) => return Ok(Err(error.into())),
         };
         let identity_changed = current_identity != next_identity;
-        if identity_changed {
-            candidate_provider.resource.revision =
-                candidate_provider.resource.revision.saturating_add(1);
-        }
 
         let mut candidate_shares = shares.clone();
         let updated_share = if identity_changed {
             match candidate_shares.record_subscription_identity_rebind(
                 share_id,
+                workspace_app,
+                &workspace_provider_id,
                 current_identity.fingerprint(),
                 next_identity.fingerprint(),
             ) {
@@ -5342,9 +5470,7 @@ impl ServerStateInner {
         } else {
             current_share.clone()
         };
-        if identity_changed {
-            let provider_keys =
-                BTreeSet::from([(current_share.app, current_share.provider_id.clone())]);
+        if !provider_keys.is_empty() {
             candidate_shares.refresh_runtime_snapshots_for_providers(
                 &provider_keys,
                 &candidate_providers,
@@ -5363,7 +5489,7 @@ impl ServerStateInner {
             return Ok(Err(error.into()));
         }
 
-        if !identity_changed {
+        if !identity_changed && provider_keys.is_empty() {
             if let Err(error) = candidate_accounts.save(&self.config_dir) {
                 let disk_matches = AccountStore::load_or_default(&self.config_dir)
                     .ok()
@@ -6659,14 +6785,52 @@ impl ServerStateInner {
         .await
     }
 
+    pub(crate) async fn delete_share_immediate_at_revision(
+        &self,
+        share_id: &str,
+        expected_config_revision: u64,
+    ) -> anyhow::Result<Result<ShareDeleteTombstone, ConditionalShareDeleteError>> {
+        let config = self.config_snapshot().await;
+        let router_target = config.registered_router_identity().and_then(|identity| {
+            config.router_api_base().map(|router_api_base| {
+                (
+                    router_api_base.to_string(),
+                    identity.installation_id.clone(),
+                )
+            })
+        });
+        self.try_mutate_shares_immediate(|store| {
+            let current = store
+                .get(share_id)
+                .ok_or(ConditionalShareDeleteError::NotFound)?;
+            if current.config_revision != expected_config_revision {
+                return Err(ConditionalShareDeleteError::RevisionConflict {
+                    current_revision: current.config_revision,
+                });
+            }
+            Ok(match router_target.as_ref() {
+                Some((router_api_base, installation_id)) => store
+                    .delete_for_router_target(share_id, router_api_base, installation_id)
+                    .expect("validated Share exists before conditional deletion"),
+                None => store
+                    .delete(share_id)
+                    .expect("validated Share exists before conditional deletion"),
+            })
+        })
+        .await
+    }
+
     pub async fn validate_share_invocation(
         self: &Arc<Self>,
         share_id: &str,
+        app: AppKind,
         user_email: Option<&str>,
         now_ms: i64,
     ) -> Result<ShareInvocation, ShareInvocationRejection> {
         let result = self
-            .mutate_shares(|shares| shares.validate_for_invocation(share_id, user_email, now_ms))
+            .mutate_shares(|shares| {
+                shares.validate_for_invocation(share_id, app, user_email, now_ms)
+            })
             .await;
         if result
             .as_ref()
@@ -7492,8 +7656,12 @@ async fn run_periodic_share_sync_retry_once(state: &ServerState) {
 }
 
 pub fn spawn_share_edit_event_listener(state: ServerState) {
+    let event_state = state.clone();
     tokio::spawn(async move {
-        share_edit_event_loop(state).await;
+        share_edit_event_loop(event_state).await;
+    });
+    tokio::spawn(async move {
+        share_edit_poll_loop(state).await;
     });
 }
 
@@ -8430,6 +8598,11 @@ pub struct ShareEditSyncSummary {
 }
 
 pub async fn pull_and_apply_pending_share_edits(state: ServerState) -> ShareEditSyncSummary {
+    let _sync = state.share_edit_sync.lock().await;
+    pull_and_apply_pending_share_edits_locked(&state).await
+}
+
+async fn pull_and_apply_pending_share_edits_locked(state: &ServerState) -> ShareEditSyncSummary {
     let config = state.config.read().await.clone();
     if !config.has_registered_router_identity() {
         return ShareEditSyncSummary {
@@ -8452,7 +8625,7 @@ pub async fn pull_and_apply_pending_share_edits(state: ServerState) -> ShareEdit
     let edits = match client::pending_share_edits(&http_client, &config, share_ids).await {
         Ok(edits) => edits,
         Err(error) => {
-            record_share_edit_sync_error(&state, error.to_string()).await;
+            record_share_edit_sync_error(state, error.to_string()).await;
             return ShareEditSyncSummary {
                 error: Some(error.to_string()),
                 ..ShareEditSyncSummary::default()
@@ -8464,7 +8637,7 @@ pub async fn pull_and_apply_pending_share_edits(state: ServerState) -> ShareEdit
         ..ShareEditSyncSummary::default()
     };
     for edit in edits {
-        apply_and_ack_share_edit(&state, &config, edit, &mut summary).await;
+        apply_and_ack_share_edit(state, &config, edit, &mut summary).await;
     }
     summary
 }
@@ -8541,11 +8714,11 @@ async fn apply_share_edit_locally(state: &ServerState, edit: &ShareEditView) -> 
 }
 
 async fn record_share_edit_sync_error(state: &ServerState, message: String) {
-    {
-        let mut shares = state.shares.write().await;
-        shares.last_router_error = Some(message);
-    }
-    save_shares_debounced(state);
+    state
+        .mutate_shares_debounced(|shares| {
+            shares.last_router_error = Some(message);
+        })
+        .await;
 }
 
 pub(crate) async fn sync_one_share_to_router(
@@ -9243,6 +9416,59 @@ async fn share_edit_event_loop(state: ServerState) {
     }
 }
 
+async fn share_edit_poll_loop(state: ServerState) {
+    loop {
+        run_periodic_share_edit_pull_once(&state).await;
+        sleep(SHARE_EDIT_POLL_INTERVAL).await;
+    }
+}
+
+async fn run_periodic_share_edit_pull_once(state: &ServerState) -> Option<ShareEditSyncSummary> {
+    if !share_edit_sync_is_configured(state).await {
+        return None;
+    }
+    Some(process_share_edit_trigger(state, "periodic").await)
+}
+
+async fn share_edit_sync_is_configured(state: &ServerState) -> bool {
+    let registered = state.config.read().await.has_registered_router_identity();
+    registered && !state.shares.read().await.shares.is_empty()
+}
+
+async fn process_share_edit_trigger(state: &ServerState, trigger: &str) -> ShareEditSyncSummary {
+    let summary = pull_and_apply_pending_share_edits(state.clone()).await;
+    let work_occurred = summary.pulled > 0
+        || summary.applied > 0
+        || summary.rejected > 0
+        || summary.acked > 0
+        || summary.ack_failed > 0
+        || summary.remote_synced > 0
+        || summary.remote_sync_failed > 0;
+    if work_occurred {
+        tracing::info!(
+            trigger,
+            pulled = summary.pulled,
+            applied = summary.applied,
+            rejected = summary.rejected,
+            acked = summary.acked,
+            ack_failed = summary.ack_failed,
+            remote_synced = summary.remote_synced,
+            remote_sync_failed = summary.remote_sync_failed,
+            "processed Router Share edits"
+        );
+    } else if let Some(error) = summary.error.as_deref() {
+        tracing::warn!(trigger, error, "Router Share edit synchronization failed");
+    } else {
+        tracing::debug!(trigger, "no pending Router Share edits");
+    }
+    summary
+}
+
+fn share_edit_event_trigger(line: &str) -> Option<&str> {
+    let event = line.strip_prefix("event:")?.trim();
+    matches!(event, "resync" | "share_edit_available").then_some(event)
+}
+
 async fn listen_for_share_edit_events_once(state: ServerState) -> anyhow::Result<()> {
     let config = state.config.read().await.clone();
     if !config.has_registered_router_identity() || state.shares.read().await.shares.is_empty() {
@@ -9270,16 +9496,8 @@ async fn listen_for_share_edit_events_once(state: ServerState) -> anyhow::Result
         while let Some(index) = buffer.find('\n') {
             let line = buffer[..index].trim().to_string();
             buffer = buffer[index + 1..].to_string();
-            if line.starts_with("event: share_edit_available") || line.starts_with("event: resync")
-            {
-                let summary = pull_and_apply_pending_share_edits(state.clone()).await;
-                tracing::info!(
-                    pulled = summary.pulled,
-                    applied = summary.applied,
-                    rejected = summary.rejected,
-                    acked = summary.acked,
-                    "processed router share edit event"
-                );
+            if let Some(trigger) = share_edit_event_trigger(&line) {
+                process_share_edit_trigger(&state, trigger).await;
             }
         }
     }
@@ -9326,6 +9544,14 @@ pub(crate) async fn share_request_log_entry(
             .actual_model_source
             .clone()
             .unwrap_or_else(|| "server".to_string()),
+        requested_reasoning_effort: log.requested_reasoning_effort.clone(),
+        effective_reasoning_effort: log.effective_reasoning_effort.clone(),
+        client_service_tier: log.client_service_tier.clone(),
+        effective_service_tier: log.effective_service_tier.clone(),
+        service_tier_decision: log.service_tier_decision.clone(),
+        usage_state: log.usage_state.as_str().to_string(),
+        stream_status: log.stream_status.clone(),
+        usage_revision: log.usage_revision,
         status_code: log.status_code,
         latency_ms: clamp_u128_to_u64(log.duration_ms),
         first_token_ms: log.first_token_ms.map(clamp_u128_to_u64),
@@ -9656,7 +9882,7 @@ mod tests {
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
-    use crate::domain::sharing::shares::{Share, ShareAcl, UpsertShareInput};
+    use crate::domain::sharing::shares::{Share, ShareAcl, ShareBinding, UpsertShareInput};
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
     use axum::extract::State as AxumState;
     use axum::http::StatusCode;
@@ -9887,6 +10113,198 @@ mod tests {
         config.router.identity = Some(identity);
         config.client.tunnel_subdomain = Some("clienttest".to_string());
         state.replace_config(config).await.unwrap();
+    }
+
+    #[test]
+    fn share_edit_event_triggers_cover_reconnect_and_live_notifications() {
+        assert_eq!(share_edit_event_trigger("event: ready"), None);
+        assert_eq!(share_edit_event_trigger("event:resync"), Some("resync"));
+        assert_eq!(
+            share_edit_event_trigger("event: share_edit_available"),
+            Some("share_edit_available")
+        );
+        assert_eq!(share_edit_event_trigger("data: {}"), None);
+        assert_eq!(share_edit_event_trigger("event: unrelated"), None);
+    }
+
+    #[tokio::test]
+    async fn share_edit_stream_resync_pulls_pending_edits_once() {
+        async fn events() -> axum::response::sse::Sse<
+            impl futures_util::Stream<
+                Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+            >,
+        > {
+            axum::response::sse::Sse::new(futures_util::stream::iter([
+                Ok(axum::response::sse::Event::default()
+                    .event("ready")
+                    .data("{}")),
+                Ok(axum::response::sse::Event::default()
+                    .event("resync")
+                    .data("{}")),
+            ]))
+        }
+
+        async fn pending(
+            AxumState(calls): AxumState<Arc<AtomicUsize>>,
+            Json(_request): Json<Value>,
+        ) -> Json<Value> {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Json(json!({"edits": []}))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/shares/edit-events", get(events))
+            .route("/v1/shares/pending-edits", post(pending))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(&state, &format!("http://{address}"), "inst-events").await;
+        create_router_shares(&state, "eventshare", 1).await;
+
+        listen_for_share_edit_events_once(state).await.unwrap();
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_share_edit_pulls_are_singleflight() {
+        #[derive(Clone)]
+        struct Probe {
+            calls: Arc<AtomicUsize>,
+            current: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+
+        async fn pending(
+            AxumState(probe): AxumState<Probe>,
+            Json(_request): Json<Value>,
+        ) -> Json<Value> {
+            probe.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let current = probe.current.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            probe.max.fetch_max(current, AtomicOrdering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            probe.current.fetch_sub(1, AtomicOrdering::SeqCst);
+            Json(json!({"edits": []}))
+        }
+
+        let probe = Probe {
+            calls: Arc::new(AtomicUsize::new(0)),
+            current: Arc::new(AtomicUsize::new(0)),
+            max: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/v1/shares/pending-edits", post(pending))
+            .with_state(probe.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(
+            &state,
+            &format!("http://{address}"),
+            "inst-singleflight-edits",
+        )
+        .await;
+        create_router_shares(&state, "singleflightshare", 1).await;
+
+        let (first, second) = tokio::join!(
+            pull_and_apply_pending_share_edits(state.clone()),
+            pull_and_apply_pending_share_edits(state.clone()),
+        );
+
+        assert!(first.error.is_none());
+        assert!(second.error.is_none());
+        assert_eq!(probe.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(probe.max.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_share_edit_pull_recovers_a_missed_edit() {
+        #[derive(Clone)]
+        struct RecoveryRouter {
+            pending_calls: Arc<AtomicUsize>,
+            ack_calls: Arc<AtomicUsize>,
+        }
+
+        async fn pending(
+            AxumState(router): AxumState<RecoveryRouter>,
+            Json(_request): Json<Value>,
+        ) -> Json<Value> {
+            router.pending_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Json(json!({
+                "edits": [{
+                    "id": "edit-periodic-recovery",
+                    "shareId": "periodicshare0",
+                    "installationId": "inst-periodic-recovery",
+                    "revision": 1,
+                    "status": "pending",
+                    "patch": {"description": "Recovered by periodic pull"},
+                    "createdByEmail": "owner@example.com",
+                    "createdAt": "2026-07-29T12:00:00Z",
+                    "updatedAt": "2026-07-29T12:00:00Z"
+                }]
+            }))
+        }
+
+        async fn batch_sync(Json(_request): Json<Value>) -> Json<Value> {
+            Json(json!({"ok": true}))
+        }
+
+        async fn ack(
+            AxumState(router): AxumState<RecoveryRouter>,
+            Json(_request): Json<Value>,
+        ) -> Json<Value> {
+            router.ack_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Json(json!({"ok": true}))
+        }
+
+        let router = RecoveryRouter {
+            pending_calls: Arc::new(AtomicUsize::new(0)),
+            ack_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/v1/shares/pending-edits", post(pending))
+            .route("/v1/shares/batch-sync", post(batch_sync))
+            .route("/v1/shares/edit-ack", post(ack))
+            .with_state(router.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(
+            &state,
+            &format!("http://{address}"),
+            "inst-periodic-recovery",
+        )
+        .await;
+        create_router_shares(&state, "periodicshare", 1).await;
+
+        let summary = run_periodic_share_edit_pull_once(&state)
+            .await
+            .expect("configured periodic pull");
+
+        assert_eq!(summary.pulled, 1);
+        assert_eq!(summary.applied, 1);
+        assert_eq!(summary.acked, 1);
+        assert_eq!(summary.remote_synced, 1);
+        assert!(summary.error.is_none());
+        assert_eq!(
+            state
+                .shares
+                .read()
+                .await
+                .get("periodicshare0")
+                .and_then(|share| share.description.as_deref()),
+            Some("Recovered by periodic pull")
+        );
+        assert_eq!(router.pending_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(router.ack_calls.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -10156,6 +10574,11 @@ mod tests {
             is_health_check: true,
             is_streaming: true,
             stream_status: Some("completed".to_string()),
+            requested_reasoning_effort: Some("high".to_string()),
+            effective_reasoning_effort: Some("high".to_string()),
+            client_service_tier: Some("default".to_string()),
+            effective_service_tier: Some("priority".to_string()),
+            service_tier_decision: Some("server_forced_priority".to_string()),
             ..UsageLogContext::default()
         });
 
@@ -10166,6 +10589,17 @@ mod tests {
         assert_eq!(entry.first_token_ms, Some(42));
         assert_eq!(entry.actual_model, "glm-5.2");
         assert_eq!(entry.actual_model_source, "model_mapping");
+        assert_eq!(entry.requested_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(entry.effective_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(entry.client_service_tier.as_deref(), Some("default"));
+        assert_eq!(entry.effective_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            entry.service_tier_decision.as_deref(),
+            Some("server_forced_priority")
+        );
+        assert_eq!(entry.usage_state, "observed");
+        assert_eq!(entry.stream_status.as_deref(), Some("completed"));
+        assert_eq!(entry.usage_revision, 1);
         assert_eq!(entry.user_country.as_deref(), Some("Japan"));
         assert_eq!(entry.user_country_iso3.as_deref(), Some("JPN"));
         assert!(entry.is_health_check);
@@ -12209,6 +12643,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conditional_share_delete_rejects_a_stale_revision() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let share = state
+            .mutate_shares_immediate(|store| {
+                store.upsert(router_sync_share_input(
+                    "conditionaldelete",
+                    "provider-conditional-delete",
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_revision = share.config_revision;
+        let current = state
+            .mutate_shares_immediate(|store| store.pause("conditionaldelete").unwrap())
+            .await
+            .unwrap();
+
+        let error = state
+            .delete_share_immediate_at_revision("conditionaldelete", stale_revision)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ConditionalShareDeleteError::RevisionConflict {
+                current_revision: current.config_revision,
+            }
+        );
+        assert!(state.shares.read().await.get("conditionaldelete").is_some());
+        assert!(ShareStore::load_or_default(&config_dir)
+            .unwrap()
+            .get("conditionaldelete")
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn pending_router_share_deletes_are_replayed_in_bounded_batches() {
         async fn handler(
             AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
@@ -12468,6 +12940,83 @@ mod tests {
                 value: "test-api-key".to_string(),
             },
         )])
+    }
+
+    fn openrouter_provider(app: AppKind, provider_id: &str, api_key: &str) -> StoredProvider {
+        let credential_name = match app {
+            AppKind::Claude => "ANTHROPIC_AUTH_TOKEN",
+            AppKind::Codex => "OPENAI_API_KEY",
+            AppKind::Gemini => "GEMINI_API_KEY",
+        };
+        let mut store = ProviderStore::default();
+        store.upsert_with_resource(
+            app,
+            Provider {
+                id: provider_id.to_string(),
+                name: provider_id.to_string(),
+                settings_config: json!({"env": {(credential_name): api_key}}),
+                category: None,
+                meta: None,
+                extra: BTreeMap::new(),
+            },
+            ProviderResourceMetadata {
+                profile_id: Some(ProfileId::parse(format!("{}.openrouter", app.as_str())).unwrap()),
+                ..ProviderResourceMetadata::default()
+            },
+        )
+    }
+
+    #[test]
+    fn provider_change_maps_multi_app_credential_divergence_to_conflict() {
+        let claude = openrouter_provider(AppKind::Claude, "shared-claude", "shared-key");
+        let codex = openrouter_provider(AppKind::Codex, "shared-codex", "shared-key");
+        let current = ProviderStore {
+            providers: vec![claude.clone(), codex.clone()],
+            ..ProviderStore::default()
+        };
+
+        let mut candidate = current.clone();
+        let rotated = openrouter_provider(AppKind::Codex, "shared-codex", "rotated-key");
+        *candidate
+            .providers
+            .iter_mut()
+            .find(|provider| {
+                provider.app == AppKind::Codex && provider.provider.id == "shared-codex"
+            })
+            .unwrap() = rotated;
+
+        let mut input = router_sync_share_input("shared-multi-app", "shared-claude");
+        input.app = AppKind::Claude;
+        input.provider_type = ProviderType::OpenRouter;
+        input.bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "shared-claude".to_string(),
+                provider_type: ProviderType::OpenRouter,
+            },
+            ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "shared-codex".to_string(),
+                provider_type: ProviderType::OpenRouter,
+            },
+        ];
+        let mut shares = ShareStore::default();
+        shares.upsert(input).unwrap();
+
+        let error = validate_ordinary_provider_subscription_change(
+            &current,
+            &candidate,
+            &AccountStore::default(),
+            &shares,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderCommandError::Conflict {
+                code: "cc_switch_share_credential_source_mismatch",
+                ..
+            }
+        ));
     }
 
     fn healthy_provider_observation(
@@ -13505,6 +14054,13 @@ mod tests {
         state
             .mutate_providers_immediate(|providers| {
                 providers.upsert(
+                    AppKind::Claude,
+                    active_codex_test_provider(
+                        "workspace-cancel-claude-provider",
+                        "workspace-cancel-account",
+                    ),
+                );
+                providers.upsert(
                     AppKind::Codex,
                     Provider {
                         id: "workspace-cancel-provider".to_string(),
@@ -13529,11 +14085,26 @@ mod tests {
             .unwrap();
         let share = state
             .mutate_shares_immediate(|shares| {
-                let mut input =
-                    router_sync_share_input("workspace-cancel-share", "workspace-cancel-provider");
+                let mut input = router_sync_share_input(
+                    "workspace-cancel-share",
+                    "workspace-cancel-claude-provider",
+                );
+                input.app = AppKind::Claude;
                 input.provider_type = ProviderType::CodexOAuth;
                 input.enabled = Some(false);
                 input.status = Some("paused".to_string());
+                input.bindings = vec![
+                    ShareBinding {
+                        app: AppKind::Claude,
+                        provider_id: "workspace-cancel-claude-provider".to_string(),
+                        provider_type: ProviderType::CodexOAuth,
+                    },
+                    ShareBinding {
+                        app: AppKind::Codex,
+                        provider_id: "workspace-cancel-provider".to_string(),
+                        provider_type: ProviderType::CodexOAuth,
+                    },
+                ];
                 shares.upsert(input).unwrap()
             })
             .await
@@ -13590,20 +14161,25 @@ mod tests {
                 .and_then(|profile| profile["selectedChatgptAccountId"].as_str()),
             Some("workspace-team")
         );
-        let provider = providers
-            .providers
-            .iter()
-            .find(|provider| provider.provider.id == "workspace-cancel-provider")
-            .unwrap();
-        assert_eq!(
-            provider
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.auth_identity_generation),
-            Some(2)
-        );
+        for provider_id in [
+            "workspace-cancel-claude-provider",
+            "workspace-cancel-provider",
+        ] {
+            let provider = providers
+                .providers
+                .iter()
+                .find(|provider| provider.provider.id == provider_id)
+                .unwrap();
+            assert_eq!(
+                provider
+                    .provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.auth_binding.as_ref())
+                    .and_then(|binding| binding.auth_identity_generation),
+                Some(2)
+            );
+        }
         let share = shares.get("workspace-cancel-share").unwrap();
         assert_eq!(
             share
@@ -13611,6 +14187,16 @@ mod tests {
                 .last()
                 .and_then(|history| history.change_kind.as_deref()),
             Some("subscription_identity")
+        );
+        let history = share.binding_history.last().unwrap();
+        assert_eq!(history.app, AppKind::Codex);
+        assert_eq!(
+            history.previous_provider_id.as_deref(),
+            Some("workspace-cancel-provider")
+        );
+        assert_eq!(
+            history.next_provider_id.as_deref(),
+            Some("workspace-cancel-provider")
         );
         crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
             &providers, &accounts, &shares,
@@ -13640,6 +14226,124 @@ mod tests {
         assert_eq!(
             serde_json::to_value(disk_shares).unwrap(),
             serde_json::to_value(shares).unwrap()
+        );
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_workspace_rebind_rejects_account_used_by_independent_shares() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "workspace-shared-account",
+                        "providerType": "codex_oauth",
+                        "profile": {
+                            "verifiedOpenAiClaims": {
+                                "subject": "workspace-shared-subject",
+                                "chatgpt_account_id": "workspace-default",
+                                "organizations": [{
+                                    "id": "workspace-team",
+                                    "name": "Workspace Team"
+                                }]
+                            },
+                            "selectedChatgptAccountId": "workspace-default"
+                        }
+                    }))
+                    .unwrap();
+                accounts.upsert(account)
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                for provider_id in ["workspace-shared-provider-a", "workspace-shared-provider-b"] {
+                    providers.upsert(
+                        AppKind::Codex,
+                        active_codex_test_provider(provider_id, "workspace-shared-account"),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let first_share = state
+            .mutate_shares_immediate(|shares| {
+                let mut first = router_sync_share_input(
+                    "workspace-independent-share-a",
+                    "workspace-shared-provider-a",
+                );
+                first.provider_type = ProviderType::CodexOAuth;
+                first.enabled = Some(false);
+                first.status = Some("paused".to_string());
+                let first = shares.upsert(first).unwrap();
+
+                let mut second = router_sync_share_input(
+                    "workspace-independent-share-b",
+                    "workspace-shared-provider-b",
+                );
+                second.provider_type = ProviderType::CodexOAuth;
+                second.enabled = Some(false);
+                second.status = Some("paused".to_string());
+                shares.upsert(second).unwrap();
+                first
+            })
+            .await
+            .unwrap();
+
+        let accounts_before = serde_json::to_value(state.accounts_snapshot().await).unwrap();
+        let providers_before = serde_json::to_value(state.providers_snapshot().await).unwrap();
+        let shares_before = serde_json::to_value(state.shares.read().await.clone()).unwrap();
+        let accounts_file_before = fs::read(accounts_path(&config_dir)).unwrap();
+        let providers_file_before = fs::read(providers_path(&config_dir)).unwrap();
+        let shares_file_before =
+            fs::read(crate::domain::sharing::shares::shares_path(&config_dir)).unwrap();
+
+        let error = state
+            .rebind_codex_workspace_for_share_command(
+                "workspace-independent-share-a",
+                "workspace-shared-account",
+                "workspace-team",
+                first_share.config_revision,
+            )
+            .await
+            .unwrap()
+            .err()
+            .expect("workspace rebind must reject an account used by another Share");
+
+        assert!(matches!(
+            error,
+            crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError::AccountInUse { ref share_ids }
+                if share_ids
+                    == &[
+                        "workspace-independent-share-a".to_string(),
+                        "workspace-independent-share-b".to_string(),
+                    ]
+        ));
+        assert_eq!(
+            serde_json::to_value(state.accounts_snapshot().await).unwrap(),
+            accounts_before
+        );
+        assert_eq!(
+            serde_json::to_value(state.providers_snapshot().await).unwrap(),
+            providers_before
+        );
+        assert_eq!(
+            serde_json::to_value(state.shares.read().await.clone()).unwrap(),
+            shares_before
+        );
+        assert_eq!(
+            fs::read(accounts_path(&config_dir)).unwrap(),
+            accounts_file_before
+        );
+        assert_eq!(
+            fs::read(providers_path(&config_dir)).unwrap(),
+            providers_file_before
+        );
+        assert_eq!(
+            fs::read(crate::domain::sharing::shares::shares_path(&config_dir)).unwrap(),
+            shares_file_before
         );
         fs::remove_dir_all(config_dir).unwrap();
     }
@@ -14406,7 +15110,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_validator_rejects_staged_current_subscription_conflict() {
+    fn restore_validator_allows_staged_independent_subscription_share() {
         let config_dir = provider_restore_test_dir("subscription-reference-composition");
         let stage_dir = config_dir.join("restore-stage");
         fs::create_dir_all(&stage_dir).unwrap();
@@ -14486,12 +15190,7 @@ mod tests {
             }],
         };
 
-        let error =
-            validate_server_backup_restore_stage(&config_dir, &stage_dir, &manifest).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("cc_switch_subscription_identity_conflict"),
-            "{error:#}"
-        );
+        validate_server_backup_restore_stage(&config_dir, &stage_dir, &manifest).unwrap();
         assert_eq!(
             ShareStore::load_or_default(&config_dir)
                 .unwrap()
@@ -15244,6 +15943,7 @@ mod tests {
     fn share(id: &str, auto_start: bool, enabled: bool, status: &str) -> Share {
         Share {
             id: id.to_string(),
+            capacity_pool_id: format!("cp-{id}"),
             owner_email: None,
             app: AppKind::Codex,
             provider_id: "p1".to_string(),

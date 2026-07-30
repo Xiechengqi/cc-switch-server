@@ -18,6 +18,11 @@ export interface RequestLog {
   requestedModel: string;
   actualModel: string;
   actualModelSource: string;
+  requestedReasoningEffort?: string | null;
+  effectiveReasoningEffort?: string | null;
+  clientServiceTier?: string | null;
+  effectiveServiceTier?: string | null;
+  serviceTierDecision?: string | null;
   rawInputTokens?: number | null;
   inputTokens: number;
   outputTokens: number;
@@ -32,6 +37,14 @@ export interface RequestLog {
   imageSize?: string | null;
   isStreaming: boolean;
   streamStatus?: string | null;
+  usageState?:
+    | "pending"
+    | "observed"
+    | "missing"
+    | "parse_error"
+    | "interrupted"
+    | string;
+  usageRevision?: number;
   latencyMs: number;
   firstTokenMs?: number;
   durationMs?: number;
@@ -181,6 +194,10 @@ export const CACHE_INCLUSIVE_APP_TYPES: ReadonlySet<string> = new Set([
 /** Subset of request-log fields needed to derive cache-normalized input. */
 export interface CacheNormalizableLog {
   inputTokens: number;
+}
+
+export function hasObservedUsage(log: { usageState?: string | null }): boolean {
+  return !log.usageState || log.usageState === "observed";
 }
 
 /**

@@ -142,6 +142,14 @@
       "saveSuccess": "Share settings saved",
       "saveError": "Failed to save share settings: {{error}}",
       "routerFromSettingsHint": "New shares use the default router from Settings → Share.",
+      "reuseTitle": "Existing share found for this account or API key",
+      "reuseDescription": "Add this app to an existing URL or keep it on a separate new URL.",
+      "reuseTarget": "Existing share",
+      "reuseCheckbox": "Reuse the existing Share URL and remote settings",
+      "reuseSuccess": "Existing share URL reused",
+      "reuseError": "Failed to reuse share URL: {{error}}",
+      "removeBindingSuccess": "Remote sharing stopped for this app",
+      "removeBindingError": "Failed to stop remote sharing: {{error}}",
       "ownerNotConfigured": "Configure Client Owner first",
       "ownerManagedHint": "Share Owner always matches Client Owner. Change it from Settings → Share via installation-signed owner transfer.",
       "officialPricePercent": "Model pricing (% of official price)",
@@ -1410,7 +1418,7 @@
     "addDeviceAccount": "Authorize with Device Code",
     "selectAccountRequired": "OpenAI OAuth must be bound to a ChatGPT account",
     "fastMode": "FAST mode",
-    "fastModeDescription": "Send service_tier=\"priority\" for lower latency. Off by default — enabling it consumes your ChatGPT quota at a higher rate."
+    "fastModeDescription": "The server controls FAST mode. When off, client service_tier values are removed. When on, the server forces priority only for models that declare support; client FAST settings cannot override this. Priority may consume ChatGPT quota faster."
   },
   "codexBankedReset": {
     "title": "Banked Reset",
@@ -1629,8 +1637,20 @@
     "outputTokens": "Output",
     "cacheReadTokens": "Cache Hit",
     "cacheCreationTokens": "Cache Creation",
+    "imageOutput": "Image Output",
+    "imageCount": "Image Count",
+    "imageBytes": "Output Bytes",
+    "imageFormat": "Image Format",
+    "imageDimensions": "Image Dimensions",
     "timingInfo": "Duration/TTFT",
     "status": "Status",
+    "usageState": {
+      "pending": "Pending",
+      "observed": "Observed",
+      "missing": "Unavailable",
+      "parse_error": "Parse error",
+      "interrupted": "Interrupted"
+    },
     "requestModel": "Request Model",
     "responseModel": "Response Model",
     "noData": "No data",
@@ -1721,7 +1741,21 @@
     "timeRangeTooLarge": "Time range is too large, please narrow it down",
     "modelPath": "Model path",
     "actualModel": "Actual model",
-    "firstToken": "First token"
+    "firstToken": "First token",
+    "requestPolicy": "Request Policy",
+    "reasoningEffortShort": "Reasoning",
+    "fastModeShort": "FAST",
+    "requestedReasoningEffort": "Requested reasoning effort",
+    "effectiveReasoningEffort": "Effective reasoning effort",
+    "clientServiceTier": "Client service tier",
+    "effectiveServiceTier": "Effective service tier",
+    "fastDecision": "FAST decision",
+    "serviceTierDecision": {
+      "server_disabled": "Disabled by server",
+      "server_forced_priority": "Priority forced by server",
+      "model_unsupported": "Model does not support priority",
+      "capability_unknown": "Priority capability unknown"
+    }
   },
   "dbUpgrade": {
     "title": "Database version is too new",

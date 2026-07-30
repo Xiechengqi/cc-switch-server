@@ -77,13 +77,17 @@ models manifest、alpha search、Provider 网络测试、模型发现、quota re
 
 ## HTTP、SSE 与 Images
 
-- Responses/Chat 请求先执行 Codex body sanitizer、model capability 和官方 CLI identity contract。
+- Responses/Chat 请求先执行 Codex body sanitizer、model capability 和官方 CLI identity contract。最终出站契约始终覆盖为 `store=false`；除原生 compact 外，OpenAI OAuth Responses 上游始终使用 `stream=true`，不信任 Claude/Codex/Gemini 入站适配器或客户端传入的这两个字段。
+- 客户端 `stream=true` 时继续得到协议转换后的 SSE；客户端 `stream=false` 时，Server 增量消费同一上游 SSE，在收到合法终止事件后聚合为单个 Responses JSON 文档。终止事件中的 usage 同时写入本地日志和 Router 同步；解析错误、缺终止事件、上游失败、超时或断流也各自写入一条终态日志并完成 Share/Provider outcome 收尾，不把“上游必须流”误报成“客户端请求了流”。
+- FAST 完全由 Provider 的 `codexFastMode` 控制：客户端的 `service_tier`/`serviceTier` 不能开启或关闭它。推理等级仍由客户端选择，OpenAI `reasoning.effort`/`reasoning_effort`、Claude `output_config.effort`/`thinking.effort` 和 Gemini `generationConfig.thinkingConfig.thinkingLevel` 的显式值均记录为 requested effort，转换后的最终出站值记录为 effective effort；`low`、`medium`、`high`、`xhigh`、`max` 保持不变，仅把非 wire 别名 `ultra` 规范为 `max`。
 - 首次 401 只允许对原账号强制 refresh 一次，再以同一 Provider、账号、workspace、session 和请求 body 重放。
 - 第二次 401、429、403、5xx、网络错误或流内错误都不能切换 Provider/账号。
 - 非流式 `response.failed` 和 SSE semantic failure 会保留 OpenAI 错误语义；已向下游提交业务输出后绝不透明重放完整生成。
 - Responses Lite、custom/freeform tool、`tool_search`、usage 四桶和空 `response.completed.output` 恢复使用同一执行身份。
 - Images generation/edit 使用固定 Codex bridge、身份头和 body 上限；401 重放后仍返回原始上游错误 body，不用另一个账号掩盖错误。
 - models manifest 与 alpha search 只访问固定 ChatGPT Codex endpoint，并采用同账号一次 401 refresh 边界。
+
+下游流式请求先创建 `usageState=pending` 的日志；终止后更新为 `observed`、`missing`、`parse_error` 或 `interrupted`，并递增 `usageRevision`。下游非流但上游被强制为 SSE 的请求直接创建一条同语义的终态日志。显式观测到的全零 usage 仍是 `observed`，与未收到 usage 严格区分。Router 只接受同一 `requestId` 的相同或更高 revision，避免迟到的 pending 覆盖终态。
 
 ### Images 兼容与资源边界
 
@@ -173,6 +177,8 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 - Share 冲突返回 409，`accounts.json`、`providers.json` 和 `shares.json` 不出现部分提交。
 - current Provider 和显式 Provider 都只能使用活动账号；并发饱和、cooldown、quota 耗尽及第二次 401 时其他 Provider/账号上游请求数为零。
 - HTTP、SSE、Images、WS 握手和 WS 到 HTTP fallback 的首次 401 都只刷新同一账号一次。
+- Claude/Codex/Gemini 经 OpenAI OAuth 转出的普通 Responses 最终出站均为 `store=false`、`stream=true`；客户端非流请求得到单个 JSON，成功终止 SSE usage 记录为 `observed` 而不是零值占位，失败聚合则按 `missing`、`parse_error` 或 `interrupted` 记录并保留已明确观测到的 usage。
+- Router 收到 pending 后可由更高 `usageRevision` 的终态覆盖；低 revision 重放不能回退状态，显式 observed zero 与 missing/parse error/interrupted 在 API 和 UI 中保持可区分。
 - WS 只在 `response.create` 成功发送前 transport fallback；发送后的 read/close/首事件超时不重放。
 - overflow compact 默认关闭；开启后仅 HTTP Responses/Chat 和 Responses SSE 重试一次，摘要 usage 独立记录，摘要失败使用省略标记，超大最新 item 与 WebSocket lifecycle 不重放。
 - credential persistence degraded 时 `/ready` 为 503 且所有 Codex OAuth credentialed surface 零上游请求。

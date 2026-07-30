@@ -190,6 +190,8 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct ShareDescriptor {
     pub share_id: String,
+    #[serde(default)]
+    pub capacity_pool_id: String,
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
@@ -527,6 +529,22 @@ pub struct ShareRequestLogEntry {
     pub requested_model: String,
     pub actual_model: String,
     pub actual_model_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_decision: Option<String>,
+    #[serde(default)]
+    pub usage_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_status: Option<String>,
+    #[serde(default)]
+    pub usage_revision: u64,
     pub status_code: u16,
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,6 +721,11 @@ pub fn descriptor_for_share_with_accounts_and_usage(
 
     ShareDescriptor {
         share_id: share.id.clone(),
+        capacity_pool_id: if share.capacity_pool_id.is_empty() {
+            share.id.clone()
+        } else {
+            share.capacity_pool_id.clone()
+        },
         share_name: share
             .display_name
             .clone()
@@ -2057,6 +2080,7 @@ mod tests {
     fn test_share(provider_type: ProviderType, quota_percent: Option<f64>) -> Share {
         Share {
             id: "share-1".to_string(),
+            capacity_pool_id: "cp-share-1".to_string(),
             owner_email: Some("owner@example.com".to_string()),
             app: AppKind::Codex,
             provider_id: "p1".to_string(),

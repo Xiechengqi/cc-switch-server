@@ -169,6 +169,8 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
 
   return {
     id,
+    capacityPoolId:
+      readString(record, "capacityPoolId", "capacity_pool_id") ?? id,
     name: readString(record, "name", "displayName", "display_name") ?? id,
     ownerEmail: readString(record, "ownerEmail", "owner_email") ?? "",
     sharedWithEmails: acl.sharedWithEmails,

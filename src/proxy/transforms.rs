@@ -1914,7 +1914,7 @@ pub fn anthropic_to_openai_chat(input: &Value) -> Result<Value, TransformError> 
     output.insert("messages".to_string(), Value::Array(output_messages));
     copy_bool(input, &mut output, "stream");
     copy_object(input, &mut output, "metadata");
-    if let Some(reasoning) = anthropic_thinking_to_openai(input.get("thinking")) {
+    if let Some(reasoning) = anthropic_reasoning_to_openai(input) {
         output.insert("reasoning".to_string(), reasoning);
     }
     if let Some(tools) = anthropic_tools_to_openai(input.get("tools")) {
@@ -1933,7 +1933,7 @@ pub fn anthropic_to_openai_responses(input: &Value) -> Result<Value, TransformEr
     copy_string(input, &mut output, "model");
     copy_bool(input, &mut output, "stream");
     copy_object(input, &mut output, "metadata");
-    if let Some(reasoning) = anthropic_thinking_to_openai(input.get("thinking")) {
+    if let Some(reasoning) = anthropic_reasoning_to_openai(input) {
         output.insert("reasoning".to_string(), reasoning);
     }
     if let Some(tools) = anthropic_tools_to_openai(input.get("tools")) {
@@ -4513,6 +4513,24 @@ fn reasoning_explicitly_disabled(effort: &str) -> bool {
     )
 }
 
+fn anthropic_reasoning_to_openai(input: &Value) -> Option<Value> {
+    let explicit_effort = input
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            input
+                .pointer("/metadata/geminiGenerationConfig/thinkingConfig/thinkingLevel")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_ascii_lowercase);
+    if let Some(effort) = explicit_effort {
+        return Some(json!({"effort": effort}));
+    }
+    anthropic_thinking_to_openai(input.get("thinking"))
+}
+
 fn anthropic_thinking_to_openai(thinking: Option<&Value>) -> Option<Value> {
     let thinking = thinking?;
     let mut output = Map::new();
@@ -6042,6 +6060,38 @@ mod tests {
                 .pointer("/tools/0/function/name")
                 .and_then(Value::as_str),
             Some("lookup")
+        );
+    }
+
+    #[test]
+    fn translated_explicit_reasoning_effort_survives_claude_and_gemini_inputs() {
+        let anthropic = json!({
+            "model": "gpt-5.6-sol",
+            "output_config": {"effort": "MAX"},
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let responses = anthropic_to_openai_responses(&anthropic).unwrap();
+        assert_eq!(
+            responses
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str),
+            Some("max")
+        );
+
+        let gemini = json!({
+            "model": "gpt-5.6-sol",
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            "generationConfig": {
+                "thinkingConfig": {"thinkingLevel": "HIGH"}
+            }
+        });
+        let anthropic = gemini_native_to_anthropic(&gemini).unwrap();
+        let responses = anthropic_to_openai_responses(&anthropic).unwrap();
+        assert_eq!(
+            responses
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str),
+            Some("high")
         );
     }
 

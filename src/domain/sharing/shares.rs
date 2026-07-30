@@ -319,6 +319,8 @@ pub struct RouterSharePruneMarker {
 pub struct Share {
     pub id: String,
     #[serde(default)]
+    pub capacity_pool_id: String,
+    #[serde(default)]
     pub owner_email: Option<String>,
     pub app: AppKind,
     pub provider_id: String,
@@ -507,7 +509,15 @@ impl ShareStore {
             .with_context(|| format!("write shares {}", path.display()))
     }
 
-    pub fn upsert(&mut self, mut input: UpsertShareInput) -> Result<Share, SharePatchError> {
+    pub fn upsert(&mut self, input: UpsertShareInput) -> Result<Share, SharePatchError> {
+        self.upsert_with_capacity(input, None)
+    }
+
+    pub fn upsert_with_capacity(
+        &mut self,
+        mut input: UpsertShareInput,
+        capacity_pool_id: Option<String>,
+    ) -> Result<Share, SharePatchError> {
         let _binding =
             crate::domain::sharing::invariants::validate_and_normalize_upsert_input(&mut input)?;
         let provider_id = input.provider_id.clone();
@@ -526,10 +536,7 @@ impl ShareStore {
             let binding_changed = existing.app != input.app
                 || existing.provider_id != input.provider_id
                 || existing.provider_type != input.provider_type
-                || existing.bindings.len() != 1
-                || existing.bindings[0].app != input.bindings[0].app
-                || existing.bindings[0].provider_id != input.bindings[0].provider_id
-                || existing.bindings[0].provider_type != input.bindings[0].provider_type;
+                || existing.bindings != input.bindings;
             if binding_changed {
                 return Err(SharePatchError::BindingImmutable);
             }
@@ -544,10 +551,13 @@ impl ShareStore {
         });
 
         if let Some(conflict) = self.shares.iter().find(|item| {
-            item.app == app
-                && item.provider_id == provider_id
-                && existing_id.as_deref() != Some(item.id.as_str())
+            existing_id.as_deref() != Some(item.id.as_str())
                 && item.status != "deleted"
+                && input.bindings.iter().any(|binding| {
+                    item.bindings.iter().any(|existing| {
+                        existing.app == binding.app && existing.provider_id == binding.provider_id
+                    })
+                })
         }) {
             return Err(SharePatchError::Invalid(format!(
                 "provider already has share {}",
@@ -631,9 +641,19 @@ impl ShareStore {
             crate::infra::time::now_ms()
         };
         let explicit_user_grants = (!input.user_grants.is_empty()).then_some(input.user_grants);
+        let capacity_pool_id = capacity_pool_id
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.shares
+                    .iter()
+                    .find(|share| share.id == share_id)
+                    .map(|share| share.capacity_pool_id.clone())
+            })
+            .unwrap_or_default();
 
         let share = Share {
             id: share_id,
+            capacity_pool_id,
             owner_email,
             app,
             provider_id,
@@ -677,6 +697,7 @@ impl ShareStore {
         };
 
         let mut share = share;
+        canonicalize_shared_app_settings_for_share(&mut share);
         if let Some(user_grants) = explicit_user_grants.as_ref() {
             share.user_grants = normalize_user_grants(
                 user_grants,
@@ -704,9 +725,63 @@ impl ShareStore {
     pub fn share_ids_for_provider(&self, app: AppKind, provider_id: &str) -> Vec<String> {
         self.shares
             .iter()
-            .filter(|item| item.app == app && item.provider_id == provider_id)
+            .filter(|item| {
+                item.bindings
+                    .iter()
+                    .any(|binding| binding.app == app && binding.provider_id == provider_id)
+            })
             .map(|item| item.id.clone())
             .collect()
+    }
+
+    pub fn refresh_capacity_pool_ids(
+        &mut self,
+        providers: &ProviderStore,
+        accounts: &AccountStore,
+        root_key: &[u8; 32],
+    ) -> Result<Vec<String>, crate::domain::sharing::credential_source::ShareCredentialSourceError>
+    {
+        let mut updated_ids = Vec::new();
+        for share in self
+            .shares
+            .iter_mut()
+            .filter(|share| share.status != "deleted")
+        {
+            let capacity_pool_id =
+                crate::domain::sharing::credential_source::capacity_pool_id_for_share(
+                    providers, accounts, share, root_key,
+                )?;
+            if share.capacity_pool_id == capacity_pool_id {
+                continue;
+            }
+            share.capacity_pool_id = capacity_pool_id;
+            mark_share_config_pending(share);
+            updated_ids.push(share.id.clone());
+        }
+        Ok(updated_ids)
+    }
+
+    pub fn apply_capacity_pool_ids(
+        &mut self,
+        capacity_pool_ids: &BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let mut updated_ids = Vec::new();
+        for share in self
+            .shares
+            .iter_mut()
+            .filter(|share| share.status != "deleted")
+        {
+            let Some(capacity_pool_id) = capacity_pool_ids.get(&share.id) else {
+                continue;
+            };
+            if capacity_pool_id.is_empty() || share.capacity_pool_id == *capacity_pool_id {
+                continue;
+            }
+            share.capacity_pool_id.clone_from(capacity_pool_id);
+            mark_share_config_pending(share);
+            updated_ids.push(share.id.clone());
+        }
+        updated_ids
     }
 
     pub fn delete(&mut self, share_id: &str) -> Option<ShareDeleteTombstone> {
@@ -891,6 +966,7 @@ impl ShareStore {
     pub fn validate_for_invocation(
         &mut self,
         share_id: &str,
+        app: AppKind,
         user_email: Option<&str>,
         now_ms: i64,
     ) -> Result<ShareInvocation, ShareInvocationRejection> {
@@ -901,6 +977,14 @@ impl ShareStore {
                 status_changed: false,
             });
         };
+
+        if !share.bindings.iter().any(|binding| binding.app == app) {
+            return Err(ShareInvocationRejection {
+                reason: ShareRejectReason::UnsupportedApp,
+                message: format!("Share does not provide the {} API format.", app.as_str()),
+                status_changed: false,
+            });
+        }
 
         if !share.enabled || share.status != "active" {
             return Err(ShareInvocationRejection {
@@ -1065,11 +1149,30 @@ impl ShareStore {
         share_id: &str,
         binding: ShareBinding,
     ) -> Result<Share, ShareUpdateError> {
+        self.update_binding_inner(share_id, binding, None)
+    }
+
+    pub fn update_binding_with_capacity(
+        &mut self,
+        share_id: &str,
+        binding: ShareBinding,
+        capacity_pool_id: String,
+    ) -> Result<Share, ShareUpdateError> {
+        self.update_binding_inner(share_id, binding, Some(capacity_pool_id))
+    }
+
+    fn update_binding_inner(
+        &mut self,
+        share_id: &str,
+        binding: ShareBinding,
+        capacity_pool_id: Option<String>,
+    ) -> Result<Share, ShareUpdateError> {
         if self.shares.iter().any(|item| {
             item.id != share_id
-                && item.app == binding.app
-                && item.provider_id == binding.provider_id
                 && item.status != "deleted"
+                && item.bindings.iter().any(|existing| {
+                    existing.app == binding.app && existing.provider_id == binding.provider_id
+                })
         }) {
             return Err(ShareUpdateError::ProviderAlreadyShared);
         }
@@ -1086,19 +1189,21 @@ impl ShareStore {
             return Err(ShareUpdateError::InvalidApp);
         }
 
-        if share.bindings.len() != 1 {
-            share.bindings = vec![ShareBinding {
-                app: share.app,
-                provider_id: share.provider_id.clone(),
-                provider_type: share.provider_type,
-            }];
-        }
-
-        let previous_provider_id = share.bindings.first().map(|item| item.provider_id.clone());
-        share.bindings = vec![binding.clone()];
+        let Some(existing_binding) = share
+            .bindings
+            .iter_mut()
+            .find(|existing| existing.app == binding.app)
+        else {
+            return Err(ShareUpdateError::InvalidApp);
+        };
+        let previous_provider_id = Some(existing_binding.provider_id.clone());
+        *existing_binding = binding.clone();
 
         share.provider_id = binding.provider_id.clone();
         share.provider_type = binding.provider_type;
+        if let Some(capacity_pool_id) = capacity_pool_id {
+            share.capacity_pool_id = capacity_pool_id;
+        }
 
         share.binding_history.push(ShareBindingHistory {
             app: binding.app,
@@ -1115,9 +1220,133 @@ impl ShareStore {
         Some(share.clone()).ok_or(ShareUpdateError::NotFound)
     }
 
+    pub fn add_binding(
+        &mut self,
+        share_id: &str,
+        binding: ShareBinding,
+    ) -> Result<Share, SharePatchError> {
+        self.add_binding_inner(share_id, binding, None)
+    }
+
+    pub fn add_binding_with_capacity(
+        &mut self,
+        share_id: &str,
+        binding: ShareBinding,
+        capacity_pool_id: String,
+    ) -> Result<Share, SharePatchError> {
+        self.add_binding_inner(share_id, binding, Some(capacity_pool_id))
+    }
+
+    fn add_binding_inner(
+        &mut self,
+        share_id: &str,
+        binding: ShareBinding,
+        capacity_pool_id: Option<String>,
+    ) -> Result<Share, SharePatchError> {
+        if self.shares.iter().any(|share| {
+            share.id != share_id
+                && share.status != "deleted"
+                && share.bindings.iter().any(|existing| {
+                    existing.app == binding.app && existing.provider_id == binding.provider_id
+                })
+        }) {
+            return Err(SharePatchError::Invalid(
+                "provider already has an active share".to_string(),
+            ));
+        }
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|share| share.id == share_id)
+            .ok_or(SharePatchError::NotFound)?;
+        if share
+            .bindings
+            .iter()
+            .any(|existing| existing.app == binding.app)
+        {
+            return Err(SharePatchError::Invalid(format!(
+                "share already has a {} binding",
+                binding.app.as_str()
+            )));
+        }
+        if share.bindings.len() >= 3 {
+            return Err(SharePatchError::Invalid(
+                "share already has the maximum number of bindings".to_string(),
+            ));
+        }
+        share.bindings.push(binding.clone());
+        share.bindings.sort_by_key(|item| item.app);
+        if let Some(capacity_pool_id) = capacity_pool_id {
+            share.capacity_pool_id = capacity_pool_id;
+        }
+        share.binding_history.push(ShareBindingHistory {
+            app: binding.app,
+            previous_provider_id: None,
+            next_provider_id: Some(binding.provider_id),
+            previous_subscription_identity_fingerprint: None,
+            next_subscription_identity_fingerprint: None,
+            change_kind: Some("binding_added".to_string()),
+            changed_at_ms: now_ms(),
+        });
+        canonicalize_shared_app_settings_for_share(share);
+        mark_share_config_pending(share);
+        Ok(share.clone())
+    }
+
+    pub fn remove_binding(
+        &mut self,
+        share_id: &str,
+        app: AppKind,
+        provider_id: &str,
+    ) -> Result<Share, SharePatchError> {
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|share| share.id == share_id)
+            .ok_or(SharePatchError::NotFound)?;
+        if share.bindings.len() <= 1 {
+            return Err(SharePatchError::Invalid(
+                "removing the final binding must delete the share".to_string(),
+            ));
+        }
+        let Some(index) = share
+            .bindings
+            .iter()
+            .position(|binding| binding.app == app && binding.provider_id == provider_id)
+        else {
+            return Err(SharePatchError::Invalid(
+                "provider is not bound to this share".to_string(),
+            ));
+        };
+        let removed = share.bindings.remove(index);
+        if share.app == removed.app {
+            let primary = share
+                .bindings
+                .first()
+                .expect("a multi-binding share retains at least one binding");
+            share.app = primary.app;
+            share.provider_id = primary.provider_id.clone();
+            share.provider_type = primary.provider_type;
+        }
+        share.binding_history.push(ShareBindingHistory {
+            app: removed.app,
+            previous_provider_id: Some(removed.provider_id),
+            next_provider_id: None,
+            previous_subscription_identity_fingerprint: None,
+            next_subscription_identity_fingerprint: None,
+            change_kind: Some("binding_removed".to_string()),
+            changed_at_ms: now_ms(),
+        });
+        canonicalize_shared_app_settings_for_share(share);
+        mark_share_config_pending(share);
+        Ok(share.clone())
+    }
+
     pub fn record_subscription_identity_rebind(
         &mut self,
         share_id: &str,
+        app: AppKind,
+        provider_id: &str,
         previous_fingerprint: String,
         next_fingerprint: String,
     ) -> Result<Share, ShareUpdateError> {
@@ -1129,10 +1358,15 @@ impl ShareStore {
         if share.status != "paused" {
             return Err(ShareUpdateError::MustBePaused);
         }
+        let binding = share
+            .bindings
+            .iter()
+            .find(|binding| binding.app == app && binding.provider_id == provider_id)
+            .ok_or(ShareUpdateError::InvalidApp)?;
         share.binding_history.push(ShareBindingHistory {
-            app: share.app,
-            previous_provider_id: Some(share.provider_id.clone()),
-            next_provider_id: Some(share.provider_id.clone()),
+            app: binding.app,
+            previous_provider_id: Some(binding.provider_id.clone()),
+            next_provider_id: Some(binding.provider_id.clone()),
             previous_subscription_identity_fingerprint: Some(previous_fingerprint),
             next_subscription_identity_fingerprint: Some(next_fingerprint),
             change_kind: Some("subscription_identity".to_string()),
@@ -1145,6 +1379,7 @@ impl ShareStore {
     pub fn replace_acl(&mut self, share_id: &str, acl: ShareAcl) -> Option<Share> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         share.acl = acl;
+        canonicalize_shared_app_settings_for_share(share);
         mark_share_config_pending(share);
         Some(share.clone())
     }
@@ -1279,9 +1514,32 @@ impl ShareStore {
         if let Some(access_by_app) = patch.access_by_app {
             share.access_by_app =
                 normalize_access_by_app(access_by_app, share.owner_email.as_deref());
+            if let Some(access) = share
+                .access_by_app
+                .get(share.app.as_str())
+                .or_else(|| share.access_by_app.values().next())
+            {
+                share.acl.shared_with_emails = access.shared_with_emails.clone();
+                share.acl.market_access_mode = Some(access.market_access_mode.clone());
+            }
         }
         if let Some(app_settings) = patch.app_settings {
             share.app_settings = normalize_app_settings(app_settings, share.owner_email.as_deref());
+            if let Some(settings) = share
+                .app_settings
+                .get(share.app.as_str())
+                .or_else(|| share.app_settings.values().next())
+                .cloned()
+            {
+                apply_router_for_sale_patch(&mut share, &settings.for_sale);
+                share.acl.market_access_mode = Some(settings.market_access_mode);
+                share.acl.shared_with_emails = settings.shared_with_emails;
+                share.token_limit =
+                    (settings.token_limit >= 0).then_some(settings.token_limit as u64);
+                share.parallel_limit =
+                    (settings.parallel_limit >= 0).then_some(settings.parallel_limit as u32);
+                share.expires_at = parse_share_expiration(&settings.expires_at)?;
+            }
         }
         if let Some(pricing) = patch.for_sale_official_price_percent_by_app {
             share.for_sale_official_price_percent_by_app = pricing;
@@ -1307,11 +1565,6 @@ impl ShareStore {
             share.auto_start = auto_start;
         }
 
-        reconcile_user_grants(&mut share, explicit_user_grants.as_ref());
-        if let Some(operation) = managed_grant.as_ref() {
-            apply_managed_grant_operation(&mut share, operation)?;
-        }
-
         let pricing_eligible = share.for_sale && !share.free_access;
         if !pricing_eligible {
             if pricing_was_explicit && !share.for_sale_official_price_percent_by_app.is_empty() {
@@ -1320,6 +1573,13 @@ impl ShareStore {
                 ));
             }
             share.for_sale_official_price_percent_by_app.clear();
+        }
+        crate::domain::sharing::invariants::validate_share_import(&share)?;
+        canonicalize_shared_app_settings_for_share(&mut share);
+
+        reconcile_user_grants(&mut share, explicit_user_grants.as_ref());
+        if let Some(operation) = managed_grant.as_ref() {
+            apply_managed_grant_operation(&mut share, operation)?;
         }
         crate::domain::sharing::invariants::validate_share_import(&share)?;
         mark_share_config_pending(&mut share);
@@ -1414,33 +1674,7 @@ impl ShareStore {
             .iter_mut()
             .find(|item| item.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
-        let app = share.app.as_str().to_string();
-        let market_access_mode = share
-            .acl
-            .market_access_mode
-            .clone()
-            .unwrap_or_else(|| "selected".to_string());
-        let shared_with_emails = share.acl.shared_with_emails.clone();
-        share.access_by_app.clear();
-        share.access_by_app.insert(
-            app.clone(),
-            ShareAppAccess {
-                shared_with_emails: shared_with_emails.clone(),
-                market_access_mode: market_access_mode.clone(),
-            },
-        );
-        share.app_settings.clear();
-        share.app_settings.insert(
-            app,
-            ShareAppSettings {
-                for_sale: share_router_for_sale_label(share),
-                market_access_mode,
-                shared_with_emails,
-                token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
-                parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
-                expires_at: share_expires_at_rfc3339(share.expires_at),
-            },
-        );
+        canonicalize_shared_app_settings_for_share(share);
         Ok(share.clone())
     }
 
@@ -1479,8 +1713,12 @@ impl ShareStore {
                 .any(|(other_index, other)| {
                     other_index != index
                         && other.status != "deleted"
-                        && other.app == share.app
-                        && other.provider_id == share.provider_id
+                        && other.bindings.iter().any(|other_binding| {
+                            share.bindings.iter().any(|binding| {
+                                other_binding.app == binding.app
+                                    && other_binding.provider_id == binding.provider_id
+                            })
+                        })
                 })
             {
                 return Err(SharePatchError::Invalid(format!(
@@ -1511,8 +1749,12 @@ impl ShareStore {
         if self.shares.iter().enumerate().any(|(other_index, share)| {
             other_index != index
                 && share.status != "deleted"
-                && share.app == candidate.app
-                && share.provider_id == candidate.provider_id
+                && share.bindings.iter().any(|other_binding| {
+                    candidate.bindings.iter().any(|binding| {
+                        other_binding.app == binding.app
+                            && other_binding.provider_id == binding.provider_id
+                    })
+                })
         }) {
             return Err(SharePatchError::Invalid(
                 "provider already has an active share".to_string(),
@@ -1890,6 +2132,7 @@ impl ShareInvocationRejection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareRejectReason {
     NotFound,
+    UnsupportedApp,
     Inactive,
     Expired,
     Exhausted,
@@ -1903,6 +2146,7 @@ impl ShareRejectReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NotFound => "NotFound",
+            Self::UnsupportedApp => "UnsupportedApp",
             Self::Inactive => "Inactive",
             Self::Expired => "Expired",
             Self::Exhausted => "Exhausted",
@@ -1921,7 +2165,7 @@ impl std::fmt::Display for ShareUpdateError {
             Self::MustBePaused => {
                 formatter.write_str("share must be paused before updating binding")
             }
-            Self::InvalidApp => formatter.write_str("share binding app must match share.app"),
+            Self::InvalidApp => formatter.write_str("share binding app/provider is invalid"),
             Self::ProviderAlreadyShared => {
                 formatter.write_str("provider already has an active share")
             }
@@ -2025,6 +2269,52 @@ pub(crate) fn share_router_for_sale_label(share: &Share) -> String {
         "Yes".to_string()
     } else {
         "No".to_string()
+    }
+}
+
+fn canonicalize_shared_app_settings_for_share(share: &mut Share) {
+    let apps = share
+        .bindings
+        .iter()
+        .map(|binding| binding.app.as_str().to_string())
+        .collect::<Vec<_>>();
+    let market_access_mode = share
+        .acl
+        .market_access_mode
+        .clone()
+        .unwrap_or_else(|| "selected".to_string());
+    let shared_with_emails = share.acl.shared_with_emails.clone();
+    let access = ShareAppAccess {
+        shared_with_emails: shared_with_emails.clone(),
+        market_access_mode: market_access_mode.clone(),
+    };
+    let settings = ShareAppSettings {
+        for_sale: share_router_for_sale_label(share),
+        market_access_mode,
+        shared_with_emails,
+        token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
+        parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
+        expires_at: share_expires_at_rfc3339(share.expires_at),
+    };
+    let price = share
+        .for_sale_official_price_percent_by_app
+        .values()
+        .next()
+        .copied();
+
+    share.access_by_app.clear();
+    share.app_settings.clear();
+    share.for_sale_official_price_percent_by_app.clear();
+    for app in apps {
+        share.access_by_app.insert(app.clone(), access.clone());
+        share.app_settings.insert(app.clone(), settings.clone());
+        if share.for_sale && !share.free_access {
+            if let Some(price) = price {
+                share
+                    .for_sale_official_price_percent_by_app
+                    .insert(app, price);
+            }
+        }
     }
 }
 
@@ -3410,13 +3700,18 @@ mod tests {
         store.record_user_invocation_result("user-quota", Some("alice@example.com"), 5, now);
         assert_eq!(
             store
-                .validate_for_invocation("user-quota", Some("alice@example.com"), now)
+                .validate_for_invocation(
+                    "user-quota",
+                    AppKind::Codex,
+                    Some("alice@example.com"),
+                    now,
+                )
                 .unwrap_err()
                 .reason,
             ShareRejectReason::UserExhausted
         );
         assert!(store
-            .validate_for_invocation("user-quota", Some("bob@example.com"), now)
+            .validate_for_invocation("user-quota", AppKind::Codex, Some("bob@example.com"), now,)
             .is_ok());
         assert_eq!(store.get("user-quota").unwrap().status, "active");
 
@@ -3428,13 +3723,13 @@ mod tests {
             0
         );
         assert!(store
-            .validate_for_invocation("user-quota", Some("alice@example.com"), now)
+            .validate_for_invocation("user-quota", AppKind::Codex, Some("alice@example.com"), now,)
             .is_ok());
 
         store.record_user_invocation_result("user-quota", Some("bob@example.com"), 95, now);
         store.record_user_invocation_result("user-quota", Some("alice@example.com"), 5, now);
         let rejection = store
-            .validate_for_invocation("user-quota", Some("bob@example.com"), now)
+            .validate_for_invocation("user-quota", AppKind::Codex, Some("bob@example.com"), now)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Inactive);
         assert_eq!(store.get("user-quota").unwrap().status, "exhausted");
@@ -3765,12 +4060,118 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_upsert_refreshes_derived_capacity_pool() {
+        let mut store = ShareStore::default();
+        let original = store
+            .upsert_with_capacity(
+                codex_share_input("capacity-refresh"),
+                Some("cp_old".to_string()),
+            )
+            .unwrap();
+
+        let refreshed = store
+            .upsert_with_capacity(
+                codex_share_input("capacity-refresh"),
+                Some("cp_new".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(refreshed.capacity_pool_id, "cp_new");
+        assert!(refreshed.config_revision > original.config_revision);
+    }
+
+    #[test]
+    fn multi_app_binding_shares_configuration_and_removes_one_app() {
+        let mut store = ShareStore::default();
+        let original = store
+            .upsert_with_capacity(
+                codex_share_input("multi-app"),
+                Some("cp_shared".to_string()),
+            )
+            .unwrap();
+        let shared = store
+            .add_binding(
+                "multi-app",
+                ShareBinding {
+                    app: AppKind::Claude,
+                    provider_id: "claude-provider".to_string(),
+                    provider_type: ProviderType::Claude,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(shared.capacity_pool_id, "cp_shared");
+        assert_eq!(shared.bindings.len(), 2);
+        assert_eq!(
+            shared.app_settings["claude"].token_limit,
+            shared.app_settings["codex"].token_limit
+        );
+        assert_eq!(
+            shared.app_settings["claude"].shared_with_emails,
+            shared.app_settings["codex"].shared_with_emails
+        );
+        assert_eq!(
+            shared.access_by_app["claude"].shared_with_emails,
+            shared.access_by_app["codex"].shared_with_emails
+        );
+
+        let updated = store
+            .apply_settings_patch(
+                "multi-app",
+                ShareSettingsPatch {
+                    shared_with_emails: Some(vec!["user@example.com".to_string()]),
+                    market_access_mode: Some("selected".to_string()),
+                    token_limit: Some(42),
+                    parallel_limit: Some(3),
+                    for_sale: Some("Yes".to_string()),
+                    for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
+                        "claude".to_string(),
+                        80,
+                    )])),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.app_settings["claude"].shared_with_emails,
+            updated.app_settings["codex"].shared_with_emails
+        );
+        assert_eq!(
+            updated.app_settings["claude"].market_access_mode,
+            updated.app_settings["codex"].market_access_mode
+        );
+        assert_eq!(updated.app_settings["codex"].token_limit, 42);
+        assert_eq!(updated.app_settings["codex"].parallel_limit, 3);
+        assert_eq!(
+            updated.for_sale_official_price_percent_by_app,
+            BTreeMap::from([("claude".to_string(), 80), ("codex".to_string(), 80)])
+        );
+        assert!(store
+            .validate_for_invocation("multi-app", AppKind::Claude, None, 1_000)
+            .is_ok());
+        let rejection = store
+            .validate_for_invocation("multi-app", AppKind::Gemini, None, 1_000)
+            .unwrap_err();
+        assert_eq!(rejection.reason, ShareRejectReason::UnsupportedApp);
+
+        let retained = store
+            .remove_binding("multi-app", AppKind::Codex, &original.provider_id)
+            .unwrap();
+        assert_eq!(retained.app, AppKind::Claude);
+        assert_eq!(retained.provider_id, "claude-provider");
+        assert_eq!(retained.bindings.len(), 1);
+        assert_eq!(store.shares.len(), 1);
+        assert!(!retained.app_settings.contains_key("codex"));
+    }
+
+    #[test]
     fn validates_share_invocation_lifecycle_limits_and_counters() {
         let mut store = ShareStore::default();
         let _ = store.upsert(codex_share_input("expired")).unwrap();
         store.shares[0].expires_at = Some(999);
         let rejection = store
-            .validate_for_invocation("expired", None, 1_000_000)
+            .validate_for_invocation("expired", AppKind::Codex, None, 1_000_000)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Expired);
         assert_eq!(
@@ -3785,7 +4186,7 @@ mod tests {
         let _ = store.upsert(paused).unwrap();
         store.pause("paused").unwrap();
         let rejection = store
-            .validate_for_invocation("paused", None, 1_000_000)
+            .validate_for_invocation("paused", AppKind::Codex, None, 1_000_000)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Inactive);
         assert!(rejection.formatted_message().contains("[Inactive]"));
@@ -3803,7 +4204,7 @@ mod tests {
             limited.tokens_used = 10;
         }
         let rejection = store
-            .validate_for_invocation("limited", None, 1_000_000)
+            .validate_for_invocation("limited", AppKind::Codex, None, 1_000_000)
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Exhausted);
         assert_eq!(
@@ -3925,19 +4326,60 @@ mod tests {
 
         store.pause("s1").unwrap();
         let share = store
-            .update_binding(
+            .update_binding_with_capacity(
                 "s1",
                 ShareBinding {
                     app: AppKind::Codex,
                     provider_id: "p2".to_string(),
                     provider_type: ProviderType::OpenRouter,
                 },
+                "cp-rebound".to_string(),
             )
             .unwrap();
 
         assert_eq!(share.provider_id, "p2");
         assert_eq!(share.provider_type, ProviderType::OpenRouter);
+        assert_eq!(share.capacity_pool_id, "cp-rebound");
         assert_eq!(share.binding_history.len(), 1);
+    }
+
+    #[test]
+    fn updating_binding_rejects_provider_used_as_another_shares_secondary_app() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("s1")).unwrap();
+        store.pause("s1").unwrap();
+
+        let mut multi = codex_share_input("s2");
+        multi.app = AppKind::Claude;
+        multi.provider_id = "claude-p1".to_string();
+        multi.provider_type = ProviderType::Claude;
+        multi.bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "claude-p1".to_string(),
+                provider_type: ProviderType::Claude,
+            },
+            ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "codex-secondary".to_string(),
+                provider_type: ProviderType::OpenRouter,
+            },
+        ];
+        store.upsert(multi).unwrap();
+
+        let error = store
+            .update_binding(
+                "s1",
+                ShareBinding {
+                    app: AppKind::Codex,
+                    provider_id: "codex-secondary".to_string(),
+                    provider_type: ProviderType::OpenRouter,
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error, ShareUpdateError::ProviderAlreadyShared);
+        assert_eq!(store.get("s1").unwrap().provider_id, "p1");
     }
 
     #[test]
@@ -3995,6 +4437,7 @@ mod tests {
         let mut store = ShareStore::default();
         let share = Share {
             id: "s1".to_string(),
+            capacity_pool_id: "cp-s1".to_string(),
             owner_email: None,
             app: AppKind::Claude,
             provider_id: "p1".to_string(),

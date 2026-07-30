@@ -21,6 +21,7 @@ import { useRequestLogs } from "@/lib/query/usage";
 import {
   getFreshInputTokens,
   getTotalTokens,
+  hasObservedUsage,
   type LogFilters,
   type UsageRangeSelection,
 } from "@/types/usage";
@@ -190,6 +191,11 @@ export function RequestLogTable({
                   </TableRow>
                 ) : (
                   logs.map((log) => {
+                    const usageObserved = hasObservedUsage(log);
+                    const usageStateLabel = t(
+                      `usage.usageState.${log.usageState || "observed"}`,
+                      { defaultValue: log.usageState || "observed" },
+                    );
                     const freshInput = getFreshInputTokens(log);
                     const rawInput =
                       log.rawInputTokens ??
@@ -197,6 +203,30 @@ export function RequestLogTable({
                         log.cacheReadTokens +
                         log.cacheCreationTokens;
                     const totalTokens = getTotalTokens(log);
+                    const requestedEffort = log.requestedReasoningEffort;
+                    const effectiveEffort = log.effectiveReasoningEffort;
+                    const reasoningPath =
+                      requestedEffort &&
+                      effectiveEffort &&
+                      requestedEffort !== effectiveEffort
+                        ? `${requestedEffort} → ${effectiveEffort}`
+                        : requestedEffort || effectiveEffort;
+                    const clientTier = log.clientServiceTier;
+                    const effectiveTier = log.effectiveServiceTier;
+                    const tierPath =
+                      clientTier &&
+                      effectiveTier &&
+                      clientTier !== effectiveTier
+                        ? `${clientTier} → ${effectiveTier}`
+                        : effectiveTier || clientTier;
+                    const fastDecision = log.serviceTierDecision
+                      ? t(
+                          `usage.serviceTierDecision.${log.serviceTierDecision}`,
+                          {
+                            defaultValue: log.serviceTierDecision,
+                          },
+                        )
+                      : null;
                     return (
                       <TableRow key={log.requestId}>
                         <TableCell className="text-center whitespace-nowrap text-xs px-1.5">
@@ -225,42 +255,67 @@ export function RequestLogTable({
                               {log.requestedModel || log.requestModel || "-"}
                               {" → "}
                             </span>
-                            <span>
-                              {log.actualModel || log.model || "-"}
-                            </span>
+                            <span>{log.actualModel || log.model || "-"}</span>
                           </div>
-                        </TableCell>
-                        <TableCell className="text-center px-1.5">
-                          <div
-                            className="tabular-nums"
-                            title={
-                              rawInput !== freshInput
-                                ? `Raw: ${rawInput.toLocaleString()}`
-                                : undefined
-                            }
-                          >
-                            {fmtInt(freshInput, locale)}
-                          </div>
-                          {(log.cacheReadTokens > 0 ||
-                            log.cacheCreationTokens > 0) && (
-                            <div className="text-[10px] text-muted-foreground whitespace-nowrap">
-                              {[
-                                log.cacheReadTokens > 0 &&
-                                  `R${fmtInt(log.cacheReadTokens, locale)}`,
-                                log.cacheCreationTokens > 0 &&
-                                  `W${fmtInt(log.cacheCreationTokens, locale)}`,
-                              ]
-                                .filter(Boolean)
-                                .join("·")}
+                          {(reasoningPath || fastDecision) && (
+                            <div className="mt-1 flex flex-wrap justify-center gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+                              {reasoningPath && (
+                                <span>
+                                  {t("usage.reasoningEffortShort")}:{" "}
+                                  {reasoningPath}
+                                </span>
+                              )}
+                              {fastDecision && (
+                                <span>
+                                  {t("usage.fastModeShort")}: {fastDecision}
+                                  {tierPath ? ` (${tierPath})` : ""}
+                                </span>
+                              )}
                             </div>
                           )}
                         </TableCell>
+                        <TableCell className="text-center px-1.5">
+                          {usageObserved ? (
+                            <>
+                              <div
+                                className="tabular-nums"
+                                title={
+                                  rawInput !== freshInput
+                                    ? `Raw: ${rawInput.toLocaleString()}`
+                                    : undefined
+                                }
+                              >
+                                {fmtInt(freshInput, locale)}
+                              </div>
+                              {(log.cacheReadTokens > 0 ||
+                                log.cacheCreationTokens > 0) && (
+                                <div className="text-[10px] text-muted-foreground whitespace-nowrap">
+                                  {[
+                                    log.cacheReadTokens > 0 &&
+                                      `R${fmtInt(log.cacheReadTokens, locale)}`,
+                                    log.cacheCreationTokens > 0 &&
+                                      `W${fmtInt(log.cacheCreationTokens, locale)}`,
+                                  ]
+                                    .filter(Boolean)
+                                    .join("·")}
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <span
+                              className="text-xs text-muted-foreground"
+                              title={log.streamStatus || undefined}
+                            >
+                              {usageStateLabel}
+                            </span>
+                          )}
+                        </TableCell>
                         <TableCell className="text-center">
-                          {fmtInt(log.outputTokens, locale)}
+                          {usageObserved ? fmtInt(log.outputTokens, locale) : "-"}
                         </TableCell>
                         <TableCell className="text-center px-1.5">
                           <div className="font-medium tabular-nums">
-                            {fmtInt(totalTokens, locale)}
+                            {usageObserved ? fmtInt(totalTokens, locale) : "-"}
                           </div>
                         </TableCell>
                         <TableCell className="text-center whitespace-nowrap text-xs tabular-nums">
