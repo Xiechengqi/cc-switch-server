@@ -3419,6 +3419,28 @@ mod tests {
         app_settings
     }
 
+    #[test]
+    fn upsert_canonicalizes_app_settings_to_the_share_expiration() {
+        let expires_at = Utc
+            .with_ymd_and_hms(2099, 12, 31, 23, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+            .saturating_add(323);
+        let mut input = codex_share_input("canonical-expiration");
+        input.expires_at = Some(expires_at);
+        input.app_settings = codex_app_settings(Vec::new());
+
+        let share = ShareStore::default().upsert(input).unwrap();
+        let settings = &share.app_settings["codex"];
+
+        assert_eq!(share.expires_at, Some(expires_at));
+        assert_eq!(
+            settings.expires_at,
+            share_expires_at_rfc3339(Some(expires_at))
+        );
+    }
+
     fn test_timestamp_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
             .single()

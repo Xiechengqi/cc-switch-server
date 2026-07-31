@@ -22,7 +22,7 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 import {
   getProviderSharePhase,
   isShareRunning,
-  permanentExpiresInSecs,
+  PERMANENT_EXPIRES_AT,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
   type ProviderSharePhase,
@@ -66,26 +66,26 @@ export function useToggleProviderShare(
   const createNewShare = async () => {
     if (!shareable || !providerId) return;
     await createMutation.mutateAsync({
-        bindings: { [appId]: providerId },
-        forSale: "Yes",
-        tokenLimit: UNLIMITED_TOKEN_LIMIT,
-        parallelLimit: UNLIMITED_PARALLEL_LIMIT,
-        expiresInSecs: permanentExpiresInSecs(),
-        sharedWithEmails: [],
-        marketAccessMode: "all",
-        accessByApp: {
-          [appId]: { sharedWithEmails: [], marketAccessMode: "all" },
+      bindings: { [appId]: providerId },
+      forSale: "Yes",
+      tokenLimit: UNLIMITED_TOKEN_LIMIT,
+      parallelLimit: UNLIMITED_PARALLEL_LIMIT,
+      expiresAt: Date.parse(PERMANENT_EXPIRES_AT),
+      sharedWithEmails: [],
+      marketAccessMode: "all",
+      accessByApp: {
+        [appId]: { sharedWithEmails: [], marketAccessMode: "all" },
+      },
+      appSettings: {
+        [appId]: {
+          forSale: "Yes",
+          marketAccessMode: "all",
+          sharedWithEmails: [],
+          tokenLimit: UNLIMITED_TOKEN_LIMIT,
+          parallelLimit: UNLIMITED_PARALLEL_LIMIT,
+          expiresAt: PERMANENT_EXPIRES_AT,
         },
-        appSettings: {
-          [appId]: {
-            forSale: "Yes",
-            marketAccessMode: "all",
-            sharedWithEmails: [],
-            tokenLimit: UNLIMITED_TOKEN_LIMIT,
-            parallelLimit: UNLIMITED_PARALLEL_LIMIT,
-            expiresAt: "2099-12-31T23:59:59Z",
-          },
-        },
+      },
     });
   };
 

@@ -3634,6 +3634,7 @@ mod tests {
             share_id: None,
             share: Some(ShareDescriptor {
                 share_id: "share-descriptor-fallback".into(),
+                capacity_pool_id: "cp-descriptor-fallback".into(),
                 share_name: "Descriptor fallback".into(),
                 subdomain: "fallback".into(),
                 descriptor_generation: 7,
@@ -3651,6 +3652,7 @@ mod tests {
         let captured = requests.lock().await.clone();
         assert_eq!(captured.len(), 2);
         let strict_share = &captured[0].1["ops"][0]["share"];
+        assert_eq!(strict_share["capacityPoolId"], "cp-descriptor-fallback");
         assert_eq!(strict_share["descriptorGeneration"], 7);
         assert_eq!(
             strict_share["descriptorFingerprint"],
@@ -3658,6 +3660,7 @@ mod tests {
         );
         let legacy_request = &captured[1].1;
         let legacy_share = &legacy_request["ops"][0]["share"];
+        assert_eq!(legacy_share["capacityPoolId"], "cp-descriptor-fallback");
         assert!(legacy_share.get("descriptorGeneration").is_none());
         assert!(legacy_share.get("descriptorFingerprint").is_none());
 

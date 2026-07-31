@@ -127,7 +127,7 @@ export interface CreateShareParams {
   forSale: "Yes" | "No" | "Free";
   tokenLimit: number;
   parallelLimit: number;
-  expiresInSecs: number;
+  expiresAt: number;
   subdomain?: string;
   sharedWithEmails?: string[];
   marketAccessMode?: "selected" | "all";

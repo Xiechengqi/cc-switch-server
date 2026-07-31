@@ -620,20 +620,25 @@ export function ProviderShareSection({
       return;
     }
 
-    const aclPayload = buildAclPayload(
-      tokenLimit,
-      parallelLimit,
-      resolveExpiresAt(),
-    );
+    const expiresAt = resolveExpiresAt();
+    const expiresAtMs = Date.parse(expiresAt);
+    if (!Number.isFinite(expiresAtMs)) {
+      toast.error(
+        t("provider.share.invalidNumber", {
+          defaultValue: "请输入有效数字",
+        }),
+      );
+      return;
+    }
+
+    const aclPayload = buildAclPayload(tokenLimit, parallelLimit, expiresAt);
     const payloadUserGrants = userGrantsForAcl(aclPayload.sharedWithEmails);
     const created = await createMutation.mutateAsync({
       bindings: { [shareableApp]: providerId },
       forSale: forSaleValue,
       tokenLimit,
       parallelLimit,
-      expiresInSecs: isPermanent
-        ? permanentExpiresInSecs()
-        : Math.max(1, Number(expiresInSecsInput) || 3600),
+      expiresAt: expiresAtMs,
       subdomain: subdomainInput.trim() || undefined,
       description: descriptionInput.trim() || undefined,
       sharedWithEmails: aclPayload.sharedWithEmails,
