@@ -1,10 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowLeft, Settings, Share2, ShieldCheck, Terminal } from "lucide-react";
+import {
+  ArrowLeft,
+  Settings,
+  Share2,
+  ShieldCheck,
+  Terminal,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { SettingsPage, type SettingsTab } from "@/components/settings/SettingsPage";
+import {
+  SettingsPage,
+  type SettingsTab,
+} from "@/components/settings/SettingsPage";
 import { SharePage } from "@/components/share/SharePage";
 import { useOauthQuotaRefreshBridge } from "@/hooks/useOauthQuotaRefreshBridge";
 import { useProviderHealthRefreshBridge } from "@/hooks/useProviderHealthRefreshBridge";
@@ -28,7 +37,8 @@ const VIEW_STORAGE_KEY = "cc-switch-server-view";
 
 function getInitialView(enableWebTerminal: boolean): View {
   const stored = localStorage.getItem(VIEW_STORAGE_KEY);
-  if (stored === "terminal") return enableWebTerminal ? "terminal" : "providers";
+  if (stored === "terminal")
+    return enableWebTerminal ? "terminal" : "providers";
   if (stored === "providers" || stored === "shares" || stored === "settings") {
     return stored;
   }
@@ -102,7 +112,12 @@ export default function ServerApp({
       return (
         <Suspense
           fallback={
-            <div className={cn(PAGE_SHELL_PADDING_X, "pt-4 text-sm text-muted-foreground")}>
+            <div
+              className={cn(
+                PAGE_SHELL_PADDING_X,
+                "pt-4 text-sm text-muted-foreground",
+              )}
+            >
               {t("common.loading")}
             </div>
           }
@@ -112,58 +127,15 @@ export default function ServerApp({
       );
     }
     return (
-      <div className={cn(PAGE_SHELL_PADDING_X, "flex h-full min-h-0 flex-col overflow-y-auto")}>
-        <ProviderBundlesPage onOpenShareSettings={() => openSettings("share")} />
-      </div>
-    );
-  })();
-
-  return (
-    <div
-      className={cn(
-        "flex h-screen flex-col overflow-hidden bg-background text-foreground selection:bg-primary/30",
-        APP_VIEWPORT_PADDING_Y,
-        PAGE_HEADER_CONTENT_GAP,
-      )}
-    >
-      <header className="sticky top-0 z-50 w-full shrink-0 bg-background/90 backdrop-blur-md">
-        <div
-          className={cn(
-            PAGE_SHELL_CLASS,
-            PAGE_SHELL_PADDING_X,
-            "flex min-h-14 items-center justify-between gap-2",
-          )}
-        >
-          <div className="flex min-w-0 items-center gap-2">
-            {currentView !== "providers" ? (
-              <>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  onClick={() => setCurrentView("providers")}
-                  title={t("common.back")}
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                </Button>
-                <h1 className="truncate text-lg font-semibold">
-                  {currentView === "settings" && t("settings.title")}
-                  {currentView === "shares" && t("share.title")}
-                  {currentView === "terminal" && t("terminal.title")}
-                </h1>
-              </>
-            ) : (
-              <a
-                href="https://tokenswitch.org"
-                target="_blank"
-                rel="noreferrer"
-                className="truncate text-lg font-semibold text-foreground transition-colors hover:text-primary"
-              >
-                CC Switch Server
-              </a>
-            )}
-          </div>
-
-          {currentView === "providers" ? (
+      <div
+        className={cn(
+          PAGE_SHELL_PADDING_X,
+          "flex h-full min-h-0 flex-col overflow-y-auto",
+        )}
+      >
+        <ProviderBundlesPage
+          onOpenShareSettings={() => openSettings("share")}
+          toolbarActions={
             <div className="flex shrink-0 items-center gap-1">
               <Button
                 variant="ghost"
@@ -200,9 +172,45 @@ export default function ServerApp({
                 <Settings className="h-4 w-4" />
               </Button>
             </div>
-          ) : null}
-        </div>
-      </header>
+          }
+        />
+      </div>
+    );
+  })();
+
+  return (
+    <div
+      className={cn(
+        "flex h-screen flex-col overflow-hidden bg-background text-foreground selection:bg-primary/30",
+        APP_VIEWPORT_PADDING_Y,
+        PAGE_HEADER_CONTENT_GAP,
+      )}
+    >
+      {currentView !== "providers" ? (
+        <header className="sticky top-0 z-50 w-full shrink-0 bg-background/90 backdrop-blur-md">
+          <div
+            className={cn(
+              PAGE_SHELL_CLASS,
+              PAGE_SHELL_PADDING_X,
+              "flex min-h-14 items-center gap-2",
+            )}
+          >
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => setCurrentView("providers")}
+              title={t("common.back")}
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+            <h1 className="truncate text-lg font-semibold">
+              {currentView === "settings" && t("settings.title")}
+              {currentView === "shares" && t("share.title")}
+              {currentView === "terminal" && t("terminal.title")}
+            </h1>
+          </div>
+        </header>
+      ) : null}
 
       <main className="min-h-0 flex-1 overflow-hidden">
         <AnimatePresence mode="wait">

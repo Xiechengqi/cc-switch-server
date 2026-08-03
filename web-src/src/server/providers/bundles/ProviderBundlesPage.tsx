@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
@@ -35,6 +35,7 @@ export const providerBundleKeys = {
 
 interface ProviderBundlesPageProps {
   onOpenShareSettings?: () => void;
+  toolbarActions?: ReactNode;
 }
 
 function AppLogo({ app }: { app: CoreProviderApp }) {
@@ -124,11 +125,18 @@ function BundleCard({
           <Route className="h-3.5 w-3.5" />
           {bundle.routeKey}
         </Badge>
-        <Badge variant={bundle.credentialConfigured ? "secondary" : "destructive"} className="gap-1.5">
+        <Badge
+          variant={bundle.credentialConfigured ? "secondary" : "destructive"}
+          className="gap-1.5"
+        >
           <KeyRound className="h-3.5 w-3.5" />
           {bundle.credentialConfigured
-            ? t("providerBundle.credentialReady", { defaultValue: "凭据已配置" })
-            : t("providerBundle.credentialMissing", { defaultValue: "缺少凭据" })}
+            ? t("providerBundle.credentialReady", {
+                defaultValue: "凭据已配置",
+              })
+            : t("providerBundle.credentialMissing", {
+                defaultValue: "缺少凭据",
+              })}
         </Badge>
         {shared ? (
           <Badge variant="secondary" className="gap-1.5">
@@ -156,6 +164,7 @@ function BundleCard({
 
 export function ProviderBundlesPage({
   onOpenShareSettings,
+  toolbarActions,
 }: ProviderBundlesPageProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -164,7 +173,9 @@ export function ProviderBundlesPage({
     queryFn: providersApi.getBundles,
   });
   const sharesQuery = useSharesQuery();
-  const [editing, setEditing] = useState<ProviderBundleView | "new" | null>(null);
+  const [editing, setEditing] = useState<ProviderBundleView | "new" | null>(
+    null,
+  );
   const [deleting, setDeleting] = useState<ProviderBundleView | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const bundles = bundlesQuery.data ?? [];
@@ -206,7 +217,9 @@ export function ProviderBundlesPage({
       await providersApi.deleteBundle(deleting.id, preview.revision);
       await queryClient.invalidateQueries({ queryKey: providerBundleKeys.all });
       setDeleting(null);
-      toast.success(t("providerBundle.deleted", { defaultValue: "供应商已删除" }));
+      toast.success(
+        t("providerBundle.deleted", { defaultValue: "供应商已删除" }),
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
@@ -216,19 +229,35 @@ export function ProviderBundlesPage({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col pb-12">
-      <div className="flex flex-wrap items-center justify-between gap-3 pb-4">
-        <div>
-          <h1 className="text-base font-semibold">
+      <div className="sticky top-0 z-30 mb-4 flex min-h-14 shrink-0 items-center gap-3 border-b border-border/60 bg-background/95 backdrop-blur-md">
+        <a
+          href="https://tokenswitch.org"
+          target="_blank"
+          rel="noreferrer"
+          className="hidden shrink-0 text-lg font-semibold text-foreground transition-colors hover:text-primary sm:block"
+        >
+          CC Switch Server
+        </a>
+        <span
+          className="hidden h-5 w-px shrink-0 bg-border sm:block"
+          aria-hidden
+        />
+        <div className="flex min-w-0 items-baseline gap-2">
+          <h1 className="shrink-0 text-base font-semibold">
             {t("providerBundle.title", { defaultValue: "供应商" })}
           </h1>
-          <p className="mt-1 text-xs text-muted-foreground">
+          <p className="hidden truncate text-xs text-muted-foreground md:block">
             {t("providerBundle.count", {
               defaultValue: "{{count}} 个供应商节点",
               count: bundles.length,
             })}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {toolbarActions}
+          {toolbarActions ? (
+            <span className="mx-1 h-5 w-px shrink-0 bg-border" aria-hidden />
+          ) : null}
           <Button
             type="button"
             size="icon"
@@ -238,12 +267,22 @@ export function ProviderBundlesPage({
             onClick={() => void bundlesQuery.refetch()}
           >
             <RefreshCw
-              className={cn("h-4 w-4", bundlesQuery.isFetching && "animate-spin")}
+              className={cn(
+                "h-4 w-4",
+                bundlesQuery.isFetching && "animate-spin",
+              )}
             />
           </Button>
-          <Button type="button" onClick={() => setEditing("new")}>
-            <Plus className="mr-2 h-4 w-4" />
-            {t("providers.addProvider", { defaultValue: "添加供应商" })}
+          <Button
+            type="button"
+            className="shrink-0"
+            title={t("providers.addProvider", { defaultValue: "添加供应商" })}
+            onClick={() => setEditing("new")}
+          >
+            <Plus className="h-4 w-4 sm:mr-2" />
+            <span className="hidden sm:inline">
+              {t("providers.addProvider", { defaultValue: "添加供应商" })}
+            </span>
           </Button>
         </div>
       </div>

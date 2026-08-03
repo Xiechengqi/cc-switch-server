@@ -15,6 +15,7 @@ import {
 import { toast } from "sonner";
 
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
+import { ProviderIcon } from "@/components/ProviderIcon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -54,7 +55,10 @@ import {
   type ProviderFamilySpec,
   type ProviderModelPolicy,
 } from "@/server/providerRegistry";
-import { profileAllowsEndpointEditing } from "@/server/providers/editor/providerDraft";
+import {
+  createDraftForProfile,
+  profileAllowsEndpointEditing,
+} from "@/server/providers/editor/providerDraft";
 import { SecretInput } from "@/server/ui/SecretInput";
 import { cn } from "@/lib/utils";
 import {
@@ -95,6 +99,21 @@ function AppLogo({ app, size = 16 }: { app: CoreProviderApp; size?: number }) {
   if (app === "claude") return <ClaudeIcon size={size} />;
   if (app === "codex") return <CodexIcon size={size} />;
   return <GeminiIcon size={size} />;
+}
+
+function FamilyLogo({ family }: { family: ProviderFamilySpec }) {
+  const profile = profileById(family.credentialProfileId);
+  const preset = profile ? createDraftForProfile(profile) : undefined;
+  return (
+    <ProviderIcon
+      icon={preset?.icon}
+      name={family.label}
+      color={preset?.iconColor}
+      size={16}
+      className="shrink-0"
+      showFallback
+    />
+  );
 }
 
 function Section({
@@ -845,27 +864,45 @@ export function ProviderBundleEditor({
           title={t("providerBundle.identity", { defaultValue: "供应商" })}
         >
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
+            <div className={cn("space-y-2", !persisted && "md:col-span-2")}>
               <Label>
                 {t("providerBundle.family", { defaultValue: "供应商类型" })}
               </Label>
               {persisted ? (
-                <div className="flex h-10 items-center rounded-md border px-3 text-sm">
+                <div className="flex h-10 items-center gap-2 rounded-md border px-3 text-sm">
+                  <FamilyLogo family={family} />
                   {family.label}
                 </div>
               ) : (
-                <Select value={draft.familyId} onValueChange={changeFamily}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providerRegistry.families.map((item) => (
-                      <SelectItem key={item.familyId} value={item.familyId}>
-                        {item.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <div
+                  role="radiogroup"
+                  aria-label={t("providerBundle.family", {
+                    defaultValue: "供应商类型",
+                  })}
+                  className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"
+                >
+                  {providerRegistry.families.map((item) => {
+                    const selected = item.familyId === draft.familyId;
+                    return (
+                      <button
+                        key={item.familyId}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => changeFamily(item.familyId)}
+                        className={cn(
+                          "inline-flex min-h-10 w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors",
+                          selected
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-accent text-muted-foreground hover:bg-accent/80 hover:text-foreground",
+                        )}
+                      >
+                        <FamilyLogo family={item} />
+                        <span className="truncate">{item.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
               )}
             </div>
             <div className="space-y-2">
