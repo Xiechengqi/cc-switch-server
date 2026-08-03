@@ -2,7 +2,7 @@ import { useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
-import { providersApi, settingsApi, openclawApi, type AppId } from "@/lib/api";
+import { providersApi, openclawApi, type AppId } from "@/lib/api";
 import type {
   ProviderCredentialPatches,
   ProviderCustomBinding,
@@ -17,14 +17,12 @@ import {
   useAddProviderMutation,
   useUpdateProviderMutation,
   useDeleteProviderMutation,
-  useSwitchProviderMutation,
-  useClearCurrentProviderMutation,
 } from "@/lib/query";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { openclawKeys } from "@/hooks/useOpenClaw";
 
 /**
- * Hook for managing provider actions (add, update, delete, switch)
+ * Hook for managing legacy provider CRUD actions.
  * Extracts business logic from App.tsx
  */
 export function useProviderActions(
@@ -38,36 +36,6 @@ export function useProviderActions(
   const addProviderMutation = useAddProviderMutation(activeApp);
   const updateProviderMutation = useUpdateProviderMutation(activeApp);
   const deleteProviderMutation = useDeleteProviderMutation(activeApp);
-  const switchProviderMutation = useSwitchProviderMutation(activeApp);
-  const clearCurrentProviderMutation = useClearCurrentProviderMutation(activeApp);
-
-  // Claude 插件同步逻辑
-  const syncClaudePlugin = useCallback(
-    async (provider: Provider) => {
-      if (activeApp !== "claude") return;
-
-      try {
-        const settings = await settingsApi.get();
-        if (!settings?.enableClaudePluginIntegration) {
-          return;
-        }
-
-        const isOfficial = provider.category === "official";
-        await settingsApi.applyClaudePluginConfig({ official: isOfficial });
-
-        // 静默执行，不显示成功通知
-      } catch (error) {
-        const detail =
-          extractErrorMessage(error) ||
-          t("notifications.syncClaudePluginFailed", {
-            defaultValue: "同步 Claude 插件失败",
-          });
-        toast.error(detail, { duration: 4200 });
-      }
-    },
-    [activeApp, t],
-  );
-
   // 添加供应商
   const addProvider = useCallback(
     async (
@@ -162,67 +130,6 @@ export function useProviderActions(
     [updateProviderMutation],
   );
 
-  // 切换供应商
-  const switchProvider = useCallback(
-    async (provider: Provider) => {
-      try {
-        const result = await switchProviderMutation.mutateAsync(provider.id);
-        await syncClaudePlugin(provider);
-
-        // Show backfill warning if present
-        if (result?.warnings?.length) {
-          toast.warning(
-            t("notifications.backfillWarning", {
-              defaultValue:
-                "切换成功，但旧供应商配置回填失败，您手动修改的配置可能未保存",
-            }),
-            { duration: 5000 },
-          );
-        }
-
-        let messageKey = "notifications.switchSuccess";
-        let defaultMessage = "切换成功！";
-        if (activeApp === "codex") {
-          messageKey = "notifications.codexRestartRequired";
-          defaultMessage = "切换成功，请重启客户端以生效";
-        } else if (activeApp === "claude-desktop") {
-          if (provider.meta?.claudeDesktopMode === "proxy") {
-            messageKey = "notifications.claudeDesktopProxyRestartRequired";
-            defaultMessage =
-              "切换成功，请保持 CC Switch 运行，并重启 Claude Desktop 后生效";
-          } else {
-            messageKey = "notifications.claudeDesktopRestartRequired";
-            defaultMessage = "切换成功，重启 Claude Desktop 后生效";
-          }
-        } else if (activeApp === "opencode" || activeApp === "openclaw") {
-          messageKey = "notifications.addToConfigSuccess";
-          defaultMessage = "已添加到配置";
-        }
-        toast.success(t(messageKey, { defaultValue: defaultMessage }), {
-          closeButton: true,
-        });
-      } catch {
-        // 错误提示由 mutation 处理
-      }
-    },
-    [switchProviderMutation, syncClaudePlugin, activeApp, t],
-  );
-
-  // 取消当前供应商（Claude/Codex/Gemini 互斥模式）
-  const clearCurrentProvider = useCallback(async () => {
-    try {
-      await clearCurrentProviderMutation.mutateAsync();
-      toast.success(
-        t("notifications.clearCurrentSuccess", {
-          defaultValue: "已取消启用",
-        }),
-        { closeButton: true },
-      );
-    } catch {
-      // 错误提示由 mutation 处理
-    }
-  }, [clearCurrentProviderMutation, t]);
-
   // 删除供应商
   const deleteProvider = useCallback(
     async (id: string) => {
@@ -278,15 +185,11 @@ export function useProviderActions(
   return {
     addProvider,
     updateProvider,
-    switchProvider,
-    clearCurrentProvider,
     deleteProvider,
     setAsDefaultModel,
     isLoading:
       addProviderMutation.isPending ||
       updateProviderMutation.isPending ||
-      deleteProviderMutation.isPending ||
-      switchProviderMutation.isPending ||
-      clearCurrentProviderMutation.isPending,
+      deleteProviderMutation.isPending,
   };
 }

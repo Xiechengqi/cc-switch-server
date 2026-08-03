@@ -2,6 +2,7 @@ import registrySnapshot from "../../../assets/contract/provider-registry.json";
 
 export type CoreProviderApp = "claude" | "codex" | "gemini";
 export type ProviderModelPolicy = "passthrough" | "single";
+export type ProviderFieldScope = "bundle" | "surface";
 
 export type ProviderFormComposition =
   | "managed_account"
@@ -35,6 +36,7 @@ export type ProviderOutboundIdentityPolicy =
       family:
         | "claude_code"
         | "codex_cli"
+        | "gemini_cli"
         | "grok_cli"
         | "kiro"
         | "cursor"
@@ -84,6 +86,22 @@ export interface ProviderRegistryProfile {
   maturity: "stable" | "experimental";
 }
 
+export interface ProviderFamilySurfaceSpec {
+  app: CoreProviderApp;
+  profileId: string;
+  defaultEnabled: boolean;
+}
+
+export interface ProviderFamilySpec {
+  familyId: string;
+  label: string;
+  credentialProfileId: string;
+  endpointScope: ProviderFieldScope;
+  headersScope: ProviderFieldScope;
+  driverOptionsScope: ProviderFieldScope;
+  surfaces: ProviderFamilySurfaceSpec[];
+}
+
 export interface ProviderRegistryDriver {
   driverId: string;
   driverContractRevision: number;
@@ -110,6 +128,7 @@ export interface ProviderCustomPolicy {
 export interface ProviderRegistrySnapshot {
   format: "cc-switch-provider-registry";
   schemaVersion: number;
+  families: ProviderFamilySpec[];
   profiles: ProviderRegistryProfile[];
   drivers: ProviderRegistryDriver[];
   customPolicies: ProviderCustomPolicy[];
@@ -157,6 +176,18 @@ export function profileById(
 ): ProviderRegistryProfile | undefined {
   return providerRegistry.profiles.find(
     (profile) => profile.profileId === profileId,
+  );
+}
+
+export function familyById(familyId: string): ProviderFamilySpec | undefined {
+  return providerRegistry.families.find((family) => family.familyId === familyId);
+}
+
+export function familyForProfile(
+  profileId: string,
+): ProviderFamilySpec | undefined {
+  return providerRegistry.families.find((family) =>
+    family.surfaces.some((surface) => surface.profileId === profileId),
   );
 }
 

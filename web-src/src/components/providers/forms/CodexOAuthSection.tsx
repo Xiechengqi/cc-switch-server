@@ -23,6 +23,7 @@ import {
   User,
   X,
   Image,
+  RefreshCw,
   TriangleAlert,
 } from "lucide-react";
 import { useCodexOauth } from "./hooks/useCodexOauth";
@@ -32,6 +33,7 @@ import { canUseOpenAiCliOAuth, isRemoteWebMode } from "@/lib/api/auth";
 import { useClientTunnelQuery } from "@/lib/query/share";
 import CodexBankedResetPanel from "./CodexBankedResetPanel";
 import { AccountSubscriptionExpiryControl } from "@/components/settings/AccountSubscriptionExpiryControl";
+import { logoutAccountsAndClearSelection } from "./accountSelectionActions";
 
 interface CodexOAuthSectionProps {
   className?: string;
@@ -41,6 +43,8 @@ interface CodexOAuthSectionProps {
   onAccountSelect?: (accountId: string | null) => void;
   /** 是否显示已登录账号管理列表 */
   showLoggedInAccounts?: boolean;
+  /** 账号选择是全局默认值还是当前 Provider 的显式绑定。 */
+  accountSelectionMode?: "default" | "provider";
   /** 是否开启 Codex FAST mode */
   fastModeEnabled?: boolean;
   /** FAST mode 切换回调 */
@@ -63,6 +67,20 @@ interface CodexOAuthSectionProps {
   showBankedResetPanel?: boolean;
 }
 
+export async function selectCodexActiveAccountAndNotify(
+  accountId: string,
+  selectActiveAccount: (accountId: string) => Promise<unknown>,
+  onAccountSelect?: (accountId: string | null) => void,
+): Promise<boolean> {
+  try {
+    await selectActiveAccount(accountId);
+    onAccountSelect?.(accountId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Codex OAuth 认证区块
  *
@@ -74,6 +92,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   selectedAccountId,
   onAccountSelect,
   showLoggedInAccounts = false,
+  accountSelectionMode = "default",
   fastModeEnabled = false,
   onFastModeChange,
   imageGenerationEnabled = false,
@@ -94,6 +113,9 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   const {
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     pollingState,
     deviceCode,
     error,
@@ -108,12 +130,13 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     activeCodexAccountId,
     needsCodexAccountSelection,
     cancelAuth,
-    logout,
+    logoutAsync,
     removeAccountAsync,
     selectActiveCodexAccount,
     setWorkspace,
     addAccountWithMode,
     submitOauthCallback,
+    refetchStatus,
   } = useCodexOauth();
   const configuredClientUrl =
     clientTunnel?.config?.expectedUrl ?? clientTunnel?.config?.tunnelUrl;
@@ -131,9 +154,11 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     setCallbackUrl("");
   }, [deviceCode?.device_code]);
 
-  const effectiveActiveAccountId = codexSelection
+  const defaultProxyAccountId = codexSelection
     ? activeCodexAccountId
     : (defaultAccountId ?? null);
+  const effectiveActiveAccountId = defaultProxyAccountId;
+  const selectionRequired = needsCodexAccountSelection;
 
   React.useEffect(() => {
     if (
@@ -179,12 +204,11 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   };
 
   const handleActiveAccountSelect = async (accountId: string) => {
-    try {
-      await selectActiveCodexAccount(accountId);
-      onAccountSelect?.(accountId);
-    } catch {
-      return;
-    }
+    await selectCodexActiveAccountAndNotify(
+      accountId,
+      selectActiveCodexAccount,
+      onAccountSelect,
+    );
   };
 
   const handleRemoveAccount = async (
@@ -206,6 +230,61 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     }
   };
 
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <div className={`space-y-4 ${className || ""}`}>
+        <div className="flex items-center justify-between">
+          <Label>{t("codexOauth.authStatus", "认证状态")}</Label>
+          <Badge variant={isStatusError ? "destructive" : "secondary"}>
+            {isStatusError ? t("common.error") : t("common.loading")}
+          </Badge>
+        </div>
+        {isStatusError ? (
+          <div
+            className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+            role="alert"
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <TriangleAlert className="h-4 w-4 shrink-0" />
+              {error ||
+                t("common.authStatusLoadFailed", {
+                  defaultValue: "Failed to load Codex authentication status.",
+                })}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isFetchingStatus}
+              onClick={() => void refetchStatus()}
+            >
+              {isFetchingStatus ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-2 h-4 w-4" />
+              )}
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {t("common.loading")}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className={`space-y-4 ${className || ""}`}>
       {/* 认证状态标题 */}
@@ -213,19 +292,19 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         <Label>{t("codexOauth.authStatus", "认证状态")}</Label>
         <Badge
           variant={
-            needsCodexAccountSelection
+            selectionRequired
               ? "destructive"
               : hasAnyAccount
                 ? "default"
                 : "secondary"
           }
           className={
-            hasAnyAccount && !needsCodexAccountSelection
+            hasAnyAccount && !selectionRequired
               ? "bg-green-500 hover:bg-green-600"
               : ""
           }
         >
-          {needsCodexAccountSelection
+          {selectionRequired
             ? t("codexOauth.selectionRequiredBadge", "Selection required")
             : activeAccount
               ? t("codexOauth.activeAccountBadge", {
@@ -242,16 +321,18 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       </div>
 
       {hasAnyAccount &&
-        (needsCodexAccountSelection || accounts.length > 1) && (
+        (accountSelectionMode === "provider" ||
+          selectionRequired ||
+          accounts.length > 1) && (
           <div
             className={`space-y-2 rounded-md border p-3 ${
-              needsCodexAccountSelection
+              selectionRequired
                 ? "border-amber-500/60 bg-amber-500/10"
                 : "bg-muted/30"
             }`}
           >
             <Label className="flex items-center gap-2 text-sm font-medium">
-              {needsCodexAccountSelection && (
+              {selectionRequired && (
                 <TriangleAlert className="h-4 w-4 text-amber-600" />
               )}
               {t("codexOauth.activeProxyAccount", "Active proxy account")}
@@ -280,7 +361,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                 ))}
               </SelectContent>
             </Select>
-            {needsCodexAccountSelection && (
+            {selectionRequired && (
               <p className="text-xs text-amber-700 dark:text-amber-400">
                 {t(
                   "codexOauth.selectionRequired",
@@ -413,14 +494,14 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                   <span className="truncate text-sm font-medium">
                     {account.login}
                   </span>
-                  {effectiveActiveAccountId === account.id && (
+                  {defaultProxyAccountId === account.id && (
                     <Badge variant="secondary" className="text-xs">
                       {t("codexOauth.defaultAccount", "Active proxy")}
                     </Badge>
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                  {effectiveActiveAccountId !== account.id && (
+                  {defaultProxyAccountId !== account.id && (
                     <Button
                       type="button"
                       variant="ghost"
@@ -707,7 +788,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         <Button
           type="button"
           variant="outline"
-          onClick={logout}
+          onClick={() => void handleLogout()}
+          disabled={isAddingAccount || isSubmittingOauthCallback}
           className="w-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
         >
           <LogOut className="mr-2 h-4 w-4" />

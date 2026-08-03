@@ -14,6 +14,7 @@ struct CachedToken {
 #[derive(Debug, Default)]
 pub struct CursorApiKeyTokenCache {
     tokens: RwLock<HashMap<String, CachedToken>>,
+    auth_cooldowns: RwLock<HashMap<String, i64>>,
     flights: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -122,6 +123,34 @@ impl CursorApiKeyTokenCache {
         self.tokens.write().await.remove(key_hash);
     }
 
+    pub async fn mark_auth_cooldown(&self, key_hash: &str, until_ms: i64) {
+        let mut cooldowns = self.auth_cooldowns.write().await;
+        cooldowns
+            .entry(key_hash.to_string())
+            .and_modify(|current| *current = (*current).max(until_ms))
+            .or_insert(until_ms);
+        while cooldowns.len() > MAX_CREDENTIAL_CACHE_ENTRIES {
+            let Some(oldest) = cooldowns
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cooldowns.remove(&oldest);
+        }
+    }
+
+    pub async fn auth_cooldown_until(&self, key_hash: &str, now_ms: i64) -> Option<i64> {
+        let mut cooldowns = self.auth_cooldowns.write().await;
+        let until = cooldowns.get(key_hash).copied();
+        if until.is_some_and(|until| until <= now_ms) {
+            cooldowns.remove(key_hash);
+            return None;
+        }
+        until
+    }
+
     pub async fn lock(&self, key_hash: &str) -> OwnedMutexGuard<()> {
         let flight = {
             let mut flights = self.flights.lock().await;
@@ -150,6 +179,15 @@ mod tests {
         assert!(cache.tokens.read().await.is_empty());
         cache.invalidate("key").await;
         assert!(cache.get("key", 0).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_cooldown_is_monotonic_and_expires() {
+        let cache = CursorApiKeyTokenCache::default();
+        cache.mark_auth_cooldown("key", 10_000).await;
+        cache.mark_auth_cooldown("key", 9_000).await;
+        assert_eq!(cache.auth_cooldown_until("key", 5_000).await, Some(10_000));
+        assert!(cache.auth_cooldown_until("key", 10_000).await.is_none());
     }
 
     #[tokio::test]

@@ -274,8 +274,20 @@ function audit() {
   if (!accountManagers.includes(".map(account_import_template_for)")) {
     errors.push("account_import_templates no longer maps account_provider_types");
   }
+  for (const marker of [
+    "pub enum AccountManagerKind",
+    "pub enum AccountCredentialOwnership",
+    "pub refresh_capability: OAuthRefreshCapability",
+    "pub quota_capability: OAuthQuotaCapability",
+    "pub inference_binding_supported: bool",
+    "ProviderType::DeepSeekAccount => AccountManagerKind::ImportOnly",
+  ]) {
+    if (!accountManagers.includes(marker)) {
+      errors.push(`account capabilities no longer expose typed ownership marker: ${marker}`);
+    }
+  }
   if (!accountManagers.includes("manual_token_store_with_native_refresh")) {
-    errors.push("account capabilities no longer expose manual_token_store_with_native_refresh");
+    errors.push("account capabilities no longer preserve the legacy manager contract");
   }
   if (!accountManagers.includes("\"manual_import_native_refresh\"")) {
     errors.push("account capabilities no longer expose manual_import_native_refresh status");

@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { useCursorOauth } from "./hooks/useCursorOauth";
 import { copyText } from "@/lib/clipboard";
+import { removeAccountAndUpdateSelection } from "./accountSelectionActions";
+import { ManagedAuthStatusNotice } from "./ManagedAuthStatusNotice";
 
 interface CursorOAuthSectionProps {
   className?: string;
@@ -32,8 +34,12 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
   const { t } = useTranslation();
   const [copied, setCopied] = React.useState(false);
   const {
+    authStatus,
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     pollingState,
     deviceCode,
     error,
@@ -43,30 +49,54 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
     addAccount,
     cancelAuth,
     importCursorLocalAuth,
-    removeAccount,
+    removeAccountAsync,
+    refetchStatus,
   } = useCursorOauth();
 
   React.useEffect(() => {
+    if (!authStatus) return;
     const account = accounts.length === 1 ? accounts[0] : undefined;
     if (account && selectedAccountId !== account.id) {
       onAccountSelect?.(account.id);
     } else if (!account && selectedAccountId) {
       onAccountSelect?.(null);
     }
-  }, [accounts, onAccountSelect, selectedAccountId]);
+  }, [accounts, authStatus, onAccountSelect, selectedAccountId]);
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <ManagedAuthStatusNotice
+        className={className}
+        title={t("cursorOauth.authStatus", {
+          defaultValue: "Cursor OAuth 认证",
+        })}
+        error={error}
+        isError={isStatusError}
+        isFetching={isFetchingStatus}
+        onRetry={() => void refetchStatus()}
+      />
+    );
+  }
 
   const accountDisplayName = (account: {
     email?: string | null;
     login: string;
   }) => account.email || account.login;
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const copyVerificationUrl = async () => {
@@ -262,31 +292,33 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
         </div>
       )}
 
-      {pollingState === "error" && error && (
+      {error && (
         <div className="space-y-2">
           <p className="text-sm text-red-500">{error}</p>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              onClick={addAccount}
-              variant="outline"
-              size="sm"
-            >
-              {t("cursorOauth.retry", {
-                defaultValue: "重试",
-              })}
-            </Button>
-            <Button
-              type="button"
-              onClick={cancelAuth}
-              variant="ghost"
-              size="sm"
-            >
-              {t("common.cancel", {
-                defaultValue: "取消",
-              })}
-            </Button>
-          </div>
+          {pollingState === "error" && (
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={addAccount}
+                variant="outline"
+                size="sm"
+              >
+                {t("cursorOauth.retry", {
+                  defaultValue: "重试",
+                })}
+              </Button>
+              <Button
+                type="button"
+                onClick={cancelAuth}
+                variant="ghost"
+                size="sm"
+              >
+                {t("common.cancel", {
+                  defaultValue: "取消",
+                })}
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>

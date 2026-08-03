@@ -19,12 +19,7 @@ export type ShareAccessByApp = Partial<
 >;
 
 export type ShareTokenPeriod =
-  | "lifetime"
-  | "day"
-  | "week"
-  | "sevenDays"
-  | "calendarMonth"
-  | "thirtyDays";
+  "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays";
 
 export type ShareUserPolicy = {
   parallelLimit?: number;
@@ -121,7 +116,8 @@ export interface ShareRecord {
 }
 
 export interface CreateShareParams {
-  /** New Shares start with one binding; more are attached after explicit reuse confirmation. */
+  id?: string;
+  expectedConfigRevision?: number;
   bindings: ShareBindings;
   description?: string;
   forSale: "Yes" | "No" | "Free";
@@ -226,6 +222,21 @@ export interface SaveProviderShareParams {
   parallelLimit: number;
   expiresAt: string;
   userGrants: ShareUserGrantMap;
+}
+
+/** Bundle-scoped Share payload; enabled Surface bindings are derived by the Server. */
+export interface SaveProviderBundleShareParams {
+  bundleId: string;
+  shareId?: string;
+  expectedConfigRevision?: number;
+  enabled: boolean;
+  subdomain: string;
+  description?: string;
+  forSale: "Yes" | "No" | "Free";
+  tokenLimit: number;
+  parallelLimit: number;
+  expiresAt: string;
+  sharedWithEmails: string[];
 }
 
 export interface UpdateShareTokenLimitParams {
@@ -476,6 +487,18 @@ async function saveProviderShare(
   return invokeShareRecord("save_provider_share", { params });
 }
 
+async function saveProviderBundleShare(
+  params: SaveProviderBundleShareParams,
+): Promise<ShareRecord | undefined> {
+  const raw = await invokeCommand<unknown>("save_provider_bundle_share", {
+    params,
+  });
+  if (raw == null) return undefined;
+  const normalized = normalizeShareRecord(raw);
+  if (!normalized) throw new Error("Invalid Provider Bundle Share response");
+  return normalized;
+}
+
 export interface ImportSharesResult {
   imported: number;
   skippedExisting: string[];
@@ -656,6 +679,7 @@ export const shareApi = {
   updateExpiration,
   updateAcl,
   saveProviderShare,
+  saveProviderBundleShare,
   exportAll,
   importMany,
   listTokenMarkets,

@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
 
-use axum::http::HeaderMap;
-use sha2::{Digest, Sha256};
-
 use crate::domain::accounts::store::{active_account_usage_block, AccountStore, AccountUsageBlock};
+use crate::domain::providers::bundle::{route_key as provider_route_key, surface_enabled};
 use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::runtime::{authoritative_managed_account, managed_account_binding};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::infra::time::now_ms;
 use crate::state::AccountInFlightSnapshot;
@@ -58,118 +57,32 @@ pub(super) struct AccountConcurrencySelection {
     pub current: u32,
 }
 
-#[derive(Default)]
-struct ProviderSelectionOptions<'a> {
-    provider_type_filter: Option<ProviderType>,
-    provider_filter: Option<fn(&StoredProvider) -> bool>,
-    account_in_flight: Option<&'a AccountInFlightSnapshot>,
-    affinity_key: Option<&'a str>,
-}
-
 const DEFAULT_ACCOUNT_MAX_CONCURRENT: u32 = 8;
 
-pub(super) fn select_provider(
+pub(super) fn select_provider_for_route_key(
     store: &ProviderStore,
     accounts: &AccountStore,
     app: AppKind,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
+    route_key: &str,
+    account_in_flight: Option<&AccountInFlightSnapshot>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_inner(
-        store,
-        accounts,
-        app,
-        headers,
-        current_provider_id,
-        None,
-        None,
-    )
-}
-
-pub(super) fn select_provider_with_account_inflight(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    app: AppKind,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    account_in_flight: &AccountInFlightSnapshot,
-    affinity_key: Option<&str>,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_with_optional_filter(
-        store,
-        accounts,
-        app,
-        headers,
-        current_provider_id,
-        ProviderSelectionOptions {
-            account_in_flight: Some(account_in_flight),
-            affinity_key,
-            ..ProviderSelectionOptions::default()
-        },
-    )
-}
-
-pub(super) fn select_exact_provider_with_account_inflight(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    app: AppKind,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    account_in_flight: &AccountInFlightSnapshot,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    let current_provider_id = current_provider_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ProxyError::not_found(format!(
-                "no current provider configured for {}",
-                app.as_str()
-            ))
-        })?;
-    if let Some(requested) = headers
-        .get("x-cc-provider-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if requested != current_provider_id {
-            return Err(ProxyError::bad_request(
-                "Claude direct inference is pinned to the configured current provider",
-            ));
-        }
-    }
+    let route_key = route_key.trim();
     let provider = store
         .providers
         .iter()
-        .find(|item| item.app == app && item.provider.id == current_provider_id)
+        .find(|item| {
+            item.app == app
+                && surface_enabled(&item.provider)
+                && provider_route_key(&item.provider) == route_key
+        })
         .cloned()
         .ok_or_else(|| {
-            ProxyError::not_found(format!("provider not found: {current_provider_id}"))
+            ProxyError::not_found(format!(
+                "no enabled {} Surface is configured for route key {route_key}",
+                app.as_str()
+            ))
         })?;
-    finalize_provider_selection(store, accounts, provider, Some(account_in_flight), now_ms())
-}
-
-pub(super) fn select_provider_for_claude_count_tokens(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    account_in_flight: &AccountInFlightSnapshot,
-    affinity_key: Option<&str>,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_with_optional_filter(
-        store,
-        accounts,
-        AppKind::Claude,
-        headers,
-        current_provider_id,
-        ProviderSelectionOptions {
-            provider_filter: Some(provider_supports_claude_count_tokens),
-            account_in_flight: Some(account_in_flight),
-            affinity_key,
-            ..ProviderSelectionOptions::default()
-        },
-    )
+    finalize_provider_selection(store, accounts, provider, account_in_flight, now_ms())
 }
 
 pub(super) fn select_failover_provider(
@@ -199,16 +112,21 @@ pub(super) fn select_failover_provider_matching(
 ) -> Option<ProviderRouteSelection> {
     let app = route.app();
     let now = now_ms();
-    let excluded_account_keys = store
-        .list(Some(app))
-        .into_iter()
+    let providers = store.list(Some(app));
+    let excluded_contains_managed_execution = providers
+        .iter()
         .filter(|provider| excluded_provider_ids.contains(&provider.provider.id))
-        .filter_map(|provider| provider_account_failover_key(&provider))
-        .collect::<BTreeSet<_>>();
-    for provider in store.list(Some(app)) {
+        .cloned()
+        .any(|provider| {
+            ProviderExecution::from_store(store, provider)
+                .ok()
+                .is_some_and(|execution| execution.managed_account_target().is_some())
+        });
+    if excluded_contains_managed_execution {
+        return None;
+    }
+    for provider in providers {
         if excluded_provider_ids.contains(&provider.provider.id)
-            || provider_account_failover_key(&provider)
-                .is_some_and(|key| excluded_account_keys.contains(&key))
             || !provider_filter(&provider)
             || (route == ProxyRoute::ClaudeCountTokens
                 && !provider_supports_claude_count_tokens(&provider))
@@ -229,6 +147,9 @@ pub(super) fn select_failover_provider_matching(
                 continue;
             }
         };
+        if execution.managed_account_target().is_some() {
+            continue;
+        }
         if execution
             .ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)
             .is_err()
@@ -240,235 +161,12 @@ pub(super) fn select_failover_provider_matching(
     None
 }
 
-fn provider_account_failover_key(provider: &StoredProvider) -> Option<String> {
-    let account_id = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())?
-        .trim();
-    (!account_id.is_empty()).then(|| format!("{}:{account_id}", provider.provider_type.as_str()))
-}
-
 pub(super) fn provider_supports_claude_count_tokens(provider: &StoredProvider) -> bool {
     provider.app == AppKind::Claude
         && matches!(
             provider.provider_type,
             ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth
         )
-}
-
-pub(super) fn select_provider_for_type(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    app: AppKind,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    provider_type: ProviderType,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_inner(
-        store,
-        accounts,
-        app,
-        headers,
-        current_provider_id,
-        Some(provider_type),
-        None,
-    )
-}
-
-pub(super) fn select_provider_for_codex_image_generation(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    account_in_flight: &AccountInFlightSnapshot,
-    affinity_key: Option<&str>,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    let selection = select_provider_with_account_inflight(
-        store,
-        accounts,
-        AppKind::Codex,
-        headers,
-        current_provider_id,
-        account_in_flight,
-        affinity_key,
-    )?;
-    if !codex_image_generation_provider(&selection.execution.stored) {
-        return Err(ProxyError::bad_request(
-            "selected Codex provider does not support image generation",
-        ));
-    }
-    Ok(selection)
-}
-
-fn select_provider_inner(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    app: AppKind,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    provider_type_filter: Option<ProviderType>,
-    account_in_flight: Option<&AccountInFlightSnapshot>,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    select_provider_with_optional_filter(
-        store,
-        accounts,
-        app,
-        headers,
-        current_provider_id,
-        ProviderSelectionOptions {
-            provider_type_filter,
-            account_in_flight,
-            ..ProviderSelectionOptions::default()
-        },
-    )
-}
-
-fn select_provider_with_optional_filter(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    app: AppKind,
-    headers: &HeaderMap,
-    current_provider_id: Option<&str>,
-    options: ProviderSelectionOptions<'_>,
-) -> Result<ProviderRouteSelection, ProxyError> {
-    let ProviderSelectionOptions {
-        provider_type_filter,
-        provider_filter,
-        account_in_flight,
-        affinity_key,
-    } = options;
-    let now = now_ms();
-    let explicit_provider_id = headers
-        .get("x-cc-provider-id")
-        .and_then(|value| value.to_str().ok());
-    let provider_id = explicit_provider_id
-        .or(current_provider_id)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ProxyError::not_found(format!(
-                "no current provider configured for {}",
-                app.as_str()
-            ))
-        })?;
-    let provider = store
-        .providers
-        .iter()
-        .find(|item| {
-            item.app == app
-                && item.provider.id == provider_id
-                && provider_type_filter
-                    .map(|provider_type| item.provider_type == provider_type)
-                    .unwrap_or(true)
-                && provider_filter.map(|filter| filter(item)).unwrap_or(true)
-        })
-        .cloned()
-        .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
-    let automatic_managed_selection = explicit_provider_id.is_none()
-        && !matches!(
-            provider.provider_type,
-            ProviderType::CodexOAuth
-                | ProviderType::GrokOAuth
-                | ProviderType::CursorOAuth
-                | ProviderType::CursorApiKey
-        )
-        && bound_account_for_provider(&provider, accounts).is_some();
-    if let Some(account_in_flight) = account_in_flight.filter(|_| automatic_managed_selection) {
-        if let Some(selection) = select_managed_provider_candidate(
-            store,
-            accounts,
-            &provider,
-            provider_filter,
-            account_in_flight,
-            affinity_key,
-        ) {
-            return Ok(selection);
-        }
-    }
-    finalize_provider_selection(store, accounts, provider, account_in_flight, now)
-}
-
-fn select_managed_provider_candidate(
-    store: &ProviderStore,
-    accounts: &AccountStore,
-    current_provider: &StoredProvider,
-    provider_filter: Option<fn(&StoredProvider) -> bool>,
-    account_in_flight: &AccountInFlightSnapshot,
-    affinity_key: Option<&str>,
-) -> Option<ProviderRouteSelection> {
-    let now = now_ms();
-    let mut best: Option<(ProviderRouteSelection, u32, u32, u64, bool)> = None;
-    for provider in store.list(Some(current_provider.app)) {
-        if provider.provider_type != current_provider.provider_type
-            || !provider_filter
-                .map(|filter| filter(&provider))
-                .unwrap_or(true)
-            || ensure_provider_account_does_not_need_relogin(&provider, accounts).is_err()
-            || ensure_provider_account_usage_available(&provider, accounts, now).is_err()
-            || bound_account_for_provider(&provider, accounts).is_none()
-        {
-            continue;
-        }
-        let concurrency = account_concurrency_for_provider(&provider, accounts, account_in_flight);
-        if concurrency
-            .as_ref()
-            .is_some_and(|selection| selection.current >= selection.max_concurrent)
-        {
-            continue;
-        }
-        let execution = match ProviderExecution::from_store(store, provider) {
-            Ok(execution) => execution,
-            Err(_) => continue,
-        };
-        if execution
-            .ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)
-            .is_err()
-        {
-            continue;
-        }
-        let (load, capacity) = concurrency
-            .map(|selection| (selection.current, selection.max_concurrent))
-            .unwrap_or((0, u32::MAX));
-        let affinity = affinity_key
-            .map(|key| provider_affinity_score(key, &execution.stored.provider.id))
-            .unwrap_or_default();
-        let is_current = execution.stored.provider.id == current_provider.provider.id;
-        let replace = best.as_ref().is_none_or(
-            |(_, best_load, best_capacity, best_affinity, best_is_current)| {
-                let left = u64::from(load) * u64::from(*best_capacity);
-                let right = u64::from(*best_load) * u64::from(capacity);
-                left < right
-                    || (left == right
-                        && if affinity_key.is_some() {
-                            affinity > *best_affinity
-                        } else {
-                            is_current && !*best_is_current
-                        })
-            },
-        );
-        if replace {
-            best = Some((
-                ProviderRouteSelection { execution },
-                load,
-                capacity,
-                affinity,
-                is_current,
-            ));
-        }
-    }
-    best.map(|(selection, ..)| selection)
-}
-
-fn provider_affinity_score(key: &str, provider_id: &str) -> u64 {
-    let mut digest = Sha256::new();
-    digest.update(key.as_bytes());
-    digest.update([0]);
-    digest.update(provider_id.as_bytes());
-    let bytes = digest.finalize();
-    u64::from_be_bytes(bytes[..8].try_into().expect("SHA-256 prefix has 8 bytes"))
 }
 
 fn finalize_provider_selection(
@@ -478,7 +176,7 @@ fn finalize_provider_selection(
     account_in_flight: Option<&AccountInFlightSnapshot>,
     now: u128,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    ensure_codex_oauth_active_account(&provider, accounts)?;
+    ensure_codex_oauth_binding(&provider, accounts)?;
     ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
     ensure_provider_account_usage_available(&provider, accounts, now)?;
     if account_in_flight
@@ -492,52 +190,28 @@ fn finalize_provider_selection(
     Ok(ProviderRouteSelection { execution })
 }
 
-pub(crate) fn ensure_codex_oauth_active_account(
+pub(crate) fn ensure_codex_oauth_binding(
     provider: &StoredProvider,
     accounts: &AccountStore,
 ) -> Result<(), ProxyError> {
     if provider.provider_type != ProviderType::CodexOAuth {
         return Ok(());
     }
-    let selection = accounts.codex_oauth_selection();
-    let active_account_id = selection.active_account_id.as_deref().ok_or_else(|| {
-        ProxyError {
-            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            message: match selection.status {
-                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::Unconfigured => {
-                    "Codex OAuth account is not configured".to_string()
-                }
-                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::NeedsSelection => {
-                    "multiple Codex OAuth accounts exist; select the active account before proxying"
-                        .to_string()
-                }
-                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::Ready => {
-                    "Codex OAuth active account is unavailable".to_string()
-                }
-            },
-        }
-    })?;
-    let bound_account_id = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ProxyError {
-            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            message: format!(
-                "Codex OAuth provider {} is not bound to the active account",
-                provider.provider.id
-            ),
-        })?;
-    if bound_account_id != active_account_id {
+    let Some((ProviderType::CodexOAuth, account_id)) = managed_account_binding(provider) else {
         return Err(ProxyError {
             status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
             message: format!(
-                "Codex OAuth provider {} is bound to an inactive account",
+                "Codex OAuth provider {} has no explicit account binding",
                 provider.provider.id
+            ),
+        });
+    };
+    if authoritative_managed_account(provider, accounts).is_none() {
+        return Err(ProxyError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "Codex OAuth provider {} account binding {account_id} is missing or stale",
+                provider.provider.id,
             ),
         });
     }
@@ -578,13 +252,7 @@ fn bound_account_for_provider<'a>(
     provider: &StoredProvider,
     accounts: &'a AccountStore,
 ) -> Option<&'a crate::domain::accounts::store::Account> {
-    let account_id = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())?;
-    accounts.find_for_provider(provider.provider_type, Some(account_id))
+    authoritative_managed_account(provider, accounts)
 }
 
 fn provider_concurrency_override(provider: &StoredProvider) -> Option<u32> {
@@ -688,18 +356,7 @@ pub(super) fn ensure_provider_account_does_not_need_relogin(
 }
 
 fn provider_account_needs_relogin(provider: &StoredProvider, accounts: &AccountStore) -> bool {
-    let Some(account_id) = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())
-    else {
-        return false;
-    };
-    accounts
-        .find_for_provider(provider.provider_type, Some(account_id))
-        .is_some_and(|account| account.needs_relogin)
+    bound_account_for_provider(provider, accounts).is_some_and(|account| account.needs_relogin)
 }
 
 fn provider_account_usage_block(
@@ -708,20 +365,12 @@ fn provider_account_usage_block(
     now_ms: u128,
 ) -> Option<AccountUsageBlock> {
     let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
-    let account_id = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())?;
-    accounts
-        .find_for_provider(provider.provider_type, Some(account_id))
+    bound_account_for_provider(provider, accounts)
         .and_then(|account| active_account_usage_block(account, now_ms))
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     use super::*;
@@ -815,6 +464,28 @@ mod tests {
             },
             provider_type: ProviderType::ClaudeOAuth,
             provider_type_id: "claude_oauth".to_string(),
+            resource: Default::default(),
+        }
+    }
+
+    fn claude_api_key_provider(id: &str) -> StoredProvider {
+        StoredProvider {
+            app: AppKind::Claude,
+            provider: Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({
+                    "env": {
+                        "ANTHROPIC_AUTH_TOKEN": format!("key-{id}"),
+                        "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                    }
+                }),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::Claude,
+            provider_type_id: ProviderType::Claude.as_str().to_string(),
             resource: Default::default(),
         }
     }
@@ -931,6 +602,31 @@ mod tests {
         }
     }
 
+    fn cursor_api_key_provider_with_stale_binding(id: &str, account_id: &str) -> StoredProvider {
+        StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({"apiKey": "provider-owned-key"}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    auth_binding: Some(AuthBinding {
+                        source: Some("legacy".to_string()),
+                        auth_provider: Some("cursor_apikey".to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..ProviderMeta::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorApiKey,
+            provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
+            resource: Default::default(),
+        }
+    }
+
     fn cursor_oauth_account(id: &str, rate_limited_until: Option<i64>) -> UpsertAccountInput {
         UpsertAccountInput {
             id: Some(id.to_string()),
@@ -1010,27 +706,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_provider_header_overrides_current_provider() {
+    fn route_key_selects_the_exact_enabled_surface() {
         let store = provider_store();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
-
-        let accounts = AccountStore::default();
-        let selected =
-            select_provider(&store, &accounts, AppKind::Codex, &headers, Some("p1")).unwrap();
-
-        assert_eq!(selected.execution.stored.provider.id, "p2");
-    }
-
-    #[test]
-    fn current_provider_is_selected_without_automatic_fallback() {
-        let store = provider_store();
-        let selected = select_provider(
+        let selected = select_provider_for_route_key(
             &store,
             &AccountStore::default(),
             AppKind::Codex,
-            &HeaderMap::new(),
-            Some("p2"),
+            "p2",
+            None,
         )
         .unwrap();
 
@@ -1038,22 +721,61 @@ mod tests {
     }
 
     #[test]
-    fn missing_current_provider_is_rejected() {
-        let store = provider_store();
-        let error = select_provider(
-            &store,
-            &AccountStore::default(),
-            AppKind::Codex,
-            &HeaderMap::new(),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
-        assert!(error.message.contains("no current provider"));
+    fn missing_or_disabled_route_key_is_rejected() {
+        let mut store = provider_store();
+        store.providers[1]
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(false));
+
+        for route_key in ["missing", "p2"] {
+            let error = select_provider_for_route_key(
+                &store,
+                &AccountStore::default(),
+                AppKind::Codex,
+                route_key,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
+            assert!(error.message.contains("no enabled codex Surface"));
+        }
     }
 
     #[test]
-    fn current_rate_limited_provider_returns_429_without_fallback() {
+    fn codex_route_key_uses_its_binding_independent_of_active_account() {
+        let store = runtime_store(vec![codex_oauth_provider("p2", "acct-2")]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(codex_oauth_account("acct-1", None));
+        accounts.upsert(codex_oauth_account("acct-2", None));
+        accounts
+            .select_active_codex_oauth_account("acct-1")
+            .unwrap();
+
+        let selected =
+            select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p2", None).unwrap();
+
+        assert_eq!(
+            selected.execution.managed_account_target(),
+            Some((ProviderType::CodexOAuth, "acct-2"))
+        );
+    }
+
+    #[test]
+    fn codex_route_key_rejects_a_missing_explicit_binding() {
+        let store = runtime_store(vec![codex_oauth_provider("p1", "acct-1")]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(codex_oauth_account("acct-2", None));
+
+        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
+            .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("missing or stale"));
+    }
+
+    #[test]
+    fn route_key_rate_limited_provider_returns_429_without_fallback() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![
             codex_oauth_provider("p1", "acct-1"),
@@ -1062,41 +784,26 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", Some(now + 60_000)));
         accounts.upsert(codex_oauth_account("acct-2", None));
-        accounts
-            .select_active_codex_oauth_account("acct-1")
-            .unwrap();
-        let error = select_provider(
-            &store,
-            &accounts,
-            AppKind::Codex,
-            &HeaderMap::new(),
-            Some("p1"),
-        )
-        .unwrap_err();
+        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
+            .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
-    fn current_quota_exhausted_provider_returns_429_without_fallback() {
+    fn route_key_quota_exhausted_provider_returns_429_without_fallback() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![codex_oauth_provider("p1", "acct-1")]);
         let mut accounts = AccountStore::default();
         accounts.upsert(exhausted_codex_oauth_account("acct-1", now));
 
-        let error = select_provider(
-            &store,
-            &accounts,
-            AppKind::Codex,
-            &HeaderMap::new(),
-            Some("p1"),
-        )
-        .unwrap_err();
+        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
+            .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
         assert!(error.message.contains("quota_exhausted"));
     }
 
     #[test]
-    fn current_cursor_provider_respects_account_cooldown() {
+    fn route_key_cursor_provider_respects_account_cooldown() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![
             cursor_oauth_provider("p1", "cursor-acct-1"),
@@ -1105,15 +812,45 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(cursor_oauth_account("cursor-acct-1", Some(now + 60_000)));
         accounts.upsert(cursor_oauth_account("cursor-acct-2", None));
-        let error = select_provider(
+        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
+            .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn provider_owned_cursor_key_ignores_stale_account_state() {
+        let now = now_ms() as i64;
+        let store = runtime_store(vec![cursor_api_key_provider_with_stale_binding(
+            "cursor-static",
+            "legacy-cursor-account",
+        )]);
+        let mut account = cursor_oauth_account("legacy-cursor-account", Some(now + 60_000));
+        account.provider_type = ProviderType::CursorApiKey;
+        account.api_key = Some("deprecated-account-key".to_string());
+        let mut accounts = AccountStore::default();
+        accounts.upsert(account);
+        accounts.accounts[0].needs_relogin = true;
+        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
+        let _guard = tracker
+            .try_acquire(ProviderType::CursorApiKey, "legacy-cursor-account", 1)
+            .unwrap();
+
+        let selected = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Codex,
-            &HeaderMap::new(),
-            Some("p1"),
+            "cursor-static",
+            Some(&tracker.snapshot()),
         )
-        .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        .unwrap();
+
+        assert_eq!(selected.execution.stored.provider.id, "cursor-static");
+        assert!(account_concurrency_for_provider(
+            &selected.execution.stored,
+            &accounts,
+            &tracker.snapshot()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1134,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn current_provider_that_requires_relogin_returns_401_without_fallback() {
+    fn route_key_provider_that_requires_relogin_returns_401_without_fallback() {
         let store = runtime_store(vec![
             codex_oauth_provider("p1", "acct-1"),
             codex_oauth_provider("p2", "acct-2"),
@@ -1142,24 +879,15 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
-        accounts
-            .select_active_codex_oauth_account("acct-1")
-            .unwrap();
         accounts.accounts[0].needs_relogin = true;
-        let error = select_provider(
-            &store,
-            &accounts,
-            AppKind::Codex,
-            &HeaderMap::new(),
-            Some("p1"),
-        )
-        .unwrap_err();
+        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
+            .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::UNAUTHORIZED);
         assert!(error.message.contains("requires login"));
     }
 
     #[test]
-    fn automatic_managed_selection_skips_saturated_current_account() {
+    fn saturated_managed_provider_returns_429_without_switching_accounts() {
         let store = runtime_store(vec![
             claude_oauth_provider("p1", "acct-1", Some(1)),
             claude_oauth_provider("p2", "acct-2", Some(1)),
@@ -1172,21 +900,20 @@ mod tests {
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .unwrap();
         let snapshot = tracker.snapshot();
-        let selected = select_provider_with_account_inflight(
+        let error = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Claude,
-            &HeaderMap::new(),
-            Some("p1"),
-            &snapshot,
-            None,
+            "p1",
+            Some(&snapshot),
         )
-        .unwrap();
-        assert_eq!(selected.execution.stored.provider.id, "p2");
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message.contains("p1"));
     }
 
     #[test]
-    fn grok_current_provider_at_concurrency_limit_never_selects_another_account() {
+    fn grok_route_key_at_concurrency_limit_never_selects_another_account() {
         let store = runtime_store(vec![
             grok_oauth_provider("grok-current", "grok-acct-current", 1),
             grok_oauth_provider("grok-other", "grok-acct-other", 1),
@@ -1199,14 +926,12 @@ mod tests {
             .try_acquire(ProviderType::GrokOAuth, "grok-acct-current", 1)
             .unwrap();
 
-        let error = select_provider_with_account_inflight(
+        let error = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Codex,
-            &HeaderMap::new(),
-            Some("grok-current"),
-            &tracker.snapshot(),
-            Some("grok-session"),
+            "grok-current",
+            Some(&tracker.snapshot()),
         )
         .unwrap_err();
 
@@ -1215,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_current_provider_remains_selected_when_another_account_is_less_busy() {
+    fn grok_route_key_remains_selected_when_another_account_is_less_busy() {
         let store = runtime_store(vec![
             grok_oauth_provider("grok-current", "grok-acct-current", 8),
             grok_oauth_provider("grok-other", "grok-acct-other", 8),
@@ -1228,14 +953,12 @@ mod tests {
             .try_acquire(ProviderType::GrokOAuth, "grok-acct-current", 8)
             .unwrap();
 
-        let selected = select_provider_with_account_inflight(
+        let selected = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Codex,
-            &HeaderMap::new(),
-            Some("grok-current"),
-            &tracker.snapshot(),
-            Some("grok-session"),
+            "grok-current",
+            Some(&tracker.snapshot()),
         )
         .unwrap();
 
@@ -1243,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_claude_selection_never_switches_accounts() {
+    fn claude_route_key_never_switches_accounts() {
         let store = runtime_store(vec![
             claude_oauth_provider("p1", "acct-1", Some(1)),
             claude_oauth_provider("p2", "acct-2", Some(1)),
@@ -1256,107 +979,19 @@ mod tests {
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .unwrap();
 
-        let error = select_exact_provider_with_account_inflight(
+        let error = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Claude,
-            &HeaderMap::new(),
-            Some("p1"),
-            &tracker.snapshot(),
-        )
-        .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
-        let error = select_exact_provider_with_account_inflight(
-            &store,
-            &accounts,
-            AppKind::Claude,
-            &headers,
-            Some("p1"),
-            &tracker.snapshot(),
-        )
-        .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn explicit_managed_provider_at_concurrency_limit_returns_429() {
-        let store = runtime_store(vec![
-            claude_oauth_provider("p1", "acct-1", Some(1)),
-            claude_oauth_provider("p2", "acct-2", Some(1)),
-        ]);
-        let mut accounts = AccountStore::default();
-        accounts.upsert(claude_oauth_account("acct-1"));
-        accounts.upsert(claude_oauth_account("acct-2"));
-        let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
-        let _guard = tracker
-            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p1"));
-
-        let error = select_provider_with_account_inflight(
-            &store,
-            &accounts,
-            AppKind::Claude,
-            &headers,
-            Some("p1"),
-            &tracker.snapshot(),
-            Some("session-pinned"),
+            "p1",
+            Some(&tracker.snapshot()),
         )
         .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
-    fn codex_images_honor_explicit_provider_bound_to_active_account() {
-        let mut current = codex_oauth_provider("p1", "acct-1");
-        current
-            .provider
-            .meta
-            .as_mut()
-            .unwrap()
-            .codex_image_generation_enabled = Some(true);
-        let mut requested = codex_oauth_provider("p2", "acct-1");
-        requested
-            .provider
-            .meta
-            .as_mut()
-            .unwrap()
-            .codex_image_generation_enabled = Some(true);
-        let store = runtime_store(vec![current, requested]);
-        let mut accounts = AccountStore::default();
-        accounts.upsert(codex_oauth_account("acct-1", None));
-        accounts
-            .select_active_codex_oauth_account("acct-1")
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
-
-        let selected = select_provider_for_codex_image_generation(
-            &store,
-            &accounts,
-            &headers,
-            Some("p1"),
-            &AccountInFlightTracker::default().snapshot(),
-            Some("image-session"),
-        )
-        .unwrap();
-
-        assert_eq!(selected.execution.stored.provider.id, "p2");
-    }
-
-    #[test]
-    fn codex_images_reject_explicit_provider_bound_to_inactive_account() {
-        let mut current = codex_oauth_provider("p1", "acct-1");
-        current
-            .provider
-            .meta
-            .as_mut()
-            .unwrap()
-            .codex_image_generation_enabled = Some(true);
+    fn codex_images_honor_route_key_binding_independent_of_active_account() {
         let mut requested = codex_oauth_provider("p2", "acct-2");
         requested
             .provider
@@ -1364,43 +999,41 @@ mod tests {
             .as_mut()
             .unwrap()
             .codex_image_generation_enabled = Some(true);
-        let store = runtime_store(vec![current, requested]);
+        let store = runtime_store(vec![requested]);
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
         accounts
             .select_active_codex_oauth_account("acct-1")
             .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-cc-provider-id", HeaderValue::from_static("p2"));
 
-        let error = select_provider_for_codex_image_generation(
+        let selected = select_provider_for_route_key(
             &store,
             &accounts,
-            &headers,
-            Some("p1"),
-            &AccountInFlightTracker::default().snapshot(),
-            Some("image-session"),
+            AppKind::Codex,
+            "p2",
+            Some(&AccountInFlightTracker::default().snapshot()),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(error.message.contains("inactive account"));
+        assert_eq!(selected.execution.stored.provider.id, "p2");
+        assert!(codex_image_generation_provider(&selected.execution.stored));
     }
 
     #[test]
-    fn codex_selection_does_not_switch_from_active_account_for_load() {
+    fn codex_route_key_does_not_switch_for_load() {
         let mut first = codex_oauth_provider("p1", "acct-1");
         first.provider.settings_config["ACCOUNT_MAX_CONCURRENT"] = json!(8);
         let mut second = codex_oauth_provider("p2", "acct-2");
         second.provider.settings_config["ACCOUNT_MAX_CONCURRENT"] = json!(2);
-        let store = runtime_store(vec![first, second]);
+        let mut store = runtime_store(vec![first, second]);
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
         accounts
             .select_active_codex_oauth_account("acct-2")
             .unwrap();
+        store.rebuild_runtime_index(&accounts).unwrap();
         let tracker = std::sync::Arc::new(AccountInFlightTracker::default());
         let _first_guards = [
             tracker
@@ -1414,14 +1047,12 @@ mod tests {
             .try_acquire(ProviderType::CodexOAuth, "acct-2", 2)
             .unwrap();
 
-        let selected = select_provider_with_account_inflight(
+        let selected = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Codex,
-            &HeaderMap::new(),
-            Some("p2"),
-            &tracker.snapshot(),
-            Some("session-load-aware"),
+            "p2",
+            Some(&tracker.snapshot()),
         )
         .unwrap();
 
@@ -1439,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_selection_affinity_is_stable_when_load_is_equal() {
+    fn repeated_route_key_selection_remains_stable() {
         let store = runtime_store(vec![
             claude_oauth_provider("p1", "acct-1", Some(8)),
             claude_oauth_provider("p2", "acct-2", Some(8)),
@@ -1449,48 +1080,39 @@ mod tests {
         accounts.upsert(claude_oauth_account("acct-2"));
         let snapshot = AccountInFlightTracker::default().snapshot();
 
-        let first = select_provider_with_account_inflight(
+        let first = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Claude,
-            &HeaderMap::new(),
-            Some("p1"),
-            &snapshot,
-            Some("stable-session"),
+            "p1",
+            Some(&snapshot),
         )
         .unwrap();
-        let second = select_provider_with_account_inflight(
+        let second = select_provider_for_route_key(
             &store,
             &accounts,
             AppKind::Claude,
-            &HeaderMap::new(),
-            Some("p1"),
-            &snapshot,
-            Some("stable-session"),
+            "p1",
+            Some(&snapshot),
         )
         .unwrap();
 
-        assert_eq!(
-            first.execution.stored.provider.id,
-            second.execution.stored.provider.id
-        );
+        assert_eq!(first.execution.stored.provider.id, "p1");
+        assert_eq!(second.execution.stored.provider.id, "p1");
     }
 
     #[test]
     fn failover_selection_uses_authoritative_order_and_exclusions() {
         let mut store = runtime_store(vec![
-            claude_oauth_provider("p1", "acct-1", None),
-            claude_oauth_provider("p2", "acct-2", None),
-            claude_oauth_provider("p3", "acct-3", None),
+            claude_api_key_provider("p1"),
+            claude_api_key_provider("p2"),
+            claude_api_key_provider("p3"),
         ]);
         store.order.insert(
             AppKind::Claude,
             vec!["p3".to_string(), "p1".to_string(), "p2".to_string()],
         );
-        let mut accounts = AccountStore::default();
-        for account_id in ["acct-1", "acct-2", "acct-3"] {
-            accounts.upsert(claude_oauth_account(account_id));
-        }
+        let accounts = AccountStore::default();
         let excluded = BTreeSet::from(["p3".to_string()]);
 
         let selected = select_failover_provider(
@@ -1506,15 +1128,14 @@ mod tests {
     }
 
     #[test]
-    fn failover_selection_skips_other_providers_bound_to_excluded_account() {
+    fn failover_selection_skips_managed_provider_candidates() {
         let store = runtime_store(vec![
-            claude_oauth_provider("failed", "shared-account", None),
-            claude_oauth_provider("duplicate", "shared-account", None),
-            claude_oauth_provider("backup", "backup-account", None),
+            claude_api_key_provider("failed"),
+            claude_oauth_provider("managed", "managed-account", None),
+            claude_api_key_provider("backup"),
         ]);
         let mut accounts = AccountStore::default();
-        accounts.upsert(claude_oauth_account("shared-account"));
-        accounts.upsert(claude_oauth_account("backup-account"));
+        accounts.upsert(claude_oauth_account("managed-account"));
 
         let selected = select_failover_provider(
             &store,
@@ -1529,7 +1150,27 @@ mod tests {
     }
 
     #[test]
-    fn failover_selection_skips_unhealthy_and_saturated_accounts() {
+    fn failover_selection_stops_after_managed_provider_origin() {
+        let store = runtime_store(vec![
+            claude_oauth_provider("failed-managed", "managed-account", None),
+            claude_api_key_provider("backup"),
+        ]);
+        let mut accounts = AccountStore::default();
+        accounts.upsert(claude_oauth_account("managed-account"));
+
+        let selected = select_failover_provider(
+            &store,
+            &accounts,
+            ProxyRoute::ClaudeMessages,
+            &AccountInFlightTracker::default().snapshot(),
+            &BTreeSet::from(["failed-managed".to_string()]),
+        );
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn failover_selection_never_uses_another_managed_account() {
         let store = runtime_store(vec![
             claude_oauth_provider("excluded", "acct-excluded", None),
             claude_oauth_provider("relogin", "acct-relogin", None),
@@ -1571,10 +1212,9 @@ mod tests {
             ProxyRoute::ClaudeMessages,
             &tracker.snapshot(),
             &excluded,
-        )
-        .unwrap();
+        );
 
-        assert_eq!(selected.execution.stored.provider.id, "healthy");
+        assert!(selected.is_none());
     }
 
     #[test]
@@ -1588,28 +1228,29 @@ mod tests {
         accounts.upsert(claude_oauth_account("acct-1"));
         let tracker = AccountInFlightTracker::default();
 
-        let selected = select_provider_for_claude_count_tokens(
+        let selected = select_provider_for_route_key(
             &store,
             &accounts,
-            &HeaderMap::new(),
-            Some("claude-native"),
-            &tracker.snapshot(),
-            None,
+            AppKind::Claude,
+            "claude-native",
+            Some(&tracker.snapshot()),
         )
         .unwrap();
         assert_eq!(selected.execution.stored.provider.id, "claude-native");
+        assert!(provider_supports_claude_count_tokens(
+            &selected.execution.stored
+        ));
 
-        let mut pinned = HeaderMap::new();
-        pinned.insert("x-cc-provider-id", HeaderValue::from_static("codex-first"));
-        let error = select_provider_for_claude_count_tokens(
+        let selected = select_provider_for_route_key(
             &store,
             &accounts,
-            &pinned,
-            Some("claude-native"),
-            &tracker.snapshot(),
-            None,
+            AppKind::Claude,
+            "codex-first",
+            Some(&tracker.snapshot()),
         )
-        .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
+        .unwrap();
+        assert!(!provider_supports_claude_count_tokens(
+            &selected.execution.stored
+        ));
     }
 }

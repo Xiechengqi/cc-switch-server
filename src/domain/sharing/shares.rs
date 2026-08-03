@@ -1342,6 +1342,152 @@ impl ShareStore {
         Ok(share.clone())
     }
 
+    pub(crate) fn replace_bundle_configuration_with_usage(
+        &mut self,
+        share_id: &str,
+        mut bindings: Vec<ShareBinding>,
+        capacity_pool_id: String,
+        tunnel_subdomain: Option<String>,
+        settings: ShareSettingsPatch,
+        enabled: bool,
+        usage: &UsageStore,
+        applied_at_ms: i64,
+    ) -> Result<Share, SharePatchError> {
+        if !(1..=3).contains(&bindings.len()) {
+            return Err(SharePatchError::Invalid(
+                "share must have between one and three bindings".to_string(),
+            ));
+        }
+        bindings.sort_by_key(|binding| binding.app);
+        if bindings.windows(2).any(|pair| pair[0].app == pair[1].app) {
+            return Err(SharePatchError::Invalid(
+                "share must have at most one binding per app".to_string(),
+            ));
+        }
+        if bindings
+            .iter()
+            .any(|binding| binding.provider_id.trim().is_empty())
+        {
+            return Err(SharePatchError::Invalid(
+                "share binding provider_id is required".to_string(),
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let index = candidate
+            .shares
+            .iter()
+            .position(|share| share.id == share_id)
+            .ok_or(SharePatchError::NotFound)?;
+        if let Some(conflict) = candidate.shares.iter().find(|share| {
+            share.id != share_id
+                && share.status != "deleted"
+                && share.bindings.iter().any(|existing| {
+                    bindings.iter().any(|binding| {
+                        existing.app == binding.app && existing.provider_id == binding.provider_id
+                    })
+                })
+        }) {
+            return Err(SharePatchError::Invalid(format!(
+                "provider already has share {}",
+                conflict.id
+            )));
+        }
+
+        let tunnel_subdomain = tunnel_subdomain
+            .map(|subdomain| {
+                normalize_share_subdomain(&subdomain)
+                    .map_err(|message| SharePatchError::Invalid(message.to_string()))
+            })
+            .transpose()?;
+        if let Some(subdomain) = tunnel_subdomain.as_deref() {
+            if let Some(conflict) = candidate.shares.iter().find(|share| {
+                share.id != share_id
+                    && share.status != "deleted"
+                    && share.tunnel_subdomain.as_deref() == Some(subdomain)
+            }) {
+                return Err(SharePatchError::Invalid(format!(
+                    "share subdomain is already used by {}",
+                    conflict.id
+                )));
+            }
+        }
+
+        let mut share = candidate.shares[index].clone();
+        let previous_bindings = share
+            .bindings
+            .iter()
+            .map(|binding| (binding.app, binding.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let next_bindings = bindings
+            .iter()
+            .map(|binding| (binding.app, binding.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let changed_at_ms = now_ms();
+        for app in previous_bindings
+            .keys()
+            .chain(next_bindings.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            let previous = previous_bindings.get(&app);
+            let next = next_bindings.get(&app);
+            if previous == next {
+                continue;
+            }
+            share.binding_history.push(ShareBindingHistory {
+                app,
+                previous_provider_id: previous.map(|binding| binding.provider_id.clone()),
+                next_provider_id: next.map(|binding| binding.provider_id.clone()),
+                previous_subscription_identity_fingerprint: None,
+                next_subscription_identity_fingerprint: None,
+                change_kind: Some(
+                    match (previous, next) {
+                        (None, Some(_)) => "binding_added",
+                        (Some(_), None) => "binding_removed",
+                        (Some(_), Some(_)) => "provider_binding",
+                        (None, None) => unreachable!("binding union contains the app"),
+                    }
+                    .to_string(),
+                ),
+                changed_at_ms,
+            });
+        }
+
+        let primary = bindings
+            .iter()
+            .find(|binding| binding.app == share.app)
+            .unwrap_or_else(|| bindings.first().expect("bindings are non-empty"));
+        share.app = primary.app;
+        share.provider_id = primary.provider_id.clone();
+        share.provider_type = primary.provider_type;
+        share.bindings = bindings;
+        share.capacity_pool_id = capacity_pool_id;
+        if let Some(subdomain) = tunnel_subdomain {
+            share.tunnel_subdomain = Some(subdomain.clone());
+            if let Some(snapshot) = share.runtime_snapshot.as_mut() {
+                if let Some(object) = snapshot.as_object_mut() {
+                    object.insert("subdomain".to_string(), json!(subdomain));
+                }
+            }
+        }
+        share.enabled = enabled;
+        share.status = if enabled { "active" } else { "paused" }.to_string();
+        if enabled {
+            share.last_error = None;
+        }
+        canonicalize_shared_app_settings_for_share(&mut share);
+        crate::domain::sharing::invariants::validate_share_import(&share)?;
+        candidate.shares[index] = share;
+        candidate.apply_settings_patch_with_usage(share_id, settings, usage, applied_at_ms)?;
+        let saved = candidate
+            .get(share_id)
+            .cloned()
+            .ok_or(SharePatchError::NotFound)?;
+        *self = candidate;
+        Ok(saved)
+    }
+
     pub fn record_subscription_identity_rebind(
         &mut self,
         share_id: &str,

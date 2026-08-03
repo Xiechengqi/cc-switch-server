@@ -55,6 +55,7 @@ pub(in crate::api) fn cached_oauth_quota_from_response(
     json!({
         "authProvider": auth_provider,
         "accountId": account.id,
+        "authIdentityGeneration": account.auth_identity_generation,
         "providerId": provider_id,
         "providerName": Value::Null,
         "appType": app_type,
@@ -451,6 +452,10 @@ mod tests {
             "server",
         );
         assert_eq!(cached["authProvider"], "codex_oauth");
+        assert_eq!(
+            cached["authIdentityGeneration"],
+            account.auth_identity_generation
+        );
         assert_eq!(cached["quota"]["tiers"][0]["utilization"], 25.0);
         assert_eq!(cached["nextRefreshAt"], json!(1_700_000_300_000i64));
     }

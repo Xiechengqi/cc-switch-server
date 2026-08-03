@@ -112,6 +112,54 @@ pub fn record_codex_images_output(operation: &'static str, format: &str, count: 
     .increment(bytes);
 }
 
+pub fn record_image_capability_event(event: &'static str) {
+    metrics::counter!(
+        "cc_switch_image_capability_events_total",
+        "event" => event
+    )
+    .increment(1);
+}
+
+pub fn set_image_capability_store_size(entries: usize, bytes: u64) {
+    metrics::gauge!("cc_switch_image_capability_entries").set(entries as f64);
+    metrics::gauge!("cc_switch_image_capability_bytes").set(bytes as f64);
+}
+
+pub fn record_image_transport_first_byte(
+    surface: &'static str,
+    mode: &'static str,
+    elapsed: std::time::Duration,
+) {
+    metrics::histogram!(
+        "cc_switch_image_transport_first_byte_seconds",
+        "surface" => surface,
+        "mode" => mode
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+pub fn record_image_transport_heartbeat(surface: &'static str, mode: &'static str) {
+    metrics::counter!(
+        "cc_switch_image_transport_heartbeats_total",
+        "surface" => surface,
+        "mode" => mode
+    )
+    .increment(1);
+}
+
+pub fn record_image_transport_max_silence(
+    surface: &'static str,
+    mode: &'static str,
+    silence: std::time::Duration,
+) {
+    metrics::histogram!(
+        "cc_switch_image_transport_max_silence_seconds",
+        "surface" => surface,
+        "mode" => mode
+    )
+    .record(silence.as_secs_f64());
+}
+
 pub fn record_provider_outcome(app: &str, provider_id: &str, outcome: ProviderRequestOutcome) {
     let outcome = match outcome {
         ProviderRequestOutcome::Success { .. } => "success",
@@ -255,6 +303,30 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_codex_images_output_bytes_total",
         "Codex OAuth Images decoded output bytes by operation and format"
+    );
+    metrics::describe_counter!(
+        "cc_switch_image_capability_events_total",
+        "Image capability store insert, lookup, expiry, eviction, and integrity events"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_image_capability_entries",
+        "Current durable image capability entry count"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_image_capability_bytes",
+        "Current durable image capability payload bytes"
+    );
+    metrics::describe_histogram!(
+        "cc_switch_image_transport_first_byte_seconds",
+        "Time until the first downstream byte for long-running image transports"
+    );
+    metrics::describe_counter!(
+        "cc_switch_image_transport_heartbeats_total",
+        "Heartbeat chunks emitted for long-running image transports"
+    );
+    metrics::describe_histogram!(
+        "cc_switch_image_transport_max_silence_seconds",
+        "Maximum downstream silence observed during a long-running image transport"
     );
     metrics::describe_counter!(
         "cc_switch_provider_outcome_total",

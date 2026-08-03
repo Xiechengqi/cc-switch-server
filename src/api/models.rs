@@ -12,20 +12,15 @@ use crate::state::ServerState;
 
 pub(in crate::api) async fn gemini_models_response(
     state: &ServerState,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
     path: &str,
 ) -> Result<Option<Response>, ApiError> {
     let path = path.trim_matches('/');
     if path != "models" && !path.starts_with("models/") {
         return Ok(None);
     }
-    let provider_id = headers
-        .get("x-cc-provider-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
     let providers = state.providers.read().await;
-    let models = openai_model_list(&providers.providers, Some(AppKind::Gemini), provider_id)
+    let models = openai_model_list(&providers.providers, Some(AppKind::Gemini), None)
         .into_iter()
         .map(gemini_model_from_openai)
         .collect::<Vec<_>>();

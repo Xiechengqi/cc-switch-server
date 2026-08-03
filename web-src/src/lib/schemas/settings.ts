@@ -28,12 +28,6 @@ export const settingsSchema = z.object({
   opencodeConfigDir: directorySchema.nullable().optional(),
   openclawConfigDir: directorySchema.nullable().optional(),
 
-  // 当前供应商 ID（设备级）
-  currentProviderClaude: z.string().optional(),
-  currentProviderClaudeDesktop: z.string().optional(),
-  currentProviderCodex: z.string().optional(),
-  currentProviderGemini: z.string().optional(),
-
   // Skill 同步设置
   skillSyncMethod: z.enum(["auto", "symlink", "copy"]).optional(),
   skillStorageLocation: z.enum(["cc_switch", "unified"]).optional(),

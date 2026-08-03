@@ -53,6 +53,14 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
         ManagedIdentityFamily::CodexCli => {
             crate::codex_identity::finalize_owned_headers(headers);
         }
+        ManagedIdentityFamily::GeminiCli => {
+            set_user_agent(headers, crate::provider_identity::gemini_cli_user_agent());
+            replace_header(
+                headers,
+                "x-goog-api-client",
+                crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT.to_string(),
+            );
+        }
         ManagedIdentityFamily::GrokCli => {
             set_user_agent(headers, crate::domain::grok_cli::grok_cli_user_agent());
         }
@@ -188,6 +196,10 @@ mod tests {
                 crate::domain::grok_cli::grok_cli_user_agent(),
             ),
             (
+                ManagedIdentityFamily::GeminiCli,
+                crate::provider_identity::gemini_cli_user_agent(),
+            ),
+            (
                 ManagedIdentityFamily::Kiro,
                 "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string(),
             ),
@@ -251,6 +263,40 @@ mod tests {
                     .to_string()
                     .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn gemini_identity_replaces_user_agent_and_api_client_as_one_tuple() {
+        let mut headers = vec![
+            ("User-Agent".to_string(), "untrusted/1".to_string()),
+            (
+                "X-Goog-Api-Client".to_string(),
+                "untrusted-sdk/1".to_string(),
+            ),
+        ];
+        finalize_headers(
+            &plan(OutboundIdentityPolicy::ManagedIdentity {
+                family: ManagedIdentityFamily::GeminiCli,
+            }),
+            &mut headers,
+        )
+        .unwrap();
+
+        assert_eq!(
+            header(&headers, "user-agent"),
+            Some(crate::provider_identity::gemini_cli_user_agent().as_str())
+        );
+        assert_eq!(
+            header(&headers, "x-goog-api-client"),
+            Some(crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT)
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("x-goog-api-client"))
+                .count(),
+            1
         );
     }
 

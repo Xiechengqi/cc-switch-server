@@ -1,5 +1,4 @@
 import React from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -26,9 +25,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { authApi, type ManagedAuthDeviceCodeResponse } from "@/lib/api";
+import { authApi } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { useManagedAuth } from "./hooks/useManagedAuth";
+import {
+  logoutAccountsAndClearSelection,
+  removeAccountAndUpdateSelection,
+} from "./accountSelectionActions";
+import { ManagedAuthStatusNotice } from "./ManagedAuthStatusNotice";
 
 interface GrokOAuthSectionProps {
   className?: string;
@@ -46,27 +50,31 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
   allowDefaultAccountOption = true,
 }) => {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const [copied, setCopied] = React.useState(false);
   const [showAuthJsonImport, setShowAuthJsonImport] = React.useState(false);
   const [authJsonInput, setAuthJsonInput] = React.useState("");
   const [isImporting, setIsImporting] = React.useState(false);
-  const [loginRequest, setLoginRequest] =
-    React.useState<ManagedAuthDeviceCodeResponse | null>(null);
   const [oauthCodeInput, setOauthCodeInput] = React.useState("");
-  const [isStartingLogin, setIsStartingLogin] = React.useState(false);
-  const [isSubmittingCode, setIsSubmittingCode] = React.useState(false);
-  const [loginError, setLoginError] = React.useState<string | null>(null);
   const {
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
+    deviceCode: loginRequest,
     error,
+    isAddingAccount: isStartingLogin,
+    isSubmittingOauthCallback: isSubmittingCode,
     isRemovingAccount,
     isSettingDefaultAccount,
     defaultAccountId,
-    logout,
-    removeAccount,
+    logoutAsync,
+    removeAccountAsync,
     setDefaultAccount,
+    addAccountWithMode,
+    cancelAuth,
+    submitOauthCallback,
+    invalidateAccountViews,
     refetchStatus,
   } = useManagedAuth("grok_oauth");
 
@@ -74,13 +82,29 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
     onAccountSelect?.(value === "none" ? null : value);
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const copyVerificationUrl = async () => {
@@ -90,22 +114,9 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const startLogin = async () => {
-    setIsStartingLogin(true);
-    setLoginError(null);
-    try {
-      const response = await authApi.authStartLogin(
-        "grok_oauth",
-        undefined,
-        "web_paste",
-      );
-      setLoginRequest(response);
-      setOauthCodeInput("");
-    } catch (error) {
-      setLoginError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsStartingLogin(false);
-    }
+  const startLogin = () => {
+    setOauthCodeInput("");
+    addAccountWithMode("web_paste");
   };
 
   const submitOauthCode = async () => {
@@ -119,19 +130,8 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
       );
       return;
     }
-    setIsSubmittingCode(true);
-    setLoginError(null);
     try {
-      const account = await authApi.authSubmitOauthCode(
-        "grok_oauth",
-        loginRequest.device_code,
-        code,
-      );
-      await refetchStatus();
-      await queryClient.invalidateQueries({
-        queryKey: ["managed-auth-status", "grok_oauth"],
-      });
-      setLoginRequest(null);
+      const account = await submitOauthCallback(code);
       setOauthCodeInput("");
       onAccountSelect?.(account.id);
       toast.success(
@@ -139,11 +139,7 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
           defaultValue: "Grok 账号已登录",
         }),
       );
-    } catch (error) {
-      setLoginError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsSubmittingCode(false);
-    }
+    } catch {}
   };
 
   const importAuthJson = async () => {
@@ -168,13 +164,11 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
       return;
     }
 
+    cancelAuth();
     setIsImporting(true);
     try {
       const response = await authApi.importGrokAuthJson(parsed);
-      await refetchStatus();
-      await queryClient.invalidateQueries({
-        queryKey: ["managed-auth-status", "grok_oauth"],
-      });
+      await invalidateAccountViews();
       setAuthJsonInput("");
       setShowAuthJsonImport(false);
       onAccountSelect?.(response.account.id);
@@ -189,6 +183,21 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
       setIsImporting(false);
     }
   };
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <ManagedAuthStatusNotice
+        className={className}
+        title={t("grokOauth.authStatus", {
+          defaultValue: "Grok OAuth 认证",
+        })}
+        error={error}
+        isError={isStatusError}
+        isFetching={isFetchingStatus}
+        onRetry={() => void refetchStatus()}
+      />
+    );
+  }
 
   return (
     <div className={`space-y-4 ${className || ""}`}>
@@ -451,9 +460,8 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
             variant="outline"
             className="w-full"
             onClick={() => {
-              setLoginRequest(null);
+              cancelAuth();
               setOauthCodeInput("");
-              setLoginError(null);
             }}
           >
             {t("common.cancel", { defaultValue: "取消" })}
@@ -461,7 +469,6 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
         </div>
       )}
 
-      {loginError && <p className="text-sm text-destructive">{loginError}</p>}
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       {hasAnyAccount && (
@@ -469,7 +476,8 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
           type="button"
           variant="outline"
           className="w-full"
-          onClick={logout}
+          onClick={() => void handleLogout()}
+          disabled={isStartingLogin || isSubmittingCode || isImporting}
         >
           <LogOut className="mr-2 h-4 w-4" />
           {t("grokOauth.logoutAll", {

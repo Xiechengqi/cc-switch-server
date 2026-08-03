@@ -2,10 +2,11 @@ import React from "react";
 import type { ProviderMeta } from "@/types";
 import { useGrokOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 import type { AppId } from "@/lib/api";
 import { SubscriptionQuotaView } from "@/components/SubscriptionQuotaFooter";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface GrokOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -24,15 +25,33 @@ const GrokOauthQuotaFooter: React.FC<GrokOauthQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useGrokOauthQuota(meta, { enabled: true });
-  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.GROK_OAUTH);
-  const handleRefresh = React.useCallback(async () => {
-    await subscriptionApi.refreshOauthQuota(
-      PROVIDER_TYPES.GROK_OAUTH,
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.GROK_OAUTH,
+  );
+  const accountId = identity?.accountId ?? null;
+  const handleRefresh = React.useCallback(
+    () =>
+      refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            PROVIDER_TYPES.GROK_OAUTH,
+            accountId,
+            meta?.providerType,
+            undefined,
+            undefined,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
+      ),
+    [
       accountId,
+      identity?.authIdentityGeneration,
       meta?.providerType,
-    );
-    await refetch();
-  }, [accountId, meta?.providerType, refetch]);
+      refetch,
+    ],
+  );
 
   return (
     <SubscriptionQuotaView

@@ -32,6 +32,13 @@ const expectedCounts = Object.freeze({
   universalRecipes: 2,
   serverPresets: Object.freeze({ claude: 16, codex: 8, gemini: 5 }),
 });
+const reviewedFirstClassProfileAdditions = Object.freeze([
+  "claude.anthropic_api_key",
+  "claude.bearer_relay",
+  "claude.google_oauth",
+  "codex.openai_api_key",
+  "gemini.google_api_key",
+]);
 
 const sourceFiles = {
   providerTypes: "src-tauri/src/proxy/providers/mod.rs",
@@ -509,11 +516,7 @@ function buildCoverageMappings(baseline, serverInventory) {
       "codex.legacy_compat",
       "gemini.legacy_compat",
     ],
-    firstClassProfileAdditions: [
-      "claude.anthropic_api_key",
-      "codex.openai_api_key",
-      "gemini.google_api_key",
-    ],
+    firstClassProfileAdditions: [...reviewedFirstClassProfileAdditions],
   };
 }
 
@@ -677,10 +680,11 @@ export function validateBaselineContracts(baseline, serverInventory) {
   }
   if (
     !Array.isArray(mappings.firstClassProfileAdditions) ||
-    mappings.firstClassProfileAdditions.length !== 3 ||
+    JSON.stringify(mappings.firstClassProfileAdditions) !==
+      JSON.stringify(reviewedFirstClassProfileAdditions) ||
     "directApiCandidates" in mappings
   ) {
-    throw new Error("three reviewed first-class direct API Profile additions are required");
+    throw new Error("reviewed first-class Server Profile additions are incomplete");
   }
 }
 

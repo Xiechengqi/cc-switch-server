@@ -21,6 +21,7 @@ const KNOWN_JSON_SECRET_POINTERS: &[&str] = &[
     "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
     "/settingsConfig/env/API_KEY",
     "/settingsConfig/env/AWS_ACCESS_KEY_ID",
+    "/settingsConfig/env/AWS_BEARER_TOKEN_BEDROCK",
     "/settingsConfig/env/AWS_SECRET_ACCESS_KEY",
     "/settingsConfig/env/AWS_SESSION_TOKEN",
     "/settingsConfig/env/CODEX_API_KEY",
@@ -102,7 +103,6 @@ pub struct ProviderReferencePreview {
     pub provider_id: String,
     pub revision: u64,
     pub share_ids: Vec<String>,
-    pub current_provider: bool,
     pub blocked: bool,
 }
 

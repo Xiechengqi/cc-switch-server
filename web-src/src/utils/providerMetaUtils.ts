@@ -1,5 +1,9 @@
 import type { AppId } from "@/lib/api/types";
 import { PROVIDER_TYPES } from "@/config/constants";
+import {
+  isManagedAccountBindingSource,
+  managedAuthProvidersMatch,
+} from "@/lib/authBinding";
 import type { CustomEndpoint, Provider, ProviderMeta } from "@/types";
 
 /**
@@ -66,10 +70,20 @@ export function hasManagedAuthBinding(
 ): boolean {
   const binding = meta?.authBinding;
   return (
-    binding?.source === "managed_account" &&
-    binding.authProvider === authProvider &&
+    !!binding &&
+    isManagedAccountBindingSource(binding.source) &&
+    managedAuthProvidersMatch(binding.authProvider, authProvider) &&
     typeof binding.accountId === "string" &&
     binding.accountId.trim() !== ""
+  );
+}
+
+function isGoogleGeminiOauthProviderType(
+  providerType?: string | null,
+): boolean {
+  return (
+    providerType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH ||
+    providerType === "gemini_cli"
   );
 }
 
@@ -120,7 +134,7 @@ export function isManagedOauthProvider(
     isOpenAIOAuthProviderType(provider.meta?.providerType) ||
     provider.meta?.providerType === PROVIDER_TYPES.GROK_OAUTH ||
     provider.meta?.providerType === PROVIDER_TYPES.CLAUDE_OAUTH ||
-    provider.meta?.providerType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH ||
+    isGoogleGeminiOauthProviderType(provider.meta?.providerType) ||
     isAntigravityFamily ||
     isCursorOauthWithManagedAuth(provider) ||
     provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH ||
@@ -169,7 +183,7 @@ export function canTestModelProvider(
   }
 
   if (
-    provider.meta?.providerType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH ||
+    isGoogleGeminiOauthProviderType(provider.meta?.providerType) ||
     isAntigravityFamily ||
     (appId === "gemini" && isGoogleGeminiOfficialWithManagedAuth(provider))
   ) {
@@ -211,6 +225,7 @@ export type ProviderQuotaSource =
   | "claude_oauth"
   | "google_gemini_oauth"
   | "antigravity_oauth"
+  | "agy_oauth"
   | "cursor_oauth"
   | "cursor_apikey"
   | "kiro_oauth"
@@ -241,15 +256,16 @@ export function getProviderQuotaSource(
     return "grok_oauth";
   }
 
-  if (provider.meta?.providerType === PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH) {
+  if (isGoogleGeminiOauthProviderType(provider.meta?.providerType)) {
     return "google_gemini_oauth";
   }
 
-  if (
-    provider.meta?.providerType === PROVIDER_TYPES.ANTIGRAVITY_OAUTH ||
-    provider.meta?.providerType === PROVIDER_TYPES.AGY_OAUTH
-  ) {
+  if (provider.meta?.providerType === PROVIDER_TYPES.ANTIGRAVITY_OAUTH) {
     return "antigravity_oauth";
+  }
+
+  if (provider.meta?.providerType === PROVIDER_TYPES.AGY_OAUTH) {
+    return "agy_oauth";
   }
 
   if (isCursorOauthWithManagedAuth(provider)) {

@@ -12,6 +12,28 @@
   "providers": {
     "addProvider": "添加供应商"
   },
+  "providerBundle": {
+    "account": "OAuth 账号",
+    "advancedSettings": "高级设置 JSON",
+    "count": "{{count}} 个供应商节点",
+    "create": "新建供应商",
+    "credential": "凭据",
+    "credentialMissing": "缺少凭据",
+    "credentialReady": "凭据已配置",
+    "deleteBlocked": "请先删除或解绑该供应商的远程分享",
+    "deleted": "供应商已删除",
+    "driverOptions": "驱动选项",
+    "edit": "编辑供应商",
+    "family": "供应商类型",
+    "identity": "供应商",
+    "routeKey": "Route Key",
+    "saved": "供应商已保存",
+    "selectAccount": "选择 OAuth 账号",
+    "surfaceCredential": "认证凭据",
+    "surfaceEnabled": "启用 API",
+    "surfaces": "API Surface",
+    "title": "供应商"
+  },
   "provider": {
     "share": {
       "sectionTitle": "远程分享",
@@ -101,7 +123,7 @@
     "loadFailed": "无法加载设置，请刷新页面后重试。",
     "selectFileFailed": "选择目录失败",
     "authCenter": {
-      "serverDescription": "管理用于反代上游的官方 OAuth 账号。用量刷新仅作用于当前启用的 Provider。",
+      "serverDescription": "管理供应商节点及其 API Surface 使用的官方 OAuth 账号。",
       "claudeOauthDescription": "管理 Claude 官方订阅账号",
       "grokOauthDescription": "管理 Grok/xAI 订阅账号",
       "kiroOauthDescription": "管理 Kiro AWS Builder ID 账号",
@@ -132,10 +154,5 @@
         }
       }
     }
-  },
-  "notifications": {
-    "clearCurrentSuccess": "已取消启用",
-    "clearCurrentFailedTitle": "取消启用失败",
-    "clearCurrentFailed": "取消启用失败：{{error}}"
   }
 }

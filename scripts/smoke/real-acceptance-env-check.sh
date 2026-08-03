@@ -44,6 +44,17 @@ is_set() {
   [[ -n "$value" && "$value" != \<* ]]
 }
 
+gate_status() {
+  local name
+  for name in "$@"; do
+    if ! is_set "$name"; then
+      printf '%s' "blocked-inputs"
+      return
+    fi
+  done
+  printf '%s' "inputs-ready"
+}
+
 join_missing() {
   local missing=("$@")
   local output=""
@@ -157,6 +168,20 @@ check_stream_probe() {
   esac
 }
 
+check_binary_flag() {
+  local name="$1"
+  local value="${!name:-0}"
+  case "$value" in
+    0|1)
+      echo "[OK] ${name}=${value}"
+      ;;
+    *)
+      FAILED_GROUPS=$((FAILED_GROUPS + 1))
+      echo "[BLOCKED] ${name} must be 0 or 1"
+      ;;
+  esac
+}
+
 echo "== cc-switch-server real acceptance env check =="
 echo "stage=${STAGE}"
 echo "No secret values are printed."
@@ -190,8 +215,9 @@ fi
 
 if should_run "AB4"; then
   echo "== AB4 code agent regression =="
-  check_group "AB4 local regression" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID
+  check_group "AB4 local regression" SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_INFERENCE_TOKEN SHARE_ID
   check_group "AB4 real provider tokens" CLAUDE_PROVIDER_TOKEN CODEX_PROVIDER_TOKEN GEMINI_PROVIDER_TOKEN
+  check_group "AB4 complete fixture evidence" MATRIX_LIVE_EVIDENCE_FILE
 fi
 
 if should_run "AB5"; then
@@ -199,6 +225,13 @@ if should_run "AB5"; then
   check_group "AB5 Codex OAuth real account" CODEX_OAUTH_TEST_ACCOUNT CODEX_OAUTH_CALLBACK_URL
   check_optional CODEX_OAUTH_REFRESH_TOKEN_FIXTURE
   check_optional CODEX_OAUTH_REFRESH_TOKEN
+  check_binary_flag CC_SWITCH_CODEX_IMAGES_SMOKE
+  if [[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]]; then
+    check_external_group "AB5 Codex Images Cloudflare smoke" CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_CODEX_ROUTE_KEY
+    echo "[INFO] Run node scripts/smoke/codex-images-real.mjs; input readiness is not live acceptance."
+  else
+    echo "[OPTIONAL] Codex Images Cloudflare smoke is disabled"
+  fi
 fi
 
 if should_run "AB6"; then
@@ -206,6 +239,10 @@ if should_run "AB6"; then
   check_group "AB6 Claude OAuth real account" CLAUDE_OAUTH_TEST_ACCOUNT CLAUDE_OAUTH_CALLBACK_URL
   check_optional CLAUDE_OAUTH_REFRESH_TOKEN_FIXTURE
   check_optional CLAUDE_OAUTH_REFRESH_TOKEN
+  echo "== AB6 Claude Max multiplier external gates =="
+  check_external_group "AB6 Claude Max 5x plan resolution" CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT
+  check_external_group "AB6 Claude Max 20x plan resolution" CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT
+  echo "[INFO] Each Max multiplier requires its own real OAuth account before live acceptance can be claimed."
   check_group "AB6 Gemini OAuth real account" GEMINI_OAUTH_TEST_ACCOUNT GEMINI_OAUTH_CALLBACK_URL
   check_optional GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE
   check_optional GEMINI_OAUTH_REFRESH_TOKEN
@@ -213,7 +250,7 @@ if should_run "AB6"; then
   check_group "AB6 Antigravity/Agy OAuth real account" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
   check_optional ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE
   echo "== AB6 Grok OAuth external gate =="
-  check_external_group "AB6 Grok OAuth single-account smoke" GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_PROVIDER_ID
+  check_external_group "AB6 Grok OAuth single-account smoke" GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_ROUTE_KEY
   check_optional GROK_OAUTH_CALLBACK_URL
   check_optional GROK_OAUTH_REFRESH_TOKEN_FIXTURE
   check_optional GROK_OAUTH_AUTH_JSON_FIXTURE
@@ -250,7 +287,10 @@ echo "external_blocked_groups=${EXTERNAL_BLOCKED_GROUPS}"
 if [[ -n "$EVIDENCE_FILE" ]]; then
   BLOCKED_GROUPS="$FAILED_GROUPS" \
   EXTERNAL_BLOCKED_GROUPS="$EXTERNAL_BLOCKED_GROUPS" \
-  GROK_GATE_STATUS="$([[ "$EXTERNAL_BLOCKED_GROUPS" -eq 0 ]] && echo inputs-ready || echo blocked-inputs)" \
+  GROK_GATE_STATUS="$(gate_status GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_ROUTE_KEY)" \
+  CODEX_IMAGES_GATE_STATUS="$([[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]] && gate_status CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_CODEX_ROUTE_KEY || printf '%s' disabled)" \
+  CLAUDE_MAX_5X_GATE_STATUS="$(gate_status CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT)" \
+  CLAUDE_MAX_20X_GATE_STATUS="$(gate_status CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT)" \
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-${STAGE}-env-check}" \
   EVIDENCE_STATUS="$([[ "$FAILED_GROUPS" -eq 0 ]] && echo ready || echo blocked)" \
     node scripts/smoke/write-acceptance-evidence.mjs --out "$EVIDENCE_FILE"

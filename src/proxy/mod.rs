@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod account_headers;
 pub mod adapters;
 mod anthropic_semantics;
 mod cache_injector;
@@ -15,6 +16,7 @@ mod forwarder;
 mod grok;
 pub(crate) mod kiro;
 mod outbound_identity;
+pub(crate) mod outbound_request;
 mod overflow_compact;
 pub(crate) mod provider_ops;
 pub(crate) mod reasoning_bridge;
@@ -22,6 +24,7 @@ mod remote_image;
 mod request_governance;
 mod response_semantics;
 mod responses_wire;
+mod retry_policy;
 mod router;
 mod stream_transforms;
 mod streaming;
@@ -35,13 +38,19 @@ use serde_json::Value;
 
 pub use forwarder::forward;
 pub use forwarder::forward_codex_alpha_search;
+pub use forwarder::forward_codex_alpha_search_for_route_key;
 pub use forwarder::forward_codex_models_manifest;
+pub use forwarder::forward_codex_models_manifest_for_route_key;
 pub use forwarder::forward_codex_responses_ws;
+pub use forwarder::forward_codex_responses_ws_for_route_key;
+pub use forwarder::forward_for_route_key;
 pub use forwarder::forward_grok_media;
+pub use forwarder::forward_grok_media_for_route_key;
 pub use forwarder::forward_images_edits;
+pub use forwarder::forward_images_edits_for_route_key;
 pub use forwarder::forward_images_generations;
+pub use forwarder::forward_images_generations_for_route_key;
 pub(crate) use request_governance::decode_request_body_for_proxy_with_limit;
-pub(crate) use router::ensure_codex_oauth_active_account;
 pub use router::ProxyRoute;
 
 pub const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
@@ -374,7 +383,7 @@ mod tests {
                         source: Some("managed_account".to_string()),
                         auth_provider: Some("codex_oauth".to_string()),
                         account_id: Some("a1".to_string()),
-                        auth_identity_generation: None,
+                        auth_identity_generation: Some(1),
                     }),
                     ..Default::default()
                 }),

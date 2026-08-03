@@ -250,4 +250,56 @@ mod tests {
             "cursorAgentService": {"enabled": false}
         }))));
     }
+
+    #[test]
+    fn typed_cursor_oauth_explicit_disable_returns_fail_closed_contract() {
+        let mut stored = stored(json!({
+            "env": {
+                "CURSOR_AGENT_SERVICE": "0",
+                "CURSOR_AGENT_SERVICE_BASE_URL": "http://127.0.0.1:9"
+            }
+        }));
+        stored.resource = crate::domain::providers::store::ProviderResourceMetadata {
+            profile_id: Some(
+                crate::domain::providers::registry::ProfileId::parse("claude.cursor_oauth")
+                    .unwrap(),
+            ),
+            profile_schema_revision: Some(1),
+            revision: 1,
+            ..Default::default()
+        };
+        stored.provider.meta = Some(ProviderMeta {
+            provider_type: Some("cursor_oauth".to_string()),
+            auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                source: Some("managed_account".to_string()),
+                auth_provider: Some("cursor_oauth".to_string()),
+                account_id: Some("cursor-account".to_string()),
+                auth_identity_generation: Some(1),
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            stored
+                .resource
+                .profile_id
+                .as_ref()
+                .map(|profile_id| profile_id.as_str()),
+            Some("claude.cursor_oauth")
+        );
+        assert!(!agentservice_driver_requested(&stored));
+
+        let body = serde_json::to_vec(&json!({
+            "model": "composer-2.5",
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .unwrap();
+        let error = agentservice_not_ready_error(ProxyRoute::ClaudeMessages, &stored, &body);
+
+        assert_eq!(error.status, StatusCode::NOT_IMPLEMENTED);
+        assert!(error.message.contains("native driver is disabled"));
+        assert!(error.message.contains("provider=cursor-p"));
+        assert!(error.message.contains("model=composer-2.5"));
+        assert!(error.message.contains("protocol=anthropic_messages"));
+    }
 }

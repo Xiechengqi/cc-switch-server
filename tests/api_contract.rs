@@ -93,6 +93,51 @@ async fn providers_snapshot(
     state.providers_snapshot().await
 }
 
+fn grok_provider_bundle_draft(
+    bundle_id: &str,
+    route_key: &str,
+    account_id: &str,
+    client_request_id: &str,
+) -> Value {
+    let surface = |app: &str, profile_id: &str, api_format: &str| {
+        json!({
+            "app": app,
+            "enabled": true,
+            "profileId": profile_id,
+            "settingsConfig": {
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": "grok-4.5"
+                }
+            },
+            "category": "official",
+            "meta": {
+                "providerType": "grok_oauth",
+                "apiFormat": api_format,
+                "authBinding": {
+                    "source": "managed_account",
+                    "authProvider": "grok_oauth",
+                    "accountId": account_id
+                }
+            }
+        })
+    };
+    json!({
+        "id": bundle_id,
+        "familyId": "family.grok_oauth",
+        "routeKey": route_key,
+        "name": "Grok OAuth Bundle",
+        "websiteUrl": "https://x.ai",
+        "icon": "grok",
+        "surfaces": [
+            surface("claude", "claude.grok_oauth", "openai_responses"),
+            surface("codex", "codex.grok_oauth", "openai_responses"),
+            surface("gemini", "gemini.grok_oauth", "openai_responses")
+        ],
+        "clientRequestId": client_request_id
+    })
+}
+
 #[tokio::test]
 async fn share_router_health_is_hidden_without_probe_header() {
     let state = test_state();
@@ -717,7 +762,7 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("cursor_oauth".to_string()),
                     account_id: Some("acct-cursor".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 provider_type: Some("cursor_oauth".to_string()),
                 ..Default::default()
@@ -789,7 +834,7 @@ async fn control_refresh_share_usage_reports_bound_account_snapshot() {
     assert!(refreshed[0].refreshed);
     assert!(refreshed[0].error.is_none());
     let account = state
-        .find_account_for_provider(ProviderType::CursorOAuth, Some("acct-cursor"))
+        .find_account_for_provider(ProviderType::CursorOAuth, "acct-cursor")
         .await
         .unwrap();
     assert_eq!(account.quota_percent, Some(25.0));
@@ -1270,6 +1315,19 @@ async fn account_capabilities_expose_structured_login_flows_and_derived_legacy_f
     assert_eq!(codex_device["supportsCallback"], false);
     assert_eq!(codex_device["supportsPoll"], true);
     assert_eq!(codex_device["supportsCancel"], true);
+    assert_eq!(
+        capability_for("codex_oauth")["manager"],
+        "manual_token_store_with_native_refresh"
+    );
+    assert_eq!(capability_for("codex_oauth")["managerKind"], "native_oauth");
+    assert_eq!(
+        capability_for("deepseek_account")["manager"],
+        "manual_token_store"
+    );
+    assert_eq!(
+        capability_for("deepseek_account")["managerKind"],
+        "import_only"
+    );
 }
 
 #[tokio::test]
@@ -1418,6 +1476,255 @@ async fn oauth_login_cancel_is_authenticated_idempotent_and_terminal() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["cancelled"], true);
+}
+
+#[tokio::test]
+async fn oauth_error_callback_cancels_the_matching_login_session() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/start",
+            json!({
+                "providerType": "claude_oauth",
+                "redirectUri": "http://localhost:15721/api/accounts/login/callback"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await["login"].clone();
+    let session_id = login["sessionId"].as_str().unwrap();
+    let oauth_state = login["state"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/accounts/login/callback?error=access_denied&state={oauth_state}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/finish",
+            json!({
+                "sessionId": session_id,
+                "state": oauth_state,
+                "code": "unused-auth-code",
+                "executeTokenExchange": true
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn managed_auth_cancel_releases_copilot_and_kiro_device_flows() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let principal_id = "owner@example.com:admin";
+
+    for (provider_type, auth_provider, device_code) in [
+        (
+            ProviderType::GitHubCopilot,
+            "github_copilot",
+            "copilot-cancel-contract",
+        ),
+        (
+            ProviderType::KiroOAuth,
+            "kiro_oauth",
+            "kiro-cancel-contract",
+        ),
+    ] {
+        let now = now_ms() as i64;
+        state
+            .bind_device_flow_principal(
+                provider_type,
+                device_code.to_string(),
+                principal_id.to_string(),
+                now.saturating_add(60_000),
+                now,
+            )
+            .await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/auth_cancel_login",
+                json!({
+                    "authProvider": auth_provider,
+                    "deviceCode": device_code
+                }),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["cancelled"], true);
+        assert!(
+            !state
+                .device_flow_is_owned_by(provider_type, device_code, principal_id, now_ms() as i64,)
+                .await
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_auth_logout_preflights_all_accounts_before_deleting_any() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "logout-claude-unbound",
+                ProviderType::ClaudeOAuth,
+            ));
+            accounts.upsert(test_account_input(
+                "logout-claude-bound",
+                ProviderType::ClaudeOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers/from-preset",
+            json!({
+                "app": "claude",
+                "profileId": "claude.official_oauth",
+                "clientRequestId": "logout-atomic-provider-create",
+                "accountId": "logout-claude-bound"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_logout",
+            json!({"authProvider": "claude_oauth"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_account_in_use"
+    );
+
+    let remaining = state.accounts_snapshot().await;
+    for account_id in ["logout-claude-unbound", "logout-claude-bound"] {
+        assert!(remaining
+            .accounts
+            .iter()
+            .any(|account| account.id == account_id));
+    }
+}
+
+#[tokio::test]
+async fn managed_auth_logout_cancels_in_flight_exchange_and_deletes_accounts_together() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "logout-existing-claude-a",
+                ProviderType::ClaudeOAuth,
+            ));
+            accounts.upsert(test_account_input(
+                "logout-existing-claude-b",
+                ProviderType::ClaudeOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts/login/start",
+            json!({
+                "providerType": "claude_oauth",
+                "redirectUri": "http://localhost:15721/api/accounts/login/callback"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await["login"].clone();
+    let session_id = login["sessionId"].as_str().unwrap().to_string();
+    let oauth_state = login["state"].as_str().unwrap().to_string();
+    state
+        .mutate_oauth_logins(|store| {
+            store.finish_for_principal(
+                Some(&session_id),
+                Some(&oauth_state),
+                Some("logout-race-auth-code"),
+                true,
+                "owner@example.com:admin",
+                now_ms() as i64,
+            )
+        })
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_logout",
+            json!({"authProvider": "claude_oauth"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!state
+        .accounts_snapshot()
+        .await
+        .accounts
+        .iter()
+        .any(|account| account.provider_type == ProviderType::ClaudeOAuth));
+    let commit = state
+        .mutate_oauth_logins(|store| {
+            store.ensure_exchange_commit_allowed(
+                &session_id,
+                Some("owner@example.com:admin"),
+                ProviderType::ClaudeOAuth,
+                now_ms() as i64,
+            )
+        })
+        .await;
+    assert!(matches!(
+        commit,
+        Err(cc_switch_server::domain::accounts::login::OAuthLoginError::Cancelled)
+    ));
 }
 
 #[tokio::test]
@@ -2083,7 +2390,7 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/v1/responses",
+            "/r/codex-proxy-error/v1/responses",
             json!({"model":"gpt-5.5","input":"ping","stream":false}),
             None,
         ))
@@ -2158,7 +2465,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("github_copilot".to_string()),
                     account_id: Some("acct-copilot".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -2207,9 +2514,8 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/chat/completions")
+                .uri("/r/copilot-managed/v1/chat/completions")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "copilot-managed")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2247,6 +2553,15 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                 |State(seen): State<Arc<AtomicUsize>>,
                  headers: HeaderMap,
                  axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(
+                        headers.get_all("content-type").iter().count(),
+                        1,
+                        "Kiro IDE requests must contain one Content-Type header"
+                    );
+                    assert_eq!(
+                        headers.get("content-type").and_then(|v| v.to_str().ok()),
+                        Some("application/json")
+                    );
                     assert_eq!(
                         headers.get("authorization").and_then(|v| v.to_str().ok()),
                         Some("Bearer kiro-access-token")
@@ -2316,7 +2631,7 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("kiro_oauth".to_string()),
                     account_id: Some("acct-kiro".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -2370,9 +2685,8 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri("/r/kiro-managed/v1/messages")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "kiro-managed")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2400,9 +2714,8 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri("/r/kiro-managed/v1/messages")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "kiro-managed")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2491,7 +2804,7 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("kiro_oauth".to_string()),
                     account_id: Some("acct-kiro-stream".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -2544,9 +2857,8 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri("/r/kiro-managed-stream/v1/messages")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "kiro-managed-stream")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2623,7 +2935,7 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/v1/responses",
+            "/r/codex-proxy-timeout/v1/responses",
             json!({"model":"gpt-5.5","input":"ping","stream":false}),
             None,
         ))
@@ -2800,8 +3112,7 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
         for stream in [false, true] {
             let request = Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
-                .header("x-cc-provider-id", provider_id)
+                .uri(format!("/r/{provider_id}/v1/messages"))
                 .header("content-type", "application/json")
                 .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .header("anthropic-beta", "unknown-client-beta")
@@ -2845,9 +3156,8 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/v1/messages/count_tokens")
+                    .uri(format!("/r/{provider_id}/v1/messages/count_tokens"))
                     .header("x-api-key", TEST_INFERENCE_TOKEN)
-                    .header("x-cc-provider-id", provider_id)
                     .header("content-type", "application/json")
                     .header("anthropic-beta", "prompt-caching-2024-07-31")
                     .body(Body::from(
@@ -2941,9 +3251,8 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri("/r/legacy-claude-missing-auth/v1/messages")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "legacy-claude-missing-auth")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2961,7 +3270,7 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
     assert!(response.status().is_client_error());
     let body = body_text(response).await;
     assert!(body.contains("explicitly bind"), "{body}");
-    assert!(body.contains("managed account"), "{body}");
+    assert!(body.contains("managed claude_oauth account"), "{body}");
     assert_eq!(upstream_requests.load(Ordering::SeqCst), 0);
 }
 
@@ -3027,9 +3336,8 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/claude/v1/messages/count_tokens")
+                .uri("/r/claude-count-oauth/v1/messages/count_tokens")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "claude-count-oauth")
                 .header("anthropic-beta", "prompt-caching-2024-07-31,unknown-beta")
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -3085,9 +3393,8 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages/count_tokens")
+                .uri("/r/claude-count-oauth/v1/messages/count_tokens")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "claude-count-oauth")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"model":"rate-limit-model","messages":[{"role":"user","content":"count me"}]}"#,
@@ -3186,12 +3493,6 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
         ),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "anthropic-semantic-guard"
-        }))
-        .await
-        .unwrap();
     let app = app_router(state);
 
     for model in ["invalid-json", "empty-stream"] {
@@ -3199,7 +3500,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
             .clone()
             .oneshot(json_request(
                 Method::POST,
-                "/v1/messages",
+                "/r/anthropic-semantic-guard/v1/messages",
                 json!({
                     "model": model,
                     "max_tokens": 16,
@@ -3217,7 +3518,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/anthropic-semantic-guard/v1/messages",
             json!({
                 "model": "semantic-error",
                 "max_tokens": 16,
@@ -3235,7 +3536,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages/count_tokens",
+            "/r/anthropic-semantic-guard/v1/messages/count_tokens",
             json!({
                 "model": "invalid-count",
                 "messages": [{"role": "user", "content": "ping"}]
@@ -3249,7 +3550,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/anthropic-semantic-guard/v1/messages",
             json!({
                 "model": "truncated-stream",
                 "max_tokens": 16,
@@ -3306,17 +3607,10 @@ async fn claude_client_disconnect_cancels_upstream_without_provider_failure() {
         claude_api_key_test_provider("claude-client-cancel", &format!("http://{upstream_addr}")),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-client-cancel"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state.clone())
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-client-cancel/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -3421,17 +3715,10 @@ async fn claude_connect_failure_retries_only_the_pinned_provider() {
         )
         .await;
     }
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-dead"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state.clone())
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-dead/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -3508,17 +3795,10 @@ async fn claude_rate_limit_body_read_failure_is_not_replayed() {
         )
         .await;
     }
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-broken-429"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state.clone())
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-broken-429/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -3605,17 +3885,10 @@ async fn claude_http_429_is_returned_without_same_account_replay() {
         claude_api_key_test_provider("claude-after-limit", &format!("http://{live_addr}")),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-limited"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state)
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-limited/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -3707,17 +3980,10 @@ async fn claude_http_529_is_returned_without_same_account_replay() {
         claude_api_key_test_provider("claude-after-overload", &format!("http://{live_addr}")),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-overloaded"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state)
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-overloaded/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -3780,9 +4046,8 @@ async fn explicit_claude_provider_never_fails_over() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri("/r/claude-explicit-dead/v1/messages")
                 .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("x-cc-provider-id", "claude-explicit-dead")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -3973,17 +4238,10 @@ async fn claude_oauth_body_retry_stays_on_original_provider() {
         ),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-body-retry"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state)
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-body-retry/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -4065,17 +4323,10 @@ async fn claude_split_first_error_event_is_not_replayed() {
         claude_api_key_test_provider("claude-sse-failover", &format!("http://{upstream_addr}")),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-sse-retry"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state.clone())
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-sse-retry/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -4164,17 +4415,10 @@ async fn claude_stream_failure_after_first_event_does_not_replay_on_next_provide
         ),
     )
     .await;
-    state
-        .apply_ui_settings_patch_immediate(json!({
-            "currentProviderClaude": "claude-stream-break"
-        }))
-        .await
-        .unwrap();
-
     let response = app_router(state)
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/claude-stream-break/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -4245,7 +4489,7 @@ async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
     let response = app_router(state)
         .oneshot(json_request(
             Method::POST,
-            "/v1/messages",
+            "/r/native-claude-signature-error/v1/messages",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
@@ -4290,7 +4534,7 @@ async fn stream_proxy_marks_upstream_chunk_error() {
     let response = app
         .oneshot(json_request(
             Method::POST,
-            "/v1/responses",
+            "/r/codex-stream-error/v1/responses",
             json!({"model":"gpt-5.5","input":"ping","stream":true}),
             None,
         ))
@@ -5735,6 +5979,23 @@ async fn web_invoke_registry_returns_stable_errors() {
     assert_eq!(body["code"].as_str(), Some("cc_switch_feature_disabled"));
     assert_eq!(body["type"].as_str(), Some("feature_disabled"));
 
+    for removed_command in ["switch_proxy_provider", "sync_current_providers_live"] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/web-api/invoke/{removed_command}"),
+                json!({}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = json_body(response).await;
+        assert_eq!(body["code"].as_str(), Some("cc_switch_web_invoke_unknown"));
+        assert_eq!(body["type"].as_str(), Some("web_invoke_unknown"));
+    }
+
     let response = app
         .oneshot(json_request(
             Method::POST,
@@ -5940,55 +6201,6 @@ async fn web_invoke_get_providers_returns_legacy_record_shape() {
         stored.provider.settings_config["env"]["OPENAI_API_KEY"],
         json!("__CC_SWITCH_SECRET_KEEP__")
     );
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/web-api/invoke/get_current_provider",
-            json!({"app": "codex"}),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await.as_str(), Some("codex-web"));
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/web-api/invoke/switch_provider",
-            json!({"app": "codex", "id": "codex-web"}),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/web-api/invoke/clear_current_provider",
-            json!({"app": "codex"}),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .oneshot(json_request(
-            Method::POST,
-            "/web-api/invoke/get_current_provider",
-            json!({"app": "codex"}),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await.as_str(), Some(""));
 }
 
 #[tokio::test]
@@ -6015,7 +6227,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        38
+        40
     );
     let profiles = registry["registry"]["profiles"].as_array().unwrap();
     let official = profiles
@@ -6103,9 +6315,741 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
 }
 
 #[tokio::test]
+async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "bundle-grok-account",
+                ProviderType::GrokOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let draft = grok_provider_bundle_draft(
+        "bundle-grok",
+        "bundle-grok-route",
+        "bundle-grok-account",
+        "bundle-grok-create-request",
+    );
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            draft.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await["bundle"].clone();
+    assert_eq!(created["revision"], 1);
+    assert_eq!(
+        created["supportedApps"],
+        json!(["claude", "codex", "gemini"])
+    );
+    assert_eq!(created["enabledApps"], created["supportedApps"]);
+    assert_eq!(created["credentialConfigured"], true);
+    assert_eq!(
+        created["surfaces"].as_object().map(|value| value.len()),
+        Some(3)
+    );
+    for provider_app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+        assert_eq!(
+            state
+                .provider_id_for_route_key(provider_app, "bundle-grok-route")
+                .await
+                .as_deref(),
+            Some("bundle-grok")
+        );
+    }
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            draft.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(json_body(replay).await["bundle"]["revision"], 1);
+    assert_eq!(providers_snapshot(&state).await.providers.len(), 3);
+
+    let mut mismatched_replay = draft.clone();
+    mismatched_replay["name"] = json!("Changed replay");
+    let mismatch = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            mismatched_replay,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(mismatch).await["code"],
+        "cc_switch_provider_idempotency_conflict"
+    );
+
+    let mut update = draft.clone();
+    update.as_object_mut().unwrap().remove("clientRequestId");
+    update["expectedRevision"] = json!(1);
+    update["surfaces"][0]["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.3");
+    let updated = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/bundle-grok",
+            update.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(json_body(updated).await["bundle"]["revision"], 2);
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|provider| provider.resource.revision == 2));
+
+    let stale = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/bundle-grok",
+            update.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(stale).await["code"],
+        "cc_switch_provider_revision_conflict"
+    );
+
+    update["expectedRevision"] = json!(2);
+    update["surfaces"][1]["settingsConfig"]["modelMapping"]["upstreamModel"] =
+        json!("grok-4.20-multi-agent");
+    let updated = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/bundle-grok",
+            update,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(json_body(updated).await["bundle"]["revision"], 3);
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|provider| provider.resource.revision == 3));
+
+    let claude_surface = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/bundle-grok?app=claude",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claude_surface.status(), StatusCode::OK);
+    let claude_surface = json_body(claude_surface).await;
+    let single_surface_update = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/providers/bundle-grok?app=claude",
+            json!({
+                "provider": claude_surface["provider"],
+                "expectedRevision": claude_surface["revision"]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(single_surface_update.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(single_surface_update).await["code"],
+        "cc_switch_provider_bundle_surface_managed"
+    );
+
+    let single_surface_delete = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/providers/bundle-grok?app=claude&expectedRevision=3",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(single_surface_delete.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(single_surface_delete).await["code"],
+        "cc_switch_provider_bundle_surface_managed"
+    );
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|provider| provider.resource.revision == 3));
+
+    let single_surface_delete_preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/bundle-grok/delete-preview?app=claude",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(single_surface_delete_preview.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(single_surface_delete_preview).await["code"],
+        "cc_switch_provider_bundle_surface_managed"
+    );
+
+    let mut detached_surface = claude_surface["provider"].clone();
+    for field in ["bundleId", "familyId", "routeKey", "surfaceEnabled"] {
+        detached_surface.as_object_mut().unwrap().remove(field);
+    }
+    for provider in [
+        detached_surface,
+        json!({
+            "id": "partial-bundle-metadata",
+            "name": "Partial Bundle metadata",
+            "settingsConfig": {},
+            "surfaceEnabled": true
+        }),
+    ] {
+        let blocked_import = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/providers/import",
+                json!({
+                    "mode": "preview",
+                    "providers": [{"app": "claude", "provider": provider}]
+                }),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blocked_import.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(blocked_import).await["code"],
+            "cc_switch_provider_bundle_surface_managed"
+        );
+    }
+
+    for (path, payload) in [
+        (
+            "/api/providers/bundle-grok/adopt-profile?app=claude",
+            json!({
+                "mode": "preview",
+                "expectedRevision": 3,
+                "profileId": "claude.grok_oauth"
+            }),
+        ),
+        (
+            "/api/providers/bundle-grok/rebind-custom?app=claude",
+            json!({
+                "mode": "preview",
+                "expectedRevision": 3,
+                "customBinding": {
+                    "upstreamProtocol": "anthropic_messages",
+                    "authScheme": "api_key"
+                }
+            }),
+        ),
+        (
+            "/api/providers/bundle-grok/clone-as-custom?app=claude",
+            json!({
+                "mode": "preview",
+                "expectedRevision": 3,
+                "targetProviderId": "bundle-surface-clone",
+                "targetName": "Bundle Surface clone",
+                "customBinding": {
+                    "upstreamProtocol": "anthropic_messages",
+                    "authScheme": "api_key"
+                },
+                "clientRequestId": "bundle-surface-clone-request"
+            }),
+        ),
+    ] {
+        let blocked_action = app
+            .clone()
+            .oneshot(json_request(Method::POST, path, payload, Some(&token)))
+            .await
+            .unwrap();
+        assert_eq!(blocked_action.status(), StatusCode::CONFLICT, "{path}");
+        assert_eq!(
+            json_body(blocked_action).await["code"],
+            "cc_switch_provider_bundle_surface_managed",
+            "{path}"
+        );
+    }
+
+    let migration = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/providers/account-bindings/migration",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(migration.status(), StatusCode::OK);
+    assert_eq!(json_body(migration).await["preview"]["items"], json!([]));
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|provider| provider.resource.revision == 3));
+
+    let route_conflict = grok_provider_bundle_draft(
+        "bundle-grok-other",
+        "bundle-grok-route",
+        "bundle-grok-account",
+        "bundle-grok-other-request",
+    );
+    let conflict = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            route_conflict,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(conflict).await["code"],
+        "cc_switch_provider_route_key_conflict"
+    );
+
+    let mut share_input =
+        test_share_input("share-bundle-grok", "bundle-grok", ProviderType::GrokOAuth);
+    share_input.bindings = [AppKind::Claude, AppKind::Codex, AppKind::Gemini]
+        .into_iter()
+        .map(|provider_app| ShareBinding {
+            app: provider_app,
+            provider_id: "bundle-grok".to_string(),
+            provider_type: ProviderType::GrokOAuth,
+        })
+        .collect();
+    state
+        .mutate_shares_immediate(|shares| shares.upsert(share_input).unwrap())
+        .await
+        .unwrap();
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/provider-bundles/bundle-grok/delete-preview",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["preview"]["blocked"], true);
+    assert_eq!(preview["preview"]["shareIds"], json!(["share-bundle-grok"]));
+
+    let blocked_delete = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/provider-bundles/bundle-grok?expectedRevision=3",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked_delete.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(blocked_delete).await["code"],
+        "cc_switch_provider_bundle_in_use"
+    );
+
+    state
+        .mutate_shares_immediate(|shares| shares.delete("share-bundle-grok"))
+        .await
+        .unwrap();
+    let deleted = app
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/provider-bundles/bundle-grok?expectedRevision=3",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(providers_snapshot(&state).await.providers.is_empty());
+}
+
+#[tokio::test]
+async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_plans() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let draft = json!({
+        "id": "bundle-custom-claude-only",
+        "familyId": "family.custom_http",
+        "routeKey": "bundle-custom-claude-only-route",
+        "name": "Claude-only Custom HTTP",
+        "surfaces": [
+            {
+                "app": "claude",
+                "enabled": true,
+                "profileId": "claude.custom_http",
+                "settingsConfig": {
+                    "env": {"ANTHROPIC_BASE_URL": "https://claude.example/v1"},
+                    "modelMapping": {"mode": "single", "upstreamModel": "claude-test"}
+                },
+                "customBinding": {
+                    "upstreamProtocol": "anthropic_messages",
+                    "authScheme": "api_key"
+                },
+                "credentialPatches": {
+                    "/settingsConfig/apiKey": {
+                        "action": "replace",
+                        "value": "claude-custom-secret"
+                    }
+                }
+            },
+            {
+                "app": "codex",
+                "enabled": false,
+                "profileId": "codex.custom_http",
+                "settingsConfig": {
+                    "modelMapping": {"mode": "single", "upstreamModel": "gpt-test"}
+                },
+                "customBinding": {
+                    "upstreamProtocol": "open_ai_responses",
+                    "authScheme": "bearer"
+                }
+            },
+            {
+                "app": "gemini",
+                "enabled": false,
+                "profileId": "gemini.custom_http",
+                "settingsConfig": {
+                    "modelMapping": {"mode": "single", "upstreamModel": "gemini-test"}
+                },
+                "customBinding": {
+                    "upstreamProtocol": "gemini_native",
+                    "authScheme": "api_key"
+                }
+            }
+        ],
+        "clientRequestId": "bundle-custom-claude-only-create"
+    });
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            draft,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let bundle = json_body(created).await["bundle"].clone();
+    assert_eq!(bundle["enabledApps"], json!(["claude"]));
+    assert_eq!(bundle["credentialConfigured"], true);
+    assert_eq!(bundle["surfaces"]["claude"]["credentialConfigured"], true);
+    assert_eq!(bundle["surfaces"]["codex"]["credentialConfigured"], false);
+    assert_eq!(bundle["surfaces"]["gemini"]["credentialConfigured"], false);
+
+    assert!(state
+        .provider_runtime_plan(AppKind::Claude, "bundle-custom-claude-only")
+        .await
+        .is_some());
+    assert!(state
+        .provider_runtime_plan(AppKind::Codex, "bundle-custom-claude-only")
+        .await
+        .is_none());
+    assert!(state
+        .provider_runtime_plan(AppKind::Gemini, "bundle-custom-claude-only")
+        .await
+        .is_none());
+
+    let status = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_proxy_status",
+            json!({}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status = json_body(status).await;
+    assert_eq!(status["active_targets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(status["active_targets"][0]["app_type"], "claude");
+    assert_eq!(
+        status["active_targets"][0]["provider_id"],
+        "bundle-custom-claude-only"
+    );
+    assert_eq!(
+        status["active_targets"][0]["route_key"],
+        "bundle-custom-claude-only-route"
+    );
+
+    let routing = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_proxy_takeover_status",
+            json!({}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(routing.status(), StatusCode::OK);
+    let routing = json_body(routing).await;
+    assert_eq!(routing["claude"], true);
+    assert_eq!(routing["claude_pending"], false);
+    assert_eq!(routing["codex"], false);
+    assert_eq!(routing["codex_pending"], true);
+    assert_eq!(routing["gemini"], false);
+    assert_eq!(routing["gemini_pending"], true);
+}
+
+#[tokio::test]
+async fn provider_bundle_share_save_is_atomic_and_server_derived() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "bundle-share-grok-account",
+                ProviderType::GrokOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let draft = grok_provider_bundle_draft(
+        "bundle-share-grok",
+        "bundle-share-grok-route",
+        "bundle-share-grok-account",
+        "bundle-share-grok-create-request",
+    );
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            draft.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let created_share = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_bundle_share",
+            json!({
+                "params": {
+                    "bundleId": "bundle-share-grok",
+                    "enabled": true,
+                    "subdomain": "bundle-share-grok-url",
+                    "description": "One Bundle Share",
+                    "forSale": "No",
+                    "tokenLimit": 500,
+                    "parallelLimit": 5,
+                    "expiresAt": "2035-01-01T00:00:00Z",
+                    "sharedWithEmails": ["friend@example.com"]
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let status = created_share.status();
+    let created_share = json_body(created_share).await;
+    assert_eq!(status, StatusCode::OK, "response body: {created_share}");
+    assert_eq!(created_share["configRevision"], 1);
+    assert_eq!(created_share["bindings"].as_array().map(Vec::len), Some(3));
+    assert!(created_share["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|binding| binding["providerId"] == "bundle-share-grok"));
+    let share_id = created_share["id"].as_str().unwrap().to_string();
+
+    let mut disable_gemini = draft.clone();
+    disable_gemini
+        .as_object_mut()
+        .unwrap()
+        .remove("clientRequestId");
+    disable_gemini["expectedRevision"] = json!(1);
+    disable_gemini["surfaces"][2]["enabled"] = json!(false);
+    let bundle_update = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/bundle-share-grok",
+            disable_gemini,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bundle_update.status(), StatusCode::OK);
+
+    let reconciled = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_bundle_share",
+            json!({
+                "params": {
+                    "bundleId": "bundle-share-grok",
+                    "shareId": share_id,
+                    "expectedConfigRevision": 1,
+                    "enabled": false,
+                    "subdomain": "bundle-share-grok-url",
+                    "description": "Saved while paused",
+                    "forSale": "Free",
+                    "tokenLimit": 250,
+                    "parallelLimit": 3,
+                    "expiresAt": "2036-01-01T00:00:00Z",
+                    "sharedWithEmails": ["friend@example.com", "FRIEND@example.com"]
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let status = reconciled.status();
+    let reconciled = json_body(reconciled).await;
+    assert_eq!(status, StatusCode::OK, "response body: {reconciled}");
+    assert_eq!(reconciled["configRevision"], 2);
+    assert_eq!(reconciled["status"], "paused");
+    assert_eq!(reconciled["bindings"].as_array().map(Vec::len), Some(2));
+    assert_eq!(reconciled["bindings"][0]["app"], "claude");
+    assert_eq!(reconciled["bindings"][1]["app"], "codex");
+    assert_eq!(reconciled["description"], "Saved while paused");
+    assert_eq!(reconciled["tokenLimit"], 250);
+    assert_eq!(
+        reconciled["acl"]["sharedWithEmails"],
+        json!(["friend@example.com"])
+    );
+
+    let mut enable_gemini = draft;
+    enable_gemini
+        .as_object_mut()
+        .unwrap()
+        .remove("clientRequestId");
+    enable_gemini["expectedRevision"] = json!(2);
+    let bundle_update = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/bundle-share-grok",
+            enable_gemini,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bundle_update.status(), StatusCode::OK);
+
+    let rejected = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_bundle_share",
+            json!({
+                "params": {
+                    "bundleId": "bundle-share-grok",
+                    "shareId": share_id,
+                    "expectedConfigRevision": 2,
+                    "enabled": false,
+                    "subdomain": "INVALID SUBDOMAIN",
+                    "description": "must not persist",
+                    "forSale": "No",
+                    "tokenLimit": 1,
+                    "parallelLimit": 1,
+                    "expiresAt": "2037-01-01T00:00:00Z",
+                    "sharedWithEmails": []
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let unchanged = state
+        .mutate_shares(|shares| shares.get(&share_id).cloned())
+        .await
+        .unwrap();
+    assert_eq!(unchanged.config_revision, 2);
+    assert_eq!(unchanged.bindings.len(), 2);
+    assert_eq!(unchanged.description.as_deref(), Some("Saved while paused"));
+
+    let stale = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_bundle_share",
+            json!({
+                "params": {
+                    "bundleId": "bundle-share-grok",
+                    "shareId": share_id,
+                    "expectedConfigRevision": 1,
+                    "enabled": false,
+                    "subdomain": "bundle-share-grok-url",
+                    "description": "stale",
+                    "forSale": "No",
+                    "tokenLimit": -1,
+                    "parallelLimit": -1,
+                    "expiresAt": "2038-01-01T00:00:00Z",
+                    "sharedWithEmails": []
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(stale).await["code"],
+        "cc_switch_share_revision_conflict"
+    );
+}
+
+#[tokio::test]
 async fn provider_credential_reveal_is_authenticated_and_slot_scoped() {
     let state = test_state();
-    let app = app_router(state);
+    let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
     let secret = "api-contract-visible-openai-key";
 
@@ -6967,7 +7911,7 @@ async fn codex_active_account_selection_is_exposed_and_enforced_by_provider_writ
         })
         .await
         .unwrap();
-    let app = app_router(state);
+    let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
 
     let accounts = app
@@ -7006,6 +7950,7 @@ async fn codex_active_account_selection_is_exposed_and_enforced_by_provider_writ
     );
 
     let inactive_provider = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/providers/from-preset",
@@ -7019,10 +7964,35 @@ async fn codex_active_account_selection_is_exposed_and_enforced_by_provider_writ
         ))
         .await
         .unwrap();
-    assert_eq!(inactive_provider.status(), StatusCode::CONFLICT);
+    assert_eq!(inactive_provider.status(), StatusCode::OK);
+    let providers = providers_snapshot(&state).await;
+    let stored = providers
+        .providers
+        .iter()
+        .find(|provider| provider.app == AppKind::Codex)
+        .unwrap();
     assert_eq!(
-        json_body(inactive_provider).await["code"],
-        "cc_switch_codex_inactive_account"
+        stored
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.auth_binding.as_ref())
+            .and_then(|binding| binding.account_id.as_deref()),
+        Some("api-codex-account-a")
+    );
+    let accounts = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/accounts",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accounts.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(accounts).await["codexOauth"]["activeAccountId"],
+        "api-codex-account-b"
     );
 }
 
@@ -7145,7 +8115,7 @@ async fn models_routes_dispatch_codex_manifest_only_for_codex_client_requests() 
             .oneshot(json_request(Method::GET, path, Value::Null, None))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
 }
 
@@ -7216,6 +8186,76 @@ async fn account_delete_preview_blocks_bound_account() {
         .accounts
         .iter()
         .any(|account| account.id == "bound-claude-account"));
+}
+
+#[tokio::test]
+async fn share_delete_returns_conflict_until_in_flight_request_finishes() {
+    let state = test_state();
+    let share = state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "share-in-flight-delete",
+                    "provider-before-delete",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    let (_invocation, guard) = state
+        .validate_and_acquire_share_invocation(&share.id, AppKind::Codex, None, 1)
+        .await
+        .unwrap();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let blocked = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/shares/share-in-flight-delete",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(blocked).await["code"],
+        "cc_switch_share_in_flight"
+    );
+
+    state
+        .record_share_invocation_result(&share.id, None, 41, 1)
+        .await;
+    drop(guard);
+    let deleted = app
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/shares/share-in-flight-delete",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(json_body(deleted).await["deleted"], true);
+
+    let recreated = state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "share-in-flight-delete",
+                    "provider-after-delete",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    assert_eq!(recreated.requests_count, 0);
+    assert_eq!(recreated.tokens_used, 0);
 }
 
 #[tokio::test]
@@ -7700,7 +8740,7 @@ async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metad
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("claude_oauth".to_string()),
                     account_id: Some("acct-claude-expiry".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -7854,7 +8894,7 @@ async fn managed_auth_recurring_subscription_expiry_rule_is_validated_and_synced
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("claude_oauth".to_string()),
                     account_id: Some("acct-claude-recurring".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -8018,7 +9058,7 @@ async fn managed_auth_grok_manual_subscription_expiry_is_available_as_fallback()
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("grok_oauth".to_string()),
                     account_id: Some("acct-grok-expiry".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -8107,6 +9147,7 @@ async fn managed_auth_list_accounts_returns_sanitized_subscription_views() {
             let mut input = test_account_input("acct-claude-sanitized", ProviderType::ClaudeOAuth);
             input.id_token = Some("id-token-secret".to_string());
             input.api_key = Some("api-key-secret".to_string());
+            input.subscription_level = Some("Claude Max 20x".to_string());
             input.raw = Some(json!({"secret": "raw-secret"}));
             accounts.upsert(input);
         })
@@ -8126,6 +9167,7 @@ async fn managed_auth_list_accounts_returns_sanitized_subscription_views() {
     let accounts = json_body(response).await;
     let account = &accounts.as_array().unwrap()[0];
     assert_eq!(account["id"], "acct-claude-sanitized");
+    assert_eq!(account["subscriptionLevel"], "Claude Max 20x");
     assert_eq!(
         account["subscriptionExpiry"]["capability"],
         "manual_required"
@@ -8243,6 +9285,82 @@ async fn account_control_api_returns_public_views_without_credentials() {
 }
 
 #[tokio::test]
+async fn deepseek_account_write_paths_reject_missing_access_token_without_mutation() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let missing_create = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts",
+            json!({
+                "id": "deepseek-missing-token",
+                "providerType": "deepseek_account",
+                "email": "missing@example.com"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_create.status(), StatusCode::BAD_REQUEST);
+    assert!(json_body(missing_create).await["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("non-empty accessToken")));
+    assert!(state.accounts_snapshot().await.accounts.is_empty());
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/deepseek_account_add",
+            json!({
+                "accessToken": "deepseek-shim-token",
+                "email": "deepseek@example.com"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let account_id = json_body(created).await["id"]
+        .as_str()
+        .expect("deepseek shim account id")
+        .to_string();
+
+    let missing_update = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/accounts",
+            json!({
+                "id": account_id,
+                "providerType": "deepseek_account",
+                "email": "changed@example.com"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_update.status(), StatusCode::BAD_REQUEST);
+    assert!(json_body(missing_update).await["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("non-empty accessToken")));
+
+    let accounts = state.accounts_snapshot().await;
+    assert_eq!(accounts.accounts.len(), 1);
+    assert_eq!(accounts.accounts[0].id, account_id);
+    assert_eq!(
+        accounts.accounts[0].access_token.as_deref(),
+        Some("deepseek-shim-token")
+    );
+    assert_eq!(
+        accounts.accounts[0].email.as_deref(),
+        Some("deepseek@example.com")
+    );
+}
+
+#[tokio::test]
 async fn managed_oauth_quota_rejects_cross_provider_account_binding() {
     let state = test_state();
     let app = app_router(state.clone());
@@ -8275,6 +9393,61 @@ async fn managed_oauth_quota_rejects_cross_provider_account_binding() {
     assert!(body["error"]
         .as_str()
         .is_some_and(|message| message.contains("account does not belong to grok_oauth")));
+}
+
+#[tokio::test]
+async fn managed_oauth_quota_rejects_stale_auth_identity_generation() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "acct-codex-stale-quota",
+                ProviderType::CodexOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let generation = state
+        .find_account_by_id("acct-codex-stale-quota")
+        .await
+        .unwrap()
+        .auth_identity_generation;
+
+    let stale = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_cached_oauth_quota",
+            json!({
+                "authProvider": "codex_oauth",
+                "accountId": "acct-codex-stale-quota",
+                "authIdentityGeneration": generation.saturating_add(1)
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let current = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/get_cached_oauth_quota",
+            json!({
+                "authProvider": "codex_oauth",
+                "accountId": "acct-codex-stale-quota",
+                "authIdentityGeneration": generation
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    let current = json_body(current).await;
+    assert_eq!(current["accountId"], "acct-codex-stale-quota");
+    assert_eq!(current["authIdentityGeneration"], generation);
 }
 
 #[tokio::test]
@@ -8459,7 +9632,7 @@ async fn oauth_share_requires_an_explicit_provider_account_binding() {
 }
 
 #[tokio::test]
-async fn managed_auth_account_removal_refreshes_unbound_legacy_provider_shares() {
+async fn managed_auth_account_removal_does_not_refresh_unbound_provider_shares() {
     let state = test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
@@ -8539,7 +9712,7 @@ async fn managed_auth_account_removal_refreshes_unbound_legacy_provider_shares()
                 .config_revision
         })
         .await;
-    assert!(revision_after > revision_before);
+    assert_eq!(revision_after, revision_before);
 }
 
 #[tokio::test]
@@ -8568,7 +9741,7 @@ async fn account_runtime_metadata_refreshes_share_only_when_effective_value_chan
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("codex_oauth".to_string()),
                     account_id: Some("acct-codex-auto-expiry".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),
@@ -8671,7 +9844,7 @@ async fn account_rate_limit_refreshes_share_once_per_block_transition() {
                     source: Some("managed_account".to_string()),
                     auth_provider: Some("codex_oauth".to_string()),
                     account_id: Some("acct-codex-rate-limit".to_string()),
-                    auth_identity_generation: None,
+                    auth_identity_generation: Some(1),
                 }),
                 ..Default::default()
             }),

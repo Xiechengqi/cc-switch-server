@@ -179,6 +179,7 @@ const quotaSourceToAuthProvider = (
     return PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH;
   if (quotaSource === "antigravity_oauth")
     return PROVIDER_TYPES.ANTIGRAVITY_OAUTH;
+  if (quotaSource === "agy_oauth") return PROVIDER_TYPES.AGY_OAUTH;
   if (quotaSource === "cursor_oauth") return PROVIDER_TYPES.CURSOR_OAUTH;
   if (quotaSource === "cursor_apikey") return null;
   if (quotaSource === "kiro_oauth") return PROVIDER_TYPES.KIRO_OAUTH;
@@ -522,9 +523,15 @@ export function ProviderCard({
                 providerId={provider.id}
                 isCurrent={isCurrent}
               />
-            ) : quotaSource === "antigravity_oauth" ? (
+            ) : quotaSource === "antigravity_oauth" ||
+              quotaSource === "agy_oauth" ? (
               <AntigravityOauthQuotaFooter
                 meta={provider.meta}
+                authProvider={
+                  quotaSource === "agy_oauth"
+                    ? PROVIDER_TYPES.AGY_OAUTH
+                    : PROVIDER_TYPES.ANTIGRAVITY_OAUTH
+                }
                 inline={true}
                 appId={appId}
                 providerId={provider.id}

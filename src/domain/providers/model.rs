@@ -170,6 +170,8 @@ pub enum CodexImageToolStripPolicy {
     Always,
 }
 
+pub const MANAGED_ACCOUNT_AUTH_BINDING_SOURCE: &str = "managed_account";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthBinding {

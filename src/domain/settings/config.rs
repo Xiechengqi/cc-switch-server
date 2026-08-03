@@ -205,6 +205,57 @@ pub struct ClientConfig {
     pub tunnel_status: Option<String>,
     #[serde(default)]
     pub last_heartbeat_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_pending: Option<ClientTunnelClaimIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientTunnelClaimIntent {
+    pub installation_id: String,
+    pub router_api_base: String,
+    pub owner_email: String,
+    pub subdomain: String,
+}
+
+impl ClientTunnelClaimIntent {
+    pub fn from_config(config: &ServerConfig) -> anyhow::Result<Self> {
+        let installation_id = config
+            .registered_router_identity()
+            .map(|identity| identity.installation_id.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+        let router_api_base = config
+            .router_api_base()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+            .trim_end_matches('/');
+        let owner_email = config
+            .owner
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
+        let subdomain = config
+            .client
+            .tunnel_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
+        Ok(Self {
+            installation_id: installation_id.to_string(),
+            router_api_base: router_api_base.to_string(),
+            owner_email: owner_email.to_ascii_lowercase(),
+            subdomain: subdomain.to_string(),
+        })
+    }
+
+    pub fn matches_config(&self, config: &ServerConfig) -> bool {
+        Self::from_config(config).is_ok_and(|current| current == *self)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -480,6 +531,7 @@ impl ServerConfig {
                 tunnel_subdomain: Some(tunnel_subdomain),
                 tunnel_status: Some("claimed".to_string()),
                 last_heartbeat_ms: None,
+                claim_pending: None,
             },
             setup_completion_notification: None,
             upgrade_policy: UpgradePolicyConfig::default(),

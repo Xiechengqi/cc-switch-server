@@ -1,7 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { proxyApi } from "@/lib/api/proxy";
-import { toast } from "sonner";
-import { useTranslation } from "react-i18next";
 
 // ========== 代理服务器状态 Hooks ==========
 
@@ -119,33 +117,6 @@ export function useSetProxyTakeoverForApp() {
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] });
       queryClient.invalidateQueries({ queryKey: ["liveTakeoverActive"] });
-    },
-  });
-}
-
-/**
- * 代理模式下切换供应商
- */
-export function useSwitchProxyProvider() {
-  const queryClient = useQueryClient();
-  const { t } = useTranslation();
-
-  return useMutation({
-    mutationFn: ({
-      appType,
-      providerId,
-    }: {
-      appType: string;
-      providerId: string;
-    }) => proxyApi.switchProxyProvider(appType, providerId),
-    onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-      queryClient.invalidateQueries({
-        queryKey: ["providers", variables.appType],
-      });
-    },
-    onError: (error: Error) => {
-      toast.error(t("proxy.switchFailed", { error: error.message }));
     },
   });
 }

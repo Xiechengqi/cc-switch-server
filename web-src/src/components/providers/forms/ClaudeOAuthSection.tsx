@@ -20,12 +20,18 @@ import {
   Sparkles,
   User,
   X,
+  RefreshCw,
 } from "lucide-react";
 import { useClaudeOauth } from "./hooks/useClaudeOauth";
 import { copyText } from "@/lib/clipboard";
 import { Input } from "@/components/ui/input";
 import type { ClaudeOAuthFlowMode } from "./hooks/useClaudeOauth";
+import type { ManagedAuthAccount } from "@/lib/api";
 import { AccountSubscriptionExpiryControl } from "@/components/settings/AccountSubscriptionExpiryControl";
+import {
+  logoutAccountsAndClearSelection,
+  removeAccountAndUpdateSelection,
+} from "./accountSelectionActions";
 
 interface ClaudeOAuthSectionProps {
   className?: string;
@@ -35,6 +41,13 @@ interface ClaudeOAuthSectionProps {
   onAccountSelect?: (accountId: string | null) => void;
   /** 是否显示已登录账号管理列表 */
   showLoggedInAccounts?: boolean;
+}
+
+export function claudeAccountDisplayLabel(
+  account: Pick<ManagedAuthAccount, "login" | "subscriptionLevel">,
+): string {
+  const plan = account.subscriptionLevel?.trim();
+  return plan ? `${account.login} · ${plan}` : account.login;
 }
 
 /**
@@ -55,6 +68,9 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
   const {
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     authState,
     deviceCode,
     error,
@@ -69,9 +85,10 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
     addAccount,
     cancelAuth,
     submitPasteCode,
-    logout,
-    removeAccount,
+    logoutAsync,
+    removeAccountAsync,
     setDefaultAccount,
+    refetchStatus,
   } = useClaudeOauth();
   const [pasteCode, setPasteCode] = React.useState("");
   React.useEffect(() => {
@@ -94,13 +111,29 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
     onAccountSelect?.(value === "none" ? null : value);
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const startClaudeLogin = (flowMode: ClaudeOAuthFlowMode) => {
@@ -154,6 +187,52 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
     );
   };
 
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <div className={`space-y-4 ${className || ""}`}>
+        <div className="flex items-center justify-between">
+          <Label>{t("claudeOauth.authStatus", "Claude 订阅认证")}</Label>
+          <Badge variant={isStatusError ? "destructive" : "secondary"}>
+            {isStatusError ? t("common.error") : t("common.loading")}
+          </Badge>
+        </div>
+        {isStatusError ? (
+          <div
+            className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+            role="alert"
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <RefreshCw className="h-4 w-4 shrink-0" />
+              {error ||
+                t("common.authStatusLoadFailed", {
+                  defaultValue: "Failed to load Claude authentication status.",
+                })}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isFetchingStatus}
+              onClick={() => void refetchStatus()}
+            >
+              {isFetchingStatus ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-2 h-4 w-4" />
+              )}
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {t("common.loading")}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className={`space-y-4 ${className || ""}`}>
       {/* 认证状态标题 */}
@@ -184,11 +263,20 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
                 key={account.id}
                 className="flex flex-wrap items-center justify-between rounded-md border bg-muted/30 p-2"
               >
-                <div className="flex min-w-0 items-center gap-2">
+                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                   <User className="h-5 w-5 shrink-0 text-muted-foreground" />
-                  <span className="truncate text-sm font-medium">
+                  <span className="min-w-0 max-w-full truncate text-sm font-medium">
                     {account.login}
                   </span>
+                  {account.subscriptionLevel?.trim() && (
+                    <Badge
+                      variant="outline"
+                      className="max-w-full truncate text-xs"
+                      title={account.subscriptionLevel}
+                    >
+                      {account.subscriptionLevel}
+                    </Badge>
+                  )}
                   {defaultAccountId === account.id && (
                     <Badge variant="secondary" className="text-xs">
                       {t("claudeOauth.defaultAccount", "默认")}
@@ -258,9 +346,11 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
               </SelectItem>
               {accounts.map((account) => (
                 <SelectItem key={account.id} value={account.id}>
-                  <div className="flex items-center gap-2">
-                    <User className="h-4 w-4 text-muted-foreground" />
-                    <span>{account.login}</span>
+                  <div className="flex min-w-0 max-w-full items-center gap-2">
+                    <User className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 truncate">
+                      {claudeAccountDisplayLabel(account)}
+                    </span>
                   </div>
                 </SelectItem>
               ))}
@@ -465,6 +555,10 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
         </div>
       )}
 
+      {authState !== "error" && !isWaitingPaste && error && (
+        <p className="text-sm text-red-500">{error}</p>
+      )}
+
       {/* 错误状态 */}
       {authState === "error" && error && (
         <div className="space-y-2">
@@ -488,7 +582,8 @@ export const ClaudeOAuthSection: React.FC<ClaudeOAuthSectionProps> = ({
         <Button
           type="button"
           variant="outline"
-          onClick={logout}
+          onClick={() => void handleLogout()}
+          disabled={isAddingAccount || isSubmittingPaste}
           className="w-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
         >
           <LogOut className="mr-2 h-4 w-4" />

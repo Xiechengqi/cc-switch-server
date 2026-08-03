@@ -8,8 +8,6 @@ export interface ProxyStatus {
   failed_requests: number;
   success_rate: number;
   uptime_seconds: number;
-  current_provider: string | null;
-  current_provider_id: string | null;
   last_request_at: string | null;
   last_error: string | null;
   active_targets?: ActiveTarget[];
@@ -19,6 +17,7 @@ export interface ActiveTarget {
   app_type: string;
   provider_name: string;
   provider_id: string;
+  route_key: string | null;
 }
 
 export interface ProxyServerInfo {
@@ -35,9 +34,7 @@ export interface ProxyTakeoverStatus {
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
-  // 「意图位已开启 但当前还没 current provider」的待接管态。
-  // 后端 derive 计算：enabled && !has_current_provider。
-  // 前端可据此显示「代理已就绪，添加 provider 后自动启用接管」类提示。
+  // 核心应用尚无已启用 Surface 时的待配置态。
   claude_pending?: boolean;
   codex_pending?: boolean;
   gemini_pending?: boolean;

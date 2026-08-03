@@ -43,7 +43,7 @@ market or direct share URL
 - Cursor AgentService 已默认接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；Provider maturity 保持 Experimental，直到 OAuth/API key 真实验收矩阵通过。
 - GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
 - Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
-- Managed OAuth Provider 必须显式绑定账号。Codex OAuth 在全局只允许一个当前反代账号：单账号自动生效，多账号必须由管理员显式选择，并原子重绑未被 Share 占用的 Codex OAuth Provider；请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude 直连始终固定 `currentProviderClaude` 及其绑定账号；Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
+- Managed OAuth Provider Bundle 必须显式绑定账号。Codex OAuth 的 active account 仅是账号中心独立操作的目标，不重绑 Provider 或 Share，也不参与数据面路由。直连请求由 `/r/:routeKey` 精确选择 Claude/Codex/Gemini Surface 及其绑定账号；请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
 - Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
 - Codex context overflow 自动压缩可通过 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 显式启用；它只在业务输出提交前使用同一账号做一次有界摘要和重试，默认关闭且摘要 usage 独立记录。
 - 支持 router installation register、client tunnel、share tunnel、share batch sync、direct share request log sync、pending share edit pull/ack/event 监听。
@@ -63,7 +63,7 @@ market or direct share URL
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | **Claude Code** | `POST /v1/messages` | ✅ Native | Anthropic Messages 原生转发；支持 Claude/Codex/Gemini/OpenRouter 等跨协议 adapter |
-| **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；Images 增量/Cloudflare 心跳；有界 WS cache 与提交前 HTTP/SSE fallback |
+| **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；Images/Responses Cloudflare 心跳与持久化 capability URL；有界 WS cache 与提交前 HTTP/SSE fallback |
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
@@ -132,7 +132,7 @@ curl -fsS -X POST http://127.0.0.1:15721/api/setup/bootstrap \
 2. 浏览器授权后会跳转到本机 `localhost:1455`；页面不可达是远程部署下的预期现象。
 3. 从地址栏提交完整的 `http://localhost:1455/auth/callback?code=...&state=...` URL，Server 校验固定 scheme/host/port/path、state、当前管理员主体和会话期限后交换 token。
 
-只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。存在一条凭据时该账号自动成为当前反代账号；存在多条凭据时必须在 Web 管理面显式选择唯一账号，`needs_selection` 期间所有 Codex OAuth 出站均被阻断。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
+只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。存在一条 Codex 凭据时该账号自动成为账号中心操作目标；存在多条凭据时可在 Web 管理面显式选择，`needs_selection` 只阻断依赖该偏好的账号中心操作，不影响已明确绑定账号的 Route Key 或 Share 数据面。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
 
 或使用 CLI 在启动 HTTP 前写本地配置：
 
@@ -190,8 +190,10 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 scripts/audit/validate-local.sh
 scripts/smoke/smoke-local.sh
-RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
+RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```
+
+`RUN_TESTS=0` 仅用于负向审计：脚本会记录 `local-contracts-unverified`，输出 `decision=blocked` 并以状态码 `1` 退出；不得将其作为本地合同或发布验收通过证据。
 
 有真实 router、market、provider、OAuth 或 Router 内建 Share Market 端到端环境时，把变量写入私有 env 文件后运行：
 
@@ -274,8 +276,9 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
+| Codex Images | `CC_SWITCH_IMAGE_PUBLIC_BASE_URL` 固定公开 origin；`CC_SWITCH_IMAGE_STORE_DIR` 指定可跨重启的 capability 目录，多副本共享时底层文件系统必须支持跨进程锁和 atomic rename |
 | OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
-| Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
+| Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
 | 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`DIRECT_SHARE_URL` 及各真实 Provider token |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
@@ -288,6 +291,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
 - `shares.json` / `tunnels.json`：Share、binding、ACL、Router 管理的 Share Market entitlement 和 tunnel runtime。
 - `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
+- `image-capabilities/`：默认的短期图片 capability payload/metadata；URL 默认跨重启有效 1 小时，内容仍属于敏感生成结果。
 - `email-auth.json` 及运行时生成的日志/备份目录。
 
 这些文件可能包含 token、secret 或账号信息，不能提交到 git。

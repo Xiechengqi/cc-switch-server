@@ -11,6 +11,8 @@ SKELETON_TOTAL=0
 OAUTH_NATIVE_READY=false
 OAUTH_GATE_STATUS="unknown"
 GROK_GATE_STATUS="unknown"
+CLAUDE_MAX_5X_GATE_STATUS="unknown"
+CLAUDE_MAX_20X_GATE_STATUS="unknown"
 
 pass() { echo "[PASS] $*"; }
 warn() { WARNINGS=$((WARNINGS + 1)); echo "[WARN] $*"; }
@@ -67,7 +69,7 @@ check_any_var() {
 check_grok_external_gate() {
   local missing=()
   local var
-  for var in GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_PROVIDER_ID; do
+  for var in GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_ROUTE_KEY; do
     if ! env_present "$var"; then
       missing+=("$var")
     fi
@@ -86,6 +88,19 @@ check_grok_external_gate() {
       echo "[EXTERNAL-OPTIONAL] $var is not set"
     fi
   done
+}
+
+check_claude_max_external_gate() {
+  local label="$1"
+  local account_var="$2"
+  local status_var="$3"
+  if env_present "$account_var"; then
+    printf -v "$status_var" '%s' "inputs-ready"
+    echo "[EXTERNAL-READY] $label account present; live plan validation has not run"
+  else
+    printf -v "$status_var" '%s' "blocked-inputs"
+    echo "[EXTERNAL-BLOCKED] $label missing $account_var"
+  fi
 }
 
 echo "== local fixtures =="
@@ -134,6 +149,8 @@ check_required_vars "AB5 Codex OAuth" CODEX_OAUTH_TEST_ACCOUNT CODEX_OAUTH_CALLB
 check_any_var "AB5 Codex refresh/import fixture" CODEX_OAUTH_REFRESH_TOKEN_FIXTURE CODEX_OAUTH_REFRESH_TOKEN
 check_required_vars "AB6 Claude OAuth" CLAUDE_OAUTH_TEST_ACCOUNT CLAUDE_OAUTH_CALLBACK_URL
 check_any_var "AB6 Claude refresh/import fixture" CLAUDE_OAUTH_REFRESH_TOKEN_FIXTURE CLAUDE_OAUTH_REFRESH_TOKEN
+check_claude_max_external_gate "AB6 Claude Max 5x plan resolution" CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT CLAUDE_MAX_5X_GATE_STATUS
+check_claude_max_external_gate "AB6 Claude Max 20x plan resolution" CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT CLAUDE_MAX_20X_GATE_STATUS
 check_required_vars "AB6 Gemini OAuth" GEMINI_OAUTH_TEST_ACCOUNT GEMINI_OAUTH_CALLBACK_URL
 check_any_var "AB6 Gemini refresh/import fixture" GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE GEMINI_OAUTH_REFRESH_TOKEN GEMINI_CLI_CREDENTIALS_FIXTURE
 check_required_vars "AB6 Antigravity/Agy OAuth" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
@@ -157,6 +174,8 @@ if [[ -n "$EVIDENCE_FILE" ]]; then
   EVIDENCE_STATUS="$([[ "$FAILURES" -eq 0 ]] && echo pass || echo fail)" \
   OAUTH_NATIVE_READY="$OAUTH_NATIVE_READY" OAUTH_GATE_STATUS="$OAUTH_GATE_STATUS" \
   GROK_GATE_STATUS="$GROK_GATE_STATUS" \
+  CLAUDE_MAX_5X_GATE_STATUS="$CLAUDE_MAX_5X_GATE_STATUS" \
+  CLAUDE_MAX_20X_GATE_STATUS="$CLAUDE_MAX_20X_GATE_STATUS" \
   CURSOR_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
   COPILOT_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
   KIRO_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \

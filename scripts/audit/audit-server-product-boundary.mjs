@@ -262,14 +262,34 @@ export function providerEditorBoundaryViolations(sources) {
   }
 
   const app = sources["web-src/src/ServerApp.tsx"] ?? "";
-  if (!app.includes("@/server/providers/useServerProviderActions")) {
+  if (!app.includes("@/server/providers/bundles/ProviderBundlesPage")) {
     violations.push(
-      "web-src/src/ServerApp.tsx: missing Server-only Provider action boundary",
+      "web-src/src/ServerApp.tsx: missing Server-only Provider Bundle boundary",
     );
   }
-  if (app.includes("@/hooks/useProviderActions")) {
+  for (const forbiddenImport of [
+    "@/hooks/useProviderActions",
+    "@/server/providers/useServerProviderActions",
+  ]) {
+    if (!app.includes(forbiddenImport)) continue;
     violations.push(
-      "web-src/src/ServerApp.tsx: imports non-Server Provider action dispatcher",
+      `web-src/src/ServerApp.tsx: imports obsolete Provider action dispatcher ${forbiddenImport}`,
+    );
+  }
+
+  const bundlesPage =
+    sources["web-src/src/server/providers/bundles/ProviderBundlesPage.tsx"] ?? "";
+  if (!bundlesPage.includes("./ProviderBundleEditor")) {
+    violations.push(
+      "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx: missing Provider Bundle editor boundary",
+    );
+  }
+
+  const bundleEditor =
+    sources["web-src/src/server/providers/bundles/ProviderBundleEditor.tsx"] ?? "";
+  if (!bundleEditor.includes("@/lib/api/providers")) {
+    violations.push(
+      "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx: missing Server Provider API boundary",
     );
   }
 
@@ -352,6 +372,8 @@ export function auditServerProductBoundary(root = repoRoot) {
     "web-src/src/components/providers/EditProviderDialog.tsx",
     "web-src/src/ServerApp.tsx",
     "web-src/src/server/providers/useServerProviderActions.ts",
+    "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx",
+    "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx",
   ];
   violations.push(
     ...providerEditorBoundaryViolations(

@@ -5,3 +5,4 @@ export * from "./proxy";
 export * from "./share";
 export * from "./emailAuth";
 export * from "./upgradePolicy";
+export * from "./accounts";

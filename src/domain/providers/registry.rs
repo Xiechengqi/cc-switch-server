@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 3;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -75,6 +75,7 @@ impl ProviderKey {
 pub struct ProviderRegistry {
     pub format: String,
     pub schema_version: u32,
+    pub families: Vec<ProviderFamilySpec>,
     pub profiles: Vec<ProfileSpec>,
     pub drivers: Vec<DriverSpec>,
     #[serde(default)]
@@ -88,6 +89,33 @@ pub struct ProviderRegistry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderFamilySpec {
+    pub family_id: String,
+    pub label: String,
+    pub credential_profile_id: ProfileId,
+    pub endpoint_scope: ProviderFieldScope,
+    pub headers_scope: ProviderFieldScope,
+    pub driver_options_scope: ProviderFieldScope,
+    pub surfaces: Vec<ProviderFamilySurfaceSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderFamilySurfaceSpec {
+    pub app: AppKind,
+    pub profile_id: ProfileId,
+    pub default_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFieldScope {
+    Bundle,
+    Surface,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileSpec {
     pub profile_id: ProfileId,
@@ -110,7 +138,7 @@ pub struct ProfileSpec {
     pub maturity: ProfileMaturity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -142,7 +170,7 @@ pub enum EndpointPolicy {
     FrozenLegacy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "mode",
     rename_all = "snake_case",
@@ -236,6 +264,7 @@ pub enum OutboundIdentityPolicy {
 pub enum ManagedIdentityFamily {
     ClaudeCode,
     CodexCli,
+    GeminiCli,
     GrokCli,
     Kiro,
     Cursor,
@@ -385,6 +414,22 @@ pub fn profile_by_id(profile_id: &str) -> Option<&'static ProfileSpec> {
         .profiles
         .iter()
         .find(|profile| profile.profile_id.as_str() == profile_id)
+}
+
+pub fn family_by_id(family_id: &str) -> Option<&'static ProviderFamilySpec> {
+    provider_registry()
+        .families
+        .iter()
+        .find(|family| family.family_id == family_id)
+}
+
+pub fn family_for_profile(profile_id: &str) -> Option<&'static ProviderFamilySpec> {
+    provider_registry().families.iter().find(|family| {
+        family
+            .surfaces
+            .iter()
+            .any(|surface| surface.profile_id.as_str() == profile_id)
+    })
 }
 
 pub fn profile_for_legacy_preset(app: AppKind, legacy_name: &str) -> Option<&'static ProfileSpec> {
@@ -566,8 +611,106 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         )?;
     }
 
+    let creatable_profile_ids = registry
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile.visibility == ProfileVisibility::Visible
+                && profile.creation_policy == CreationPolicy::CreateAllowed
+        })
+        .map(|profile| profile.profile_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut family_ids = BTreeSet::new();
+    let mut family_profile_ids = BTreeSet::new();
+    for family in &registry.families {
+        validate_registry_id(&family.family_id, "family")?;
+        if !family_ids.insert(family.family_id.as_str()) {
+            bail!("duplicate Provider family id {}", family.family_id);
+        }
+        if family.label.trim().is_empty() || family.label != family.label.trim() {
+            bail!("Provider family {} has an invalid label", family.family_id);
+        }
+        if family.surfaces.is_empty() || family.surfaces.len() > 3 {
+            bail!(
+                "Provider family {} must contain between one and three surfaces",
+                family.family_id
+            );
+        }
+        let credential_profile = registry
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == family.credential_profile_id)
+            .with_context(|| {
+                format!(
+                    "Provider family {} references unknown credential profile {}",
+                    family.family_id, family.credential_profile_id
+                )
+            })?;
+        let mut apps = BTreeSet::new();
+        for surface in &family.surfaces {
+            if !apps.insert(surface.app) {
+                bail!(
+                    "Provider family {} repeats the {} surface",
+                    family.family_id,
+                    surface.app.as_str()
+                );
+            }
+            let profile = registry
+                .profiles
+                .iter()
+                .find(|profile| profile.profile_id == surface.profile_id)
+                .with_context(|| {
+                    format!(
+                        "Provider family {} references unknown profile {}",
+                        family.family_id, surface.profile_id
+                    )
+                })?;
+            if profile.app != surface.app {
+                bail!(
+                    "Provider family {} surface {} references a profile from another app",
+                    family.family_id,
+                    surface.app.as_str()
+                );
+            }
+            if profile.visibility != ProfileVisibility::Visible
+                || profile.creation_policy != CreationPolicy::CreateAllowed
+            {
+                bail!(
+                    "Provider family {} references non-creatable profile {}",
+                    family.family_id,
+                    surface.profile_id
+                );
+            }
+            if profile.credential_policy != credential_profile.credential_policy {
+                bail!(
+                    "Provider family {} surfaces do not share one credential policy",
+                    family.family_id
+                );
+            }
+            if !family_profile_ids.insert(surface.profile_id.as_str()) {
+                bail!(
+                    "Provider profile {} belongs to more than one family",
+                    surface.profile_id
+                );
+            }
+        }
+    }
+    if family_profile_ids != creatable_profile_ids {
+        let missing = creatable_profile_ids
+            .difference(&family_profile_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        let unexpected = family_profile_ids
+            .difference(&creatable_profile_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        bail!(
+            "Provider family coverage disagrees with creatable profiles; missing={missing:?}, unexpected={unexpected:?}"
+        );
+    }
+
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 17usize),
+        (AppKind::Claude, 19usize),
         (AppKind::Codex, 9usize),
         (AppKind::Gemini, 6usize),
     ]);
@@ -590,9 +733,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 38 {
+    if registry.profiles.len() != 40 {
         bail!(
-            "Provider registry contains {} profiles, expected 38",
+            "Provider registry contains {} profiles, expected 40",
             registry.profiles.len()
         );
     }
@@ -638,8 +781,10 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         }
     }
 
-    let direct_profile_ids = BTreeSet::from([
+    let reviewed_first_class_additions = BTreeSet::from([
         "claude.anthropic_api_key",
+        "claude.bearer_relay",
+        "claude.google_oauth",
         "codex.openai_api_key",
         "gemini.google_api_key",
     ]);
@@ -650,12 +795,22 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             !matches!(
                 profile.form_composition,
                 FormComposition::Custom | FormComposition::Legacy
-            ) && !direct_profile_ids.contains(profile.profile_id.as_str())
+            ) && !reviewed_first_class_additions.contains(profile.profile_id.as_str())
         })
         .map(|profile| profile.profile_id.as_str())
         .collect::<BTreeSet<_>>();
     if mapped_profile_ids != expected_mapped_profile_ids {
-        bail!("legacy preset mappings do not cover exactly the 29 historical Profiles");
+        let missing = expected_mapped_profile_ids
+            .difference(&mapped_profile_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        let unexpected = mapped_profile_ids
+            .difference(&expected_mapped_profile_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        bail!(
+            "legacy preset mappings disagree with historical Profiles; missing={missing:?}, unexpected={unexpected:?}"
+        );
     }
 
     let tombstones = registry
@@ -939,7 +1094,7 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.profiles.len(), 38);
+        assert_eq!(registry.profiles.len(), 40);
         assert_eq!(registry.legacy_preset_mappings.len(), 29);
         assert_eq!(
             registry
@@ -965,6 +1120,76 @@ mod tests {
             let profile = profile_for_legacy_preset(mapping.app, &mapping.legacy_name).unwrap();
             assert_eq!(profile.app, mapping.app);
             assert_eq!(profile.profile_id, mapping.profile_id);
+        }
+    }
+
+    #[test]
+    fn required_provider_type_app_pairs_have_a_creatable_visible_profile() {
+        let required = [
+            (ProviderType::Claude, AppKind::Claude),
+            (ProviderType::ClaudeAuth, AppKind::Claude),
+            (ProviderType::ClaudeOAuth, AppKind::Claude),
+            (ProviderType::Codex, AppKind::Codex),
+            (ProviderType::CodexOAuth, AppKind::Claude),
+            (ProviderType::CodexOAuth, AppKind::Codex),
+            (ProviderType::Gemini, AppKind::Gemini),
+            (ProviderType::GeminiCli, AppKind::Claude),
+            (ProviderType::GeminiCli, AppKind::Gemini),
+            (ProviderType::OpenRouter, AppKind::Claude),
+            (ProviderType::OpenRouter, AppKind::Codex),
+            (ProviderType::OpenRouter, AppKind::Gemini),
+            (ProviderType::GitHubCopilot, AppKind::Claude),
+            (ProviderType::DeepSeekAccount, AppKind::Claude),
+            (ProviderType::KiroOAuth, AppKind::Claude),
+            (ProviderType::CursorOAuth, AppKind::Claude),
+            (ProviderType::CursorOAuth, AppKind::Codex),
+            (ProviderType::CursorApiKey, AppKind::Claude),
+            (ProviderType::CursorApiKey, AppKind::Codex),
+            (ProviderType::AntigravityOAuth, AppKind::Claude),
+            (ProviderType::AntigravityOAuth, AppKind::Gemini),
+            (ProviderType::AgyOAuth, AppKind::Claude),
+            (ProviderType::AgyOAuth, AppKind::Gemini),
+            (ProviderType::OllamaCloud, AppKind::Claude),
+            (ProviderType::OllamaCloud, AppKind::Codex),
+            (ProviderType::AwsBedrock, AppKind::Claude),
+            (ProviderType::Nvidia, AppKind::Claude),
+            (ProviderType::Nvidia, AppKind::Codex),
+            (ProviderType::DeepSeekApi, AppKind::Claude),
+            (ProviderType::DeepSeekApi, AppKind::Codex),
+            (ProviderType::GrokOAuth, AppKind::Claude),
+            (ProviderType::GrokOAuth, AppKind::Codex),
+            (ProviderType::GrokOAuth, AppKind::Gemini),
+        ];
+
+        for (provider_type, app) in required {
+            let profiles = provider_registry()
+                .profiles
+                .iter()
+                .filter(|profile| {
+                    profile.app == app
+                        && profile.compatibility_provider_type == Some(provider_type)
+                        && profile.visibility == ProfileVisibility::Visible
+                        && profile.creation_policy == CreationPolicy::CreateAllowed
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !profiles.is_empty(),
+                "missing visible create_allowed Profile for {}:{}",
+                app.as_str(),
+                provider_type.as_str()
+            );
+            for profile in profiles {
+                if let CredentialPolicy::ManagedAccount {
+                    account_provider_type,
+                } = &profile.credential_policy
+                {
+                    assert_eq!(
+                        *account_provider_type, provider_type,
+                        "{}",
+                        profile.profile_id
+                    );
+                }
+            }
         }
     }
 
@@ -1022,6 +1247,17 @@ mod tests {
                 .outbound_identity_policy,
             OutboundIdentityPolicy::ManagedIdentity {
                 family: ManagedIdentityFamily::CodexCli
+            }
+        );
+        assert_eq!(
+            registry
+                .drivers
+                .iter()
+                .find(|driver| driver.driver_id.as_str() == "oauth.gemini_code_assist")
+                .unwrap()
+                .outbound_identity_policy,
+            OutboundIdentityPolicy::ManagedIdentity {
+                family: ManagedIdentityFamily::GeminiCli
             }
         );
         assert_eq!(

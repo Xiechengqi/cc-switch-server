@@ -88,8 +88,8 @@ use crate::api::web::runtime::{self as web_runtime, WebRuntimeCommandSupport};
 use crate::build_info::build_info;
 use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
 use crate::clients::oauth::refresh::{
-    account_needs_native_refresh, execute_native_account_refresh, execute_oauth_json_request,
-    execute_oauth_token_request, provider_native_refresh_available, AccountRefreshFailure,
+    account_needs_native_refresh, execute_oauth_json_request, execute_oauth_token_request,
+    provider_native_refresh_available, AccountRefreshFailure,
 };
 
 use crate::domain::accounts::cursor_import::{
@@ -100,17 +100,17 @@ use crate::domain::accounts::login::{
     OAuthLoginError, OAuthLoginFinish, OAuthLoginFinishAttempt, OAuthLoginStart, OAuthLoginStatus,
     OAuthSessionPollState,
 };
-use crate::domain::accounts::managers::{manager_for, AccountManager};
+use crate::domain::accounts::managers::{
+    manager_for, AccountManager, AccountRefreshFlightFailure, AccountRefreshFlightFailureDetails,
+    AccountRefreshFlightStage,
+};
 use crate::domain::accounts::oauth::{
     build_cursor_profile_request, build_profile_request, build_refresh_request,
     oauth_provider_spec, token_expires_soon, upsert_input_from_login_response,
     upsert_input_from_verified_grok_login_response,
     upsert_input_from_verified_openai_login_response, OAuthAuthorizeFlow, OAuthHttpRequest,
 };
-use crate::domain::accounts::store::{
-    Account, AccountRefreshUpdate, AccountStore, UpsertAccountInput,
-};
-use crate::domain::providers::current_provider;
+use crate::domain::accounts::store::{Account, UpsertAccountInput};
 use crate::domain::providers::model::{
     classify_provider_response, AppKind, Provider, ProviderType, ProviderTypeRequest,
     ProviderTypeResponse,
@@ -201,6 +201,20 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/backup/:id/restore", post(restore_backup))
         .route("/api/backups/:id/restore", post(restore_backup))
         .route("/api/config", get(config_snapshot))
+        .route(
+            "/api/provider-bundles",
+            get(list_provider_bundles).post(create_provider_bundle),
+        )
+        .route(
+            "/api/provider-bundles/:id",
+            get(get_provider_bundle)
+                .patch(update_provider_bundle)
+                .delete(delete_provider_bundle),
+        )
+        .route(
+            "/api/provider-bundles/:id/delete-preview",
+            get(provider_bundle_delete_preview),
+        )
         .route("/api/providers", get(list_providers).post(create_provider))
         .route(
             "/api/providers/:id",
@@ -588,6 +602,94 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/v1beta/*path", any(proxy_gemini))
         .route("/gemini/v1/*path", any(proxy_gemini))
         .route("/gemini/v1beta/*path", any(proxy_gemini))
+        .route(
+            "/r/:route_key/v1/messages",
+            post(proxy_route_claude_messages),
+        )
+        .route(
+            "/r/:route_key/v1/messages/count_tokens",
+            post(proxy_route_claude_count_tokens),
+        )
+        .route(
+            "/r/:route_key/v1/models",
+            get(proxy_route_models_or_manifest),
+        )
+        .route("/r/:route_key/models", get(proxy_route_models_or_manifest))
+        .route(
+            "/r/:route_key/backend-api/codex/models",
+            get(proxy_route_codex_models_manifest),
+        )
+        .route(
+            "/r/:route_key/v1/chat/completions",
+            post(proxy_route_codex_chat_completions),
+        )
+        .route(
+            "/r/:route_key/v1/responses",
+            post(proxy_route_codex_responses).get(proxy_route_codex_responses_ws),
+        )
+        .route(
+            "/r/:route_key/v1/responses/compact",
+            post(proxy_route_codex_responses_compact).get(proxy_route_codex_responses_ws),
+        )
+        .route(
+            "/r/:route_key/v1/responses/input_tokens",
+            post(proxy_responses_input_tokens),
+        )
+        .route(
+            "/r/:route_key/v1/alpha/search",
+            post(proxy_route_codex_alpha_search),
+        )
+        .route(
+            "/r/:route_key/alpha/search",
+            post(proxy_route_codex_alpha_search),
+        )
+        .route(
+            "/r/:route_key/backend-api/codex/alpha/search",
+            post(proxy_route_codex_alpha_search),
+        )
+        .route(
+            "/r/:route_key/v1/images/generations",
+            post(proxy_route_images_generations).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/r/:route_key/images/generations",
+            post(proxy_route_images_generations).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/r/:route_key/v1/images/edits",
+            post(proxy_route_images_edits).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/r/:route_key/images/edits",
+            post(proxy_route_images_edits).layer(DefaultBodyLimit::max(
+                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/r/:route_key/v1/videos/generations",
+            post(proxy_route_grok_videos_generations)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/r/:route_key/videos/generations",
+            post(proxy_route_grok_videos_generations)
+                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/r/:route_key/v1/videos/:request_id",
+            get(proxy_route_grok_video_status),
+        )
+        .route(
+            "/r/:route_key/videos/:request_id",
+            get(proxy_route_grok_video_status),
+        )
+        .route("/r/:route_key/v1beta/*path", any(proxy_route_gemini))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             verify_router_ingress,
@@ -935,29 +1037,48 @@ async fn proxy_models(
     headers: HeaderMap,
     Query(query): Query<ModelsQuery>,
 ) -> Json<OpenAiModelsResponse> {
-    let provider_id = query
-        .provider_id
-        .as_deref()
-        .or_else(|| {
-            headers
-                .get("x-cc-provider-id")
-                .and_then(|value| value.to_str().ok())
-        })
+    let share_id = headers
+        .get("x-cc-switch-share-id")
+        .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let app = if share_id.is_some() {
+        Some(query.app.unwrap_or(AppKind::Codex))
+    } else {
+        query.app
+    };
+    let provider_id = if let (Some(share_id), Some(app)) = (share_id, app) {
+        state
+            .shares
+            .read()
+            .await
+            .shares
+            .iter()
+            .find(|share| share.id == share_id && share.enabled && share.status == "active")
+            .and_then(|share| {
+                share
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.app == app)
+                    .map(|binding| binding.provider_id.clone())
+            })
+    } else {
+        None
+    };
+    proxy_models_for_selection(&state, app, provider_id.as_deref()).await
+}
+
+async fn proxy_models_for_selection(
+    state: &ServerState,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Json<OpenAiModelsResponse> {
     let providers = state.providers.read().await.clone();
-    let mut data = openai_model_list(&providers.providers, query.app, provider_id);
-    let cursor_catalog = append_cursor_api_key_models(
-        &state,
-        &providers.providers,
-        query.app,
-        provider_id,
-        &mut data,
-    )
-    .await;
-    let ui_settings = state.ui_settings.read().await.value.clone();
-    let grok_provider =
-        resolve_grok_catalog_provider(&providers, &ui_settings, query.app, provider_id).cloned();
+    let mut data = openai_model_list(&providers.providers, app, provider_id);
+    let cursor_catalog =
+        append_cursor_api_key_models(state, &providers.providers, app, provider_id, &mut data)
+            .await;
+    let grok_provider = resolve_grok_catalog_provider(&providers, app, provider_id).cloned();
     #[cfg(test)]
     let grok_models_test_url = grok_provider.as_ref().and_then(|provider| {
         providers
@@ -981,9 +1102,10 @@ async fn proxy_models(
                 )
             } else {
                 let refresh = state
-                    .refresh_managed_account_if_needed(
+                    .refresh_managed_account_if_needed_for_generation(
                         ProviderType::GrokOAuth,
-                        Some(account_id.as_str()),
+                        account_id.as_str(),
+                        expected_generation,
                     )
                     .await;
                 if let Err(error) = refresh {
@@ -1001,10 +1123,7 @@ async fn proxy_models(
                     )
                 } else {
                     let account = state
-                        .find_account_for_provider(
-                            ProviderType::GrokOAuth,
-                            Some(account_id.as_str()),
-                        )
+                        .find_account_for_provider(ProviderType::GrokOAuth, account_id.as_str())
                         .await
                         .filter(|account| account.auth_identity_generation == expected_generation);
                     if let Some((account, access_token)) = account.as_ref().and_then(|account| {
@@ -1114,14 +1233,13 @@ async fn append_cursor_api_key_models(
     data: &mut Vec<OpenAiModel>,
 ) -> Option<CursorCatalogUse> {
     const CURSOR_MODEL_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
-    let accounts = state.accounts_snapshot().await;
     let mut used_catalog: Option<CursorCatalogUse> = None;
     for provider in providers.iter().filter(|provider| {
         provider.provider_type == ProviderType::CursorApiKey
             && app.is_none_or(|app| provider.app == app)
             && provider_id.is_none_or(|id| provider.provider.id == id)
     }) {
-        let Some(api_key) = cursor_provider_api_key(provider, &accounts) else {
+        let Some(api_key) = cursor_provider_api_key(provider) else {
             continue;
         };
         let key_hash = hex::encode(sha2::Sha256::digest(api_key.as_bytes()));
@@ -1207,7 +1325,7 @@ async fn append_cursor_api_key_models(
     used_catalog
 }
 
-fn cursor_provider_api_key(provider: &StoredProvider, accounts: &AccountStore) -> Option<String> {
+fn cursor_provider_api_key(provider: &StoredProvider) -> Option<String> {
     provider
         .provider
         .settings_config
@@ -1237,20 +1355,58 @@ fn cursor_provider_api_key(provider: &StoredProvider, accounts: &AccountStore) -
                     .map(str::to_string)
             })
         })
-        .or_else(|| {
-            let account_id = provider
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref())?;
-            accounts
-                .find_for_provider(ProviderType::CursorApiKey, Some(account_id))
-                .and_then(|account| account.api_key.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
+}
+
+#[cfg(test)]
+mod cursor_provider_api_key_tests {
+    use super::*;
+    use crate::domain::providers::model::{AuthBinding, ProviderMeta};
+    use crate::domain::providers::store::ProviderResourceMetadata;
+
+    fn cursor_provider(settings_config: Value) -> StoredProvider {
+        StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: "cursor-static".to_string(),
+                name: "Cursor API Key".to_string(),
+                settings_config,
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account".to_string()),
+                        auth_provider: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                        account_id: Some("stale-metadata-account".to_string()),
+                        auth_identity_generation: Some(8),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorApiKey,
+            provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
+            resource: ProviderResourceMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn stale_metadata_binding_does_not_supply_cursor_api_key() {
+        let provider = cursor_provider(json!({}));
+
+        assert_eq!(cursor_provider_api_key(&provider), None);
+    }
+
+    #[test]
+    fn cursor_api_key_comes_from_provider_configuration() {
+        let provider = cursor_provider(json!({
+            "env": {"CURSOR_API_KEY": " provider-secret "}
+        }));
+
+        assert_eq!(
+            cursor_provider_api_key(&provider).as_deref(),
+            Some("provider-secret")
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1258,8 +1414,6 @@ fn cursor_provider_api_key(provider: &StoredProvider, accounts: &AccountStore) -
 struct ModelsDispatchQuery {
     #[serde(default)]
     app: Option<AppKind>,
-    #[serde(default)]
-    provider_id: Option<String>,
     #[serde(default, rename = "client_version")]
     client_version: Option<String>,
 }
@@ -1279,16 +1433,46 @@ async fn proxy_models_or_manifest(
             .map_err(ApiError::proxy);
     }
 
-    Ok(proxy_models(
-        State(state),
-        headers,
-        Query(ModelsQuery {
-            app: query.app,
-            provider_id: query.provider_id,
-        }),
+    Ok(
+        proxy_models(State(state), headers, Query(ModelsQuery { app: query.app }))
+            .await
+            .into_response(),
     )
-    .await
-    .into_response())
+}
+
+async fn proxy_route_models_or_manifest(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ModelsDispatchQuery>,
+) -> Result<Response, ApiError> {
+    if query
+        .client_version
+        .as_deref()
+        .is_some_and(|version| !version.trim().is_empty())
+    {
+        return proxy::forward_codex_models_manifest_for_route_key(
+            state,
+            route_key,
+            headers,
+            query.client_version,
+        )
+        .await
+        .map_err(ApiError::proxy);
+    }
+    let provider_id = state
+        .provider_id_for_route_key(AppKind::Codex, &route_key)
+        .await
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no enabled codex Surface is configured for route key {route_key}"
+            ))
+        })?;
+    Ok(
+        proxy_models_for_selection(&state, Some(AppKind::Codex), Some(&provider_id))
+            .await
+            .into_response(),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1306,12 +1490,39 @@ async fn proxy_codex_models_manifest(
         .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_codex_models_manifest(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<CodexModelsManifestQuery>,
+) -> Result<Response, ApiError> {
+    proxy::forward_codex_models_manifest_for_route_key(
+        state,
+        route_key,
+        headers,
+        query.client_version,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
 async fn proxy_codex_alpha_search(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     proxy::forward_codex_alpha_search(state, headers, body)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_route_codex_alpha_search(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_codex_alpha_search_for_route_key(state, route_key, headers, body)
         .await
         .map_err(ApiError::proxy)
 }
@@ -1385,30 +1596,17 @@ mod responses_input_token_tests {
 
 fn resolve_grok_catalog_provider<'a>(
     providers: &'a crate::domain::providers::store::ProviderStore,
-    ui_settings: &Value,
     app: Option<AppKind>,
-    explicit_provider_id: Option<&str>,
+    provider_id: Option<&str>,
 ) -> Option<&'a StoredProvider> {
-    if let Some(provider_id) = explicit_provider_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        let mut matches = providers.providers.iter().filter(|provider| {
-            provider.provider_type == ProviderType::GrokOAuth
-                && provider.provider.id == provider_id
-                && app.is_none_or(|app| provider.app == app)
-        });
-        let provider = matches.next()?;
-        return matches.next().is_none().then_some(provider);
-    }
-
-    let app = app?;
-    let provider_id = current_provider::resolve_current_provider_id(providers, ui_settings, app)?;
-    providers.providers.iter().find(|provider| {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
         provider.provider_type == ProviderType::GrokOAuth
             && provider.provider.id == provider_id
-            && provider.app == app
-    })
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
 }
 
 fn grok_catalog_managed_account_binding(
@@ -1488,34 +1686,19 @@ mod grok_catalog_provider_tests {
             ..Default::default()
         };
 
-        assert!(resolve_grok_catalog_provider(&providers, &json!({}), None, None).is_none());
+        assert!(resolve_grok_catalog_provider(&providers, None, None).is_none());
     }
 
     #[test]
-    fn model_catalog_uses_explicit_or_app_current_grok_provider() {
+    fn model_catalog_requires_an_explicit_route_or_share_binding() {
         let providers = ProviderStore {
             providers: vec![grok_provider("grok-first"), grok_provider("grok-current")],
             ..Default::default()
         };
-        let ui_settings = json!({"currentProviderCodex": "grok-current"});
-
-        let explicit =
-            resolve_grok_catalog_provider(&providers, &ui_settings, None, Some("grok-first"))
-                .unwrap();
+        let explicit = resolve_grok_catalog_provider(&providers, None, Some("grok-first")).unwrap();
         assert_eq!(explicit.provider.id, "grok-first");
 
-        let current =
-            resolve_grok_catalog_provider(&providers, &ui_settings, Some(AppKind::Codex), None)
-                .unwrap();
-        assert_eq!(current.provider.id, "grok-current");
-
-        assert!(resolve_grok_catalog_provider(
-            &providers,
-            &json!({"currentProviderCodex": ""}),
-            Some(AppKind::Codex),
-            None,
-        )
-        .is_none());
+        assert!(resolve_grok_catalog_provider(&providers, Some(AppKind::Codex), None).is_none());
     }
 
     #[test]
@@ -1527,19 +1710,11 @@ mod grok_catalog_provider_tests {
             ..Default::default()
         };
 
-        assert!(
-            resolve_grok_catalog_provider(&providers, &json!({}), None, Some("shared-id"),)
-                .is_none()
-        );
+        assert!(resolve_grok_catalog_provider(&providers, None, Some("shared-id")).is_none());
         assert_eq!(
-            resolve_grok_catalog_provider(
-                &providers,
-                &json!({}),
-                Some(AppKind::Codex),
-                Some("shared-id"),
-            )
-            .unwrap()
-            .app,
+            resolve_grok_catalog_provider(&providers, Some(AppKind::Codex), Some("shared-id"),)
+                .unwrap()
+                .app,
             AppKind::Codex,
         );
     }
@@ -1600,7 +1775,8 @@ mod grok_catalog_provider_tests {
         let state = catalog_test_state("ephemeral-image-download");
         let image = Bytes::from_static(b"\x89PNG\r\n\x1a\nfixture");
         let handle = state
-            .store_ephemeral_image(image.clone(), "image/png".to_string())
+            .store_image_capability(image.clone(), "image/png".to_string())
+            .await
             .unwrap();
         let path = format!("/v1/images/files/{}", handle.token);
         let app = app_router(state);
@@ -1640,7 +1816,13 @@ mod grok_catalog_provider_tests {
             .await
             .unwrap();
         assert_eq!(head_response.status(), StatusCode::OK);
+        assert_eq!(head_response.headers()[header::CONTENT_TYPE], "image/png");
         assert_eq!(head_response.headers()[header::CONTENT_LENGTH], "15");
+        assert_eq!(
+            head_response.headers()[header::CACHE_CONTROL],
+            "private, no-store, max-age=0"
+        );
+        assert_eq!(head_response.headers()["x-content-type-options"], "nosniff");
         assert!(axum::body::to_bytes(head_response.into_body(), 1024)
             .await
             .unwrap()
@@ -1753,13 +1935,10 @@ mod grok_catalog_provider_tests {
             .unwrap();
         state.inject_account_refresh_persist_failures(1);
 
-        let response = proxy_models(
-            State(state.clone()),
-            HeaderMap::new(),
-            Query(ModelsQuery {
-                app: Some(AppKind::Codex),
-                provider_id: Some("grok-degraded-model-provider".to_string()),
-            }),
+        let response = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("grok-degraded-model-provider"),
         )
         .await
         .0;
@@ -1858,13 +2037,10 @@ mod grok_catalog_provider_tests {
             .await
             .unwrap();
 
-        let response = proxy_models(
-            State(state.clone()),
-            HeaderMap::new(),
-            Query(ModelsQuery {
-                app: Some(AppKind::Codex),
-                provider_id: Some("grok-refresh-rejected-provider".to_string()),
-            }),
+        let response = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("grok-refresh-rejected-provider"),
         )
         .await
         .0;
@@ -1969,16 +2145,10 @@ mod grok_catalog_provider_tests {
             .unwrap();
 
         for provider_id in ["grok-unbound-model-provider", "grok-stale-model-provider"] {
-            let response = proxy_models(
-                State(state.clone()),
-                HeaderMap::new(),
-                Query(ModelsQuery {
-                    app: Some(AppKind::Codex),
-                    provider_id: Some(provider_id.to_string()),
-                }),
-            )
-            .await
-            .0;
+            let response =
+                proxy_models_for_selection(&state, Some(AppKind::Codex), Some(provider_id))
+                    .await
+                    .0;
             assert_eq!(response.source.as_deref(), Some("static_fallback"));
             assert_eq!(response.stale, Some(true));
             assert_eq!(response.fetched_at_ms, None);
@@ -2065,13 +2235,10 @@ mod grok_catalog_provider_tests {
             .await
             .unwrap();
 
-        let response = proxy_models(
-            State(state),
-            HeaderMap::new(),
-            Query(ModelsQuery {
-                app: Some(AppKind::Codex),
-                provider_id: Some("grok-runtime-bound-provider".to_string()),
-            }),
+        let response = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("grok-runtime-bound-provider"),
         )
         .await
         .0;
@@ -2185,6 +2352,24 @@ async fn proxy_claude_messages(
         .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_claude_messages(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_for_route_key(
+        state,
+        ProxyRoute::ClaudeMessages,
+        route_key,
+        None,
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
 async fn proxy_claude_count_tokens(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2193,6 +2378,24 @@ async fn proxy_claude_count_tokens(
     proxy::forward(state, ProxyRoute::ClaudeCountTokens, None, headers, body)
         .await
         .map_err(ApiError::proxy)
+}
+
+async fn proxy_route_claude_count_tokens(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_for_route_key(
+        state,
+        ProxyRoute::ClaudeCountTokens,
+        route_key,
+        None,
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
 }
 
 async fn proxy_codex_chat_completions(
@@ -2205,6 +2408,24 @@ async fn proxy_codex_chat_completions(
         .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_codex_chat_completions(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_for_route_key(
+        state,
+        ProxyRoute::CodexChatCompletions,
+        route_key,
+        None,
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
 async fn proxy_codex_responses(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2213,6 +2434,24 @@ async fn proxy_codex_responses(
     proxy::forward(state, ProxyRoute::CodexResponses, None, headers, body)
         .await
         .map_err(ApiError::proxy)
+}
+
+async fn proxy_route_codex_responses(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_for_route_key(
+        state,
+        ProxyRoute::CodexResponses,
+        route_key,
+        None,
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
 }
 
 async fn proxy_codex_responses_compact(
@@ -2231,12 +2470,41 @@ async fn proxy_codex_responses_compact(
     .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_codex_responses_compact(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_for_route_key(
+        state,
+        ProxyRoute::CodexResponsesCompact,
+        route_key,
+        None,
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
 async fn proxy_codex_responses_ws(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     proxy::forward_codex_responses_ws(state, headers, ws)
+        .await
+        .map_err(ApiError::proxy)
+}
+
+async fn proxy_route_codex_responses_ws(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    proxy::forward_codex_responses_ws_for_route_key(state, route_key, headers, ws)
         .await
         .map_err(ApiError::proxy)
 }
@@ -2251,6 +2519,17 @@ async fn proxy_images_generations(
         .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_images_generations(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_images_generations_for_route_key(state, route_key, headers, body)
+        .await
+        .map_err(ApiError::proxy)
+}
+
 async fn ephemeral_image_file(
     State(state): State<ServerState>,
     Path(token): Path<String>,
@@ -2259,8 +2538,13 @@ async fn ephemeral_image_file(
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(image) = state.ephemeral_image(&token) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let image = match state.image_capability(token).await {
+        Ok(Some(image)) => image,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "image capability read failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     let body = if method == Method::HEAD {
         Body::empty()
@@ -2309,6 +2593,17 @@ async fn proxy_images_edits(
         .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_images_edits(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_images_edits_for_route_key(state, route_key, headers, body)
+        .await
+        .map_err(ApiError::proxy)
+}
+
 async fn proxy_grok_videos_generations(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2316,6 +2611,24 @@ async fn proxy_grok_videos_generations(
 ) -> Result<Response, ApiError> {
     proxy::forward_grok_media(
         state,
+        Method::POST,
+        "/videos/generations".to_string(),
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
+async fn proxy_route_grok_videos_generations(
+    State(state): State<ServerState>,
+    Path(route_key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    proxy::forward_grok_media_for_route_key(
+        state,
+        route_key,
         Method::POST,
         "/videos/generations".to_string(),
         headers,
@@ -2341,6 +2654,23 @@ async fn proxy_grok_video_status(
     .map_err(ApiError::proxy)
 }
 
+async fn proxy_route_grok_video_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((route_key, request_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    proxy::forward_grok_media_for_route_key(
+        state,
+        route_key,
+        Method::GET,
+        format!("/videos/{request_id}"),
+        headers,
+        Bytes::new(),
+    )
+    .await
+    .map_err(ApiError::proxy)
+}
+
 async fn proxy_gemini(
     method: Method,
     State(state): State<ServerState>,
@@ -2356,6 +2686,26 @@ async fn proxy_gemini(
     proxy::forward(state, ProxyRoute::Gemini, Some(path), headers, body)
         .await
         .map_err(ApiError::proxy)
+}
+
+async fn proxy_route_gemini(
+    method: Method,
+    State(state): State<ServerState>,
+    Path((route_key, path)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let _ = method;
+    proxy::forward_for_route_key(
+        state,
+        ProxyRoute::Gemini,
+        route_key,
+        Some(path),
+        headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)
 }
 
 async fn web_dist_missing() -> impl IntoResponse {

@@ -905,8 +905,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Select provider": "选择供应商",
     "Share must be paused before binding changes are accepted.":
       "必须先暂停 Share，才能修改绑定。",
-    "Share routes expose selected providers through router and market flows.":
-      "Share 路由会通过 router 和市场流程暴露选定供应商。",
     "Start tunnel": "启动隧道",
     "Stop tunnel": "停止隧道",
     Subdomain: "子域名",
@@ -1135,8 +1133,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Select provider": "選擇供應商",
     "Share must be paused before binding changes are accepted.":
       "必須先暫停 Share，才能修改綁定。",
-    "Share routes expose selected providers through router and market flows.":
-      "Share 路由會透過 router 和市場流程暴露選定供應商。",
     "Start tunnel": "啟動隧道",
     "Stop tunnel": "停止隧道",
     Subdomain: "子網域",
@@ -1368,8 +1364,6 @@ const phraseResources: Record<Language, Record<string, string>> = {
     "Select provider": "プロバイダーを選択",
     "Share must be paused before binding changes are accepted.":
       "バインド変更には先に Share を一時停止する必要があります。",
-    "Share routes expose selected providers through router and market flows.":
-      "Share ルートは選択したプロバイダーを router とマーケットフローに公開します。",
     "Start tunnel": "トンネル開始",
     "Stop tunnel": "トンネル停止",
     Subdomain: "サブドメイン",

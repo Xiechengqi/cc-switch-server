@@ -70,6 +70,12 @@ import { getIconMetadata } from "@/icons/extracted/metadata";
 import { stableStringify } from "@/lib/stableStringify";
 import { isValidUserAgentHeader } from "@/lib/userAgent";
 import {
+  findAccountCapability,
+  resolveManagedAccountCapabilityState,
+  useAccountCapabilitiesQuery,
+  useManagedAccountsQuery,
+} from "@/lib/query/accounts";
+import {
   customPolicyForProfile,
   driverForProfile,
   modelPoliciesForProfile,
@@ -88,6 +94,7 @@ import {
   createDraftForProfile,
   defaultSingleModel,
   ensureObject,
+  profileAllowsEndpointEditing,
   providerPresetForProfile,
   readEndpoint,
   readModelPolicy,
@@ -198,6 +205,91 @@ interface ServerProviderFormProps {
   initialData?: InitialProviderData;
   showButtons?: boolean;
   onOpenShareSettings?: () => void;
+}
+
+export type ManagedAccountBindingState =
+  | "not_applicable"
+  | "loading"
+  | "load_error"
+  | "unselected"
+  | "missing"
+  | "stale"
+  | "current";
+
+interface ResolveManagedAccountBindingStateInput {
+  managed: boolean;
+  queryStatus: "pending" | "error" | "success";
+  isEditMode: boolean;
+  accountId: string;
+  storedAccountId?: string;
+  storedGeneration?: number;
+  selectedGeneration?: number;
+}
+
+export function resolveManagedAccountBindingState({
+  managed,
+  queryStatus,
+  isEditMode,
+  accountId,
+  storedAccountId,
+  storedGeneration,
+  selectedGeneration,
+}: ResolveManagedAccountBindingStateInput): ManagedAccountBindingState {
+  if (!managed) return "not_applicable";
+  if (queryStatus === "pending") return "loading";
+  if (queryStatus === "error") return "load_error";
+  if (!accountId) return "unselected";
+  if (selectedGeneration == null) return "missing";
+  if (
+    isEditMode &&
+    storedAccountId === accountId &&
+    storedGeneration != null &&
+    storedGeneration !== selectedGeneration
+  ) {
+    return "stale";
+  }
+  return "current";
+}
+
+interface ResolveManagedAccountSelectionInput {
+  currentAccountId: string;
+  currentBinding?: ProviderMeta["authBinding"];
+  nextAccountId: string | null;
+  authProvider: string;
+  accounts?: readonly {
+    id: string;
+    authIdentityGeneration: number;
+  }[];
+}
+
+export function resolveManagedAccountSelection({
+  currentAccountId,
+  currentBinding,
+  nextAccountId,
+  authProvider,
+  accounts,
+}: ResolveManagedAccountSelectionInput): {
+  accountId: string;
+  authBinding: NonNullable<ProviderMeta["authBinding"]>;
+} {
+  const accountId = nextAccountId ?? "";
+  const accountChanged = accountId !== currentAccountId;
+  const authIdentityGeneration = accountChanged
+    ? accounts?.find((account) => account.id === accountId)
+        ?.authIdentityGeneration
+    : currentBinding?.accountId === accountId
+      ? currentBinding.authIdentityGeneration
+      : undefined;
+
+  return {
+    accountId,
+    authBinding: {
+      source: "managed_account",
+      authProvider,
+      accountId,
+      ...(authIdentityGeneration != null ? { authIdentityGeneration } : {}),
+    },
+  };
 }
 
 const CUSTOM_DEFAULT_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
@@ -434,9 +526,14 @@ function buildEditorState(
     ).trim() || "us-east-1";
   if (isLockedPresetProfile(profile)) {
     const presetDraft = createDraftForProfile(profile);
-    const presetEndpoint = canonicalPresetEndpoint(profile, app, awsRegion);
     draft.name = presetDraft.name;
     draft.websiteUrl = presetDraft.websiteUrl;
+  }
+  if (
+    isLockedPresetProfile(profile) &&
+    !profileAllowsEndpointEditing(profile)
+  ) {
+    const presetEndpoint = canonicalPresetEndpoint(profile, app, awsRegion);
     setEndpoint(draft.settingsConfig, app, presetEndpoint);
     if (app === "codex" && typeof draft.settingsConfig.config === "string") {
       draft.settingsConfig.config = setCodexBaseUrl(
@@ -504,10 +601,16 @@ function providerMetaForSubmit(
   }
 
   if (profile.credentialPolicy.mode === "managed_account") {
+    const currentBinding = state.draft.meta.authBinding;
+    const authIdentityGeneration =
+      currentBinding?.accountId === state.accountId
+        ? currentBinding.authIdentityGeneration
+        : undefined;
     meta.authBinding = {
       source: "managed_account",
       authProvider: profile.credentialPolicy.accountProviderType,
       accountId: state.accountId,
+      ...(authIdentityGeneration != null ? { authIdentityGeneration } : {}),
     };
   } else {
     delete meta.authBinding;
@@ -595,13 +698,10 @@ function prepareSettingsForSubmit(
   const settings = clone(state.draft.settingsConfig);
   if (profile.formComposition === "legacy") return settings;
   ensureObject(settings, "env");
-  if (
-    profile.endpointPolicy === "custom" ||
-    profile.endpointPolicy === "override_allowed"
-  ) {
+  if (profileAllowsEndpointEditing(profile)) {
     setEndpoint(settings, app, state.endpoint);
   }
-  if (isLockedPresetProfile(profile)) {
+  if (!profileAllowsEndpointEditing(profile)) {
     const endpoint = canonicalPresetEndpoint(profile, app, state.awsRegion);
     setEndpoint(settings, app, endpoint);
     if (app === "codex" && typeof settings.config === "string") {
@@ -640,8 +740,7 @@ function validateState(
     return t("serverProviderForm.validation.accountRequired");
   }
   if (
-    (profile.endpointPolicy === "custom" ||
-      profile.endpointPolicy === "override_allowed") &&
+    profileAllowsEndpointEditing(profile) &&
     !isValidEndpoint(state.endpoint)
   ) {
     return t("serverProviderForm.validation.endpointInvalid");
@@ -998,6 +1097,59 @@ function ManagedAccountSection({
   onAccountSelect: (accountId: string | null) => void;
 }) {
   const { t } = useTranslation();
+  const capabilityQuery = useAccountCapabilitiesQuery();
+  const capability = findAccountCapability(capabilityQuery.data, providerType);
+  const capabilityState = resolveManagedAccountCapabilityState(
+    capabilityQuery.status,
+    capability,
+  );
+  if (capabilityState === "loading") {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <LoaderCircle className="h-4 w-4 animate-spin" />
+        {t("common.loading")}
+      </div>
+    );
+  }
+  if (capabilityState === "load_error") {
+    return (
+      <div
+        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+        role="alert"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          {t("settings.authCenter.capabilityLoadFailed", {
+            defaultValue: "无法加载账号能力，供应商账号绑定已暂停。",
+          })}
+        </span>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={capabilityQuery.isFetching}
+          onClick={() => void capabilityQuery.refetch()}
+        >
+          {capabilityQuery.isFetching ? (
+            <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <RotateCcw className="mr-2 h-4 w-4" />
+          )}
+          {t("common.retry")}
+        </Button>
+      </div>
+    );
+  }
+  if (capabilityState === "unsupported") {
+    return (
+      <div className="flex items-center gap-2 text-sm text-destructive">
+        <AlertTriangle className="h-4 w-4" />
+        {t("serverProviderForm.unsupportedAccountType", {
+          type: providerType,
+        })}
+      </div>
+    );
+  }
   const common = {
     selectedAccountId: accountId || null,
     onAccountSelect,
@@ -1007,7 +1159,7 @@ function ManagedAccountSection({
     case "claude_oauth":
       return <ClaudeOAuthSection {...common} />;
     case "codex_oauth":
-      return <CodexOAuthSection {...common} />;
+      return <CodexOAuthSection {...common} accountSelectionMode="provider" />;
     case "grok_oauth":
       return <GrokOAuthSection {...common} allowDefaultAccountOption={false} />;
     case "github_copilot":
@@ -1190,6 +1342,9 @@ export function ServerProviderForm({
   };
 
   const profile = profileById(state.profileId);
+  const managedAccountsQuery = useManagedAccountsQuery({
+    enabled: profile?.credentialPolicy.mode === "managed_account",
+  });
   if (!profile || profile.app !== appId) {
     throw new Error(`Provider profile ${state.profileId} is unavailable`);
   }
@@ -1211,6 +1366,26 @@ export function ServerProviderForm({
   const cloneDirty =
     profile.formComposition === "legacy" &&
     cloneDraftFingerprint(cloneDraft) !== cloneBaseline;
+  const selectedManagedAccount = managedAccountsQuery.data?.find(
+    (account) => account.id === state.accountId,
+  );
+  const storedAuthBinding = state.draft.meta.authBinding;
+  const managedAccountBindingState = resolveManagedAccountBindingState({
+    managed: profile.credentialPolicy.mode === "managed_account",
+    queryStatus: managedAccountsQuery.status,
+    isEditMode,
+    accountId: state.accountId,
+    storedAccountId: storedAuthBinding?.accountId,
+    storedGeneration: storedAuthBinding?.authIdentityGeneration,
+    selectedGeneration: selectedManagedAccount?.authIdentityGeneration,
+  });
+  const staleManagedAccountBinding = managedAccountBindingState === "stale";
+  const managedAccountSubmitBlocked = [
+    "loading",
+    "load_error",
+    "missing",
+    "stale",
+  ].includes(managedAccountBindingState);
 
   useEffect(() => {
     onDirtyChange?.(dirty);
@@ -1219,8 +1394,8 @@ export function ServerProviderForm({
     onUnsavedChange?.(dirty || shareDirty || cloneDirty);
   }, [cloneDirty, dirty, onUnsavedChange, shareDirty]);
   useEffect(() => {
-    onSubmitBlockedChange?.(customBindingDirty);
-  }, [customBindingDirty, onSubmitBlockedChange]);
+    onSubmitBlockedChange?.(customBindingDirty || managedAccountSubmitBlocked);
+  }, [customBindingDirty, managedAccountSubmitBlocked, onSubmitBlockedChange]);
   useEffect(
     () => () => {
       onDirtyChange?.(false);
@@ -1303,6 +1478,35 @@ export function ServerProviderForm({
     event.preventDefault();
     if (customBindingDirty) {
       toast.error(t("serverProviderForm.toasts.applyBindingFirst"));
+      return;
+    }
+    if (managedAccountBindingState === "loading") {
+      toast.error(
+        t("serverProviderForm.account.loading", {
+          defaultValue: "Managed accounts are still loading.",
+        }),
+      );
+      return;
+    }
+    if (managedAccountBindingState === "load_error") {
+      toast.error(
+        t("serverProviderForm.account.loadFailed", {
+          defaultValue:
+            "Managed accounts could not be loaded. Retry before saving.",
+        }),
+      );
+      return;
+    }
+    if (managedAccountBindingState === "missing") {
+      toast.error(
+        t("serverProviderForm.account.selectedUnavailable", {
+          defaultValue: "The selected managed account is no longer available.",
+        }),
+      );
+      return;
+    }
+    if (managedAccountBindingState === "stale") {
+      toast.error(t("serverProviderForm.account.identityChanged"));
       return;
     }
     const validationError = validateState(state, profile, t);
@@ -1565,13 +1769,8 @@ export function ServerProviderForm({
 
   const customAuthRequiresSecret = profile.formComposition === "custom";
   const showEndpoint =
-    profile.endpointPolicy === "custom" ||
-    profile.endpointPolicy === "override_allowed" ||
-    Boolean(state.endpoint);
-  const endpointEditable =
-    !isLockedPresetProfile(profile) &&
-    (profile.endpointPolicy === "custom" ||
-      profile.endpointPolicy === "override_allowed");
+    profileAllowsEndpointEditing(profile) || Boolean(state.endpoint);
+  const endpointEditable = profileAllowsEndpointEditing(profile);
   const showCodexOptions =
     driverForProfile(profile)?.driverId === "oauth.openai_codex";
   const allowedModelPolicies = modelPoliciesForProfile(profile);
@@ -1818,12 +2017,110 @@ export function ServerProviderForm({
             providerType={profile.credentialPolicy.accountProviderType}
             accountId={state.accountId}
             onAccountSelect={(accountId) =>
-              setState((current) => ({
-                ...current,
-                accountId: accountId ?? "",
-              }))
+              setState((current) => {
+                if (profile.credentialPolicy.mode !== "managed_account") {
+                  return current;
+                }
+                const selection = resolveManagedAccountSelection({
+                  currentAccountId: current.accountId,
+                  currentBinding: current.draft.meta.authBinding,
+                  nextAccountId: accountId,
+                  authProvider: profile.credentialPolicy.accountProviderType,
+                  accounts: managedAccountsQuery.data,
+                });
+                return {
+                  ...current,
+                  accountId: selection.accountId,
+                  draft: {
+                    ...current.draft,
+                    meta: {
+                      ...current.draft.meta,
+                      authBinding: selection.authBinding,
+                    },
+                  },
+                };
+              })
             }
           />
+          {managedAccountBindingState === "loading" ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+              {t("serverProviderForm.account.loading", {
+                defaultValue: "Loading managed accounts...",
+              })}
+            </div>
+          ) : null}
+          {managedAccountBindingState === "load_error" ||
+          managedAccountBindingState === "missing" ? (
+            <div
+              className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+              role="alert"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                {managedAccountBindingState === "missing"
+                  ? t("serverProviderForm.account.selectedUnavailable", {
+                      defaultValue:
+                        "The selected managed account is no longer available.",
+                    })
+                  : t("serverProviderForm.account.loadFailed", {
+                      defaultValue:
+                        "Managed accounts could not be loaded. Account binding is paused.",
+                    })}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={managedAccountsQuery.isFetching}
+                onClick={() => void managedAccountsQuery.refetch()}
+              >
+                {managedAccountsQuery.isFetching ? (
+                  <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <RotateCcw className="mr-2 h-4 w-4" />
+                )}
+                {t("common.retry")}
+              </Button>
+            </div>
+          ) : null}
+          {staleManagedAccountBinding ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
+              <div className="flex min-w-0 items-start gap-2 text-sm text-amber-700 dark:text-amber-300">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{t("serverProviderForm.account.identityChanged")}</span>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setState((current) => ({
+                    ...current,
+                    draft: {
+                      ...current.draft,
+                      meta: {
+                        ...current.draft.meta,
+                        authBinding: {
+                          source: "managed_account",
+                          authProvider:
+                            profile.credentialPolicy.mode === "managed_account"
+                              ? profile.credentialPolicy.accountProviderType
+                              : undefined,
+                          accountId: current.accountId,
+                          authIdentityGeneration:
+                            selectedManagedAccount?.authIdentityGeneration,
+                        },
+                      },
+                    },
+                  }))
+                }
+              >
+                <RotateCcw className="mr-2 h-4 w-4" />
+                {t("serverProviderForm.account.rebindIdentity")}
+              </Button>
+            </div>
+          ) : null}
         </Section>
       ) : null}
 
@@ -2373,7 +2670,10 @@ export function ServerProviderForm({
           <Button
             type="submit"
             disabled={
-              submitting || customBindingDirty || (isEditMode && !providerDirty)
+              submitting ||
+              customBindingDirty ||
+              managedAccountSubmitBlocked ||
+              (isEditMode && !providerDirty)
             }
           >
             <Save className="mr-2 h-4 w-4" />

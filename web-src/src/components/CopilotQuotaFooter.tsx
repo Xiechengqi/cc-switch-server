@@ -6,7 +6,7 @@ import type { ProviderMeta } from "@/types";
 import { useCopilotQuota } from "@/lib/query/copilot";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 import {
   TierBadge,
@@ -18,6 +18,10 @@ import {
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  formatOauthQuotaRetryDelay,
+  refreshOauthQuotaAndReload,
+} from "@/lib/query/oauthQuotaSnapshot";
 
 interface CopilotQuotaFooterProps {
   meta?: ProviderMeta;
@@ -54,29 +58,47 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
-  const [manualRefreshLoading, setManualRefreshLoading] =
-    React.useState(false);
-  const accountId = resolveManagedAccountId(
+  const [manualRefreshLoading, setManualRefreshLoading] = React.useState(false);
+  const identity = resolveManagedAccountIdentity(
     meta,
     PROVIDER_TYPES.GITHUB_COPILOT,
   );
+  const accountId = identity?.accountId ?? null;
 
   const {
     data: quota,
     isFetching: loading,
     refetch,
-  } = useCopilotQuota(accountId, { enabled: true });
+  } = useCopilotQuota(accountId, identity?.authIdentityGeneration ?? null, {
+    enabled: true,
+  });
   const handleRefresh = React.useCallback(async () => {
     if (manualRefreshLoading) return;
     setManualRefreshLoading(true);
     try {
-      await subscriptionApi.refreshOauthQuota("github_copilot", accountId);
-      await refetch();
+      await refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            "github_copilot",
+            accountId,
+            undefined,
+            undefined,
+            undefined,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
+      );
       setLastManualRefreshAt(Date.now());
     } finally {
       setManualRefreshLoading(false);
     }
-  }, [accountId, manualRefreshLoading, refetch]);
+  }, [
+    accountId,
+    identity?.authIdentityGeneration,
+    manualRefreshLoading,
+    refetch,
+  ]);
   const effectiveLoading = loading || manualRefreshLoading;
   const reportRefreshError = React.useCallback(
     (error: unknown) =>
@@ -85,39 +107,49 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
   );
 
   const displayQueriedAt = resolveQuotaQueriedAt(
-    quota?.queriedAt,
+    quota?.refreshedAt ?? quota?.queriedAt,
     lastManualRefreshAt,
   );
 
   const [now, setNow] = React.useState(Date.now());
   React.useEffect(() => {
-    if (quota?.queriedAt && quota.queriedAt > 0) {
+    const serverRefreshedAt = quota?.refreshedAt ?? quota?.queriedAt;
+    if (serverRefreshedAt && serverRefreshedAt > 0) {
       setLastManualRefreshAt(null);
     }
-  }, [quota?.queriedAt]);
+  }, [quota?.queriedAt, quota?.refreshedAt]);
 
   React.useEffect(() => {
-    if (!displayQueriedAt) return;
+    if (!displayQueriedAt && !quota?.nextRefreshAt) return;
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
-  }, [displayQueriedAt]);
+  }, [displayQueriedAt, quota?.nextRefreshAt]);
 
   if (!quota) return null;
 
   // API 调用失败
   if (!quota.success) {
+    const retryDelay = formatOauthQuotaRetryDelay(quota.nextRefreshAt, now);
+    const retryText = retryDelay
+      ? t("subscription.retryAfter", { time: retryDelay })
+      : null;
+    const statusText = [quota.error || t("subscription.queryFailed"), retryText]
+      .filter(Boolean)
+      .join(" · ");
+    const refreshDisabled = effectiveLoading || Boolean(retryDelay);
+    const failureRefreshTitle = retryText || refreshTitle;
     if (inline) {
       return (
         <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
           <div className="flex items-center gap-1.5 text-red-500 dark:text-red-400">
             <AlertCircle size={12} />
-            <span>{quota.error || t("subscription.queryFailed")}</span>
+            <span>{statusText}</span>
           </div>
           <button
             onClick={() => void handleRefresh().catch(reportRefreshError)}
-            disabled={effectiveLoading}
+            disabled={refreshDisabled}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={refreshTitle}
+            title={failureRefreshTitle}
           >
             <RefreshCw
               size={12}
@@ -127,7 +159,27 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
         </div>
       );
     }
-    return null;
+    return (
+      <div className="mt-3 rounded-xl border border-border-default bg-card px-4 py-3 shadow-sm">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 text-red-500 dark:text-red-400">
+            <AlertCircle size={14} />
+            <span>{statusText}</span>
+          </div>
+          <button
+            onClick={() => void handleRefresh().catch(reportRefreshError)}
+            disabled={refreshDisabled}
+            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
+            title={failureRefreshTitle}
+          >
+            <RefreshCw
+              size={12}
+              className={effectiveLoading ? "animate-spin" : ""}
+            />
+          </button>
+        </div>
+      </div>
+    );
   }
 
   const tiers = quota.tiers;

@@ -218,16 +218,6 @@ export const settingsApi = {
     return await invokeCommand("s3_sync_fetch_remote_info");
   },
 
-  async syncCurrentProvidersLive(): Promise<void> {
-    const result = (await invokeCommand("sync_current_providers_live")) as {
-      success?: boolean;
-      message?: string;
-    };
-    if (!result?.success) {
-      throw new Error(result?.message || "Sync current providers failed");
-    }
-  },
-
   async openExternal(url: string): Promise<void> {
     try {
       const u = new URL(url);

@@ -7,7 +7,7 @@ use crate::domain::accounts::store::{
 use crate::domain::health::ProviderHealthStatus;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
-use crate::domain::providers::runtime::ProviderRuntimePlan;
+use crate::domain::providers::runtime::{authoritative_managed_account, ProviderRuntimePlan};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::Share;
 use crate::domain::usage::store::{UsageLog, UsageStore};
@@ -329,14 +329,7 @@ fn account_for_provider<'a>(
     accounts: Option<&'a AccountStore>,
     provider: &StoredProvider,
 ) -> Option<&'a Account> {
-    let account_id = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())?;
-    accounts
-        .and_then(|accounts| accounts.find_for_provider(provider.provider_type, Some(account_id)))
+    authoritative_managed_account(provider, accounts?)
 }
 
 pub(crate) fn share_bindings(share: &Share) -> Vec<(AppKind, String)> {

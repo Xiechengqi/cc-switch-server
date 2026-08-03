@@ -160,31 +160,6 @@ export function useProxyStatus() {
     },
   });
 
-  // 代理模式切换供应商（热切换）
-  const switchProxyProviderMutation = useMutation({
-    mutationFn: ({
-      appType,
-      providerId,
-    }: {
-      appType: string;
-      providerId: string;
-    }) => invokeCommand("switch_proxy_provider", { appType, providerId }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-    },
-    onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
-      toast.error(
-        t("proxy.switchFailed", {
-          error: detail,
-          defaultValue: `切换失败: ${detail}`,
-        }),
-      );
-    },
-  });
-
   // 检查是否运行中
   const checkRunning = async () => {
     try {
@@ -221,9 +196,6 @@ export function useProxyStatus() {
 
     // 按应用接管开关
     setTakeoverForApp: setTakeoverForAppMutation.mutateAsync,
-
-    // 代理模式下切换供应商
-    switchProxyProvider: switchProxyProviderMutation.mutateAsync,
 
     // 状态检查
     checkRunning,

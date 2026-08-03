@@ -30,22 +30,27 @@ Run the checks manually at:
 
 ## Providers
 
-- Provider list, current provider state, readiness, health, model, account binding, and quota/capability summaries are visible.
-- Create/edit/test/fetch-models/switch actions match server capability gates.
-- Add/Edit only offers Claude, Codex, and Gemini Profiles from the Server registry; OpenCode, OpenClaw, Hermes, Claude Desktop, raw env/TOML/auth editors, automatic failover, and outbound proxy controls never appear.
-- Add Provider uses the icon-based preset grid and exposes every visible, creatable Registry Profile exactly once, including Custom HTTP.
-- Fixed Profile identity cannot be changed by editing a name, URL, category, or compatibility metadata. Custom protocol/auth changes require preview/apply rebind; legacy records expose adopt or clone-as-custom actions instead of an unrestricted raw editor.
-- Fixed preset name, website, and API Endpoint are read-only and submit canonical preset values; Custom and legacy repair flows retain their intended editing controls.
-- Static secrets load through the authenticated, slot-scoped reveal command and appear in a password input with show/copy controls. Opening the editor or loading the current value must not mark the draft dirty; changing the value emits `replace`, restoring the original emits `keep`, and clearing an optional value emits `clear`. Provider list/detail responses remain redacted. Managed Providers require an explicitly selected compatible account, and account/quota refresh does not mark the Provider draft dirty.
-- Provider and Share edits have independent dirty/save state. Saving or failing one section does not silently commit or reset the other, and the Provider Save button is disabled when the canonical draft has not changed.
-- S1 installations show a read-only migration status and blocker codes. The Web UI never applies, rolls back, or cleans the Provider store while the Server is running; it directs the operator to the offline CLI.
-- A fresh data directory is treated as S2 before the first Provider is saved and never shows the S1 migration warning.
-- Planned or diagnostic-only provider combinations are clearly gated and not presented as fully native.
-- Unknown legacy JSON is preserved read-only or blocks S2 cutover; it is not exposed as an editable Server field.
+- The page lists Provider Bundles rather than separate per-App Provider records. Each Bundle title shows the logos for every supported Claude, Codex, and Gemini Surface.
+- Add Provider starts with one Family selector sourced from the Server Provider registry. Selecting a Family automatically creates its complete authoritative Surface set; the operator never adds or removes arbitrary App records.
+- Every visible, creatable Family appears exactly once, including Custom HTTP, and the matrix matches the provider coverage audit. OpenCode, OpenClaw, Hermes, Claude Desktop, Universal Providers, raw env/TOML editors, automatic failover, and outbound proxy controls never appear.
+- Selecting Grok OAuth automatically shows Claude, Codex, and Gemini as icon-labelled tabs. Switching tabs does not discard unsaved values or change Bundle-wide fields.
+- Bundle name, Family identity, OAuth/managed account, shared credentials, common endpoint, shared driver options, and Remote Share controls remain outside the Surface tabs.
+- Each Surface tab contains only that App's enable state, model mapping, custom endpoint override when the Family permits it, protocol/auth configuration when custom binding permits it, Surface credential slots, and headers.
+- Managed Families require one explicitly selected compatible Account shared by their enabled Surfaces. Account and quota refresh updates do not mark unrelated Bundle fields dirty.
+- Static secrets use authenticated slot-scoped reveal and password controls. Opening or revealing a secret does not dirty the draft; edits submit `replace`, an unchanged secret submits `keep`, and clearing an optional secret submits `clear`. List and detail responses remain redacted.
+- Disabling a Surface removes it from the Bundle's enabled App set. That Surface requires no credential, produces no runtime plan or route, and is excluded from Bundle Share bindings.
+- Fixed Family/Profile identity, canonical website, endpoint, protocol, and auth fields cannot be changed through display-name or metadata edits. Custom HTTP exposes only the explicit custom controls allowed by the registry.
+- The editor has exactly one global Save action at the bottom. There are no per-tab Save buttons, and saving submits the complete Bundle plus the one Bundle-scoped Share configuration.
+- Create/edit/test/fetch-model actions follow the capability gates of the active Surface without introducing a current/selected Provider state.
+- Bundle cards and the editor expose no Switch, Select, Set Current, Clear Current, or hot-switch action. Runtime routing is resolved from the request route, Bundle Surface, or Share binding.
+- Saving, reloading, editing, and deleting a Bundle preserve its complete Surface set and revision. A Bundle referenced by a Share cannot be deleted until the reference is removed.
 
 ## Shares
 
 - Share status, owner, tunnel/subdomain, provider binding, ACL, limits, market/grant, pending edits, and connect info are visible.
+- One Provider Bundle maps to at most one Share. All enabled Claude, Codex, and Gemini Surface bindings use that same Share record, subdomain, and Share URL; no per-App Share URL is created.
+- The Bundle editor keeps Remote Share outside the Surface tabs and uses the same bottom Save action. The Server derives bindings from enabled Surfaces instead of trusting App/provider binding fields from the browser.
+- Enabling or disabling a Bundle Surface and saving reconciles that one Share's bindings without changing its URL, ACL, limits, sale settings, or tunnel identity.
 - Share Owner is read-only and always displays Client Owner; Provider Share create/save requests do not submit an independent owner. Changing Client Owner through verified email ownership updates every Share and preserves a valid previous owner as shared access.
 - Pause/resume/binding/tunnel actions are disabled or gated consistently with server state.
 - Share connect info can be inspected without exposing excluded client-only features.
@@ -87,6 +92,10 @@ Run the checks manually at:
 ## Accounts, OAuth, Quota
 
 - Manual/import-only account templates, refresh plan, quota refresh, Codex banked reset, Copilot/Kiro device flow, and OAuth preview/finish states are visible where supported.
+- In Server mode, AuthCenter and every managed-account Provider editor use `/api/accounts/capabilities` as the authority. Loading or request failure must not expose an unverified binding control; metadata-only, deprecated, missing, or `inferenceBindingSupported=false` account types remain hidden or disabled. Static API Key/AWS credentials stay in the Provider form.
+- Antigravity OAuth and Agy OAuth appear as separate AuthCenter entries. Add/list/default/remove and quota refresh for `agy_oauth` update only Agy state/query rows and never display or mutate `antigravity_oauth` accounts as Agy.
+- DeepSeek Account shows an optional account label and a required masked access-token field, never an email/phone plus password login. Import creates a real persisted account, selects it when opened from a Provider form, and list/default/remove survive reload; neither the token nor a password field/value is echoed after import.
+- Quota refresh settings appear only when the capability matrix contains at least one `quotaCapability=live_refresh` entry with `supportsLiveQuotaRefresh=true`. Saving invalidates only authoritative live-refresh roots; imported-snapshot and cached-only accounts are not presented as live polling support.
 - Claude and Grok subscription expiry uses the same monthly/yearly rule control; monthly day, yearly month/day, IANA time zone, next occurrence, automatic Grok precedence, legacy-date migration, save/clear states, and narrow viewport wrapping are verified.
 - Real browser login is not shown as native until capability gates are explicitly opened after real credential validation.
 - Tokens and secrets are never echoed back after save/import.
@@ -102,8 +111,8 @@ Record manual findings in the relevant implementation note or PR/commit summary:
 
 ## Current Status
 
-- 2026-07-03 static-only pass: not run in a browser.
-- Reason: current implementation pass prohibits deployment/startup and UI automation.
-- Static gate used: `scripts/static-checks.sh`; native invoke registry audit currently reports no registered-not-implemented command and checks implemented commands against `web_invoke_dispatch`.
-- Phase M/M1+N2 i18n static pass is implemented: language switch is in Settings, Server-owned zh/zh-TW/en/ja locale files and the lightweight runtime dictionary/`tx()` layer cover page-level and Dashboard body copy, and `scripts/audit/audit-web-i18n-literals.mjs` currently reports zero JSX English literals. Human reviewers still need to check translated text fit in real viewports.
+- 2026-08-03 non-browser validation passed: Rust format/check/test, Web typecheck/unit tests/build, Web runtime contract audit, Provider coverage audit, UI Provider matrix audit, and local HTTP smoke.
+- No browser automation, screenshot test, or automated click flow was run.
+- Offline release readiness remains `blocked_inputs`: real Router/Market/OAuth/Share credentials and deployment acceptance were not supplied. `RUN_TESTS=0` also records the readiness script's own local-test phase as skipped; the full local suites were run separately and passed.
+- Server-owned zh/zh-TW/en/ja locale coverage remains statically validated. Human reviewers still need to check translated text fit in real viewports.
 - Manual wide and narrow viewport checks remain pending for a human reviewer.

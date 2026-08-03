@@ -20,15 +20,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::domain::accounts::store::{Account, AccountStore};
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::model::ProviderType;
+use crate::domain::providers::runtime::{
+    authoritative_managed_account, managed_account_binding_with_generation,
+};
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
 use crate::proxy::adapters::AdapterRequest;
 use crate::state::{AccountInFlightGuard, ServerState, ShareInFlightGuard};
 
-use super::super::forwarder::{record_provider_outcome, record_share_invocation_result};
+use super::super::forwarder::{
+    managed_credential_accounts_snapshot, mark_managed_account_auth_cooldown_for_stored,
+    record_provider_outcome, record_share_invocation_result,
+};
+use super::super::retry_policy::{AuthRecoveryDecision, AuthRecoveryState};
 use super::super::router::ProxyRoute;
 use super::super::usage::{log_usage, update_stream_usage};
 use super::super::{setting, ProxyError};
@@ -65,6 +71,7 @@ use super::tool_resolver::resolve_tool_call;
 const DEFAULT_CURSOR_BACKEND_BASE_URL: &str = "https://api2.cursor.sh";
 const EXCHANGE_USER_API_KEY_PATH: &str = "/auth/exchange_user_api_key";
 const MAX_CURSOR_ERROR_BODY_BYTES: usize = 8 * 1024;
+const CURSOR_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 
 pub struct AgentServiceForwardOptions {
     pub state: ServerState,
@@ -80,6 +87,40 @@ pub struct AgentServiceForwardOptions {
 struct CursorCredential {
     account: CursorAccountData,
     access_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorAgentServiceAuthAction {
+    RefreshAndReplaySameBinding,
+    UseResponse,
+}
+
+async fn cursor_agentservice_auth_action(
+    state: &ServerState,
+    stored: &StoredProvider,
+    rejected_access_token: Option<&str>,
+    auth_recovery: &mut AuthRecoveryState,
+    status: StatusCode,
+    replay_allowed: bool,
+) -> CursorAgentServiceAuthAction {
+    match auth_recovery.decide(status, stored.provider_type, replay_allowed) {
+        Some(AuthRecoveryDecision::RefreshAndReplaySameBinding) => {
+            CursorAgentServiceAuthAction::RefreshAndReplaySameBinding
+        }
+        Some(AuthRecoveryDecision::ReturnUnauthorized) => {
+            if auth_recovery.attempted() {
+                mark_cursor_agentservice_auth_cooldown(
+                    state,
+                    stored,
+                    rejected_access_token,
+                    "cursor_agentservice_unauthorized_after_refresh",
+                )
+                .await;
+            }
+            CursorAgentServiceAuthAction::UseResponse
+        }
+        None => CursorAgentServiceAuthAction::UseResponse,
+    }
 }
 
 enum ExecHandling {
@@ -149,7 +190,7 @@ pub async fn forward_agentservice(
     let session_key = resolve_session_key(&state, &plan).await?;
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_input_tokens(&plan.user_text);
-    let mut session_entry = acquire_or_open_session(
+    let (mut session_entry, mut session_access_token) = acquire_or_open_session(
         &state,
         &stored,
         &plan,
@@ -158,25 +199,40 @@ pub async fn forward_agentservice(
         timeouts,
     )
     .await?;
-    let mut status = session_status(&session_entry).await?;
-    if status == StatusCode::UNAUTHORIZED && plan.tool_results.is_empty() {
-        state
-            .cursor_sessions
-            .release(session_entry, SessionState::Closed)
-            .await;
-        recover_cursor_unauthorized(&state, &stored).await?;
-        let refreshed_identity = cursor_session_identity(&state, &stored).await?;
-        session_entry = acquire_or_open_session(
+    let mut auth_recovery = AuthRecoveryState::default();
+    let status = loop {
+        let status = session_status(&session_entry).await?;
+        match cursor_agentservice_auth_action(
             &state,
             &stored,
-            &plan,
-            &session_key,
-            &refreshed_identity,
-            timeouts,
+            session_access_token.as_deref(),
+            &mut auth_recovery,
+            status,
+            plan.tool_results.is_empty(),
         )
-        .await?;
-        status = session_status(&session_entry).await?;
-    }
+        .await
+        {
+            CursorAgentServiceAuthAction::UseResponse => break status,
+            CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
+                state
+                    .cursor_sessions
+                    .release(session_entry, SessionState::Closed)
+                    .await;
+                recover_cursor_unauthorized(&state, &stored, session_access_token.as_deref())
+                    .await?;
+                let refreshed_identity = cursor_session_identity(&state, &stored).await?;
+                (session_entry, session_access_token) = acquire_or_open_session(
+                    &state,
+                    &stored,
+                    &plan,
+                    &session_key,
+                    &refreshed_identity,
+                    timeouts,
+                )
+                .await?;
+            }
+        }
+    };
     if !status.is_success() {
         let upstream_error = read_cursor_upstream_error(&session_entry).await;
         maybe_mark_cursor_rate_limited(
@@ -992,7 +1048,7 @@ async fn acquire_or_open_session(
     session_key: &str,
     session_identity: &str,
     timeouts: CursorH2Timeouts,
-) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
+) -> Result<(Arc<tokio::sync::Mutex<CursorSession>>, Option<String>), ProxyError> {
     if !plan.tool_results.is_empty() {
         let entry = state
             .cursor_sessions
@@ -1004,11 +1060,12 @@ async fn acquire_or_open_session(
                 ))
             })?;
         resume_tool_results(&entry, &plan.tool_results).await?;
-        return Ok(entry);
+        return Ok((entry, None));
     }
 
     let credential = resolve_cursor_credential(state, stored, timeouts.request).await?;
-    open_agent_stream(
+    let access_token = credential.access_token.clone();
+    let entry = open_agent_stream(
         state,
         &credential,
         stored,
@@ -1017,7 +1074,8 @@ async fn acquire_or_open_session(
         session_identity,
         timeouts,
     )
-    .await
+    .await?;
+    Ok((entry, Some(access_token)))
 }
 
 async fn resume_tool_results(
@@ -1174,7 +1232,9 @@ async fn maybe_mark_cursor_rate_limited(
     {
         return;
     }
-    let Some(account_id) = cursor_bound_account_id(state, stored).await else {
+    let Some((provider_type, account_id, auth_identity_generation)) =
+        managed_account_binding_with_generation(stored)
+    else {
         return;
     };
     let now = crate::infra::time::now_ms() as i64;
@@ -1184,7 +1244,13 @@ async fn maybe_mark_cursor_rate_limited(
         .unwrap_or_default();
     let message = format!("cursor upstream returned 429; cooling account until {until}{detail}");
     state
-        .mark_account_rate_limited_until(&account_id, until, Some(message))
+        .mark_account_rate_limited_until_if_current(
+            account_id,
+            provider_type,
+            auth_identity_generation,
+            until,
+            Some(message),
+        )
         .await;
 }
 
@@ -1200,17 +1266,6 @@ fn is_cursor_account_provider(provider_type: ProviderType) -> bool {
         provider_type,
         ProviderType::CursorOAuth | ProviderType::CursorApiKey
     )
-}
-
-async fn cursor_bound_account_id(_state: &ServerState, stored: &StoredProvider) -> Option<String> {
-    let explicit = stored
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())
-        .map(str::to_string);
-    explicit
 }
 
 fn cursor_rate_limit_until_from_body(body: &[u8], now_ms: i64) -> Option<i64> {
@@ -1431,49 +1486,21 @@ async fn cursor_session_identity(
 ) -> Result<String, ProxyError> {
     let principal = match stored.provider_type {
         ProviderType::CursorOAuth => {
-            let account_id = stored
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::bad_request(
-                        "Cursor OAuth provider must bind one explicit managed account",
-                    )
-                })?;
-            let accounts = state.accounts.read().await;
-            let account = accounts
-                .find_for_provider(ProviderType::CursorOAuth, Some(account_id))
-                .ok_or_else(|| {
-                    ProxyError::bad_request("Cursor OAuth managed account is required")
-                })?;
+            let accounts = managed_credential_accounts_snapshot(state).await?;
+            let account = authoritative_managed_account(stored, &accounts).ok_or_else(|| {
+                ProxyError::conflict("Cursor OAuth account identity changed; rebind the Provider")
+            })?;
             format!(
                 "oauth:{}:{}:{}",
                 account.id, account.auth_identity_generation, account.token_refresh_generation
             )
         }
         ProviderType::CursorApiKey => {
-            let accounts = state.accounts.read().await;
-            let api_key = cursor_api_key(stored, &accounts)?;
-            let account_generation = stored
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref())
-                .and_then(|account_id| {
-                    accounts.find_for_provider(ProviderType::CursorApiKey, Some(account_id))
-                })
-                .map(|account| account.auth_identity_generation)
-                .unwrap_or_default();
+            let api_key = cursor_api_key(stored)?;
             format!(
-                "apikey:{}:{}:{}",
+                "apikey:{}:{}",
                 cursor_api_key_hash(&api_key),
-                stored.resource.credential_generation,
-                account_generation
+                stored.resource.credential_generation
             )
         }
         _ => {
@@ -1712,6 +1739,397 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cursor_agentservice_401_refreshes_once_then_cools_bound_account() {
+        let state = cursor_stream_test_state("auth-recovery");
+        let account_id = "cursor-auth-recovery-account";
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some(account_id.to_string()),
+                    provider_type: ProviderType::CursorOAuth,
+                    email: Some("cursor-auth-recovery@example.com".to_string()),
+                    access_token: Some("cursor-old-access-token".to_string()),
+                    refresh_token: Some("cursor-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: None,
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: None,
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-auth-recovery-provider".to_string(),
+                name: "Cursor auth recovery provider".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                    auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                        source: Some("account_store".to_string()),
+                        auth_provider: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorOAuth,
+            provider_type_id: ProviderType::CursorOAuth.as_str().to_string(),
+            resource: Default::default(),
+        };
+        let mut auth_recovery = AuthRecoveryState::default();
+
+        assert_eq!(
+            cursor_agentservice_auth_action(
+                &state,
+                &stored,
+                Some("cursor-old-access-token"),
+                &mut auth_recovery,
+                StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await,
+            CursorAgentServiceAuthAction::RefreshAndReplaySameBinding
+        );
+        let after_first = state.find_account_by_id(account_id).await.unwrap();
+        assert!(after_first.rate_limited_until.is_none());
+
+        let before_cooldown = crate::infra::time::now_ms() as i64;
+        assert_eq!(
+            cursor_agentservice_auth_action(
+                &state,
+                &stored,
+                Some("cursor-old-access-token"),
+                &mut auth_recovery,
+                StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await,
+            CursorAgentServiceAuthAction::UseResponse
+        );
+        let after_second = state.find_account_by_id(account_id).await.unwrap();
+        assert!(after_second
+            .rate_limited_until
+            .is_some_and(|until| until > before_cooldown));
+        assert!(after_second.last_refresh_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cursor_agentservice_refresh_failure_cools_bound_oauth_account() {
+        let state = cursor_stream_test_state("auth-recovery-failure");
+        let config_dir = state.config_dir.clone();
+        let account_id = "cursor-auth-recovery-failure-account";
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some(account_id.to_string()),
+                    provider_type: ProviderType::CursorOAuth,
+                    email: Some("cursor-auth-failure@example.com".to_string()),
+                    access_token: Some("cursor-rejected-access-token".to_string()),
+                    refresh_token: None,
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: None,
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: Some(1),
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-auth-recovery-failure-provider".to_string(),
+                name: "Cursor auth recovery failure provider".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                    auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                        source: Some("account_store".to_string()),
+                        auth_provider: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorOAuth,
+            provider_type_id: ProviderType::CursorOAuth.as_str().to_string(),
+            resource: Default::default(),
+        };
+
+        let before_cooldown = crate::infra::time::now_ms() as i64;
+        let error =
+            recover_cursor_unauthorized(&state, &stored, Some("cursor-rejected-access-token"))
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        let account = state.find_account_by_id(account_id).await.unwrap();
+        assert!(account
+            .rate_limited_until
+            .is_some_and(|until| until > before_cooldown));
+
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_agentservice_cools_unbound_api_key_after_second_unauthorized() {
+        let state = cursor_stream_test_state("apikey-auth-cooldown");
+        let config_dir = state.config_dir.clone();
+        let api_key = "cursor-unbound-auth-cooldown-key";
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-unbound-auth-cooldown-provider".to_string(),
+                name: "Cursor unbound auth cooldown provider".to_string(),
+                settings_config: json!({"env": {"CURSOR_API_KEY": api_key}}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorApiKey,
+            provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
+            resource: Default::default(),
+        };
+        let mut auth_recovery = AuthRecoveryState::default();
+
+        assert_eq!(
+            cursor_agentservice_auth_action(
+                &state,
+                &stored,
+                None,
+                &mut auth_recovery,
+                StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await,
+            CursorAgentServiceAuthAction::RefreshAndReplaySameBinding
+        );
+        assert_eq!(
+            cursor_agentservice_auth_action(
+                &state,
+                &stored,
+                None,
+                &mut auth_recovery,
+                StatusCode::UNAUTHORIZED,
+                true,
+            )
+            .await,
+            CursorAgentServiceAuthAction::UseResponse
+        );
+        let key_hash = cursor_api_key_hash(api_key);
+        let now = crate::infra::time::now_ms() as i64;
+        assert!(state
+            .cursor_api_key_tokens
+            .auth_cooldown_until(&key_hash, now)
+            .await
+            .is_some_and(|until| until > now));
+        let error = cached_cursor_api_key_token(
+            &state,
+            &stored,
+            api_key,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_api_key_stale_binding_does_not_cool_an_oauth_account_on_429() {
+        let state = cursor_stream_test_state("apikey-stale-binding-rate-limit");
+        let config_dir = state.config_dir.clone();
+        let account_id = "cursor-unrelated-oauth-account";
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some(account_id.to_string()),
+                    provider_type: ProviderType::CursorOAuth,
+                    email: Some("cursor-unrelated@example.com".to_string()),
+                    access_token: Some("cursor-unrelated-access".to_string()),
+                    refresh_token: Some("cursor-unrelated-refresh".to_string()),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: None,
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: None,
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                });
+            })
+            .await
+            .unwrap();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-api-key-stale-binding-provider".to_string(),
+                name: "Cursor API key stale binding provider".to_string(),
+                settings_config: json!({"env": {"CURSOR_API_KEY": "cursor-api-key"}}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                    auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                        source: Some("legacy".to_string()),
+                        auth_provider: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorApiKey,
+            provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
+            resource: Default::default(),
+        };
+
+        maybe_mark_cursor_rate_limited(
+            &state,
+            &stored,
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            br#"{"error":"rate_limited"}"#,
+        )
+        .await;
+
+        let account = state.find_account_by_id(account_id).await.unwrap();
+        assert!(account.rate_limited_until.is_none());
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_429_does_not_cross_same_id_auth_identity_generation() {
+        let state = cursor_stream_test_state("oauth-generation-rate-limit");
+        let config_dir = state.config_dir.clone();
+        let account_id = "cursor-generation-rate-limit-account";
+        let account = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(crate::domain::accounts::store::UpsertAccountInput {
+                    id: Some(account_id.to_string()),
+                    provider_type: ProviderType::CursorOAuth,
+                    email: Some("cursor-before@example.com".to_string()),
+                    access_token: Some("cursor-generation-access".to_string()),
+                    refresh_token: Some("cursor-generation-refresh".to_string()),
+                    id_token: None,
+                    token_type: Some("Bearer".to_string()),
+                    api_key: None,
+                    extra_headers: None,
+                    scopes: Vec::new(),
+                    profile: None,
+                    raw: None,
+                    subscription_level: None,
+                    entitlement_status: None,
+                    quota_percent: None,
+                    quota: None,
+                    quota_refreshed_at: None,
+                    quota_next_refresh_at: None,
+                    expires_at: None,
+                    rate_limited_until: None,
+                    last_refresh_error: None,
+                })
+            })
+            .await
+            .unwrap();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-generation-rate-limit-provider".to_string(),
+                name: "Cursor generation rate limit provider".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                    auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                        source: Some("managed_account".to_string()),
+                        auth_provider: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(account.auth_identity_generation),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorOAuth,
+            provider_type_id: ProviderType::CursorOAuth.as_str().to_string(),
+            resource: Default::default(),
+        };
+        state
+            .mutate_accounts(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap()
+                    .auth_identity_generation += 1;
+            })
+            .await;
+
+        maybe_mark_cursor_rate_limited(
+            &state,
+            &stored,
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            br#"{"error":"rate_limited"}"#,
+        )
+        .await;
+
+        assert!(state
+            .find_account_by_id(account_id)
+            .await
+            .unwrap()
+            .rate_limited_until
+            .is_none());
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[test]
     fn cursor_error_message_extracts_known_json_shapes() {
         assert_eq!(
@@ -1794,25 +2212,10 @@ async fn resolve_cursor_credential(
 ) -> Result<CursorCredential, ProxyError> {
     match stored.provider_type {
         ProviderType::CursorOAuth => {
-            let accounts = state.accounts.read().await;
-            let account_id = stored
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::bad_request(
-                        "Cursor OAuth provider must bind one explicit managed account",
-                    )
-                })?;
-            let account = accounts
-                .find_for_provider(ProviderType::CursorOAuth, Some(account_id))
-                .ok_or_else(|| {
-                    ProxyError::bad_request("Cursor OAuth managed account is required")
-                })?;
+            let accounts = managed_credential_accounts_snapshot(state).await?;
+            let account = authoritative_managed_account(stored, &accounts).ok_or_else(|| {
+                ProxyError::conflict("Cursor OAuth account identity changed; rebind the Provider")
+            })?;
             let access_token = account
                 .access_token
                 .as_deref()
@@ -1828,9 +2231,7 @@ async fn resolve_cursor_credential(
             })
         }
         ProviderType::CursorApiKey => {
-            let accounts = state.accounts.read().await;
-            let api_key = cursor_api_key(stored, &accounts)?;
-            drop(accounts);
+            let api_key = cursor_api_key(stored)?;
             let access_token =
                 cached_cursor_api_key_token(state, stored, &api_key, request_timeout).await?;
             Ok(CursorCredential {
@@ -1847,44 +2248,78 @@ async fn resolve_cursor_credential(
 async fn recover_cursor_unauthorized(
     state: &ServerState,
     stored: &StoredProvider,
+    rejected_access_token: Option<&str>,
 ) -> Result<(), ProxyError> {
-    match stored.provider_type {
-        ProviderType::CursorOAuth => {
-            let account_id = stored
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::bad_request(
-                        "Cursor OAuth provider must bind one explicit managed account",
+    let result = async {
+        match stored.provider_type {
+            ProviderType::CursorOAuth => {
+                let (provider_type, account_id, expected_generation) =
+                    managed_account_binding_with_generation(stored).ok_or_else(|| {
+                        ProxyError::bad_request(
+                            "Cursor OAuth provider must bind one explicit managed account",
+                        )
+                    })?;
+                state
+                    .refresh_managed_account_now_for_generation(
+                        provider_type,
+                        account_id,
+                        expected_generation,
                     )
-                })?;
-            state
-                .refresh_managed_account_now(ProviderType::CursorOAuth, Some(account_id))
-                .await
-                .map_err(super::super::forwarder::managed_account_refresh_error_to_proxy_error)
+                    .await
+                    .map_err(super::super::forwarder::managed_account_refresh_error_to_proxy_error)
+            }
+            ProviderType::CursorApiKey => {
+                let api_key = cursor_api_key(stored)?;
+                state
+                    .cursor_api_key_tokens
+                    .invalidate(&cursor_api_key_hash(&api_key))
+                    .await;
+                Ok(())
+            }
+            _ => Err(ProxyError::bad_request(
+                "Cursor unauthorized recovery requires a Cursor provider",
+            )),
         }
-        ProviderType::CursorApiKey => {
-            let accounts = state.accounts.read().await;
-            let api_key = cursor_api_key(stored, &accounts)?;
-            drop(accounts);
-            state
-                .cursor_api_key_tokens
-                .invalidate(&cursor_api_key_hash(&api_key))
-                .await;
-            Ok(())
-        }
-        _ => Err(ProxyError::bad_request(
-            "Cursor unauthorized recovery requires a Cursor provider",
-        )),
     }
+    .await;
+    if result.is_err() {
+        mark_cursor_agentservice_auth_cooldown(
+            state,
+            stored,
+            rejected_access_token,
+            "cursor_agentservice_refresh_failed",
+        )
+        .await;
+    }
+    result
 }
 
-fn cursor_api_key(stored: &StoredProvider, accounts: &AccountStore) -> Result<String, ProxyError> {
+async fn mark_cursor_agentservice_auth_cooldown(
+    state: &ServerState,
+    stored: &StoredProvider,
+    rejected_access_token: Option<&str>,
+    source: &'static str,
+) {
+    if stored.provider_type == ProviderType::CursorOAuth {
+        mark_managed_account_auth_cooldown_for_stored(state, stored, rejected_access_token, source)
+            .await;
+        return;
+    }
+    let api_key = cursor_api_key(stored).ok();
+    let Some(api_key) = api_key else {
+        return;
+    };
+    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    state
+        .cursor_api_key_tokens
+        .mark_auth_cooldown(
+            &cursor_api_key_hash(&api_key),
+            now.saturating_add(CURSOR_AUTH_FAILURE_COOLDOWN_MS),
+        )
+        .await;
+}
+
+fn cursor_api_key(stored: &StoredProvider) -> Result<String, ProxyError> {
     stored
         .provider
         .settings_config
@@ -1905,27 +2340,7 @@ fn cursor_api_key(stored: &StoredProvider, accounts: &AccountStore) -> Result<St
                 ],
             )
         })
-        .or_else(|| {
-            let account_id = stored
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref());
-            accounts
-                .find_for_provider(ProviderType::CursorApiKey, account_id)
-                .and_then(account_api_key)
-        })
         .ok_or_else(|| ProxyError::bad_request("Cursor API key is required"))
-}
-
-fn account_api_key(account: &Account) -> Option<String> {
-    account
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 async fn exchange_cursor_api_key(
@@ -1998,11 +2413,13 @@ async fn cached_cursor_api_key_token(
 ) -> Result<String, ProxyError> {
     let key_hash = cursor_api_key_hash(api_key);
     let now = crate::infra::time::now_ms() as i64;
+    ensure_cursor_api_key_auth_cooldown_elapsed(state, &key_hash, now).await?;
     if let Some(token) = state.cursor_api_key_tokens.get(&key_hash, now).await {
         return Ok(token);
     }
     let _flight = state.cursor_api_key_tokens.lock(&key_hash).await;
     let now = crate::infra::time::now_ms() as i64;
+    ensure_cursor_api_key_auth_cooldown_elapsed(state, &key_hash, now).await?;
     if let Some(token) = state.cursor_api_key_tokens.get(&key_hash, now).await {
         return Ok(token);
     }
@@ -2013,6 +2430,28 @@ async fn cached_cursor_api_key_token(
         .insert(key_hash, token.clone(), expires_at_ms)
         .await;
     Ok(token)
+}
+
+async fn ensure_cursor_api_key_auth_cooldown_elapsed(
+    state: &ServerState,
+    key_hash: &str,
+    now_ms: i64,
+) -> Result<(), ProxyError> {
+    let Some(until_ms) = state
+        .cursor_api_key_tokens
+        .auth_cooldown_until(key_hash, now_ms)
+        .await
+    else {
+        return Ok(());
+    };
+    let retry_after_seconds = u64::try_from(until_ms.saturating_sub(now_ms))
+        .unwrap_or(u64::MAX)
+        .saturating_add(999)
+        / 1_000;
+    Err(ProxyError::rate_limited(
+        "Cursor API key is cooling down after repeated upstream authentication failures",
+        retry_after_seconds.max(1),
+    ))
 }
 
 async fn read_reqwest_body_limited(

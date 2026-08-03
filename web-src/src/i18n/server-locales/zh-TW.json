@@ -12,6 +12,28 @@
   "providers": {
     "addProvider": "新增供應商"
   },
+  "providerBundle": {
+    "account": "OAuth 帳號",
+    "advancedSettings": "進階設定 JSON",
+    "count": "{{count}} 個供應商節點",
+    "create": "新增供應商",
+    "credential": "憑證",
+    "credentialMissing": "缺少憑證",
+    "credentialReady": "憑證已設定",
+    "deleteBlocked": "請先刪除或解除綁定此供應商的遠端分享",
+    "deleted": "供應商已刪除",
+    "driverOptions": "驅動程式選項",
+    "edit": "編輯供應商",
+    "family": "供應商類型",
+    "identity": "供應商",
+    "routeKey": "Route Key",
+    "saved": "供應商已儲存",
+    "selectAccount": "選擇 OAuth 帳號",
+    "surfaceCredential": "驗證憑證",
+    "surfaceEnabled": "啟用 API",
+    "surfaces": "API Surface",
+    "title": "供應商"
+  },
   "provider": {
     "share": {
       "sectionTitle": "遠端分享",
@@ -101,7 +123,7 @@
     "loadFailed": "無法載入設定，請重新整理頁面後再試。",
     "selectFileFailed": "選擇目錄失敗",
     "authCenter": {
-      "serverDescription": "管理用於上游反向代理的官方 OAuth 帳號。用量重新整理僅作用於目前啟用的 Provider。",
+      "serverDescription": "管理供應商節點及其 API Surface 使用的官方 OAuth 帳號。",
       "claudeOauthDescription": "管理 Claude 官方訂閱帳號",
       "grokOauthDescription": "管理 Grok/xAI 訂閱帳號",
       "kiroOauthDescription": "管理 Kiro AWS Builder ID 帳號",
@@ -132,10 +154,5 @@
         }
       }
     }
-  },
-  "notifications": {
-    "clearCurrentSuccess": "已停用",
-    "clearCurrentFailedTitle": "停用失敗",
-    "clearCurrentFailed": "停用失敗：{{error}}"
   }
 }

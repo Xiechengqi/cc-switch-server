@@ -1,7 +1,7 @@
 import { invokeCommand } from "@/lib/runtime";
-import { isTauriRuntime } from "@/lib/runtime";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { Provider } from "@/types";
+import type { ProviderMeta } from "@/types";
+import type { CoreProviderApp } from "@/server/providerRegistry";
 import type { AppId } from "./types";
 
 export interface ProviderSortUpdate {
@@ -53,6 +53,56 @@ export interface ProviderResource {
   credentialSlots: string[];
 }
 
+export interface ProviderBundleView {
+  id: string;
+  familyId: string;
+  routeKey: string;
+  revision: number;
+  name: string;
+  websiteUrl?: string;
+  notes?: string;
+  icon?: string;
+  iconColor?: string;
+  supportedApps: CoreProviderApp[];
+  enabledApps: CoreProviderApp[];
+  credentialConfigured: boolean;
+  credentialSlots: string[];
+  surfaces: Partial<Record<CoreProviderApp, ProviderResource>>;
+}
+
+export interface ProviderBundleSurfaceWriteDraft {
+  app: CoreProviderApp;
+  enabled: boolean;
+  profileId: string;
+  settingsConfig: Record<string, unknown>;
+  category?: string;
+  meta?: ProviderMeta;
+  customBinding?: ProviderCustomBinding;
+  credentialPatches?: ProviderCredentialPatches;
+}
+
+export interface ProviderBundleWriteDraft {
+  id: string;
+  familyId: string;
+  routeKey: string;
+  name: string;
+  websiteUrl?: string;
+  notes?: string;
+  icon?: string;
+  iconColor?: string;
+  surfaces: ProviderBundleSurfaceWriteDraft[];
+  credentialPatches?: ProviderCredentialPatches;
+  expectedRevision?: number;
+  clientRequestId?: string;
+}
+
+export interface ProviderBundleReferencePreview {
+  bundleId: string;
+  revision: number;
+  shareIds: string[];
+  blocked: boolean;
+}
+
 export type ProviderCredentialPatch =
   | { action: "keep" }
   | { action: "replace"; value: string }
@@ -102,15 +152,6 @@ export interface ProviderStoreMigrationReport {
   items: ProviderStoreMigrationItem[];
 }
 
-export interface ProviderSwitchEvent {
-  appType: AppId;
-  providerId: string;
-}
-
-export interface SwitchResult {
-  warnings: string[];
-}
-
 export interface OpenTerminalOptions {
   cwd?: string;
 }
@@ -137,6 +178,33 @@ export interface ClaudeDesktopDefaultRoute {
 }
 
 export const providersApi = {
+  async getBundles(): Promise<ProviderBundleView[]> {
+    return await invokeCommand("get_provider_bundles");
+  },
+
+  async getBundle(id: string): Promise<ProviderBundleView> {
+    return await invokeCommand("get_provider_bundle", { id });
+  },
+
+  async upsertBundle(
+    bundle: ProviderBundleWriteDraft,
+  ): Promise<ProviderBundleView> {
+    return await invokeCommand("upsert_provider_bundle", { bundle });
+  },
+
+  async getBundleDeletePreview(
+    id: string,
+  ): Promise<ProviderBundleReferencePreview> {
+    return await invokeCommand("get_provider_bundle_delete_preview", { id });
+  },
+
+  async deleteBundle(id: string, expectedRevision: number): Promise<boolean> {
+    return await invokeCommand("delete_provider_bundle", {
+      id,
+      expectedRevision,
+    });
+  },
+
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return await invokeCommand("get_providers", { app: appId });
   },
@@ -163,10 +231,6 @@ export const providersApi = {
 
   async getStoreMigration(): Promise<ProviderStoreMigrationReport> {
     return await invokeCommand("get_provider_store_migration");
-  },
-
-  async getCurrent(appId: AppId): Promise<string> {
-    return await invokeCommand("get_current_provider", { app: appId });
   },
 
   async add(
@@ -258,14 +322,6 @@ export const providersApi = {
     });
   },
 
-  async switch(id: string, appId: AppId): Promise<SwitchResult> {
-    return await invokeCommand("switch_provider", { id, app: appId });
-  },
-
-  async clearCurrent(appId: AppId): Promise<SwitchResult> {
-    return await invokeCommand("clear_current_provider", { app: appId });
-  },
-
   async ensureClaudeDesktopOfficialProvider(): Promise<boolean> {
     return await invokeCommand("ensure_claude_desktop_official_provider");
   },
@@ -289,19 +345,6 @@ export const providersApi = {
     return await invokeCommand("update_providers_sort_order", {
       updates,
       app: appId,
-    });
-  },
-
-  async onSwitched(
-    handler: (event: ProviderSwitchEvent) => void,
-  ): Promise<UnlistenFn> {
-    if (!isTauriRuntime()) {
-      return () => undefined;
-    }
-    const { listen } = await import("@tauri-apps/api/event");
-    return await listen("provider-switched", (event) => {
-      const payload = event.payload as ProviderSwitchEvent;
-      handler(payload);
     });
   },
 

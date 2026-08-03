@@ -12,7 +12,7 @@ use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
-use crate::domain::providers::runtime::ProviderRuntimePlan;
+use crate::domain::providers::runtime::{authoritative_managed_account, ProviderRuntimePlan};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
@@ -1062,13 +1062,7 @@ fn account_for_provider<'a>(
     accounts: &'a AccountStore,
     provider: &StoredProvider,
 ) -> Option<&'a Account> {
-    let account_id = provider
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())?;
-    accounts.find_for_provider(provider.provider_type, Some(account_id))
+    authoritative_managed_account(provider, accounts)
 }
 
 fn account_subscription_expires_at(account: &Account) -> Option<String> {

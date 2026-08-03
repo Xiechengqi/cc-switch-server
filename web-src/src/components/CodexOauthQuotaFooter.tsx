@@ -5,9 +5,10 @@ import {
   useCodexOauthQuota,
 } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import type { AppId } from "@/lib/api";
 import { SubscriptionQuotaView } from "@/components/SubscriptionQuotaFooter";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface CodexOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -34,15 +35,31 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
     refetch,
   } = useCodexOauthQuota(meta, { enabled: true });
   const authProvider = resolveCodexQuotaAuthProvider();
-  const accountId = resolveManagedAccountId(meta, authProvider);
-  const handleRefresh = React.useCallback(async () => {
-    await subscriptionApi.refreshOauthQuota(
-      authProvider,
+  const identity = resolveManagedAccountIdentity(meta, authProvider);
+  const accountId = identity?.accountId ?? null;
+  const handleRefresh = React.useCallback(
+    () =>
+      refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            authProvider,
+            accountId,
+            meta?.providerType,
+            undefined,
+            undefined,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
+      ),
+    [
       accountId,
+      authProvider,
+      identity?.authIdentityGeneration,
       meta?.providerType,
-    );
-    await refetch();
-  }, [accountId, authProvider, meta?.providerType, refetch]);
+      refetch,
+    ],
+  );
 
   return (
     <SubscriptionQuotaView

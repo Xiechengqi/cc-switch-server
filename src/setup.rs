@@ -202,10 +202,6 @@ pub async fn complete_setup(
         (config, "skipped", Vec::new())
     } else {
         let provision = provision_client_tunnel(state, config, allow_offline).await?;
-        state
-            .replace_config(provision.config.clone())
-            .await
-            .map_err(ApiError::internal)?;
         (provision.config, provision.claim_status, provision.warnings)
     };
     if let Some(domain) = final_config.router.domain.clone() {

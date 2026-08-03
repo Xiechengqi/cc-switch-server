@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::domain::accounts::store::AccountStore;
+use crate::domain::accounts::managers::{account_credential_ownership, AccountCredentialOwnership};
+use crate::domain::accounts::store::{Account, AccountStore};
 
 use super::credentials::redact_provider;
 use super::model::{AppKind, Provider, ProviderType};
@@ -139,6 +140,9 @@ impl ProviderRuntimeIndex {
     pub fn compile(store: &ProviderStore, accounts: &AccountStore) -> anyhow::Result<Self> {
         let mut plans = BTreeMap::new();
         for stored in &store.providers {
+            if !super::bundle::surface_enabled(&stored.provider) {
+                continue;
+            }
             let plan = Arc::new(compile_runtime_plan(stored, accounts)?);
             if plans.insert(plan.provider_key.clone(), plan).is_some() {
                 bail!("duplicate Provider key while compiling runtime index");
@@ -243,6 +247,8 @@ pub fn compile_runtime_plan(
         | EndpointPolicy::FrozenLegacy => configured_endpoint.or(default_endpoint),
         EndpointPolicy::Custom => configured_endpoint,
     };
+    #[cfg(test)]
+    let endpoint = configured_setting(&stored.provider, "testRuntimeEndpoint").or(endpoint);
     let endpoint = match endpoint {
         Some(endpoint) => match validate_endpoint(&endpoint, stored) {
             Ok(endpoint) => endpoint,
@@ -431,21 +437,21 @@ fn runtime_auth_ref(
     warnings: &mut Vec<String>,
 ) -> RuntimeAuthRef {
     let Some(profile) = profile else {
-        if matches!(
-            stored.provider_type,
-            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
-        ) && provider_account_id(stored).is_some()
+        if account_credential_ownership(stored.provider_type)
+            == AccountCredentialOwnership::ManagedAccount
         {
-            return managed_account_auth_ref(stored, accounts, stored.provider_type, warnings);
-        }
-        if stored.provider_type == ProviderType::GrokOAuth {
-            warnings.push(
-                "grok_oauth Provider must explicitly bind a managed grok_oauth account".to_string(),
-            );
+            if provider_account_id(stored).is_some() {
+                return managed_account_auth_ref(stored, accounts, stored.provider_type, warnings);
+            }
+            warnings.push(format!(
+                "{} Provider must explicitly bind a managed {} account",
+                stored.provider_type.as_str(),
+                stored.provider_type.as_str()
+            ));
             return RuntimeAuthRef::Missing;
         }
         return RuntimeAuthRef::Legacy {
-            account_id: provider_account_id(stored).map(str::to_string),
+            account_id: None,
             credential_generation: stored.resource.credential_generation,
         };
     };
@@ -838,12 +844,13 @@ fn non_empty_value(value: Option<&Value>) -> Option<String> {
 
 fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
     match provider_type {
-        ProviderType::Claude | ProviderType::ClaudeOAuth => Some("https://api.anthropic.com"),
+        ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
+            Some("https://api.anthropic.com")
+        }
         ProviderType::Codex => Some("https://api.openai.com"),
         ProviderType::CodexOAuth => Some("https://chatgpt.com/backend-api/codex"),
-        ProviderType::Gemini | ProviderType::GeminiCli => {
-            Some("https://generativelanguage.googleapis.com")
-        }
+        ProviderType::Gemini => Some("https://generativelanguage.googleapis.com"),
+        ProviderType::GeminiCli => Some("https://cloudcode-pa.googleapis.com"),
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
             Some("https://daily-cloudcode-pa.googleapis.com")
         }
@@ -858,7 +865,6 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::Nvidia => Some("https://integrate.api.nvidia.com"),
         ProviderType::DeepSeekApi => Some("https://api.deepseek.com"),
         ProviderType::GrokOAuth => Some("https://api.x.ai/v1"),
-        ProviderType::ClaudeAuth => None,
     }
 }
 
@@ -921,6 +927,59 @@ fn provider_account_id(stored: &StoredProvider) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn managed_account_provider_type(stored: &StoredProvider) -> Option<ProviderType> {
+    if let Some(profile_id) = stored.resource.profile_id.as_ref() {
+        let profile = profile_by_id(profile_id.as_str())?;
+        return match &profile.credential_policy {
+            CredentialPolicy::ManagedAccount {
+                account_provider_type,
+            } => Some(*account_provider_type),
+            CredentialPolicy::Legacy
+                if account_credential_ownership(stored.provider_type)
+                    == AccountCredentialOwnership::ManagedAccount =>
+            {
+                Some(stored.provider_type)
+            }
+            _ => None,
+        };
+    }
+
+    (account_credential_ownership(stored.provider_type)
+        == AccountCredentialOwnership::ManagedAccount)
+        .then_some(stored.provider_type)
+}
+
+pub(crate) fn managed_account_binding(stored: &StoredProvider) -> Option<(ProviderType, &str)> {
+    Some((
+        managed_account_provider_type(stored)?,
+        provider_account_id(stored)?,
+    ))
+}
+
+pub(crate) fn managed_account_binding_with_generation(
+    stored: &StoredProvider,
+) -> Option<(ProviderType, &str, u64)> {
+    let (provider_type, account_id) = managed_account_binding(stored)?;
+    Some((
+        provider_type,
+        account_id,
+        provider_auth_identity_generation(stored)?,
+    ))
+}
+
+pub(crate) fn authoritative_managed_account<'a>(
+    stored: &StoredProvider,
+    accounts: &'a AccountStore,
+) -> Option<&'a Account> {
+    let (provider_type, account_id, expected_generation) =
+        managed_account_binding_with_generation(stored)?;
+    accounts.accounts.iter().find(|account| {
+        account.id == account_id
+            && account.provider_type == provider_type
+            && account.auth_identity_generation == expected_generation
+    })
+}
+
 fn provider_auth_identity_generation(stored: &StoredProvider) -> Option<u64> {
     stored
         .provider
@@ -969,7 +1028,7 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
         ProviderType::Codex => "http.openai_responses",
         ProviderType::CodexOAuth => "oauth.openai_codex",
         ProviderType::Gemini => "http.gemini_native",
-        ProviderType::GeminiCli => "oauth.gemini_native",
+        ProviderType::GeminiCli => "oauth.gemini_code_assist",
         ProviderType::OpenRouter => match stored.app {
             AppKind::Claude => "http.anthropic_messages",
             AppKind::Codex => "http.openai_responses",
@@ -1053,6 +1112,156 @@ mod tests {
         stored.provider.name = "Renamed".to_string();
         let second = compile_runtime_plan(&stored, &accounts).unwrap();
         assert_eq!(first.runtime_fingerprint, second.runtime_fingerprint);
+    }
+
+    #[test]
+    fn managed_account_binding_ignores_stale_binding_on_static_profile() {
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.provider.meta.as_mut().unwrap().auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some(ProviderType::OpenRouter.as_str().to_string()),
+            account_id: Some("stale-account".to_string()),
+            auth_identity_generation: Some(4),
+        });
+
+        assert_eq!(managed_account_provider_type(&stored), None);
+        assert_eq!(managed_account_binding(&stored), None);
+        assert!(authoritative_managed_account(&stored, &AccountStore::default()).is_none());
+    }
+
+    #[test]
+    fn authoritative_managed_account_requires_matching_identity_generation() {
+        let mut stored = provider("codex.openai_oauth", ProviderType::CodexOAuth);
+        stored.provider.meta.as_mut().unwrap().auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some(ProviderType::CodexOAuth.as_str().to_string()),
+            account_id: Some("account-1".to_string()),
+            auth_identity_generation: Some(4),
+        });
+        let mut accounts = AccountStore {
+            accounts: vec![serde_json::from_value(json!({
+                "id": "account-1",
+                "providerType": "codex_oauth",
+                "authIdentityGeneration": 4,
+                "accessToken": "managed-access-token"
+            }))
+            .unwrap()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            authoritative_managed_account(&stored, &accounts).map(|account| account.id.as_str()),
+            Some("account-1")
+        );
+        accounts.accounts.push(
+            serde_json::from_value(json!({
+                "id": "account-2",
+                "providerType": "codex_oauth",
+                "authIdentityGeneration": 4,
+                "accessToken": "managed-access-token-2"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            authoritative_managed_account(&stored, &accounts).map(|account| account.id.as_str()),
+            Some("account-1")
+        );
+        accounts
+            .select_active_codex_oauth_account("account-1")
+            .unwrap();
+        assert_eq!(
+            authoritative_managed_account(&stored, &accounts).map(|account| account.id.as_str()),
+            Some("account-1")
+        );
+        accounts
+            .select_active_codex_oauth_account("account-2")
+            .unwrap();
+        assert_eq!(
+            authoritative_managed_account(&stored, &accounts).map(|account| account.id.as_str()),
+            Some("account-1")
+        );
+        accounts
+            .select_active_codex_oauth_account("account-1")
+            .unwrap();
+        accounts.accounts[0].auth_identity_generation = 5;
+        assert!(authoritative_managed_account(&stored, &accounts).is_none());
+    }
+
+    #[test]
+    fn codex_managed_auth_ref_uses_the_explicit_bound_account() {
+        let mut stored = provider("codex.openai_oauth", ProviderType::CodexOAuth);
+        stored.provider.meta.as_mut().unwrap().auth_binding = Some(AuthBinding {
+            source: Some("account".to_string()),
+            auth_provider: Some(ProviderType::CodexOAuth.as_str().to_string()),
+            account_id: Some("account-1".to_string()),
+            auth_identity_generation: Some(1),
+        });
+        let mut accounts = AccountStore::default();
+        for account_id in ["account-1", "account-2"] {
+            accounts.upsert(
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "codex_oauth",
+                    "accessToken": format!("managed-access-{account_id}")
+                }))
+                .unwrap(),
+            );
+        }
+
+        let unselected = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert!(matches!(
+            unselected.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                ref account_id,
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            } if account_id == "account-1"
+        ));
+        assert_eq!(
+            unselected.configuration_state,
+            RuntimeConfigurationState::Ready
+        );
+
+        accounts
+            .select_active_codex_oauth_account("account-2")
+            .unwrap();
+        let non_active = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert!(matches!(
+            non_active.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                ref account_id,
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            } if account_id == "account-1"
+        ));
+
+        accounts
+            .select_active_codex_oauth_account("account-1")
+            .unwrap();
+        let active = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert!(matches!(
+            active.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                ref account_id,
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            } if account_id == "account-1"
+        ));
+    }
+
+    #[test]
+    fn managed_account_binding_requires_explicit_legacy_binding() {
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.resource.profile_id = None;
+        stored.provider_type = ProviderType::KiroOAuth;
+        stored.provider_type_id = ProviderType::KiroOAuth.as_str().to_string();
+        stored.provider.meta.as_mut().unwrap().auth_binding = None;
+
+        assert_eq!(
+            managed_account_provider_type(&stored),
+            Some(ProviderType::KiroOAuth)
+        );
+        assert_eq!(managed_account_binding(&stored), None);
     }
 
     #[test]

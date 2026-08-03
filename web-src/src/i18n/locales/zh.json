@@ -21,6 +21,7 @@
     "notInstalled": "未安装",
     "success": "成功",
     "error": "错误",
+    "authStatusLoadFailed": "无法加载认证状态。",
     "unknown": "未知",
     "enterValidValue": "请输入有效的内容",
     "clear": "清除",
@@ -444,6 +445,8 @@
       "title": "OAuth 认证中心",
       "description": "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
       "beta": "Beta",
+      "capabilityLoading": "正在加载账号能力...",
+      "capabilityLoadFailed": "无法加载账号能力，认证入口已暂停。",
       "quotaRefreshIntervalTitle": "用量刷新间隔",
       "quotaRefreshIntervalDescription": "控制 OAuth 账号 5h / 7day 用量进度条的自动刷新频率，仅当前激活供应商会自动轮询。",
       "quotaRefreshIntervalMinutes": "分钟",
@@ -457,6 +460,8 @@
       "quotaSettingsSaved": "OAuth 用量刷新设置已保存",
       "copilotDescription": "管理 GitHub Copilot 账号",
       "codexOauthDescription": "管理 ChatGPT 账号",
+      "agyOauthTitle": "Agy OAuth",
+      "agyOauthDescription": "管理 Agy 订阅账号",
       "subscriptionExpiry": {
         "title": "订阅到期日",
         "notSet": "未设置",
@@ -556,7 +561,7 @@
       },
       "proxy": {
         "title": "API 路由",
-        "description": "查看 Server API 路由状态和当前 Provider",
+        "description": "查看 Server API 路由状态和可路由的 Bundle Surface",
         "running": "运行中",
         "stopped": "已停止"
       },
@@ -1387,6 +1392,7 @@
     "activeAccountBadge": "当前反代：{{login}}",
     "selectionRequiredBadge": "需要选择",
     "activeProxyAccount": "当前反代账号",
+    "providerAccount": "供应商绑定账号",
     "selectionRequired": "请选择用于反代的 ChatGPT 账号。",
     "selectAccount": "选择账号",
     "selectAccountPlaceholder": "选择一个 ChatGPT 账号",
@@ -2510,8 +2516,7 @@
     "panel": {
       "serviceAddress": "服务地址",
       "addressCopied": "地址已复制",
-      "currentProvider": "当前 Provider：",
-      "waitingFirstRequest": "当前 Provider：等待首次请求…",
+      "routableSurfaces": "可路由 Surface",
       "stoppedTitle": "路由服务已停止",
       "stoppedDescription": "使用上方开关即可启动服务",
       "openSettings": "配置路由服务",
@@ -3233,10 +3238,12 @@
   },
   "deepseekAccount": {
     "authStatus": "DeepSeek 账号",
-    "identifier": "邮箱或手机号",
-    "identifierPlaceholder": "请输入邮箱或手机号",
-    "password": "密码",
-    "addAccount": "添加账号",
+    "identifier": "账号标识（可选）",
+    "identifierPlaceholder": "邮箱、手机号或自定义名称",
+    "accessToken": "Access Token",
+    "accessTokenPlaceholder": "粘贴 DeepSeek access token",
+    "importAccount": "导入账号",
+    "importAnotherAccount": "导入其他账号",
     "loginRequired": "请先添加 DeepSeek 账号",
     "selectAccountRequired": "DeepSeek Account 必须绑定一个 DeepSeek 账号"
   },
@@ -3377,7 +3384,12 @@
       "notes": "备注"
     },
     "account": {
-      "title": "认证账号"
+      "title": "认证账号",
+      "loading": "托管账号仍在加载中。",
+      "loadFailed": "无法加载托管账号，请重试后再保存。",
+      "selectedUnavailable": "所选托管账号已不可用。",
+      "identityChanged": "该账号当前对应的认证身份已变化。保存此供应商前需要显式重新绑定。",
+      "rebindIdentity": "重新绑定身份"
     },
     "aws": {
       "title": "AWS 凭据"
@@ -3467,6 +3479,8 @@
     "extraUsage": "超额用量",
     "expiredHint": "请运行 {{tool}} 命令刷新登录",
     "queryFailed": "查询失败",
+    "credentialParseFailed": "凭据数据解析失败",
+    "retryAfter": "{{time}} 后可重试",
     "refresh": "刷新"
   },
   "terminal": {

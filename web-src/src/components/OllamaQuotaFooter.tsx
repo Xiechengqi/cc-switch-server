@@ -1,19 +1,22 @@
 import React from "react";
-import { RefreshCw, AlertCircle, Clock } from "lucide-react";
+import { RefreshCw, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import type { AppId } from "@/lib/api";
 import { useOllamaQuota } from "@/lib/query/ollama";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { useQueryClient } from "@tanstack/react-query";
-import { formatExpireDistance } from "@/components/SubscriptionQuotaFooter";
+import {
+  formatExpireDistance,
+  SubscriptionQuotaView,
+} from "@/components/SubscriptionQuotaFooter";
 import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface OllamaQuotaFooterProps {
   meta?: ProviderMeta;
@@ -49,36 +52,36 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
-  const [manualRefreshLoading, setManualRefreshLoading] =
-    React.useState(false);
-  const queryClient = useQueryClient();
-
+  const [manualRefreshLoading, setManualRefreshLoading] = React.useState(false);
   const {
     data: cached,
     isFetching: loading,
     refetch,
-  } = useOllamaQuota(providerId, { enabled: true, appId });
+  } = useOllamaQuota(providerId, {
+    enabled: true,
+    appId,
+  });
 
   const handleRefresh = React.useCallback(async () => {
     if (manualRefreshLoading) return;
     setManualRefreshLoading(true);
     try {
-      await subscriptionApi.refreshOauthQuota(
-        "ollama_cloud",
-        providerId,
-        "ollama_cloud",
-        appId,
-        providerId,
+      await refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            "ollama_cloud",
+            null,
+            "ollama_cloud",
+            appId,
+            providerId,
+          ),
+        () => refetch(),
       );
-      await refetch();
-      await queryClient.invalidateQueries({
-        queryKey: ["ollama", "quota", providerId],
-      });
       setLastManualRefreshAt(Date.now());
     } finally {
       setManualRefreshLoading(false);
     }
-  }, [appId, manualRefreshLoading, providerId, queryClient, refetch]);
+  }, [appId, manualRefreshLoading, providerId, refetch]);
   const effectiveLoading = loading || manualRefreshLoading;
   const reportRefreshError = React.useCallback(
     (error: unknown) =>
@@ -120,28 +123,19 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
   const quota = cached.quota;
 
   if (!quota.success) {
-    if (inline) {
-      return (
-        <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
-          <div className="flex items-center gap-1.5 text-red-500 dark:text-red-400">
-            <AlertCircle size={12} />
-            <span>{quota.error || t("subscription.queryFailed")}</span>
-          </div>
-          <button
-            onClick={() => void handleRefresh().catch(reportRefreshError)}
-            disabled={effectiveLoading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={refreshTitle}
-          >
-            <RefreshCw
-              size={12}
-              className={effectiveLoading ? "animate-spin" : ""}
-            />
-          </button>
-        </div>
-      );
-    }
-    return null;
+    return (
+      <SubscriptionQuotaView
+        quota={{
+          ...quota,
+          refreshedAt: cached.refreshedAt,
+          nextRefreshAt: cached.nextRefreshAt,
+        }}
+        loading={effectiveLoading}
+        refetch={handleRefresh}
+        appIdForExpiredHint="ollama_cloud"
+        inline={inline}
+      />
+    );
   }
 
   const plan =

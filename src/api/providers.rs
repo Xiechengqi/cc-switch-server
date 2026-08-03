@@ -3,6 +3,110 @@ use super::*;
 const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
+pub(in crate::api) async fn list_provider_bundles(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ListProviderBundlesResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let bundles = state
+        .provider_bundle_views()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(ListProviderBundlesResponse { ok: true, bundles }))
+}
+
+pub(in crate::api) async fn create_provider_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::domain::providers::bundle::ProviderBundleWriteDraft>,
+) -> Result<Json<ProviderBundleResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    require_provider_write_contract(&state, &headers)?;
+    if input.expected_revision.is_some() {
+        return Err(ApiError::bad_request(
+            "expectedRevision is only valid when updating a Provider Bundle",
+        ));
+    }
+    let bundle = state
+        .upsert_provider_bundle_command(input)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    Ok(Json(ProviderBundleResponse { ok: true, bundle }))
+}
+
+pub(in crate::api) async fn get_provider_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ProviderBundleResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let bundle = state
+        .provider_bundle_view(&id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("Provider Bundle not found"))?;
+    Ok(Json(ProviderBundleResponse { ok: true, bundle }))
+}
+
+pub(in crate::api) async fn update_provider_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<crate::domain::providers::bundle::ProviderBundleWriteDraft>,
+) -> Result<Json<ProviderBundleResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    require_provider_write_contract(&state, &headers)?;
+    if input.id != id {
+        return Err(ApiError::bad_request(
+            "Provider Bundle id in body must match resource path",
+        ));
+    }
+    if input.expected_revision.is_none() {
+        return Err(ApiError::bad_request(
+            "expectedRevision is required when updating a Provider Bundle",
+        ));
+    }
+    let bundle = state
+        .upsert_provider_bundle_command(input)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    Ok(Json(ProviderBundleResponse { ok: true, bundle }))
+}
+
+pub(in crate::api) async fn delete_provider_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<DeleteProviderBundleQuery>,
+) -> Result<Json<DeleteProviderBundleResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    require_provider_write_contract(&state, &headers)?;
+    let deleted = state
+        .delete_provider_bundle_command(id, query.expected_revision)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    Ok(Json(DeleteProviderBundleResponse { ok: true, deleted }))
+}
+
+pub(in crate::api) async fn provider_bundle_delete_preview(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ProviderBundleDeletePreviewResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let preview = state
+        .provider_bundle_reference_preview(&id)
+        .await
+        .map_err(map_provider_command_error)?;
+    Ok(Json(ProviderBundleDeletePreviewResponse {
+        ok: true,
+        preview,
+    }))
+}
+
 pub(in crate::api) async fn list_providers(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -680,17 +784,36 @@ pub(in crate::api) async fn test_provider_inner(
 
     if query.network.unwrap_or(false) {
         ensure_provider_outbound_allowed(state, &execution).await?;
-        if let Some((provider_type, account_id)) = execution.managed_account_target() {
+        if let Some((provider_type, account_id, expected_generation)) =
+            execution.managed_account_identity_target()
+        {
             state
-                .refresh_managed_account_if_needed(provider_type, Some(account_id))
+                .refresh_managed_account_if_needed_for_generation(
+                    provider_type,
+                    account_id,
+                    expected_generation,
+                )
                 .await
                 .map_err(map_managed_account_refresh_error)?;
+            if matches!(
+                provider_type,
+                ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+            ) {
+                state
+                    .ensure_gemini_v1internal_project_for_generation(
+                        provider_type,
+                        account_id,
+                        expected_generation,
+                    )
+                    .await
+                    .map_err(map_managed_account_refresh_error)?;
+            }
         }
         ensure_provider_outbound_allowed(state, &execution).await?;
     }
     let accounts = state.accounts_snapshot().await;
     let body = provider_test_body(stored.app, stored, Some(&model), requested_stream);
-    let (adapter_request, endpoint, target_headers) = if execution
+    let (adapter_request, endpoint, mut target_headers) = if execution
         .driver_is("oauth.claude_messages")
     {
         let prepared = execution
@@ -738,14 +861,18 @@ pub(in crate::api) async fn test_provider_inner(
             .materialize_auth(&accounts)
             .map_err(ApiError::proxy)?;
         execution
-            .apply_auth(
-                &mut target_headers,
-                &mut endpoint,
-                materialized_auth.as_ref(),
-            )
+            .apply_auth(&mut target_headers, &mut endpoint, &materialized_auth)
             .map_err(ApiError::proxy)?;
         execution
             .finalize_outbound_identity(&mut target_headers)
+            .map_err(ApiError::proxy)?;
+        execution
+            .finalize_protocol_auth(
+                &accounts,
+                &mut adapter_request,
+                &mut endpoint,
+                &mut target_headers,
+            )
             .map_err(ApiError::proxy)?;
         (adapter_request, endpoint, target_headers)
     };
@@ -757,25 +884,36 @@ pub(in crate::api) async fn test_provider_inner(
     if query.network.unwrap_or(false) {
         let started = std::time::Instant::now();
         let http_client = state.http_client().await;
-        let mut request = http_client
-            .post(&endpoint)
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(adapter_request.body.clone());
+        let mut client_headers = HeaderMap::new();
         if stream {
-            request = request.header(axum::http::header::ACCEPT, "text/event-stream");
+            client_headers.insert(
+                axum::http::header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
         }
         if execution.driver_is("oauth.openai_codex") {
-            request = request.header("accept-encoding", "identity");
-        }
-        for (name, value) in &target_headers {
-            request = request.header(name, value);
+            target_headers.push(("accept-encoding".to_string(), "identity".to_string()));
         }
         let timeout = query
             .timeout_ms
             .filter(|value| *value > 0)
             .map(std::time::Duration::from_millis)
             .unwrap_or_else(|| execution.request_timeout());
-        match request.timeout(timeout).send().await {
+        let request = proxy::outbound_request::build_post_request(
+            &http_client,
+            proxy::outbound_request::OutboundPostRequest {
+                url: &endpoint,
+                body: adapter_request.body.clone(),
+                client_headers: &client_headers,
+                target_headers: &target_headers,
+                default_accept: "*/*",
+                default_content_type: "application/json",
+                timeout,
+                stream_requested: false,
+            },
+        )
+        .map_err(ApiError::proxy)?;
+        match request.send().await {
             Ok(mut response) => {
                 let status = response.status().as_u16();
                 network_status_code = Some(status);
@@ -1031,7 +1169,11 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             }
             Some((account_id, expected_generation)) => {
                 let refresh = state
-                    .refresh_managed_account_if_needed(ProviderType::GrokOAuth, Some(account_id))
+                    .refresh_managed_account_if_needed_for_generation(
+                        ProviderType::GrokOAuth,
+                        account_id,
+                        expected_generation,
+                    )
                     .await;
                 if let Err(error) = refresh {
                     tracing::warn!(error = ?error, "Grok model discovery token refresh failed");
@@ -1044,7 +1186,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                     )
                 } else {
                     let account = state
-                        .find_account_for_provider(ProviderType::GrokOAuth, Some(account_id))
+                        .find_account_for_provider(ProviderType::GrokOAuth, account_id)
                         .await
                         .filter(|account| account.auth_identity_generation == expected_generation);
                     if let Some((account, access_token)) = account.as_ref().and_then(|account| {
@@ -1105,16 +1247,16 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         .materialize_auth(&accounts)
         .map_err(ApiError::proxy)?;
     execution
-        .apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())
+        .apply_auth(&mut target_headers, &mut url, &materialized_auth)
         .map_err(ApiError::proxy)?;
     execution
         .finalize_outbound_identity(&mut target_headers)
         .map_err(ApiError::proxy)?;
     let http_client = state.http_client().await;
-    let mut request = http_client.get(&url);
-    for (name, value) in target_headers {
-        request = request.header(name, value);
-    }
+    let mut headers = HeaderMap::new();
+    proxy::outbound_request::insert_target_headers(&mut headers, &target_headers)
+        .map_err(ApiError::proxy)?;
+    let request = http_client.get(&url).headers(headers);
     let timeout = timeout_ms
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
@@ -1162,21 +1304,15 @@ pub(in crate::api) async fn ensure_stored_provider_outbound_allowed(
     state: &ServerState,
     stored: &StoredProvider,
 ) -> Result<(), ApiError> {
-    let has_managed_binding = stored
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())
-        .is_some_and(|account_id| !account_id.trim().is_empty());
+    let has_managed_binding =
+        crate::domain::providers::runtime::managed_account_binding(stored).is_some();
     if has_managed_binding && state.credential_persistence_degraded() {
         return Err(ApiError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "managed account credentials are waiting for durable persistence",
         ));
     }
-    let accounts = state.accounts_snapshot().await;
-    proxy::ensure_codex_oauth_active_account(stored, &accounts).map_err(ApiError::proxy)
+    Ok(())
 }
 
 async fn ensure_provider_outbound_allowed(
@@ -1291,7 +1427,9 @@ pub(in crate::api) async fn create_provider_from_preset(
             .meta
             .get_or_insert_with(crate::domain::providers::model::ProviderMeta::default);
         meta.auth_binding = Some(crate::domain::providers::model::AuthBinding {
-            source: Some("account".to_string()),
+            source: Some(
+                crate::domain::providers::model::MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string(),
+            ),
             auth_provider: Some(account_provider_type.as_str().to_string()),
             account_id: Some(account_id),
             auth_identity_generation: None,
@@ -1345,6 +1483,19 @@ fn s1_provider_for_profile(
                 "modelMapping": {"mode": "passthrough"}
             }),
         ),
+        "claude.bearer_relay" => (
+            "Claude Bearer Relay",
+            json!({
+                "env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+                "modelMapping": {"mode": "passthrough"}
+            }),
+        ),
+        "claude.google_oauth" => (
+            "Google Gemini OAuth",
+            json!({
+                "env": {"ANTHROPIC_BASE_URL": "https://cloudcode-pa.googleapis.com"}
+            }),
+        ),
         "codex.openai_api_key" => (
             "OpenAI API Key",
             json!({
@@ -1381,6 +1532,12 @@ fn apply_s1_profile_creation_defaults(
 ) -> Result<(), ApiError> {
     use crate::domain::providers::registry::ModelPolicyKind;
 
+    if let Some(provider_type) = profile.compatibility_provider_type {
+        provider
+            .meta
+            .get_or_insert_with(crate::domain::providers::model::ProviderMeta::default)
+            .provider_type = Some(provider_type.as_str().to_string());
+    }
     if !provider.settings_config.is_object() {
         provider.settings_config = json!({});
     }
@@ -1770,11 +1927,14 @@ fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshE
                 provider_type.as_str()
             ),
         ),
-        ManagedAccountRefreshError::NotFound => ApiError::not_found("managed account not found"),
-        ManagedAccountRefreshError::InactiveCodexAccount => ApiError::conflict_code(
-            "cc_switch_codex_inactive_account",
-            "Codex OAuth account is not active",
+        ManagedAccountRefreshError::IdentityChanged { provider_type } => ApiError::conflict_code(
+            "cc_switch_provider_account_identity_stale",
+            format!(
+                "bound {} account identity changed; rebind the Provider",
+                provider_type.as_str()
+            ),
         ),
+        ManagedAccountRefreshError::NotFound => ApiError::not_found("managed account not found"),
         ManagedAccountRefreshError::CredentialPersistenceDegraded => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "managed account credentials are waiting for durable persistence",

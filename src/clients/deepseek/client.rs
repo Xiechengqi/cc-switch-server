@@ -30,15 +30,22 @@ impl DeepSeekWebClient {
         Self::with_api_base("https://chat.deepseek.com")
     }
 
+    pub fn with_http_client(http: Client) -> Self {
+        Self::with_http_client_and_api_base(http, "https://chat.deepseek.com")
+    }
+
     pub fn with_api_base(api_base: impl Into<String>) -> Self {
+        let http = crate::infra::http::direct_client_builder()
+            .build()
+            .unwrap_or_else(|_| {
+                crate::infra::http::direct_client().expect("default direct HTTP client must build")
+            });
+        Self::with_http_client_and_api_base(http, api_base)
+    }
+
+    fn with_http_client_and_api_base(http: Client, api_base: impl Into<String>) -> Self {
         Self {
-            http: crate::infra::http::direct_client_builder()
-                .user_agent("DeepSeek/2.0.4 Android/35")
-                .build()
-                .unwrap_or_else(|_| {
-                    crate::infra::http::direct_client()
-                        .expect("default direct HTTP client must build")
-                }),
+            http,
             api_base: api_base.into().trim_end_matches('/').to_string(),
         }
     }
@@ -141,6 +148,10 @@ impl Default for DeepSeekWebClient {
 
 pub fn deepseek_base_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("DeepSeek/2.0.4 Android/35"),
+    );
     headers.insert(
         reqwest::header::ACCEPT,
         reqwest::header::HeaderValue::from_static("application/json"),

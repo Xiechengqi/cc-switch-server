@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::domain::health::ProviderHealth;
+use crate::domain::providers::bundle::{ProviderBundleReferencePreview, ProviderBundleView};
 use crate::domain::providers::credentials::ProviderImportPreview;
 use crate::domain::providers::credentials::{
     CredentialPatch, ProviderAccountBindingMigrationPreview, ProviderIdentityChangePreview,
@@ -26,6 +27,40 @@ pub(in crate::api) struct ListProvidersQuery {
 pub(in crate::api) struct ListProvidersResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) providers: Vec<ProviderView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ListProviderBundlesResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) bundles: Vec<ProviderBundleView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ProviderBundleResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) bundle: ProviderBundleView,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct DeleteProviderBundleQuery {
+    pub(in crate::api) expected_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct DeleteProviderBundleResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ProviderBundleDeletePreviewResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) preview: ProviderBundleReferencePreview,
 }
 
 #[derive(Debug, Serialize)]

@@ -28,6 +28,7 @@ import {
   type SubscriptionExpiryRuleDraft,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { oauthQuotaRootKey } from "@/lib/query/oauthQuotaKeys";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface AccountSubscriptionExpiryControlProps {
@@ -83,7 +84,9 @@ function formStateFromExpiry(
   };
 }
 
-function draftFromForm(form: RuleFormState): SubscriptionExpiryRuleDraft | null {
+function draftFromForm(
+  form: RuleFormState,
+): SubscriptionExpiryRuleDraft | null {
   if (!form.cadence) return null;
   return {
     cadence: form.cadence,
@@ -159,7 +162,10 @@ export function AccountSubscriptionExpiryControl({
     queryClient,
   ]);
 
-  const formatDate = (value: string | null, timeZone?: string): string | null => {
+  const formatDate = (
+    value: string | null,
+    timeZone?: string,
+  ): string | null => {
     if (!value) return null;
     const date = new Date(value);
     if (!Number.isFinite(date.getTime())) return null;
@@ -169,10 +175,9 @@ export function AccountSubscriptionExpiryControl({
         ...(timeZone ? { timeZone } : {}),
       }).format(date);
     } catch {
-      return new Intl.DateTimeFormat(
-        i18n.resolvedLanguage ?? i18n.language,
-        { dateStyle: "medium" },
-      ).format(date);
+      return new Intl.DateTimeFormat(i18n.resolvedLanguage ?? i18n.language, {
+        dateStyle: "medium",
+      }).format(date);
     }
   };
 
@@ -200,7 +205,9 @@ export function AccountSubscriptionExpiryControl({
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["managed-auth-status"] }),
       queryClient.invalidateQueries({ queryKey: ["subscription"] }),
-      queryClient.invalidateQueries({ queryKey: [account.provider, "quota"] }),
+      queryClient.invalidateQueries({
+        queryKey: oauthQuotaRootKey(account.provider),
+      }),
       queryClient.invalidateQueries({ queryKey: ["providers"] }),
       queryClient.invalidateQueries({ queryKey: ["share"] }),
     ]);
@@ -208,11 +215,7 @@ export function AccountSubscriptionExpiryControl({
 
   const mutation = useMutation({
     mutationFn: (rule: SubscriptionExpiryRuleDraft | null) =>
-      authApi.authSetSubscriptionExpiryRule(
-        account.provider,
-        account.id,
-        rule,
-      ),
+      authApi.authSetSubscriptionExpiryRule(account.provider, account.id, rule),
     onSuccess: async (updatedAccount, rule) => {
       const updatedExpiry = updatedAccount.subscriptionExpiry;
       setForm(
@@ -380,9 +383,7 @@ export function AccountSubscriptionExpiryControl({
               >
                 <SelectTrigger
                   className="h-9 w-[6.5rem] text-xs"
-                  aria-label={t(
-                    "settings.authCenter.subscriptionExpiry.month",
-                  )}
+                  aria-label={t("settings.authCenter.subscriptionExpiry.month")}
                 >
                   <SelectValue />
                 </SelectTrigger>
@@ -416,9 +417,7 @@ export function AccountSubscriptionExpiryControl({
               >
                 <SelectTrigger
                   className="h-9 w-[6.5rem] text-xs"
-                  aria-label={t(
-                    "settings.authCenter.subscriptionExpiry.day",
-                  )}
+                  aria-label={t("settings.authCenter.subscriptionExpiry.day")}
                 >
                   <SelectValue />
                 </SelectTrigger>
@@ -451,9 +450,7 @@ export function AccountSubscriptionExpiryControl({
                   className="h-9 w-9"
                   onClick={() => draft && mutation.mutate(draft)}
                   disabled={mutation.isPending || !hasDraft || !draft}
-                  aria-label={t(
-                    "settings.authCenter.subscriptionExpiry.save",
-                  )}
+                  aria-label={t("settings.authCenter.subscriptionExpiry.save")}
                 >
                   {isSaving ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -483,9 +480,7 @@ export function AccountSubscriptionExpiryControl({
                   disabled={
                     mutation.isPending || (!hasPersistedManual && !hasDraft)
                   }
-                  aria-label={t(
-                    "settings.authCenter.subscriptionExpiry.clear",
-                  )}
+                  aria-label={t("settings.authCenter.subscriptionExpiry.clear")}
                 >
                   {isClearing ? (
                     <Loader2 className="h-4 w-4 animate-spin" />

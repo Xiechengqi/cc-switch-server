@@ -8,7 +8,7 @@ use crate::domain::health::{
     provider_probe_support, ProviderHealthObservation, ProviderHealthSnapshot,
     ProviderHealthStatus, ProviderProbeSupport, PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS,
 };
-use crate::domain::providers::current_provider::resolve_current_provider_id;
+use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::{
@@ -71,7 +71,6 @@ pub(in crate::api) fn spawn_share_model_health_scheduler(state: ServerState) {
 pub(crate) async fn run_share_model_health_cycle(state: &ServerState) {
     let shares = state.shares.read().await.shares.clone();
     let providers = state.providers_snapshot().await;
-    let ui_settings = state.ui_settings.read().await.for_frontend();
     let accounts = state.accounts_snapshot().await;
     let config = web_stream_check_config(state).await;
 
@@ -79,7 +78,7 @@ pub(crate) async fn run_share_model_health_cycle(state: &ServerState) {
         tracing::warn!(error = %error, "failed to prune Provider health snapshots");
     }
 
-    let targets = health_targets(&shares, &providers, &ui_settings);
+    let targets = health_targets(&shares, &providers);
     if targets.is_empty() {
         tracing::debug!("no active Provider targets require a model health check");
         return;
@@ -131,9 +130,22 @@ pub(crate) async fn run_share_model_health_cycle(state: &ServerState) {
 fn health_targets(
     shares: &[Share],
     providers: &ProviderStore,
-    ui_settings: &serde_json::Value,
 ) -> BTreeMap<(AppKind, String), HealthTarget> {
     let mut targets = BTreeMap::<(AppKind, String), HealthTarget>::new();
+    for provider in providers
+        .providers
+        .iter()
+        .filter(|provider| surface_enabled(&provider.provider))
+        .cloned()
+    {
+        targets.insert(
+            (provider.app, provider.provider.id.clone()),
+            HealthTarget {
+                provider,
+                shares: Vec::new(),
+            },
+        );
+    }
     for share in shares
         .iter()
         .filter(|share| share.enabled && share.status == "active")
@@ -165,29 +177,6 @@ fn health_targets(
         }
     }
 
-    for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-        let Some(provider_id) = resolve_current_provider_id(providers, ui_settings, app) else {
-            continue;
-        };
-        let key = (app, provider_id.clone());
-        if targets.contains_key(&key) {
-            continue;
-        }
-        if let Some(provider) = providers
-            .providers
-            .iter()
-            .find(|provider| provider.app == app && provider.provider.id == provider_id)
-            .cloned()
-        {
-            targets.insert(
-                key,
-                HealthTarget {
-                    provider,
-                    shares: Vec::new(),
-                },
-            );
-        }
-    }
     targets
 }
 
@@ -947,7 +936,7 @@ mod tests {
             share("share-2", "p1", true, "active"),
         ];
 
-        let targets = health_targets(&shares, &providers, &json!({}));
+        let targets = health_targets(&shares, &providers);
         assert_eq!(targets.len(), 1);
         assert_eq!(
             targets
@@ -960,9 +949,16 @@ mod tests {
     }
 
     #[test]
-    fn targets_exclude_inactive_shares_and_unused_providers() {
+    fn targets_include_all_enabled_surfaces_and_exclude_disabled_surfaces() {
         let providers = ProviderStore {
-            providers: vec![provider(), provider_with(AppKind::Codex, "p2")],
+            providers: vec![provider(), provider_with(AppKind::Codex, "p2"), {
+                let mut disabled = provider_with(AppKind::Claude, "p3");
+                disabled
+                    .provider
+                    .extra
+                    .insert("surfaceEnabled".to_string(), json!(false));
+                disabled
+            }],
             ..Default::default()
         };
         let shares = [
@@ -970,30 +966,27 @@ mod tests {
             share("paused", "p2", true, "paused"),
             share("disabled", "p2", false, "active"),
         ];
-        let settings = json!({ "currentProviderCodex": "" });
+        let targets = health_targets(&shares, &providers);
 
-        let targets = health_targets(&shares, &providers, &settings);
-
-        assert_eq!(targets.len(), 1);
+        assert_eq!(targets.len(), 2);
         assert!(targets.contains_key(&(AppKind::Codex, "p1".to_string())));
-        assert!(!targets.contains_key(&(AppKind::Codex, "p2".to_string())));
+        assert!(targets.contains_key(&(AppKind::Codex, "p2".to_string())));
+        assert!(!targets.contains_key(&(AppKind::Claude, "p3".to_string())));
     }
 
     #[test]
-    fn targets_include_current_provider_without_an_active_share() {
+    fn targets_include_enabled_surface_without_an_active_share() {
         let providers = ProviderStore {
             providers: vec![provider(), provider_with(AppKind::Codex, "p2")],
             ..Default::default()
         };
         let shares = [share("paused", "p1", true, "paused")];
-        let settings = json!({ "currentProviderCodex": "p2" });
+        let targets = health_targets(&shares, &providers);
 
-        let targets = health_targets(&shares, &providers, &settings);
-
-        assert_eq!(targets.len(), 1);
+        assert_eq!(targets.len(), 2);
         let target = targets
             .get(&(AppKind::Codex, "p2".to_string()))
-            .expect("current Provider should be checked");
+            .expect("enabled Provider Surface should be checked");
         assert!(target.shares.is_empty());
     }
 

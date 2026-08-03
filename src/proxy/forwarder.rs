@@ -30,8 +30,8 @@ use crate::domain::accounts::store::{
     grok_account_capability_enabled, AccountStore, GrokAccountCapability,
 };
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
-use crate::domain::providers::current_provider;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
+use crate::domain::providers::runtime::managed_account_binding_with_generation;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{
@@ -44,6 +44,9 @@ use crate::state::{
     GrokMediaSessionBinding, ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
 };
 
+#[cfg(test)]
+use super::account_headers::account_header_override_blocked;
+use super::account_headers::apply_account_header_overrides;
 use super::adapters::{self, ProviderAdapter, UpstreamFormat};
 use super::anthropic_semantics::{
     self, AnthropicJsonObservation, AnthropicObservation, AnthropicSseInspector, AnthropicTerminal,
@@ -62,16 +65,17 @@ use super::response_semantics::{
     self, FailureOrigin, ResponsesSseInspector, SemanticFailure, SemanticObservation,
     SemanticTerminal,
 };
+use super::retry_policy::{self, AuthRecoveryDecision};
 use super::router::{
     account_concurrency_for_provider, codex_image_generation_provider,
     ensure_provider_account_does_not_need_relogin, ensure_provider_account_usage_available,
-    provider_supports_claude_count_tokens, select_exact_provider_with_account_inflight,
-    select_failover_provider, select_provider_for_codex_image_generation,
-    select_provider_with_account_inflight, ProxyRoute,
+    provider_supports_claude_count_tokens, select_failover_provider, select_provider_for_route_key,
+    ProxyRoute,
 };
 use super::streaming::{
-    ClaudeSseError, ClaudeSseErrorDetector, ResponsesSseAggregationError,
-    ResponsesSseAggregationErrorKind, ResponsesSseAggregator, StreamUsageAccumulator,
+    ClaudeSseError, ClaudeSseErrorDetector, GeminiV1InternalSseAggregator,
+    ResponsesSseAggregationError, ResponsesSseAggregationErrorKind, ResponsesSseAggregator,
+    StreamUsageAccumulator,
 };
 use super::usage::{
     log_usage, update_image_stream_usage, update_stream_usage, update_stream_usage_result,
@@ -82,6 +86,7 @@ use super::{setting, ProxyError};
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
 const CODEX_IMAGES_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const IMAGE_CLIENT_CANCELLED_MESSAGE: &str = "downstream client cancelled the image response";
 const CODEX_IMAGES_MAX_PARTIAL_IMAGES: i64 = 3;
 const CODEX_IMAGES_MAX_OUTPUT_BYTES: usize = 48 * 1024 * 1024;
 const CODEX_IMAGES_MAX_UPSTREAM_BYTES: usize = 72 * 1024 * 1024;
@@ -106,6 +111,83 @@ const CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_OVERFLOW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 const PROXY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+struct ImageTransportMetrics {
+    surface: &'static str,
+    mode: &'static str,
+    started: Instant,
+    last_emit: Instant,
+    max_silence: Duration,
+    emitted: bool,
+}
+
+impl ImageTransportMetrics {
+    fn new(surface: &'static str, mode: &'static str, started: Instant) -> Self {
+        Self {
+            surface,
+            mode,
+            started,
+            last_emit: started,
+            max_silence: Duration::ZERO,
+            emitted: false,
+        }
+    }
+
+    fn emit(&mut self, heartbeat: bool) {
+        let now = Instant::now();
+        self.max_silence = self
+            .max_silence
+            .max(now.saturating_duration_since(self.last_emit));
+        if !self.emitted {
+            crate::metrics::record_image_transport_first_byte(
+                self.surface,
+                self.mode,
+                now.saturating_duration_since(self.started),
+            );
+            self.emitted = true;
+        }
+        self.last_emit = now;
+        if heartbeat {
+            crate::metrics::record_image_transport_heartbeat(self.surface, self.mode);
+        }
+    }
+
+    fn next_heartbeat_deadline(&self, interval: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.last_emit + interval)
+    }
+}
+
+fn image_keepalive_interval(execution: &ProviderExecution) -> Duration {
+    #[cfg(test)]
+    if let Some(milliseconds) = execution
+        .plan
+        .driver_options
+        .get("testImageKeepaliveMs")
+        .and_then(Value::as_u64)
+        .filter(|milliseconds| *milliseconds > 0)
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    #[cfg(not(test))]
+    let _ = execution;
+    CODEX_IMAGES_KEEPALIVE_INTERVAL
+}
+
+impl Drop for ImageTransportMetrics {
+    fn drop(&mut self) {
+        if !self.emitted {
+            return;
+        }
+        self.max_silence = self
+            .max_silence
+            .max(Instant::now().saturating_duration_since(self.last_emit));
+        crate::metrics::record_image_transport_max_silence(
+            self.surface,
+            self.mode,
+            self.max_silence,
+        );
+    }
+}
 
 type ResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -302,6 +384,7 @@ struct ForwardAttemptContext {
     codex_body_override: Option<Bytes>,
     excluded_provider_ids: BTreeSet<String>,
     grok_session_id: Option<String>,
+    route_binding_pinned: bool,
 }
 
 impl Default for ForwardAttemptContext {
@@ -316,6 +399,7 @@ impl Default for ForwardAttemptContext {
             codex_body_override: None,
             excluded_provider_ids: BTreeSet::new(),
             grok_session_id: None,
+            route_binding_pinned: false,
         }
     }
 }
@@ -383,6 +467,43 @@ pub async fn forward(
     .await
 }
 
+pub async fn forward_for_route_key(
+    state: ServerState,
+    route: ProxyRoute,
+    route_key: String,
+    gemini_path: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    if request_context_from_headers(&headers).share_id.is_some() {
+        return Err(ProxyError::bad_request(
+            "Share inference must use the Share URL without a route-key prefix",
+        ));
+    }
+    let accounts = state.accounts_snapshot().await;
+    let providers = state.providers.read().await;
+    let snapshot = state.account_in_flight.snapshot();
+    let selection = select_provider_for_route_key(
+        &providers,
+        &accounts,
+        route.app(),
+        &route_key,
+        Some(&snapshot),
+    )?;
+    if route == ProxyRoute::ClaudeCountTokens
+        && !provider_supports_claude_count_tokens(&selection.execution.stored)
+    {
+        return Err(ProxyError::bad_request(
+            "Claude count_tokens requires a native Anthropic provider",
+        ));
+    }
+    drop(providers);
+    let mut attempt_context = ForwardAttemptContext::default();
+    attempt_context.execution = Some(selection.execution);
+    attempt_context.route_binding_pinned = true;
+    forward_with_attempt(state, route, gemini_path, headers, body, attempt_context).await
+}
+
 struct CodexAuthContext {
     execution: ProviderExecution,
     stored: StoredProvider,
@@ -394,29 +515,30 @@ struct CodexAuthContext {
 async fn select_codex_oauth_surface_execution(
     state: &ServerState,
     headers: &HeaderMap,
+    route_key: Option<&str>,
 ) -> Result<ProviderExecution, ProxyError> {
     let request_context = request_context_from_headers(headers);
+    if route_key.is_some() && request_context.share_id.is_some() {
+        return Err(ProxyError::bad_request(
+            "Share requests must use the Share URL without a route-key prefix",
+        ));
+    }
     let accounts = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
         let shares = state.shares.read().await.clone();
         select_share_execution(&providers, &shares, &accounts, AppKind::Codex, share_id)?.0
+    } else if let Some(route_key) = route_key {
+        select_provider_for_route_key(&providers, &accounts, AppKind::Codex, route_key, None)?
+            .execution
     } else {
-        let ui_settings = state.ui_settings.read().await.for_frontend();
-        let configured_provider_id =
-            current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
-        super::router::select_provider(
-            &providers,
-            &accounts,
-            AppKind::Codex,
-            headers,
-            configured_provider_id.as_deref(),
-        )?
-        .execution
+        return Err(ProxyError::bad_request(
+            "direct Codex auxiliary requests require a route-scoped endpoint under /r/:routeKey",
+        ));
     };
     if !execution.driver_is("oauth.openai_codex") {
         return Err(ProxyError::bad_request(
-            "this endpoint requires the current provider to be codex_oauth",
+            "this endpoint requires a codex_oauth Provider Surface",
         ));
     }
     Ok(execution)
@@ -432,8 +554,8 @@ async fn materialize_codex_auth_context(
     refresh_execution_managed_account_if_needed(state, execution).await?;
     ensure_managed_credential_persistence_available(state, execution)?;
     let stored = execution.runtime_stored_view();
-    let accounts = state.accounts_snapshot().await;
-    super::router::ensure_codex_oauth_active_account(&stored, &accounts)?;
+    let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
+    super::router::ensure_codex_oauth_binding(&stored, &accounts)?;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let mut headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
     append_codex_client_request_headers(&mut headers, client_headers, false);
@@ -441,7 +563,7 @@ async fn materialize_codex_auth_context(
     let mut headers = owned_headers(headers);
     let mut url = endpoint;
     let materialized_auth = execution.materialize_auth(&accounts)?;
-    execution.apply_auth(&mut headers, &mut url, materialized_auth.as_ref())?;
+    execution.apply_auth(&mut headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
     Ok(CodexAuthContext {
@@ -457,20 +579,77 @@ async fn force_refresh_codex_auth_context(
     state: &ServerState,
     execution: &ProviderExecution,
 ) -> Result<(), ProxyError> {
-    let (provider_type, account_id) = execution.managed_account_target().ok_or_else(|| {
-        ProxyError::bad_request("codex_oauth provider is missing a managed account binding")
-    })?;
+    let (provider_type, account_id, expected_generation) =
+        execution.managed_account_identity_target().ok_or_else(|| {
+            ProxyError::bad_request("codex_oauth provider is missing a managed account binding")
+        })?;
     state
-        .refresh_managed_account_now(provider_type, Some(account_id))
+        .refresh_managed_account_now_for_generation(provider_type, account_id, expected_generation)
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)?;
     ensure_managed_credential_persistence_available(state, execution)
+}
+
+fn codex_models_client_version(client_version: Option<&str>) -> String {
+    client_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::codex_identity::configured_version)
+}
+
+fn build_codex_models_request(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    target_headers: &[(String, String)],
+    client_headers: &HeaderMap,
+    version: &str,
+) -> Result<reqwest::RequestBuilder, ProxyError> {
+    let mut url = url::Url::parse(endpoint)
+        .map_err(|error| ProxyError::bad_gateway(format!("invalid Codex models URL: {error}")))?;
+    url.query_pairs_mut().append_pair("client_version", version);
+
+    let mut headers = HeaderMap::new();
+    super::outbound_request::insert_target_headers(&mut headers, target_headers)?;
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+    headers.insert(
+        "version",
+        HeaderValue::from_str(version)
+            .map_err(|_| ProxyError::bad_request("invalid Codex client version header"))?,
+    );
+    if let Some(etag) = client_headers.get("if-none-match").cloned() {
+        headers.insert("if-none-match", etag);
+    }
+
+    Ok(http_client
+        .get(url)
+        .headers(headers)
+        .timeout(Duration::from_secs(15)))
 }
 
 pub async fn forward_codex_models_manifest(
     state: ServerState,
     headers: HeaderMap,
     client_version: Option<String>,
+) -> Result<Response, ProxyError> {
+    forward_codex_models_manifest_inner(state, headers, client_version, None).await
+}
+
+pub async fn forward_codex_models_manifest_for_route_key(
+    state: ServerState,
+    route_key: String,
+    headers: HeaderMap,
+    client_version: Option<String>,
+) -> Result<Response, ProxyError> {
+    forward_codex_models_manifest_inner(state, headers, client_version, Some(route_key)).await
+}
+
+async fn forward_codex_models_manifest_inner(
+    state: ServerState,
+    headers: HeaderMap,
+    client_version: Option<String>,
+    route_key: Option<String>,
 ) -> Result<Response, ProxyError> {
     let request_context = request_context_from_headers(&headers);
     let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
@@ -487,40 +666,25 @@ pub async fn forward_codex_models_manifest(
     } else {
         None
     };
-    let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
+    let execution =
+        select_codex_oauth_surface_execution(&state, &headers, route_key.as_deref()).await?;
     let accounts = state.accounts_snapshot().await;
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
         acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
     let endpoint = codex_models_manifest_url(&execution);
-    let version = client_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(crate::codex_identity::configured_version);
+    let version = codex_models_client_version(client_version.as_deref());
     let mut auth_refresh_attempted = false;
     loop {
         let context =
             materialize_codex_auth_context(&state, &execution, &headers, endpoint.clone()).await?;
-        let mut url = url::Url::parse(&context.url).map_err(|error| {
-            ProxyError::bad_gateway(format!("invalid Codex models URL: {error}"))
-        })?;
-        url.query_pairs_mut()
-            .append_pair("client_version", &version);
-        let mut request = context
-            .http_client
-            .get(url)
-            .header(ACCEPT, "application/json")
-            .header("accept-encoding", "identity")
-            .header("version", &version)
-            .timeout(Duration::from_secs(15));
-        if let Some(etag) = optional_header(&headers, "if-none-match") {
-            request = request.header("if-none-match", etag);
-        }
-        for (name, value) in &context.headers {
-            request = request.header(name, value);
-        }
+        let request = build_codex_models_request(
+            &context.http_client,
+            &context.url,
+            &context.headers,
+            &headers,
+            &version,
+        )?;
         let mut upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
         if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
             drop(upstream);
@@ -532,6 +696,7 @@ pub async fn forward_codex_models_manifest(
             mark_managed_account_auth_cooldown(
                 &state,
                 &execution,
+                bearer_token_from_owned_headers(&context.headers),
                 "models_unauthorized_after_refresh",
             )
             .await;
@@ -592,6 +757,24 @@ pub async fn forward_codex_alpha_search(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    forward_codex_alpha_search_inner(state, headers, body, None).await
+}
+
+pub async fn forward_codex_alpha_search_for_route_key(
+    state: ServerState,
+    route_key: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    forward_codex_alpha_search_inner(state, headers, body, Some(route_key)).await
+}
+
+async fn forward_codex_alpha_search_inner(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Bytes,
+    route_key: Option<String>,
+) -> Result<Response, ProxyError> {
     let body = prepare_codex_alpha_search_body(&headers, body)?;
     let request_context = request_context_from_headers(&headers);
     let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
@@ -608,7 +791,8 @@ pub async fn forward_codex_alpha_search(
     } else {
         None
     };
-    let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
+    let execution =
+        select_codex_oauth_surface_execution(&state, &headers, route_key.as_deref()).await?;
     let body = apply_codex_alpha_search_policy(&body, &execution)?;
     let accounts = state.accounts_snapshot().await;
     let snapshot = state.account_in_flight.snapshot();
@@ -641,6 +825,7 @@ pub async fn forward_codex_alpha_search(
             mark_managed_account_auth_cooldown(
                 &state,
                 &execution,
+                bearer_token_from_owned_headers(&context.headers),
                 "alpha_search_unauthorized_after_refresh",
             )
             .await;
@@ -890,6 +1075,7 @@ async fn summarize_codex_overflow(
             CODEX_OVERFLOW_SUMMARY_TIMEOUT,
             true,
         )
+        .map_err(|error| error.to_string())?
         .header("accept-encoding", "identity")
         .send()
         .await
@@ -1026,39 +1212,9 @@ async fn forward_with_attempt(
             None
         };
         let accounts_for_selection = state.accounts_snapshot().await;
-        let (execution, account_in_flight_guard) = if let Some(execution) =
-            attempt_context.execution.clone()
-        {
-            execution.ensure_operation_supported(ProviderOperation::Forward)?;
-            let snapshot = state.account_in_flight.snapshot();
-            let guard = acquire_account_in_flight(
-                &state,
-                &execution.stored,
-                &accounts_for_selection,
-                &snapshot,
-            )?;
-            (execution, guard)
-        } else {
-            let shares = state.shares.read().await.clone();
-            let providers = state.providers.read().await;
-            let ui_settings = state.ui_settings.read().await.for_frontend();
-            let configured_provider_id =
-                current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
-            if let Some(share_id) = request_context.share_id.as_deref() {
-                let (execution, _share_name) = select_share_execution(
-                    &providers,
-                    &shares,
-                    &accounts_for_selection,
-                    app,
-                    share_id,
-                )?;
-                if route == ProxyRoute::ClaudeCountTokens
-                    && !provider_supports_claude_count_tokens(&execution.stored)
-                {
-                    return Err(ProxyError::bad_request(
-                        "Claude count_tokens requires a native Anthropic provider",
-                    ));
-                }
+        let (execution, account_in_flight_guard) =
+            if let Some(execution) = attempt_context.execution.clone() {
+                execution.ensure_operation_supported(ProviderOperation::Forward)?;
                 let snapshot = state.account_in_flight.snapshot();
                 let guard = acquire_account_in_flight(
                     &state,
@@ -1068,42 +1224,37 @@ async fn forward_with_attempt(
                 )?;
                 (execution, guard)
             } else {
-                select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-                    if matches!(
-                        route,
-                        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
-                    ) {
-                        let selection = select_exact_provider_with_account_inflight(
-                            &providers,
-                            &accounts_for_selection,
-                            app,
-                            &headers,
-                            configured_provider_id.as_deref(),
-                            snapshot,
-                        )?;
-                        if route == ProxyRoute::ClaudeCountTokens
-                            && !provider_supports_claude_count_tokens(&selection.execution.stored)
-                        {
-                            return Err(ProxyError::bad_request(
-                                "Claude count_tokens requires a native Anthropic provider",
-                            ));
-                        }
-                        Ok(selection)
-                    } else {
-                        select_provider_with_account_inflight(
-                            &providers,
-                            &accounts_for_selection,
-                            app,
-                            &headers,
-                            configured_provider_id.as_deref(),
-                            snapshot,
-                            request_context.session_id.as_deref(),
-                        )
+                let shares = state.shares.read().await.clone();
+                let providers = state.providers.read().await;
+                if let Some(share_id) = request_context.share_id.as_deref() {
+                    let (execution, _share_name) = select_share_execution(
+                        &providers,
+                        &shares,
+                        &accounts_for_selection,
+                        app,
+                        share_id,
+                    )?;
+                    if route == ProxyRoute::ClaudeCountTokens
+                        && !provider_supports_claude_count_tokens(&execution.stored)
+                    {
+                        return Err(ProxyError::bad_request(
+                            "Claude count_tokens requires a native Anthropic provider",
+                        ));
                     }
-                    .map(|selection| selection.execution)
-                })?
-            }
-        };
+                    let snapshot = state.account_in_flight.snapshot();
+                    let guard = acquire_account_in_flight(
+                        &state,
+                        &execution.stored,
+                        &accounts_for_selection,
+                        &snapshot,
+                    )?;
+                    (execution, guard)
+                } else {
+                    return Err(ProxyError::bad_request(
+                        "direct inference requires a route-scoped endpoint under /r/:routeKey",
+                    ));
+                }
+            };
         let stored = execution.runtime_stored_view();
         let codex_request_intent = if execution.driver_is("oauth.openai_codex") {
             super::codex_request_policy::extract_intent_from_bytes(&body)
@@ -1111,7 +1262,7 @@ async fn forward_with_attempt(
             super::codex_request_policy::CodexRequestIntent::default()
         };
         ensure_managed_credential_persistence_available(&state, &execution)?;
-        super::router::ensure_codex_oauth_active_account(&stored, &accounts_for_selection)?;
+        super::router::ensure_codex_oauth_binding(&stored, &accounts_for_selection)?;
         validate_codex_allowed_client(
             &stored,
             route,
@@ -1129,7 +1280,7 @@ async fn forward_with_attempt(
             let mut adapter_request = adapter_request;
             execution.enforce_model_policy(&mut adapter_request)?;
             refresh_execution_managed_account_if_needed(&state, &execution).await?;
-            let accounts = state.accounts_snapshot().await;
+            let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
             execution.materialize_auth(&accounts)?;
             return cursor::forward_agentservice(cursor::AgentServiceForwardOptions {
                 state,
@@ -1146,6 +1297,9 @@ async fn forward_with_attempt(
                 },
             })
             .await;
+        }
+        if execution.driver_is("special.cursor") {
+            return Err(cursor::agentservice_not_ready_error(route, &stored, &body));
         }
         if app == AppKind::Claude && execution.driver_is("special.kiro") {
             return forward_claude_kiro(ClaudeKiroForwardOptions {
@@ -1238,7 +1392,7 @@ async fn forward_with_attempt(
         let (mut adapter_request, url, target_headers) =
             if execution.driver_is("oauth.claude_messages") {
                 refresh_execution_managed_account_if_needed(&state, &execution).await?;
-                let accounts = state.accounts_snapshot().await;
+                let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
                 let prepared = execution.finalize_claude_request(
                     adapter_request,
                     route,
@@ -1277,17 +1431,25 @@ async fn forward_with_attempt(
                     url = codex_compact_url(&url);
                 }
                 refresh_execution_managed_account_if_needed(&state, &execution).await?;
+                if !adapter_request.is_gemini_count_tokens() {
+                    ensure_execution_gemini_v1internal_project(&state, &execution).await?;
+                }
                 let copilot_upstream_auth = if execution.driver_is("special.copilot") {
+                    let account_id = execution.managed_account_id().ok_or_else(|| {
+                        ProxyError::bad_request(
+                            "github_copilot provider must bind one explicit managed account",
+                        )
+                    })?;
                     Some(
                         state
-                            .prepare_copilot_upstream_auth(execution.managed_account_id())
+                            .prepare_copilot_upstream_auth(account_id)
                             .await
                             .map_err(copilot_upstream_auth_error_to_proxy_error)?,
                     )
                 } else {
                     None
                 };
-                let accounts = state.accounts_snapshot().await;
+                let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
                 let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
                 target_headers.extend(adapter_request.upstream_headers.iter().cloned());
                 if execution.driver_is("oauth.openai_codex") {
@@ -1329,7 +1491,7 @@ async fn forward_with_attempt(
                 }
                 let mut target_headers = owned_headers(target_headers);
                 let materialized_auth = execution.materialize_auth(&accounts)?;
-                execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+                execution.apply_auth(&mut target_headers, &mut url, &materialized_auth)?;
                 apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
                 if route == ProxyRoute::ClaudeCountTokens {
                     replace_or_push_owned_header(
@@ -1339,6 +1501,12 @@ async fn forward_with_attempt(
                     );
                 }
                 execution.finalize_outbound_identity(&mut target_headers)?;
+                execution.finalize_protocol_auth(
+                    &accounts,
+                    &mut adapter_request,
+                    &mut url,
+                    &mut target_headers,
+                )?;
                 (adapter_request, url, target_headers)
             };
 
@@ -1351,7 +1519,7 @@ async fn forward_with_attempt(
             &target_headers,
             execution.request_timeout(),
             adapter_request.upstream_stream_requested,
-        );
+        )?;
 
         let upstream_result = if adapter_request.upstream_stream_requested {
             match execution.stream_first_byte_timeout() {
@@ -1428,11 +1596,9 @@ async fn forward_with_attempt(
             if let Some(next_attempt) = next_unauthorized_attempt(
                 &state,
                 route,
-                &headers,
-                &request_context,
                 &attempt_context,
                 &execution,
-                &stored,
+                &target_headers,
             )
             .await?
             {
@@ -1447,7 +1613,7 @@ async fn forward_with_attempt(
             route,
             ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
         ) && status.as_u16() == 529
-            && !request_is_provider_pinned(&headers, &request_context)
+            && !request_is_provider_pinned(&attempt_context, &request_context)
         {
             if let Some(next_attempt) =
                 next_provider_failover(&state, route, &attempt_context, &execution, "http_529")
@@ -1462,8 +1628,8 @@ async fn forward_with_attempt(
                 continue 'attempt;
             }
         }
-        maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
-        maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
+        maybe_update_grok_entitlement(&state, &execution, &response_headers).await;
+        maybe_mark_grok_cooldown(&state, &execution, status, &response_headers).await;
         let mut content_type = response_headers
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
@@ -1503,7 +1669,7 @@ async fn forward_with_attempt(
                         &target_headers,
                         execution.request_timeout(),
                         adapter_request.upstream_stream_requested,
-                    );
+                    )?;
                     match retry_request.send().await {
                         Ok(retry_upstream) => {
                             adapter_request.body = retry_body;
@@ -1512,18 +1678,17 @@ async fn forward_with_attempt(
                             status_code = status.as_u16();
                             response_headers = upstream.headers().clone();
                             strip_hop_by_hop_response_headers(&mut response_headers);
-                            maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
-                            maybe_mark_grok_cooldown(&state, &stored, status, &response_headers)
+                            maybe_update_grok_entitlement(&state, &execution, &response_headers)
+                                .await;
+                            maybe_mark_grok_cooldown(&state, &execution, status, &response_headers)
                                 .await;
                             if status == StatusCode::UNAUTHORIZED {
                                 if let Some(next_attempt) = next_unauthorized_attempt(
                                     &state,
                                     route,
-                                    &headers,
-                                    &request_context,
                                     &attempt_context,
                                     &execution,
-                                    &stored,
+                                    &target_headers,
                                 )
                                 .await?
                                 {
@@ -1698,7 +1863,7 @@ async fn forward_with_attempt(
                 &decoded.body,
             )
             .await;
-            if !request_is_provider_pinned(&headers, &request_context) {
+            if !request_is_provider_pinned(&attempt_context, &request_context) {
                 if let Some(next_attempt) =
                     next_provider_failover(&state, route, &attempt_context, &execution, "http_429")
                         .await
@@ -1761,6 +1926,48 @@ async fn forward_with_attempt(
             }
             copy_safe_upstream_response_headers(&response_headers, &mut response);
             return Ok(response);
+        }
+
+        if execution.driver_is("oauth.openai_codex")
+            && adapter_request.upstream_stream_requested
+            && !adapter_request.stream_requested
+            && status.is_success()
+            && buffered_upstream_body.is_none()
+            && responses_body_requests_image_generation(route, &adapter_request.body)
+        {
+            let request_id = log_usage(
+                &state,
+                &stored,
+                status_code,
+                started.elapsed().as_millis(),
+                model_metadata(&adapter_request),
+                TokenUsage::default(),
+                UsageLogContext {
+                    is_streaming: false,
+                    stream_status: Some("pending".to_string()),
+                    usage_state: Some(UsageState::Pending),
+                    ..request_context.clone()
+                },
+            )
+            .await;
+            return Ok(responses_image_json_heartbeat_response(
+                ResponsesImageJsonHeartbeatArgs {
+                    state,
+                    stored,
+                    upstream,
+                    adapter,
+                    adapter_request,
+                    request_context,
+                    started,
+                    request_id,
+                    status_code,
+                    response_headers,
+                    timeout: execution.request_timeout(),
+                    keepalive_interval: image_keepalive_interval(&execution),
+                    account_in_flight_guard,
+                    share_invocation_guard,
+                },
+            ));
         }
 
         if execution.driver_is("oauth.openai_codex")
@@ -1858,7 +2065,60 @@ async fn forward_with_attempt(
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
 
-        if adapter_request.stream_requested && buffered_upstream_body.is_none() {
+        if adapters::is_gemini_v1internal_provider_type(stored.provider_type)
+            && adapter_request.upstream_stream_requested
+            && !adapter_request.stream_requested
+            && status.is_success()
+            && buffered_upstream_body.is_none()
+        {
+            let response = match aggregate_gemini_v1internal_upstream(
+                &mut upstream,
+                execution.request_timeout(),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure {
+                            status_code: error.status.as_u16(),
+                        },
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            let body = match serde_json::to_vec(&response).map(Bytes::from) {
+                Ok(body) => body,
+                Err(error) => {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure { status_code: 502 },
+                    )
+                    .await;
+                    return Err(ProxyError::bad_gateway(format!(
+                        "encode aggregated Gemini v1internal response: {error}"
+                    )));
+                }
+            };
+            buffered_upstream_body = Some(ResponseDecodeResult {
+                body,
+                preserve_content_encoding: false,
+            });
+            content_type = Some("application/json".to_string());
+            content_encoding = None;
+            response_headers.remove(CONTENT_ENCODING);
+            response_headers.remove(CONTENT_LENGTH);
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+
+        if adapter_request.stream_requested
+            && status.is_success()
+            && buffered_upstream_body.is_none()
+        {
             let timeouts = StreamTimeoutConfig {
                 first_byte: execution.stream_first_byte_timeout(),
                 idle: execution.stream_idle_timeout(),
@@ -1870,10 +2130,15 @@ async fn forward_with_attempt(
             let upstream_format =
                 adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
                     .unwrap_or_else(|| adapters::downstream_format_for_route(route));
+            let responses_image_transport = upstream_format == UpstreamFormat::OpenAiResponses
+                && responses_body_requests_image_generation(route, &adapter_request.body);
             let inspect_responses_semantics = status.is_success()
-                && (response_semantics::semantic_guard_enabled()
-                    || codex_overflow_compact_eligible(route, &execution, &attempt_context))
-                && upstream_format == UpstreamFormat::OpenAiResponses;
+                && upstream_format == UpstreamFormat::OpenAiResponses
+                && responses_semantic_inspection_required(
+                    response_semantics::semantic_guard_enabled(),
+                    codex_overflow_compact_eligible(route, &execution, &attempt_context),
+                    responses_image_transport,
+                );
             let inspect_anthropic_semantics = status.is_success()
                 && response_semantics::semantic_guard_enabled()
                 && route == ProxyRoute::ClaudeMessages
@@ -1889,9 +2154,10 @@ async fn forward_with_attempt(
             let mut pending_chunk_already_inspected = false;
             let mut pending_chunk_saw_business_output = false;
             let mut pending_chunk_committed_output = false;
-            if sse_error_detector.is_some()
-                || inspect_responses_semantics
-                || inspect_anthropic_semantics
+            if !responses_image_transport
+                && (sse_error_detector.is_some()
+                    || inspect_responses_semantics
+                    || inspect_anthropic_semantics)
             {
                 let mut prelude = Vec::new();
                 let mut detected_error = None;
@@ -2124,7 +2390,7 @@ async fn forward_with_attempt(
                                 ProviderOutcome::Failure { status_code: 502 },
                             )
                             .await;
-                            if !request_is_provider_pinned(&headers, &request_context) {
+                            if !request_is_provider_pinned(&attempt_context, &request_context) {
                                 if let Some(next_attempt) = next_provider_failover(
                                     &state,
                                     route,
@@ -2178,7 +2444,7 @@ async fn forward_with_attempt(
                                 )
                                 .await;
                                 semantic_provider_outcome_recorded = true;
-                                if !request_is_provider_pinned(&headers, &request_context) {
+                                if !request_is_provider_pinned(&attempt_context, &request_context) {
                                     if let Some(next_attempt) = next_provider_failover(
                                         &state,
                                         route,
@@ -2211,7 +2477,7 @@ async fn forward_with_attempt(
                                 ProviderOutcome::Failure { status_code: 502 },
                             )
                             .await;
-                            if !request_is_provider_pinned(&headers, &request_context) {
+                            if !request_is_provider_pinned(&attempt_context, &request_context) {
                                 if let Some(next_attempt) = next_provider_failover(
                                     &state,
                                     route,
@@ -2315,12 +2581,29 @@ async fn forward_with_attempt(
                 semantic_provider_outcome_recorded,
                 terminal_frame_sent: false,
                 interrupted_update_armed,
-                _account_in_flight_guard: account_in_flight_guard,
-                _share_invocation_guard: share_invocation_guard,
+                pending_image_transport_chunk: responses_image_transport
+                    .then(|| Bytes::from_static(b": connected\n\n")),
+                image_upstream_deadline: responses_image_transport
+                    .then(|| {
+                        timeouts
+                            .first_byte
+                            .map(|timeout| tokio::time::Instant::now() + timeout)
+                    })
+                    .flatten(),
+                image_transport: responses_image_transport
+                    .then(|| ImageTransportMetrics::new("responses", "sse", started)),
+                image_keepalive_interval: image_keepalive_interval(&execution),
+                account_in_flight_guard,
+                share_invocation_guard,
             };
             let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
                 if stream_state.terminal_frame_sent {
                     return Ok(None);
+                }
+
+                if let Some(initial) = stream_state.pending_image_transport_chunk.take() {
+                    stream_state.record_image_transport_emit(&initial, false);
+                    return Ok(Some((initial, stream_state)));
                 }
 
                 let semantic_terminal_seen = stream_state
@@ -2334,12 +2617,47 @@ async fn forward_with_attempt(
                         .and_then(AnthropicSseInspector::terminal)
                         .is_some();
                 let mut chunk_already_inspected = false;
+                let mut image_heartbeat = false;
                 let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
                     chunk_already_inspected = stream_state.pending_chunk_already_inspected;
                     stream_state.pending_chunk_already_inspected = false;
                     Ok(Some(chunk))
                 } else if semantic_terminal_seen {
                     Ok(None)
+                } else if stream_state.image_transport.is_some() {
+                    let timeout_kind = stream_state.next_timeout_kind();
+                    let heartbeat_deadline = stream_state
+                        .image_transport
+                        .as_ref()
+                        .expect("image transport checked")
+                        .next_heartbeat_deadline(stream_state.image_keepalive_interval);
+                    if let Some(deadline) = stream_state.image_upstream_deadline {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(deadline) => {
+                                let timeout = stream_state.next_timeout().unwrap_or_default();
+                                Err(StreamReadError::Timeout { kind: timeout_kind, timeout })
+                            }
+                            _ = tokio::time::sleep_until(heartbeat_deadline) => {
+                                image_heartbeat = true;
+                                Ok(Some(Bytes::new()))
+                            }
+                            result = stream_state.inner.try_next() => {
+                                result.map_err(StreamReadError::Upstream)
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(heartbeat_deadline) => {
+                                image_heartbeat = true;
+                                Ok(Some(Bytes::new()))
+                            }
+                            result = stream_state.inner.try_next() => {
+                                result.map_err(StreamReadError::Upstream)
+                            }
+                        }
+                    }
                 } else {
                     let timeout_kind = stream_state.next_timeout_kind();
                     match stream_state.next_timeout() {
@@ -2360,6 +2678,12 @@ async fn forward_with_attempt(
                             .map_err(StreamReadError::Upstream),
                     }
                 };
+
+                if image_heartbeat {
+                    let heartbeat = Bytes::from_static(b": keepalive\n\n");
+                    stream_state.record_image_transport_emit(&heartbeat, true);
+                    return Ok(Some((heartbeat, stream_state)));
+                }
 
                 match next_chunk {
                     Ok(Some(chunk)) => {
@@ -2455,6 +2779,7 @@ async fn forward_with_attempt(
                             }
                         }
                         stream_state.received_any_chunk |= committed_output;
+                        stream_state.observe_image_upstream_chunk();
                         if !chunk_already_inspected && !stream_state.sse_error_outcome_recorded {
                             let sse_error_outcome = stream_state
                                 .sse_error_detector
@@ -2498,6 +2823,7 @@ async fn forward_with_attempt(
                         let transformed = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
+                        stream_state.record_image_transport_emit(&transformed, false);
                         Ok(Some((transformed, stream_state)))
                     }
                     Ok(None) => {
@@ -2584,6 +2910,7 @@ async fn forward_with_attempt(
                             let transformed = stream_state
                                 .codex_custom_tool_stream_patcher
                                 .push(transformed);
+                            stream_state.record_image_transport_emit(&transformed, false);
                             return Ok(Some((transformed, stream_state)));
                         }
                         if let Some(inspector) = stream_state.responses_semantics.as_mut() {
@@ -2659,6 +2986,31 @@ async fn forward_with_attempt(
                                     .map(SemanticTerminal::stream_status)
                             })
                             .unwrap_or("completed");
+                        let terminal_status_code = match (&anthropic_terminal, &semantic_terminal) {
+                            (Some(AnthropicTerminal::Error(_)), _) => {
+                                StatusCode::BAD_GATEWAY.as_u16()
+                            }
+                            (_, Some(SemanticTerminal::Failure(failure))) => match failure.origin {
+                                FailureOrigin::Client => StatusCode::BAD_REQUEST.as_u16(),
+                                FailureOrigin::Provider => StatusCode::BAD_GATEWAY.as_u16(),
+                            },
+                            _ => stream_state.status_code,
+                        };
+                        let terminal_error_message = match (&anthropic_terminal, &semantic_terminal)
+                        {
+                            (Some(AnthropicTerminal::Error(error)), _) => Some(format!(
+                                "{}: {}",
+                                error.error_type,
+                                error
+                                    .message
+                                    .as_deref()
+                                    .unwrap_or("upstream Anthropic stream failed")
+                            )),
+                            (_, Some(SemanticTerminal::Failure(failure))) => {
+                                Some(failure.display_message())
+                            }
+                            _ => None,
+                        };
                         let usage_result =
                             std::mem::take(&mut stream_state.usage).finish_with_status();
                         let usage = usage_result.usage;
@@ -2666,13 +3018,21 @@ async fn forward_with_attempt(
                             &stream_state.state,
                             &stream_state.stored,
                             &stream_state.request_id,
-                            stream_state.status_code,
+                            terminal_status_code,
                             stream_state.started.elapsed().as_millis(),
                             stream_state.first_token_ms,
                             usage_result,
                             Some(stream_status),
                         )
                         .await;
+                        if let Some(message) = terminal_error_message {
+                            update_terminal_usage_error(
+                                &stream_state.state,
+                                &stream_state.request_id,
+                                message,
+                            )
+                            .await;
+                        }
                         record_share_invocation_result(
                             &stream_state.state,
                             stream_state.share_id.as_deref(),
@@ -2727,6 +3087,7 @@ async fn forward_with_attempt(
                         let usage = usage_result.usage;
                         let status = error.status_code();
                         let stream_status = error.stream_status();
+                        let message = error.to_string();
                         update_stream_usage_result(
                             &stream_state.state,
                             &stream_state.stored,
@@ -2736,6 +3097,12 @@ async fn forward_with_attempt(
                             stream_state.first_token_ms,
                             usage_result,
                             Some(stream_status),
+                        )
+                        .await;
+                        update_terminal_usage_error(
+                            &stream_state.state,
+                            &stream_state.request_id,
+                            message.clone(),
                         )
                         .await;
                         record_share_invocation_result(
@@ -2755,10 +3122,10 @@ async fn forward_with_attempt(
                             .interrupted_update_armed
                             .store(false, Ordering::Relaxed);
                         stream_state.terminal_frame_sent = true;
-                        let message = error.to_string();
                         if let Some(frame) =
                             stream_terminal_error_frame(stream_state.route, &message, status)
                         {
+                            stream_state.record_image_transport_emit(&frame, false);
                             Ok(Some((frame, stream_state)))
                         } else {
                             Err(std::io::Error::other(message))
@@ -2774,6 +3141,9 @@ async fn forward_with_attempt(
                 }
             }
             copy_safe_upstream_response_headers(&response_headers, &mut response);
+            if responses_image_transport {
+                apply_codex_images_streaming_headers(&mut response);
+            }
             return Ok(response);
         }
 
@@ -2819,6 +3189,17 @@ async fn forward_with_attempt(
         };
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
+        if status.is_success()
+            && adapters::is_gemini_v1internal_provider_type(stored.provider_type)
+            && serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .as_ref()
+                .and_then(adapters::google_embedded_error)
+                .is_some()
+        {
+            status = StatusCode::BAD_GATEWAY;
+            status_code = status.as_u16();
+        }
         let next_body_retry_stage = if route == ProxyRoute::ClaudeMessages
             && execution.driver_is("oauth.claude_messages")
         {
@@ -2908,7 +3289,7 @@ async fn forward_with_attempt(
                         ProviderOutcome::Failure { status_code: 502 },
                     )
                     .await;
-                    if !request_is_provider_pinned(&headers, &request_context) {
+                    if !request_is_provider_pinned(&attempt_context, &request_context) {
                         if let Some(next_attempt) = next_provider_failover(
                             &state,
                             route,
@@ -2961,7 +3342,7 @@ async fn forward_with_attempt(
                     )
                     .await;
                     semantic_provider_outcome_recorded = true;
-                    if !request_is_provider_pinned(&headers, &request_context) {
+                    if !request_is_provider_pinned(&attempt_context, &request_context) {
                         if let Some(next_attempt) = next_provider_failover(
                             &state,
                             route,
@@ -2983,13 +3364,31 @@ async fn forward_with_attempt(
         } else {
             None
         };
-        let usage = if route == ProxyRoute::ClaudeCountTokens {
+        let is_count_tokens_request =
+            route == ProxyRoute::ClaudeCountTokens || adapter_request.is_gemini_count_tokens();
+        let usage = if is_count_tokens_request {
             TokenUsage::default()
         } else {
             adapter.parse_usage(&bytes, &stored, route)
         };
-        let bytes =
-            adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)?;
+        let bytes = if status.is_success() {
+            match adapter.transform_response_for_request(bytes, &stored, route, &adapter_request) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure {
+                            status_code: error.status.as_u16(),
+                        },
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            bytes
+        };
         let bytes = super::claude_oauth::restore_claude_tool_names_in_response_bytes(
             bytes,
             &adapter_request.claude_tool_name_map,
@@ -2997,7 +3396,7 @@ async fn forward_with_attempt(
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
             crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
-        } else {
+        } else if !is_count_tokens_request {
             let user_email_for_record = request_context.user_email.clone();
             log_usage(
                 &state,
@@ -3007,7 +3406,7 @@ async fn forward_with_attempt(
                 model_metadata(&adapter_request),
                 usage,
                 UsageLogContext {
-                    is_streaming: false,
+                    is_streaming: adapter_request.stream_requested,
                     ..request_context
                 },
             )
@@ -3073,10 +3472,33 @@ pub async fn forward_codex_responses_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ProxyError> {
+    forward_codex_responses_ws_inner(state, headers, ws, None).await
+}
+
+pub async fn forward_codex_responses_ws_for_route_key(
+    state: ServerState,
+    route_key: String,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ProxyError> {
+    forward_codex_responses_ws_inner(state, headers, ws, Some(route_key)).await
+}
+
+async fn forward_codex_responses_ws_inner(
+    state: ServerState,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    route_key: Option<String>,
+) -> Result<Response, ProxyError> {
     let downstream_connection_guard = acquire_responses_downstream_connection()?;
     let route = ProxyRoute::CodexResponses;
     let app = route.app();
     let mut request_context = request_context_from_headers(&headers);
+    if route_key.is_some() && request_context.share_id.is_some() {
+        return Err(ProxyError::bad_request(
+            "Share requests must use the Share URL without a route-key prefix",
+        ));
+    }
     request_context.session_id = session_id_from_request(route, &headers, b"");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
@@ -3094,22 +3516,17 @@ pub async fn forward_codex_responses_ws(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let ui_settings = state.ui_settings.read().await.for_frontend();
-    let configured_provider_id =
-        current_provider::resolve_current_provider_id(&providers, &ui_settings, app);
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
         let (execution, _share_name) =
             select_share_execution(&providers, &shares, &accounts_for_selection, app, share_id)?;
         execution
+    } else if let Some(route_key) = route_key.as_deref() {
+        select_provider_for_route_key(&providers, &accounts_for_selection, app, route_key, None)?
+            .execution
     } else {
-        super::router::select_provider(
-            &providers,
-            &accounts_for_selection,
-            app,
-            &headers,
-            configured_provider_id.as_deref(),
-        )?
-        .execution
+        return Err(ProxyError::bad_request(
+            "direct inference requires a route-scoped endpoint under /r/:routeKey",
+        ));
     };
     drop(providers);
     let stored = execution.runtime_stored_view();
@@ -3259,6 +3676,28 @@ pub async fn forward_grok_media(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    forward_grok_media_inner(state, method, upstream_path, headers, body, None).await
+}
+
+pub async fn forward_grok_media_for_route_key(
+    state: ServerState,
+    route_key: String,
+    method: Method,
+    upstream_path: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    forward_grok_media_inner(state, method, upstream_path, headers, body, Some(route_key)).await
+}
+
+async fn forward_grok_media_inner(
+    state: ServerState,
+    method: Method,
+    upstream_path: String,
+    headers: HeaderMap,
+    body: Bytes,
+    route_key: Option<String>,
+) -> Result<Response, ProxyError> {
     super::grok::validate_media_request(&method, &upstream_path)?;
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
@@ -3266,6 +3705,11 @@ pub async fn forward_grok_media(
         super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
+    if route_key.is_some() && request_context.share_id.is_some() {
+        return Err(ProxyError::bad_request(
+            "Share requests must use the Share URL without a route-key prefix",
+        ));
+    }
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
@@ -3281,21 +3725,10 @@ pub async fn forward_grok_media(
     };
     let sticky_media_binding = super::grok::sticky_media_session_key(&upstream_path, &body)
         .and_then(|session_key| state.grok_media_session_binding(&session_key));
-    let mut selection_headers = headers.clone();
-    if let Some(binding) = sticky_media_binding.as_ref() {
-        if selection_headers.get("x-cc-provider-id").is_none() {
-            if let Ok(value) = HeaderValue::from_str(&binding.provider_id) {
-                selection_headers.insert(HeaderName::from_static("x-cc-provider-id"), value);
-            }
-        }
-    }
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
     let account_in_flight = state.account_in_flight.snapshot();
-    let ui_settings = state.ui_settings.read().await.for_frontend();
-    let configured_provider_id =
-        current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
         let (execution, _share_name) = select_share_execution(
             &providers,
@@ -3305,16 +3738,19 @@ pub async fn forward_grok_media(
             share_id,
         )?;
         execution
-    } else {
-        super::router::select_provider_for_type(
+    } else if let Some(route_key) = route_key.as_deref() {
+        select_provider_for_route_key(
             &providers,
             &accounts_for_selection,
             AppKind::Codex,
-            &selection_headers,
-            configured_provider_id.as_deref(),
-            ProviderType::GrokOAuth,
+            route_key,
+            Some(&account_in_flight),
         )?
         .execution
+    } else {
+        return Err(ProxyError::bad_request(
+            "direct Grok media requests require a route-scoped endpoint under /r/:routeKey",
+        ));
     };
     let account_in_flight_guard = acquire_account_in_flight(
         &state,
@@ -3349,6 +3785,24 @@ pub async fn forward_images_generations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    forward_images_generations_inner(state, headers, body, None).await
+}
+
+pub async fn forward_images_generations_for_route_key(
+    state: ServerState,
+    route_key: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    forward_images_generations_inner(state, headers, body, Some(route_key)).await
+}
+
+async fn forward_images_generations_inner(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Bytes,
+    route_key: Option<String>,
+) -> Result<Response, ProxyError> {
     let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
@@ -3356,6 +3810,11 @@ pub async fn forward_images_generations(
         super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
+    if route_key.is_some() && request_context.share_id.is_some() {
+        return Err(ProxyError::bad_request(
+            "Share requests must use the Share URL without a route-key prefix",
+        ));
+    }
     request_context.session_id =
         session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
@@ -3374,9 +3833,6 @@ pub async fn forward_images_generations(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let ui_settings = state.ui_settings.read().await.for_frontend();
-    let configured_provider_id =
-        current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
     let (execution, account_in_flight_guard) =
         if let Some(share_id) = request_context.share_id.as_deref() {
             let (execution, _share_name) = select_share_image_generation_execution(
@@ -3393,18 +3849,26 @@ pub async fn forward_images_generations(
                 &snapshot,
             )?;
             (execution, guard)
-        } else {
+        } else if let Some(route_key) = route_key.as_deref() {
             select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-                select_provider_for_codex_image_generation(
+                let selection = select_provider_for_route_key(
                     &providers,
                     &accounts_for_selection,
-                    &headers,
-                    configured_provider_id.as_deref(),
-                    snapshot,
-                    request_context.session_id.as_deref(),
-                )
-                .map(|selection| selection.execution)
+                    AppKind::Codex,
+                    route_key,
+                    Some(snapshot),
+                )?;
+                if !codex_image_generation_provider(&selection.execution.stored) {
+                    return Err(ProxyError::bad_request(
+                        "selected Codex Provider Surface does not support image generation",
+                    ));
+                }
+                Ok(selection.execution)
             })?
+        } else {
+            return Err(ProxyError::bad_request(
+                "direct image requests require a route-scoped endpoint under /r/:routeKey",
+            ));
         };
     drop(providers);
 
@@ -3448,6 +3912,24 @@ pub async fn forward_images_edits(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
+    forward_images_edits_inner(state, headers, body, None).await
+}
+
+pub async fn forward_images_edits_for_route_key(
+    state: ServerState,
+    route_key: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    forward_images_edits_inner(state, headers, body, Some(route_key)).await
+}
+
+async fn forward_images_edits_inner(
+    state: ServerState,
+    headers: HeaderMap,
+    body: Bytes,
+    route_key: Option<String>,
+) -> Result<Response, ProxyError> {
     let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
@@ -3455,6 +3937,11 @@ pub async fn forward_images_edits(
         super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
+    if route_key.is_some() && request_context.share_id.is_some() {
+        return Err(ProxyError::bad_request(
+            "Share requests must use the Share URL without a route-key prefix",
+        ));
+    }
     request_context.session_id =
         session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
@@ -3473,9 +3960,6 @@ pub async fn forward_images_edits(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let ui_settings = state.ui_settings.read().await.for_frontend();
-    let configured_provider_id =
-        current_provider::resolve_current_provider_id(&providers, &ui_settings, AppKind::Codex);
     let (execution, account_in_flight_guard) =
         if let Some(share_id) = request_context.share_id.as_deref() {
             let (execution, _share_name) = select_share_image_generation_execution(
@@ -3492,18 +3976,26 @@ pub async fn forward_images_edits(
                 &snapshot,
             )?;
             (execution, guard)
-        } else {
+        } else if let Some(route_key) = route_key.as_deref() {
             select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-                select_provider_for_codex_image_generation(
+                let selection = select_provider_for_route_key(
                     &providers,
                     &accounts_for_selection,
-                    &headers,
-                    configured_provider_id.as_deref(),
-                    snapshot,
-                    request_context.session_id.as_deref(),
-                )
-                .map(|selection| selection.execution)
+                    AppKind::Codex,
+                    route_key,
+                    Some(snapshot),
+                )?;
+                if !codex_image_generation_provider(&selection.execution.stored) {
+                    return Err(ProxyError::bad_request(
+                        "selected Codex Provider Surface does not support image generation",
+                    ));
+                }
+                Ok(selection.execution)
             })?
+        } else {
+            return Err(ProxyError::bad_request(
+                "direct image requests require a route-scoped endpoint under /r/:routeKey",
+            ));
         };
     drop(providers);
 
@@ -3571,8 +4063,8 @@ async fn forward_grok_media_with_execution(
     sticky_media_binding: Option<GrokMediaSessionBinding>,
     share_id: Option<String>,
     user_email: Option<String>,
-    _account_in_flight_guard: Option<AccountInFlightGuard>,
-    _share_invocation_guard: Option<ShareInFlightGuard>,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     let stored = execution.runtime_stored_view();
     if let Some(binding) = sticky_media_binding.as_ref() {
@@ -3581,7 +4073,17 @@ async fn forward_grok_media_with_execution(
     ensure_managed_credential_persistence_available(&state, &execution)?;
     let capability = grok_media_capability(&method, &upstream_path);
     ensure_grok_account_capability(&state, &execution, capability).await?;
-    refresh_execution_managed_account_if_needed(&state, &execution).await?;
+    if let Err(error) = refresh_execution_managed_account_if_needed(&state, &execution).await {
+        record_grok_media_terminal(
+            &state,
+            &stored,
+            share_id.as_deref(),
+            user_email.as_deref(),
+            provider_outcome_from_status(error.status.as_u16()),
+        )
+        .await;
+        return Err(error);
+    }
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let media_session_id = optional_header(&headers, "x-grok-conv-id")
         .map(|value| value.trim().to_string())
@@ -3609,7 +4111,7 @@ async fn forward_grok_media_with_execution(
     let mut auth_refresh_attempted = false;
     let mut upstream = loop {
         ensure_managed_credential_persistence_available(&state, &execution)?;
-        let accounts = state.accounts_snapshot().await;
+        let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
         let mut target_headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
         if let Some(session_id) = media_session_id.as_deref() {
             replace_or_push_header(
@@ -3623,6 +4125,11 @@ async fn forward_grok_media_with_execution(
             "accept",
             "application/json, text/event-stream".to_string(),
         );
+        replace_or_push_header(
+            &mut target_headers,
+            "accept-encoding",
+            "identity".to_string(),
+        );
         let mut target_headers = owned_headers(target_headers);
         super::grok::apply_cli_identity_headers(
             &mut target_headers,
@@ -3630,7 +4137,7 @@ async fn forward_grok_media_with_execution(
         );
         let mut url = super::join_url(&execution.plan.endpoint, &upstream_path);
         let materialized_auth = execution.materialize_auth(&accounts)?;
-        execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+        execution.apply_auth(&mut target_headers, &mut url, &materialized_auth)?;
         apply_account_header_overrides(&mut target_headers, &stored, &accounts)?;
         execution.finalize_outbound_identity(&mut target_headers)?;
 
@@ -3644,34 +4151,67 @@ async fn forward_grok_media_with_execution(
             request = request.body(body.clone());
         }
         request = request.timeout(execution.request_timeout());
-        let upstream = request.send().await.map_err(|error| {
-            tokio::spawn({
-                let state = state.clone();
-                let stored = stored.clone();
-                async move {
-                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-                }
-            });
-            ProxyError::bad_gateway(error)
-        })?;
-        if upstream.status() != StatusCode::UNAUTHORIZED || auth_refresh_attempted {
+        let upstream = match request.send().await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                record_grok_media_terminal(
+                    &state,
+                    &stored,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    ProviderOutcome::NetworkFailure,
+                )
+                .await;
+                return Err(ProxyError::bad_gateway(error));
+            }
+        };
+        if upstream.status() != StatusCode::UNAUTHORIZED {
             break upstream;
         }
-        let Some((provider_type, account_id)) = execution.managed_account_target() else {
+        let rejected_access_token = bearer_token_from_owned_headers(&target_headers);
+        if auth_refresh_attempted {
+            mark_managed_account_auth_cooldown(
+                &state,
+                &execution,
+                rejected_access_token,
+                "grok_media_unauthorized_after_refresh",
+            )
+            .await;
+            break upstream;
+        }
+        let Some((provider_type, account_id, expected_generation)) =
+            execution.managed_account_identity_target()
+        else {
             break upstream;
         };
         drop(upstream);
         if let Err(error) = state
-            .refresh_managed_account_now(provider_type, Some(account_id))
+            .refresh_managed_account_now_for_generation(
+                provider_type,
+                account_id,
+                expected_generation,
+            )
             .await
         {
             mark_managed_account_auth_cooldown(
                 &state,
                 &execution,
+                rejected_access_token,
                 "grok_media_forced_refresh_failed",
             )
             .await;
-            return Err(managed_account_refresh_error_to_proxy_error(error));
+            let error = managed_account_refresh_error_to_proxy_error(error);
+            record_grok_media_terminal(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                ProviderOutcome::Failure {
+                    status_code: StatusCode::UNAUTHORIZED.as_u16(),
+                },
+            )
+            .await;
+            return Err(error);
         }
         auth_refresh_attempted = true;
         record_forward_retry(
@@ -3680,36 +4220,109 @@ async fn forward_grok_media_with_execution(
             "grok_media_unauthorized",
         );
     };
-    if upstream.status() == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
-        mark_managed_account_auth_cooldown(
-            &state,
-            &execution,
-            "grok_media_unauthorized_after_refresh",
-        )
-        .await;
-    }
     let status = upstream.status();
     let status_code = status.as_u16();
     let mut response_headers = upstream.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
-    maybe_update_grok_entitlement(&state, &stored, &response_headers).await;
-    maybe_mark_grok_cooldown(&state, &stored, status, &response_headers).await;
+    maybe_update_grok_entitlement(&state, &execution, &response_headers).await;
+    maybe_mark_grok_cooldown(&state, &execution, status, &response_headers).await;
     let content_type = response_headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let content_encoding = content_encoding_value(&response_headers);
-    let bytes = crate::infra::http::read_response_body_limited(
+    let is_image_request = upstream_path.contains("/images/");
+    if is_image_request && status.is_success() {
+        if content_encoding.as_ref().is_some_and(|value| {
+            value
+                .to_str()
+                .ok()
+                .is_none_or(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+        }) {
+            record_grok_media_terminal(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                ProviderOutcome::Failure { status_code: 502 },
+            )
+            .await;
+            return Err(ProxyError::bad_gateway(
+                "Grok Images upstream ignored Accept-Encoding: identity",
+            ));
+        }
+        if upstream.content_length().is_some_and(|length| {
+            length > u64::try_from(super::MEDIA_RESPONSE_BODY_LIMIT_BYTES).unwrap_or(u64::MAX)
+        }) {
+            record_grok_media_terminal(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                ProviderOutcome::Failure { status_code: 502 },
+            )
+            .await;
+            return Err(ProxyError::bad_gateway(format!(
+                "Grok Images response exceeds the {} byte limit",
+                super::MEDIA_RESPONSE_BODY_LIMIT_BYTES
+            )));
+        }
+        return Ok(grok_image_heartbeat_response(GrokImageHeartbeatArgs {
+            keepalive_interval: image_keepalive_interval(&execution),
+            state,
+            execution,
+            stored,
+            upstream,
+            response_headers,
+            content_type,
+            status,
+            capability,
+            share_id,
+            user_email,
+            started,
+            account_in_flight_guard,
+            share_invocation_guard,
+        }));
+    }
+    let bytes = match crate::infra::http::read_response_body_limited(
         &mut upstream,
         super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
     )
     .await
-    .map_err(ProxyError::bad_gateway)?;
-    let decoded = decode_response_body_for_proxy_with_limit(
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            record_grok_media_terminal(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                ProviderOutcome::NetworkFailure,
+            )
+            .await;
+            return Err(ProxyError::bad_gateway(error));
+        }
+    };
+    let decoded = match decode_response_body_for_proxy_with_limit(
         &response_headers,
         bytes,
         super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
-    )?;
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            record_grok_media_terminal(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                ProviderOutcome::Failure {
+                    status_code: error.status.as_u16(),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let mut preserve_content_encoding = decoded.preserve_content_encoding;
     let (response_body, version_gate_rewritten) =
         maybe_rewrite_grok_cli_version_gate_body(status, &stored, decoded.body);
@@ -3726,23 +4339,28 @@ async fn forward_grok_media_with_execution(
     .await;
     if status.is_success() && upstream_path.contains("/videos/generations") {
         if let Some(session_key) = super::grok::video_session_key_from_response(&response_body) {
-            state.remember_grok_media_session(
-                session_key,
-                stored.provider.id.clone(),
-                execution.managed_account_id().map(str::to_string),
-                24 * 60 * 60 * 1000,
-            );
+            if let Some((ProviderType::GrokOAuth, account_id, auth_identity_generation)) =
+                execution.managed_account_identity_target()
+            {
+                state.remember_grok_media_session(
+                    session_key,
+                    stored.provider.id.clone(),
+                    account_id.to_string(),
+                    auth_identity_generation,
+                    24 * 60 * 60 * 1000,
+                );
+            }
         }
     }
     if status.is_success() {
         record_grok_capability_evidence(&state, &execution, capability).await;
     }
-    record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
-    record_share_invocation_result(
+    record_grok_media_terminal(
         &state,
+        &stored,
         share_id.as_deref(),
         user_email.as_deref(),
-        TokenUsage::default(),
+        provider_outcome_from_status(status_code),
     )
     .await;
     let mut response = Response::new(Body::from(response_body));
@@ -3767,21 +4385,306 @@ async fn forward_grok_media_with_execution(
     Ok(response)
 }
 
+struct GrokImageHeartbeatArgs {
+    keepalive_interval: Duration,
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    upstream: reqwest::Response,
+    response_headers: HeaderMap,
+    content_type: Option<String>,
+    status: StatusCode,
+    capability: GrokAccountCapability,
+    share_id: Option<String>,
+    user_email: Option<String>,
+    started: Instant,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+enum GrokImageReadStep {
+    Keepalive,
+    Upstream(Result<Option<Bytes>, reqwest::Error>),
+}
+
+fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
+    let GrokImageHeartbeatArgs {
+        keepalive_interval,
+        state,
+        execution,
+        stored,
+        upstream,
+        response_headers,
+        content_type,
+        status,
+        capability,
+        share_id,
+        user_email,
+        started,
+        account_in_flight_guard,
+        share_invocation_guard,
+    } = args;
+    let upstream_is_sse = content_type
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let mode = if upstream_is_sse { "sse" } else { "json" };
+    let mut lifecycle = GrokImageLifecycleGuard {
+        armed: true,
+        state: state.clone(),
+        execution,
+        stored: stored.clone(),
+        capability,
+        share_id,
+        user_email,
+        started,
+        account_in_flight_guard,
+        share_invocation_guard,
+    };
+    let stream = async_stream::stream! {
+        let mut transport = ImageTransportMetrics::new("grok_images", mode, started);
+        let initial = if upstream_is_sse {
+            Bytes::from_static(b": connected\n\n")
+        } else {
+            Bytes::from_static(b"\n")
+        };
+        transport.emit(false);
+        yield Ok::<Bytes, std::convert::Infallible>(initial);
+
+        let mut inner = upstream.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + keepalive_interval,
+            keepalive_interval,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let step = tokio::select! {
+                biased;
+                _ = keepalive.tick() => GrokImageReadStep::Keepalive,
+                result = inner.try_next() => GrokImageReadStep::Upstream(result),
+            };
+            match step {
+                GrokImageReadStep::Keepalive => {
+                    let heartbeat = if upstream_is_sse {
+                        Bytes::from_static(b": keepalive\n\n")
+                    } else {
+                        Bytes::from_static(b" \n")
+                    };
+                    transport.emit(true);
+                    yield Ok(heartbeat);
+                }
+                GrokImageReadStep::Upstream(Err(error)) => {
+                    let message = bounded_codex_image_message(format!(
+                        "Grok Images upstream body read failed: {error}"
+                    ));
+                    lifecycle
+                        .finish_failure(ProviderOutcome::NetworkFailure)
+                        .await;
+                    let body = grok_image_transport_error(upstream_is_sse, &message);
+                    transport.emit(false);
+                    yield Ok(body);
+                    return;
+                }
+                GrokImageReadStep::Upstream(Ok(Some(chunk))) => {
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                    if total_bytes > super::MEDIA_RESPONSE_BODY_LIMIT_BYTES {
+                        let message = format!(
+                            "Grok Images response exceeds the {} byte limit",
+                            super::MEDIA_RESPONSE_BODY_LIMIT_BYTES
+                        );
+                        lifecycle
+                            .finish_failure(ProviderOutcome::Failure { status_code: 502 })
+                            .await;
+                        let body = grok_image_transport_error(upstream_is_sse, &message);
+                        transport.emit(false);
+                        yield Ok(body);
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk);
+                    if upstream_is_sse {
+                        while let Some((event_end, delimiter_len)) =
+                            next_sse_event_boundary_bytes(&buffer)
+                        {
+                            let end = event_end + delimiter_len;
+                            let remaining = buffer.split_off(end);
+                            let frame = Bytes::from(std::mem::replace(&mut buffer, remaining));
+                            transport.emit(false);
+                            yield Ok(frame);
+                        }
+                    }
+                }
+                GrokImageReadStep::Upstream(Ok(None)) => {
+                    if !upstream_is_sse && serde_json::from_slice::<Value>(&buffer).is_err() {
+                        let message = "Grok Images upstream returned invalid JSON";
+                        lifecycle
+                            .finish_failure(ProviderOutcome::Failure { status_code: 502 })
+                            .await;
+                        let body = grok_image_transport_error(false, message);
+                        transport.emit(false);
+                        yield Ok(body);
+                        return;
+                    }
+                    let tail = if buffer.is_empty() {
+                        None
+                    } else if upstream_is_sse
+                        && !buffer.ends_with(b"\n\n")
+                        && !buffer.ends_with(b"\r\n\r\n")
+                    {
+                        buffer.extend_from_slice(b"\n\n");
+                        Some(Bytes::from(buffer))
+                    } else {
+                        Some(Bytes::from(buffer))
+                    };
+                    lifecycle.finish_success().await;
+                    if let Some(tail) = tail {
+                        transport.emit(false);
+                        yield Ok(tail);
+                    }
+                    tracing::debug!(
+                        provider_id = stored.provider.id,
+                        status = status.as_u16(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "grok image request completed"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(if upstream_is_sse {
+            "text/event-stream; charset=utf-8"
+        } else {
+            "application/json"
+        }),
+    );
+    copy_safe_upstream_response_headers(&response_headers, &mut response);
+    apply_codex_images_streaming_headers(&mut response);
+    response
+}
+
+fn grok_image_transport_error(upstream_is_sse: bool, message: &str) -> Bytes {
+    let payload = json!({
+        "error": {
+            "type": "upstream_error",
+            "code": "grok_image_response_error",
+            "message": bounded_codex_image_message(message.to_string()),
+        }
+    });
+    if upstream_is_sse {
+        Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+    } else {
+        serde_json::to_vec(&payload)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| Bytes::from_static(b"{\"error\":{\"type\":\"upstream_error\",\"code\":\"grok_image_response_error\",\"message\":\"Grok image response failed\"}}"))
+    }
+}
+
+struct GrokImageLifecycleGuard {
+    armed: bool,
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    capability: GrokAccountCapability,
+    share_id: Option<String>,
+    user_email: Option<String>,
+    started: Instant,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+async fn record_grok_media_terminal(
+    state: &ServerState,
+    stored: &StoredProvider,
+    share_id: Option<&str>,
+    user_email: Option<&str>,
+    outcome: ProviderOutcome,
+) {
+    record_provider_outcome(state, stored, outcome).await;
+    record_share_invocation_result(state, share_id, user_email, TokenUsage::default()).await;
+}
+
+impl GrokImageLifecycleGuard {
+    async fn finish_success(&mut self) {
+        record_grok_capability_evidence(&self.state, &self.execution, self.capability).await;
+        record_grok_media_terminal(
+            &self.state,
+            &self.stored,
+            self.share_id.as_deref(),
+            self.user_email.as_deref(),
+            provider_outcome_from_status(StatusCode::OK.as_u16()),
+        )
+        .await;
+        self.disarm();
+    }
+
+    async fn finish_failure(&mut self, outcome: ProviderOutcome) {
+        record_grok_media_terminal(
+            &self.state,
+            &self.stored,
+            self.share_id.as_deref(),
+            self.user_email.as_deref(),
+            outcome,
+        )
+        .await;
+        self.disarm();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.account_in_flight_guard.take();
+        self.share_invocation_guard.take();
+    }
+}
+
+impl Drop for GrokImageLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let stored = self.stored.clone();
+        let share_id = self.share_id.clone();
+        let user_email = self.user_email.clone();
+        let account_in_flight_guard = self.account_in_flight_guard.take();
+        let share_invocation_guard = self.share_invocation_guard.take();
+        tokio::spawn(async move {
+            record_share_invocation_result(
+                &state,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                TokenUsage::default(),
+            )
+            .await;
+            drop(account_in_flight_guard);
+            drop(share_invocation_guard);
+            crate::metrics::record_stream_client_cancelled(stored.app.as_str());
+        });
+    }
+}
+
 fn ensure_grok_media_session_binding(
     execution: &ProviderExecution,
     binding: &GrokMediaSessionBinding,
 ) -> Result<(), ProxyError> {
-    let account_matches = binding.account_id.as_deref().is_some_and(|account_id| {
-        execution
-            .managed_account_id()
-            .is_some_and(|current| current == account_id)
-    });
+    let account_matches = execution.managed_account_identity_target().is_some_and(
+        |(provider_type, account_id, auth_identity_generation)| {
+            provider_type == ProviderType::GrokOAuth
+                && binding.account_id == account_id
+                && binding.auth_identity_generation == auth_identity_generation
+        },
+    );
     if binding.provider_id == execution.stored.provider.id && account_matches {
         return Ok(());
     }
     Err(ProxyError {
         status: StatusCode::CONFLICT,
-        message: "Grok media session is bound to a different Provider or OAuth account".to_string(),
+        message: "Grok media session is bound to a different Provider or OAuth account identity"
+            .to_string(),
     })
 }
 
@@ -3797,7 +4700,7 @@ async fn forward_codex_images_request(
     let stored = execution.runtime_stored_view();
     ensure_managed_credential_persistence_available(&state, &execution)?;
     let accounts = state.accounts_snapshot().await;
-    super::router::ensure_codex_oauth_active_account(&stored, &accounts)?;
+    super::router::ensure_codex_oauth_binding(&stored, &accounts)?;
     validate_codex_allowed_client(
         &stored,
         ProxyRoute::CodexResponses,
@@ -3812,6 +4715,7 @@ async fn forward_codex_images_request(
         requested_model: Some(prepared.requested_model.clone()),
         actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
         actual_model_source: Some("codex_image_generation_bridge".to_string()),
+        gemini_action: None,
         stream_requested: true,
         upstream_stream_requested: true,
         custom_tool_names: Default::default(),
@@ -3865,11 +4769,11 @@ async fn forward_codex_images_request(
     }
     let first_event_timeout = execution.stream_first_byte_timeout();
     let mut auth_refresh_attempted = false;
-    let mut upstream = loop {
+    let (mut upstream, rejected_access_token) = loop {
         let header_timeout = first_event_timeout
             .map(|timeout| timeout.saturating_sub(started.elapsed()))
             .unwrap_or_else(|| execution.request_timeout());
-        let upstream = match send_codex_images_attempt(
+        let attempt = match send_codex_images_attempt(
             &state,
             &execution,
             &stored,
@@ -3879,7 +4783,7 @@ async fn forward_codex_images_request(
         )
         .await
         {
-            Ok(upstream) => upstream,
+            Ok(attempt) => attempt,
             Err(error) => {
                 let timeout = error.status == StatusCode::GATEWAY_TIMEOUT;
                 record_codex_images_prebody_failure(
@@ -3908,16 +4812,23 @@ async fn forward_codex_images_request(
                 return Err(error);
             }
         };
-        if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
-            if let Some((provider_type, account_id)) = execution.managed_account_target() {
-                drop(upstream);
+        if attempt.response.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
+            if let Some((provider_type, account_id, expected_generation)) =
+                execution.managed_account_identity_target()
+            {
+                drop(attempt.response);
                 let refresh_result = state
-                    .refresh_managed_account_now(provider_type, Some(account_id))
+                    .refresh_managed_account_now_for_generation(
+                        provider_type,
+                        account_id,
+                        expected_generation,
+                    )
                     .await;
                 if let Err(error) = refresh_result {
                     mark_managed_account_auth_cooldown(
                         &state,
                         &execution,
+                        attempt.access_token.as_deref(),
                         "images_forced_refresh_failed",
                     )
                     .await;
@@ -3944,13 +4855,18 @@ async fn forward_codex_images_request(
                 continue;
             }
         }
-        break upstream;
+        break (attempt.response, attempt.access_token);
     };
     let status = upstream.status();
     let status_code = status.as_u16();
     if status == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
-        mark_managed_account_auth_cooldown(&state, &execution, "images_unauthorized_after_refresh")
-            .await;
+        mark_managed_account_auth_cooldown(
+            &state,
+            &execution,
+            rejected_access_token.as_deref(),
+            "images_unauthorized_after_refresh",
+        )
+        .await;
     }
     let mut response_headers = upstream.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -4219,6 +5135,11 @@ async fn forward_codex_images_request(
     Ok(response)
 }
 
+struct CodexImagesAttempt {
+    response: reqwest::Response,
+    access_token: Option<String>,
+}
+
 async fn send_codex_images_attempt(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -4226,8 +5147,8 @@ async fn send_codex_images_attempt(
     adapter_request: &adapters::AdapterRequest,
     session_id: Option<&str>,
     header_timeout: Duration,
-) -> Result<reqwest::Response, ProxyError> {
-    let accounts = state.accounts_snapshot().await;
+) -> Result<CodexImagesAttempt, ProxyError> {
+    let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let mut target_headers = adapter.build_headers(AppKind::Codex, stored, &accounts)?;
     append_codex_oauth_session_headers(&mut target_headers, session_id);
@@ -4240,9 +5161,10 @@ async fn send_codex_images_attempt(
     let mut target_headers = owned_headers(target_headers);
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, adapter_request)?;
     let materialized_auth = execution.materialize_auth(&accounts)?;
-    execution.apply_auth(&mut target_headers, &mut url, materialized_auth.as_ref())?;
+    execution.apply_auth(&mut target_headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut target_headers, stored, &accounts)?;
     execution.finalize_outbound_identity(&mut target_headers)?;
+    let access_token = bearer_token_from_owned_headers(&target_headers).map(str::to_string);
     let http_client = forward_http_client(state, stored).await?;
     let mut request = http_client
         .post(&url)
@@ -4252,7 +5174,7 @@ async fn send_codex_images_attempt(
     for (name, value) in &target_headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    tokio::time::timeout(header_timeout, request.send())
+    let response = tokio::time::timeout(header_timeout, request.send())
         .await
         .map_err(|_| ProxyError {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -4261,7 +5183,11 @@ async fn send_codex_images_attempt(
                 header_timeout.as_millis()
             ),
         })?
-        .map_err(ProxyError::bad_gateway)
+        .map_err(ProxyError::bad_gateway)?;
+    Ok(CodexImagesAttempt {
+        response,
+        access_token,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4914,6 +5840,11 @@ fn codex_images_response_stream(
         usage_snapshot: TokenUsage::default(),
         operation: prepared.operation,
         downstream_stream: prepared.stream,
+        transport_metrics: ImageTransportMetrics::new(
+            "codex_images",
+            if prepared.stream { "sse" } else { "json" },
+            started,
+        ),
         account_in_flight_guard,
         share_invocation_guard,
     };
@@ -4925,6 +5856,7 @@ fn codex_images_response_stream(
         } else {
             Bytes::from_static(b"\n")
         };
+        lifecycle.transport_metrics.emit(false);
         yield Ok(initial);
 
         let mut keepalive = tokio::time::interval_at(
@@ -4941,14 +5873,14 @@ fn codex_images_response_stream(
                 tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(deadline) => CodexImagesReadStep::Timeout,
-                    result = inner.try_next() => CodexImagesReadStep::Upstream(result),
                     _ = keepalive.tick() => CodexImagesReadStep::Keepalive,
+                    result = inner.try_next() => CodexImagesReadStep::Upstream(result),
                 }
             } else {
                 tokio::select! {
                     biased;
-                    result = inner.try_next() => CodexImagesReadStep::Upstream(result),
                     _ = keepalive.tick() => CodexImagesReadStep::Keepalive,
+                    result = inner.try_next() => CodexImagesReadStep::Upstream(result),
                 }
             };
 
@@ -4959,6 +5891,7 @@ fn codex_images_response_stream(
                     } else {
                         Bytes::from_static(b" \n")
                     };
+                    lifecycle.transport_metrics.emit(true);
                     yield Ok(keepalive);
                     continue;
                 }
@@ -5018,8 +5951,13 @@ fn codex_images_response_stream(
                                         &prepared,
                                         &partial,
                                         public_origin.as_deref(),
-                                    ) {
-                                        Ok(frame) => yield Ok(frame),
+                                    )
+                                    .await
+                                    {
+                                        Ok(frame) => {
+                                            lifecycle.transport_metrics.emit(false);
+                                            yield Ok(frame)
+                                        },
                                         Err(error) => {
                                             terminal = Some(Err(error));
                                             break;
@@ -5051,7 +5989,8 @@ fn codex_images_response_stream(
                         &prepared,
                         completion,
                         public_origin.as_deref(),
-                    );
+                    )
+                    .await;
                     match rendered {
                         Ok(rendered) => {
                             if lifecycle.first_token_ms.is_none() {
@@ -5070,6 +6009,7 @@ fn codex_images_response_stream(
                                 )
                                 .await;
                             for frame in rendered.frames {
+                                lifecycle.transport_metrics.emit(false);
                                 yield Ok(frame);
                             }
                             return;
@@ -5087,6 +6027,7 @@ fn codex_images_response_stream(
                                     error.metric_outcome(),
                                 )
                                 .await;
+                            lifecycle.transport_metrics.emit(false);
                             yield Ok(render_codex_images_error(prepared.stream, &error));
                             return;
                         }
@@ -5105,6 +6046,7 @@ fn codex_images_response_stream(
                             error.metric_outcome(),
                         )
                         .await;
+                    lifecycle.transport_metrics.emit(false);
                     yield Ok(render_codex_images_error(prepared.stream, &error));
                     return;
                 }
@@ -5131,6 +6073,7 @@ struct CodexImagesLifecycleGuard {
     usage_snapshot: TokenUsage,
     operation: CodexImagesOperation,
     downstream_stream: bool,
+    transport_metrics: ImageTransportMetrics,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 }
@@ -5209,6 +6152,8 @@ impl Drop for CodexImagesLifecycleGuard {
         let usage = self.usage_snapshot;
         let operation = self.operation;
         let downstream_stream = self.downstream_stream;
+        let account_in_flight_guard = self.account_in_flight_guard.take();
+        let share_invocation_guard = self.share_invocation_guard.take();
         tokio::spawn(async move {
             update_image_stream_usage(
                 &state,
@@ -5219,7 +6164,7 @@ impl Drop for CodexImagesLifecycleGuard {
                 first_token_ms,
                 usage,
                 "client_cancelled",
-                Some("downstream client cancelled the image response"),
+                Some(IMAGE_CLIENT_CANCELLED_MESSAGE),
                 None,
             )
             .await;
@@ -5230,6 +6175,8 @@ impl Drop for CodexImagesLifecycleGuard {
                 usage,
             )
             .await;
+            drop(account_in_flight_guard);
+            drop(share_invocation_guard);
             crate::metrics::record_codex_images_request(
                 operation.as_str(),
                 downstream_stream,
@@ -5688,7 +6635,7 @@ struct RenderedCodexImagesCompletion {
     image_usage: ImageUsageMetadata,
 }
 
-fn render_codex_images_completion(
+async fn render_codex_images_completion(
     state: &ServerState,
     prepared: &CodexImagesPreparedRequest,
     completion: CodexImagesCompletion,
@@ -5699,7 +6646,8 @@ fn render_codex_images_completion(
     let mut image_usage = ImageUsageMetadata::default();
     for result in completion.results {
         let (item, item_usage) =
-            render_codex_image_data(state, result, &prepared.response_format, public_origin)?;
+            render_codex_image_data(state, result, &prepared.response_format, public_origin)
+                .await?;
         merge_codex_image_usage(&mut image_usage, item_usage);
         data.push(item);
     }
@@ -5752,7 +6700,7 @@ fn render_codex_images_completion(
     })
 }
 
-fn render_codex_image_partial(
+async fn render_codex_image_partial(
     state: &ServerState,
     prepared: &CodexImagesPreparedRequest,
     partial: &CodexImagePartial,
@@ -5761,7 +6709,7 @@ fn render_codex_image_partial(
     let mut result = partial.meta.clone();
     result.result = partial.result.clone();
     let (mut payload, _) =
-        render_codex_image_data(state, result, &prepared.response_format, public_origin)?;
+        render_codex_image_data(state, result, &prepared.response_format, public_origin).await?;
     let event_name = format!("{}.partial_image", prepared.operation.stream_prefix());
     payload["type"] = Value::String(event_name.clone());
     payload["created_at"] = Value::Number(partial.created_at.into());
@@ -5771,7 +6719,7 @@ fn render_codex_image_partial(
     )))
 }
 
-fn render_codex_image_data(
+async fn render_codex_image_data(
     state: &ServerState,
     mut result: CodexImageResult,
     response_format: &str,
@@ -5806,7 +6754,8 @@ fn render_codex_image_data(
             CodexImagesFailure::local("image URL response has no public server origin")
         })?;
         let handle = state
-            .store_ephemeral_image(Bytes::from(decoded), mime_type)
+            .store_image_capability(Bytes::from(decoded), mime_type)
+            .await
             .map_err(|error| CodexImagesFailure::local(error.to_string()))?;
         data["url"] = Value::String(format!("{public_origin}/v1/images/files/{}", handle.token));
     } else {
@@ -6412,13 +7361,48 @@ async fn ensure_responses_websocket_turn_allowed(
     execution: &ProviderExecution,
     mode: ResponsesWebsocketMode,
 ) -> Result<(), ProxyError> {
-    ensure_managed_credential_persistence_available(state, execution)?;
+    let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
+    ensure_responses_websocket_turn_allowed_with_accounts(execution, mode, &accounts)
+}
+
+fn ensure_responses_websocket_turn_allowed_with_accounts(
+    execution: &ProviderExecution,
+    mode: ResponsesWebsocketMode,
+    accounts: &AccountStore,
+) -> Result<(), ProxyError> {
+    if let Some((provider_type, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    {
+        let account = accounts
+            .find_for_provider(provider_type, Some(account_id))
+            .ok_or_else(|| {
+                ProxyError::conflict(format!(
+                    "bound account {account_id} is unavailable; reconnect the WebSocket"
+                ))
+            })?;
+        if account.auth_identity_generation != auth_identity_generation {
+            return Err(ProxyError::conflict(format!(
+                "bound account {account_id} identity changed; reconnect the WebSocket"
+            )));
+        }
+    }
     if matches!(mode, ResponsesWebsocketMode::Codex) {
         let stored = execution.runtime_stored_view();
-        let accounts = state.accounts_snapshot().await;
-        super::router::ensure_codex_oauth_active_account(&stored, &accounts)?;
+        super::router::ensure_codex_oauth_binding(&stored, accounts)?;
     }
     Ok(())
+}
+
+async fn lock_responses_websocket_turn_accounts<'a>(
+    state: &'a ServerState,
+    execution: &ProviderExecution,
+    mode: ResponsesWebsocketMode,
+) -> Result<tokio::sync::RwLockReadGuard<'a, AccountStore>, ProxyError> {
+    ensure_managed_credential_persistence_available(state, execution)?;
+    let accounts = state.accounts.read().await;
+    ensure_managed_credential_persistence_available(state, execution)?;
+    ensure_responses_websocket_turn_allowed_with_accounts(execution, mode, &accounts)?;
+    Ok(accounts)
 }
 
 async fn prepare_responses_websocket_target(
@@ -6430,7 +7414,7 @@ async fn prepare_responses_websocket_target(
 ) -> Result<PreparedResponsesWebSocketTarget, ProxyError> {
     ensure_managed_credential_persistence_available(state, execution)?;
     let stored = execution.runtime_stored_view();
-    let accounts = state.accounts_snapshot().await;
+    let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
     let adapter = adapters::adapter_for(stored.app, stored.provider_type);
     let mut headers = adapter.build_headers(stored.app, &stored, &accounts)?;
     append_codex_oauth_session_headers(&mut headers, session_id);
@@ -6449,7 +7433,7 @@ async fn prepare_responses_websocket_target(
         codex_responses_websocket_url(execution)
     };
     let materialized_auth = execution.materialize_auth(&accounts)?;
-    execution.apply_auth(&mut headers, &mut ws_url, materialized_auth.as_ref())?;
+    execution.apply_auth(&mut headers, &mut ws_url, &materialized_auth)?;
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
     let pool_key = if matches!(mode, ResponsesWebsocketMode::Codex) {
@@ -6795,12 +7779,22 @@ async fn bridge_responses_websocket(
                         "the first responses websocket request must be response.create",
                     ));
                 }
-                let send_result = entry
-                    .as_mut()
-                    .expect("upstream websocket is connected")
-                    .socket
-                    .send(message)
-                    .await;
+                let send_result = {
+                    let _account_read_guard = if starts_response {
+                        Some(
+                            lock_responses_websocket_turn_accounts(state, &execution, mode)
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    entry
+                        .as_mut()
+                        .expect("upstream websocket is connected")
+                        .socket
+                        .send(message)
+                        .await
+                };
                 if let Err(error) = send_result {
                     let _failed_entry = entry.take();
                     if response_in_flight
@@ -7610,19 +8604,26 @@ async fn connect_responses_websocket(
                     && responses_websocket_http_error(&error)
                         .is_some_and(|(status, _, _)| status == StatusCode::UNAUTHORIZED) =>
             {
-                let Some((provider_type, account_id)) = execution.managed_account_target() else {
+                let Some((provider_type, account_id, expected_generation)) =
+                    execution.managed_account_identity_target()
+                else {
                     return Err(ResponsesWebsocketConnectFailure {
                         error: responses_websocket_connect_error(state, execution, error).await,
                         fallback_source: None,
                     });
                 };
                 let refresh_result = state
-                    .refresh_managed_account_now(provider_type, Some(account_id))
+                    .refresh_managed_account_now_for_generation(
+                        provider_type,
+                        account_id,
+                        expected_generation,
+                    )
                     .await;
                 if let Err(error) = refresh_result {
                     mark_managed_account_auth_cooldown(
                         state,
                         execution,
+                        bearer_token_from_owned_headers(headers),
                         "websocket_forced_refresh_failed",
                     )
                     .await;
@@ -7662,6 +8663,7 @@ async fn connect_responses_websocket(
                     mark_managed_account_auth_cooldown(
                         state,
                         execution,
+                        bearer_token_from_owned_headers(headers),
                         "websocket_unauthorized_after_refresh",
                     )
                     .await;
@@ -7746,7 +8748,7 @@ async fn run_codex_websocket_http_fallback(
 
     loop {
         let stored = execution.runtime_stored_view();
-        let target = match prepare_codex_http_fallback_target(
+        let (request, rejected_access_token) = match prepare_codex_http_fallback_target(
             state,
             execution,
             response_body,
@@ -7755,8 +8757,9 @@ async fn run_codex_websocket_http_fallback(
             intent,
         )
         .await
+        .and_then(build_codex_http_fallback_request)
         {
-            Ok(target) => target,
+            Ok(request) => request,
             Err(error) => {
                 if error.status.is_server_error() {
                     record_provider_outcome(
@@ -7783,15 +8786,6 @@ async fn run_codex_websocket_http_fallback(
                 .await;
             }
         };
-        let mut request = target
-            .http_client
-            .post(&target.url)
-            .header(ACCEPT, "text/event-stream")
-            .header(CONTENT_TYPE, "application/json")
-            .body(target.body);
-        for (name, value) in &target.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
         let first_event_deadline =
             first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let send_result = match first_event_deadline {
@@ -7846,7 +8840,9 @@ async fn run_codex_websocket_http_fallback(
         };
         let status = upstream.status();
         if status == StatusCode::UNAUTHORIZED && !*auth_refresh_attempted {
-            let Some((provider_type, account_id)) = execution.managed_account_target() else {
+            let Some((provider_type, account_id, expected_generation)) =
+                execution.managed_account_identity_target()
+            else {
                 let error = ProxyError {
                     status,
                     message: "Responses HTTP fallback upstream rejected authentication".to_string(),
@@ -7875,12 +8871,17 @@ async fn run_codex_websocket_http_fallback(
             };
             drop(upstream);
             let refresh_result = state
-                .refresh_managed_account_now(provider_type, Some(account_id))
+                .refresh_managed_account_now_for_generation(
+                    provider_type,
+                    account_id,
+                    expected_generation,
+                )
                 .await;
             if let Err(error) = refresh_result {
                 mark_managed_account_auth_cooldown(
                     state,
                     execution,
+                    rejected_access_token.as_deref(),
                     "websocket_http_fallback_refresh_failed",
                 )
                 .await;
@@ -7919,6 +8920,7 @@ async fn run_codex_websocket_http_fallback(
             mark_managed_account_auth_cooldown(
                 state,
                 execution,
+                rejected_access_token.as_deref(),
                 "websocket_http_fallback_unauthorized_after_refresh",
             )
             .await;
@@ -8271,7 +9273,7 @@ async fn prepare_codex_http_fallback_target(
 
     refresh_execution_managed_account_if_needed(state, execution).await?;
     ensure_managed_credential_persistence_available(state, execution)?;
-    let accounts = state.accounts_snapshot().await;
+    let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
     let mut headers = adapter.build_headers(AppKind::Codex, &stored, &accounts)?;
     headers.extend(adapter_request.upstream_headers.iter().cloned());
     if let Some(contract) = grok_contract {
@@ -8291,7 +9293,7 @@ async fn prepare_codex_http_fallback_target(
     }
     let mut headers = owned_headers(headers);
     let materialized_auth = execution.materialize_auth(&accounts)?;
-    execution.apply_auth(&mut headers, &mut url, materialized_auth.as_ref())?;
+    execution.apply_auth(&mut headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
 
@@ -8301,6 +9303,26 @@ async fn prepare_codex_http_fallback_target(
         headers,
         body: adapter_request.body,
     })
+}
+
+fn build_codex_http_fallback_request(
+    target: PreparedCodexHttpFallbackTarget,
+) -> Result<(reqwest::RequestBuilder, Option<String>), ProxyError> {
+    let access_token = bearer_token_from_owned_headers(&target.headers).map(str::to_string);
+    let request = super::outbound_request::build_post_request(
+        &target.http_client,
+        super::outbound_request::OutboundPostRequest {
+            url: &target.url,
+            body: target.body,
+            client_headers: &HeaderMap::new(),
+            target_headers: &target.headers,
+            default_accept: "text/event-stream",
+            default_content_type: "application/json",
+            timeout: Duration::ZERO,
+            stream_requested: true,
+        },
+    )?;
+    Ok((request, access_token))
 }
 
 fn axum_responses_websocket_http_body(
@@ -9134,8 +10156,8 @@ async fn responses_websocket_connect_error(
     maybe_mark_upstream_rate_limited(state, execution, status, &headers, &body).await;
     if execution.driver_is("oauth.grok_responses") {
         let stored = execution.runtime_stored_view();
-        maybe_update_grok_entitlement(state, &stored, &headers).await;
-        maybe_mark_grok_cooldown(state, &stored, status, &headers).await;
+        maybe_update_grok_entitlement(state, execution, &headers).await;
+        maybe_mark_grok_cooldown(state, execution, status, &headers).await;
         if is_grok_cli_version_gate_message(&upstream_error_message(&body)) {
             record_grok_cli_version_gate(&stored, "websocket_handshake");
             return ProxyError {
@@ -9470,13 +10492,8 @@ async fn maybe_mark_upstream_rate_limited(
     if status != StatusCode::TOO_MANY_REQUESTS {
         return;
     }
-    let Some((provider_type, requested_account_id)) = execution.managed_account_target() else {
-        return;
-    };
-    let Some(account_id) = state
-        .find_account_for_provider(provider_type, Some(requested_account_id))
-        .await
-        .map(|account| account.id)
+    let Some((provider_type, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
     else {
         return;
     };
@@ -9486,20 +10503,76 @@ async fn maybe_mark_upstream_rate_limited(
     };
     let message = format!("upstream returned 429; account is rate limited until {until}");
     state
-        .mark_account_rate_limited_until(&account_id, until, Some(message))
+        .mark_account_rate_limited_until_if_current(
+            account_id,
+            provider_type,
+            auth_identity_generation,
+            until,
+            Some(message),
+        )
         .await;
 }
 
 async fn mark_managed_account_auth_cooldown(
     state: &ServerState,
     execution: &ProviderExecution,
+    rejected_access_token: Option<&str>,
     source: &'static str,
 ) {
-    let Some((provider_type, requested_account_id)) = execution.managed_account_target() else {
+    let Some((provider_type, requested_account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return;
+    };
+    mark_managed_account_auth_cooldown_for_target(
+        state,
+        provider_type,
+        requested_account_id,
+        auth_identity_generation,
+        rejected_access_token,
+        source,
+    )
+    .await;
+}
+
+pub(super) async fn mark_managed_account_auth_cooldown_for_stored(
+    state: &ServerState,
+    stored: &StoredProvider,
+    rejected_access_token: Option<&str>,
+    source: &'static str,
+) {
+    let Some((provider_type, requested_account_id, auth_identity_generation)) =
+        managed_account_binding_with_generation(stored)
+    else {
+        return;
+    };
+    mark_managed_account_auth_cooldown_for_target(
+        state,
+        provider_type,
+        requested_account_id,
+        auth_identity_generation,
+        rejected_access_token,
+        source,
+    )
+    .await;
+}
+
+async fn mark_managed_account_auth_cooldown_for_target(
+    state: &ServerState,
+    provider_type: ProviderType,
+    requested_account_id: &str,
+    auth_identity_generation: u64,
+    rejected_access_token: Option<&str>,
+    source: &'static str,
+) {
+    let Some(rejected_access_token) = rejected_access_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    else {
         return;
     };
     let Some(account_id) = state
-        .find_account_for_provider(provider_type, Some(requested_account_id))
+        .find_account_for_provider(provider_type, requested_account_id)
         .await
         .map(|account| account.id)
     else {
@@ -9508,8 +10581,11 @@ async fn mark_managed_account_auth_cooldown(
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     let until = now.saturating_add(DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS);
     state
-        .mark_account_rate_limited_until(
+        .mark_account_auth_cooldown_if_current(
             &account_id,
+            provider_type,
+            auth_identity_generation,
+            rejected_access_token,
             until,
             Some(format!(
                 "upstream authentication remained unauthorized after refresh ({source})"
@@ -9543,14 +10619,16 @@ fn upstream_rate_limit_until(
 
 async fn maybe_mark_grok_cooldown(
     state: &ServerState,
-    stored: &StoredProvider,
+    execution: &ProviderExecution,
     status: StatusCode,
     headers: &HeaderMap,
 ) {
-    if stored.provider_type != ProviderType::GrokOAuth || status == StatusCode::TOO_MANY_REQUESTS {
+    if status == StatusCode::TOO_MANY_REQUESTS {
         return;
     }
-    let Some(account_id) = managed_account_id(stored).map(str::to_string) else {
+    let Some((ProviderType::GrokOAuth, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
         return;
     };
     let now = crate::infra::time::now_ms() as i64;
@@ -9558,19 +10636,24 @@ async fn maybe_mark_grok_cooldown(
         return;
     };
     state
-        .mark_account_rate_limited_until(&account_id, until, Some(message))
+        .mark_account_rate_limited_until_if_current(
+            account_id,
+            ProviderType::GrokOAuth,
+            auth_identity_generation,
+            until,
+            Some(message),
+        )
         .await;
 }
 
 async fn maybe_update_grok_entitlement(
     state: &ServerState,
-    stored: &StoredProvider,
+    execution: &ProviderExecution,
     headers: &HeaderMap,
 ) {
-    if stored.provider_type != ProviderType::GrokOAuth {
-        return;
-    }
-    let Some(account_id) = managed_account_id(stored).map(str::to_string) else {
+    let Some((ProviderType::GrokOAuth, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
         return;
     };
     let subscription_level = optional_header(headers, "xai-subscription-tier");
@@ -9579,8 +10662,10 @@ async fn maybe_update_grok_entitlement(
         return;
     }
     state
-        .update_account_entitlement_snapshot(
-            &account_id,
+        .update_account_entitlement_snapshot_if_current(
+            account_id,
+            ProviderType::GrokOAuth,
+            auth_identity_generation,
             subscription_level,
             entitlement_status,
             crate::infra::time::now_ms() as i64,
@@ -9662,6 +10747,7 @@ async fn forward_claude_deepseek(
         requested_model: model_selection.requested_model.clone(),
         actual_model: model_selection.actual_model.clone(),
         actual_model_source: model_selection.actual_model_source.clone(),
+        gemini_action: None,
         stream_requested: false,
         upstream_stream_requested: false,
         custom_tool_names: Default::default(),
@@ -9698,10 +10784,19 @@ async fn forward_claude_deepseek(
     );
 
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
-    let accounts = state.accounts_snapshot().await;
+    let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
     execution.materialize_auth(&accounts)?;
+    let (provider_type, account_id, expected_generation) = execution
+        .managed_account_identity_target()
+        .filter(|(provider_type, _, _)| *provider_type == ProviderType::DeepSeekAccount)
+        .ok_or_else(|| {
+            ProxyError::bad_request(
+                "deepseek_account provider must bind one explicit managed account",
+            )
+        })?;
+    debug_assert_eq!(provider_type, ProviderType::DeepSeekAccount);
     let upstream = state
-        .start_deepseek_chat_completion(execution.managed_account_id(), &deepseek_model, &prompt)
+        .start_deepseek_chat_completion(account_id, expected_generation, &deepseek_model, &prompt)
         .await
         .map_err(deepseek_upstream_error_to_proxy_error)?;
     let status = upstream.status();
@@ -9881,6 +10976,12 @@ fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> Proxy
         DeepSeekUpstreamError::NotFound => {
             ProxyError::not_found("deepseek_account managed account not found")
         }
+        DeepSeekUpstreamError::IdentityChanged => {
+            ProxyError::conflict("bound deepseek_account identity changed; rebind the Provider")
+        }
+        DeepSeekUpstreamError::CredentialPersistenceDegraded => {
+            managed_credential_persistence_error()
+        }
         DeepSeekUpstreamError::MissingToken => ProxyError {
             status: StatusCode::UNAUTHORIZED,
             message: "deepseek account access token is missing".to_string(),
@@ -9914,6 +11015,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         requested_model: model_selection.requested_model.clone(),
         actual_model: model_selection.actual_model.clone(),
         actual_model_source: model_selection.actual_model_source.clone(),
+        gemini_action: None,
         stream_requested: false,
         upstream_stream_requested: false,
         custom_tool_names: Default::default(),
@@ -9950,54 +11052,118 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .unwrap_or(false);
 
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
-    let accounts = state.accounts_snapshot().await;
-    execution.materialize_auth(&accounts)?;
-    let account = state
-        .find_account_for_provider(ProviderType::KiroOAuth, execution.managed_account_id())
-        .await
-        .ok_or_else(|| ProxyError::not_found("kiro_oauth managed account not found"))?;
-    let mut prepared = kiro::prepare_kiro_request(&account, &request_body)?;
-    if let Some(base_url) = kiro_api_base_override(&stored) {
-        prepared.url = super::join_url(&base_url, "/generateAssistantResponse");
-    }
-
     let http_client = forward_http_client(&state, &stored).await?;
-    let mut request = http_client
-        .post(&prepared.url)
-        .json(&prepared.body)
-        .header(ACCEPT, copy_header(&headers, ACCEPT).unwrap_or("*/*"));
-    for (name, value) in &prepared.headers {
-        request = request.header(*name, value);
-    }
-    if !stream_requested {
-        request = request.timeout(execution.request_timeout());
-    }
-
-    let upstream_result = if stream_requested {
-        match execution.stream_first_byte_timeout() {
-            Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-                    return Err(ProxyError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: format!(
-                            "proxy upstream streaming first byte timeout after {}ms",
-                            timeout.as_millis()
-                        ),
-                    });
-                }
-            },
-            None => request.send().await,
+    let mut auth_recovery = retry_policy::AuthRecoveryState::default();
+    let (upstream, prepared) = loop {
+        let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
+        execution.materialize_auth(&accounts)?;
+        let account_id = execution
+            .managed_account_target()
+            .filter(|(provider_type, _)| *provider_type == ProviderType::KiroOAuth)
+            .map(|(_, account_id)| account_id)
+            .ok_or_else(|| {
+                ProxyError::bad_request("kiro_oauth managed account binding is required")
+            })?;
+        let account = accounts
+            .find_for_provider(ProviderType::KiroOAuth, Some(account_id))
+            .cloned()
+            .ok_or_else(|| ProxyError::not_found("kiro_oauth managed account not found"))?;
+        let replay_allowed = account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        let mut prepared = kiro::prepare_kiro_request(&account, &request_body)?;
+        if let Some(base_url) = kiro_api_base_override(&stored) {
+            prepared.url = kiro_url_with_base_override(&base_url, &prepared.url)?;
         }
-    } else {
-        request.send().await
-    };
-    let upstream = match upstream_result {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            return Err(ProxyError::bad_gateway(error));
+        let serialized_body = serde_json::to_vec(&prepared.body)
+            .map(Bytes::from)
+            .map_err(|error| ProxyError::bad_request(format!("encode Kiro request: {error}")))?;
+        let target_headers = prepared
+            .headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect::<Vec<_>>();
+        let request = build_upstream_post_request(
+            &http_client,
+            &prepared.url,
+            serialized_body,
+            &headers,
+            &target_headers,
+            execution.request_timeout(),
+            stream_requested,
+        )?;
+
+        let upstream_result = if stream_requested {
+            match execution.stream_first_byte_timeout() {
+                Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
+                            .await;
+                        return Err(ProxyError {
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            message: format!(
+                                "proxy upstream streaming first byte timeout after {}ms",
+                                timeout.as_millis()
+                            ),
+                        });
+                    }
+                },
+                None => request.send().await,
+            }
+        } else {
+            request.send().await
+        };
+        let upstream = match upstream_result {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+                return Err(ProxyError::bad_gateway(error));
+            }
+        };
+        match auth_recovery.decide(upstream.status(), stored.provider_type, replay_allowed) {
+            Some(AuthRecoveryDecision::RefreshAndReplaySameBinding) => {
+                drop(upstream);
+                let Some((provider_type, account_id, expected_generation)) =
+                    execution.managed_account_identity_target()
+                else {
+                    return Err(ProxyError::bad_request(
+                        "kiro_oauth provider is missing a managed account binding",
+                    ));
+                };
+                if let Err(error) = state
+                    .refresh_managed_account_now_for_generation(
+                        provider_type,
+                        account_id,
+                        expected_generation,
+                    )
+                    .await
+                {
+                    mark_managed_account_auth_cooldown(
+                        &state,
+                        &execution,
+                        bearer_token_from_owned_headers(&target_headers),
+                        "kiro_forced_refresh_failed",
+                    )
+                    .await;
+                    return Err(managed_account_refresh_error_to_proxy_error(error));
+                }
+                record_forward_retry(ProxyRoute::ClaudeMessages, "auth", "kiro_unauthorized");
+            }
+            Some(AuthRecoveryDecision::ReturnUnauthorized) => {
+                if auth_recovery.attempted() {
+                    mark_managed_account_auth_cooldown(
+                        &state,
+                        &execution,
+                        bearer_token_from_owned_headers(&target_headers),
+                        "kiro_unauthorized_after_refresh",
+                    )
+                    .await;
+                }
+                break (upstream, prepared);
+            }
+            None => break (upstream, prepared),
         }
     };
     let status = upstream.status();
@@ -10367,6 +11533,26 @@ fn kiro_api_base_override(stored: &StoredProvider) -> Option<String> {
     )
 }
 
+fn kiro_url_with_base_override(base_url: &str, prepared_url: &str) -> Result<String, ProxyError> {
+    let prepared = url::Url::parse(prepared_url)
+        .map_err(|error| ProxyError::bad_gateway(format!("invalid prepared Kiro URL: {error}")))?;
+    let mut base = url::Url::parse(base_url)
+        .map_err(|error| ProxyError::bad_request(format!("invalid Kiro API base URL: {error}")))?;
+    let base_path = base.path().trim_end_matches('/');
+    let prepared_path = prepared.path().trim_start_matches('/');
+    let path = if base_path.is_empty() {
+        format!("/{prepared_path}")
+    } else if prepared_path.is_empty() {
+        format!("{base_path}/")
+    } else {
+        format!("{base_path}/{prepared_path}")
+    };
+    base.set_path(&path);
+    base.set_query(prepared.query());
+    base.set_fragment(None);
+    Ok(base.to_string())
+}
+
 enum AccountInFlightAcquire {
     Acquired(AccountInFlightGuard),
     NotManaged,
@@ -10444,7 +11630,7 @@ async fn validate_and_acquire_share_invocation(
     user_email: Option<&str>,
 ) -> Result<(String, ShareInFlightGuard), ProxyError> {
     let validation = state
-        .validate_share_invocation(
+        .validate_and_acquire_share_invocation(
             share_id,
             app,
             user_email,
@@ -10452,35 +11638,10 @@ async fn validate_and_acquire_share_invocation(
         )
         .await;
 
-    let invocation = match validation {
-        Ok(invocation) => invocation,
+    let (invocation, guard) = match validation {
+        Ok(result) => result,
         Err(rejection) => return Err(share_rejection_to_proxy_error(rejection)),
     };
-
-    let guard = state
-        .share_in_flight
-        .try_acquire_for_user(
-            &invocation.share_id,
-            invocation.parallel_limit,
-            invocation.user_email.as_deref(),
-            invocation.user_parallel_limit,
-        )
-        .map_err(|limit| {
-            share_rejection_to_proxy_error(ShareInvocationRejection {
-                reason: match limit {
-                    crate::state::ShareInFlightAcquireError::ShareLimit => {
-                        ShareRejectReason::ParallelLimit
-                    }
-                    crate::state::ShareInFlightAcquireError::UserLimit => {
-                        ShareRejectReason::UserParallelLimit
-                    }
-                },
-                message:
-                    "Share parallel limit has been reached. Wait for an in-flight request to finish."
-                        .to_string(),
-                status_changed: false,
-            })
-        })?;
     Ok((invocation.share_name, guard))
 }
 
@@ -10812,33 +11973,46 @@ fn join_bytes(first: Bytes, second: Bytes) -> Bytes {
     Bytes::from(joined)
 }
 
-async fn refresh_managed_account_if_needed(
-    state: &ServerState,
-    app: AppKind,
-    stored: &StoredProvider,
-) -> Result<(), ProxyError> {
-    if provider_secret_configured(app, stored) {
-        return Ok(());
-    }
-
-    state
-        .refresh_managed_account_if_needed(stored.provider_type, managed_account_id(stored))
-        .await
-        .map_err(managed_account_refresh_error_to_proxy_error)
-}
-
 async fn refresh_execution_managed_account_if_needed(
     state: &ServerState,
     execution: &ProviderExecution,
 ) -> Result<(), ProxyError> {
-    let Some((provider_type, account_id)) = execution.managed_account_target() else {
+    let Some((provider_type, account_id, expected_generation)) =
+        execution.managed_account_identity_target()
+    else {
         return Ok(());
     };
     state
-        .refresh_managed_account_if_needed(provider_type, Some(account_id))
+        .refresh_managed_account_if_needed_for_generation(
+            provider_type,
+            account_id,
+            expected_generation,
+        )
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)?;
     ensure_managed_credential_persistence_available(state, execution)
+}
+
+async fn ensure_execution_gemini_v1internal_project(
+    state: &ServerState,
+    execution: &ProviderExecution,
+) -> Result<(), ProxyError> {
+    let Some((provider_type, account_id, expected_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return Ok(());
+    };
+    if !adapters::is_gemini_v1internal_provider_type(provider_type) {
+        return Ok(());
+    }
+    state
+        .ensure_gemini_v1internal_project_for_generation(
+            provider_type,
+            account_id,
+            expected_generation,
+        )
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)
 }
 
 fn ensure_managed_credential_persistence_available(
@@ -10846,12 +12020,36 @@ fn ensure_managed_credential_persistence_available(
     execution: &ProviderExecution,
 ) -> Result<(), ProxyError> {
     if execution.managed_account_target().is_some() && state.credential_persistence_degraded() {
-        return Err(ProxyError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "managed account credentials are waiting for durable persistence".to_string(),
-        });
+        return Err(managed_credential_persistence_error());
     }
     Ok(())
+}
+
+fn managed_credential_persistence_error() -> ProxyError {
+    ProxyError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "managed account credentials are waiting for durable persistence".to_string(),
+    }
+}
+
+pub(crate) async fn managed_credential_accounts_snapshot(
+    state: &ServerState,
+) -> Result<AccountStore, ProxyError> {
+    state
+        .accounts_snapshot_if_credentials_persisted()
+        .await
+        .ok_or_else(managed_credential_persistence_error)
+}
+
+async fn accounts_snapshot_for_execution_auth(
+    state: &ServerState,
+    execution: &ProviderExecution,
+) -> Result<AccountStore, ProxyError> {
+    if execution.managed_account_target().is_some() {
+        managed_credential_accounts_snapshot(state).await
+    } else {
+        Ok(state.accounts_snapshot().await)
+    }
 }
 
 async fn ensure_grok_account_capability(
@@ -10866,7 +12064,7 @@ async fn ensure_grok_account_capability(
         });
     };
     let account = state
-        .find_account_for_provider(ProviderType::GrokOAuth, Some(account_id))
+        .find_account_for_provider(ProviderType::GrokOAuth, account_id)
         .await
         .ok_or_else(|| ProxyError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -10901,11 +12099,19 @@ async fn record_grok_capability_evidence(
     execution: &ProviderExecution,
     capability: GrokAccountCapability,
 ) {
-    let Some((ProviderType::GrokOAuth, account_id)) = execution.managed_account_target() else {
+    let Some((ProviderType::GrokOAuth, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
         return;
     };
     if let Err(error) = state
-        .record_grok_capability_evidence(account_id, capability, "upstream_success")
+        .record_grok_capability_evidence_if_current(
+            account_id,
+            ProviderType::GrokOAuth,
+            auth_identity_generation,
+            capability,
+            "upstream_success",
+        )
         .await
     {
         tracing::warn!(
@@ -10942,45 +12148,44 @@ async fn next_claude_transport_attempt(
 async fn next_unauthorized_attempt(
     state: &ServerState,
     route: ProxyRoute,
-    headers: &HeaderMap,
-    request_context: &UsageLogContext,
     attempt_context: &ForwardAttemptContext,
     execution: &ProviderExecution,
-    stored: &StoredProvider,
+    target_headers: &[(String, String)],
 ) -> Result<Option<ForwardAttemptContext>, ProxyError> {
     if !supports_forced_auth_refresh(route, execution) {
         return Ok(None);
     }
+    let Some((provider_type, account_id, expected_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return Ok(None);
+    };
+    let decision = retry_policy::unauthorized_recovery_decision(
+        StatusCode::UNAUTHORIZED,
+        provider_type,
+        attempt_context.auth_refresh_attempted,
+        attempt_context.retry_allowed(),
+    )
+    .expect("an unauthorized status always produces an auth recovery decision");
 
-    if !attempt_context.auth_refresh_attempted && attempt_context.retry_allowed() {
-        let Some((provider_type, account_id)) = execution.managed_account_target() else {
-            return Ok(None);
-        };
-        if let Err(error) = state
-            .refresh_managed_account_now(provider_type, Some(account_id))
-            .await
+    if decision == AuthRecoveryDecision::RefreshAndReplaySameBinding {
+        if let Err(error) = force_refresh_execution_auth(
+            state,
+            provider_type,
+            account_id,
+            expected_generation,
+            target_headers,
+        )
+        .await
         {
-            mark_managed_account_auth_cooldown(state, execution, "forced_refresh_failed").await;
-            if !request_is_provider_pinned(headers, request_context) {
-                if let Some(next_attempt) = next_provider_failover(
-                    state,
-                    route,
-                    attempt_context,
-                    execution,
-                    "auth_refresh_failed",
-                )
-                .await
-                {
-                    record_provider_outcome(
-                        state,
-                        stored,
-                        ProviderOutcome::Failure { status_code: 401 },
-                    )
-                    .await;
-                    return Ok(Some(next_attempt));
-                }
-            }
-            return Err(managed_account_refresh_error_to_proxy_error(error));
+            mark_managed_account_auth_cooldown(
+                state,
+                execution,
+                bearer_token_from_owned_headers(target_headers),
+                "forced_refresh_failed",
+            )
+            .await;
+            return Err(error);
         }
         if route == ProxyRoute::ClaudeCountTokens {
             crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
@@ -10989,30 +12194,55 @@ async fn next_unauthorized_attempt(
         return Ok(Some(attempt_context.after_auth_refresh(execution)));
     }
 
-    if attempt_context.auth_refresh_attempted {
-        mark_managed_account_auth_cooldown(state, execution, "unauthorized_after_refresh").await;
-        if !request_is_provider_pinned(headers, request_context) {
-            if let Some(next_attempt) = next_provider_failover(
-                state,
-                route,
-                attempt_context,
-                execution,
-                "unauthorized_after_refresh",
-            )
-            .await
-            {
-                record_provider_outcome(
-                    state,
-                    stored,
-                    ProviderOutcome::Failure { status_code: 401 },
-                )
-                .await;
-                return Ok(Some(next_attempt));
-            }
-        }
+    if decision == AuthRecoveryDecision::ReturnUnauthorized
+        && attempt_context.auth_refresh_attempted
+    {
+        mark_managed_account_auth_cooldown(
+            state,
+            execution,
+            bearer_token_from_owned_headers(target_headers),
+            "unauthorized_after_refresh",
+        )
+        .await;
     }
 
     Ok(None)
+}
+
+async fn force_refresh_execution_auth(
+    state: &ServerState,
+    provider_type: ProviderType,
+    account_id: &str,
+    expected_auth_identity_generation: u64,
+    target_headers: &[(String, String)],
+) -> Result<(), ProxyError> {
+    if provider_type == ProviderType::GitHubCopilot {
+        let rejected_token = bearer_token_from_owned_headers(target_headers);
+        state
+            .refresh_copilot_upstream_auth_now(account_id, rejected_token)
+            .await
+            .map(|_| ())
+            .map_err(copilot_upstream_auth_error_to_proxy_error)
+    } else {
+        state
+            .refresh_managed_account_now_for_generation(
+                provider_type,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+            .map_err(managed_account_refresh_error_to_proxy_error)
+    }
+}
+
+fn bearer_token_from_owned_headers(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, value)| value.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 async fn next_provider_failover(
@@ -11023,6 +12253,7 @@ async fn next_provider_failover(
     reason: &'static str,
 ) -> Option<ForwardAttemptContext> {
     if matches!(route.app(), AppKind::Claude | AppKind::Codex)
+        || failed.managed_account_target().is_some()
         || failed.driver_is("oauth.openai_codex")
         || !attempt_context.retry_allowed()
     {
@@ -11048,27 +12279,19 @@ async fn next_provider_failover(
     Some(attempt_context.after_provider_failover(failed, &next))
 }
 
-fn request_is_provider_pinned(headers: &HeaderMap, request_context: &UsageLogContext) -> bool {
-    request_context.share_id.is_some()
-        || headers
-            .get("x-cc-provider-id")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| !value.trim().is_empty())
+fn request_is_provider_pinned(
+    attempt_context: &ForwardAttemptContext,
+    request_context: &UsageLogContext,
+) -> bool {
+    attempt_context.route_binding_pinned || request_context.share_id.is_some()
 }
 
-fn supports_forced_auth_refresh(route: ProxyRoute, execution: &ProviderExecution) -> bool {
-    if execution.driver_is("oauth.grok_responses") {
-        return true;
-    }
-    match route {
-        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
-            execution.driver_is("oauth.claude_messages")
-        }
-        ProxyRoute::CodexChatCompletions
-        | ProxyRoute::CodexResponses
-        | ProxyRoute::CodexResponsesCompact => execution.driver_is("oauth.openai_codex"),
-        ProxyRoute::Gemini => false,
-    }
+fn supports_forced_auth_refresh(_route: ProxyRoute, execution: &ProviderExecution) -> bool {
+    execution
+        .managed_account_target()
+        .is_some_and(|(provider_type, _)| {
+            retry_policy::supports_unauthorized_recovery(provider_type)
+        })
 }
 
 fn record_forward_retry(route: ProxyRoute, stage: &'static str, source: &'static str) {
@@ -11265,11 +12488,13 @@ pub(crate) fn managed_account_refresh_error_to_proxy_error(
             "{} account refresh is already in progress",
             provider_type.as_str()
         )),
+        ManagedAccountRefreshError::IdentityChanged { provider_type } => {
+            ProxyError::conflict(format!(
+                "bound {} account identity changed; rebind the Provider",
+                provider_type.as_str()
+            ))
+        }
         ManagedAccountRefreshError::NotFound => ProxyError::not_found("managed account not found"),
-        ManagedAccountRefreshError::InactiveCodexAccount => ProxyError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Codex OAuth account is not active".to_string(),
-        },
         ManagedAccountRefreshError::CredentialPersistenceDegraded => ProxyError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "managed account credentials are waiting for durable persistence".to_string(),
@@ -11305,6 +12530,9 @@ fn copilot_upstream_auth_error_to_proxy_error(error: CopilotUpstreamAuthError) -
     match error {
         CopilotUpstreamAuthError::NotFound => {
             ProxyError::not_found("github_copilot managed account not found")
+        }
+        CopilotUpstreamAuthError::CredentialPersistenceDegraded => {
+            managed_credential_persistence_error()
         }
         CopilotUpstreamAuthError::MissingGitHubToken { account_id } => ProxyError::bad_request(
             format!("github_copilot managed account {account_id} lacks a GitHub token"),
@@ -11352,104 +12580,6 @@ fn replace_or_push_owned_header(headers: &mut Vec<(String, String)>, name: Strin
     headers.push((name, value));
 }
 
-fn apply_account_header_overrides(
-    headers: &mut Vec<(String, String)>,
-    stored: &StoredProvider,
-    accounts: &AccountStore,
-) -> Result<(), ProxyError> {
-    let Some(account_id) = managed_account_id(stored) else {
-        return Ok(());
-    };
-    let Some(account) = accounts.find_for_provider(stored.provider_type, Some(account_id)) else {
-        return Ok(());
-    };
-    for (name, value) in &account.extra_headers {
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            ProxyError::bad_request(format!(
-                "account {} extra header name is invalid: {name}",
-                account.id
-            ))
-        })?;
-        let normalized_name = header_name.as_str();
-        if account_header_override_blocked(normalized_name, stored.provider_type) {
-            return Err(ProxyError::bad_request(format!(
-                "account {} extra header cannot override proxy-controlled header: {normalized_name}",
-                account.id
-            )));
-        }
-        HeaderValue::from_str(value).map_err(|_| {
-            ProxyError::bad_request(format!(
-                "account {} extra header value is invalid for {normalized_name}",
-                account.id
-            ))
-        })?;
-        replace_or_push_owned_header(headers, normalized_name.to_string(), value.clone());
-    }
-    Ok(())
-}
-
-fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    if provider_type == ProviderType::ClaudeOAuth
-        && (matches!(
-            normalized.as_str(),
-            "anthropic-beta"
-                | "anthropic-version"
-                | "x-app"
-                | "sec-fetch-mode"
-                | "anthropic-dangerous-direct-browser-access"
-                | "x-claude-code-session-id"
-        ) || normalized.starts_with("x-stainless-"))
-    {
-        return true;
-    }
-    if provider_type == ProviderType::GrokOAuth
-        && matches!(
-            normalized.as_str(),
-            "x-xai-token-auth"
-                | "x-grok-client-identifier"
-                | "x-grok-client-version"
-                | "x-grok-client-surface"
-                | "x-authenticateresponse"
-                | "x-grok-conv-id"
-                | "x-grok-cache-identity"
-                | "x-grok-turn-idx"
-        )
-    {
-        return true;
-    }
-    matches!(
-        normalized.as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "host"
-            | "content-length"
-            | "content-type"
-            | "accept"
-            | "connection"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-            | "cookie"
-            | "set-cookie"
-            | "user-agent"
-            | "originator"
-            | "version"
-            | "chatgpt-account-id"
-            | "session_id"
-            | "x-client-request-id"
-            | "x-codex-window-id"
-            | "openai-beta"
-    )
-}
-
 fn build_upstream_post_request(
     http_client: &reqwest::Client,
     url: &str,
@@ -11458,25 +12588,20 @@ fn build_upstream_post_request(
     target_headers: &[(String, String)],
     request_timeout: Duration,
     stream_requested: bool,
-) -> reqwest::RequestBuilder {
-    let mut request = http_client
-        .post(url)
-        .body(body)
-        .header(ACCEPT, copy_header(client_headers, ACCEPT).unwrap_or("*/*"));
-
-    if let Some(content_type) = copy_header(client_headers, CONTENT_TYPE) {
-        request = request.header(CONTENT_TYPE, content_type);
-    } else {
-        request = request.header(CONTENT_TYPE, "application/json");
-    }
-
-    for (name, value) in target_headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    if !stream_requested {
-        request = request.timeout(request_timeout);
-    }
-    request
+) -> Result<reqwest::RequestBuilder, ProxyError> {
+    super::outbound_request::build_post_request(
+        http_client,
+        super::outbound_request::OutboundPostRequest {
+            url,
+            body,
+            client_headers,
+            target_headers,
+            default_accept: "*/*",
+            default_content_type: "application/json",
+            timeout: request_timeout,
+            stream_requested,
+        },
+    )
 }
 
 fn decoded_upstream_response(
@@ -11500,6 +12625,297 @@ fn decoded_upstream_response(
     }
     copy_safe_upstream_response_headers(response_headers, &mut response);
     response
+}
+
+struct ResponsesImageJsonHeartbeatArgs {
+    state: ServerState,
+    stored: StoredProvider,
+    upstream: reqwest::Response,
+    adapter: adapters::GenericForwardingAdapter,
+    adapter_request: adapters::AdapterRequest,
+    request_context: UsageLogContext,
+    started: Instant,
+    request_id: String,
+    status_code: u16,
+    response_headers: HeaderMap,
+    timeout: Duration,
+    keepalive_interval: Duration,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs) -> Response {
+    let ResponsesImageJsonHeartbeatArgs {
+        state,
+        stored,
+        mut upstream,
+        adapter,
+        adapter_request,
+        request_context,
+        started,
+        request_id,
+        status_code,
+        response_headers,
+        timeout,
+        keepalive_interval,
+        account_in_flight_guard,
+        share_invocation_guard,
+    } = args;
+    let mut lifecycle = ResponsesImageJsonLifecycleGuard {
+        armed: true,
+        state: state.clone(),
+        stored: stored.clone(),
+        request_context,
+        request_id,
+        started,
+        first_token_ms: None,
+        account_in_flight_guard,
+        share_invocation_guard,
+    };
+    let stream = async_stream::stream! {
+        let mut transport = ImageTransportMetrics::new("responses", "json", started);
+        transport.emit(false);
+        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"\n"));
+
+        let aggregation = aggregate_openai_responses_upstream(&mut upstream, timeout);
+        tokio::pin!(aggregation);
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + keepalive_interval,
+            keepalive_interval,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let aggregation = loop {
+            let complete = tokio::select! {
+                biased;
+                result = &mut aggregation => Some(result),
+                _ = keepalive.tick() => None,
+            };
+            if let Some(result) = complete {
+                break result;
+            }
+            transport.emit(true);
+            yield Ok(Bytes::from_static(b" \n"));
+        };
+
+        match aggregation {
+            Ok(aggregation) => {
+                let usage = usage_from_json_with_semantics(
+                    &aggregation.response,
+                    InputTokenSemantics::Inclusive,
+                );
+                let encoded = serde_json::to_vec(&aggregation.response)
+                    .map(Bytes::from)
+                    .map_err(|error| ProxyError::bad_gateway(format!(
+                        "encode aggregated OpenAI Responses payload: {error}"
+                    )))
+                    .and_then(|body| {
+                        adapter.transform_response_for_request(
+                            body,
+                            &stored,
+                            ProxyRoute::CodexResponses,
+                            &adapter_request,
+                        )
+                    })
+                    .map(|body| {
+                        super::claude_oauth::restore_claude_tool_names_in_response_bytes(
+                            body,
+                            &adapter_request.claude_tool_name_map,
+                        )
+                    });
+                match encoded {
+                    Ok(body) => {
+                        lifecycle.first_token_ms = Some(started.elapsed().as_millis());
+                        lifecycle
+                            .finish(
+                                status_code,
+                                usage,
+                                false,
+                                aggregation.stream_status,
+                                None,
+                                Some(provider_outcome_from_status(status_code)),
+                            )
+                            .await;
+                        transport.emit(false);
+                        yield Ok(body);
+                    }
+                    Err(error) => {
+                        let failure = OpenAiResponsesAggregationFailure {
+                            error,
+                            usage,
+                            usage_state: observed_or_missing_usage_state(usage),
+                            stream_status: "transform_error",
+                            provider_outcome: Some(ProviderOutcome::Failure { status_code: 502 }),
+                            semantic_failure: None,
+                            saw_business_output: true,
+                        };
+                        lifecycle
+                            .finish(
+                                failure.error.status.as_u16(),
+                                failure.usage,
+                                failure.usage_state == UsageState::ParseError,
+                                failure.stream_status,
+                                Some(failure.error.client_message()),
+                                failure.provider_outcome,
+                            )
+                            .await;
+                        let body = responses_image_json_error_body(&failure);
+                        transport.emit(false);
+                        yield Ok(body);
+                    }
+                }
+            }
+            Err(failure) => {
+                lifecycle
+                    .finish(
+                        failure.error.status.as_u16(),
+                        failure.usage,
+                        failure.usage_state == UsageState::ParseError,
+                        failure.stream_status,
+                        Some(failure.error.client_message()),
+                        failure.provider_outcome,
+                    )
+                    .await;
+                let body = responses_image_json_error_body(&failure);
+                transport.emit(false);
+                yield Ok(body);
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    copy_safe_upstream_response_headers(&response_headers, &mut response);
+    apply_codex_images_streaming_headers(&mut response);
+    response
+}
+
+fn responses_image_json_error_body(failure: &OpenAiResponsesAggregationFailure) -> Bytes {
+    let code = failure
+        .semantic_failure
+        .as_ref()
+        .map(|failure| failure.code.as_str())
+        .unwrap_or("image_generation_failed");
+    let error_type = if failure.error.status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    let message = bounded_codex_image_message(failure.error.client_message().to_string());
+    serde_json::to_vec(&json!({
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+        }
+    }))
+    .map(Bytes::from)
+    .unwrap_or_else(|_| Bytes::from_static(b"{\"error\":{\"type\":\"server_error\",\"code\":\"image_generation_failed\",\"message\":\"image generation failed\"}}"))
+}
+
+struct ResponsesImageJsonLifecycleGuard {
+    armed: bool,
+    state: ServerState,
+    stored: StoredProvider,
+    request_context: UsageLogContext,
+    request_id: String,
+    started: Instant,
+    first_token_ms: Option<u128>,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+impl ResponsesImageJsonLifecycleGuard {
+    #[allow(clippy::too_many_arguments)]
+    async fn finish(
+        &mut self,
+        status_code: u16,
+        usage: TokenUsage,
+        parse_error: bool,
+        stream_status: &str,
+        error_message: Option<&str>,
+        provider_outcome: Option<ProviderOutcome>,
+    ) {
+        update_stream_usage_result(
+            &self.state,
+            &self.stored,
+            &self.request_id,
+            status_code,
+            self.started.elapsed().as_millis(),
+            self.first_token_ms,
+            super::streaming::StreamUsageResult { usage, parse_error },
+            Some(stream_status),
+        )
+        .await;
+        if let Some(error_message) = error_message {
+            let error_message = bounded_codex_image_message(error_message.to_string());
+            let _ = self
+                .state
+                .update_usage_log(&self.request_id, move |log| {
+                    log.error_message = Some(error_message);
+                })
+                .await;
+        }
+        record_share_invocation_result(
+            &self.state,
+            self.request_context.share_id.as_deref(),
+            self.request_context.user_email.as_deref(),
+            usage,
+        )
+        .await;
+        if let Some(outcome) = provider_outcome {
+            record_provider_outcome(&self.state, &self.stored, outcome).await;
+        }
+        self.armed = false;
+        self.account_in_flight_guard.take();
+        self.share_invocation_guard.take();
+    }
+}
+
+impl Drop for ResponsesImageJsonLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.clone();
+        let stored = self.stored.clone();
+        let request_context = self.request_context.clone();
+        let request_id = self.request_id.clone();
+        let duration_ms = self.started.elapsed().as_millis();
+        let first_token_ms = self.first_token_ms;
+        let account_in_flight_guard = self.account_in_flight_guard.take();
+        let share_invocation_guard = self.share_invocation_guard.take();
+        tokio::spawn(async move {
+            update_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                499,
+                duration_ms,
+                first_token_ms,
+                TokenUsage::default(),
+                Some("client_cancelled"),
+            )
+            .await;
+            update_terminal_usage_error(
+                &state,
+                &request_id,
+                IMAGE_CLIENT_CANCELLED_MESSAGE.to_string(),
+            )
+            .await;
+            record_share_invocation_result(
+                &state,
+                request_context.share_id.as_deref(),
+                request_context.user_email.as_deref(),
+                TokenUsage::default(),
+            )
+            .await;
+            drop(account_in_flight_guard);
+            drop(share_invocation_guard);
+            crate::metrics::record_stream_client_cancelled(stored.app.as_str());
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -11680,6 +13096,34 @@ async fn aggregate_openai_responses_upstream(
             semantics.saw_business(),
         )
     })
+}
+
+async fn aggregate_gemini_v1internal_upstream(
+    response: &mut reqwest::Response,
+    timeout: Duration,
+) -> Result<Value, ProxyError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut aggregator = GeminiV1InternalSseAggregator::new();
+    loop {
+        let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => return Err(ProxyError::bad_gateway(error)),
+            Err(_) => {
+                return Err(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Gemini v1internal aggregation timed out after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        aggregator.push(&chunk)?;
+    }
+    aggregator.finish()
 }
 
 fn codex_oauth_session_id_from_request(headers: &HeaderMap, body: &[u8]) -> Option<String> {
@@ -12357,6 +13801,49 @@ fn is_codex_image_generation_tool(tool: &Value) -> bool {
         .is_some_and(|name| matches!(name, "image_generation" | "image_gen"))
 }
 
+fn responses_body_requests_image_generation(route: ProxyRoute, body: &[u8]) -> bool {
+    if route != ProxyRoute::CodexResponses {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    std::iter::once(&value)
+        .chain(value.get("request"))
+        .chain(value.get("response"))
+        .any(responses_candidate_requests_image_generation)
+}
+
+fn responses_semantic_inspection_required(
+    semantic_guard_enabled: bool,
+    overflow_compact_eligible: bool,
+    image_transport: bool,
+) -> bool {
+    semantic_guard_enabled || overflow_compact_eligible || image_transport
+}
+
+fn responses_candidate_requests_image_generation(candidate: &Value) -> bool {
+    candidate
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(is_codex_image_generation_tool))
+        || candidate
+            .get("tool_choice")
+            .is_some_and(is_codex_image_generation_tool_choice)
+        || candidate
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|input| {
+                input.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                        && item
+                            .get("tools")
+                            .and_then(Value::as_array)
+                            .is_some_and(|tools| tools.iter().any(is_codex_image_generation_tool))
+                })
+            })
+}
+
 fn codex_image_tool_rejection_body(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     (text.contains("image_generation") || text.contains("image_gen"))
@@ -12418,8 +13905,21 @@ struct StreamForwardState {
     semantic_provider_outcome_recorded: bool,
     terminal_frame_sent: bool,
     interrupted_update_armed: Arc<AtomicBool>,
-    _account_in_flight_guard: Option<AccountInFlightGuard>,
-    _share_invocation_guard: Option<ShareInFlightGuard>,
+    pending_image_transport_chunk: Option<Bytes>,
+    image_upstream_deadline: Option<tokio::time::Instant>,
+    image_transport: Option<ImageTransportMetrics>,
+    image_keepalive_interval: Duration,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+async fn update_terminal_usage_error(state: &ServerState, request_id: &str, message: String) {
+    let message = bounded_codex_image_message(message);
+    let _ = state
+        .update_usage_log(request_id, move |log| {
+            log.error_message = Some(message);
+        })
+        .await;
 }
 
 impl StreamForwardState {
@@ -12438,10 +13938,29 @@ impl StreamForwardState {
         }
     }
 
+    fn observe_image_upstream_chunk(&mut self) {
+        if self.image_transport.is_some() && self.received_any_chunk {
+            self.image_upstream_deadline = self
+                .timeouts
+                .idle
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+        }
+    }
+
+    fn record_image_transport_emit(&mut self, chunk: &Bytes, heartbeat: bool) {
+        if chunk.is_empty() {
+            return;
+        }
+        if let Some(metrics) = self.image_transport.as_mut() {
+            metrics.emit(heartbeat);
+        }
+    }
+
     async fn terminate_transform_error(
         mut self,
         error: ProxyError,
     ) -> Result<Option<(Bytes, Self)>, std::io::Error> {
+        let message = error.client_message().to_string();
         let usage_result = std::mem::take(&mut self.usage).finish_with_status();
         let usage = usage_result.usage;
         let status = error.status.as_u16();
@@ -12456,6 +13975,7 @@ impl StreamForwardState {
             Some("transform_error"),
         )
         .await;
+        update_terminal_usage_error(&self.state, &self.request_id, message.clone()).await;
         record_share_invocation_result(
             &self.state,
             self.share_id.as_deref(),
@@ -12474,9 +13994,11 @@ impl StreamForwardState {
         self.interrupted_update_armed
             .store(false, Ordering::Relaxed);
         self.terminal_frame_sent = true;
-        let message = error.client_message().to_string();
         match stream_terminal_error_frame(self.route, &message, status) {
-            Some(frame) => Ok(Some((frame, self))),
+            Some(frame) => {
+                self.record_image_transport_emit(&frame, false);
+                Ok(Some((frame, self)))
+            }
             None => Err(std::io::Error::other(message)),
         }
     }
@@ -13113,13 +14635,20 @@ impl Drop for StreamForwardState {
         let state = self.state.clone();
         let stored = self.stored.clone();
         let request_id = self.request_id.clone();
-        let status_code = self.status_code;
+        let image_transport = self.image_transport.is_some();
+        let status_code = if image_transport {
+            499
+        } else {
+            self.status_code
+        };
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
         let usage_result = std::mem::take(&mut self.usage).finish_with_status();
         let usage = usage_result.usage;
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms;
+        let account_in_flight_guard = self.account_in_flight_guard.take();
+        let share_invocation_guard = self.share_invocation_guard.take();
         tokio::spawn(async move {
             update_stream_usage_result(
                 &state,
@@ -13132,6 +14661,14 @@ impl Drop for StreamForwardState {
                 Some("client_cancelled"),
             )
             .await;
+            if image_transport {
+                update_terminal_usage_error(
+                    &state,
+                    &request_id,
+                    IMAGE_CLIENT_CANCELLED_MESSAGE.to_string(),
+                )
+                .await;
+            }
             record_share_invocation_result(
                 &state,
                 share_id.as_deref(),
@@ -13139,6 +14676,8 @@ impl Drop for StreamForwardState {
                 usage,
             )
             .await;
+            drop(account_in_flight_guard);
+            drop(share_invocation_guard);
             crate::metrics::record_stream_client_cancelled(stored.app.as_str());
         });
     }
@@ -13336,7 +14875,7 @@ fn select_share_execution(
         message: format!("[{}] {error}", error.code()),
     })?;
     let (stored, share_name) = select_share_provider(providers, shares, app, share_id)?;
-    super::router::ensure_codex_oauth_active_account(&stored, accounts)?;
+    super::router::ensure_codex_oauth_binding(&stored, accounts)?;
     ensure_provider_account_does_not_need_relogin(&stored, accounts)?;
     ensure_provider_account_usage_available(&stored, accounts, current_time_ms())?;
     let execution = ProviderExecution::from_store(providers, stored)?;
@@ -13491,6 +15030,111 @@ mod tests {
     };
 
     #[test]
+    fn grok_http_fallback_uses_one_protocol_accept_header() {
+        let target = PreparedCodexHttpFallbackTarget {
+            http_client: reqwest::Client::new(),
+            url: "https://example.invalid/v1/responses".to_string(),
+            headers: vec![
+                (
+                    "accept".to_string(),
+                    "application/json, text/event-stream".to_string(),
+                ),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            body: Bytes::from_static(br#"{"model":"grok-4"}"#),
+        };
+
+        let request = build_codex_http_fallback_request(target)
+            .unwrap()
+            .0
+            .build()
+            .unwrap();
+
+        assert_eq!(request.headers().get_all(ACCEPT).iter().count(), 1);
+        assert_eq!(
+            request
+                .headers()
+                .get(ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json, text/event-stream")
+        );
+        assert_eq!(request.headers().get_all(CONTENT_TYPE).iter().count(), 1);
+    }
+
+    #[test]
+    fn kiro_cli_override_preserves_root_path_and_protocol_content_type() {
+        let account = serde_json::from_value(json!({
+            "id": "kiro-cli-account",
+            "providerType": "kiro_oauth",
+            "accessToken": "ksk_fixture",
+            "refreshToken": "ksk_fixture",
+            "profile": {
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                "apiRegion": "us-east-1",
+                "authMethod": "api_key"
+            },
+            "raw": {
+                "endpoint": "cli",
+                "authMethod": "api_key"
+            }
+        }))
+        .unwrap();
+        let prepared = kiro::prepare_kiro_request(
+            &account,
+            &json!({
+                "model": "claude-sonnet-4-8",
+                "messages": [{"role": "user", "content": "ping"}]
+            }),
+        )
+        .unwrap();
+        let url =
+            kiro_url_with_base_override("http://127.0.0.1:43123/proxy", &prepared.url).unwrap();
+        let target_headers = prepared
+            .headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect::<Vec<_>>();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = build_upstream_post_request(
+            &reqwest::Client::new(),
+            &url,
+            Bytes::from(serde_json::to_vec(&prepared.body).unwrap()),
+            &client_headers,
+            &target_headers,
+            Duration::from_secs(30),
+            false,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(request.url().path(), "/proxy/");
+        assert_eq!(request.headers().get_all(CONTENT_TYPE).iter().count(), 1);
+        assert_eq!(
+            request
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/x-amz-json-1.0")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-amz-target")
+                .and_then(|value| value.to_str().ok()),
+            Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("tokentype")
+                .and_then(|value| value.to_str().ok()),
+            Some("API_KEY")
+        );
+    }
+
+    #[test]
     fn retry_context_pins_provider_and_tracks_body_stage() {
         let context = ForwardAttemptContext::default();
         assert_eq!(context.attempt, 0);
@@ -13539,6 +15183,102 @@ mod tests {
                 .map(|execution| execution.stored.provider.id.as_str()),
             Some("codex-failover")
         );
+    }
+
+    #[test]
+    fn codex_models_client_version_prefers_non_empty_request_value() {
+        assert_eq!(
+            codex_models_client_version(Some("  codex-cli/9.9.9  ")),
+            "codex-cli/9.9.9"
+        );
+        assert_eq!(
+            codex_models_client_version(Some("   ")),
+            crate::codex_identity::configured_version()
+        );
+        assert_eq!(
+            codex_models_client_version(None),
+            crate::codex_identity::configured_version()
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_models_request_captures_one_client_version_header() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let versions = headers
+                        .get_all("version")
+                        .iter()
+                        .filter_map(|value| value.to_str().ok())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    *captured.lock().unwrap() = Some((
+                        versions,
+                        uri.query().unwrap_or_default().to_string(),
+                        authorization,
+                    ));
+                    axum::Json(json!({"models": []}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let target_headers = vec![
+            (
+                "version".to_string(),
+                "configured-server-version".to_string(),
+            ),
+            ("Version".to_string(), "stale-duplicate-version".to_string()),
+            (
+                "authorization".to_string(),
+                "Bearer models-token".to_string(),
+            ),
+        ];
+        let response = build_codex_models_request(
+            &reqwest::Client::new(),
+            &format!("http://{address}/models?existing=1"),
+            &target_headers,
+            &HeaderMap::new(),
+            "codex-cli/9.9.9",
+        )
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let (versions, query, authorization) = captured.lock().unwrap().take().unwrap();
+        assert_eq!(versions, ["codex-cli/9.9.9"]);
+        assert_eq!(authorization, "Bearer models-token");
+        let query = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<Vec<_>>();
+        assert!(query.contains(&("existing".to_string(), "1".to_string())));
+        assert_eq!(
+            query
+                .iter()
+                .filter(|(name, _)| name == "client_version")
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![("client_version".to_string(), "codex-cli/9.9.9".to_string())]
+        );
+
+        server.abort();
     }
 
     #[test]
@@ -13595,26 +15335,20 @@ mod tests {
             let mut selection_calls = 0;
             let error = select_and_acquire_account_in_flight(&state, &accounts, |snapshot| {
                 selection_calls += 1;
-                let selection = if selection_kind == "images" {
-                    select_provider_for_codex_image_generation(
-                        &providers,
-                        &accounts,
-                        &HeaderMap::new(),
-                        Some("race-provider-1"),
-                        snapshot,
-                        None,
-                    )
-                } else {
-                    select_provider_with_account_inflight(
-                        &providers,
-                        &accounts,
-                        AppKind::Codex,
-                        &HeaderMap::new(),
-                        Some("race-provider-1"),
-                        snapshot,
-                        None,
-                    )
-                }?;
+                let selection = select_provider_for_route_key(
+                    &providers,
+                    &accounts,
+                    AppKind::Codex,
+                    "race-provider-1",
+                    Some(snapshot),
+                )?;
+                if selection_kind == "images"
+                    && !codex_image_generation_provider(&selection.execution.stored)
+                {
+                    return Err(ProxyError::bad_request(
+                        "selected Codex Provider Surface does not support image generation",
+                    ));
+                }
                 if selection_calls == 1 {
                     assert_eq!(selection.execution.stored.provider.id, "race-provider-1");
                     competing_guard = state.account_in_flight.try_acquire(
@@ -13809,25 +15543,23 @@ mod tests {
             .unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_static("legacy-refresh-provider"),
-        );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
         );
         let (first, second) = tokio::join!(
-            forward(
+            forward_for_route_key(
                 state.clone(),
                 ProxyRoute::ClaudeMessages,
+                "legacy-refresh-provider".to_string(),
                 None,
                 headers.clone(),
                 body.clone(),
             ),
-            forward(
+            forward_for_route_key(
                 state.clone(),
                 ProxyRoute::ClaudeMessages,
+                "legacy-refresh-provider".to_string(),
                 None,
                 headers,
                 body,
@@ -14092,21 +15824,12 @@ mod tests {
             ("count", ProxyRoute::ClaudeCountTokens),
         ] {
             let provider_id = format!("unauthorized-{kind}-provider");
-            state
-                .apply_ui_settings_patch_immediate(json!({
-                    "currentProviderClaude": provider_id.clone()
-                }))
-                .await
-                .unwrap();
             let mut headers = HeaderMap::new();
-            headers.insert(
-                "x-cc-provider-id",
-                HeaderValue::from_str(&provider_id).unwrap(),
-            );
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            let response = forward(
+            let response = forward_for_route_key(
                 state.clone(),
                 route,
+                provider_id,
                 None,
                 headers,
                 Bytes::from_static(
@@ -14342,18 +16065,12 @@ mod tests {
             )
             .await
             .unwrap();
-        state
-            .apply_ui_settings_patch_immediate(json!({
-                "currentProviderClaude": "auth-failover-oauth"
-            }))
-            .await
-            .unwrap();
-
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward(
+        let response = forward_for_route_key(
             state.clone(),
             ProxyRoute::ClaudeMessages,
+            "auth-failover-oauth".to_string(),
             None,
             headers,
             Bytes::from_static(
@@ -14404,22 +16121,24 @@ mod tests {
                     .find(|account| account.id == "auth-failover-account")
                     .expect("managed account");
                 account.rate_limited_until = None;
-                account.raw = Some(json!({
-                    "testOAuthTokenUrl": pinned_token_url,
-                    "account": {"uuid": "rejected-principal"}
-                }));
+                account
+                    .raw
+                    .get_or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .expect("account raw metadata")
+                    .insert(
+                        "testOAuthTokenUrl".to_string(),
+                        Value::String(pinned_token_url),
+                    );
             })
             .await
             .unwrap();
         let mut pinned_headers = HeaderMap::new();
         pinned_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        pinned_headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_static("auth-failover-oauth"),
-        );
-        let pinned = forward(
+        let pinned = forward_for_route_key(
             state.clone(),
             ProxyRoute::ClaudeMessages,
+            "auth-failover-oauth".to_string(),
             None,
             pinned_headers,
             Bytes::from_static(
@@ -14586,6 +16305,1125 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(Debug, Clone)]
+    struct GeminiV1InternalObservation {
+        authorization: String,
+        uri: String,
+        body: Value,
+    }
+
+    async fn spawn_gemini_v1internal_upstream(
+        unauthorized_responses: usize,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<GeminiV1InternalObservation>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/v1internal:streamGenerateContent",
+            axum::routing::post(
+                move |headers: HeaderMap, uri: axum::http::Uri, body: Bytes| {
+                    let observations = std::sync::Arc::clone(&observations_for_route);
+                    let requests = std::sync::Arc::clone(&requests_for_route);
+                    async move {
+                        let authorization = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        observations.lock().unwrap().push(GeminiV1InternalObservation {
+                            authorization,
+                            uri: uri.to_string(),
+                            body,
+                        });
+                        let request = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if request < unauthorized_responses {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    r#"{"error":{"code":401,"message":"expired token"}}"#,
+                                ))
+                                .unwrap();
+                        }
+                        let chunks = [
+                            Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                b"data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello \"}]}}]}}\n\n",
+                            )),
+                            Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                b"data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Gemini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}}\n\n",
+                            )),
+                        ];
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, observations, server)
+    }
+
+    async fn spawn_gemini_count_tokens_upstream(
+        unauthorized_responses: usize,
+        embedded_error: bool,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<GeminiV1InternalObservation>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let load_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_requests_for_route = std::sync::Arc::clone(&load_requests);
+        let app = axum::Router::new()
+            .route(
+                "/v1beta/models/gemini-2.5-pro:countTokens",
+                axum::routing::post(
+                    move |headers: HeaderMap, uri: axum::http::Uri, body: Bytes| {
+                        let observations = std::sync::Arc::clone(&observations_for_route);
+                        let requests = std::sync::Arc::clone(&requests_for_route);
+                        async move {
+                            let authorization = headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string();
+                            let body: Value = serde_json::from_slice(&body).unwrap();
+                            observations.lock().unwrap().push(GeminiV1InternalObservation {
+                                authorization,
+                                uri: uri.to_string(),
+                                body,
+                            });
+                            let request =
+                                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if request < unauthorized_responses {
+                                return Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(
+                                        r#"{"error":{"code":401,"status":"UNAUTHENTICATED","message":"expired token"}}"#,
+                                    ))
+                                    .unwrap();
+                            }
+                            if embedded_error {
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(
+                                        r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"embedded count failure"}}"#,
+                                    ))
+                                    .unwrap();
+                            }
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(r#"{"totalTokens":7}"#))
+                                .unwrap()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1internal:loadCodeAssist",
+                axum::routing::post(move || {
+                    let load_requests = std::sync::Arc::clone(&load_requests_for_route);
+                    async move {
+                        load_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::from("countTokens must not discover projects"))
+                            .unwrap()
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, observations, load_requests, server)
+    }
+
+    async fn spawn_gemini_embedded_error_upstream(
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1internal:streamGenerateContent",
+            axum::routing::post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"response\":{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"embedded stream failure\"}}}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, server)
+    }
+
+    async fn spawn_gemini_refresh_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": "gemini-refreshed-access",
+                        "refresh_token": "gemini-refreshed-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/token"), requests, server)
+    }
+
+    async fn spawn_gemini_project_discovery_upstream(
+        unauthorized_load_responses: usize,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let load_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inference_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_requests_for_route = std::sync::Arc::clone(&load_requests);
+        let inference_requests_for_route = std::sync::Arc::clone(&inference_requests);
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, body: Bytes| {
+                    let load_requests = std::sync::Arc::clone(&load_requests_for_route);
+                    let inference_requests =
+                        std::sync::Arc::clone(&inference_requests_for_route);
+                    async move {
+                        match uri.path() {
+                            "/v1internal:loadCodeAssist" => {
+                                let request = load_requests
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if request < unauthorized_load_responses {
+                                    return Response::builder()
+                                        .status(StatusCode::UNAUTHORIZED)
+                                        .header(CONTENT_TYPE, "application/json")
+                                        .body(Body::from(
+                                            r#"{"error":{"code":401,"message":"expired token"}}"#,
+                                        ))
+                                        .unwrap();
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(
+                                        json!({
+                                            "cloudaicompanionProject": "gemini-discovered-project",
+                                            "currentTier": {"id": "standard-tier", "name": "Standard"}
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .unwrap()
+                            }
+                            "/v1internal:streamGenerateContent" => {
+                                let body: Value = serde_json::from_slice(&body).unwrap();
+                                if body.get("project").and_then(Value::as_str)
+                                    != Some("gemini-discovered-project")
+                                {
+                                    return Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .header(CONTENT_TYPE, "application/json")
+                                        .body(Body::from(
+                                            r#"{"error":"missing discovered project"}"#,
+                                        ))
+                                        .unwrap();
+                                }
+                                inference_requests
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .body(Body::from(
+                                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ready\"}]},\"finishReason\":\"STOP\"}]}}\n\n",
+                                    ))
+                                    .unwrap()
+                            }
+                            _ => Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Body::empty())
+                                .unwrap(),
+                        }
+                    }
+                },
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, load_requests, inference_requests, server)
+    }
+
+    async fn install_gemini_v1internal_test_provider(
+        state: &ServerState,
+        fixture: &str,
+        endpoint: String,
+        token_url: String,
+        include_project: bool,
+    ) -> (String, String) {
+        let account_id = format!("gemini-v1internal-{fixture}-account");
+        let account_id_for_state = account_id.clone();
+        let refresh_token = format!("gemini-v1internal-{fixture}-refresh-token");
+        let profile = if include_project {
+            json!({
+                "projectId": "gemini-v1internal-project",
+                "email": "gemini@example.com"
+            })
+        } else {
+            json!({"email": "gemini@example.com"})
+        };
+        let code_assist_base_url = endpoint.clone();
+        let ai_studio_base_url = endpoint.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "gemini_cli",
+                        "authIdentityGeneration": 1,
+                        "accessToken": "gemini-initial-access",
+                        "refreshToken": refresh_token,
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": profile,
+                        "raw": {
+                            "clientId": "gemini-test-client",
+                            "clientSecret": "gemini-test-secret",
+                            "testOAuthTokenUrl": token_url,
+                            "testGeminiCodeAssistBaseUrl": code_assist_base_url,
+                            "testGeminiAiStudioBaseUrl": ai_studio_base_url
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let provider_id = format!("gemini-v1internal-{fixture}-provider");
+        let mut stored = stored_provider(
+            AppKind::Gemini,
+            ProviderType::GeminiCli,
+            json!({}),
+            Some(&account_id),
+        );
+        stored.provider.id = provider_id.clone();
+        stored.resource.profile_id = Some(
+            crate::domain::providers::registry::ProfileId::parse("gemini.google_oauth").unwrap(),
+        );
+        stored.resource.profile_schema_revision = Some(1);
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut plan = providers
+            .runtime_plan(AppKind::Gemini, &provider_id)
+            .unwrap()
+            .as_ref()
+            .clone();
+        plan.endpoint = endpoint;
+        plan.runtime_fingerprint = format!("gemini-v1internal-{fixture}-runtime");
+        std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        state.replace_provider_store_for_test(providers).await;
+        (provider_id, account_id)
+    }
+
+    async fn install_antigravity_claude_test_provider(
+        state: &ServerState,
+        fixture: &str,
+        endpoint: String,
+    ) -> String {
+        let account_id = format!("antigravity-{fixture}-account");
+        let account_id_for_state = account_id.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "antigravity_oauth",
+                        "authIdentityGeneration": 1,
+                        "accessToken": "antigravity-access",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "projectId": "antigravity-stream-project",
+                            "email": "antigravity@example.com"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let provider_id = format!("antigravity-{fixture}-provider");
+        let mut stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::AntigravityOAuth,
+            json!({}),
+            Some(&account_id),
+        );
+        stored.provider.id = provider_id.clone();
+        stored.resource.profile_id = Some(
+            crate::domain::providers::registry::ProfileId::parse("gemini.antigravity_oauth")
+                .unwrap(),
+        );
+        stored.resource.profile_schema_revision = Some(1);
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut plan = providers
+            .runtime_plan(AppKind::Claude, &provider_id)
+            .unwrap()
+            .as_ref()
+            .clone();
+        plan.endpoint = endpoint;
+        plan.runtime_fingerprint = format!("antigravity-{fixture}-runtime");
+        std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        state.replace_provider_store_for_test(providers).await;
+        provider_id
+    }
+
+    fn gemini_v1internal_downstream_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers
+    }
+
+    #[tokio::test]
+    async fn gemini_v1internal_non_stream_wraps_and_aggregates_sse() {
+        let (address, observations, upstream_server) = spawn_gemini_v1internal_upstream(0).await;
+        let state = forwarder_test_state("gemini-v1internal-non-stream");
+        let (provider_id, _) = install_gemini_v1internal_test_provider(
+            &state,
+            "non-stream",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+            true,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-2.5-pro:generateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(
+                br#"{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"safetySettings":[{"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body.pointer("/candidates/0/content/parts"),
+            Some(&json!([{"text": "Hello Gemini"}]))
+        );
+        assert_eq!(
+            body.pointer("/candidates/0/finishReason"),
+            Some(&json!("STOP"))
+        );
+        assert_eq!(
+            body.pointer("/usageMetadata/totalTokenCount"),
+            Some(&json!(3))
+        );
+        assert!(body.get("response").is_none());
+
+        let observations = observations.lock().unwrap().clone();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(observation.authorization, "Bearer gemini-initial-access");
+        assert_eq!(observation.uri, "/v1internal:streamGenerateContent?alt=sse");
+        assert_eq!(observation.body["project"], "gemini-v1internal-project");
+        assert_eq!(observation.body["model"], "gemini-2.5-pro");
+        assert_eq!(observation.body.as_object().unwrap().len(), 3);
+        assert!(observation.body.get("requestId").is_none());
+        assert!(observation.body.get("userAgent").is_none());
+        assert!(observation.body.get("requestType").is_none());
+        assert_eq!(
+            observation
+                .body
+                .pointer("/request/safetySettings/0/threshold"),
+            Some(&json!("BLOCK_NONE"))
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_count_tokens_uses_ai_studio_oauth_without_project_discovery() {
+        let (address, observations, load_requests, upstream_server) =
+            spawn_gemini_count_tokens_upstream(0, false).await;
+        let state = forwarder_test_state("gemini-count-tokens-direct");
+        let (provider_id, _) = install_gemini_v1internal_test_provider(
+            &state,
+            "count-tokens-direct",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+            false,
+        )
+        .await;
+        let share_id = "gemini-count-tokens-share".to_string();
+        let share_id_for_state = share_id.clone();
+        let provider_id_for_share = provider_id.clone();
+        state
+            .mutate_shares_immediate(move |shares| {
+                shares.shares.push(
+                    serde_json::from_value(json!({
+                        "id": share_id_for_state,
+                        "app": "gemini",
+                        "providerId": provider_id_for_share,
+                        "providerType": "gemini_cli",
+                        "enabled": true,
+                        "status": "active",
+                        "tokenLimit": 7,
+                        "bindings": [{
+                            "app": "gemini",
+                            "providerId": provider_id_for_share,
+                            "providerType": "gemini_cli"
+                        }]
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let mut headers = gemini_v1internal_downstream_headers();
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(&share_id).unwrap(),
+        );
+        let response = forward(
+            state.clone(),
+            ProxyRoute::Gemini,
+            Some("models/gemini-2.5-pro:countTokens".to_string()),
+            headers,
+            Bytes::from_static(br#"{"contents":[{"role":"user","parts":[{"text":"count me"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response_body).unwrap(),
+            json!({"totalTokens": 7})
+        );
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let observations = observations.lock().unwrap().clone();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].authorization,
+            "Bearer gemini-initial-access"
+        );
+        assert_eq!(
+            observations[0].uri,
+            "/v1beta/models/gemini-2.5-pro:countTokens"
+        );
+        assert_eq!(
+            observations[0].body.pointer("/contents/0/parts/0/text"),
+            Some(&json!("count me"))
+        );
+        assert!(observations[0].body.get("request").is_none());
+        assert!(observations[0].body.get("project").is_none());
+        assert!(state.usage_snapshot().await.logs.is_empty());
+        let shares = state.shares.read().await;
+        let share = shares
+            .shares
+            .iter()
+            .find(|candidate| candidate.id == share_id)
+            .unwrap();
+        assert_eq!(share.tokens_used, 0);
+        assert_eq!(share.requests_count, 0);
+        drop(shares);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_count_tokens_embedded_error_returns_failure_status_and_outcome() {
+        let _ = crate::metrics::init();
+        let (address, observations, load_requests, upstream_server) =
+            spawn_gemini_count_tokens_upstream(0, true).await;
+        let state = forwarder_test_state("gemini-count-tokens-embedded-error");
+        let (provider_id, _) = install_gemini_v1internal_test_provider(
+            &state,
+            "count-tokens-embedded-error",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+            false,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::Gemini,
+            provider_id.clone(),
+            Some("models/gemini-2.5-pro:countTokens".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"fail"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_body: Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(response_body.pointer("/error/code"), Some(&json!(429)));
+        assert_eq!(
+            response_body.pointer("/error/status"),
+            Some(&json!("RESOURCE_EXHAUSTED"))
+        );
+        assert_eq!(observations.lock().unwrap().len(), 1);
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let metrics = crate::metrics::render();
+        let outcome = metrics
+            .lines()
+            .find(|line| {
+                line.starts_with("cc_switch_provider_outcome_total")
+                    && line.contains(&format!("provider_id=\"{provider_id}\""))
+            })
+            .unwrap_or_default();
+        assert!(outcome.contains("outcome=\"failure\""), "{metrics}");
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_count_tokens_401_refreshes_and_replays_same_account_once() {
+        let (token_url, token_requests, token_server) = spawn_gemini_refresh_server().await;
+        let (address, observations, load_requests, upstream_server) =
+            spawn_gemini_count_tokens_upstream(1, false).await;
+        let state = forwarder_test_state("gemini-count-tokens-401");
+        let (provider_id, account_id) = install_gemini_v1internal_test_provider(
+            &state,
+            "count-tokens-401",
+            format!("http://{address}"),
+            token_url,
+            false,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-2.5-pro:countTokens".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"retry"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        {
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert_eq!(
+                observations
+                    .iter()
+                    .map(|observation| observation.authorization.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Bearer gemini-initial-access",
+                    "Bearer gemini-refreshed-access"
+                ]
+            );
+            assert!(observations.iter().all(|observation| {
+                observation.uri == "/v1beta/models/gemini-2.5-pro:countTokens"
+                    && observation.body.get("request").is_none()
+                    && observation.body.get("project").is_none()
+            }));
+        }
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("gemini-refreshed-access")
+        );
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_v1internal_stream_unwraps_response_frames() {
+        let (address, observations, upstream_server) = spawn_gemini_v1internal_upstream(0).await;
+        let state = forwarder_test_state("gemini-v1internal-stream");
+        let (provider_id, _) = install_gemini_v1internal_test_provider(
+            &state,
+            "stream",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+            true,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-2.5-flash:streamGenerateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"role":"user","parts":[{"text":"ping"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"text\":\"Hello \""));
+        assert!(body.contains("\"text\":\"Gemini\""));
+        assert!(body.contains("\"finishReason\":\"STOP\""));
+        assert!(!body.contains("\"response\":"), "{body}");
+        assert_eq!(observations.lock().unwrap().len(), 1);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn cross_protocol_streaming_non_success_preserves_status_and_body() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let error_body =
+            r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}"#;
+        let upstream = axum::Router::new().route(
+            "/v1internal:streamGenerateContent",
+            axum::routing::post(move || async move {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(error_body))
+                    .unwrap()
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = forwarder_test_state("cross-protocol-stream-non-success");
+        let provider_id = install_antigravity_claude_test_provider(
+            &state,
+            "stream-non-success",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"fail"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), error_body.as_bytes());
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_embedded_stream_error_terminates_claude_and_records_failure() {
+        let _ = crate::metrics::init();
+        let (address, upstream_server) = spawn_gemini_embedded_error_upstream().await;
+        let state = forwarder_test_state("antigravity-embedded-stream-error");
+        let provider_id = install_antigravity_claude_test_provider(
+            &state,
+            "embedded-stream-error",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"fail"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("event: message_stop"), "{body}");
+        assert!(body.contains("embedded stream failure"), "{body}");
+        assert!(!body.contains("event: message_start"), "{body}");
+        assert!(!body.contains("event: message_delta"), "{body}");
+        let metrics = crate::metrics::render();
+        let outcome = metrics
+            .lines()
+            .find(|line| {
+                line.starts_with("cc_switch_provider_outcome_total")
+                    && line.contains(&format!("provider_id=\"{provider_id}\""))
+            })
+            .unwrap_or_default();
+        assert!(outcome.contains("outcome=\"failure\""), "{metrics}");
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_gemini_first_requests_share_project_discovery_and_persist_it() {
+        let (address, load_requests, inference_requests, upstream_server) =
+            spawn_gemini_project_discovery_upstream(0).await;
+        let state = forwarder_test_state("gemini-v1internal-project-discovery");
+        let (provider_id, account_id) = install_gemini_v1internal_test_provider(
+            &state,
+            "project-discovery",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+            false,
+        )
+        .await;
+        let request = || {
+            forward_for_route_key(
+                state.clone(),
+                ProxyRoute::Gemini,
+                provider_id.clone(),
+                Some("models/gemini-2.5-pro:generateContent".to_string()),
+                gemini_v1internal_downstream_headers(),
+                Bytes::from_static(br#"{"contents":[{"parts":[{"text":"discover"}]}]}"#),
+            )
+        };
+        let (first, second) = tokio::join!(request(), request());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let _ = axum::body::to_bytes(second.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            inference_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(
+            crate::domain::accounts::store::gemini_v1internal_project_id(&account).as_deref(),
+            Some("gemini-discovered-project")
+        );
+        let persisted =
+            crate::domain::accounts::store::AccountStore::load_or_default(&state.config_dir)
+                .unwrap();
+        let persisted = persisted
+            .find_for_provider(ProviderType::GeminiCli, Some(&account_id))
+            .unwrap();
+        assert_eq!(
+            crate::domain::accounts::store::gemini_v1internal_project_id(persisted).as_deref(),
+            Some("gemini-discovered-project")
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_project_commit_failure_is_coalesced_and_cooled_down() {
+        let (address, load_requests, _, upstream_server) =
+            spawn_gemini_project_discovery_upstream(0).await;
+        let state = forwarder_test_state("gemini-v1internal-project-commit-failure");
+        let (_, account_id) = install_gemini_v1internal_test_provider(
+            &state,
+            "project-commit-failure",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+            false,
+        )
+        .await;
+        state.inject_gemini_project_commit_failures(1);
+
+        let first = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
+        let second = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
+        let (first, second) = tokio::join!(first, second);
+        for result in [first, second] {
+            assert!(matches!(
+                result,
+                Err(ManagedAccountRefreshError::Refresh {
+                    status_code: 500,
+                    retry_after_ms: Some(_),
+                    ..
+                })
+            ));
+        }
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let cooled_down = state
+            .ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id)
+            .await;
+        assert!(matches!(
+            cooled_down,
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 500,
+                retry_after_ms: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_project_refresh_commit_failure_is_shared_without_token_reuse() {
+        let (token_url, token_requests, token_server) = spawn_gemini_refresh_server().await;
+        let (address, load_requests, _, upstream_server) =
+            spawn_gemini_project_discovery_upstream(1).await;
+        let state = forwarder_test_state("gemini-v1internal-project-refresh-commit-failure");
+        let (_, account_id) = install_gemini_v1internal_test_provider(
+            &state,
+            "project-refresh-commit-failure",
+            format!("http://{address}"),
+            token_url,
+            false,
+        )
+        .await;
+        state.inject_account_refresh_persist_failures(1);
+
+        let first = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
+        let second = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
+        let (first, second) = tokio::join!(first, second);
+        for result in [first, second] {
+            assert!(matches!(
+                result,
+                Err(ManagedAccountRefreshError::CredentialPersistenceDegraded)
+                    | Err(ManagedAccountRefreshError::Refresh {
+                        status_code: 503,
+                        ..
+                    })
+            ));
+        }
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("gemini-refreshed-refresh")
+        );
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_project_discovery_401_refreshes_same_account_once() {
+        let (token_url, token_requests, token_server) = spawn_gemini_refresh_server().await;
+        let (address, load_requests, inference_requests, upstream_server) =
+            spawn_gemini_project_discovery_upstream(1).await;
+        let state = forwarder_test_state("gemini-v1internal-project-discovery-401");
+        let (provider_id, account_id) = install_gemini_v1internal_test_provider(
+            &state,
+            "project-discovery-401",
+            format!("http://{address}"),
+            token_url,
+            false,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-2.5-pro:generateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"recover"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            inference_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("gemini-refreshed-access")
+        );
+        assert_eq!(
+            crate::domain::accounts::store::gemini_v1internal_project_id(&account).as_deref(),
+            Some("gemini-discovered-project")
+        );
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_v1internal_401_refreshes_once_and_replays_same_binding() {
+        let (token_url, token_requests, token_server) = spawn_gemini_refresh_server().await;
+        let (address, observations, upstream_server) = spawn_gemini_v1internal_upstream(1).await;
+        let state = forwarder_test_state("gemini-v1internal-401");
+        let (provider_id, account_id) = install_gemini_v1internal_test_provider(
+            &state,
+            "refresh-once",
+            format!("http://{address}"),
+            token_url,
+            true,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-2.5-pro:generateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"retry"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        {
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert_eq!(
+                observations
+                    .iter()
+                    .map(|observation| observation.authorization.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Bearer gemini-initial-access",
+                    "Bearer gemini-refreshed-access"
+                ]
+            );
+            assert!(observations
+                .iter()
+                .all(|observation| observation.body["project"] == "gemini-v1internal-project"));
+        }
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("gemini-refreshed-access")
+        );
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_v1internal_second_401_stops_without_another_refresh() {
+        let (token_url, token_requests, token_server) = spawn_gemini_refresh_server().await;
+        let (address, observations, upstream_server) =
+            spawn_gemini_v1internal_upstream(usize::MAX).await;
+        let state = forwarder_test_state("gemini-v1internal-second-401");
+        let (provider_id, _) = install_gemini_v1internal_test_provider(
+            &state,
+            "second-401",
+            format!("http://{address}"),
+            token_url,
+            true,
+        )
+        .await;
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-2.5-pro:generateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"reject"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].authorization,
+            "Bearer gemini-initial-access"
+        );
+        assert_eq!(
+            observations[1].authorization,
+            "Bearer gemini-refreshed-access"
+        );
+        drop(observations);
+        token_server.abort();
+        upstream_server.abort();
+    }
+
     async fn install_grok_test_execution(
         state: &ServerState,
         name: &str,
@@ -14640,7 +17478,10 @@ mod tests {
         let mut stored = stored_provider(
             AppKind::Codex,
             ProviderType::GrokOAuth,
-            json!({}),
+            json!({
+                "testRuntimeEndpoint": endpoint,
+                "testGrokWebsocketUrl": websocket_url
+            }),
             Some(&account_id),
         );
         stored.provider.id = provider_id;
@@ -14655,18 +17496,298 @@ mod tests {
             .unwrap()
             .as_ref()
             .clone();
-        plan.endpoint = endpoint;
+        plan.endpoint = stored.provider.settings_config["testRuntimeEndpoint"]
+            .as_str()
+            .unwrap()
+            .to_string();
         plan.runtime_fingerprint = format!("{name}-grok-test-runtime");
-        if let Some(websocket_url) = websocket_url {
+        if let Some(websocket_url) =
+            stored.provider.settings_config["testGrokWebsocketUrl"].as_str()
+        {
             plan.driver_options.insert(
                 "testGrokWebsocketUrl".to_string(),
-                Value::String(websocket_url),
+                Value::String(websocket_url.to_string()),
             );
         }
         std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
         let execution = ProviderExecution::from_store(&providers, stored).unwrap();
         state.replace_provider_store_for_test(providers).await;
         execution
+    }
+
+    async fn install_kiro_test_provider(
+        state: &ServerState,
+        name: &str,
+        api_base_url: String,
+        token_url: String,
+    ) -> String {
+        let account_id = format!("{name}-account");
+        let provider_id = format!("{name}-provider");
+        let account_id_for_state = account_id.clone();
+        let name_for_state = name.to_string();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "kiro_oauth",
+                        "email": format!("{name_for_state}@example.com"),
+                        "accessToken": "kiro-old-access",
+                        "refreshToken": "kiro-old-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                            "authRegion": "us-east-1",
+                            "apiRegion": "us-east-1",
+                            "machineId": "kiro-test-machine",
+                            "authMethod": "social"
+                        },
+                        "raw": {
+                            "authMethod": "social",
+                            "testOAuthTokenUrl": token_url
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let mut stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::KiroOAuth,
+            json!({"env": {"KIRO_API_BASE_URL": api_base_url}}),
+            Some(&account_id),
+        );
+        stored.provider.id = provider_id.clone();
+        stored.resource.profile_id = Some(
+            crate::domain::providers::registry::ProfileId::parse("claude.kiro_oauth").unwrap(),
+        );
+        stored.resource.profile_schema_revision = Some(1);
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        provider_id
+    }
+
+    #[tokio::test]
+    async fn kiro_401_refresh_replays_once_with_new_authorization_and_single_content_type() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "accessToken": "kiro-new-access",
+                        "refreshToken": "kiro-new-refresh",
+                        "tokenType": "Bearer",
+                        "expiresIn": 3600
+                    }))
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let upstream_app = axum::Router::new().route(
+            "/generateAssistantResponse",
+            axum::routing::post(move |headers: HeaderMap| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                async move {
+                    let authorization = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let content_types = headers
+                        .get_all(CONTENT_TYPE)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok().map(str::to_string))
+                        .collect::<Vec<_>>();
+                    observations
+                        .lock()
+                        .unwrap()
+                        .push((authorization.clone(), content_types));
+                    if authorization == "Bearer kiro-old-access" {
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .body(Body::from("unauthorized"))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("kiro-401-refresh");
+        let provider_id = install_kiro_test_provider(
+            &state,
+            "kiro-401-refresh",
+            format!("http://{upstream_address}"),
+            format!("http://{token_address}/token"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_route_key(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-8","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        {
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert_eq!(observations[0].0, "Bearer kiro-old-access");
+            assert_eq!(observations[1].0, "Bearer kiro-new-access");
+            for (_, content_types) in observations.iter() {
+                assert_eq!(content_types, &["application/json"]);
+            }
+        }
+        assert_eq!(
+            state
+                .find_account_by_id("kiro-401-refresh-account")
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("kiro-new-access")
+        );
+        token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_second_401_stops_without_another_refresh_or_replay() {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "accessToken": "kiro-new-access",
+                        "refreshToken": "kiro-new-refresh",
+                        "tokenType": "Bearer",
+                        "expiresIn": 3600
+                    }))
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let upstream_app = axum::Router::new().route(
+            "/generateAssistantResponse",
+            axum::routing::post(move |headers: HeaderMap| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                async move {
+                    observations.lock().unwrap().push((
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        headers
+                            .get_all(CONTENT_TYPE)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok().map(str::to_string))
+                            .collect::<Vec<_>>(),
+                    ));
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::from("unauthorized"))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("kiro-second-401");
+        let provider_id = install_kiro_test_provider(
+            &state,
+            "kiro-second-401",
+            format!("http://{upstream_address}"),
+            format!("http://{token_address}/token"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_route_key(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-8","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].0, "Bearer kiro-old-access");
+        assert_eq!(observations[1].0, "Bearer kiro-new-access");
+        for (_, content_types) in observations.iter() {
+            assert_eq!(content_types, &["application/json"]);
+        }
+        token_server.abort();
+        upstream_server.abort();
     }
 
     async fn spawn_test_grok_responses_bridge(
@@ -14893,6 +18014,30 @@ mod tests {
                 plan: std::sync::Arc::new(plan),
             },
         )
+    }
+
+    fn switch_codex_test_workspace(accounts: &mut AccountStore, account_id: &str) {
+        let next_workspace_id = format!("{account_id}-next-workspace");
+        let account = accounts
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .unwrap();
+        account
+            .profile
+            .as_mut()
+            .and_then(|profile| profile.pointer_mut("/verifiedOpenAiClaims"))
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "organizations".to_string(),
+                json!([{ "id": next_workspace_id, "name": "Next workspace" }]),
+            );
+        let previous_generation = account.auth_identity_generation;
+        let updated = accounts
+            .select_codex_workspace(account_id, &next_workspace_id)
+            .unwrap();
+        assert!(updated.auth_identity_generation > previous_generation);
     }
 
     #[derive(Clone)]
@@ -15571,6 +18716,18 @@ mod tests {
                 crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
             plan.endpoint = spec.endpoint.clone();
             plan.runtime_fingerprint = format!("{}-runtime", spec.name);
+            let account_id = format!("{}-account", spec.name);
+            let auth_identity_generation = accounts
+                .find_for_provider(ProviderType::CodexOAuth, Some(&account_id))
+                .unwrap()
+                .auth_identity_generation;
+            plan.auth_ref = crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation,
+            };
+            plan.configuration_state =
+                crate::domain::providers::runtime::RuntimeConfigurationState::Ready;
             if let Some(websocket_url) = spec.websocket_url.as_ref() {
                 plan.driver_options.insert(
                     "testCodexWebsocketUrl".to_string(),
@@ -16638,6 +19795,60 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         }
     }
 
+    struct TestGrokImageUpstream {
+        address: std::net::SocketAddr,
+        accept_encodings: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_test_grok_image_upstream(
+        content_type: &'static str,
+        chunks: Vec<(Duration, Bytes)>,
+    ) -> TestGrokImageUpstream {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept_encodings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accept_encodings_for_route = std::sync::Arc::clone(&accept_encodings);
+        let chunks = std::sync::Arc::new(chunks);
+        let app = axum::Router::new().route(
+            "/images/generations",
+            axum::routing::post(move |headers: HeaderMap| {
+                let accept_encodings = std::sync::Arc::clone(&accept_encodings_for_route);
+                let chunks = std::sync::Arc::clone(&chunks);
+                async move {
+                    accept_encodings.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::ACCEPT_ENCODING)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let chunks = futures_util::stream::iter(chunks.as_ref().clone()).then(
+                        |(delay, chunk)| async move {
+                            tokio::time::sleep(delay).await;
+                            Ok::<Bytes, std::convert::Infallible>(chunk)
+                        },
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from_stream(chunks))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestGrokImageUpstream {
+            address,
+            accept_encodings,
+            server,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn codex_images_stream_test_args(
         state: &ServerState,
@@ -16806,6 +20017,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert_eq!(
             deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::NotFound).status,
             StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::IdentityChanged).status,
+            StatusCode::CONFLICT
         );
         assert_eq!(
             deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::MissingToken).status,
@@ -17294,6 +20509,34 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
+    fn responses_image_transport_detects_top_level_and_responses_lite_tools_only() {
+        assert!(responses_body_requests_image_generation(
+            ProxyRoute::CodexResponses,
+            br#"{"tools":[{"type":"image_generation"}]}"#,
+        ));
+        assert!(responses_body_requests_image_generation(
+            ProxyRoute::CodexResponses,
+            br#"{"request":{"input":[{"type":"additional_tools","tools":[{"type":"image_gen"}]}]}}"#,
+        ));
+        assert!(!responses_body_requests_image_generation(
+            ProxyRoute::CodexResponses,
+            br#"{"input":"explain the image_generation tool"}"#,
+        ));
+        assert!(!responses_body_requests_image_generation(
+            ProxyRoute::CodexChatCompletions,
+            br#"{"tools":[{"type":"image_generation"}]}"#,
+        ));
+    }
+
+    #[test]
+    fn responses_image_transport_forces_semantic_inspection_during_incident_rollback() {
+        assert!(responses_semantic_inspection_required(false, false, true));
+        assert!(responses_semantic_inspection_required(true, false, false));
+        assert!(responses_semantic_inspection_required(false, true, false));
+        assert!(!responses_semantic_inspection_required(false, false, false));
+    }
+
+    #[test]
     fn codex_image_tool_on_error_helpers_detect_rejection_and_build_retry_body() {
         assert!(codex_image_tool_rejection_body(
             br#"{"error":{"message":"unsupported image_generation tool"}}"#,
@@ -17646,12 +20889,26 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
     #[test]
     fn share_requests_always_pin_their_provider() {
-        let headers = HeaderMap::new();
         let context = UsageLogContext {
             share_id: Some("share-one-account".to_string()),
             ..UsageLogContext::default()
         };
-        assert!(request_is_provider_pinned(&headers, &context));
+        assert!(request_is_provider_pinned(
+            &ForwardAttemptContext::default(),
+            &context
+        ));
+    }
+
+    #[test]
+    fn route_key_requests_always_pin_their_provider() {
+        let attempt_context = ForwardAttemptContext {
+            route_binding_pinned: true,
+            ..ForwardAttemptContext::default()
+        };
+        assert!(request_is_provider_pinned(
+            &attempt_context,
+            &UsageLogContext::default()
+        ));
     }
 
     #[test]
@@ -17907,8 +21164,8 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
         assert_eq!(completion.results[0].revised_prompt.as_deref(), Some("cat"));
     }
 
-    #[test]
-    fn codex_images_output_requires_a_supported_matching_image_signature() {
+    #[tokio::test]
+    async fn codex_images_output_requires_a_supported_matching_image_signature() {
         let state = forwarder_test_state("codex-images-output-signature");
         let invalid = render_codex_image_data(
             &state,
@@ -17920,6 +21177,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             "b64_json",
             None,
         )
+        .await
         .unwrap_err();
         assert_eq!(invalid.code, "invalid_upstream_image_response");
         assert!(invalid.message.contains("supported image signature"));
@@ -17934,6 +21192,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             "b64_json",
             None,
         )
+        .await
         .unwrap_err();
         assert!(mismatch
             .message
@@ -17948,6 +21207,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             "b64_json",
             None,
         )
+        .await
         .unwrap();
         assert_eq!(data["b64_json"], "iVBORw0KGgo=");
         assert_eq!(usage.format.as_deref(), Some("png"));
@@ -18631,6 +21891,582 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         server.abort();
     }
 
+    fn image_generation_responses_sse() -> Bytes {
+        Bytes::from_static(concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-image\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"image-1\",\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-image\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes())
+    }
+
+    fn failed_image_generation_responses_sse() -> Bytes {
+        Bytes::from_static(concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-image-failed\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-image-failed\",\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"code\":\"image_backend_failed\",\"message\":\"image backend failed\"}}}\n\n"
+        ).as_bytes())
+    }
+
+    fn configure_test_image_heartbeat(execution: &mut ProviderExecution) {
+        let plan = std::sync::Arc::make_mut(&mut execution.plan);
+        plan.driver_options
+            .insert("testImageKeepaliveMs".to_string(), Value::from(20));
+        plan.transport_policy.stream_first_byte_timeout_ms = Some(250);
+        plan.transport_policy.stream_idle_timeout_ms = Some(250);
+    }
+
+    #[tokio::test]
+    async fn responses_image_stream_commits_immediately_and_keeps_semantic_inspection() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(Duration::from_millis(80), image_generation_responses_sse())],
+            false,
+        )
+        .await;
+        let (state, mut execution) = codex_bridge_test_context(
+            "responses-image-heartbeat-sse",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        configure_test_image_heartbeat(&mut execution);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-5.4-mini","input":"draw","stream":true,"tools":[{"type":"image_generation","model":"gpt-image-2"}],"tool_choice":{"type":"image_generation"}}"#,
+            ),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert!(response.headers()[CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-transform"));
+
+        let mut body = response.into_body().into_data_stream();
+        let initial = tokio::time::timeout(Duration::from_millis(50), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial, Bytes::from_static(b": connected\n\n"));
+        let heartbeat = tokio::time::timeout(Duration::from_millis(60), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(heartbeat, Bytes::from_static(b": keepalive\n\n"));
+        let mut remaining = Vec::new();
+        while let Some(chunk) = body.next().await {
+            remaining.extend_from_slice(&chunk.unwrap());
+        }
+        let remaining = String::from_utf8(remaining).unwrap();
+        assert!(remaining.contains("response.output_item.done"));
+        assert!(remaining.contains("response.completed"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_image_stream_keeps_wire_200_but_records_semantic_failure_status() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(
+                Duration::from_millis(30),
+                failed_image_generation_responses_sse(),
+            )],
+            false,
+        )
+        .await;
+        let (state, mut execution) = codex_bridge_test_context(
+            "responses-image-semantic-failure",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        configure_test_image_heartbeat(&mut execution);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-5.4-mini","input":"draw","stream":true,"tools":[{"type":"image_generation","model":"gpt-image-2"}],"tool_choice":{"type":"image_generation"}}"#,
+            ),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("response.failed"));
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().unwrap();
+        assert_eq!(log.status_code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(log.stream_status.as_deref(), Some("provider_failed"));
+        assert!(log
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("image backend failed")));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_image_cancel_records_499_and_holds_lease_through_accounting() {
+        for (suffix, downstream_stream, initial) in [
+            ("sse", true, Bytes::from_static(b": connected\n\n")),
+            ("json", false, Bytes::from_static(b"\n")),
+        ] {
+            let name = format!("responses-image-cancel-{suffix}");
+            let upstream = spawn_test_streaming_codex_images_upstream(Vec::new(), true).await;
+            let (state, mut execution) =
+                codex_bridge_test_context(&name, format!("http://{}", upstream.address)).await;
+            configure_test_image_heartbeat(&mut execution);
+            let account_id = execution.managed_account_id().unwrap().to_string();
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let response = forward_with_attempt(
+                state.clone(),
+                ProxyRoute::CodexResponses,
+                None,
+                headers,
+                Bytes::from(format!(
+                    r#"{{"model":"gpt-5.4-mini","input":"draw","stream":{downstream_stream},"tools":[{{"type":"image_generation","model":"gpt-image-2"}}],"tool_choice":{{"type":"image_generation"}}}}"#
+                )),
+                ForwardAttemptContext {
+                    execution: Some(execution),
+                    ..ForwardAttemptContext::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let request_id = state
+                .usage_snapshot()
+                .await
+                .logs
+                .last()
+                .unwrap()
+                .request_id
+                .clone();
+            let mut body = response.into_body().into_data_stream();
+            assert_eq!(body.next().await.unwrap().unwrap(), initial);
+            assert_eq!(
+                state
+                    .account_in_flight
+                    .snapshot()
+                    .current(ProviderType::CodexOAuth, &account_id),
+                1
+            );
+
+            let usage_write = state.usage.write().await;
+            drop(body);
+            tokio::task::yield_now().await;
+            assert_eq!(
+                state
+                    .account_in_flight
+                    .snapshot()
+                    .current(ProviderType::CodexOAuth, &account_id),
+                1,
+                "the account lease must outlive asynchronous cancellation accounting"
+            );
+            drop(usage_write);
+
+            for _ in 0..100 {
+                let released = state
+                    .account_in_flight
+                    .snapshot()
+                    .current(ProviderType::CodexOAuth, &account_id)
+                    == 0;
+                let cancelled = state
+                    .usage_snapshot()
+                    .await
+                    .logs
+                    .iter()
+                    .find(|log| log.request_id == request_id)
+                    .is_some_and(|log| {
+                        log.status_code == 499
+                            && log.stream_status.as_deref() == Some("client_cancelled")
+                            && log.error_message.as_deref() == Some(IMAGE_CLIENT_CANCELLED_MESSAGE)
+                    });
+                if released && cancelled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                state
+                    .account_in_flight
+                    .snapshot()
+                    .current(ProviderType::CodexOAuth, &account_id),
+                0
+            );
+            let usage = state.usage_snapshot().await;
+            let log = usage
+                .logs
+                .iter()
+                .find(|log| log.request_id == request_id)
+                .unwrap();
+            assert_eq!(log.status_code, 499);
+            assert_eq!(log.stream_status.as_deref(), Some("client_cancelled"));
+            assert_eq!(
+                log.error_message.as_deref(),
+                Some(IMAGE_CLIENT_CANCELLED_MESSAGE)
+            );
+            upstream.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_image_json_heartbeats_preserve_one_json_document() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(Duration::from_millis(80), image_generation_responses_sse())],
+            false,
+        )
+        .await;
+        let (state, mut execution) = codex_bridge_test_context(
+            "responses-image-heartbeat-json",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        configure_test_image_heartbeat(&mut execution);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-5.4-mini","input":"draw","stream":false,"tools":[{"type":"image_generation","model":"gpt-image-2"}],"tool_choice":{"type":"image_generation"}}"#,
+            ),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        let initial = body.next().await.unwrap().unwrap();
+        assert_eq!(initial, Bytes::from_static(b"\n"));
+        bytes.extend_from_slice(&initial);
+        let heartbeat = tokio::time::timeout(Duration::from_millis(60), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+        bytes.extend_from_slice(&heartbeat);
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["id"], "resp-image");
+        assert_eq!(value["output"][0]["type"], "image_generation_call");
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().unwrap();
+        assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        assert_eq!(log.total_tokens, Some(5));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_image_json_terminal_errors_are_bounded_on_wire_and_in_usage() {
+        let long_message = "x".repeat(2048);
+        let failure = OpenAiResponsesAggregationFailure {
+            error: ProxyError::bad_gateway(&long_message),
+            usage: TokenUsage::default(),
+            usage_state: UsageState::Missing,
+            stream_status: "provider_failed",
+            provider_outcome: None,
+            semantic_failure: None,
+            saw_business_output: false,
+        };
+        let wire = responses_image_json_error_body(&failure);
+        let wire: Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(
+            wire.pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap()
+                .chars()
+                .count(),
+            512
+        );
+
+        let state = forwarder_test_state("responses-image-json-bounded-error");
+        let stored = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
+        let started = Instant::now();
+        let request_id = log_usage(
+            &state,
+            &stored,
+            StatusCode::OK.as_u16(),
+            0,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+            UsageLogContext {
+                is_streaming: false,
+                stream_status: Some("pending".to_string()),
+                ..UsageLogContext::default()
+            },
+        )
+        .await;
+        let mut lifecycle = ResponsesImageJsonLifecycleGuard {
+            armed: true,
+            state: state.clone(),
+            stored,
+            request_context: UsageLogContext::default(),
+            request_id: request_id.clone(),
+            started,
+            first_token_ms: None,
+            account_in_flight_guard: None,
+            share_invocation_guard: None,
+        };
+        lifecycle
+            .finish(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                TokenUsage::default(),
+                false,
+                "provider_failed",
+                Some(&long_message),
+                None,
+            )
+            .await;
+        let usage = state.usage_snapshot().await;
+        let persisted = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == request_id)
+            .and_then(|log| log.error_message.as_deref())
+            .unwrap();
+        assert_eq!(persisted.chars().count(), 512);
+    }
+
+    async fn grok_image_test_execution(
+        state: &ServerState,
+        name: &str,
+        address: std::net::SocketAddr,
+    ) -> ProviderExecution {
+        let mut execution = install_grok_test_execution(
+            state,
+            name,
+            format!("http://{address}"),
+            None,
+            &format!("{name}-access"),
+            None,
+            &[GrokAccountCapability::ImageGeneration],
+        )
+        .await;
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert("testImageKeepaliveMs".to_string(), Value::from(20));
+        execution
+    }
+
+    #[tokio::test]
+    async fn grok_image_json_uses_identity_and_legal_whitespace_heartbeats() {
+        let upstream = spawn_test_grok_image_upstream(
+            "application/json",
+            vec![(
+                Duration::from_millis(80),
+                Bytes::from_static(
+                    br#"{"created":1,"data":[{"url":"https://example.test/image"}]}"#,
+                ),
+            )],
+        )
+        .await;
+        let state = forwarder_test_state("grok-image-json-heartbeat");
+        let execution =
+            grok_image_test_execution(&state, "grok-image-json-heartbeat", upstream.address).await;
+        let response = forward_grok_media_with_execution(
+            state,
+            execution,
+            Method::POST,
+            "/images/generations".to_string(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"grok-imagine","prompt":"draw"}"#),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        let initial = body.next().await.unwrap().unwrap();
+        assert_eq!(initial, Bytes::from_static(b"\n"));
+        bytes.extend_from_slice(&initial);
+        let heartbeat = tokio::time::timeout(Duration::from_millis(60), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+        bytes.extend_from_slice(&heartbeat);
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["data"][0]["url"], "https://example.test/image");
+        assert_eq!(
+            upstream.accept_encodings.lock().unwrap().as_slice(),
+            ["identity"]
+        );
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_image_sse_heartbeats_never_split_an_upstream_event() {
+        let upstream = spawn_test_grok_image_upstream(
+            "text/event-stream",
+            vec![
+                (
+                    Duration::from_millis(5),
+                    Bytes::from_static(b"event: image_generation.completed\ndata: {\"type\":\"image_generation.com"),
+                ),
+                (
+                    Duration::from_millis(75),
+                    Bytes::from_static(b"pleted\",\"url\":\"https://example.test/image\"}\n\n"),
+                ),
+            ],
+        )
+        .await;
+        let state = forwarder_test_state("grok-image-sse-heartbeat");
+        let execution =
+            grok_image_test_execution(&state, "grok-image-sse-heartbeat", upstream.address).await;
+        let response = forward_grok_media_with_execution(
+            state,
+            execution,
+            Method::POST,
+            "/images/generations".to_string(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"grok-imagine","prompt":"draw","stream":true}"#),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b": connected\n\n")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(60), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b": keepalive\n\n")
+        );
+        let event = loop {
+            let chunk = body.next().await.unwrap().unwrap();
+            if !chunk.starts_with(b": keepalive") {
+                break chunk;
+            }
+        };
+        let event = String::from_utf8(event.to_vec()).unwrap();
+        assert!(event.starts_with("event: image_generation.completed\n"));
+        assert!(event.contains("image_generation.completed"));
+        assert!(!event.contains(": keepalive"));
+        while body.next().await.is_some() {}
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_image_cancel_holds_account_and_share_leases_through_accounting() {
+        let name = "grok-image-cancel-leases";
+        let upstream = spawn_test_grok_image_upstream("application/json", Vec::new()).await;
+        let state = forwarder_test_state(name);
+        let execution = grok_image_test_execution(&state, name, upstream.address).await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let account_guard = state
+            .account_in_flight
+            .try_acquire(ProviderType::GrokOAuth, &account_id, 1)
+            .unwrap();
+        let share_id = "grok-image-cancel-share";
+        let share_guard = state.share_in_flight.try_acquire(share_id, None).unwrap();
+        let response = forward_grok_media_with_execution(
+            state.clone(),
+            execution,
+            Method::POST,
+            "/images/generations".to_string(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"grok-imagine","prompt":"draw"}"#),
+            None,
+            Some(share_id.to_string()),
+            None,
+            Some(account_guard),
+            Some(share_guard),
+        )
+        .await
+        .unwrap();
+
+        let usage_write = state.usage.write().await;
+        drop(response);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::GrokOAuth, &account_id),
+            1
+        );
+        assert!(state.share_in_flight.has_in_flight(share_id));
+        drop(usage_write);
+
+        for _ in 0..100 {
+            if state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::GrokOAuth, &account_id)
+                == 0
+                && !state.share_in_flight.has_in_flight(share_id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::GrokOAuth, &account_id),
+            0
+        );
+        assert!(!state.share_in_flight.has_in_flight(share_id));
+        upstream.server.abort();
+    }
+
     #[test]
     fn stream_terminal_error_frames_match_client_protocols() {
         let responses = stream_terminal_error_frame(ProxyRoute::CodexResponses, "boom", 504)
@@ -18734,6 +22570,72 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         assert!(account
             .rate_limited_until
             .is_some_and(|until| until >= before + 30 * 60_000));
+    }
+
+    #[tokio::test]
+    async fn stale_grok_websocket_response_observations_are_discarded() {
+        let state = forwarder_test_state("grok-ws-stale-observation");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-ws-stale-observation",
+            super::super::grok::default_base_url().to_string(),
+            None,
+            "grok-ws-stale-access",
+            None,
+            &[GrokAccountCapability::Websocket],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        state
+            .mutate_accounts(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap()
+                    .auth_identity_generation += 1;
+            })
+            .await;
+
+        let rate_limited = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(429)
+            .header("retry-after", "30")
+            .header("xai-subscription-tier", "stale-tier")
+            .header("xai-entitlement-status", "stale-entitlement")
+            .body(Some(br#"{"error":"rate_limited"}"#.to_vec()))
+            .unwrap();
+        let error = responses_websocket_connect_error(
+            &state,
+            &execution,
+            TungsteniteError::Http(rate_limited),
+        )
+        .await;
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+
+        let forbidden = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(403)
+            .body(Some(br#"{"error":"subscription blocked"}"#.to_vec()))
+            .unwrap();
+        let error = responses_websocket_connect_error(
+            &state,
+            &execution,
+            TungsteniteError::Http(forbidden),
+        )
+        .await;
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        record_grok_capability_evidence(&state, &execution, GrokAccountCapability::ImageGeneration)
+            .await;
+
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert!(account.rate_limited_until.is_none());
+        assert!(account.subscription_level.is_none());
+        assert!(account.entitlement_status.is_none());
+        assert!(
+            !crate::domain::accounts::store::grok_account_capability_evidence_present(
+                &account,
+                GrokAccountCapability::ImageGeneration,
+            )
+        );
     }
 
     #[test]
@@ -19632,7 +23534,18 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 .current(ProviderType::CodexOAuth, &account_id),
             1
         );
+        let usage_write = state.usage.write().await;
         drop(body);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CodexOAuth, &account_id),
+            1,
+            "the account lease must remain held until cancellation accounting completes"
+        );
+        drop(usage_write);
 
         for _ in 0..100 {
             let released = state
@@ -19904,7 +23817,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_inactive_account_is_rejected_before_any_image_outbound() {
+    async fn codex_explicit_binding_is_valid_independent_of_active_account() {
         let active_name = "codex-active-outbound";
         let inactive_name = "codex-inactive-outbound";
         let active = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
@@ -19929,29 +23842,16 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
         let inactive_execution = executions.remove(1);
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let prepared = codex_images_edit_request_from_value(json!({
-            "model": "gpt-image-2",
-            "prompt": "must not leave the server",
-            "image": "file:///must-not-be-inspected.png"
-        }))
-        .unwrap();
-
-        let error = forward_codex_images_request(
-            state,
-            inactive_execution,
-            headers,
-            prepared,
-            UsageLogContext::default(),
-            None,
-            None,
+        let accounts = state.accounts_snapshot().await;
+        super::super::router::ensure_codex_oauth_binding(
+            &inactive_execution.runtime_stored_view(),
+            &accounts,
         )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(error.message.contains("inactive account"));
+        .unwrap();
+        assert_eq!(
+            inactive_execution.managed_account_id(),
+            Some("codex-inactive-outbound-account")
+        );
         assert_eq!(
             active
                 .http_requests
@@ -19970,7 +23870,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_websocket_rechecks_active_account_before_each_response() {
+    async fn codex_websocket_does_not_depend_on_active_account() {
         let name = "codex-websocket-active-turn";
         let (state, execution) =
             codex_bridge_test_context(name, "http://127.0.0.1:9".to_string()).await;
@@ -20001,6 +23901,23 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             .await
             .unwrap();
 
+        ensure_responses_websocket_turn_allowed(&state, &execution, ResponsesWebsocketMode::Codex)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_rechecks_identity_generation_before_each_response() {
+        let name = "codex-websocket-generation-turn";
+        let (state, execution) =
+            codex_bridge_test_context(name, "http://127.0.0.1:9".to_string()).await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        state
+            .mutate_accounts(|accounts| {
+                switch_codex_test_workspace(accounts, &account_id);
+            })
+            .await;
+
         let error = ensure_responses_websocket_turn_allowed(
             &state,
             &execution,
@@ -20009,8 +23926,47 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .await
         .unwrap_err();
 
-        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(error.message.contains("inactive account"));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("identity changed"));
+        assert!(error.message.contains("reconnect"));
+    }
+
+    #[tokio::test]
+    async fn grok_websocket_rechecks_identity_generation_before_each_response() {
+        let state = forwarder_test_state("grok-websocket-generation-turn");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-websocket-generation-turn",
+            super::super::grok::default_base_url().to_string(),
+            None,
+            "grok-websocket-generation-access",
+            None,
+            &[GrokAccountCapability::Websocket],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        state
+            .mutate_accounts(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap()
+                    .auth_identity_generation += 1;
+            })
+            .await;
+
+        let error = ensure_responses_websocket_turn_allowed(
+            &state,
+            &execution,
+            ResponsesWebsocketMode::Grok,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("identity changed"));
+        assert!(error.message.contains("reconnect"));
     }
 
     #[tokio::test]
@@ -20400,6 +24356,120 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             Some(&json!("high"))
         );
         drop(observations);
+
+        bridge_server.abort();
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_generation_change_stops_before_reusing_the_old_socket() {
+        let upstream = spawn_test_codex_upstream(TestCodexWebSocketBehavior::Complete).await;
+        let endpoint = format!("http://{}", upstream.address);
+        let (state, execution) = codex_bridge_test_context("ws-generation-change", endpoint).await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge(
+            state.clone(),
+            execution,
+            format!("ws://{}/ws", upstream.address),
+            None,
+            "generation-change-session",
+        )
+        .await;
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{bridge_address}/bridge"))
+                .await
+                .unwrap();
+
+        socket
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "input": "first identity"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let first_completed = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(message) = socket.next().await {
+                let Ok(TungsteniteMessage::Text(text)) = message else {
+                    continue;
+                };
+                if serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("response.completed")
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("first WebSocket turn should finish");
+        assert!(first_completed);
+        assert_eq!(
+            upstream
+                .websocket_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        state
+            .mutate_accounts(|accounts| {
+                switch_codex_test_workspace(accounts, &account_id);
+            })
+            .await;
+        socket
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "input": "must not use the old identity"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let terminated_without_response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(TungsteniteMessage::Text(text))) => {
+                        if serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .as_deref()
+                            == Some("response.completed")
+                        {
+                            return false;
+                        }
+                    }
+                    Some(Ok(TungsteniteMessage::Close(_))) | Some(Err(_)) | None => return true,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("identity drift should terminate the WebSocket");
+        assert!(terminated_without_response);
+        assert_eq!(
+            upstream
+                .websocket_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
 
         bridge_server.abort();
         upstream.server.abort();
@@ -21347,14 +25417,11 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
-        );
         headers.insert("x-session-id", HeaderValue::from_static("client-session"));
-        let response = forward(
+        let response = forward_for_route_key(
             state.clone(),
             ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
             None,
             headers,
             Bytes::from_static(
@@ -21505,15 +25572,12 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
-        );
         headers.insert("session_id", HeaderValue::from_static("client-session-17"));
         headers.insert("x-grok-turn-idx", HeaderValue::from_static("17"));
-        let response = forward(
+        let response = forward_for_route_key(
             state.clone(),
             ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
             None,
             headers,
             Bytes::from_static(br#"{"model":"grok","input":"ping","stream":true,"store":false}"#),
@@ -21541,15 +25605,12 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
-        );
         headers.insert("session_id", HeaderValue::from_static("client-session-17"));
         headers.insert("x-grok-turn-idx", HeaderValue::from_static("17"));
-        let response = forward(
+        let response = forward_for_route_key(
             state.clone(),
             ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
             None,
             headers,
             Bytes::from_static(br#"{"model":"grok","input":"ping","stream":false,"store":false}"#),
@@ -21665,13 +25726,10 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_str(&execution.stored.provider.id).unwrap(),
-        );
         let body = Bytes::from_static(br#"{"model":"grok-4.5","prompt":"draw"}"#);
-        let blocked = forward_grok_media(
+        let blocked = forward_grok_media_for_route_key(
             state.clone(),
+            execution.stored.provider.id.clone(),
             Method::POST,
             "/images/generations".to_string(),
             headers.clone(),
@@ -21691,8 +25749,9 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             )
             .await
             .unwrap());
-        let first = forward_grok_media(
+        let first = forward_grok_media_for_route_key(
             state.clone(),
+            execution.stored.provider.id.clone(),
             Method::POST,
             "/images/generations".to_string(),
             headers.clone(),
@@ -21701,8 +25760,9 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .await
         .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        let second = forward_grok_media(
+        let second = forward_grok_media_for_route_key(
             state.clone(),
+            execution.stored.provider.id.clone(),
             Method::POST,
             "/images/generations".to_string(),
             headers,
@@ -21745,7 +25805,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn grok_video_status_rejects_provider_or_account_binding_drift() {
+    async fn grok_video_status_rejects_provider_account_or_generation_binding_drift() {
         let observed_conversation_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let observed_for_route = std::sync::Arc::clone(&observed_conversation_id);
         let upstream = axum::Router::new().route(
@@ -21780,21 +25840,21 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         )
         .await;
         let provider_id = execution.stored.provider.id.clone();
-        let account_id = execution.managed_account_id().unwrap().to_string();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-cc-provider-id",
-            HeaderValue::from_str(&provider_id).unwrap(),
-        );
+        let (_, account_id, auth_identity_generation) =
+            execution.managed_account_identity_target().unwrap();
+        let account_id = account_id.to_string();
+        let headers = HeaderMap::new();
 
         state.remember_grok_media_session(
             "grok-video:request-1".to_string(),
             "different-provider".to_string(),
-            Some(account_id.clone()),
+            account_id.clone(),
+            auth_identity_generation,
             60_000,
         );
-        let provider_drift = forward_grok_media(
+        let provider_drift = forward_grok_media_for_route_key(
             state.clone(),
+            provider_id.clone(),
             Method::GET,
             "/videos/request-1".to_string(),
             headers.clone(),
@@ -21807,11 +25867,13 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         state.remember_grok_media_session(
             "grok-video:request-1".to_string(),
             provider_id.clone(),
-            Some("different-account".to_string()),
+            "different-account".to_string(),
+            auth_identity_generation,
             60_000,
         );
-        let account_drift = forward_grok_media(
+        let account_drift = forward_grok_media_for_route_key(
             state.clone(),
+            provider_id.clone(),
             Method::GET,
             "/videos/request-1".to_string(),
             headers.clone(),
@@ -21821,11 +25883,31 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .unwrap_err();
         assert_eq!(account_drift.status, StatusCode::CONFLICT);
 
+        state.remember_grok_media_session(
+            "grok-video:request-1".to_string(),
+            provider_id.clone(),
+            account_id.clone(),
+            auth_identity_generation.saturating_add(1),
+            60_000,
+        );
+        let generation_drift = forward_grok_media_for_route_key(
+            state.clone(),
+            provider_id.clone(),
+            Method::GET,
+            "/videos/request-1".to_string(),
+            headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(generation_drift.status, StatusCode::CONFLICT);
+
         ensure_grok_media_session_binding(
             &execution,
             &GrokMediaSessionBinding {
                 provider_id,
-                account_id: Some(account_id),
+                account_id,
+                auth_identity_generation,
                 expires_at_ms: i64::MAX,
             },
         )
@@ -21834,11 +25916,13 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         state.remember_grok_media_session(
             "grok-video:request-1".to_string(),
             execution.stored.provider.id.clone(),
-            execution.managed_account_id().map(str::to_string),
+            execution.managed_account_id().unwrap().to_string(),
+            auth_identity_generation,
             60_000,
         );
-        let response = forward_grok_media(
+        let response = forward_grok_media_for_route_key(
             state,
+            execution.stored.provider.id.clone(),
             Method::GET,
             "/videos/request-1".to_string(),
             headers,
@@ -22035,12 +26119,74 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             &state.account_in_flight.snapshot(),
             &excluded,
         )
-        .is_some());
+        .is_none());
         state.replace_provider_store_for_test(providers).await;
 
         assert!(next_provider_failover(
             &state,
             ProxyRoute::CodexResponses,
+            &ForwardAttemptContext::default(),
+            &execution,
+            "test_failure",
+        )
+        .await
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_gemini_execution_never_enters_generic_provider_failover() {
+        let state = forwarder_test_state("managed-gemini-no-provider-failover");
+        let (provider_id, _) = install_gemini_v1internal_test_provider(
+            &state,
+            "no-provider-failover",
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:9/token".to_string(),
+            true,
+        )
+        .await;
+        let accounts = state.accounts_snapshot().await;
+        let (execution, mut providers) = {
+            let providers = state.providers.read().await;
+            let stored = providers
+                .providers
+                .iter()
+                .find(|stored| stored.provider.id == provider_id)
+                .cloned()
+                .unwrap();
+            (
+                ProviderExecution::from_store(&providers, stored).unwrap(),
+                providers.clone(),
+            )
+        };
+        let mut fallback = stored_provider(
+            AppKind::Gemini,
+            ProviderType::OpenRouter,
+            json!({
+                "env": {
+                    "OPENAI_API_KEY": "fallback-key",
+                    "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"
+                }
+            }),
+            None,
+        );
+        fallback.provider.id = "available-gemini-fallback".to_string();
+        providers.providers.push(fallback);
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut excluded = BTreeSet::new();
+        excluded.insert(execution.stored.provider.id.clone());
+        assert!(select_failover_provider(
+            &providers,
+            &accounts,
+            ProxyRoute::Gemini,
+            &state.account_in_flight.snapshot(),
+            &excluded,
+        )
+        .is_none());
+        state.replace_provider_store_for_test(providers).await;
+
+        assert!(next_provider_failover(
+            &state,
+            ProxyRoute::Gemini,
             &ForwardAttemptContext::default(),
             &execution,
             "test_failure",

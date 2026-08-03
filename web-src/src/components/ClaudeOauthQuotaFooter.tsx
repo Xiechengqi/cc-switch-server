@@ -2,10 +2,11 @@ import React from "react";
 import type { ProviderMeta } from "@/types";
 import { useClaudeOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 import type { AppId } from "@/lib/api";
 import { SubscriptionQuotaView } from "@/components/SubscriptionQuotaFooter";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface ClaudeOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -25,11 +26,28 @@ const ClaudeOauthQuotaFooter: React.FC<ClaudeOauthQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useClaudeOauthQuota(meta, { enabled: true });
-  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.CLAUDE_OAUTH);
-  const handleRefresh = React.useCallback(async () => {
-    await subscriptionApi.refreshOauthQuota("claude_oauth", accountId);
-    await refetch();
-  }, [accountId, refetch]);
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.CLAUDE_OAUTH,
+  );
+  const accountId = identity?.accountId ?? null;
+  const handleRefresh = React.useCallback(
+    () =>
+      refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            "claude_oauth",
+            accountId,
+            undefined,
+            undefined,
+            undefined,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
+      ),
+    [accountId, identity?.authIdentityGeneration, refetch],
+  );
 
   return (
     <SubscriptionQuotaView

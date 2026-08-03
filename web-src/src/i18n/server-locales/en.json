@@ -12,6 +12,28 @@
   "providers": {
     "addProvider": "Add provider"
   },
+  "providerBundle": {
+    "account": "OAuth account",
+    "advancedSettings": "Advanced settings JSON",
+    "count": "{{count}} provider nodes",
+    "create": "New provider",
+    "credential": "Credential",
+    "credentialMissing": "Credential missing",
+    "credentialReady": "Credential configured",
+    "deleteBlocked": "Remove or detach this provider's remote Share first",
+    "deleted": "Provider deleted",
+    "driverOptions": "Driver options",
+    "edit": "Edit provider",
+    "family": "Provider type",
+    "identity": "Provider",
+    "routeKey": "Route Key",
+    "saved": "Provider saved",
+    "selectAccount": "Select an OAuth account",
+    "surfaceCredential": "Authentication credential",
+    "surfaceEnabled": "Enable API",
+    "surfaces": "API Surfaces",
+    "title": "Providers"
+  },
   "provider": {
     "share": {
       "sectionTitle": "Remote Share",
@@ -101,7 +123,7 @@
     "loadFailed": "Unable to load settings. Refresh the page and try again.",
     "selectFileFailed": "Failed to select directory",
     "authCenter": {
-      "serverDescription": "Manage official OAuth accounts used by the upstream proxy. Usage refresh applies only to the active Provider.",
+      "serverDescription": "Manage official OAuth accounts used by provider nodes and their API Surfaces.",
       "claudeOauthDescription": "Manage Claude official subscription accounts",
       "grokOauthDescription": "Manage Grok/xAI subscription accounts",
       "kiroOauthDescription": "Manage Kiro AWS Builder ID accounts",
@@ -132,10 +154,5 @@
         }
       }
     }
-  },
-  "notifications": {
-    "clearCurrentSuccess": "Provider disabled",
-    "clearCurrentFailedTitle": "Failed to disable Provider",
-    "clearCurrentFailed": "Failed to disable Provider: {{error}}"
   }
 }

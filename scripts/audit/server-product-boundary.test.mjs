@@ -107,9 +107,13 @@ test("Server Provider dialogs cannot re-import the non-Server dispatcher", () =>
     "web-src/src/components/providers/EditProviderDialog.tsx":
       'import { ServerProviderForm } from "@/server/providers/editor/ServerProviderForm";',
     "web-src/src/ServerApp.tsx":
-      'import { useServerProviderActions } from "@/server/providers/useServerProviderActions";',
+      'import { ProviderBundlesPage } from "@/server/providers/bundles/ProviderBundlesPage";',
     "web-src/src/server/providers/useServerProviderActions.ts":
       "export function useServerProviderActions() {}",
+    "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx":
+      'import { ProviderBundleEditor } from "./ProviderBundleEditor";',
+    "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx":
+      'import { providersApi } from "@/lib/api/providers";',
   };
   assert.deepEqual(providerEditorBoundaryViolations(valid), []);
 

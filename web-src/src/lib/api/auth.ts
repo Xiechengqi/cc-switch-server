@@ -28,8 +28,10 @@ export interface DeepSeekAccountStatus {
 export interface ManagedAuthAccount {
   id: string;
   provider: ManagedAuthProvider;
+  authIdentityGeneration: number;
   login: string;
   email?: string | null;
+  subscriptionLevel?: string | null;
   avatar_url: string | null;
   authenticated_at: number;
   is_default: boolean;
@@ -72,9 +74,7 @@ export interface ManagedAuthSubscriptionExpiry {
 }
 
 export type CodexOAuthAccountSelectionStatus =
-  | "unconfigured"
-  | "ready"
-  | "needs_selection";
+  "unconfigured" | "ready" | "needs_selection";
 
 export interface CodexOAuthAccountSelection {
   status: CodexOAuthAccountSelectionStatus;
@@ -343,11 +343,12 @@ export async function authCancelLogin(
 }
 
 export async function authListAccounts(
-  authProvider: ManagedAuthProvider,
+  authProvider?: ManagedAuthProvider,
 ): Promise<ManagedAuthAccount[]> {
-  return invokeCommand<ManagedAuthAccount[]>("auth_list_accounts", {
-    authProvider,
-  });
+  return invokeCommand<ManagedAuthAccount[]>(
+    "auth_list_accounts",
+    authProvider ? { authProvider } : undefined,
+  );
 }
 
 export async function authGetStatus(
@@ -471,14 +472,12 @@ export async function importKiroApiKey(
 }
 
 export async function deepseekAccountAdd(params: {
-  email?: string | null;
-  mobile?: string | null;
-  password: string;
+  identifier?: string | null;
+  accessToken: string;
 }): Promise<DeepSeekAccount> {
   return invokeCommand<DeepSeekAccount>("deepseek_account_add", {
-    email: params.email || null,
-    mobile: params.mobile || null,
-    password: params.password,
+    identifier: params.identifier || null,
+    accessToken: params.accessToken,
   });
 }
 

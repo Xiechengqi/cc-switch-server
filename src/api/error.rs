@@ -281,16 +281,9 @@ pub(crate) fn map_codex_active_account_selection_error(
 ) -> ApiError {
     let code = error.code();
     let message = error.to_string();
-    match error {
-        crate::state::CodexActiveAccountSelectionError::AccountNotFound(_) => {
-            let mut api_error = ApiError::not_found(message);
-            api_error.code = Some(code);
-            api_error
-        }
-        crate::state::CodexActiveAccountSelectionError::ShareConflict { .. } => {
-            ApiError::conflict_code(code, message)
-        }
-    }
+    let mut api_error = ApiError::not_found(message);
+    api_error.code = Some(code);
+    api_error
 }
 
 #[cfg(test)]

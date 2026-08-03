@@ -21,6 +21,7 @@
     "notInstalled": "未インストール",
     "success": "成功",
     "error": "エラー",
+    "authStatusLoadFailed": "認証状態を読み込めませんでした。",
     "unknown": "不明",
     "enterValidValue": "有効な値を入力してください",
     "clear": "クリア",
@@ -128,15 +129,15 @@
     },
     "share": {
       "ownerNotConfigured": "先に Client Owner を設定してください",
-  "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
-  "reuseTitle": "同じアカウントまたは API キーの共有が見つかりました",
-  "reuseDescription": "このアプリを既存 URL に追加するか、新しい個別 URL を作成できます。",
-  "reuseTarget": "既存の共有",
-  "reuseCheckbox": "既存の Share URL とリモート設定を再利用する",
-  "reuseSuccess": "既存の共有 URL を再利用しました",
-  "reuseError": "共有 URL の再利用に失敗しました: {{error}}",
-  "removeBindingSuccess": "このアプリのリモート共有を停止しました",
-  "removeBindingError": "リモート共有の停止に失敗しました: {{error}}",
+      "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
+      "reuseTitle": "同じアカウントまたは API キーの共有が見つかりました",
+      "reuseDescription": "このアプリを既存 URL に追加するか、新しい個別 URL を作成できます。",
+      "reuseTarget": "既存の共有",
+      "reuseCheckbox": "既存の Share URL とリモート設定を再利用する",
+      "reuseSuccess": "既存の共有 URL を再利用しました",
+      "reuseError": "共有 URL の再利用に失敗しました: {{error}}",
+      "removeBindingSuccess": "このアプリのリモート共有を停止しました",
+      "removeBindingError": "リモート共有の停止に失敗しました: {{error}}",
       "deleteShort": "Share を削除",
       "deleteConfirmTitle": "Share を削除",
       "deleteConfirmMessage": "削除すると Share ページから取り除かれ、元に戻せません。",
@@ -384,6 +385,8 @@
       "title": "OAuth 認証センター",
       "description": "Claude Code で他のサブスクリプションをご利用いただけます。コンプライアンスリスクにご注意ください。",
       "beta": "Beta",
+      "capabilityLoading": "アカウント機能を読み込んでいます...",
+      "capabilityLoadFailed": "アカウント機能を読み込めません。認証操作を一時停止しました。",
       "quotaRefreshIntervalTitle": "使用量の更新間隔",
       "quotaRefreshIntervalDescription": "OAuth アカウントの 5h / 7day 使用量バーを自動更新する頻度を制御します。バックグラウンドでポーリングするのは現在有効なプロバイダーのみです。",
       "quotaRefreshIntervalMinutes": "分",
@@ -391,6 +394,8 @@
       "quotaRefreshIntervalSaved": "使用量の更新間隔を保存しました",
       "copilotDescription": "GitHub Copilot アカウントを管理します",
       "codexOauthDescription": "ChatGPT アカウントを管理します",
+      "agyOauthTitle": "Agy OAuth",
+      "agyOauthDescription": "Agy サブスクリプションアカウントを管理します",
       "subscriptionExpiry": {
         "title": "サブスクリプション有効期限日",
         "notSet": "未設定",
@@ -477,7 +482,7 @@
       },
       "proxy": {
         "title": "API ルーティング",
-        "description": "Server API のルーティング状態と現在の Provider を表示",
+        "description": "Server API のルーティング状態とルーティング可能な Bundle Surface を表示",
         "running": "実行中",
         "stopped": "停止中"
       },
@@ -1308,6 +1313,7 @@
     "activeAccountBadge": "使用中: {{login}}",
     "selectionRequiredBadge": "選択が必要",
     "activeProxyAccount": "プロキシで使用するアカウント",
+    "providerAccount": "Provider に紐づけるアカウント",
     "selectionRequired": "プロキシで使用する ChatGPT アカウントを選択してください。",
     "selectAccount": "アカウントを選択",
     "selectAccountPlaceholder": "ChatGPT アカウントを選択",
@@ -2431,8 +2437,7 @@
     "panel": {
       "serviceAddress": "サービスアドレス",
       "addressCopied": "アドレスをコピーしました",
-      "currentProvider": "現在のプロバイダー:",
-      "waitingFirstRequest": "現在のプロバイダー: 最初のリクエスト待ち...",
+      "routableSurfaces": "ルーティング可能な Surface",
       "stoppedTitle": "ルーティングサービス停止中",
       "stoppedDescription": "上のトグルでサービスを開始できます",
       "openSettings": "ルーティングサービスを設定",
@@ -3152,10 +3157,12 @@
   },
   "deepseekAccount": {
     "authStatus": "DeepSeek アカウント",
-    "identifier": "メールアドレスまたは電話番号",
-    "identifierPlaceholder": "メールアドレスまたは電話番号を入力",
-    "password": "パスワード",
-    "addAccount": "アカウントを追加",
+    "identifier": "アカウントラベル（任意）",
+    "identifierPlaceholder": "メール、電話番号、または任意のラベル",
+    "accessToken": "Access token",
+    "accessTokenPlaceholder": "DeepSeek access token を貼り付け",
+    "importAccount": "アカウントをインポート",
+    "importAnotherAccount": "別のアカウントをインポート",
     "loginRequired": "先に DeepSeek アカウントを追加してください",
     "selectAccountRequired": "DeepSeek Account を DeepSeek アカウントに関連付けてください"
   },
@@ -3296,7 +3303,12 @@
       "notes": "メモ"
     },
     "account": {
-      "title": "認証アカウント"
+      "title": "認証アカウント",
+      "loading": "管理アカウントを読み込んでいます。",
+      "loadFailed": "管理アカウントを読み込めませんでした。再試行してから保存してください。",
+      "selectedUnavailable": "選択した管理アカウントは利用できなくなりました。",
+      "identityChanged": "このアカウントの認証 ID が変更されています。この Provider を保存する前に明示的に再紐付けしてください。",
+      "rebindIdentity": "認証 ID を再紐付け"
     },
     "aws": {
       "title": "AWS 認証情報"
@@ -3386,6 +3398,8 @@
     "extraUsage": "超過使用量",
     "expiredHint": "{{tool}}コマンドを実行してログインを更新してください",
     "queryFailed": "クエリに失敗しました",
+    "credentialParseFailed": "認証情報を解析できませんでした",
+    "retryAfter": "{{time}}後に再試行できます",
     "refresh": "更新"
   },
   "terminal": {

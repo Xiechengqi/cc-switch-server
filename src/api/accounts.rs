@@ -47,6 +47,7 @@ pub(in crate::api) async fn upsert_account(
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
     verify_and_mark_managed_account_input(&state, &mut input, false).await?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             let manager = manager_for(input.provider_type);
@@ -56,6 +57,8 @@ pub(in crate::api) async fn upsert_account(
         })
         .await
         .map_err(map_account_write_error)??;
+    drop(managed_auth_operation);
+    state.schedule_gemini_v1internal_project_enrichment(account.provider_type, &account.id);
     Ok(Json(UpsertAccountResponse {
         ok: true,
         account: account.into(),
@@ -87,6 +90,7 @@ pub(in crate::api) async fn import_claude_credentials(
 ) -> Result<Json<ImportClaudeCredentialsResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let upsert = upsert_input_from_claude_credentials(input.credentials)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             manager_for(ProviderType::ClaudeOAuth)
@@ -95,6 +99,7 @@ pub(in crate::api) async fn import_claude_credentials(
         })
         .await
         .map_err(map_account_write_error)??;
+    drop(managed_auth_operation);
     Ok(Json(ImportClaudeCredentialsResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -108,6 +113,7 @@ pub(in crate::api) async fn import_grok_auth_json(
 ) -> Result<Json<ImportGrokAuthJsonResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let upsert = upsert_input_from_grok_auth_json(&state, input.auth_json).await?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             manager_for(ProviderType::GrokOAuth)
@@ -116,6 +122,7 @@ pub(in crate::api) async fn import_grok_auth_json(
         })
         .await
         .map_err(map_account_write_error)??;
+    drop(managed_auth_operation);
     Ok(Json(ImportGrokAuthJsonResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -176,6 +183,7 @@ async fn import_kiro_upsert(
     upsert: UpsertAccountInput,
     source: Option<String>,
 ) -> Result<Json<ImportKiroCredentialsResponse>, ApiError> {
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             manager_for(ProviderType::KiroOAuth)
@@ -184,6 +192,7 @@ async fn import_kiro_upsert(
         })
         .await
         .map_err(map_account_write_error)??;
+    drop(managed_auth_operation);
     Ok(Json(ImportKiroCredentialsResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -229,6 +238,7 @@ pub(in crate::api) async fn import_cursor_local_auth(
         }
     };
     let upsert = upsert_input_from_cursor_local_import(import, profile_raw, now_ms() as i64);
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
             manager_for(ProviderType::CursorOAuth)
@@ -237,6 +247,7 @@ pub(in crate::api) async fn import_cursor_local_auth(
         })
         .await
         .map_err(map_account_write_error)??;
+    drop(managed_auth_operation);
     Ok(Json(ImportCursorLocalAuthResponse {
         ok: true,
         account: AccountLoginAccountSummary::from_account(&account),
@@ -267,6 +278,7 @@ pub(in crate::api) async fn start_account_login(
             .or_else(|| Some(default_account_login_redirect_uri(&state))),
     };
     let principal_id = principal.oauth_binding_id();
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let login = state
         .mutate_oauth_logins(|store| {
             store.start_for_principal(
@@ -278,6 +290,7 @@ pub(in crate::api) async fn start_account_login(
         })
         .await
         .map_err(oauth_login_api_error)?;
+    drop(managed_auth_operation);
     Ok(Json(StartAccountLoginResponse { ok: true, login }))
 }
 
@@ -288,6 +301,7 @@ pub(in crate::api) async fn cancel_account_login(
 ) -> Result<Json<CancelAccountLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let principal_id = principal.oauth_binding_id();
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let login = state
         .mutate_oauth_logins(|store| match input.expected_provider_type {
             Some(expected_provider_type) => store.cancel_for_principal_with_expected_provider(
@@ -306,6 +320,7 @@ pub(in crate::api) async fn cancel_account_login(
         })
         .await
         .map_err(oauth_login_api_error)?;
+    drop(managed_auth_operation);
     Ok(Json(CancelAccountLoginResponse { ok: true, login }))
 }
 
@@ -321,8 +336,10 @@ pub(in crate::api) async fn account_login_callback(
     } = query;
     if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
         let message = oauth_callback_public_error(error, error_description);
+        cancel_oauth_callback_session(&state, oauth_state.as_deref(), None).await;
         return Err(ApiError::bad_request(message));
     }
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let finish = state
         .mutate_oauth_logins(|store| {
             let oauth_state = oauth_state
@@ -336,6 +353,7 @@ pub(in crate::api) async fn account_login_callback(
         })
         .await
         .map_err(oauth_login_api_error)?;
+    drop(managed_auth_operation);
     Ok(Json(FinishAccountLoginResponse {
         ok: true,
         login: redact_oauth_login_finish(finish),
@@ -371,8 +389,11 @@ async fn cli_oauth_callback(
     } = query;
     if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
         let message = oauth_callback_public_error(error, error_description);
+        cancel_oauth_callback_session(&state, oauth_state.as_deref(), Some(expected_provider_type))
+            .await;
         return Ok(Html(oauth_callback_html(label, false, &message)));
     }
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let finish_result = state
         .mutate_oauth_logins(|store| {
             let oauth_state = oauth_state
@@ -391,6 +412,7 @@ async fn cli_oauth_callback(
             )
         })
         .await;
+    drop(managed_auth_operation);
     let mut finish = match finish_result {
         Ok(finish) => finish,
         Err(OAuthLoginError::ProviderMismatch) => {
@@ -413,12 +435,38 @@ async fn cli_oauth_callback(
             &format!("{label} OAuth login was already completed for {account}"),
         )));
     }
-    let account = execute_account_login_token_exchange(&state, &mut finish).await?;
+    let account = execute_account_login_token_exchange(&state, &mut finish, None).await?;
     Ok(Html(oauth_callback_html(
         label,
         true,
         &format!("{label} OAuth login completed for {}", account.id),
     )))
+}
+
+async fn cancel_oauth_callback_session(
+    state: &ServerState,
+    oauth_state: Option<&str>,
+    expected_provider_type: Option<ProviderType>,
+) {
+    let Some(oauth_state) = oauth_state.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancellation = state
+        .mutate_oauth_logins(|store| match expected_provider_type {
+            Some(expected_provider_type) => store
+                .cancel_from_oauth_callback_with_expected_provider(
+                    oauth_state,
+                    expected_provider_type,
+                    now_ms() as i64,
+                ),
+            None => store.cancel_from_oauth_callback(oauth_state, now_ms() as i64),
+        })
+        .await;
+    drop(managed_auth_operation);
+    if let Err(error) = cancellation {
+        tracing::debug!(error = %error, "oauth error callback did not match a cancellable login session");
+    }
 }
 
 fn oauth_callback_public_error(error: String, description: Option<String>) -> String {
@@ -732,10 +780,12 @@ async fn require_device_flow_owner(
     now_ms: i64,
     provider_label: &str,
 ) -> Result<(), ApiError> {
-    if state
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let owned = state
         .device_flow_is_owned_by(provider_type, device_code, principal_id, now_ms)
-        .await
-    {
+        .await;
+    drop(managed_auth_operation);
+    if owned {
         Ok(())
     } else {
         Err(ApiError::unauthorized(format!(
@@ -772,6 +822,7 @@ pub(in crate::api) async fn finish_account_login(
 ) -> Result<Json<FinishAccountLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let principal_id = principal.oauth_binding_id();
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let provider_type = state
         .mutate_oauth_logins(|store| {
             store.provider_type_for_principal(
@@ -783,9 +834,11 @@ pub(in crate::api) async fn finish_account_login(
         })
         .await
         .map_err(oauth_login_api_error)?;
+    drop(managed_auth_operation);
     if provider_type == ProviderType::CodexOAuth {
         crate::api::invoke::handlers::require_secure_manual_cli_origin(&state, &headers).await?;
     }
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let mut finish = state
         .mutate_oauth_logins(|store| match input.expected_provider_type {
             Some(expected_provider_type) => store.finish_for_principal_with_expected_provider(
@@ -810,6 +863,7 @@ pub(in crate::api) async fn finish_account_login(
         })
         .await
         .map_err(oauth_login_api_error)?;
+    drop(managed_auth_operation);
     let account = if input.execute_token_exchange.unwrap_or(false) {
         if finish.status == OAuthLoginStatus::TokenExchanged {
             let account_id = finish
@@ -822,7 +876,10 @@ pub(in crate::api) async fn finish_account_login(
                 .ok_or_else(|| ApiError::not_found("completed oauth account not found"))?;
             Some(AccountLoginAccountSummary::from_account(&account))
         } else {
-            Some(execute_account_login_token_exchange(&state, &mut finish).await?)
+            Some(
+                execute_account_login_token_exchange(&state, &mut finish, Some(&principal_id))
+                    .await?,
+            )
         }
     } else {
         None
@@ -897,6 +954,7 @@ pub(in crate::api) async fn start_copilot_device_login(
     .await
     .map_err(map_copilot_device_error)?;
     let now = now_ms() as i64;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     state
         .bind_device_flow_principal(
             ProviderType::GitHubCopilot,
@@ -906,6 +964,7 @@ pub(in crate::api) async fn start_copilot_device_login(
             now,
         )
         .await;
+    drop(managed_auth_operation);
     Ok(Json(StartCopilotDeviceLoginResponse { ok: true, device }))
 }
 
@@ -941,14 +1000,17 @@ pub(in crate::api) async fn poll_copilot_device_login(
                 error.status,
                 StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
             ) {
+                let managed_auth_operation = state.lock_managed_auth_operations().await;
                 state
-                    .remove_device_flow_principal(
+                    .remove_device_flow_for_principal_under_managed_auth_guard(
+                        &managed_auth_operation,
                         ProviderType::GitHubCopilot,
                         &input.device_code,
                         &principal_id,
                         now,
                     )
                     .await;
+                drop(managed_auth_operation);
             }
             return Err(map_copilot_device_error(error));
         }
@@ -962,26 +1024,17 @@ pub(in crate::api) async fn poll_copilot_device_login(
             account: None,
         }));
     }
-    state
-        .remove_device_flow_principal(
-            ProviderType::GitHubCopilot,
-            &input.device_code,
-            &principal_id,
-            now,
-        )
-        .await;
     let account_input = result
         .account_input
         .ok_or_else(|| ApiError::bad_gateway("copilot device flow completed without account"))?;
-    let provider_type = account_input.provider_type;
-    let account = state
-        .try_mutate_accounts_immediate(|store| {
-            manager_for(provider_type)
-                .finish_login(store, account_input)
-                .map_err(ApiError::bad_request)
-        })
-        .await
-        .map_err(map_account_write_error)??;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::GitHubCopilot,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
     Ok(Json(PollCopilotDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1014,6 +1067,7 @@ pub(in crate::api) async fn start_kiro_device_login(
         )
         .await
         .map_err(map_kiro_device_error)?;
+        let managed_auth_operation = state.lock_managed_auth_operations().await;
         state
             .insert_kiro_social_device_flow(device.device_code.clone(), flow, now)
             .await;
@@ -1026,6 +1080,7 @@ pub(in crate::api) async fn start_kiro_device_login(
                 now,
             )
             .await;
+        drop(managed_auth_operation);
         return Ok(Json(StartKiroDeviceLoginResponse { ok: true, device }));
     }
     let (device, flow) = crate::clients::oauth::kiro_device::start_device_flow(
@@ -1037,6 +1092,7 @@ pub(in crate::api) async fn start_kiro_device_login(
     )
     .await
     .map_err(map_kiro_device_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     state
         .insert_kiro_device_flow(device.device_code.clone(), flow, now)
         .await;
@@ -1049,6 +1105,7 @@ pub(in crate::api) async fn start_kiro_device_login(
             now,
         )
         .await;
+    drop(managed_auth_operation);
     Ok(Json(StartKiroDeviceLoginResponse { ok: true, device }))
 }
 
@@ -1070,37 +1127,30 @@ pub(in crate::api) async fn poll_kiro_device_login(
     )
     .await?;
     let http_client = state.http_client().await;
-    let (result, social) =
-        if let Some(flow) = state.get_kiro_device_flow(&input.device_code, now).await {
-            (
-                crate::clients::oauth::kiro_device::poll_device_flow(
-                    &http_client,
-                    &input.device_code,
-                    flow,
-                    now,
-                )
-                .await,
-                false,
-            )
-        } else if let Some(flow) = state
-            .get_kiro_social_device_flow(&input.device_code, now)
-            .await
-        {
-            (
-                crate::clients::oauth::kiro_device::poll_social_device_flow(
-                    &http_client,
-                    &input.device_code,
-                    flow,
-                    now,
-                )
-                .await,
-                true,
-            )
-        } else {
-            return Err(ApiError::unauthorized(
-                "kiro device flow is expired or unknown",
-            ));
-        };
+    let result = if let Some(flow) = state.get_kiro_device_flow(&input.device_code, now).await {
+        crate::clients::oauth::kiro_device::poll_device_flow(
+            &http_client,
+            &input.device_code,
+            flow,
+            now,
+        )
+        .await
+    } else if let Some(flow) = state
+        .get_kiro_social_device_flow(&input.device_code, now)
+        .await
+    {
+        crate::clients::oauth::kiro_device::poll_social_device_flow(
+            &http_client,
+            &input.device_code,
+            flow,
+            now,
+        )
+        .await
+    } else {
+        return Err(ApiError::unauthorized(
+            "kiro device flow is expired or unknown",
+        ));
+    };
     let result = match result {
         Ok(result) => result,
         Err(error) => {
@@ -1108,21 +1158,17 @@ pub(in crate::api) async fn poll_kiro_device_login(
                 error.status,
                 StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
             ) {
+                let managed_auth_operation = state.lock_managed_auth_operations().await;
                 state
-                    .remove_device_flow_principal(
+                    .remove_device_flow_for_principal_under_managed_auth_guard(
+                        &managed_auth_operation,
                         ProviderType::KiroOAuth,
                         &input.device_code,
                         &principal_id,
                         now,
                     )
                     .await;
-                if social {
-                    state
-                        .remove_kiro_social_device_flow(&input.device_code)
-                        .await;
-                } else {
-                    state.remove_kiro_device_flow(&input.device_code).await;
-                }
+                drop(managed_auth_operation);
             }
             return Err(map_kiro_device_error(error));
         }
@@ -1136,33 +1182,17 @@ pub(in crate::api) async fn poll_kiro_device_login(
             account: None,
         }));
     }
-    if social {
-        state
-            .remove_kiro_social_device_flow(&input.device_code)
-            .await;
-    } else {
-        state.remove_kiro_device_flow(&input.device_code).await;
-    }
-    state
-        .remove_device_flow_principal(
-            ProviderType::KiroOAuth,
-            &input.device_code,
-            &principal_id,
-            now,
-        )
-        .await;
     let account_input = result
         .account_input
         .ok_or_else(|| ApiError::bad_gateway("kiro device flow completed without account"))?;
-    let provider_type = account_input.provider_type;
-    let account = state
-        .try_mutate_accounts_immediate(|store| {
-            manager_for(provider_type)
-                .finish_login(store, account_input)
-                .map_err(ApiError::bad_request)
-        })
-        .await
-        .map_err(map_account_write_error)??;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::KiroOAuth,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
     Ok(Json(PollKiroDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1183,6 +1213,7 @@ pub(in crate::api) async fn start_codex_device_login(
     let (device, flow) = crate::clients::oauth::codex_device::start_device_flow(&http_client, now)
         .await
         .map_err(map_codex_device_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     state
         .insert_codex_device_flow(device.device_code.clone(), flow, now)
         .await;
@@ -1195,6 +1226,7 @@ pub(in crate::api) async fn start_codex_device_login(
             now,
         )
         .await;
+    drop(managed_auth_operation);
     Ok(Json(StartCodexDeviceLoginResponse { ok: true, device }))
 }
 
@@ -1237,15 +1269,19 @@ pub(in crate::api) async fn poll_codex_device_login(
                         {
                             Ok(()) => {}
                             Err(error) => {
+                                let managed_auth_operation =
+                                    state.lock_managed_auth_operations().await;
                                 state.fail_codex_device_poll(&input.device_code, true).await;
                                 state
-                                    .remove_device_flow_principal(
+                                    .remove_device_flow_for_principal_under_managed_auth_guard(
+                                        &managed_auth_operation,
                                         ProviderType::CodexOAuth,
                                         &input.device_code,
                                         &principal_id,
                                         now,
                                     )
                                     .await;
+                                drop(managed_auth_operation);
                                 return Err(error);
                             }
                         }
@@ -1265,17 +1301,22 @@ pub(in crate::api) async fn poll_codex_device_login(
                         error.status,
                         StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
                     );
-                    state
-                        .fail_codex_device_poll(&input.device_code, terminal)
-                        .await;
                     if terminal {
+                        let managed_auth_operation = state.lock_managed_auth_operations().await;
+                        state.fail_codex_device_poll(&input.device_code, true).await;
                         state
-                            .remove_device_flow_principal(
+                            .remove_device_flow_for_principal_under_managed_auth_guard(
+                                &managed_auth_operation,
                                 ProviderType::CodexOAuth,
                                 &input.device_code,
                                 &principal_id,
                                 now,
                             )
+                            .await;
+                        drop(managed_auth_operation);
+                    } else {
+                        state
+                            .fail_codex_device_poll(&input.device_code, false)
                             .await;
                     }
                     return Err(map_codex_device_error(error));
@@ -1302,23 +1343,18 @@ pub(in crate::api) async fn poll_codex_device_login(
             account: None,
         }));
     }
-    let mut account_input = result
+    let account_input = result
         .account_input
         .clone()
         .ok_or_else(|| ApiError::bad_gateway("codex device flow completed without account"))?;
-    let verified_subject = verified_codex_subject(&account_input);
-    let provider_type = account_input.provider_type;
-    let account = state
-        .try_mutate_accounts_immediate(|store| {
-            if let Some(subject) = verified_subject.as_deref() {
-                reuse_existing_codex_subject_account(store, &mut account_input, subject);
-            }
-            manager_for(provider_type)
-                .finish_login(store, account_input)
-                .map_err(ApiError::bad_request)
-        })
-        .await
-        .map_err(map_account_write_error)??;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::CodexOAuth,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
     Ok(Json(PollCodexDeviceLoginResponse {
         ok: true,
         pending: false,
@@ -1335,19 +1371,17 @@ pub(in crate::api) async fn cancel_codex_device_login(
 ) -> Result<Json<CancelCodexDeviceLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let now = now_ms() as i64;
-    let owned = state
-        .remove_device_flow_principal(
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancelled = state
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
             ProviderType::CodexOAuth,
             &input.device_code,
             &principal.oauth_binding_id(),
             now,
         )
         .await;
-    let cancelled = if owned {
-        state.cancel_codex_device_flow(&input.device_code).await
-    } else {
-        false
-    };
+    drop(managed_auth_operation);
     Ok(Json(CancelCodexDeviceLoginResponse {
         ok: true,
         cancelled,
@@ -1365,6 +1399,7 @@ pub(in crate::api) async fn start_grok_device_login(
     let (device, flow) = crate::clients::oauth::grok_device::start_device_flow(&http_client, now)
         .await
         .map_err(map_grok_device_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     state
         .insert_grok_device_flow(device.device_code.clone(), flow, now)
         .await;
@@ -1377,6 +1412,7 @@ pub(in crate::api) async fn start_grok_device_login(
             now,
         )
         .await;
+    drop(managed_auth_operation);
     Ok(Json(StartGrokDeviceLoginResponse { ok: true, device }))
 }
 
@@ -1430,17 +1466,24 @@ pub(in crate::api) async fn poll_grok_device_login(
                         error.status,
                         StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
                     );
-                    state
-                        .fail_grok_device_poll(&input.device_code, terminal, completed_at)
-                        .await;
                     if terminal {
+                        let managed_auth_operation = state.lock_managed_auth_operations().await;
                         state
-                            .remove_device_flow_principal(
+                            .fail_grok_device_poll(&input.device_code, true, completed_at)
+                            .await;
+                        state
+                            .remove_device_flow_for_principal_under_managed_auth_guard(
+                                &managed_auth_operation,
                                 ProviderType::GrokOAuth,
                                 &input.device_code,
                                 &principal_id,
                                 completed_at,
                             )
+                            .await;
+                        drop(managed_auth_operation);
+                    } else {
+                        state
+                            .fail_grok_device_poll(&input.device_code, false, completed_at)
                             .await;
                     }
                     return Err(map_grok_device_error(error));
@@ -1502,24 +1545,66 @@ async fn persist_completed_grok_device_login(
     principal_id: &str,
     account_input: UpsertAccountInput,
 ) -> Result<Account, ApiError> {
-    let provider_type = account_input.provider_type;
+    persist_completed_device_login(
+        state,
+        ProviderType::GrokOAuth,
+        device_code,
+        principal_id,
+        account_input,
+    )
+    .await
+}
+
+async fn persist_completed_device_login(
+    state: &ServerState,
+    provider_type: ProviderType,
+    device_code: &str,
+    principal_id: &str,
+    mut account_input: UpsertAccountInput,
+) -> Result<Account, ApiError> {
+    if account_input.provider_type != provider_type {
+        return Err(ApiError::bad_gateway(format!(
+            "{} device flow returned a {} account",
+            provider_type.as_str(),
+            account_input.provider_type.as_str()
+        )));
+    }
+    let verified_codex_subject = (provider_type == ProviderType::CodexOAuth)
+        .then(|| verified_codex_subject(&account_input))
+        .flatten();
+    let completed_at = now_ms() as i64;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    if !state
+        .device_flow_is_owned_by(provider_type, device_code, principal_id, completed_at)
+        .await
+    {
+        return Err(ApiError::unauthorized(format!(
+            "{} device flow was cancelled before account import",
+            provider_type.as_str()
+        )));
+    }
     let account = state
         .try_mutate_accounts_immediate(|store| {
+            if let Some(subject) = verified_codex_subject.as_deref() {
+                reuse_existing_codex_subject_account(store, &mut account_input, subject);
+            }
             manager_for(provider_type)
                 .finish_login(store, account_input)
                 .map_err(ApiError::bad_request)
         })
         .await
         .map_err(map_account_write_error)??;
-    state.remove_grok_device_flow(device_code).await;
     state
-        .remove_device_flow_principal(
-            ProviderType::GrokOAuth,
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
+            provider_type,
             device_code,
             principal_id,
-            now_ms() as i64,
+            completed_at,
         )
         .await;
+    drop(managed_auth_operation);
+    state.schedule_gemini_v1internal_project_enrichment(account.provider_type, &account.id);
     Ok(account)
 }
 
@@ -1530,19 +1615,17 @@ pub(in crate::api) async fn cancel_grok_device_login(
 ) -> Result<Json<CancelGrokDeviceLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let now = now_ms() as i64;
-    let owned = state
-        .remove_device_flow_principal(
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancelled = state
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
             ProviderType::GrokOAuth,
             &input.device_code,
             &principal.oauth_binding_id(),
             now,
         )
         .await;
-    let cancelled = if owned {
-        state.cancel_grok_device_flow(&input.device_code).await
-    } else {
-        false
-    };
+    drop(managed_auth_operation);
     Ok(Json(CancelGrokDeviceLoginResponse {
         ok: true,
         cancelled,
@@ -1552,6 +1635,7 @@ pub(in crate::api) async fn cancel_grok_device_login(
 pub(in crate::api) async fn execute_account_login_token_exchange(
     state: &ServerState,
     finish: &mut OAuthLoginFinish,
+    principal_id: Option<&str>,
 ) -> Result<AccountLoginAccountSummary, ApiError> {
     let request = finish
         .token_request
@@ -1672,6 +1756,18 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         apply_verified_grok_identity(&mut input, verified);
     }
 
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    state
+        .mutate_oauth_logins(|store| {
+            store.ensure_exchange_commit_allowed(
+                &finish.session_id,
+                principal_id,
+                finish.provider_type,
+                now_ms() as i64,
+            )
+        })
+        .await
+        .map_err(oauth_login_api_error)?;
     let account_result = match state
         .try_mutate_accounts_immediate(|store| {
             if let Some(subject) = verified_openai_subject.as_deref() {
@@ -1683,6 +1779,7 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
     {
         Ok(result) => result,
         Err(error) => {
+            drop(managed_auth_operation);
             mark_account_login_exchange_failed(state, &finish.session_id).await;
             return Err(ApiError::internal(error));
         }
@@ -1690,6 +1787,7 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
     let account = match account_result {
         Ok(account) => account,
         Err(error) => {
+            drop(managed_auth_operation);
             mark_account_login_exchange_failed(state, &finish.session_id).await;
             return Err(ApiError::bad_request(error));
         }
@@ -1698,6 +1796,8 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         .mutate_oauth_logins(|store| store.mark_exchanged(&finish.session_id, &account.id))
         .await
         .map_err(oauth_login_api_error)?;
+    drop(managed_auth_operation);
+    state.schedule_gemini_v1internal_project_enrichment(account.provider_type, &account.id);
 
     finish.status = OAuthLoginStatus::TokenExchanged;
     finish.account_id = Some(account.id.clone());
@@ -1898,9 +1998,11 @@ pub(in crate::api) async fn mark_account_login_exchange_failed(
     state: &ServerState,
     session_id: &str,
 ) {
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     state
         .mutate_oauth_logins(|store| store.mark_exchange_failed(session_id))
         .await;
+    drop(managed_auth_operation);
 }
 
 pub(in crate::api) async fn delete_account(
@@ -1908,7 +2010,8 @@ pub(in crate::api) async fn delete_account(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
     let reference_guard = state.lock_reference_mutations().await;
     let preview = account_delete_preview_inner(&state, &id).await?;
     if preview.blocked {
@@ -1948,6 +2051,14 @@ pub(in crate::api) async fn delete_account(
     if deleted {
         if let Some((provider_type, was_default)) = removed_account {
             state
+                .cancel_managed_auth_for_principal_under_operation_guard(
+                    &managed_auth_operation,
+                    provider_type,
+                    &principal.oauth_binding_id(),
+                    now_ms() as i64,
+                )
+                .await;
+            state
                 .refresh_account_subscription_metadata_after_removal(
                     provider_type,
                     &id,
@@ -1957,6 +2068,7 @@ pub(in crate::api) async fn delete_account(
                 .map_err(ApiError::internal)?;
         }
     }
+    drop(managed_auth_operation);
     Ok(Json(DeleteResponse { ok: true, deleted }))
 }
 
@@ -1993,13 +2105,8 @@ async fn account_delete_preview_inner(
         .providers
         .iter()
         .filter(|stored| {
-            stored
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref())
-                == Some(account_id)
+            crate::domain::providers::runtime::managed_account_binding(stored)
+                .is_some_and(|(_, bound_account_id)| bound_account_id == account_id)
         })
         .map(|stored| crate::domain::providers::registry::ProviderKey {
             app: stored.app,
@@ -2028,7 +2135,7 @@ pub(in crate::api) async fn refresh_account(
     if provider_native_refresh_available(existing.provider_type) {
         ensure_managed_account_outbound_allowed(&state, &existing).await?;
         let now = now_ms() as i64;
-        let _refresh_guard = state
+        let mut refresh_guard = state
             .account_refresh_locks
             .try_lock(existing.provider_type, &existing.id)
             .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
@@ -2040,37 +2147,40 @@ pub(in crate::api) async fn refresh_account(
         ensure_managed_account_outbound_allowed(&state, &existing).await?;
         let http_client = state.http_client().await;
         let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-        let update =
-            match execute_native_account_refresh(&http_client, &existing, now, interval_ms).await {
-                Ok(update) => update,
-                Err(error) => {
-                    let updated = state
-                        .commit_native_refresh_failure(&existing, error.message.clone(), error.kind)
+        let update = match state
+            .execute_native_account_refresh_with_recovery(
+                &http_client,
+                &existing,
+                now,
+                interval_ms,
+                &mut refresh_guard,
+            )
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                let updated = state
+                    .commit_native_refresh_failure(
+                        &existing,
+                        error.message.clone(),
+                        error.kind,
+                        error.immediate_relogin,
+                    )
+                    .await
+                    .map_err(map_account_write_error)?;
+                if let Some(updated) = updated {
+                    state
+                        .refresh_account_runtime_metadata_if_changed(&existing, &updated)
                         .await
-                        .map_err(map_account_write_error)?;
-                    if let Some(updated) = updated {
-                        state
-                            .refresh_account_runtime_metadata_if_changed(&existing, &updated)
-                            .await
-                            .map_err(ApiError::internal)?;
-                    }
-                    return Err(account_refresh_api_error(error));
+                        .map_err(ApiError::internal)?;
                 }
-            };
+                return Err(account_refresh_api_error(error));
+            }
+        };
         let account = state
             .commit_native_refresh_success(&existing, update)
             .await
-            .map_err(|error| {
-                if error.is_persistence_degraded() {
-                    tracing::error!(account_id = %id, %error, "manual OAuth refresh persistence degraded");
-                    ApiError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "rotated OAuth credentials are live but durable persistence is degraded",
-                    )
-                } else {
-                    ApiError::internal(error)
-                }
-            })?;
+            .map_err(map_native_refresh_commit_api_error)?;
         state
             .refresh_account_runtime_metadata_if_changed(&existing, &account)
             .await
@@ -2105,6 +2215,23 @@ pub(in crate::api) fn account_refresh_api_error(error: AccountRefreshFailure) ->
         oauth_error_public_message(error.kind),
     )
     .with_retry_after_ms(error.retry_after_ms)
+}
+
+fn map_native_refresh_commit_api_error(error: crate::state::NativeRefreshCommitError) -> ApiError {
+    if error.is_superseded() {
+        return ApiError::conflict_code(
+            "cc_switch_account_credentials_changed",
+            "account credentials changed while OAuth refresh was in progress; retry",
+        );
+    }
+    if error.is_persistence_degraded() {
+        tracing::error!(%error, "OAuth refresh persistence degraded");
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rotated OAuth credentials are live but durable persistence is degraded",
+        );
+    }
+    ApiError::internal(error)
 }
 
 pub(in crate::api) async fn account_refresh_plan(
@@ -2205,7 +2332,7 @@ pub(in crate::api) async fn account_quota(
 
     let force = query.force.unwrap_or(false);
     let mut waited_for_in_flight = false;
-    let _quota_refresh_guard = match state
+    let mut quota_refresh_guard = match state
         .account_refresh_locks
         .try_lock(existing.provider_type, &existing.id)
     {
@@ -2230,6 +2357,20 @@ pub(in crate::api) async fn account_quota(
         .find_account_by_id(&id)
         .await
         .ok_or_else(|| ApiError::not_found("account not found"))?;
+    ensure_quota_refresh_lock_matches_account(existing.provider_type, &active_account)?;
+    let mut native_refresh_attempted = active_account.auth_identity_generation
+        != existing.auth_identity_generation
+        || active_account.token_refresh_generation != existing.token_refresh_generation;
+    if let Some(failure) = quota_refresh_guard.coalesced_quota_failure_for(&active_account) {
+        return Err(ApiError::new(
+            StatusCode::from_u16(failure.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            failure
+                .public_message
+                .as_deref()
+                .unwrap_or_else(|| oauth_error_public_message(failure.kind)),
+        )
+        .with_retry_after_ms(failure.retry_after_ms));
+    }
     ensure_managed_account_outbound_allowed(&state, &active_account).await?;
     if waited_for_in_flight && quota_refresh_satisfied_by_in_flight(&existing, &active_account) {
         return Ok(Json(AccountQuotaResponse {
@@ -2264,52 +2405,101 @@ pub(in crate::api) async fn account_quota(
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     if account_needs_native_refresh(&active_account, now) {
         let http_client = state.http_client().await;
-        let update =
-            match execute_native_account_refresh(&http_client, &active_account, now, interval_ms)
-                .await
-            {
-                Ok(update) => update,
-                Err(error) => {
-                    let updated = state
-                        .commit_native_refresh_failure(
-                            &active_account,
-                            error.message.clone(),
-                            error.kind,
+        let update = match state
+            .execute_native_account_refresh_with_recovery(
+                &http_client,
+                &active_account,
+                now,
+                interval_ms,
+                &mut quota_refresh_guard,
+            )
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                let updated = state
+                    .commit_native_refresh_failure(
+                        &active_account,
+                        error.message.clone(),
+                        error.kind,
+                        error.immediate_relogin,
+                    )
+                    .await
+                    .map_err(map_account_write_error)?;
+                if let Some(updated) = updated {
+                    state
+                        .refresh_account_runtime_metadata_if_changed(
+                            &account_before_refresh,
+                            &updated,
                         )
                         .await
-                        .map_err(map_account_write_error)?;
-                    if let Some(updated) = updated {
-                        state
-                            .refresh_account_runtime_metadata_if_changed(
-                                &account_before_refresh,
-                                &updated,
-                            )
-                            .await
-                            .map_err(ApiError::internal)?;
-                    }
-                    return Err(account_refresh_api_error(error));
+                        .map_err(ApiError::internal)?;
                 }
-            };
-        active_account = state
+                return Err(account_refresh_api_error(error));
+            }
+        };
+        active_account = match state
             .commit_native_refresh_success(&active_account, update)
             .await
-            .map_err(|error| {
-                if error.is_persistence_degraded() {
-                    tracing::error!(account_id = %id, %error, "quota OAuth refresh persistence degraded");
-                    ApiError::new(
+        {
+            Ok(account) => {
+                native_refresh_attempted = true;
+                account
+            }
+            Err(error) => {
+                if error.is_superseded() {
+                    return Err(map_native_refresh_commit_api_error(error));
+                }
+                let persistence_degraded = error.is_persistence_degraded();
+                let (status_code, public_message, retryable) = if persistence_degraded {
+                    (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "rotated OAuth credentials are live but durable persistence is degraded",
+                        "rotated credentials are live but durable persistence is degraded",
+                        true,
                     )
                 } else {
-                    ApiError::internal(error)
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "managed OAuth credential state commit failed",
+                        false,
+                    )
+                };
+                let failure_account = if persistence_degraded {
+                    state
+                        .find_account_by_id(&active_account.id)
+                        .await
+                        .unwrap_or_else(|| active_account.clone())
+                } else {
+                    active_account.clone()
+                };
+                quota_refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                    &failure_account,
+                    AccountRefreshFlightStage::NativeRefresh,
+                    AccountRefreshFlightFailureDetails {
+                        status_code: status_code.as_u16(),
+                        upstream_status: None,
+                        message: error.to_string(),
+                        public_message: Some(public_message.to_string()),
+                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                        retryable,
+                        retry_after_ms: None,
+                        immediate_relogin: false,
+                    },
+                ));
+                if persistence_degraded {
+                    tracing::error!(account_id = %id, %error, "quota OAuth refresh persistence degraded");
+                    return Err(ApiError::new(status_code, public_message));
                 }
-            })?;
+                tracing::error!(account_id = %id, %error, "quota OAuth credential state commit failed");
+                return Err(ApiError::new(status_code, public_message));
+            }
+        };
     }
 
     ensure_managed_account_outbound_allowed(&state, &active_account).await?;
     let http_client = state.http_client().await;
     let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
-    match refresh_account_quota(
+    let mut quota_result = refresh_account_quota(
         &http_client,
         &active_account,
         now,
@@ -2317,17 +2507,69 @@ pub(in crate::api) async fn account_quota(
         interval_ms,
         timeout_ms,
     )
-    .await
+    .await;
+    if !native_refresh_attempted
+        && quota_result
+            .as_ref()
+            .is_err_and(|error| error.upstream_status == Some(StatusCode::UNAUTHORIZED.as_u16()))
     {
+        match state
+            .recover_quota_unauthorized(
+                &http_client,
+                &active_account,
+                now,
+                interval_ms,
+                &mut quota_refresh_guard,
+            )
+            .await
+        {
+            Ok(refreshed) => {
+                active_account = refreshed;
+                ensure_managed_account_outbound_allowed(&state, &active_account).await?;
+                quota_result = refresh_account_quota(
+                    &http_client,
+                    &active_account,
+                    now,
+                    true,
+                    interval_ms,
+                    timeout_ms,
+                )
+                .await;
+            }
+            Err(crate::state::QuotaUnauthorizedRecoveryError::Unavailable) => {}
+            Err(crate::state::QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
+                if let Some(updated) = updated {
+                    state
+                        .refresh_account_runtime_metadata_if_changed(
+                            &account_before_refresh,
+                            &updated,
+                        )
+                        .await
+                        .map_err(ApiError::internal)?;
+                }
+                return Err(account_refresh_api_error(failure));
+            }
+            Err(crate::state::QuotaUnauthorizedRecoveryError::Commit(error)) => {
+                return Err(map_native_refresh_commit_api_error(error));
+            }
+            Err(crate::state::QuotaUnauthorizedRecoveryError::State(error)) => {
+                if state.credential_persistence_degraded() {
+                    return Err(ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "managed account credentials are waiting for durable persistence",
+                    ));
+                }
+                return Err(ApiError::internal(error));
+            }
+        }
+    }
+    match quota_result {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
             let account = state
-                .try_mutate_accounts_immediate(|store| {
-                    store
-                        .mark_refresh_success(&id, update)
-                        .ok_or_else(|| ApiError::not_found("account not found"))
-                })
+                .commit_account_quota_refresh_update(&active_account, update)
                 .await
-                .map_err(map_account_write_error)??;
+                .map_err(map_account_write_error)?
+                .map_err(map_quota_commit_skip)?;
             state
                 .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
                 .await
@@ -2364,34 +2606,58 @@ pub(in crate::api) async fn account_quota(
         }
         Err(error) => {
             let public_error = redact_account_public_diagnostic(&active_account, &error.message);
+            let status = StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
             let next_refresh_at = Some(error.next_refresh_at.unwrap_or_else(|| {
                 now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
             }));
+            quota_refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                &active_account,
+                AccountRefreshFlightStage::QuotaRefresh,
+                AccountRefreshFlightFailureDetails {
+                    status_code: status.as_u16(),
+                    upstream_status: None,
+                    message: error.message.clone(),
+                    public_message: Some(public_error.clone()),
+                    kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                    retryable: error.retryable,
+                    retry_after_ms: None,
+                    immediate_relogin: false,
+                },
+            ));
+            let mut update = error.partial_update.as_deref().cloned().unwrap_or_default();
+            update.quota_next_refresh_at = next_refresh_at;
+            update.last_refresh_error = Some(error.message.clone());
             let updated = state
-                .mutate_accounts_immediate(|store| {
-                    store.mark_refresh_success(
-                        &id,
-                        AccountRefreshUpdate {
-                            quota_next_refresh_at: next_refresh_at,
-                            last_refresh_error: Some(error.message.clone()),
-                            ..Default::default()
-                        },
-                    )
-                })
+                .commit_account_quota_refresh_update(&active_account, update)
                 .await
-                .map_err(map_account_write_error)?;
-            if let Some(updated) = updated {
-                state
-                    .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
-            Err(ApiError::new(
-                StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-                public_error,
-            ))
+                .map_err(map_account_write_error)?
+                .map_err(map_quota_commit_skip)?;
+            state
+                .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
+                .await
+                .map_err(ApiError::internal)?;
+            Err(ApiError::new(status, public_error))
         }
     }
+}
+
+fn ensure_quota_refresh_lock_matches_account(
+    locked_provider_type: ProviderType,
+    account: &Account,
+) -> Result<(), ApiError> {
+    if account.provider_type == locked_provider_type {
+        return Ok(());
+    }
+    tracing::info!(
+        account_id = %account.id,
+        locked_provider_type = %locked_provider_type.as_str(),
+        current_provider_type = %account.provider_type.as_str(),
+        "account provider type changed while quota refresh waited for its lock"
+    );
+    Err(ApiError::conflict_code(
+        "cc_switch_account_credentials_changed",
+        "account provider type changed while quota refresh was waiting; retry the request",
+    ))
 }
 
 async fn ensure_managed_account_outbound_allowed(
@@ -2404,20 +2670,29 @@ async fn ensure_managed_account_outbound_allowed(
             "managed account credentials are waiting for durable persistence",
         ));
     }
-    if account.provider_type != ProviderType::CodexOAuth {
-        return Ok(());
+    if account.provider_type == ProviderType::CodexOAuth {
+        let accounts = state.accounts_snapshot().await;
+        let selection = accounts.codex_oauth_selection();
+        if selection.active_account_id.as_deref() != Some(account.id.as_str()) {
+            let message = match selection.status {
+                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::Unconfigured => {
+                    "Codex OAuth account is not configured".to_string()
+                }
+                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::NeedsSelection => {
+                    "multiple Codex OAuth accounts exist; select the active account before refreshing quota"
+                        .to_string()
+                }
+                crate::domain::accounts::store::CodexOAuthAccountSelectionStatus::Ready => {
+                    format!("Codex OAuth account {} is not active", account.id)
+                }
+            };
+            return Err(ApiError::conflict_code(
+                "cc_switch_codex_inactive_account",
+                message,
+            ));
+        }
     }
-    let accounts = state.accounts_snapshot().await;
-    if accounts
-        .active_codex_oauth_account()
-        .is_some_and(|active| active.id == account.id)
-    {
-        return Ok(());
-    }
-    Err(ApiError::conflict_code(
-        "cc_switch_codex_inactive_account",
-        "Codex OAuth account is not active",
-    ))
+    Ok(())
 }
 
 fn quota_refresh_satisfied_by_in_flight(before: &Account, after: &Account) -> bool {
@@ -2427,7 +2702,23 @@ fn quota_refresh_satisfied_by_in_flight(before: &Account, after: &Account) -> bo
         return false;
     }
     timestamp_updated(before.quota_refreshed_at, after.quota_refreshed_at)
-        || timestamp_updated(before.quota_next_refresh_at, after.quota_next_refresh_at)
+}
+
+fn map_quota_commit_skip(skip: crate::state::AccountQuotaCommitSkip) -> ApiError {
+    match skip {
+        crate::state::AccountQuotaCommitSkip::NotFound => ApiError::not_found("account not found"),
+        crate::state::AccountQuotaCommitSkip::Stale(current) => {
+            tracing::info!(
+                account_id = %current.id,
+                provider_type = %current.provider_type.as_str(),
+                "discarded quota response for superseded account credentials"
+            );
+            ApiError::conflict_code(
+                "cc_switch_account_credentials_changed",
+                "account credentials changed while quota refresh was in progress; retry",
+            )
+        }
+    }
 }
 
 fn timestamp_updated(before: Option<i64>, after: Option<i64>) -> bool {
@@ -2538,6 +2829,7 @@ mod tests {
             kind: crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         });
 
@@ -2616,7 +2908,7 @@ mod tests {
             .unwrap();
         finish.token_request.as_mut().unwrap().url = format!("http://{address}/token");
 
-        let error = execute_account_login_token_exchange(&state, &mut finish)
+        let error = execute_account_login_token_exchange(&state, &mut finish, None)
             .await
             .unwrap_err();
         assert!(error.message.contains("missing id_token"));
@@ -2753,6 +3045,952 @@ mod tests {
         std::fs::remove_file(config_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn cancelled_device_flow_completion_cannot_persist_any_provider_account() {
+        for provider_type in [
+            ProviderType::GitHubCopilot,
+            ProviderType::KiroOAuth,
+            ProviderType::CodexOAuth,
+            ProviderType::GrokOAuth,
+        ] {
+            let state = account_api_test_state(&format!(
+                "cancelled-device-completion-{}",
+                provider_type.as_str()
+            ));
+            let device_code = format!("cancelled-device-{}", provider_type.as_str());
+            let principal_id = "owner@example.com:owner";
+            let account_id = format!("late-account-{}", provider_type.as_str());
+            state
+                .bind_device_flow_principal(
+                    provider_type,
+                    device_code.clone(),
+                    principal_id.to_string(),
+                    i64::MAX,
+                    0,
+                )
+                .await;
+            assert!(
+                state
+                    .remove_device_flow_principal(provider_type, &device_code, principal_id, 1,)
+                    .await
+            );
+
+            let error = persist_completed_device_login(
+                &state,
+                provider_type,
+                &device_code,
+                principal_id,
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": provider_type.as_str(),
+                    "accessToken": "late-access-token",
+                    "refreshToken": "late-refresh-token"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            assert!(state.find_account_by_id(&account_id).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn device_flow_completion_rejects_cross_provider_account_input() {
+        let state = account_api_test_state("device-cross-provider-account");
+        let device_code = "copilot-device-cross-provider";
+        let principal_id = "owner@example.com:owner";
+        state
+            .bind_device_flow_principal(
+                ProviderType::GitHubCopilot,
+                device_code.to_string(),
+                principal_id.to_string(),
+                i64::MAX,
+                0,
+            )
+            .await;
+
+        let error = persist_completed_device_login(
+            &state,
+            ProviderType::GitHubCopilot,
+            device_code,
+            principal_id,
+            serde_json::from_value(json!({
+                "id": "cross-provider-account",
+                "providerType": "kiro_oauth",
+                "accessToken": "cross-provider-access"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(
+            state
+                .device_flow_is_owned_by(ProviderType::GitHubCopilot, device_code, principal_id, 1,)
+                .await
+        );
+        assert!(state
+            .find_account_by_id("cross-provider-account")
+            .await
+            .is_none());
+    }
+
+    async fn assert_quota_waiter_reuses_refresh_failure_once(
+        name: &str,
+        error_description: &'static str,
+        expected_needs_relogin: bool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": error_description
+                        })),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = account_api_test_state(name);
+        let config_dir = state.config_dir.clone();
+        let account_id = format!("quota-waiter-{name}");
+        let refresh_token = format!("quota-waiter-refresh-{name}");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate({
+                let account_id = account_id.clone();
+                move |accounts| {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": account_id,
+                            "providerType": "cursor_oauth",
+                            "accessToken": "quota-waiter-expired-access",
+                            "refreshToken": refresh_token,
+                            "expiresAt": 1,
+                            "raw": {
+                                "testOAuthTokenUrl": token_url,
+                                "currentPeriodUsage": {
+                                    "planUsage": {"limit": 1000, "used": 100}
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        let mut leader_guard = state
+            .account_refresh_locks
+            .lock(account.provider_type, &account.id)
+            .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let waiter_state = state.clone();
+        let waiter_account_id = account_id.clone();
+        let mut waiter = tokio::spawn(async move {
+            account_quota(
+                State(waiter_state),
+                headers,
+                Path(waiter_account_id),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: Some(true),
+                }),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiter)
+                .await
+                .is_err()
+        );
+
+        let http_client = state.http_client().await;
+        let error = state
+            .execute_native_account_refresh_with_recovery(
+                &http_client,
+                &account,
+                now_ms() as i64,
+                state.oauth_quota_refresh_interval_ms().await,
+                &mut leader_guard,
+            )
+            .await
+            .unwrap_err();
+        state
+            .commit_native_refresh_failure(
+                &account,
+                error.message,
+                error.kind,
+                error.immediate_relogin,
+            )
+            .await
+            .unwrap();
+        leader_guard.release();
+
+        let waiter_error = waiter.await.unwrap().unwrap_err();
+        assert_eq!(waiter_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            waiter_error.message,
+            "OAuth credentials were rejected; sign in again"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(account.refresh_consecutive_failures, 1);
+        assert_eq!(account.needs_relogin, expected_needs_relogin);
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_waiter_does_not_commit_shared_refresh_failure_twice() {
+        assert_quota_waiter_reuses_refresh_failure_once(
+            "single-invalid-grant",
+            "refresh token was rejected",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn quota_waiter_propagates_refresh_failure_after_account_needs_relogin() {
+        assert_quota_waiter_reuses_refresh_failure_once(
+            "reused-invalid-grant",
+            "refresh token has already been used",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn quota_waiter_reuses_native_commit_persistence_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let request_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let request_started_for_route = std::sync::Arc::clone(&request_started);
+        let release_response = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_response_for_route = std::sync::Arc::clone(&release_response);
+        let upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let request_started = std::sync::Arc::clone(&request_started_for_route);
+                let release_response = std::sync::Arc::clone(&release_response_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    request_started.notify_waiters();
+                    release_response.notified().await;
+                    Json(json!({
+                        "access_token": "quota-commit-degraded-access",
+                        "refresh_token": "quota-commit-degraded-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "quota-commit-degraded-principal"}
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = account_api_test_state("quota-commit-degraded");
+        let config_dir = state.config_dir.clone();
+        let account_id = "quota-commit-degraded-account";
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "claude_oauth",
+                        "accessToken": "quota-commit-old-access",
+                        "refreshToken": "quota-commit-old-refresh",
+                        "profile": {"accountUUID": "quota-commit-degraded-principal"},
+                        "expiresAt": 1,
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        state.inject_account_refresh_persist_failures(1);
+
+        let quota_request = |state: ServerState| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-cc-switch-web-user-email",
+                HeaderValue::from_static("owner@example.com"),
+            );
+            account_quota(
+                State(state),
+                headers,
+                Path(account_id.to_string()),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: Some(true),
+                }),
+            )
+            .await
+        };
+        let request_started_signal = request_started.notified();
+        tokio::pin!(request_started_signal);
+        let first = tokio::spawn(quota_request(state.clone()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            &mut request_started_signal,
+        )
+        .await
+        .expect("quota refresh did not reach the token endpoint");
+        let mut second = tokio::spawn(quota_request(state.clone()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+        release_response.notify_one();
+
+        let first_error = first.await.unwrap().unwrap_err();
+        let second_error = second.await.unwrap().unwrap_err();
+        assert_eq!(first_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            first_error.message,
+            "rotated credentials are live but durable persistence is degraded"
+        );
+        assert_eq!(second_error.message, first_error.message);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while state.credential_persistence_degraded() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_waiter_reuses_recovered_native_commit_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let request_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let request_started_for_route = std::sync::Arc::clone(&request_started);
+        let release_response = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_response_for_route = std::sync::Arc::clone(&release_response);
+        let upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let request_started = std::sync::Arc::clone(&request_started_for_route);
+                let release_response = std::sync::Arc::clone(&release_response_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    request_started.notify_waiters();
+                    release_response.notified().await;
+                    Json(json!({
+                        "access_token": "quota-commit-state-access",
+                        "refresh_token": "quota-commit-state-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "quota-commit-state-principal"}
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = account_api_test_state("quota-commit-state");
+        let config_dir = state.config_dir.clone();
+        let account_id = "quota-commit-state-account";
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "claude_oauth",
+                        "accessToken": "quota-commit-state-old-access",
+                        "refreshToken": "quota-commit-state-old-refresh",
+                        "profile": {"accountUUID": "quota-commit-state-principal"},
+                        "expiresAt": 1,
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        state.inject_account_refresh_commit_state_failures(1);
+
+        let refresh = |state: ServerState| async move {
+            state
+                .refresh_managed_account_now(ProviderType::ClaudeOAuth, account_id)
+                .await
+        };
+        let request_started_signal = request_started.notified();
+        tokio::pin!(request_started_signal);
+        let first = tokio::spawn(refresh(state.clone()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            &mut request_started_signal,
+        )
+        .await
+        .expect("quota refresh did not reach the token endpoint");
+        let mut second = tokio::spawn(refresh(state.clone()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+        release_response.notify_one();
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let account = state.find_account_by_id(account_id).await.unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("quota-commit-state-access")
+        );
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("quota-commit-state-refresh")
+        );
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gemini_quota_401_refreshes_the_same_account_and_replays_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let load_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quota_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let load_requests_for_route = std::sync::Arc::clone(&load_requests);
+        let quota_requests_for_route = std::sync::Arc::clone(&quota_requests);
+        let upstream = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri, headers: HeaderMap, body: bytes::Bytes| {
+                let token_requests = std::sync::Arc::clone(&token_requests_for_route);
+                let load_requests = std::sync::Arc::clone(&load_requests_for_route);
+                let quota_requests = std::sync::Arc::clone(&quota_requests_for_route);
+                async move {
+                    let authorization = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok());
+                    match uri.path() {
+                        "/token" => {
+                            assert_eq!(
+                                token_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                                0
+                            );
+                            let body = std::str::from_utf8(&body).unwrap();
+                            assert!(body.contains("grant_type=refresh_token"), "{body}");
+                            assert!(body.contains("refresh_token=gemini-old-refresh"), "{body}");
+                            assert!(body.contains("client_id=gemini-test-client"), "{body}");
+                            assert!(body.contains("client_secret=gemini-test-secret"), "{body}");
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "access_token": "gemini-new-access",
+                                    "refresh_token": "gemini-new-refresh",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600
+                                })),
+                            )
+                        }
+                        "/v1internal:loadCodeAssist" => {
+                            let request = load_requests
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                + 1;
+                            match request {
+                                1 => {
+                                    assert_eq!(authorization, Some("Bearer gemini-old-access"));
+                                    (
+                                        StatusCode::UNAUTHORIZED,
+                                        Json(json!({"error": {"message": "expired"}})),
+                                    )
+                                }
+                                2 => {
+                                    assert_eq!(authorization, Some("Bearer gemini-new-access"));
+                                    (
+                                        StatusCode::OK,
+                                        Json(json!({
+                                            "cloudaicompanionProject": {"id": "gemini-test-project"},
+                                            "currentTier": {"name": "PRO"}
+                                        })),
+                                    )
+                                }
+                                _ => panic!("unexpected loadCodeAssist replay {request}"),
+                            }
+                        }
+                        "/v1internal:retrieveUserQuota" => {
+                            assert_eq!(
+                                quota_requests
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                                0
+                            );
+                            assert_eq!(authorization, Some("Bearer gemini-new-access"));
+                            let body: Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(body["project"], "gemini-test-project");
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "buckets": [{
+                                        "modelId": "gemini-2.5-pro",
+                                        "remainingFraction": 0.75
+                                    }]
+                                })),
+                            )
+                        }
+                        path => panic!("unexpected Gemini quota test request: {path}"),
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = account_api_test_state("gemini-quota-401-replay");
+        let config_dir = state.config_dir.clone();
+        let account_id = "gemini-quota-401-account";
+        let token_url = format!("http://{address}/token");
+        let code_assist_base_url = format!("http://{address}");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "gemini_cli",
+                        "accessToken": "gemini-old-access",
+                        "refreshToken": "gemini-old-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX,
+                        "raw": {
+                            "clientId": "gemini-test-client",
+                            "clientSecret": "gemini-test-secret",
+                            "testOAuthTokenUrl": token_url,
+                            "testGeminiCodeAssistBaseUrl": code_assist_base_url
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let Json(response) = account_quota(
+            State(state.clone()),
+            headers,
+            Path(account_id.to_string()),
+            Query(AccountQuotaQuery {
+                refresh: Some(true),
+                force: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.ok);
+        assert!(response.refreshed);
+        let quota = response.quota.unwrap();
+        assert!(quota.success);
+        assert_eq!(quota.tiers.len(), 1);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(quota_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let live = state.find_account_by_id(account_id).await.unwrap();
+        assert_eq!(live.access_token.as_deref(), Some("gemini-new-access"));
+        assert_eq!(live.refresh_token.as_deref(), Some("gemini-new-refresh"));
+        let persisted =
+            crate::domain::accounts::store::AccountStore::load_or_default(&config_dir).unwrap();
+        let persisted = persisted
+            .find_for_provider(ProviderType::GeminiCli, Some(account_id))
+            .unwrap();
+        assert_eq!(persisted.access_token.as_deref(), Some("gemini-new-access"));
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("gemini-new-refresh")
+        );
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_quota_requires_the_active_account_after_waiting_for_refresh_lock() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "invalid_grant"})),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = account_api_test_state("codex-quota-active-gate");
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for account_id in ["codex-quota-active-a", "codex-quota-active-b"] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": account_id,
+                            "providerType": "codex_oauth",
+                            "accessToken": format!("{account_id}-access"),
+                            "refreshToken": format!("{account_id}-refresh"),
+                            "expiresAt": 1,
+                            "profile": {
+                                "verifiedOpenAIClaims": {
+                                    "subject": format!("{account_id}-subject"),
+                                    "chatgpt_account_id": format!("{account_id}-workspace")
+                                }
+                            },
+                            "raw": {"testOAuthTokenUrl": token_url}
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let quota = |state: ServerState, headers: HeaderMap| async move {
+            account_quota(
+                State(state),
+                headers,
+                Path("codex-quota-active-a".to_string()),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: Some(true),
+                }),
+            )
+            .await
+        };
+
+        let needs_selection = quota(state.clone(), headers.clone()).await.unwrap_err();
+        assert_eq!(needs_selection.status, StatusCode::CONFLICT);
+        assert_eq!(
+            needs_selection.code,
+            Some("cc_switch_codex_inactive_account")
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.select_active_codex_oauth_account("codex-quota-active-b")
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let inactive = quota(state.clone(), headers.clone()).await.unwrap_err();
+        assert_eq!(inactive.status, StatusCode::CONFLICT);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        state
+            .select_active_codex_oauth_account_command("codex-quota-active-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let account = state
+            .find_account_by_id("codex-quota-active-a")
+            .await
+            .unwrap();
+        let guard = state
+            .account_refresh_locks
+            .lock(account.provider_type, &account.id)
+            .await;
+        let mut waiter = tokio::spawn(quota(state.clone(), headers));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiter)
+                .await
+                .is_err()
+        );
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.select_active_codex_oauth_account("codex-quota-active-b")
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        guard.release();
+
+        let switched = waiter.await.unwrap().unwrap_err();
+        assert_eq!(switched.status, StatusCode::CONFLICT);
+        assert_eq!(switched.code, Some("cc_switch_codex_inactive_account"));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_waiter_reuses_quota_failure_instead_of_returning_stale_snapshot() {
+        let state = account_api_test_state("quota-upstream-failure-flight");
+        let config_dir = state.config_dir.clone();
+        let account_id = "quota-upstream-failure-flight-account";
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "cursor_oauth",
+                        "accessToken": "quota-upstream-failure-access",
+                        "expiresAt": i64::MAX,
+                        "raw": {
+                            "testQuotaRefreshDelayMs": 250,
+                            "currentPeriodUsage": {}
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let quota_request = |state: ServerState| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-cc-switch-web-user-email",
+                HeaderValue::from_static("owner@example.com"),
+            );
+            account_quota(
+                State(state),
+                headers,
+                Path(account_id.to_string()),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: Some(true),
+                }),
+            )
+            .await
+        };
+        let first = tokio::spawn(quota_request(state.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !state
+                .account_refresh_locks
+                .is_locked(ProviderType::CursorOAuth, account_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quota failure leader did not acquire the account refresh lock");
+        let mut second = tokio::spawn(quota_request(state.clone()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+
+        let first_error = first.await.unwrap().unwrap_err();
+        let second_error = tokio::time::timeout(std::time::Duration::from_millis(100), second)
+            .await
+            .expect("quota failure waiter issued a second provider quota refresh")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(first_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(second_error.status, first_error.status);
+        assert_eq!(second_error.message, first_error.message);
+        let account = state.find_account_by_id(account_id).await.unwrap();
+        assert!(account.quota_next_refresh_at.is_some());
+        assert!(account.quota_refreshed_at.is_none());
+
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_waiter_rejects_same_id_recreated_for_another_provider() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_requests_for_route = std::sync::Arc::clone(&upstream_requests);
+        let upstream = axum::Router::new().fallback(move || {
+            let upstream_requests = std::sync::Arc::clone(&upstream_requests_for_route);
+            async move {
+                upstream_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({}))
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = account_api_test_state("quota-provider-type-replacement");
+        let config_dir = state.config_dir.clone();
+        let account_id = "quota-provider-type-replacement-account";
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "cursor_oauth",
+                        "accessToken": "old-provider-access",
+                        "expiresAt": i64::MAX,
+                        "raw": {
+                            "currentPeriodUsage": {
+                                "planUsage": {"limit": 1000, "used": 100}
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let old_provider_guard = state
+            .account_refresh_locks
+            .lock(ProviderType::CursorOAuth, account_id)
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let waiter_state = state.clone();
+        let mut waiter = tokio::spawn(async move {
+            account_quota(
+                State(waiter_state),
+                headers,
+                Path(account_id.to_string()),
+                Query(AccountQuotaQuery {
+                    refresh: Some(true),
+                    force: Some(true),
+                }),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiter)
+                .await
+                .is_err()
+        );
+
+        let gemini_base_url = format!("http://{address}");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                assert!(accounts.delete(account_id));
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "gemini_cli",
+                        "accessToken": "replacement-provider-access",
+                        "expiresAt": i64::MAX,
+                        "raw": {"testGeminiCodeAssistBaseUrl": gemini_base_url}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        old_provider_guard.release();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("quota waiter remained blocked on the superseded provider lock")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, Some("cc_switch_account_credentials_changed"));
+        assert_eq!(
+            error.message,
+            "account provider type changed while quota refresh was waiting; retry the request"
+        );
+        assert_eq!(
+            upstream_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let replacement = state.find_account_by_id(account_id).await.unwrap();
+        assert_eq!(replacement.provider_type, ProviderType::GeminiCli);
+        assert!(replacement.quota_refreshed_at.is_none());
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn quota_refresh_lock_binding_rejects_provider_type_changes() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "quota-lock-binding-account",
+            "providerType": "gemini_cli",
+            "accessToken": "replacement-provider-access"
+        }))
+        .unwrap();
+
+        assert!(
+            ensure_quota_refresh_lock_matches_account(ProviderType::GeminiCli, &account).is_ok()
+        );
+        let error = ensure_quota_refresh_lock_matches_account(ProviderType::CursorOAuth, &account)
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, Some("cc_switch_account_credentials_changed"));
+    }
+
     #[test]
     fn quota_singleflight_only_coalesces_when_quota_marker_advanced() {
         let before: Account = serde_json::from_value(json!({
@@ -2777,14 +4015,14 @@ mod tests {
 
         let mut quota_failure = token_only;
         quota_failure.quota_next_refresh_at = Some(3_000);
-        assert!(quota_refresh_satisfied_by_in_flight(
+        assert!(!quota_refresh_satisfied_by_in_flight(
             &before,
             &quota_failure
         ));
 
         let mut prior_long_cooldown = quota_failure.clone();
         prior_long_cooldown.quota_next_refresh_at = Some(10_000);
-        assert!(quota_refresh_satisfied_by_in_flight(
+        assert!(!quota_refresh_satisfied_by_in_flight(
             &prior_long_cooldown,
             &quota_failure
         ));
@@ -2813,6 +4051,64 @@ mod tests {
             &workspace_a,
             &workspace_b
         ));
+    }
+
+    #[tokio::test]
+    async fn quota_failure_flight_is_replayed_instead_of_coalescing_cooldown_marker() {
+        let before: Account = serde_json::from_value(json!({
+            "id": "quota-failure-flight-account",
+            "providerType": "cursor_oauth",
+            "accessToken": "quota-failure-access"
+        }))
+        .unwrap();
+        let mut after = before.clone();
+        after.quota_next_refresh_at = Some(10_000);
+        after.last_refresh_error = Some("upstream quota failed".to_string());
+        let locks =
+            std::sync::Arc::new(crate::domain::accounts::managers::AccountRefreshLocks::default());
+        let mut leader = locks.lock(before.provider_type, &before.id).await;
+        let waiter_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let waiter_started_signal = waiter_started.notified();
+        tokio::pin!(waiter_started_signal);
+        let waiter_locks = std::sync::Arc::clone(&locks);
+        let waiter_started_for_task = std::sync::Arc::clone(&waiter_started);
+        let provider_type = before.provider_type;
+        let account_id = before.id.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_started_for_task.notify_waiters();
+            waiter_locks.lock(provider_type, &account_id).await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            &mut waiter_started_signal,
+        )
+        .await
+        .expect("quota failure waiter did not start");
+
+        leader.record_failure(AccountRefreshFlightFailure::for_account(
+            &after,
+            AccountRefreshFlightStage::QuotaRefresh,
+            AccountRefreshFlightFailureDetails {
+                status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                upstream_status: Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+                message: "upstream quota failed".to_string(),
+                public_message: Some("quota refresh failed".to_string()),
+                kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                retryable: true,
+                retry_after_ms: None,
+                immediate_relogin: false,
+            },
+        ));
+        leader.release();
+        let waiter = waiter.await.unwrap();
+        assert!(waiter.coalesced_native_failure_for(&after).is_none());
+        let failure = waiter.coalesced_quota_failure_for(&after).unwrap();
+        assert_eq!(failure.status_code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(
+            failure.public_message.as_deref(),
+            Some("quota refresh failed")
+        );
+        assert!(!quota_refresh_satisfied_by_in_flight(&before, &after));
     }
 
     #[test]

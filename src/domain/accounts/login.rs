@@ -524,6 +524,38 @@ impl OAuthLoginStore {
         }
     }
 
+    pub fn ensure_exchange_commit_allowed(
+        &mut self,
+        session_id: &str,
+        principal_id: Option<&str>,
+        expected_provider_type: ProviderType,
+        now_ms: i64,
+    ) -> Result<(), OAuthLoginError> {
+        self.cleanup_expired(now_ms);
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(OAuthLoginError::NotFound)?;
+        ensure_principal(
+            session,
+            principal_id
+                .map(OAuthLoginAccess::Principal)
+                .unwrap_or(OAuthLoginAccess::Callback),
+        )?;
+        if session.provider_type != expected_provider_type {
+            return Err(OAuthLoginError::ProviderMismatch);
+        }
+        match session.status {
+            OAuthLoginStatus::TokenExchangeStarted => Ok(()),
+            OAuthLoginStatus::Cancelled => Err(OAuthLoginError::Cancelled),
+            OAuthLoginStatus::Expired => Err(OAuthLoginError::Expired),
+            OAuthLoginStatus::TokenExchanged => Err(OAuthLoginError::AlreadyConsumed),
+            OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed => {
+                Err(OAuthLoginError::InvalidTransition)
+            }
+        }
+    }
+
     pub fn mark_exchange_failed(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if session.status == OAuthLoginStatus::TokenExchangeStarted {
@@ -538,7 +570,7 @@ impl OAuthLoginStore {
         state: Option<&str>,
         now_ms: i64,
     ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
-        self.cancel_internal(session_id, state, None, None, now_ms)
+        self.cancel_internal(session_id, state, OAuthLoginAccess::Unbound, None, now_ms)
     }
 
     pub fn cancel_for_principal(
@@ -548,7 +580,13 @@ impl OAuthLoginStore {
         principal_id: &str,
         now_ms: i64,
     ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
-        self.cancel_internal(session_id, state, Some(principal_id), None, now_ms)
+        self.cancel_internal(
+            session_id,
+            state,
+            OAuthLoginAccess::Principal(principal_id),
+            None,
+            now_ms,
+        )
     }
 
     pub fn cancel_for_principal_with_expected_provider(
@@ -562,7 +600,30 @@ impl OAuthLoginStore {
         self.cancel_internal(
             session_id,
             state,
-            Some(principal_id),
+            OAuthLoginAccess::Principal(principal_id),
+            Some(expected_provider_type),
+            now_ms,
+        )
+    }
+
+    pub fn cancel_from_oauth_callback(
+        &mut self,
+        state: &str,
+        now_ms: i64,
+    ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
+        self.cancel_internal(None, Some(state), OAuthLoginAccess::Callback, None, now_ms)
+    }
+
+    pub fn cancel_from_oauth_callback_with_expected_provider(
+        &mut self,
+        state: &str,
+        expected_provider_type: ProviderType,
+        now_ms: i64,
+    ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
+        self.cancel_internal(
+            None,
+            Some(state),
+            OAuthLoginAccess::Callback,
             Some(expected_provider_type),
             now_ms,
         )
@@ -572,7 +633,7 @@ impl OAuthLoginStore {
         &mut self,
         session_id: Option<&str>,
         state: Option<&str>,
-        principal_id: Option<&str>,
+        access: OAuthLoginAccess<'_>,
         expected_provider_type: Option<ProviderType>,
         now_ms: i64,
     ) -> Result<OAuthLoginCancellation, OAuthLoginError> {
@@ -582,24 +643,19 @@ impl OAuthLoginStore {
             .sessions
             .get_mut(&session_key)
             .ok_or(OAuthLoginError::NotFound)?;
-        ensure_principal(
-            session,
-            principal_id
-                .map(OAuthLoginAccess::Principal)
-                .unwrap_or(OAuthLoginAccess::Unbound),
-        )?;
+        ensure_principal(session, access)?;
         if expected_provider_type.is_some_and(|expected| expected != session.provider_type) {
             return Err(OAuthLoginError::ProviderMismatch);
         }
         match session.status {
-            OAuthLoginStatus::Pending | OAuthLoginStatus::TokenRequestPreviewed => {
+            OAuthLoginStatus::Pending
+            | OAuthLoginStatus::TokenRequestPreviewed
+            | OAuthLoginStatus::TokenExchangeStarted => {
                 session.status = OAuthLoginStatus::Cancelled;
                 clear_session_secrets(session);
             }
             OAuthLoginStatus::Cancelled => {}
-            OAuthLoginStatus::TokenExchangeStarted | OAuthLoginStatus::TokenExchanged => {
-                return Err(OAuthLoginError::AlreadyConsumed);
-            }
+            OAuthLoginStatus::TokenExchanged => return Err(OAuthLoginError::AlreadyConsumed),
             OAuthLoginStatus::Expired => return Err(OAuthLoginError::Expired),
         }
         Ok(OAuthLoginCancellation {
@@ -609,6 +665,32 @@ impl OAuthLoginStore {
             status: session.status,
             message: "oauth login session cancelled".to_string(),
         })
+    }
+
+    pub fn cancel_all_for_principal(
+        &mut self,
+        provider_type: ProviderType,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> usize {
+        self.cleanup_expired(now_ms);
+        let mut cancelled = 0;
+        for session in self.sessions.values_mut().filter(|session| {
+            session.provider_type == provider_type
+                && session.principal_id.as_deref() == Some(principal_id)
+        }) {
+            if matches!(
+                session.status,
+                OAuthLoginStatus::Pending
+                    | OAuthLoginStatus::TokenRequestPreviewed
+                    | OAuthLoginStatus::TokenExchangeStarted
+            ) {
+                session.status = OAuthLoginStatus::Cancelled;
+                clear_session_secrets(session);
+                cancelled += 1;
+            }
+        }
+        cancelled
     }
 
     pub fn poll_state_by_oauth_state(
@@ -1296,10 +1378,14 @@ mod tests {
             store.poll_state_by_oauth_state(&login.state, 302_001),
             Ok(OAuthSessionPollState::Pending)
         ));
-        assert!(matches!(
-            store.cancel(Some(&login.session_id), Some(&login.state), 302_002),
-            Err(OAuthLoginError::AlreadyConsumed)
-        ));
+        store
+            .ensure_exchange_commit_allowed(
+                &login.session_id,
+                None,
+                ProviderType::CodexOAuth,
+                302_002,
+            )
+            .expect("exchange remains eligible for commit");
         store
             .mark_exchanged(&login.session_id, "account-1")
             .expect("complete exchange after cleanup");
@@ -1317,6 +1403,100 @@ mod tests {
         let session = store.sessions.get(&login.session_id).expect("session");
         assert!(session.code_verifier.is_empty());
         assert!(session.authorization_code.is_none());
+    }
+
+    #[test]
+    fn exchange_started_session_can_be_cancelled_before_commit() {
+        let mut store = OAuthLoginStore::default();
+        let principal_id = "owner@example.com:owner";
+        let login = store
+            .start_for_principal(
+                ProviderType::ClaudeOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                principal_id.to_string(),
+                1_000,
+            )
+            .expect("login");
+        store
+            .finish_for_principal(
+                Some(&login.session_id),
+                Some(&login.state),
+                Some("auth-code"),
+                true,
+                principal_id,
+                2_000,
+            )
+            .expect("begin exchange");
+
+        let cancelled = store
+            .cancel_for_principal(
+                Some(&login.session_id),
+                Some(&login.state),
+                principal_id,
+                2_001,
+            )
+            .expect("cancel in-flight exchange");
+        assert_eq!(cancelled.status, OAuthLoginStatus::Cancelled);
+        assert!(matches!(
+            store.ensure_exchange_commit_allowed(
+                &login.session_id,
+                Some(principal_id),
+                ProviderType::ClaudeOAuth,
+                2_002,
+            ),
+            Err(OAuthLoginError::Cancelled)
+        ));
+        assert!(matches!(
+            store.mark_exchanged(&login.session_id, "late-account"),
+            Err(OAuthLoginError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn cancel_all_for_principal_is_provider_scoped() {
+        let mut store = OAuthLoginStore::default();
+        let principal_id = "owner@example.com:owner";
+        let claude = store
+            .start_for_principal(
+                ProviderType::ClaudeOAuth,
+                Some("http://localhost:15721/api/accounts/login/callback".to_string()),
+                principal_id.to_string(),
+                1_000,
+            )
+            .expect("claude login");
+        let codex = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                principal_id.to_string(),
+                1_000,
+            )
+            .expect("codex login");
+
+        assert_eq!(
+            store.cancel_all_for_principal(ProviderType::ClaudeOAuth, principal_id, 2_000),
+            1
+        );
+        assert!(matches!(
+            store.poll_state_for_principal(
+                Some(&claude.session_id),
+                Some(&claude.state),
+                principal_id,
+                2_001,
+            ),
+            Err(OAuthLoginError::Cancelled)
+        ));
+        assert_eq!(
+            store
+                .poll_state_for_principal(
+                    Some(&codex.session_id),
+                    Some(&codex.state),
+                    principal_id,
+                    2_001,
+                )
+                .expect("other provider remains pending"),
+            OAuthSessionPollState::Pending
+        );
     }
 
     #[test]
@@ -1414,6 +1594,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cancelled.status, OAuthLoginStatus::Cancelled);
+    }
+
+    #[test]
+    fn oauth_callback_error_can_cancel_principal_bound_session() {
+        let mut store = OAuthLoginStore::default();
+        let principal_id = "owner@example.com:admin";
+        let login = store
+            .start_for_principal(
+                ProviderType::CodexOAuth,
+                Some(super::super::oauth::CODEX_CLI_REDIRECT_URI.to_string()),
+                principal_id.to_string(),
+                1_000,
+            )
+            .unwrap();
+
+        let error = store
+            .cancel_from_oauth_callback_with_expected_provider(
+                &login.state,
+                ProviderType::ClaudeOAuth,
+                2_000,
+            )
+            .unwrap_err();
+        assert!(matches!(error, OAuthLoginError::ProviderMismatch));
+        assert_eq!(
+            store
+                .poll_state_for_principal(
+                    Some(&login.session_id),
+                    Some(&login.state),
+                    principal_id,
+                    2_001,
+                )
+                .unwrap(),
+            OAuthSessionPollState::Pending
+        );
+
+        let cancelled = store
+            .cancel_from_oauth_callback_with_expected_provider(
+                &login.state,
+                ProviderType::CodexOAuth,
+                2_002,
+            )
+            .unwrap();
+        assert_eq!(cancelled.status, OAuthLoginStatus::Cancelled);
+        assert!(matches!(
+            store.poll_state_for_principal(
+                Some(&login.session_id),
+                Some(&login.state),
+                principal_id,
+                2_003,
+            ),
+            Err(OAuthLoginError::Cancelled)
+        ));
     }
 
     #[test]

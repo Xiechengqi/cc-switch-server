@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 import { providersApi, settingsApi } from "@/lib/api";
-import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
 import { useSettingsQuery, useSaveSettingsMutation } from "@/lib/query";
 import type { Settings } from "@/types";
 import { useSettingsForm, type SettingsFormState } from "./useSettingsForm";
@@ -125,41 +124,20 @@ export function useSettings(): UseSettingsResult {
   ]);
 
   // 同步 Claude 插件集成配置到 ~/.claude/settings.json
-  // 返回 true 表示已执行过 syncCurrentProvidersLiveSafe，调用方可跳过重复同步
   // prevEnabled 必须由调用方在 saveMutation 之前从实时缓存（queryClient.getQueryData）捕获，
   // 避免 useCallback closure 中 data 因未 re-render 而滞后导致的快速连切 race。
   const syncClaudePluginIfChanged = useCallback(
     async (
       enabled: boolean | undefined,
       prevEnabled: boolean | undefined,
-    ): Promise<boolean> => {
-      if (enabled === undefined || enabled === prevEnabled) return false;
+    ): Promise<void> => {
+      if (enabled === undefined || enabled === prevEnabled) return;
       try {
         if (enabled) {
-          const currentId = await providersApi.getCurrent("claude");
-          let isOfficial = false;
-          if (currentId) {
-            const allProviders = await providersApi.getAll("claude");
-            isOfficial = allProviders[currentId]?.category === "official";
-          }
-          await settingsApi.applyClaudePluginConfig({ official: isOfficial });
+          await settingsApi.applyClaudePluginConfig({ official: true });
         } else {
           await settingsApi.applyClaudePluginConfig({ official: true });
         }
-
-        const syncResult = await syncCurrentProvidersLiveSafe();
-        if (!syncResult.ok) {
-          console.warn(
-            "[useSettings] Failed to sync providers after toggling Claude plugin",
-            syncResult.error,
-          );
-          toast.error(
-            t("notifications.syncClaudePluginFailed", {
-              defaultValue: "同步 Claude 插件失败",
-            }),
-          );
-        }
-        return true;
       } catch (error) {
         console.warn(
           "[useSettings] Failed to sync Claude plugin config",
@@ -170,7 +148,6 @@ export function useSettings(): UseSettingsResult {
             defaultValue: "同步 Claude 插件失败",
           }),
         );
-        return false;
       }
     },
     [t],
@@ -325,11 +302,6 @@ export function useSettings(): UseSettingsResult {
           mergedSettings.openclawConfigDir,
         );
         const previousAppDir = initialAppConfigDir;
-        const previousClaudeDir = sanitizeDir(data?.claudeConfigDir);
-        const previousCodexDir = sanitizeDir(data?.codexConfigDir);
-        const previousGeminiDir = sanitizeDir(data?.geminiConfigDir);
-        const previousOpencodeDir = sanitizeDir(data?.opencodeConfigDir);
-        const previousOpenclawDir = sanitizeDir(data?.openclawConfigDir);
         const {
           webdavSync: _ignoredWebdavSync,
           s3Sync: _ignoredS3Sync,
@@ -400,7 +372,7 @@ export function useSettings(): UseSettingsResult {
           }
         }
 
-        const pluginSynced = await syncClaudePluginIfChanged(
+        await syncClaudePluginIfChanged(
           payload.enableClaudePluginIntegration,
           prevPluginEnabled,
         );
@@ -420,30 +392,6 @@ export function useSettings(): UseSettingsResult {
           await providersApi.updateTrayMenu();
         } catch (error) {
           console.warn("[useSettings] Failed to refresh tray menu", error);
-        }
-
-        // 如果 Claude/Codex/Gemini/OpenCode/OpenClaw 的目录覆盖发生变化，则立即将"当前使用的供应商"写回对应应用的 live 配置
-        // 如果插件同步已经执行过 syncCurrentProvidersLiveSafe，则跳过避免重复
-        const claudeDirChanged = sanitizedClaudeDir !== previousClaudeDir;
-        const codexDirChanged = sanitizedCodexDir !== previousCodexDir;
-        const geminiDirChanged = sanitizedGeminiDir !== previousGeminiDir;
-        const opencodeDirChanged = sanitizedOpencodeDir !== previousOpencodeDir;
-        const openclawDirChanged = sanitizedOpenclawDir !== previousOpenclawDir;
-        if (
-          !pluginSynced &&
-          (claudeDirChanged ||
-            codexDirChanged ||
-            geminiDirChanged ||
-            opencodeDirChanged ||
-            openclawDirChanged)
-        ) {
-          const syncResult = await syncCurrentProvidersLiveSafe();
-          if (!syncResult.ok) {
-            console.warn(
-              "[useSettings] Failed to sync current providers after directory change",
-              syncResult.error,
-            );
-          }
         }
 
         const appDirChanged = sanitizedAppDir !== (previousAppDir ?? undefined);

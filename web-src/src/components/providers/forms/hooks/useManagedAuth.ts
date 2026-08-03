@@ -6,8 +6,21 @@ import type {
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
 } from "@/lib/api";
+import { oauthQuotaRootKey } from "@/lib/query/oauthQuotaKeys";
 
 type PollingState = "idle" | "polling" | "success" | "error";
+
+interface ManagedAuthStartParams {
+  operationGeneration: number;
+  oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device";
+  kiroLoginProvider?: "google" | "github" | null;
+}
+
+interface ManagedAuthCallbackParams {
+  operationGeneration: number;
+  deviceCode: string;
+  callbackUrl: string;
+}
 
 export function useManagedAuth(
   authProvider: ManagedAuthProvider,
@@ -25,10 +38,14 @@ export function useManagedAuth(
     null,
   );
   const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const operationGenerationRef = useRef(0);
 
   const {
     data: authStatus,
     isLoading: isLoadingStatus,
+    isFetching: isFetchingStatus,
+    isError: isStatusError,
+    error: statusQueryError,
     refetch: refetchStatus,
   } = useQuery<ManagedAuthStatus>({
     queryKey,
@@ -40,8 +57,11 @@ export function useManagedAuth(
     () =>
       Promise.all([
         queryClient.invalidateQueries({ queryKey }),
+        queryClient.invalidateQueries({ queryKey: ["managed-auth-accounts"] }),
         queryClient.invalidateQueries({ queryKey: ["subscription"] }),
-        queryClient.invalidateQueries({ queryKey: [authProvider, "quota"] }),
+        queryClient.invalidateQueries({
+          queryKey: oauthQuotaRootKey(authProvider),
+        }),
         queryClient.invalidateQueries({ queryKey: ["providers"] }),
         queryClient.invalidateQueries({ queryKey: ["share"] }),
       ]),
@@ -59,30 +79,62 @@ export function useManagedAuth(
     }
   }, []);
 
+  const beginOperation = useCallback(() => {
+    operationGenerationRef.current += 1;
+    return operationGenerationRef.current;
+  }, []);
+
+  const isCurrentOperation = useCallback(
+    (generation: number) => operationGenerationRef.current === generation,
+    [],
+  );
+
+  const retireOperation = useCallback((generation: number) => {
+    if (operationGenerationRef.current !== generation) return null;
+    operationGenerationRef.current += 1;
+    return operationGenerationRef.current;
+  }, []);
+
+  const cancelRemoteLogin = useCallback(
+    async (activeDeviceCode: string) => {
+      try {
+        await authApi.authCancelLogin(authProvider, activeDeviceCode);
+      } catch (e) {
+        console.warn("[ManagedAuth] Failed to cancel remote auth session:", e);
+      }
+    },
+    [authProvider],
+  );
+
   useEffect(() => {
     return () => {
+      operationGenerationRef.current += 1;
       stopPolling();
     };
   }, [stopPolling]);
 
   const startLoginMutation = useMutation({
-    mutationFn: (params?: {
-      oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device";
-      kiroLoginProvider?: "google" | "github" | null;
-    }) =>
+    mutationFn: (params: ManagedAuthStartParams) =>
       authApi.authStartLogin(
         authProvider,
         githubDomain,
-        params?.oauthFlowMode,
-        params?.kiroLoginProvider,
+        params.oauthFlowMode,
+        params.kiroLoginProvider,
       ),
-    onSuccess: async (response) => {
+    onSuccess: async (response, params) => {
+      const generation = params.operationGeneration;
+      if (!isCurrentOperation(generation)) {
+        void cancelRemoteLogin(response.device_code);
+        return;
+      }
       setDeviceCode(response);
       setPollingState("polling");
       setError(null);
 
       if (response.flow === "cli_manual") {
         pollingTimeoutRef.current = setTimeout(() => {
+          if (retireOperation(generation) === null) return;
+          stopPolling();
           setPollingState("error");
           setError("OAuth session expired. Please try again.");
         }, response.expires_in * 1000);
@@ -95,7 +147,9 @@ export function useManagedAuth(
       const expiresAt = Date.now() + response.expires_in * 1000;
 
       const pollOnce = async () => {
+        if (!isCurrentOperation(generation)) return;
         if (Date.now() > expiresAt) {
+          if (retireOperation(generation) === null) return;
           stopPolling();
           setPollingState("error");
           setError("Device code expired. Please try again.");
@@ -108,68 +162,85 @@ export function useManagedAuth(
             response.device_code,
             githubDomain,
           );
+          if (!isCurrentOperation(generation)) return;
           if (newAccount) {
+            const completionGeneration = retireOperation(generation);
+            if (completionGeneration === null) return;
             stopPolling();
             setPollingState("success");
-            await refetchStatus();
-            await queryClient.invalidateQueries({ queryKey });
+            await invalidateManagedAccountViews();
+            if (!isCurrentOperation(completionGeneration)) return;
             setPollingState("idle");
             setDeviceCode(null);
+            setError(null);
+            return;
           }
         } catch (e) {
+          if (!isCurrentOperation(generation)) return;
           const errorMessage = e instanceof Error ? e.message : String(e);
           if (
             !errorMessage.includes("pending") &&
             !errorMessage.includes("slow_down")
           ) {
+            if (retireOperation(generation) === null) return;
             stopPolling();
             setPollingState("error");
             setError(errorMessage);
+            return;
           }
         }
+
+        if (!isCurrentOperation(generation)) return;
+        pollingIntervalRef.current = setTimeout(() => {
+          void pollOnce();
+        }, interval);
       };
 
       void pollOnce();
-      pollingIntervalRef.current = setInterval(pollOnce, interval);
       pollingTimeoutRef.current = setTimeout(() => {
+        if (retireOperation(generation) === null) return;
         stopPolling();
         setPollingState("error");
         setError("Device code expired. Please try again.");
       }, response.expires_in * 1000);
     },
-    onError: (e) => {
+    onError: (e, params) => {
+      if (retireOperation(params.operationGeneration) === null) return;
+      stopPolling();
       setPollingState("error");
       setError(e instanceof Error ? e.message : String(e));
     },
   });
 
   const submitOauthCallbackMutation = useMutation({
-    mutationFn: (callbackUrl: string) => {
-      if (!deviceCode?.device_code) {
-        throw new Error("OAuth session is not active.");
-      }
+    mutationFn: (params: ManagedAuthCallbackParams) => {
       return authApi.authSubmitOauthCallback(
         authProvider,
-        deviceCode.device_code,
-        callbackUrl,
+        params.deviceCode,
+        params.callbackUrl,
       );
     },
-    onSuccess: async () => {
+    onSuccess: async (_, params) => {
+      const completionGeneration = retireOperation(params.operationGeneration);
+      if (completionGeneration === null) return;
       stopPolling();
       setPollingState("success");
       await refetchStatus();
       await invalidateManagedAccountViews();
+      if (!isCurrentOperation(completionGeneration)) return;
       setPollingState("idle");
       setDeviceCode(null);
       setError(null);
     },
-    onError: (e) => {
+    onError: (e, params) => {
+      if (!isCurrentOperation(params.operationGeneration)) return;
       setError(e instanceof Error ? e.message : String(e));
     },
   });
 
   const logoutMutation = useMutation({
     mutationFn: () => authApi.authLogout(authProvider),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setPollingState("idle");
       setDeviceCode(null);
@@ -200,6 +271,7 @@ export function useManagedAuth(
   const removeAccountMutation = useMutation({
     mutationFn: (accountId: string) =>
       authApi.authRemoveAccount(authProvider, accountId),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setPollingState("idle");
       setDeviceCode(null);
@@ -216,6 +288,7 @@ export function useManagedAuth(
   const setDefaultAccountMutation = useMutation({
     mutationFn: (accountId: string) =>
       authApi.authSetDefaultAccount(authProvider, accountId),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setError(null);
       await refetchStatus();
@@ -233,7 +306,8 @@ export function useManagedAuth(
         authProvider,
         params.accountId,
         params.workspaceId,
-    ),
+      ),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setError(null);
       await refetchStatus();
@@ -247,12 +321,12 @@ export function useManagedAuth(
 
   const importCursorLocalMutation = useMutation({
     mutationFn: () => authApi.importCursorLocalAuth(),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setPollingState("idle");
       setDeviceCode(null);
       setError(null);
-      await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateManagedAccountViews();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to import local Cursor auth:", e);
@@ -262,56 +336,105 @@ export function useManagedAuth(
 
   const startAuth = useCallback(
     (
-      oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device",
+      oauthFlowMode?:
+        "web_paste" | "localhost" | "cli" | "cli_manual" | "device",
       options?: {
         kiroLoginProvider?: "google" | "github" | null;
       },
     ) => {
+      const activeDeviceCode = deviceCode?.device_code;
+      stopPolling();
+      const operationGeneration = beginOperation();
+      if (activeDeviceCode) {
+        void cancelRemoteLogin(activeDeviceCode);
+      }
       setPollingState("idle");
       setDeviceCode(null);
       setError(null);
-      stopPolling();
-      startLoginMutation.mutate(
-        oauthFlowMode || options?.kiroLoginProvider
-          ? {
-              oauthFlowMode,
-              kiroLoginProvider: options?.kiroLoginProvider,
-            }
-          : undefined,
-      );
+      startLoginMutation.mutate({
+        operationGeneration,
+        oauthFlowMode,
+        kiroLoginProvider: options?.kiroLoginProvider,
+      });
     },
-    [startLoginMutation, stopPolling],
+    [
+      beginOperation,
+      cancelRemoteLogin,
+      deviceCode?.device_code,
+      startLoginMutation,
+      stopPolling,
+    ],
   );
 
-  const startDefaultAuth = useCallback(() => {
-    setPollingState("idle");
-    setDeviceCode(null);
-    setError(null);
-    stopPolling();
-    startLoginMutation.mutate(undefined);
-  }, [startLoginMutation, stopPolling]);
+  const startDefaultAuth = useCallback(() => startAuth(), [startAuth]);
 
   const cancelAuth = useCallback(() => {
     const activeDeviceCode = deviceCode?.device_code;
+    beginOperation();
     stopPolling();
     setPollingState("idle");
     setDeviceCode(null);
     setError(null);
     if (activeDeviceCode) {
-      void authApi
-        .authCancelLogin(authProvider, activeDeviceCode)
-        .catch((e) => {
-          console.warn(
-            "[ManagedAuth] Failed to cancel remote auth session:",
-            e,
-          );
-        });
+      void cancelRemoteLogin(activeDeviceCode);
     }
-  }, [authProvider, deviceCode?.device_code, stopPolling]);
+  }, [beginOperation, cancelRemoteLogin, deviceCode?.device_code, stopPolling]);
+
+  const submitOauthCallback = useCallback(
+    (callbackUrl: string) => {
+      const activeDeviceCode = deviceCode?.device_code;
+      if (!activeDeviceCode) {
+        return Promise.reject(new Error("OAuth session is not active."));
+      }
+      return submitOauthCallbackMutation.mutateAsync({
+        operationGeneration: operationGenerationRef.current,
+        deviceCode: activeDeviceCode,
+        callbackUrl,
+      });
+    },
+    [deviceCode?.device_code, submitOauthCallbackMutation],
+  );
 
   const logout = useCallback(() => {
+    const activeDeviceCode = deviceCode?.device_code;
+    beginOperation();
+    stopPolling();
+    setPollingState("idle");
+    setDeviceCode(null);
+    setError(null);
+    if (activeDeviceCode) {
+      void cancelRemoteLogin(activeDeviceCode).then(() => {
+        logoutMutation.mutate();
+      });
+      return;
+    }
     logoutMutation.mutate();
-  }, [logoutMutation]);
+  }, [
+    beginOperation,
+    cancelRemoteLogin,
+    deviceCode?.device_code,
+    logoutMutation,
+    stopPolling,
+  ]);
+
+  const logoutAsync = useCallback(async () => {
+    const activeDeviceCode = deviceCode?.device_code;
+    beginOperation();
+    stopPolling();
+    setPollingState("idle");
+    setDeviceCode(null);
+    setError(null);
+    if (activeDeviceCode) {
+      await cancelRemoteLogin(activeDeviceCode);
+    }
+    return logoutMutation.mutateAsync();
+  }, [
+    beginOperation,
+    cancelRemoteLogin,
+    deviceCode?.device_code,
+    logoutMutation,
+    stopPolling,
+  ]);
 
   const removeAccount = useCallback(
     (accountId: string) => {
@@ -335,31 +458,34 @@ export function useManagedAuth(
   );
 
   const importCursorLocalAuth = useCallback(() => {
-    setPollingState("idle");
-    setDeviceCode(null);
-    setError(null);
-    stopPolling();
+    cancelAuth();
     importCursorLocalMutation.mutate();
-  }, [importCursorLocalMutation, stopPolling]);
+  }, [cancelAuth, importCursorLocalMutation]);
 
   const accounts = authStatus?.accounts ?? [];
   const codexSelection = authStatus?.codex_oauth ?? null;
+  const statusErrorMessage = statusQueryError
+    ? statusQueryError instanceof Error
+      ? statusQueryError.message
+      : String(statusQueryError)
+    : null;
 
   return {
     authStatus,
     isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     accounts,
     hasAnyAccount: accounts.length > 0,
     isAuthenticated: authStatus?.authenticated ?? false,
     defaultAccountId: authStatus?.default_account_id ?? null,
     codexSelection,
     activeCodexAccountId: codexSelection?.activeAccountId ?? null,
-    needsCodexAccountSelection:
-      codexSelection?.status === "needs_selection",
+    needsCodexAccountSelection: codexSelection?.status === "needs_selection",
     migrationError: authStatus?.migration_error ?? null,
     pollingState,
     deviceCode,
-    error,
+    error: error ?? statusErrorMessage,
     isPolling: pollingState === "polling",
     isAddingAccount: startLoginMutation.isPending || pollingState === "polling",
     isImportingCursorLocalAuth: importCursorLocalMutation.isPending,
@@ -372,13 +498,15 @@ export function useManagedAuth(
     addAccountWithMode: startAuth,
     cancelAuth,
     logout,
+    logoutAsync,
     removeAccount,
     removeAccountAsync: removeAccountMutation.mutateAsync,
     setDefaultAccount,
     selectActiveCodexAccount: setDefaultAccountMutation.mutateAsync,
     setWorkspace,
-    submitOauthCallback: submitOauthCallbackMutation.mutateAsync,
+    submitOauthCallback,
     importCursorLocalAuth,
     refetchStatus,
+    invalidateAccountViews: invalidateManagedAccountViews,
   };
 }

@@ -23,6 +23,11 @@ import {
 } from "lucide-react";
 import { useAntigravityOauth } from "./hooks/useAntigravityOauth";
 import { copyText } from "@/lib/clipboard";
+import {
+  logoutAccountsAndClearSelection,
+  removeAccountAndUpdateSelection,
+} from "./accountSelectionActions";
+import { ManagedAuthStatusNotice } from "./ManagedAuthStatusNotice";
 
 interface AntigravityOAuthSectionProps {
   className?: string;
@@ -48,6 +53,9 @@ export const AntigravityOAuthSection: React.FC<
   const {
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     pollingState,
     deviceCode,
     error,
@@ -58,22 +66,39 @@ export const AntigravityOAuthSection: React.FC<
     defaultAccountId,
     addAccount,
     cancelAuth,
-    logout,
-    removeAccount,
+    logoutAsync,
+    removeAccountAsync,
     setDefaultAccount,
+    refetchStatus,
   } = useAntigravityOauth(authProvider);
 
   const handleAccountSelect = (value: string) => {
     onAccountSelect?.(value === "none" ? null : value);
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const copyVerificationUrl = async () => {
@@ -82,6 +107,21 @@ export const AntigravityOAuthSection: React.FC<
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <ManagedAuthStatusNotice
+        className={className}
+        title={t("antigravityOauth.authStatus", {
+          defaultValue: "Antigravity 认证",
+        })}
+        error={error}
+        isError={isStatusError}
+        isFetching={isFetchingStatus}
+        onRetry={() => void refetchStatus()}
+      />
+    );
+  }
 
   return (
     <div className={`space-y-4 ${className || ""}`}>
@@ -317,7 +357,8 @@ export const AntigravityOAuthSection: React.FC<
           type="button"
           variant="outline"
           className="w-full"
-          onClick={logout}
+          onClick={() => void handleLogout()}
+          disabled={isAddingAccount}
         >
           <LogOut className="mr-2 h-4 w-4" />
           {t("antigravityOauth.logoutAll", {

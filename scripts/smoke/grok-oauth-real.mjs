@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const baseUrl = (process.env.CC_SWITCH_BASE_URL || "").trim().replace(/\/+$/, "");
 const inferenceToken = (process.env.CC_SWITCH_INFERENCE_TOKEN || "").trim();
-const providerId = (process.env.CC_SWITCH_GROK_PROVIDER_ID || "").trim();
+const routeKey = (process.env.CC_SWITCH_GROK_ROUTE_KEY || "").trim();
 const model = (process.env.CC_SWITCH_GROK_MODEL || "grok-4.5").trim();
 const mediaSmoke = (process.env.CC_SWITCH_GROK_MEDIA_SMOKE || "0").trim() === "1";
 const evidenceFile = (process.env.EVIDENCE_FILE || "").trim();
@@ -68,7 +68,7 @@ function writeEvidence(status, notes = "") {
       EVIDENCE_TARGET: isUsable(baseUrl) ? baseUrl : "",
       EVIDENCE_SOURCE: "scripts/smoke/grok-oauth-real.mjs",
       EVIDENCE_APP: "codex",
-      EVIDENCE_PROVIDER: isUsable(providerId) ? providerId : "",
+      EVIDENCE_PROVIDER: isUsable(routeKey) ? routeKey : "",
       EVIDENCE_PROVIDER_TYPE: "grok_oauth",
       EVIDENCE_NOTES: notes,
       PROBE_MODEL: model,
@@ -85,7 +85,7 @@ function writeEvidence(status, notes = "") {
 const missingInputs = [
   ["CC_SWITCH_BASE_URL", baseUrl],
   ["CC_SWITCH_INFERENCE_TOKEN", inferenceToken],
-  ["CC_SWITCH_GROK_PROVIDER_ID", providerId],
+  ["CC_SWITCH_GROK_ROUTE_KEY", routeKey],
 ]
   .filter(([, value]) => !isUsable(value))
   .map(([name]) => name);
@@ -108,7 +108,6 @@ function commonHeaders({ inference = false } = {}) {
   const headers = new Headers({
     accept: "application/json",
     "x-api-key": inferenceToken,
-    "x-cc-provider-id": providerId,
   });
   if (inference) {
     headers.set("x-session-id", sessionId);
@@ -127,8 +126,12 @@ async function request(path, init = {}, options = {}) {
   if (init.body !== undefined) {
     headers.set("content-type", "application/json");
   }
+  const routedPath =
+    path === "/ready"
+      ? path
+      : `/r/${encodeURIComponent(routeKey)}${path}`;
   try {
-    const response = await fetch(`${baseUrl}${path}`, {
+    const response = await fetch(`${baseUrl}${routedPath}`, {
       ...init,
       headers,
       signal: controller.signal,
@@ -363,7 +366,7 @@ async function main() {
   console.log("[PASS] server readiness");
 
   const models = await requireJson(
-    `/v1/models?app=codex&providerId=${encodeURIComponent(providerId)}`,
+    "/v1/models",
     { method: "GET" },
     "models",
   );

@@ -11,8 +11,39 @@ AD3 已将本页矩阵固化为 `docs/code-agent-regression-matrix.json`。`scri
 - `staticNativeFamilies`：本地静态 adapter contract 已覆盖的 provider family。
 - `staticPlannedFamilies`：已有请求计划或签名契约，但仍未启用真实转发的 provider family。
 - `staticRemainingFallbackFamilies`：仍是 skeleton/manual/import-only 的 provider family。
+- `fixtureEvidenceComplete`：所有 case 的必需真实验收维度都有 `passed` 证据和脱敏 evidence 路径。
 
 这些字段会写入 acceptance evidence；没有真实 token 时只能说明 contract pass + real skipped，不能说明真实 provider 已通过。
+
+证据同时写入 `verificationState`：离线合同确实执行并通过后为 `contract_verified`；合同未执行时保持 `blocked_inputs`，不能借静态矩阵声明升级状态。只有 `RUN_REAL=1`、`RUN_CONTRACT_TESTS=1`、合同测试确实命中并通过、矩阵输入和实际探测均无跳过、`STREAM_PROBE=1`、`REQUIRE_STREAM_USAGE=1`，并且 `MATRIX_LIVE_EVIDENCE_FILE` 对每个 case 的全部必需维度都记录为 `passed` 时才是 `live_verified`。`verificationScope=configured_matrix_routes` 只覆盖本次实际配置的路由，不代表所有 Provider family 均已真实验证。
+
+`blockerGroup` 记录最高优先级缺口，`checks.blockedGroups` 记录全部缺口。固定分类为：`contract-incomplete`（合同未运行、未通过或矩阵为空/计数不一致）、`missing-matrix-input`（矩阵要求的 token/share/URL 缺失）、`missing-stream-evidence`（stream 或 usage 硬门禁未启用）、`missing-live-fixture-evidence`（真实维度清单不完整）、`live-run-disabled`（`RUN_REAL!=1`）和 `live-probe-skipped`（矩阵输入齐备但仍有探测跳过）。真实探测失败使用 `live-probe-failed`，不会伪装成缺 token。合同或矩阵自身不完整时 evidence `status=blocked`；只有合同基线已通过、等待真实输入/证据时才使用 `ready-with-known-external-blockers`。
+
+`MATRIX_LIVE_EVIDENCE_FILE` 必须是私有、脱敏的 JSON 文件，不提交真实响应或凭据。格式如下；`cases` 必须覆盖矩阵中的每个 case id，`checks` 必须覆盖 `requiredFixtureFields` 的全部字段：
+
+```json
+{
+  "schemaVersion": 1,
+  "cases": {
+    "claude-local-messages": {
+      "evidencePath": "/private/evidence/claude-local-messages.json",
+      "checks": {
+        "non_stream": "passed",
+        "stream": "passed",
+        "tool_function": "passed",
+        "image_media": "passed",
+        "reasoning_thinking": "passed",
+        "cache_usage": "passed",
+        "upstream_4xx": "passed",
+        "upstream_5xx_timeout": "passed",
+        "client_cancel": "passed",
+        "final_usage": "passed",
+        "request_log": "passed"
+      }
+    }
+  }
+}
+```
 
 ## 入口维度
 
@@ -66,10 +97,10 @@ node scripts/smoke/code-agent-matrix-summary.mjs
 ```bash
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 STREAM_PROBE=1 scripts/smoke/router-market-smoke.sh
-REQUIRE_STREAM_USAGE=1 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
+MATRIX_LIVE_EVIDENCE_FILE=/private/code-agent-live-evidence.json REQUIRE_STREAM_USAGE=1 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 ```
 
-无真实 provider/token 时，`scripts/smoke/code-agent-regression.sh` 只跑 proxy/account contract 和可用的本地 server capability 检查；direct/market/real provider 请求会输出 skipped 或 warning，不标记真实成功。
+无真实 provider/token 时，`scripts/smoke/code-agent-regression.sh` 会运行 proxy、account domain、OAuth client、Web UI 和协议审计合同，以及可用的本地 server capability 检查；direct/market/real provider 请求会输出 skipped 或 warning，不标记真实成功。每个 Rust 过滤器会先执行 `--list` 并强制要求至少命中一条测试。
 
 stream 分支统一使用 `scripts/smoke/stream-probe.mjs`，只保存状态码、首块耗时、chunk/byte 计数、done/usage 标记和最多 2KB preview，不保存完整 stream 响应。默认要求看到结束事件；`REQUIRE_STREAM_USAGE=1` 时才把 usage 标记作为硬通过条件。
 

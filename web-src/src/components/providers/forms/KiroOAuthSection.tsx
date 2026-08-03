@@ -5,7 +5,6 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   Select,
@@ -33,6 +32,11 @@ import {
 import { useKiroOauth } from "./hooks/useKiroOauth";
 import { copyText } from "@/lib/clipboard";
 import { authApi } from "@/lib/api";
+import {
+  logoutAccountsAndClearSelection,
+  removeAccountAndUpdateSelection,
+} from "./accountSelectionActions";
+import { ManagedAuthStatusNotice } from "./ManagedAuthStatusNotice";
 
 interface KiroOAuthSectionProps {
   className?: string;
@@ -48,7 +52,6 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
   showLoggedInAccounts = false,
 }) => {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const [copied, setCopied] = React.useState(false);
   const [copiedCode, setCopiedCode] = React.useState(false);
   const [importMode, setImportMode] = React.useState<
@@ -61,6 +64,9 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
   const {
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     pollingState,
     deviceCode,
     error,
@@ -73,9 +79,10 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
     addAccount,
     addSocialAccount,
     cancelAuth,
-    logout,
-    removeAccount,
+    logoutAsync,
+    removeAccountAsync,
     setDefaultAccount,
+    invalidateAccountViews,
     refetchStatus,
   } = useKiroOauth();
 
@@ -86,16 +93,31 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
   const accountDisplayName = (account: {
     email?: string | null;
     login: string;
-  }) =>
-    account.email || account.login;
+  }) => account.email || account.login;
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const copyVerificationUrl = async () => {
@@ -113,10 +135,7 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
   };
 
   const finishImport = async (accountId: string) => {
-    await refetchStatus();
-    await queryClient.invalidateQueries({
-      queryKey: ["managed-auth-status", "kiro_oauth"],
-    });
+    await invalidateAccountViews();
     onAccountSelect?.(accountId);
     setImportMode(null);
     toast.success(
@@ -183,6 +202,21 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
       setIsImporting(false);
     }
   };
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <ManagedAuthStatusNotice
+        className={className}
+        title={t("kiroOauth.authStatus", {
+          defaultValue: "Kiro OAuth 认证",
+        })}
+        error={error}
+        isError={isStatusError}
+        isFetching={isFetchingStatus}
+        onRetry={() => void refetchStatus()}
+      />
+    );
+  }
 
   return (
     <div className={`space-y-4 ${className || ""}`}>
@@ -416,9 +450,7 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
             variant="ghost"
             size="sm"
             onClick={() =>
-              setImportMode((mode) =>
-                mode === "api-key" ? null : "api-key",
-              )
+              setImportMode((mode) => (mode === "api-key" ? null : "api-key"))
             }
             disabled={isImporting}
           >
@@ -596,31 +628,33 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
         </div>
       )}
 
-      {pollingState === "error" && error && (
+      {error && (
         <div className="space-y-2">
           <p className="text-sm text-red-500">{error}</p>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              onClick={addAccount}
-              variant="outline"
-              size="sm"
-            >
-              {t("kiroOauth.retry", {
-                defaultValue: "重试",
-              })}
-            </Button>
-            <Button
-              type="button"
-              onClick={cancelAuth}
-              variant="ghost"
-              size="sm"
-            >
-              {t("common.cancel", {
-                defaultValue: "取消",
-              })}
-            </Button>
-          </div>
+          {pollingState === "error" && (
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={addAccount}
+                variant="outline"
+                size="sm"
+              >
+                {t("kiroOauth.retry", {
+                  defaultValue: "重试",
+                })}
+              </Button>
+              <Button
+                type="button"
+                onClick={cancelAuth}
+                variant="ghost"
+                size="sm"
+              >
+                {t("common.cancel", {
+                  defaultValue: "取消",
+                })}
+              </Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -628,7 +662,8 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
         <Button
           type="button"
           variant="outline"
-          onClick={logout}
+          onClick={() => void handleLogout()}
+          disabled={isAddingAccount || isImporting}
           className="w-full text-red-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950"
         >
           <LogOut className="mr-2 h-4 w-4" />

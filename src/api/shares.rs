@@ -297,7 +297,7 @@ fn validate_share_provider_reference(
     Ok(())
 }
 
-fn map_credential_source_error(
+pub(in crate::api) fn map_credential_source_error(
     error: crate::domain::sharing::credential_source::CredentialSourceError,
 ) -> ApiError {
     use crate::domain::sharing::credential_source::CredentialSourceError;
@@ -512,6 +512,9 @@ pub(in crate::api) async fn remove_share_binding(
                         input.expected_config_revision
                     ),
                 ));
+            }
+            Err(crate::state::ConditionalShareDeleteError::InFlight) => {
+                return Err(share_delete_in_flight_error());
             }
         };
         crate::state::stop_share_tunnel(&state, &id).await;
@@ -836,7 +839,10 @@ pub(in crate::api) async fn delete_share(
     let tombstone = state
         .delete_share_immediate(&id)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?
+        .map_err(|error| match error {
+            crate::state::ShareDeleteError::InFlight => share_delete_in_flight_error(),
+        })?;
     if let Some(tombstone) = tombstone.as_ref() {
         crate::state::stop_share_tunnel(&state, &id).await;
         spawn_share_delete_sync(state.clone(), tombstone.clone());
@@ -850,6 +856,13 @@ pub(in crate::api) async fn delete_share(
         ok: true,
         deleted: tombstone.is_some(),
     }))
+}
+
+fn share_delete_in_flight_error() -> ApiError {
+    ApiError::conflict_code(
+        "cc_switch_share_in_flight",
+        "Share cannot be deleted while requests are in flight",
+    )
 }
 
 pub(in crate::api) async fn pause_share(

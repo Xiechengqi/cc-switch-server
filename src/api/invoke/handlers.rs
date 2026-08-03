@@ -1,7 +1,8 @@
 use super::super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::domain::providers::current_provider;
+use crate::domain::accounts::store::AccountStore;
+use crate::domain::providers::runtime::authoritative_managed_account;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::router_contract::{
@@ -157,12 +158,18 @@ pub(in crate::api) async fn web_proxy_target_provider_ids(
     app: AppKind,
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
-    let mut ids = HashSet::new();
-    let ui_settings = state.ui_settings.read().await.for_frontend();
-    if let Some(current) = current_provider::read_current_provider_id(&ui_settings, app) {
-        ids.insert(current);
-    }
-    ids
+    state
+        .providers
+        .read()
+        .await
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider.app == app
+                && crate::domain::providers::bundle::surface_enabled(&provider.provider)
+        })
+        .map(|provider| provider.provider.id.clone())
+        .collect::<HashSet<_>>()
 }
 
 pub(in crate::api) fn map_provider_test_to_stream_check_result(
@@ -319,6 +326,11 @@ pub(in crate::api) async fn web_provider_quota(
             account.id.clone()
         }
     };
+    let account = state
+        .find_account_by_id(&account_id)
+        .await
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
+    ensure_provider_quota_account_type(&account, provider_type)?;
     let response = account_quota(
         State(state.clone()),
         headers.clone(),
@@ -340,6 +352,19 @@ pub(in crate::api) async fn web_provider_quota(
     ))
 }
 
+fn ensure_provider_quota_account_type(
+    account: &Account,
+    expected_provider_type: ProviderType,
+) -> Result<(), ApiError> {
+    if account.provider_type == expected_provider_type {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "account does not belong to {}",
+        managed_auth_provider_label(expected_provider_type)
+    )))
+}
+
 pub(in crate::api) async fn web_cached_oauth_quota(
     state: &ServerState,
     headers: &HeaderMap,
@@ -353,18 +378,28 @@ pub(in crate::api) async fn web_cached_oauth_quota(
     let Some(account_id) = account_id else {
         return Ok(Value::Null);
     };
+    let expected_auth_identity_generation = web_optional_u64(
+        args,
+        &["authIdentityGeneration", "auth_identity_generation"],
+    );
+    let account = state
+        .find_account_by_id(&account_id)
+        .await
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
     if let Some(expected_provider_type) = expected_provider_type {
-        let actual_provider_type = state
-            .find_account_by_id(&account_id)
-            .await
-            .map(|account| account.provider_type)
-            .ok_or_else(|| ApiError::not_found("account not found"))?;
-        if actual_provider_type != expected_provider_type {
+        if account.provider_type != expected_provider_type {
             return Err(ApiError::bad_request(format!(
                 "account does not belong to {}",
                 managed_auth_provider_label(expected_provider_type)
             )));
         }
+    }
+    if expected_auth_identity_generation
+        .is_some_and(|expected| account.auth_identity_generation != expected)
+    {
+        return Err(ApiError::conflict(
+            "OAuth account identity changed; reload the Provider binding",
+        ));
     }
     let auth_provider = expected_provider_type
         .map(|provider_type| managed_auth_provider_label(provider_type).to_string())
@@ -386,6 +421,13 @@ pub(in crate::api) async fn web_cached_oauth_quota(
     let Some(account) = state.find_account_by_id(&account_id).await else {
         return Ok(Value::Null);
     };
+    if expected_auth_identity_generation
+        .is_some_and(|expected| account.auth_identity_generation != expected)
+    {
+        return Err(ApiError::conflict(
+            "OAuth account identity changed while quota was loading",
+        ));
+    }
     Ok(cached_oauth_quota_from_response(
         &auth_provider,
         &account,
@@ -409,9 +451,7 @@ pub(in crate::api) async fn web_subscription_quota(
     };
     let account_id = {
         let accounts = state.accounts.read().await;
-        accounts
-            .find_for_provider(provider_type, None)
-            .map(|account| account.id.clone())
+        managed_auth_default_account_id(&accounts, provider_type).map(str::to_string)
     };
     let Some(account_id) = account_id else {
         return Ok(subscription_quota_not_found(tool));
@@ -455,15 +495,8 @@ pub(in crate::api) async fn web_resolve_account_id(
                 .cloned()
         };
         if let Some(provider) = provider {
-            let account_id_hint = provider
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref());
             let accounts = state.accounts.read().await;
-            return Ok(accounts
-                .find_for_provider(provider.provider_type, account_id_hint)
+            return Ok(authoritative_managed_account(&provider, &accounts)
                 .map(|account| account.id.clone()));
         }
     }
@@ -928,6 +961,499 @@ pub(in crate::api) async fn web_update_share_acl(
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(state, "share.changed", &share, "acl_replaced");
     Ok(share)
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SaveProviderBundleShareCommand {
+    bundle_id: String,
+    #[serde(default)]
+    share_id: Option<String>,
+    #[serde(default)]
+    expected_config_revision: Option<u64>,
+    enabled: bool,
+    subdomain: String,
+    #[serde(default)]
+    description: Option<String>,
+    for_sale: String,
+    token_limit: i64,
+    parallel_limit: i64,
+    expires_at: String,
+    #[serde(default)]
+    shared_with_emails: Vec<String>,
+}
+
+fn provider_bundle_share_conflict(message: impl Into<String>) -> ApiError {
+    ApiError::conflict_code("cc_switch_provider_bundle_share_conflict", message)
+}
+
+fn provider_bundle_share_target<'a>(
+    store: &'a ShareStore,
+    bundle_keys: &BTreeSet<(AppKind, String)>,
+    command: &SaveProviderBundleShareCommand,
+) -> Result<Option<&'a Share>, ApiError> {
+    let mut matches = store.shares.iter().filter(|share| {
+        share.status != "deleted"
+            && share
+                .bindings
+                .iter()
+                .any(|binding| bundle_keys.contains(&(binding.app, binding.provider_id.clone())))
+    });
+    let current = matches.next();
+    if matches.next().is_some() {
+        return Err(provider_bundle_share_conflict(
+            "Provider Bundle is referenced by more than one Share",
+        ));
+    }
+    match current {
+        Some(current) => {
+            if command.share_id.as_deref() != Some(current.id.as_str()) {
+                return Err(provider_bundle_share_conflict(
+                    "Provider Bundle Share changed since this editor was opened",
+                ));
+            }
+            let expected = command.expected_config_revision.ok_or_else(|| {
+                provider_bundle_share_conflict(
+                    "expectedConfigRevision is required for an existing Provider Bundle Share",
+                )
+            })?;
+            if current.config_revision != expected {
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    format!(
+                        "Share changed since this editor was opened (expected revision {expected}, current revision {})",
+                        current.config_revision
+                    ),
+                ));
+            }
+            Ok(Some(current))
+        }
+        None => {
+            if command.share_id.is_some() || command.expected_config_revision.is_some() {
+                return Err(provider_bundle_share_conflict(
+                    "Provider Bundle Share no longer exists",
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn provider_bundle_share_limits(
+    command: &SaveProviderBundleShareCommand,
+) -> Result<(Option<u64>, Option<u32>), ApiError> {
+    let token_limit = match command.token_limit {
+        -1 => None,
+        value if value >= 0 => Some(value as u64),
+        _ => {
+            return Err(ApiError::bad_request(
+                "tokenLimit must be -1 or a non-negative integer",
+            ))
+        }
+    };
+    let parallel_limit = match command.parallel_limit {
+        -1 => None,
+        value if value >= 0 => Some(
+            u32::try_from(value)
+                .map_err(|_| ApiError::bad_request("parallelLimit exceeds the supported range"))?,
+        ),
+        _ => {
+            return Err(ApiError::bad_request(
+                "parallelLimit must be -1 or a non-negative integer",
+            ))
+        }
+    };
+    Ok((token_limit, parallel_limit))
+}
+
+fn provider_bundle_share_expiration(value: &str) -> Result<i64, ApiError> {
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .map(|value| value.timestamp_millis())
+        .map_err(|_| ApiError::bad_request("expiresAt must be an RFC3339 timestamp"))
+}
+
+fn provider_bundle_share_sale(value: &str) -> Result<(bool, bool), ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" => Ok((true, false)),
+        "no" => Ok((false, false)),
+        "free" => Ok((false, true)),
+        _ => Err(ApiError::bad_request("forSale must be Yes, No, or Free")),
+    }
+}
+
+fn normalized_provider_bundle_share_emails(emails: &[String], owner_email: &str) -> Vec<String> {
+    emails
+        .iter()
+        .map(|email| email.trim().to_ascii_lowercase())
+        .filter(|email| !email.is_empty() && !email.eq_ignore_ascii_case(owner_email))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_provider_bundle_share(
+    store: &mut ShareStore,
+    bundle_keys: &BTreeSet<(AppKind, String)>,
+    bindings: &[ShareBinding],
+    capacity_pool_id: &str,
+    bundle_name: &str,
+    owner_email: &str,
+    command: &SaveProviderBundleShareCommand,
+    create_share_id: Option<&str>,
+    usage: &crate::domain::usage::store::UsageStore,
+    applied_at_ms: i64,
+) -> Result<Option<Share>, ApiError> {
+    let current = provider_bundle_share_target(store, bundle_keys, command)?.cloned();
+    if current.is_none() && !command.enabled {
+        return Ok(None);
+    }
+    let (token_limit, parallel_limit) = provider_bundle_share_limits(command)?;
+    let expires_at = provider_bundle_share_expiration(&command.expires_at)?;
+    let (for_sale, free_access) = provider_bundle_share_sale(&command.for_sale)?;
+    let subdomain =
+        (!command.subdomain.trim().is_empty()).then(|| command.subdomain.trim().to_string());
+    let shared_with_emails =
+        normalized_provider_bundle_share_emails(&command.shared_with_emails, owner_email);
+    let description = command
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if let Some(current) = current {
+        let share = store
+            .replace_bundle_configuration_with_usage(
+                &current.id,
+                bindings.to_vec(),
+                capacity_pool_id.to_string(),
+                subdomain,
+                ShareSettingsPatch {
+                    description: Some(description),
+                    for_sale: Some(command.for_sale.clone()),
+                    shared_with_emails: Some(shared_with_emails),
+                    token_limit: Some(command.token_limit),
+                    parallel_limit: Some(command.parallel_limit),
+                    expires_at: Some(command.expires_at.clone()),
+                    ..ShareSettingsPatch::default()
+                },
+                command.enabled,
+                usage,
+                applied_at_ms,
+            )
+            .map_err(map_share_patch_error)?;
+        return Ok(Some(share));
+    }
+
+    let primary = bindings
+        .first()
+        .expect("Provider Bundle has at least one enabled Surface");
+    let share = store
+        .upsert_with_capacity(
+            UpsertShareInput {
+                id: create_share_id.map(str::to_string),
+                owner_email: Some(owner_email.to_string()),
+                app: primary.app,
+                provider_id: primary.provider_id.clone(),
+                provider_type: primary.provider_type,
+                display_name: Some(bundle_name.to_string()),
+                enabled: Some(true),
+                status: Some("active".to_string()),
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: subdomain,
+                acl: Some(ShareAcl {
+                    shared_with_emails,
+                    public_market_email: None,
+                    market_access_mode: Some("selected".to_string()),
+                }),
+                token_limit,
+                parallel_limit,
+                expires_at: Some(expires_at),
+                for_sale: Some(for_sale),
+                free_access: Some(free_access),
+                access_by_app: BTreeMap::new(),
+                app_settings: BTreeMap::new(),
+                for_sale_official_price_percent_by_app: BTreeMap::new(),
+                official_price_percent: None,
+                auto_start: Some(true),
+                description,
+                bindings: bindings.to_vec(),
+                runtime_snapshot: None,
+                user_grants: BTreeMap::new(),
+            },
+            Some(capacity_pool_id.to_string()),
+        )
+        .map_err(map_share_patch_error)?;
+    store
+        .rebuild_user_anchored_usage(&share.id, usage, applied_at_ms)
+        .map_err(map_share_patch_error)?;
+    Ok(Some(store.get(&share.id).cloned().expect(
+        "new Provider Bundle Share remains in the candidate store",
+    )))
+}
+
+pub(in crate::api) async fn web_save_provider_bundle_share(
+    state: &ServerState,
+    args: &Value,
+) -> Result<Option<Share>, ApiError> {
+    let value = web_payload(args, &["params", "input"]);
+    let command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
+        .map_err(ApiError::bad_request)?;
+    if command.bundle_id.trim().is_empty() || command.bundle_id != command.bundle_id.trim() {
+        return Err(ApiError::bad_request(
+            "bundleId must be non-empty and trimmed",
+        ));
+    }
+    if command
+        .share_id
+        .as_deref()
+        .is_some_and(|share_id| share_id.trim().is_empty() || share_id != share_id.trim())
+    {
+        return Err(ApiError::bad_request(
+            "shareId must be non-empty and trimmed",
+        ));
+    }
+    provider_bundle_share_limits(&command)?;
+    provider_bundle_share_expiration(&command.expires_at)?;
+    provider_bundle_share_sale(&command.for_sale)?;
+
+    let config = state.config.read().await.clone();
+    let owner_email = config
+        .owner
+        .email
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?
+        .to_string();
+    let reference_guard = state.lock_reference_mutations().await;
+    let providers = state.providers.read().await.clone();
+    let accounts = state.accounts.read().await.clone();
+    let usage = state.usage.read().await.clone();
+    let shares = state.shares.read().await.clone();
+
+    let surfaces = providers
+        .providers
+        .iter()
+        .filter(|stored| {
+            crate::domain::providers::bundle::is_explicit_bundle_surface(&stored.provider)
+                && crate::domain::providers::bundle::bundle_id(&stored.provider)
+                    == command.bundle_id
+        })
+        .collect::<Vec<_>>();
+    if surfaces.is_empty() {
+        return Err(ApiError::not_found("Provider Bundle not found"));
+    }
+    let bundle_name = surfaces[0].provider.name.clone();
+    let bundle_keys = surfaces
+        .iter()
+        .map(|stored| (stored.app, stored.provider.id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut bindings = surfaces
+        .iter()
+        .filter(|stored| crate::domain::providers::bundle::surface_enabled(&stored.provider))
+        .map(|stored| ShareBinding {
+            app: stored.app,
+            provider_id: stored.provider.id.clone(),
+            provider_type: stored.provider_type,
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| binding.app);
+    if bindings.is_empty() {
+        return Err(provider_bundle_share_conflict(
+            "Provider Bundle has no enabled Surface",
+        ));
+    }
+    let root_key =
+        crate::infra::credentials::load_root_key(&state.config_dir).map_err(ApiError::internal)?;
+    let capacity_pool_id =
+        crate::domain::sharing::credential_source::capacity_pool_id_for_bindings(
+            &providers,
+            &accounts,
+            &bindings,
+            &root_key.key,
+        )
+        .map_err(map_credential_source_error)?;
+
+    let previous = provider_bundle_share_target(&shares, &bundle_keys, &command)?.cloned();
+    let mut staged = shares.clone();
+    let staged_share = stage_provider_bundle_share(
+        &mut staged,
+        &bundle_keys,
+        &bindings,
+        &capacity_pool_id,
+        &bundle_name,
+        &owner_email,
+        &command,
+        None,
+        &usage,
+        crate::infra::time::now_ms() as i64,
+    )?;
+    if staged_share.is_none() {
+        return Ok(None);
+    }
+    crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+        &providers,
+        &accounts,
+        &shares,
+        &providers,
+        &accounts,
+        &staged,
+    )
+    .map_err(map_subscription_binding_error)?;
+    let staged_share = staged_share.expect("staged Provider Bundle Share exists");
+    let create_share_id = previous.is_none().then_some(staged_share.id.clone());
+    let subdomain_changed = previous
+        .as_ref()
+        .and_then(|share| share.tunnel_subdomain.as_deref())
+        != staged_share.tunnel_subdomain.as_deref();
+    let was_running = previous
+        .as_ref()
+        .is_some_and(crate::state::should_restore_share_tunnel);
+
+    let mut remote_subdomain_claimed = false;
+    if subdomain_changed && previous.is_some() && config.has_registered_router_identity() {
+        let descriptor = descriptor_for_share_with_accounts_and_usage(
+            &staged_share,
+            &providers,
+            Some(&accounts),
+            Some(&usage),
+        );
+        let http_client = state.http_client().await;
+        if let Err(error) =
+            crate::clients::router::client::claim_share_subdomain(&http_client, &config, descriptor)
+                .await
+        {
+            if let Err(reconcile_error) =
+                crate::state::reconcile_router_share_after_failed_claim(state, &staged_share.id)
+                    .await
+            {
+                tracing::warn!(
+                    share_id = %staged_share.id,
+                    error = %reconcile_error,
+                    "Router Share reconciliation after an uncertain Bundle subdomain claim failed"
+                );
+            }
+            return Err(ApiError::bad_gateway(error.to_string()));
+        }
+        remote_subdomain_claimed = true;
+    }
+
+    let command_for_commit = command.clone();
+    let bundle_keys_for_commit = bundle_keys.clone();
+    let bindings_for_commit = bindings.clone();
+    let capacity_pool_id_for_commit = capacity_pool_id.clone();
+    let bundle_name_for_commit = bundle_name.clone();
+    let owner_email_for_commit = owner_email.clone();
+    let providers_for_commit = providers.clone();
+    let accounts_for_commit = accounts.clone();
+    let saved = match state
+        .try_mutate_share_quota_immediate(|store, current_usage, applied_at_ms| {
+            let current = store.clone();
+            let saved = stage_provider_bundle_share(
+                store,
+                &bundle_keys_for_commit,
+                &bindings_for_commit,
+                &capacity_pool_id_for_commit,
+                &bundle_name_for_commit,
+                &owner_email_for_commit,
+                &command_for_commit,
+                create_share_id.as_deref(),
+                current_usage,
+                applied_at_ms,
+            )?;
+            crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
+                &providers_for_commit,
+                &accounts_for_commit,
+                &current,
+                &providers_for_commit,
+                &accounts_for_commit,
+                store,
+            )
+            .map_err(map_subscription_binding_error)?;
+            saved.ok_or_else(|| {
+                provider_bundle_share_conflict(
+                    "Provider Bundle Share disappeared before it could be committed",
+                )
+            })
+        })
+        .await
+    {
+        Ok(Ok(saved)) => saved,
+        Ok(Err(error)) => {
+            if remote_subdomain_claimed {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(state, &staged_share.id)
+                        .await
+                {
+                    tracing::warn!(
+                        share_id = %staged_share.id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after a rejected Bundle Share save failed"
+                    );
+                }
+            }
+            return Err(error);
+        }
+        Err(error) => {
+            if remote_subdomain_claimed {
+                if let Err(reconcile_error) =
+                    crate::state::reconcile_router_share_after_failed_claim(state, &staged_share.id)
+                        .await
+                {
+                    tracing::warn!(
+                        share_id = %staged_share.id,
+                        error = %reconcile_error,
+                        "Router Share reconciliation after a failed Bundle Share commit failed"
+                    );
+                }
+            }
+            return Err(ApiError::internal(error));
+        }
+    };
+    drop(reference_guard);
+
+    if !crate::state::should_restore_share_tunnel(&saved) {
+        if was_running {
+            crate::state::stop_share_tunnel(state, &saved.id).await;
+        }
+    } else if subdomain_changed && previous.is_some() {
+        crate::state::force_reconnect_share_tunnel(
+            state.clone(),
+            saved.id.clone(),
+            "provider_bundle_share_subdomain_changed",
+        )
+        .await;
+    } else {
+        crate::state::ensure_share_tunnel_running_for(
+            state.clone(),
+            &saved.id,
+            "provider_bundle_share_saved",
+        )
+        .await;
+    }
+    if let Err(error) = crate::api::router::sync_share_upsert(state.clone(), saved.clone()).await {
+        tracing::warn!(
+            share_id = %saved.id,
+            %error,
+            "Provider Bundle Share was saved locally; Router sync remains pending"
+        );
+    }
+    let saved = state
+        .shares
+        .read()
+        .await
+        .get(&saved.id)
+        .cloned()
+        .unwrap_or(saved);
+    emit_share_event(
+        state,
+        "share.changed",
+        &saved,
+        "provider_bundle_share_saved",
+    );
+    Ok(Some(saved))
 }
 
 pub(in crate::api) async fn web_save_provider_share(
@@ -1620,22 +2146,21 @@ pub(in crate::api) fn web_runtime_auth_methods(config: &ServerConfig) -> Vec<&'s
 
 pub(in crate::api) async fn web_proxy_takeover_status_json(state: &ServerState) -> Value {
     let providers = state.providers.read().await;
-    let ui_settings = state.ui_settings.read().await.for_frontend();
-
     fn app_takeover(
         providers: &crate::domain::providers::store::ProviderStore,
-        ui_settings: &Value,
         app: AppKind,
     ) -> (bool, bool) {
-        let has_provider =
-            current_provider::resolve_current_provider_id(providers, ui_settings, app).is_some();
+        let has_provider = providers.providers.iter().any(|provider| {
+            provider.app == app
+                && crate::domain::providers::bundle::surface_enabled(&provider.provider)
+        });
         // Server-native routing is always on for the three core apps.
         (has_provider, !has_provider)
     }
 
-    let (claude, claude_pending) = app_takeover(&providers, &ui_settings, AppKind::Claude);
-    let (codex, codex_pending) = app_takeover(&providers, &ui_settings, AppKind::Codex);
-    let (gemini, gemini_pending) = app_takeover(&providers, &ui_settings, AppKind::Gemini);
+    let (claude, claude_pending) = app_takeover(&providers, AppKind::Claude);
+    let (codex, codex_pending) = app_takeover(&providers, AppKind::Codex);
+    let (gemini, gemini_pending) = app_takeover(&providers, AppKind::Gemini);
 
     json!({
         "claude": claude,
@@ -1659,25 +2184,17 @@ pub(in crate::api) async fn web_is_live_takeover_active(state: &ServerState) -> 
 
 pub(in crate::api) async fn web_proxy_status_json(state: &ServerState) -> Value {
     let providers = state.providers.read().await;
-    let ui_settings = state.ui_settings.read().await.for_frontend();
     let mut active_targets = Vec::new();
-    for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-        let Some(provider_id) =
-            current_provider::resolve_current_provider_id(&providers, &ui_settings, app)
-        else {
-            continue;
-        };
-        let Some(stored) = providers
-            .providers
-            .iter()
-            .find(|provider| provider.app == app && provider.provider.id == provider_id)
-        else {
-            continue;
-        };
+    for stored in providers
+        .providers
+        .iter()
+        .filter(|provider| crate::domain::providers::bundle::surface_enabled(&provider.provider))
+    {
         active_targets.push(json!({
-            "app_type": app.as_str(),
-            "provider_id": provider_id,
+            "app_type": stored.app.as_str(),
+            "provider_id": stored.provider.id,
             "provider_name": stored.provider.name,
+            "route_key": crate::domain::providers::bundle::route_key(&stored.provider),
         }));
     }
 
@@ -1691,8 +2208,6 @@ pub(in crate::api) async fn web_proxy_status_json(state: &ServerState) -> Value 
         "failed_requests": 0,
         "success_rate": 100.0,
         "uptime_seconds": state.started_at.elapsed().as_secs(),
-        "current_provider": active_targets.first().and_then(|target| target.get("provider_name")).cloned().unwrap_or(Value::Null),
-        "current_provider_id": active_targets.first().and_then(|target| target.get("provider_id")).cloned().unwrap_or(Value::Null),
         "last_request_at": Value::Null,
         "last_error": Value::Null,
         "active_targets": active_targets,
@@ -2133,8 +2648,10 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::ClaudeOAuth => "claude_oauth",
         ProviderType::GeminiCli => "google_gemini_oauth",
         ProviderType::AntigravityOAuth => "antigravity_oauth",
+        ProviderType::AgyOAuth => "agy_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::DeepSeekAccount => "deepseek_account",
         _ => "unknown",
     }
 }
@@ -2156,6 +2673,132 @@ pub(in crate::api) fn account_is_authenticated(account: &Account) -> bool {
 
 pub(in crate::api) fn account_authenticated_at(account: &Account) -> i64 {
     account.quota_refreshed_at.unwrap_or(0)
+}
+
+pub(in crate::api) fn deepseek_account_status_json(accounts: &AccountStore) -> Value {
+    let matching = accounts
+        .accounts
+        .iter()
+        .filter(|account| account.provider_type == ProviderType::DeepSeekAccount)
+        .collect::<Vec<_>>();
+    let default_account_id = matching.first().map(|account| account.id.as_str());
+    let mapped = matching
+        .iter()
+        .map(|account| deepseek_account_json(account, default_account_id))
+        .collect::<Vec<_>>();
+    json!({
+        "authenticated": matching
+            .iter()
+            .any(|account| account_is_authenticated(account)),
+        "default_account_id": default_account_id,
+        "accounts": mapped,
+    })
+}
+
+pub(in crate::api) fn deepseek_account_json(
+    account: &Account,
+    default_account_id: Option<&str>,
+) -> Value {
+    json!({
+        "id": account.id,
+        "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
+        "authenticated_at": account_authenticated_at(account),
+        "is_default": default_account_id == Some(account.id.as_str()),
+        "has_password": false,
+        "credential_kind": "access_token",
+    })
+}
+
+#[cfg(test)]
+mod managed_auth_provider_label_tests {
+    use super::*;
+
+    #[test]
+    fn agy_and_antigravity_keep_distinct_auth_provider_labels() {
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::AntigravityOAuth),
+            "antigravity_oauth"
+        );
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::AgyOAuth),
+            "agy_oauth"
+        );
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::DeepSeekAccount),
+            "deepseek_account"
+        );
+    }
+
+    #[test]
+    fn deepseek_status_maps_real_account_store_records() {
+        let accounts: AccountStore = serde_json::from_value(json!({
+            "accounts": [
+                {
+                    "id": "deepseek-1",
+                    "providerType": "deepseek_account",
+                    "email": "owner@example.com",
+                    "accessToken": "deepseek-token"
+                },
+                {
+                    "id": "codex-1",
+                    "providerType": "codex_oauth",
+                    "accessToken": "codex-token"
+                }
+            ]
+        }))
+        .expect("account store");
+
+        let status = deepseek_account_status_json(&accounts);
+
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["default_account_id"], "deepseek-1");
+        assert_eq!(status["accounts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(status["accounts"][0]["id"], "deepseek-1");
+        assert_eq!(status["accounts"][0]["login"], "owner@example.com");
+        assert_eq!(status["accounts"][0]["is_default"], true);
+        assert_eq!(status["accounts"][0]["has_password"], false);
+        assert_eq!(status["accounts"][0]["credential_kind"], "access_token");
+    }
+
+    #[test]
+    fn codex_default_account_uses_explicit_active_selection() {
+        let accounts: AccountStore = serde_json::from_value(json!({
+            "accounts": [
+                {
+                    "id": "codex-first",
+                    "providerType": "codex_oauth",
+                    "accessToken": "first-token"
+                },
+                {
+                    "id": "codex-active",
+                    "providerType": "codex_oauth",
+                    "accessToken": "active-token"
+                }
+            ],
+            "activeCodexOauthAccountId": "codex-active"
+        }))
+        .expect("account store");
+
+        assert_eq!(
+            managed_auth_default_account_id(&accounts, ProviderType::CodexOAuth),
+            Some("codex-active")
+        );
+    }
+
+    #[test]
+    fn provider_quota_rejects_an_account_from_another_auth_provider() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "gemini-account",
+            "providerType": "gemini_cli",
+            "accessToken": "gemini-token"
+        }))
+        .expect("account");
+
+        let error = ensure_provider_quota_account_type(&account, ProviderType::CodexOAuth)
+            .expect_err("Codex quota must reject a Gemini account id");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("codex_oauth"));
+    }
 }
 
 pub(in crate::api) fn managed_auth_default_account_id(
@@ -2221,8 +2864,10 @@ pub(in crate::api) fn map_managed_auth_account(
     json!({
         "id": account.id,
         "provider": provider_label,
+        "authIdentityGeneration": account.auth_identity_generation,
         "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
         "email": account.email,
+        "subscriptionLevel": account.subscription_level,
         "avatar_url": Value::Null,
         "authenticated_at": account_authenticated_at(account),
         "is_default": default_account_id == Some(account.id.as_str()),
@@ -2567,6 +3212,7 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                     .strip_prefix("cli:")
                     .unwrap_or(device_code.as_str())
             });
+            let managed_auth_operation = state.lock_managed_auth_operations().await;
             let poll_status = state
                 .mutate_oauth_logins(|store| {
                     store.poll_state_for_principal(
@@ -2577,6 +3223,7 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                     )
                 })
                 .await;
+            drop(managed_auth_operation);
             match poll_status {
                 Ok(OAuthSessionPollState::Pending) => return Ok(Value::Null),
                 Err(OAuthLoginError::NotFound) => {
@@ -2651,7 +3298,19 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
         provider_type,
         ProviderType::GitHubCopilot | ProviderType::KiroOAuth
     ) {
-        return Ok(json!({"ok": true, "cancelled": false}));
+        let principal = require_web_admin_session(&state, &headers).await?;
+        let managed_auth_operation = state.lock_managed_auth_operations().await;
+        let cancelled = state
+            .remove_device_flow_for_principal_under_managed_auth_guard(
+                &managed_auth_operation,
+                provider_type,
+                &device_code,
+                &principal.oauth_binding_id(),
+                now_ms() as i64,
+            )
+            .await;
+        drop(managed_auth_operation);
+        return Ok(json!({"ok": true, "cancelled": cancelled}));
     }
     let manual_session_id = device_code.strip_prefix("manual:").map(str::to_string);
     let oauth_state = manual_session_id.is_none().then(|| {
@@ -3032,8 +3691,10 @@ pub(in crate::api) async fn web_managed_auth_logout(
     headers: HeaderMap,
     args: &Value,
 ) -> Result<Value, ApiError> {
-    require_session(&state, &headers).await?;
+    let principal = require_web_admin_session(&state, &headers).await?;
     let provider_type = web_auth_provider_type(args)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let reference_guard = state.lock_reference_mutations().await;
     let account_ids = state
         .accounts
         .read()
@@ -3043,9 +3704,54 @@ pub(in crate::api) async fn web_managed_auth_logout(
         .filter(|account| account.provider_type == provider_type)
         .map(|account| account.id.clone())
         .collect::<Vec<_>>();
-    for account_id in account_ids {
-        let _ = delete_account(State(state.clone()), headers.clone(), Path(account_id)).await?;
+    let account_id_set = account_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let provider_keys = state
+        .providers
+        .read()
+        .await
+        .providers
+        .iter()
+        .filter(|stored| {
+            crate::domain::providers::runtime::managed_account_binding(stored).is_some_and(
+                |(account_provider_type, account_id)| {
+                    account_provider_type == provider_type && account_id_set.contains(account_id)
+                },
+            )
+        })
+        .map(|stored| (stored.app, stored.provider.id.clone()))
+        .collect::<BTreeSet<_>>();
+    if !provider_keys.is_empty() {
+        return Err(ApiError::conflict_code(
+            "cc_switch_account_in_use",
+            format!(
+                "account is still referenced by {} Provider(s)",
+                provider_keys.len()
+            ),
+        ));
     }
+    if !account_ids.is_empty() {
+        state
+            .try_mutate_accounts_immediate_under_reference_guard(|store| {
+                for account_id in &account_ids {
+                    manager_for(provider_type)
+                        .revoke_or_delete(store, account_id)
+                        .map_err(ApiError::bad_request)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(map_account_write_error)??;
+    }
+    state
+        .cancel_managed_auth_for_principal_under_operation_guard(
+            &managed_auth_operation,
+            provider_type,
+            &principal.oauth_binding_id(),
+            now_ms() as i64,
+        )
+        .await;
+    drop(reference_guard);
+    drop(managed_auth_operation);
     Ok(Value::Null)
 }
 

@@ -20,6 +20,7 @@
     "notInstalled": "未安裝",
     "success": "成功",
     "error": "錯誤",
+    "authStatusLoadFailed": "無法載入認證狀態。",
     "unknown": "未知",
     "enterValidValue": "請輸入有效的內容",
     "clear": "清除",
@@ -126,15 +127,15 @@
     },
     "share": {
       "ownerNotConfigured": "請先設定 Client Owner",
-  "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。",
-  "reuseTitle": "發現同一帳號或 API key 的遠端分享",
-  "reuseDescription": "可以將目前應用加入既有連結，也可以保留為新的獨立連結。",
-  "reuseTarget": "既有分享",
-  "reuseCheckbox": "復用既有 Share URL 和遠端分享設定",
-  "reuseSuccess": "已復用現有分享連結",
-  "reuseError": "復用分享連結失敗：{{error}}",
-  "removeBindingSuccess": "已停止該應用的遠端分享",
-  "removeBindingError": "停止遠端分享失敗：{{error}}",
+      "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。",
+      "reuseTitle": "發現同一帳號或 API key 的遠端分享",
+      "reuseDescription": "可以將目前應用加入既有連結，也可以保留為新的獨立連結。",
+      "reuseTarget": "既有分享",
+      "reuseCheckbox": "復用既有 Share URL 和遠端分享設定",
+      "reuseSuccess": "已復用現有分享連結",
+      "reuseError": "復用分享連結失敗：{{error}}",
+      "removeBindingSuccess": "已停止該應用的遠端分享",
+      "removeBindingError": "停止遠端分享失敗：{{error}}",
       "deleteShort": "刪除 Share",
       "deleteConfirmTitle": "刪除 Share",
       "deleteConfirmMessage": "刪除後該 Share 將從 Share 頁面移除，且無法復原。",
@@ -374,8 +375,12 @@
       "title": "OAuth 驗證中心",
       "description": "在 Claude Code 中使用您的其他訂閱，請注意合規風險。",
       "beta": "Beta",
+      "capabilityLoading": "正在載入帳號能力...",
+      "capabilityLoadFailed": "無法載入帳號能力，認證操作已暫停。",
       "copilotDescription": "管理 GitHub Copilot 帳號",
       "codexOauthDescription": "管理 ChatGPT 帳號",
+      "agyOauthTitle": "Agy OAuth",
+      "agyOauthDescription": "管理 Agy 訂閱帳號",
       "subscriptionExpiry": {
         "title": "訂閱到期日",
         "notSet": "尚未設定",
@@ -462,7 +467,7 @@
       },
       "proxy": {
         "title": "API 路由",
-        "description": "查看 Server API 路由狀態和目前 Provider",
+        "description": "查看 Server API 路由狀態和可路由的 Bundle Surface",
         "running": "執行中",
         "stopped": "已停止"
       },
@@ -1265,6 +1270,7 @@
     "activeAccountBadge": "目前反代：{{login}}",
     "selectionRequiredBadge": "需要選擇",
     "activeProxyAccount": "目前反代帳號",
+    "providerAccount": "供應商綁定帳號",
     "selectionRequired": "請選擇用於反代的 ChatGPT 帳號。",
     "selectAccount": "選擇帳號",
     "selectAccountPlaceholder": "選擇一個 ChatGPT 帳號",
@@ -2388,8 +2394,7 @@
     "panel": {
       "serviceAddress": "服務位址",
       "addressCopied": "位址已複製",
-      "currentProvider": "目前 Provider：",
-      "waitingFirstRequest": "目前 Provider：等待首次請求...",
+      "routableSurfaces": "可路由 Surface",
       "stoppedTitle": "路由服務已停止",
       "stoppedDescription": "使用上方開關即可啟動服務",
       "openSettings": "設定路由服務",
@@ -2791,10 +2796,12 @@
   },
   "deepseekAccount": {
     "authStatus": "DeepSeek 帳號",
-    "identifier": "電子郵件或手機號碼",
-    "identifierPlaceholder": "請輸入電子郵件或手機號碼",
-    "password": "密碼",
-    "addAccount": "新增帳號",
+    "identifier": "帳號標籤（可選）",
+    "identifierPlaceholder": "電子郵件、手機號碼或自訂名稱",
+    "accessToken": "Access Token",
+    "accessTokenPlaceholder": "貼上 DeepSeek access token",
+    "importAccount": "匯入帳號",
+    "importAnotherAccount": "匯入其他帳號",
     "loginRequired": "請先新增 DeepSeek 帳號",
     "selectAccountRequired": "DeepSeek Account 必須綁定一個 DeepSeek 帳號"
   },
@@ -2935,7 +2942,12 @@
       "notes": "備註"
     },
     "account": {
-      "title": "認證帳號"
+      "title": "認證帳號",
+      "loading": "託管帳號仍在載入中。",
+      "loadFailed": "無法載入託管帳號，請重試後再儲存。",
+      "selectedUnavailable": "所選託管帳號已無法使用。",
+      "identityChanged": "此帳號目前對應的認證身分已變更。儲存此供應商前需要明確重新綁定。",
+      "rebindIdentity": "重新綁定身分"
     },
     "aws": {
       "title": "AWS 憑據"
@@ -3020,6 +3032,8 @@
     "extraUsage": "超額用量",
     "expiredHint": "請執行 {{tool}} 命令重新整理登入",
     "queryFailed": "查詢失敗",
+    "credentialParseFailed": "憑據資料解析失敗",
+    "retryAfter": "{{time}} 後可重試",
     "refresh": "重新整理"
   },
   "terminal": {

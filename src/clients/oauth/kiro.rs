@@ -8,7 +8,10 @@ use crate::clients::oauth::kiro_device::{
     KIRO_AUTH_METHOD_API_KEY, KIRO_AUTH_METHOD_BUILDER_ID, KIRO_ISSUER_URL,
 };
 use crate::clients::oauth::refresh::AccountRefreshFailure;
-use crate::domain::accounts::oauth::{OAuthErrorKind, OAuthRequestBodyFormat, OAuthTokenResponse};
+use crate::domain::accounts::oauth::{
+    invalid_grant_requires_immediate_relogin, OAuthErrorKind, OAuthRequestBodyFormat,
+    OAuthTokenResponse,
+};
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate, UpsertAccountInput};
 use crate::domain::providers::model::ProviderType;
 
@@ -29,12 +32,16 @@ enum KiroAuthMethod {
     ApiKey,
 }
 
-pub async fn refresh_kiro_account(
+pub async fn refresh_kiro_account<F>(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
     quota_refresh_interval_ms: i64,
-) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    receipt_hook: &mut F,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure>
+where
+    F: FnMut(&AccountRefreshUpdate) -> Result<(), AccountRefreshFailure>,
+{
     if account.provider_type != ProviderType::KiroOAuth {
         return Err(AccountRefreshFailure::bad_request(format!(
             "expected kiro_oauth account, got {}",
@@ -53,6 +60,25 @@ pub async fn refresh_kiro_account(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AccountRefreshFailure::bad_request("kiro refresh token is required"))?;
+
+    #[cfg(test)]
+    if let Some(token_url) = test_oauth_token_url(account) {
+        let raw = post_json(http, token_url, &json!({ "refreshToken": refresh_token })).await?;
+        let token = parse_token_response(raw.clone(), "kiro test refresh")?;
+        return update_from_kiro_token_response(
+            account,
+            KiroRefreshResult {
+                token,
+                raw,
+                client_update: None,
+            },
+            now_ms,
+            quota_refresh_interval_ms,
+            http,
+            receipt_hook,
+        )
+        .await;
+    }
 
     let missing_oidc_client = matches!(method, KiroAuthMethod::BuilderId | KiroAuthMethod::Idc)
         && (string_from_account(account, &["/clientId", "/client_id"]).is_none()
@@ -76,14 +102,15 @@ pub async fn refresh_kiro_account(
         Err(error) => Err(error),
     }?;
 
-    Ok(update_from_kiro_token_response(
+    update_from_kiro_token_response(
         account,
         token_result,
         now_ms,
         quota_refresh_interval_ms,
         http,
+        receipt_hook,
     )
-    .await)
+    .await
 }
 
 pub fn import_api_key(
@@ -270,7 +297,7 @@ fn upsert_from_credentials_entry(
         id: Some(account_id.clone()),
         provider_type: ProviderType::KiroOAuth,
         email: email.clone(),
-        access_token: Some(access_token),
+        access_token: Some(access_token.clone()),
         refresh_token: Some(refresh_token),
         id_token: string_at(entry, &["/idToken", "/id_token"]),
         token_type: Some("Bearer".to_string()),
@@ -446,13 +473,17 @@ async fn refresh_with_method(
     }
 }
 
-async fn update_from_kiro_token_response(
+async fn update_from_kiro_token_response<F>(
     account: &Account,
     result: KiroRefreshResult,
     now_ms: i64,
     quota_refresh_interval_ms: i64,
     http: &reqwest::Client,
-) -> AccountRefreshUpdate {
+    receipt_hook: &mut F,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure>
+where
+    F: FnMut(&AccountRefreshUpdate) -> Result<(), AccountRefreshFailure>,
+{
     let mut raw = object_value(account.raw.clone());
     insert_value(&mut raw, "tokenResponse", result.raw.clone());
     insert_value(&mut raw, "lastRefreshAtMs", json!(now_ms));
@@ -494,51 +525,13 @@ async fn update_from_kiro_token_response(
     .unwrap_or_else(|| default_profile_arn(&raw, &api_region_value));
     let machine_id = string_from_value(&raw, &["/machineId", "/machine_id"])
         .or_else(|| refresh_token.as_deref().map(machine_id_from_refresh_token));
-    let usage = if let Some(machine_id) = machine_id.as_deref() {
-        fetch_usage_limits(
-            http,
-            &api_region_value,
-            &profile_arn,
-            machine_id,
-            &access_token,
-            kiro_token_type_header(account),
-        )
-        .await
-        .ok()
-    } else {
-        None
-    };
-    if let Some(usage) = usage.as_ref() {
-        insert_value(&mut raw, "kiroUsageLimits", usage.clone());
-    }
-    let email = result
+    let token_email = result
         .token
         .extra
         .get("email")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            usage
-                .as_ref()
-                .and_then(find_email_in_value)
-                .map(str::to_string)
-        })
-        .or_else(|| account.email.clone());
-    let subscription_level = usage
-        .as_ref()
-        .and_then(|value| {
-            string_at(
-                value,
-                &[
-                    "/subscriptionInfo/subscriptionTitle",
-                    "/subscription_info/subscription_title",
-                ],
-            )
-        })
-        .or_else(|| account.subscription_level.clone());
-    let quota = usage
-        .clone()
-        .map(|value| quota_from_usage_limits(value, subscription_level.clone(), now_ms));
+        .map(str::to_string);
+    let email = token_email.clone().or_else(|| account.email.clone());
 
     let mut profile = object_value(account.profile.clone());
     insert_value(
@@ -549,42 +542,125 @@ async fn update_from_kiro_token_response(
     insert_value(&mut profile, "profileArn", json!(profile_arn));
     insert_value(&mut profile, "authRegion", json!(auth_region_value));
     insert_value(&mut profile, "apiRegion", json!(api_region_value));
-    if let Some(machine_id) = machine_id {
+    if let Some(machine_id) = machine_id.as_deref() {
         insert_value(&mut profile, "machineId", json!(machine_id));
     }
 
-    AccountRefreshUpdate {
+    let mut update = AccountRefreshUpdate {
         email,
-        access_token: Some(access_token),
-        refresh_token: result.token.refresh_token,
-        id_token: result.token.id_token,
+        access_token: Some(access_token.clone()),
+        refresh_token: result.token.refresh_token.clone(),
+        id_token: result.token.id_token.clone(),
         token_type: Some(
             result
                 .token
                 .token_type
+                .clone()
                 .unwrap_or_else(|| "Bearer".to_string()),
         ),
         scopes: result.token.scope.as_deref().map(split_scopes),
         profile: Some(profile),
         raw: Some(raw),
-        subscription_level,
-        quota_percent: quota
-            .as_ref()
-            .and_then(|quota| quota.tiers.first())
-            .and_then(|tier| tier.utilization)
-            .map(|value| value * 100.0),
-        quota,
-        quota_refreshed_at: usage.as_ref().map(|_| now_ms),
-        quota_next_refresh_at: usage
-            .as_ref()
-            .map(|_| now_ms.saturating_add(quota_refresh_interval_ms)),
+        subscription_level: account.subscription_level.clone(),
         expires_at: result
             .token
             .expires_in
             .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000))),
         last_refresh_error: None,
         ..Default::default()
+    };
+
+    receipt_hook(&update)?;
+
+    let usage = if let Some(machine_id) = machine_id.as_deref() {
+        fetch_refresh_usage(
+            http,
+            account,
+            &api_region_value,
+            &profile_arn,
+            machine_id,
+            &access_token,
+        )
+        .await
+    } else {
+        None
+    };
+    let Some(usage) = usage else {
+        return Ok(update);
+    };
+
+    if let Some(raw) = update.raw.as_mut() {
+        insert_value(raw, "kiroUsageLimits", usage.clone());
     }
+    let email = token_email
+        .or_else(|| find_email_in_value(&usage).map(str::to_string))
+        .or_else(|| account.email.clone());
+    let subscription_level = string_at(
+        &usage,
+        &[
+            "/subscriptionInfo/subscriptionTitle",
+            "/subscription_info/subscription_title",
+        ],
+    )
+    .or_else(|| account.subscription_level.clone());
+    let quota = quota_from_usage_limits(usage, subscription_level.clone(), now_ms);
+    if let Some(profile) = update.profile.as_mut() {
+        insert_value(
+            profile,
+            "email",
+            email.clone().map(Value::from).unwrap_or(Value::Null),
+        );
+    }
+    update.email = email;
+    update.subscription_level = subscription_level;
+    update.quota_percent = quota
+        .tiers
+        .first()
+        .and_then(|tier| tier.utilization)
+        .map(|value| value * 100.0);
+    update.quota = Some(quota);
+    update.quota_refreshed_at = Some(now_ms);
+    update.quota_next_refresh_at = Some(now_ms.saturating_add(quota_refresh_interval_ms));
+    Ok(update)
+}
+
+async fn fetch_refresh_usage(
+    http: &reqwest::Client,
+    account: &Account,
+    api_region: &str,
+    profile_arn: &str,
+    machine_id: &str,
+    access_token: &str,
+) -> Option<Value> {
+    #[cfg(test)]
+    if let Some(url) = test_kiro_usage_url(account) {
+        return http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok();
+    }
+    #[cfg(test)]
+    if test_oauth_token_url(account).is_some() {
+        return None;
+    }
+
+    fetch_usage_limits(
+        http,
+        api_region,
+        profile_arn,
+        machine_id,
+        access_token,
+        kiro_token_type_header(account),
+    )
+    .await
+    .ok()
 }
 
 async fn post_json(
@@ -628,6 +704,8 @@ async fn response_json(
                     | OAuthErrorKind::ExpiredToken
             ) || status.is_server_error(),
             retry_after_ms: None,
+            immediate_relogin: kind == OAuthErrorKind::InvalidGrant
+                && invalid_grant_requires_immediate_relogin(&body),
             endpoint_fallback_safe: false,
         });
     }
@@ -717,6 +795,28 @@ fn auth_method(account: &Account) -> KiroAuthMethod {
         "api_key" | "api-key" | "apikey" => KiroAuthMethod::ApiKey,
         _ => KiroAuthMethod::BuilderId,
     }
+}
+
+#[cfg(test)]
+fn test_oauth_token_url(account: &Account) -> Option<&str> {
+    account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testOAuthTokenUrl"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+fn test_kiro_usage_url(account: &Account) -> Option<&str> {
+    account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testKiroUsageUrl"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn kiro_token_type_header(account: &Account) -> Option<&'static str> {
@@ -942,6 +1042,7 @@ fn kiro_device_failure(
         },
         retryable: error.status.is_server_error() || error.status == StatusCode::TOO_MANY_REQUESTS,
         retry_after_ms: None,
+        immediate_relogin: false,
         endpoint_fallback_safe: false,
     }
 }

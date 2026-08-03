@@ -15,6 +15,7 @@ const ANTIGRAVITY_UPDATER_USER_AGENT: &str = "electron-builder";
 const ANTIGRAVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const ANTIGRAVITY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
+pub const GEMINI_CLI_X_GOOG_API_CLIENT: &str = "google-genai-sdk/1.41.0 gl-node/v22.19.0";
 
 static ANTIGRAVITY_VERSION: OnceLock<RwLock<String>> = OnceLock::new();
 static ANTIGRAVITY_UPDATER_STARTED: OnceLock<()> = OnceLock::new();
@@ -52,6 +53,26 @@ pub fn antigravity_client_metadata() -> Value {
         "ideType": 9,
         "platform": ANTIGRAVITY_CLIENT_METADATA_PLATFORM,
         "pluginType": 2,
+    })
+}
+
+pub fn gemini_cli_user_agent() -> String {
+    let platform = match std::env::consts::OS {
+        "windows" => "win32",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "x86",
+        other => other,
+    };
+    format!("GeminiCLI/0.31.0/unknown ({platform}; {arch})")
+}
+
+pub fn gemini_cli_code_assist_metadata() -> Value {
+    json!({
+        "ideType": "GEMINI_CLI",
+        "pluginType": "GEMINI",
     })
 }
 
@@ -157,5 +178,20 @@ mod tests {
         assert_eq!(metadata["ideType"], 9);
         assert_eq!(metadata["pluginType"], 2);
         assert_eq!(metadata["platform"], ANTIGRAVITY_CLIENT_METADATA_PLATFORM);
+    }
+
+    #[test]
+    fn gemini_cli_identity_is_centralized_with_code_assist_metadata() {
+        let user_agent = gemini_cli_user_agent();
+        assert!(user_agent.starts_with("GeminiCLI/0.31.0/unknown ("));
+        assert!(user_agent.ends_with(')'));
+        assert_eq!(
+            GEMINI_CLI_X_GOOG_API_CLIENT,
+            "google-genai-sdk/1.41.0 gl-node/v22.19.0"
+        );
+        assert_eq!(
+            gemini_cli_code_assist_metadata(),
+            json!({"ideType": "GEMINI_CLI", "pluginType": "GEMINI"})
+        );
     }
 }

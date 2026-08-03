@@ -1,5 +1,8 @@
 use super::*;
-use crate::domain::accounts::store::{active_account_usage_block, AccountUsageBlockKind};
+use crate::domain::accounts::store::{
+    active_account_usage_block, AccountStore, AccountUsageBlockKind,
+};
+use crate::domain::providers::runtime::authoritative_managed_account;
 pub(in crate::api) async fn usage_logs(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -132,17 +135,7 @@ pub(in crate::api) fn provider_limit_status(
     accounts: &AccountStore,
     shares: &ShareStore,
 ) -> ProviderLimitStatusView {
-    let account = accounts
-        .find_for_provider(
-            provider.provider_type,
-            provider
-                .provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.auth_binding.as_ref())
-                .and_then(|binding| binding.account_id.as_deref()),
-        )
-        .cloned();
+    let account = authoritative_managed_account(provider, accounts).cloned();
     let account_quota_percent = account
         .as_ref()
         .and_then(|account| account.quota_percent)
@@ -321,7 +314,7 @@ mod tests {
                         source: Some("account_store".to_string()),
                         auth_provider: Some("kiro_oauth".to_string()),
                         account_id: Some("kiro-account".to_string()),
-                        auth_identity_generation: None,
+                        auth_identity_generation: Some(1),
                     }),
                     ..Default::default()
                 }),
@@ -360,5 +353,58 @@ mod tests {
         assert!(!blocked
             .warnings
             .contains(&"account_quota_refresh_error".to_string()));
+    }
+
+    #[test]
+    fn provider_limit_status_does_not_select_default_for_unbound_managed_provider() {
+        let mut provider = account_provider();
+        provider.provider.meta.as_mut().unwrap().auth_binding = None;
+        let mut accounts = AccountStore::default();
+        accounts.upsert(
+            serde_json::from_value(json!({
+                "id": "kiro-account",
+                "providerType": "kiro_oauth",
+                "quotaPercent": 100.0
+            }))
+            .unwrap(),
+        );
+        accounts.mark_rate_limited_until("kiro-account", now_ms() as i64 + 60_000);
+
+        let status = provider_limit_status(&provider, &accounts, &ShareStore::default());
+
+        assert_eq!(status.account_id, None);
+        assert!(!status.blocked);
+    }
+
+    #[test]
+    fn provider_limit_status_ignores_stale_binding_for_metadata_account() {
+        let mut provider = account_provider();
+        provider.provider_type = ProviderType::CursorApiKey;
+        provider.provider_type_id = ProviderType::CursorApiKey.as_str().to_string();
+        let binding = provider
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .auth_binding
+            .as_mut()
+            .unwrap();
+        binding.auth_provider = Some(ProviderType::CursorApiKey.as_str().to_string());
+        binding.account_id = Some("cursor-metadata".to_string());
+        let mut accounts = AccountStore::default();
+        accounts.upsert(
+            serde_json::from_value(json!({
+                "id": "cursor-metadata",
+                "providerType": "cursor_apikey",
+                "quotaPercent": 100.0
+            }))
+            .unwrap(),
+        );
+        accounts.mark_rate_limited_until("cursor-metadata", now_ms() as i64 + 60_000);
+
+        let status = provider_limit_status(&provider, &accounts, &ShareStore::default());
+
+        assert_eq!(status.account_id, None);
+        assert!(!status.blocked);
     }
 }

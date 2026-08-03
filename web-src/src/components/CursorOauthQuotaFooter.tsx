@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import { useCursorOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 import type { AppId } from "@/lib/api";
 import {
@@ -20,6 +20,7 @@ import {
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface CursorOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -42,8 +43,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
-  const [manualRefreshLoading, setManualRefreshLoading] =
-    React.useState(false);
+  const [manualRefreshLoading, setManualRefreshLoading] = React.useState(false);
   const isCursorApiKey = meta?.providerType === PROVIDER_TYPES.CURSOR_APIKEY;
   const authProvider = isCursorApiKey
     ? PROVIDER_TYPES.CURSOR_APIKEY
@@ -53,21 +53,27 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useCursorOauthQuota(meta, { enabled: true, appId, providerId });
-  const accountId = isCursorApiKey
+  const identity = isCursorApiKey
     ? null
-    : resolveManagedAccountId(meta, PROVIDER_TYPES.CURSOR_OAUTH);
+    : resolveManagedAccountIdentity(meta, PROVIDER_TYPES.CURSOR_OAUTH);
+  const accountId = identity?.accountId ?? null;
   const handleRefresh = React.useCallback(async () => {
     if (manualRefreshLoading) return;
     setManualRefreshLoading(true);
     try {
-      await subscriptionApi.refreshOauthQuota(
-        authProvider,
-        accountId,
-        meta?.providerType,
-        appId,
-        providerId,
+      await refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            authProvider,
+            accountId,
+            meta?.providerType,
+            appId,
+            providerId,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
       );
-      await refetch();
       setLastManualRefreshAt(Date.now());
     } finally {
       setManualRefreshLoading(false);
@@ -76,6 +82,7 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     accountId,
     appId,
     authProvider,
+    identity?.authIdentityGeneration,
     manualRefreshLoading,
     meta?.providerType,
     providerId,

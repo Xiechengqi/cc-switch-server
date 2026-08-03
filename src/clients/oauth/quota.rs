@@ -12,8 +12,12 @@ use crate::clients::oauth::codex_reset_credits::{
 use crate::clients::oauth::kiro_device::{
     default_profile_arn, fetch_usage_limits, machine_id_from_refresh_token, quota_from_usage_limits,
 };
+use crate::domain::accounts::claude_subscription::{
+    resolve_claude_subscription, ClaudeSubscriptionCandidate, ClaudeSubscriptionResolution,
+    ClaudeSubscriptionSource,
+};
 use crate::domain::accounts::store::{
-    Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
+    gemini_v1internal_project_id, Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
 };
 use crate::domain::claude_cli::claude_cli_user_agent;
 use crate::domain::grok_cli::{
@@ -59,18 +63,22 @@ pub enum QuotaRefreshResult {
 #[derive(Debug, Clone)]
 pub struct QuotaRefreshFailure {
     pub status_code: u16,
+    pub upstream_status: Option<u16>,
     pub message: String,
     pub retryable: bool,
     pub next_refresh_at: Option<i64>,
+    pub partial_update: Option<Box<AccountRefreshUpdate>>,
 }
 
 impl QuotaRefreshFailure {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status_code: 400,
+            upstream_status: None,
             message: message.into(),
             retryable: false,
             next_refresh_at: None,
+            partial_update: None,
         }
     }
 
@@ -95,6 +103,7 @@ impl QuotaRefreshFailure {
             .or_else(|| retryable.then_some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)));
         Self {
             status_code,
+            upstream_status: Some(upstream_status.as_u16()),
             message: format!(
                 "{} quota request failed: upstream HTTP {}: {}",
                 provider_type.as_str(),
@@ -103,15 +112,18 @@ impl QuotaRefreshFailure {
             ),
             retryable,
             next_refresh_at,
+            partial_update: None,
         }
     }
 
     fn network(provider_type: ProviderType, error: reqwest::Error, now_ms: i64) -> Self {
         Self {
             status_code: 502,
+            upstream_status: None,
             message: format!("{} quota request failed: {error}", provider_type.as_str()),
             retryable: true,
             next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+            partial_update: None,
         }
     }
 
@@ -126,12 +138,14 @@ impl QuotaRefreshFailure {
             }
             error @ crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => Self {
                 status_code: 502,
+                upstream_status: None,
                 message: format!(
                     "{} quota response could not be read: {error}",
                     provider_type.as_str()
                 ),
                 retryable: false,
                 next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+                partial_update: None,
             },
         }
     }
@@ -139,13 +153,34 @@ impl QuotaRefreshFailure {
     fn parse(provider_type: ProviderType, error: impl std::fmt::Display, now_ms: i64) -> Self {
         Self {
             status_code: 502,
+            upstream_status: None,
             message: format!(
                 "{} quota response is not valid JSON: {error}",
                 provider_type.as_str()
             ),
             retryable: false,
             next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+            partial_update: None,
         }
+    }
+
+    fn missing_gemini_project(provider_type: ProviderType, now_ms: i64) -> Self {
+        Self {
+            status_code: 502,
+            upstream_status: None,
+            message: format!(
+                "{} loadCodeAssist returned no usable projectId",
+                provider_type.as_str()
+            ),
+            retryable: true,
+            next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+            partial_update: None,
+        }
+    }
+
+    fn with_partial_update(mut self, update: AccountRefreshUpdate) -> Self {
+        self.partial_update = Some(Box::new(update));
+        self
     }
 }
 
@@ -166,6 +201,16 @@ pub async fn refresh_account_quota(
                 });
             }
         }
+    }
+
+    #[cfg(test)]
+    if let Some(delay_ms) = account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testQuotaRefreshDelayMs"))
+        .and_then(Value::as_u64)
+    {
+        tokio::time::sleep(Duration::from_millis(delay_ms.min(5_000))).await;
     }
 
     let request_timeout = quota_request_timeout(request_timeout_ms);
@@ -490,10 +535,13 @@ async fn refresh_claude_quota(
         fetch_claude_bootstrap_profile_with_timeout(http, access_token, request_timeout, now_ms,),
     );
     let body = body?;
-    let plan_label = profile_lookup
-        .as_ref()
-        .and_then(|lookup| lookup.plan_label.clone());
-    let quota = parse_claude_quota(&body, plan_label, now_ms);
+    let subscription = resolve_claude_quota_subscription(
+        account,
+        &body,
+        profile_lookup.as_ref(),
+        bootstrap_profile.as_ref(),
+    );
+    let quota = parse_claude_quota(&body, subscription.as_ref(), now_ms);
     let subscription_level = quota.credential_message.clone();
     let bootstrap_merged = merge_profile_overlay(account.profile.as_ref(), bootstrap_profile);
     let existing = bootstrap_merged.as_ref().or(account.profile.as_ref());
@@ -622,54 +670,366 @@ async fn refresh_gemini_quota(
     success_cooldown_ms: i64,
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    refresh_gemini_v1internal_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+        .await
+}
+
+#[derive(Debug, Clone)]
+struct GeminiV1InternalLoadResult {
+    body: Value,
+    project_id: Option<String>,
+    subscription_level: Option<String>,
+    profile: Option<Value>,
+}
+
+impl GeminiV1InternalLoadResult {
+    fn account_update(&self) -> AccountRefreshUpdate {
+        AccountRefreshUpdate {
+            profile: self.profile.clone(),
+            subscription_level: self.subscription_level.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GeminiV1InternalSelectedTier {
+    source: &'static str,
+    value: Value,
+    label: String,
+}
+
+pub async fn load_gemini_v1internal_project(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    request_timeout_ms: i64,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    load_gemini_v1internal_project_with_timeout(
+        http,
+        account,
+        now_ms,
+        quota_request_timeout(request_timeout_ms),
+    )
+    .await
+    .and_then(|loaded| {
+        if loaded.project_id.is_some() {
+            Ok(loaded.account_update())
+        } else {
+            Err(
+                QuotaRefreshFailure::missing_gemini_project(account.provider_type, now_ms)
+                    .with_partial_update(loaded.account_update()),
+            )
+        }
+    })
+}
+
+async fn load_gemini_v1internal_project_with_timeout(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    request_timeout: Duration,
+) -> Result<GeminiV1InternalLoadResult, QuotaRefreshFailure> {
     let access_token = required_access_token(account)?;
-    let load_request = http
-        .post(GEMINI_LOAD_CODE_ASSIST_URL)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&json!({
-            "metadata": {
-                "ideType": "GEMINI_CLI",
-                "pluginType": "GEMINI"
-            }
-        }))
-        .timeout(request_timeout);
+    let metadata = gemini_code_assist_metadata(account.provider_type)?;
+    let load_url = gemini_code_assist_url(account, "loadCodeAssist")?;
+    let load_request = gemini_code_assist_post_request(
+        http,
+        account,
+        &load_url,
+        access_token,
+        &json!({"metadata": metadata}),
+        request_timeout,
+        true,
+    )?;
     let load_body = request_json(account.provider_type, load_request, now_ms).await?;
     let load: GeminiLoadCodeAssistResponse = serde_json::from_value(load_body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
     let project_id = load
         .cloudaicompanion_project
         .as_ref()
-        .and_then(extract_project_id);
-    let plan_label = load
-        .current_tier
-        .as_ref()
-        .and_then(|value| value.get("name"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+        .and_then(extract_project_id)
+        .or_else(|| gemini_v1internal_project_id(account));
+    let selected_tier = gemini_selected_tier(load.paid_tier.as_ref(), load.current_tier.as_ref());
+    let subscription_level = selected_tier.as_ref().map(|tier| tier.label.clone());
+    let profile =
+        gemini_v1internal_profile_from_load(account, project_id.as_deref(), selected_tier.as_ref());
+    Ok(GeminiV1InternalLoadResult {
+        body: load_body,
+        project_id,
+        subscription_level,
+        profile,
+    })
+}
 
+async fn refresh_gemini_v1internal_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let loaded =
+        load_gemini_v1internal_project_with_timeout(http, account, now_ms, request_timeout).await?;
+    let partial_update = loaded.account_update();
+    let access_token = required_access_token(account)?;
     let mut quota_body = json!({});
-    if let Some(project_id) = project_id.as_deref() {
+    if let Some(project_id) = loaded.project_id.as_deref() {
         quota_body["project"] = Value::String(project_id.to_string());
     }
-    let quota_request = http
-        .post(GEMINI_RETRIEVE_USER_QUOTA_URL)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&quota_body)
-        .timeout(request_timeout);
-    let body = request_json(account.provider_type, quota_request, now_ms).await?;
-    let quota_response: GeminiQuotaResponse = serde_json::from_value(body.clone())
-        .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
-    let quota = parse_gemini_quota(&quota_response, plan_label, load_body, body, now_ms);
-    let subscription_level = quota.credential_message.clone();
+    let quota_url = gemini_code_assist_url(account, "retrieveUserQuota")
+        .map_err(|error| error.with_partial_update(partial_update.clone()))?;
+    let quota_request = gemini_code_assist_post_request(
+        http,
+        account,
+        &quota_url,
+        access_token,
+        &quota_body,
+        request_timeout,
+        false,
+    )
+    .map_err(|error| error.with_partial_update(partial_update.clone()))?;
+    let body = request_json(account.provider_type, quota_request, now_ms)
+        .await
+        .map_err(|error| error.with_partial_update(partial_update.clone()))?;
+    let quota_response: GeminiQuotaResponse =
+        serde_json::from_value(body.clone()).map_err(|error| {
+            QuotaRefreshFailure::parse(account.provider_type, error, now_ms)
+                .with_partial_update(partial_update)
+        })?;
+    let quota = parse_gemini_quota(
+        &quota_response,
+        loaded.subscription_level.clone(),
+        loaded.body,
+        body,
+        now_ms,
+    );
     Ok(update_from_quota(
         quota,
-        subscription_level,
-        None,
+        loaded.subscription_level,
+        loaded.profile,
         now_ms,
         success_cooldown_ms,
     ))
+}
+
+fn gemini_code_assist_metadata(provider_type: ProviderType) -> Result<Value, QuotaRefreshFailure> {
+    match provider_type {
+        ProviderType::GeminiCli => Ok(crate::provider_identity::gemini_cli_code_assist_metadata()),
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
+            Ok(crate::provider_identity::antigravity_client_metadata())
+        }
+        _ => Err(QuotaRefreshFailure::bad_request(format!(
+            "{} does not use the Gemini Code Assist protocol",
+            provider_type.as_str()
+        ))),
+    }
+}
+
+fn gemini_code_assist_post_request(
+    http: &reqwest::Client,
+    account: &Account,
+    url: &str,
+    access_token: &str,
+    body: &Value,
+    request_timeout: Duration,
+    include_client_metadata: bool,
+) -> Result<reqwest::RequestBuilder, QuotaRefreshFailure> {
+    let request = http
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .timeout(request_timeout);
+    let request = match account.provider_type {
+        ProviderType::GeminiCli => request
+            .header(
+                USER_AGENT,
+                crate::provider_identity::gemini_cli_user_agent(),
+            )
+            .header(
+                "x-goog-api-client",
+                crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT,
+            ),
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
+            let request = request.header(
+                USER_AGENT,
+                crate::provider_identity::antigravity_user_agent(),
+            );
+            if include_client_metadata {
+                request.header(
+                    "client-metadata",
+                    crate::provider_identity::antigravity_client_metadata().to_string(),
+                )
+            } else {
+                request
+            }
+        }
+        _ => {
+            return Err(QuotaRefreshFailure::bad_request(format!(
+                "{} does not use the Gemini Code Assist protocol",
+                account.provider_type.as_str()
+            )))
+        }
+    };
+    Ok(request.json(body))
+}
+
+fn gemini_code_assist_url(
+    account: &Account,
+    operation: &'static str,
+) -> Result<String, QuotaRefreshFailure> {
+    #[cfg(test)]
+    if let Some(raw) = account.raw.as_ref() {
+        let explicit_key = match operation {
+            "loadCodeAssist" => "testGeminiLoadCodeAssistUrl",
+            "retrieveUserQuota" => "testGeminiRetrieveUserQuotaUrl",
+            _ => "",
+        };
+        if let Some(url) = raw
+            .get(explicit_key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return parse_test_gemini_code_assist_url(account.provider_type, url, None);
+        }
+        if let Some(base_url) = raw
+            .get("testGeminiCodeAssistBaseUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return parse_test_gemini_code_assist_url(
+                account.provider_type,
+                base_url,
+                Some(operation),
+            );
+        }
+    }
+
+    #[cfg(not(test))]
+    let _ = account;
+    match operation {
+        "loadCodeAssist" => Ok(GEMINI_LOAD_CODE_ASSIST_URL.to_string()),
+        "retrieveUserQuota" => Ok(GEMINI_RETRIEVE_USER_QUOTA_URL.to_string()),
+        _ => Err(QuotaRefreshFailure::bad_request(format!(
+            "unsupported Gemini Code Assist operation: {operation}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+fn parse_test_gemini_code_assist_url(
+    provider_type: ProviderType,
+    value: &str,
+    operation: Option<&str>,
+) -> Result<String, QuotaRefreshFailure> {
+    let mut url = reqwest::Url::parse(value).map_err(|error| {
+        QuotaRefreshFailure::bad_request(format!(
+            "{} test Gemini Code Assist URL is invalid: {error}",
+            provider_type.as_str()
+        ))
+    })?;
+    if let Some(operation) = operation {
+        let current_path = url.path().trim_end_matches('/');
+        let path = if let Some((prefix, action)) = current_path.rsplit_once(':') {
+            if matches!(action, "loadCodeAssist" | "retrieveUserQuota") {
+                format!("{prefix}:{operation}")
+            } else if current_path.ends_with("/v1internal") {
+                format!("{current_path}:{operation}")
+            } else {
+                format!("{current_path}/v1internal:{operation}")
+            }
+        } else if current_path.ends_with("/v1internal") {
+            format!("{current_path}:{operation}")
+        } else {
+            format!("{current_path}/v1internal:{operation}")
+        };
+        url.set_path(&path);
+        url.set_query(None);
+    }
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn gemini_selected_tier(
+    paid_tier: Option<&Value>,
+    current_tier: Option<&Value>,
+) -> Option<GeminiV1InternalSelectedTier> {
+    [("paidTier", paid_tier), ("currentTier", current_tier)]
+        .into_iter()
+        .find_map(|(source, value)| {
+            let value = value.filter(|value| !value.is_null())?;
+            let label = match value {
+                Value::String(value) => {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                }
+                Value::Object(_) => ["name", "id"].into_iter().find_map(|key| {
+                    value
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                }),
+                _ => None,
+            }?;
+            Some(GeminiV1InternalSelectedTier {
+                source,
+                value: value.clone(),
+                label,
+            })
+        })
+}
+
+fn gemini_v1internal_profile_from_load(
+    account: &Account,
+    project_id: Option<&str>,
+    selected_tier: Option<&GeminiV1InternalSelectedTier>,
+) -> Option<Value> {
+    let mut overlay = serde_json::Map::new();
+    if let Some(project_id) = project_id {
+        overlay.insert(
+            "projectId".to_string(),
+            Value::String(project_id.to_string()),
+        );
+    }
+    if let Some(selected_tier) = selected_tier {
+        overlay.insert(
+            selected_tier.source.to_string(),
+            selected_tier.value.clone(),
+        );
+        overlay.insert("selectedTier".to_string(), selected_tier.value.clone());
+        overlay.insert(
+            "selectedTierSource".to_string(),
+            Value::String(selected_tier.source.to_string()),
+        );
+        overlay.insert(
+            "tier".to_string(),
+            Value::String(selected_tier.label.clone()),
+        );
+        overlay.insert(
+            "subscriptionTier".to_string(),
+            Value::String(selected_tier.label.clone()),
+        );
+    }
+    if project_id.is_some()
+        && matches!(
+            account.provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        )
+    {
+        overlay.insert(
+            "postExchangeEnrichment".to_string(),
+            Value::String("project_loaded".to_string()),
+        );
+    }
+    if overlay.is_empty() {
+        account.profile.clone()
+    } else {
+        merge_profile_overlay(account.profile.as_ref(), Some(Value::Object(overlay)))
+    }
 }
 
 async fn refresh_grok_quota(
@@ -1845,60 +2205,8 @@ async fn refresh_antigravity_quota(
     success_cooldown_ms: i64,
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
-    let access_token = required_access_token(account)?;
-    let metadata = antigravity_code_assist_metadata();
-    let user_agent = crate::provider_identity::antigravity_user_agent();
-    let load_request = http
-        .post(GEMINI_LOAD_CODE_ASSIST_URL)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, &user_agent)
-        .header("client-metadata", metadata.to_string())
-        .json(&json!({ "metadata": metadata }))
-        .timeout(request_timeout);
-    let load_body = request_json(account.provider_type, load_request, now_ms).await?;
-    let load: GeminiLoadCodeAssistResponse = serde_json::from_value(load_body.clone())
-        .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
-    let project_id = load
-        .cloudaicompanion_project
-        .as_ref()
-        .and_then(extract_project_id)
-        .or_else(|| {
-            account
-                .profile
-                .as_ref()
-                .and_then(|value| string_at(value, &["/projectId", "/project_id"]))
-        });
-    let plan_label = load
-        .current_tier
-        .as_ref()
-        .and_then(|value| value.get("name"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let mut quota_body = json!({});
-    if let Some(project_id) = project_id.as_deref() {
-        quota_body["project"] = Value::String(project_id.to_string());
-    }
-    let quota_request = http
-        .post(GEMINI_RETRIEVE_USER_QUOTA_URL)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, user_agent)
-        .json(&quota_body)
-        .timeout(request_timeout);
-    let body = request_json(account.provider_type, quota_request, now_ms).await?;
-    let quota_response: GeminiQuotaResponse = serde_json::from_value(body.clone())
-        .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
-    let quota = parse_gemini_quota(&quota_response, plan_label, load_body, body, now_ms);
-    let subscription_level = quota.credential_message.clone();
-    Ok(update_from_quota(
-        quota,
-        subscription_level,
-        None,
-        now_ms,
-        success_cooldown_ms,
-    ))
+    refresh_gemini_v1internal_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+        .await
 }
 
 fn refresh_imported_snapshot_quota(
@@ -2006,9 +2314,11 @@ async fn refresh_kiro_quota(
     .await
     .map_err(|_| QuotaRefreshFailure {
         status_code: 504,
+        upstream_status: None,
         message: "kiro_oauth quota request timed out".to_string(),
         retryable: true,
         next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+        partial_update: None,
     })?
     .map_err(|error| {
         QuotaRefreshFailure::upstream(
@@ -2382,7 +2692,117 @@ fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
     Some((normalized / 100.0).clamp(0.0, 1.0))
 }
 
-fn parse_claude_quota(body: &Value, plan_label: Option<String>, now_ms: i64) -> AccountQuota {
+fn resolve_claude_quota_subscription(
+    account: &Account,
+    usage: &Value,
+    profile_lookup: Option<&ClaudeProfileLookup>,
+    bootstrap_profile: Option<&Value>,
+) -> Option<ClaudeSubscriptionResolution> {
+    let usage_tier = string_at(usage, &["/tier"]);
+    let usage_plan = string_at(usage, &["/plan"]);
+    let usage_subscription_type = string_at(usage, &["/subscription_type"]);
+    let bootstrap_rate_limit_tier =
+        bootstrap_profile.and_then(|value| string_at(value, &["/organizationRateLimitTier"]));
+    let bootstrap_organization_type =
+        bootstrap_profile.and_then(|value| string_at(value, &["/organizationType"]));
+    let profile_rate_limit_tier = profile_lookup.and_then(|lookup| lookup.rate_limit_tier.clone());
+    let profile_organization_type =
+        profile_lookup.and_then(|lookup| lookup.organization_type.clone());
+    let cached_profile_rate_limit_tier = account.profile.as_ref().and_then(|value| {
+        string_at(
+            value,
+            &[
+                "/organizationRateLimitTier",
+                "/organization_rate_limit_tier",
+                "/profileRaw/organizationRateLimitTier",
+                "/profileRaw/organization_rate_limit_tier",
+                "/raw/organizationRateLimitTier",
+                "/raw/organization_rate_limit_tier",
+            ],
+        )
+    });
+    let cached_profile_organization_type = account.profile.as_ref().and_then(|value| {
+        string_at(
+            value,
+            &[
+                "/organizationType",
+                "/organization_type",
+                "/profileRaw/organizationType",
+                "/profileRaw/organization_type",
+                "/raw/organizationType",
+                "/raw/organization_type",
+            ],
+        )
+    });
+    let cached_subscription_level = account.subscription_level.clone();
+
+    resolve_claude_subscription(
+        [
+            usage_tier.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(ClaudeSubscriptionSource::UsageTier, value)
+            }),
+            usage_plan.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(ClaudeSubscriptionSource::UsagePlan, value)
+            }),
+            usage_subscription_type.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::UsageSubscriptionType,
+                    value,
+                )
+            }),
+            bootstrap_rate_limit_tier.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::BootstrapRateLimitTier,
+                    value,
+                )
+            }),
+            profile_rate_limit_tier.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::ProfileRateLimitTier,
+                    value,
+                )
+            }),
+            bootstrap_organization_type.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::BootstrapOrganizationType,
+                    value,
+                )
+            }),
+            profile_organization_type.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::ProfileOrganizationType,
+                    value,
+                )
+            }),
+            cached_profile_rate_limit_tier.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::CachedProfileRateLimitTier,
+                    value,
+                )
+            }),
+            cached_profile_organization_type.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::CachedProfileOrganizationType,
+                    value,
+                )
+            }),
+            cached_subscription_level.as_deref().map(|value| {
+                ClaudeSubscriptionCandidate::new(
+                    ClaudeSubscriptionSource::CachedSubscriptionLevel,
+                    value,
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten(),
+    )
+}
+
+fn parse_claude_quota(
+    body: &Value,
+    subscription: Option<&ClaudeSubscriptionResolution>,
+    now_ms: i64,
+) -> AccountQuota {
     const KNOWN_TIERS: &[&str] = &[
         "five_hour",
         "seven_day",
@@ -2402,6 +2822,41 @@ fn parse_claude_quota(body: &Value, plan_label: Option<String>, now_ms: i64) -> 
             push_claude_tier(&mut tiers, name, Some(value));
         }
     }
+    let plan_label = subscription.map(|resolution| resolution.plan.label().to_string());
+    let subscription_json = subscription.map(|resolution| {
+        json!({
+            "planType": resolution.plan.plan_type(),
+            "planLabel": resolution.plan.label(),
+            "planSource": resolution.source.as_str(),
+            "planStale": resolution.stale,
+        })
+    });
+    let subscription_evidence = subscription.map(|resolution| {
+        let mut observed_sources = Vec::new();
+        for observation in &resolution.observations {
+            let source = observation.source.as_str();
+            if !observed_sources.contains(&source) {
+                observed_sources.push(source);
+            }
+        }
+        json!({
+            "source": resolution.source.as_str(),
+            "stale": resolution.stale,
+            "conflict": resolution.conflict,
+            "conflictingPlanTypes": resolution.conflicting_plan_types,
+            "observedSources": observed_sources,
+        })
+    });
+    let warning_codes = subscription
+        .filter(|resolution| resolution.conflict)
+        .map(|_| vec!["claude_plan_conflict"])
+        .unwrap_or_default();
+    let warnings = subscription
+        .filter(|resolution| resolution.conflict)
+        .map(|_| {
+            vec!["Conflicting Claude subscription plan evidence was returned; the highest-authority source was used."]
+        })
+        .unwrap_or_default();
     AccountQuota {
         success: true,
         credential_message: plan_label,
@@ -2409,6 +2864,10 @@ fn parse_claude_quota(body: &Value, plan_label: Option<String>, now_ms: i64) -> 
         extra_usage: Some(json!({
             "raw": body,
             "extraUsage": body.get("extra_usage"),
+            "subscription": subscription_json,
+            "subscriptionEvidence": subscription_evidence,
+            "warningCodes": warning_codes,
+            "warnings": warnings,
             "queriedAt": now_ms,
         })),
     }
@@ -2781,7 +3240,8 @@ fn parse_cursor_imported_quota(
 
 #[derive(Debug, Clone, PartialEq)]
 struct ClaudeProfileLookup {
-    plan_label: Option<String>,
+    organization_type: Option<String>,
+    rate_limit_tier: Option<String>,
     profile_overlay: Option<Value>,
 }
 
@@ -2815,8 +3275,14 @@ fn parse_claude_profile_lookup(body: &Value) -> Option<ClaudeProfileLookup> {
         .get("organization_type")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let plan_label = organization_type.map(format_claude_plan_label);
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let rate_limit_tier = organization
+        .get("rate_limit_tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let mut overlay = serde_json::Map::new();
     for (target, source) in [
         ("organizationUUID", "uuid"),
@@ -2840,9 +3306,12 @@ fn parse_claude_profile_lookup(body: &Value) -> Option<ClaudeProfileLookup> {
     {
         overlay.insert("billingSource".to_string(), Value::String(billing_source));
     }
-    (plan_label.is_some() || !overlay.is_empty()).then(|| ClaudeProfileLookup {
-        plan_label,
-        profile_overlay: (!overlay.is_empty()).then_some(Value::Object(overlay)),
+    (organization_type.is_some() || rate_limit_tier.is_some() || !overlay.is_empty()).then(|| {
+        ClaudeProfileLookup {
+            organization_type,
+            rate_limit_tier,
+            profile_overlay: (!overlay.is_empty()).then_some(Value::Object(overlay)),
+        }
     })
 }
 
@@ -3802,6 +4271,8 @@ struct ClaudeUsageWindow {
 struct GeminiLoadCodeAssistResponse {
     #[serde(rename = "cloudaicompanionProject")]
     cloudaicompanion_project: Option<Value>,
+    #[serde(rename = "paidTier")]
+    paid_tier: Option<Value>,
     #[serde(rename = "currentTier")]
     current_tier: Option<Value>,
 }
@@ -3995,17 +4466,6 @@ impl KiroImportedUsageLimitsResponse {
     }
 }
 
-fn format_claude_plan_label(org_type: &str) -> String {
-    match org_type {
-        "claude_pro" => "Claude Pro".to_string(),
-        "claude_max" => "Claude Max".to_string(),
-        "claude_free" => "Claude Free".to_string(),
-        "claude_team" => "Claude Team".to_string(),
-        "claude_enterprise" => "Claude Enterprise".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn normalize_claude_tier_name(name: &str) -> &str {
     match name {
         "seven_day_omelette" => "seven_day_opus",
@@ -4051,11 +4511,16 @@ fn window_seconds_to_tier_name(secs: i64) -> String {
 
 fn extract_project_id(value: &Value) -> Option<String> {
     match value {
-        Value::String(value) => Some(value.clone()),
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
         Value::Object(object) => object
             .get("id")
             .or_else(|| object.get("projectId"))
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(str::to_string),
         _ => None,
     }
@@ -4148,10 +4613,6 @@ pub fn codex_banked_reset_status_snapshot(account: &Account, _now_ms: i64) -> Va
             codex_account_id(account).as_deref(),
         )
     })
-}
-
-fn antigravity_code_assist_metadata() -> Value {
-    crate::provider_identity::antigravity_client_metadata()
 }
 
 fn value_at(value: &Value, pointers: &[&str]) -> Option<Value> {
@@ -4289,6 +4750,16 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[derive(Debug, Clone)]
+    struct GeminiCodeAssistObservation {
+        operation: &'static str,
+        authorization: String,
+        user_agent: String,
+        x_goog_api_client: Option<String>,
+        client_metadata: Option<String>,
+        body: Value,
+    }
+
     async fn serve_oversized_json_response() -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4308,6 +4779,94 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{address}/quota"), server)
+    }
+
+    async fn serve_gemini_code_assist(
+        load_status: axum::http::StatusCode,
+        load_body: Value,
+        quota_status: axum::http::StatusCode,
+        quota_body: Value,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<GeminiCodeAssistObservation>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                let (operation, status, response_body) = match uri.path() {
+                    "/v1internal:loadCodeAssist" => {
+                        ("loadCodeAssist", load_status, load_body.clone())
+                    }
+                    "/v1internal:retrieveUserQuota" => {
+                        ("retrieveUserQuota", quota_status, quota_body.clone())
+                    }
+                    _ => (
+                        "unknown",
+                        axum::http::StatusCode::NOT_FOUND,
+                        json!({"error": "not found"}),
+                    ),
+                };
+                async move {
+                    observations
+                        .lock()
+                        .unwrap()
+                        .push(gemini_observation(operation, &headers, &body));
+                    gemini_test_response(status, response_body)
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), observations, server)
+    }
+
+    fn gemini_observation(
+        operation: &'static str,
+        headers: &axum::http::HeaderMap,
+        body: &[u8],
+    ) -> GeminiCodeAssistObservation {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        GeminiCodeAssistObservation {
+            operation,
+            authorization: header("authorization").unwrap_or_default(),
+            user_agent: header("user-agent").unwrap_or_default(),
+            x_goog_api_client: header("x-goog-api-client"),
+            client_metadata: header("client-metadata"),
+            body: serde_json::from_slice(body).unwrap(),
+        }
+    }
+
+    fn gemini_test_response(
+        status: axum::http::StatusCode,
+        body: Value,
+    ) -> axum::response::Response {
+        axum::http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn gemini_code_assist_account(
+        provider_type: ProviderType,
+        raw: Value,
+        profile: Option<Value>,
+    ) -> Account {
+        let mut account = imported_account(provider_type, raw);
+        account.access_token = Some("gemini-code-assist-access".to_string());
+        account.profile = profile;
+        account
     }
 
     #[tokio::test]
@@ -4349,6 +4908,241 @@ mod tests {
 
         assert!(!failure.message.contains("should-not-escape"));
         assert!(failure.message.contains("[REDACTED]"));
+        assert_eq!(failure.upstream_status, Some(502));
+        assert!(failure.partial_update.is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_project_load_uses_official_identity_and_merges_tier() {
+        let (base_url, observations, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::OK,
+            json!({
+                "cloudaicompanionProject": {"id": "discovered-project"},
+                "paidTier": {"id": "PAID_ID", "displayName": "Paid"},
+                "currentTier": {"name": "STANDARD", "displayName": "Standard"}
+            }),
+            axum::http::StatusCode::OK,
+            json!({"buckets": []}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::GeminiCli,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            Some(json!({
+                "email": "owner@example.com",
+                "opaque": {"keep": true}
+            })),
+        );
+
+        let update =
+            load_gemini_v1internal_project(&reqwest::Client::new(), &account, 1_000, 5_000)
+                .await
+                .unwrap();
+        assert_eq!(update.subscription_level.as_deref(), Some("PAID_ID"));
+        let profile = update.profile.unwrap();
+        assert_eq!(profile["projectId"], "discovered-project");
+        assert_eq!(profile["tier"], "PAID_ID");
+        assert_eq!(profile["subscriptionTier"], "PAID_ID");
+        assert_eq!(profile["paidTier"]["displayName"], "Paid");
+        assert_eq!(profile["selectedTier"]["displayName"], "Paid");
+        assert_eq!(profile["selectedTierSource"], "paidTier");
+        assert_eq!(profile["email"], "owner@example.com");
+        assert_eq!(profile["opaque"], json!({"keep": true}));
+        assert!(profile.get("postExchangeEnrichment").is_none());
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(observation.operation, "loadCodeAssist");
+        assert_eq!(
+            observation.authorization,
+            "Bearer gemini-code-assist-access"
+        );
+        assert_eq!(
+            observation.user_agent,
+            crate::provider_identity::gemini_cli_user_agent()
+        );
+        assert_eq!(
+            observation.x_goog_api_client.as_deref(),
+            Some(crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT)
+        );
+        assert!(observation.client_metadata.is_none());
+        assert_eq!(
+            observation.body,
+            json!({"metadata": {"ideType": "GEMINI_CLI", "pluginType": "GEMINI"}})
+        );
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_and_agy_project_load_use_antigravity_identity() {
+        let (base_url, observations, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::OK,
+            json!({
+                "cloudaicompanionProject": "agy-project",
+                "currentTier": {"name": "PRO"}
+            }),
+            axum::http::StatusCode::OK,
+            json!({"buckets": []}),
+        )
+        .await;
+        for provider_type in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let account = gemini_code_assist_account(
+                provider_type,
+                json!({
+                    "testGeminiLoadCodeAssistUrl": format!(
+                        "{base_url}/v1internal:loadCodeAssist"
+                    )
+                }),
+                Some(json!({"displayName": provider_type.as_str()})),
+            );
+            let update =
+                load_gemini_v1internal_project(&reqwest::Client::new(), &account, 1_000, 5_000)
+                    .await
+                    .unwrap();
+            assert_eq!(update.subscription_level.as_deref(), Some("PRO"));
+            let profile = update.profile.unwrap();
+            assert_eq!(profile["projectId"], "agy-project");
+            assert_eq!(profile["postExchangeEnrichment"], "project_loaded");
+            assert_eq!(profile["displayName"], provider_type.as_str());
+        }
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        for observation in observations.iter() {
+            assert_eq!(
+                observation.user_agent,
+                crate::provider_identity::antigravity_user_agent()
+            );
+            assert!(observation.x_goog_api_client.is_none());
+            assert_eq!(
+                observation.client_metadata.as_deref(),
+                Some(
+                    crate::provider_identity::antigravity_client_metadata()
+                        .to_string()
+                        .as_str()
+                )
+            );
+            assert_eq!(
+                observation.body,
+                json!({"metadata": crate::provider_identity::antigravity_client_metadata()})
+            );
+        }
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn project_load_without_project_keeps_enrichment_deferred() {
+        let (base_url, _, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::OK,
+            json!({"currentTier": "free-tier"}),
+            axum::http::StatusCode::OK,
+            json!({"buckets": []}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::AntigravityOAuth,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            Some(json!({
+                "postExchangeEnrichment": "project_and_tier_deferred_to_quota_refresh",
+                "opaque": true
+            })),
+        );
+
+        let failure =
+            load_gemini_v1internal_project(&reqwest::Client::new(), &account, 1_000, 5_000)
+                .await
+                .unwrap_err();
+        assert_eq!(failure.status_code, 502);
+        assert!(failure.message.contains("no usable projectId"));
+        assert!(failure.retryable);
+        assert_eq!(
+            failure.next_refresh_at,
+            Some(1_000 + QUOTA_FAILURE_COOLDOWN_MS)
+        );
+        let partial = failure.partial_update.expect("tier partial update");
+        assert_eq!(partial.subscription_level.as_deref(), Some("free-tier"));
+        let profile = partial.profile.unwrap();
+        assert!(profile.get("projectId").is_none());
+        assert_eq!(
+            profile["postExchangeEnrichment"],
+            "project_and_tier_deferred_to_quota_refresh"
+        );
+        assert_eq!(profile["tier"], "free-tier");
+        assert_eq!(profile["opaque"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_quota_failure_carries_completed_project_load_update() {
+        let (base_url, observations, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::OK,
+            json!({
+                "cloudaicompanionProject": {"projectId": "partial-project"},
+                "currentTier": {"name": "PRO"}
+            }),
+            axum::http::StatusCode::BAD_GATEWAY,
+            json!({"error": {"message": "quota unavailable"}}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::GeminiCli,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            None,
+        );
+
+        let failure = refresh_gemini_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_000,
+            30_000,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.upstream_status, Some(502));
+        let partial = failure.partial_update.expect("project load update");
+        assert_eq!(partial.subscription_level.as_deref(), Some("PRO"));
+        assert_eq!(
+            partial
+                .profile
+                .as_ref()
+                .and_then(|profile| profile["projectId"].as_str()),
+            Some("partial-project")
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[1].operation, "retrieveUserQuota");
+        assert_eq!(observations[1].body["project"], "partial-project");
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn project_load_exposes_upstream_unauthorized_status() {
+        let (base_url, _, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::UNAUTHORIZED,
+            json!({"error": {"message": "expired"}}),
+            axum::http::StatusCode::OK,
+            json!({"buckets": []}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::GeminiCli,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            None,
+        );
+
+        let failure =
+            load_gemini_v1internal_project(&reqwest::Client::new(), &account, 1_000, 5_000)
+                .await
+                .unwrap_err();
+        assert_eq!(failure.status_code, 400);
+        assert_eq!(failure.upstream_status, Some(401));
+        assert!(failure.partial_update.is_none());
+        server.abort();
     }
 
     #[test]
@@ -5185,25 +5979,25 @@ mod tests {
 
     #[test]
     fn claude_usage_windows_parse_known_and_unknown_tiers() {
-        let quota = parse_claude_quota(
-            &json!({
-                "five_hour": {
-                    "utilization": 25.0,
-                    "resets_at": "2026-07-02T00:00:00Z"
-                },
-                "seven_day_omelette": {
-                    "utilization": 0.5
-                },
-                "new_window": {
-                    "utilization": 75.0
-                },
-                "extra_usage": {
-                    "is_enabled": true
-                }
-            }),
-            Some("Claude Pro".to_string()),
-            1_000,
-        );
+        let body = json!({
+            "plan": "claude_pro",
+            "five_hour": {
+                "utilization": 25.0,
+                "resets_at": "2026-07-02T00:00:00Z"
+            },
+            "seven_day_omelette": {
+                "utilization": 0.5
+            },
+            "new_window": {
+                "utilization": 75.0
+            },
+            "extra_usage": {
+                "is_enabled": true
+            }
+        });
+        let account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        let subscription = resolve_claude_quota_subscription(&account, &body, None, None).unwrap();
+        let quota = parse_claude_quota(&body, Some(&subscription), 1_000);
 
         assert_eq!(quota.credential_message.as_deref(), Some("Claude Pro"));
         assert_eq!(quota.tiers[0].name, "five_hour");
@@ -5211,6 +6005,99 @@ mod tests {
         assert_eq!(quota.tiers[1].name, "seven_day_opus");
         assert_eq!(quota.tiers[1].utilization, Some(0.5));
         assert!(quota.tiers.iter().any(|tier| tier.name == "new_window"));
+        assert_eq!(
+            quota.extra_usage.unwrap()["subscription"]["planType"],
+            "claude_pro"
+        );
+    }
+
+    #[test]
+    fn claude_subscription_resolves_live_max_multipliers() {
+        for (rate_limit_tier, expected_type, expected_label) in [
+            ("default_claude_max_5x", "claude_max_5x", "Claude Max 5x"),
+            ("default_claude_max_20x", "claude_max_20x", "Claude Max 20x"),
+        ] {
+            let account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+            let usage = json!({"plan": "claude_max"});
+            let bootstrap = json!({
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": rate_limit_tier,
+            });
+            let subscription =
+                resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap))
+                    .unwrap();
+            let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
+            let extra = quota.extra_usage.unwrap();
+
+            assert_eq!(quota.credential_message.as_deref(), Some(expected_label));
+            assert_eq!(extra["subscription"]["planType"], expected_type);
+            assert_eq!(extra["subscription"]["planLabel"], expected_label);
+            assert_eq!(
+                extra["subscriptionEvidence"]["source"],
+                "bootstrap_rate_limit_tier"
+            );
+            assert_eq!(extra["subscriptionEvidence"]["stale"], false);
+            assert_eq!(extra["warningCodes"], json!([]));
+        }
+    }
+
+    #[test]
+    fn claude_subscription_keeps_generic_max_without_multiplier_evidence() {
+        let account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        let usage = json!({"five_hour": {"utilization": 10.0}});
+        let profile_lookup = ClaudeProfileLookup {
+            organization_type: Some("claude_max".to_string()),
+            rate_limit_tier: None,
+            profile_overlay: None,
+        };
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, Some(&profile_lookup), None)
+                .unwrap();
+
+        assert_eq!(subscription.plan.plan_type(), "claude_max");
+        assert_eq!(subscription.plan.label(), "Claude Max");
+        assert!(!subscription.stale);
+        assert!(!subscription.conflict);
+    }
+
+    #[test]
+    fn claude_subscription_reports_incompatible_live_evidence() {
+        let account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        let usage = json!({"tier": "claude_pro"});
+        let bootstrap = json!({
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_20x",
+        });
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap)).unwrap();
+        let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
+        let extra = quota.extra_usage.unwrap();
+
+        assert_eq!(quota.credential_message.as_deref(), Some("Claude Pro"));
+        assert_eq!(extra["subscriptionEvidence"]["conflict"], true);
+        assert_eq!(extra["warningCodes"], json!(["claude_plan_conflict"]));
+    }
+
+    #[test]
+    fn claude_subscription_backfills_compatible_cached_multiplier_as_stale() {
+        let mut account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        account.profile = Some(json!({
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_5x",
+        }));
+        account.subscription_level = Some("Claude Max 5x".to_string());
+        let usage = json!({"plan": "claude_max"});
+        let subscription = resolve_claude_quota_subscription(&account, &usage, None, None).unwrap();
+        let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
+        let extra = quota.extra_usage.unwrap();
+
+        assert_eq!(quota.credential_message.as_deref(), Some("Claude Max 5x"));
+        assert_eq!(extra["subscription"]["planType"], "claude_max_5x");
+        assert_eq!(extra["subscription"]["planStale"], true);
+        assert_eq!(
+            extra["subscriptionEvidence"]["source"],
+            "cached_subscription_level"
+        );
     }
 
     #[test]
@@ -5531,7 +6418,8 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(lookup.plan_label.as_deref(), Some("team"));
+        assert_eq!(lookup.organization_type.as_deref(), Some("team"));
+        assert_eq!(lookup.rate_limit_tier.as_deref(), Some("tier-2"));
         let profile = lookup.profile_overlay.unwrap();
         assert_eq!(profile["organizationUUID"], "org-1");
         assert_eq!(profile["organizationName"], "Example");

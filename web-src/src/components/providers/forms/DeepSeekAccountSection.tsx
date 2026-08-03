@@ -12,6 +12,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Loader2, Plus, User, X } from "lucide-react";
+import { removeAccountAndUpdateSelection } from "./accountSelectionActions";
 import { useDeepSeekAccount } from "./hooks/useDeepSeekAccount";
 
 interface DeepSeekAccountSectionProps {
@@ -29,7 +30,7 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
 }) => {
   const { t } = useTranslation();
   const [identifier, setIdentifier] = React.useState("");
-  const [password, setPassword] = React.useState("");
+  const [accessToken, setAccessToken] = React.useState("");
   const [showForm, setShowForm] = React.useState(false);
 
   const {
@@ -49,39 +50,39 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
     onAccountSelect?.(value === "none" ? null : value);
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     const nextIdentifier = identifier.trim();
-    const nextPassword = password.trim();
-    if (!nextIdentifier) {
+    const nextAccessToken = accessToken.trim();
+    if (!nextAccessToken) {
       return;
     }
-    if (!nextPassword) {
-      return;
-    }
-    const isEmail = nextIdentifier.includes("@");
     try {
       const account = await addAccount({
-        email: isEmail ? nextIdentifier : null,
-        mobile: isEmail ? null : nextIdentifier,
-        password: nextPassword,
+        identifier: nextIdentifier || null,
+        accessToken: nextAccessToken,
       });
       onAccountSelect?.(account.id);
       setIdentifier("");
-      setPassword("");
+      setAccessToken("");
       setShowForm(false);
-    } catch {
-      // Error is surfaced by the hook.
-    }
+    } catch {}
   };
 
   return (
@@ -146,7 +147,7 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
                     variant="ghost"
                     size="icon"
                     className="h-7 w-7 text-muted-foreground hover:text-red-500"
-                    onClick={(e) => handleRemoveAccount(account.id, e)}
+                    onClick={(e) => void handleRemoveAccount(account.id, e)}
                     disabled={isRemovingAccount}
                     title={t("deepseekAccount.removeAccount", "移除账号")}
                   >
@@ -195,52 +196,60 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
         </div>
       )}
 
+      {error && (
+        <p className="break-words text-sm text-red-500" role="alert">
+          {error}
+        </p>
+      )}
+
       {showForm && (
         <form className="space-y-3" onSubmit={handleSubmit}>
           <div className="space-y-2">
             <Label htmlFor="deepseek-identifier">
-              {t("deepseekAccount.identifier", "邮箱或手机号")}
+              {t("deepseekAccount.identifier", "账号标识（可选）")}
             </Label>
             <Input
               id="deepseek-identifier"
               type="text"
               value={identifier}
               onChange={(event) => setIdentifier(event.currentTarget.value)}
-              autoComplete="username"
+              autoComplete="off"
               placeholder={t(
                 "deepseekAccount.identifierPlaceholder",
-                "请输入邮箱或手机号",
+                "邮箱、手机号或自定义名称",
+              )}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="deepseek-access-token">
+              {t("deepseekAccount.accessToken", "Access Token")}
+            </Label>
+            <Input
+              id="deepseek-access-token"
+              type="password"
+              value={accessToken}
+              onChange={(event) => setAccessToken(event.currentTarget.value)}
+              autoComplete="off"
+              placeholder={t(
+                "deepseekAccount.accessTokenPlaceholder",
+                "粘贴 DeepSeek access token",
               )}
               required
             />
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="deepseek-password">
-              {t("deepseekAccount.password", "密码")}
-            </Label>
-            <Input
-              id="deepseek-password"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.currentTarget.value)}
-              autoComplete="current-password"
-              required
-            />
-          </div>
-          {error && <p className="text-sm text-red-500">{error}</p>}
           <div className="flex gap-2">
             <Button
               type="submit"
               variant="outline"
               className="flex-1"
-              disabled={isAddingAccount || !identifier.trim()}
+              disabled={isAddingAccount || !accessToken.trim()}
             >
               {isAddingAccount ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               ) : (
                 <Plus className="mr-2 h-4 w-4" />
               )}
-              {t("deepseekAccount.addAccount", "添加账号")}
+              {t("deepseekAccount.importAccount", "导入账号")}
             </Button>
             <Button
               type="button"
@@ -262,8 +271,8 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
         >
           <Plus className="mr-2 h-4 w-4" />
           {hasAnyAccount
-            ? t("deepseekAccount.addAnotherAccount", "添加其他账号")
-            : t("deepseekAccount.addAccount", "添加账号")}
+            ? t("deepseekAccount.importAnotherAccount", "导入其他账号")
+            : t("deepseekAccount.importAccount", "导入账号")}
         </Button>
       )}
     </div>

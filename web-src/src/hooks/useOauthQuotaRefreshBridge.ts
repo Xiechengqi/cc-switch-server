@@ -1,10 +1,15 @@
 import { useQueryClient } from "@tanstack/react-query";
+import {
+  isStaleOauthQuotaAccountKey,
+  oauthQuotaInvalidationKeys,
+} from "@/lib/query/oauthQuotaKeys";
 
 import { useServerEvent } from "./useServerEvent";
 
 interface OauthQuotaUpdatedPayload {
   authProvider?: string;
   accountId?: string;
+  authIdentityGeneration?: number | null;
   providerId?: string | null;
   appType?: string | null;
 }
@@ -18,38 +23,35 @@ export function useOauthQuotaRefreshBridge() {
 
   useServerEvent<OauthQuotaUpdatedPayload>("oauth-quota-updated", (payload) => {
     const authProvider = payload?.authProvider;
-    const accountId = payload?.accountId ?? "default";
     if (!authProvider) {
       return;
     }
 
-    const key =
-      authProvider === "github_copilot"
-        ? ["copilot", "quota", accountId]
-        : [authProvider, "quota", accountId];
-    void queryClient.invalidateQueries({ queryKey: key });
-
     if (
-      authProvider === "cursor_apikey" &&
-      payload?.providerId &&
-      payload?.appType
+      payload.accountId &&
+      payload.authIdentityGeneration != null
     ) {
-      void queryClient.invalidateQueries({
-        queryKey: [
-          "cursor_apikey",
-          "quota",
-          payload.providerId,
-          payload.appType,
-        ],
+      queryClient.removeQueries({
+        predicate: (query) =>
+          isStaleOauthQuotaAccountKey(
+            query.queryKey,
+            authProvider,
+            payload.accountId!,
+            payload.authIdentityGeneration!,
+          ),
       });
     }
 
-    if (accountId !== "default") {
-      const defaultKey =
-        authProvider === "github_copilot"
-          ? ["copilot", "quota", "default"]
-          : [authProvider, "quota", "default"];
-      void queryClient.invalidateQueries({ queryKey: defaultKey });
+    for (const queryKey of oauthQuotaInvalidationKeys({
+      authProvider,
+      accountId: payload?.accountId,
+      authIdentityGeneration: payload?.authIdentityGeneration,
+      providerId: payload?.providerId,
+      appType: payload?.appType,
+    })) {
+      void queryClient.invalidateQueries({
+        queryKey,
+      });
     }
   });
 }

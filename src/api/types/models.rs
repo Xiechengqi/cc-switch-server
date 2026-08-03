@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 pub(in crate::api) struct ModelsQuery {
     #[serde(default)]
     pub(in crate::api) app: Option<AppKind>,
-    #[serde(default)]
-    pub(in crate::api) provider_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -142,6 +142,7 @@ export interface AccountQuotaTier {
 export interface AccountManagerCapability {
   providerType: string;
   manager: string;
+  managerKind: AccountManagerKind;
   support: string;
   status: string;
   blockingReason?: string | null;
@@ -151,11 +152,78 @@ export interface AccountManagerCapability {
   supportsRefresh: boolean;
   supportsQuota: boolean;
   supportsRefreshPlan: boolean;
+  supportsCachedQuota: boolean;
+  supportsLiveQuotaRefresh: boolean;
+  refreshCapability: AccountRefreshCapability;
+  quotaCapability: AccountQuotaCapability;
+  inferenceBindingSupported: boolean;
+  credentialOwnership: AccountCredentialOwnership;
+  deprecatedForInference: boolean;
+  migrationTarget?: "provider" | null;
   supportsImport: boolean;
   supportsDelete: boolean;
   serverNativeStage?: string | null;
   profileStrategy?: string | null;
   quotaStrategy?: string | null;
+  subscriptionExpiryCapability:
+    | "automatic"
+    | "automatic_or_manual"
+    | "manual_required"
+    | "research_pending"
+    | "not_applicable";
+}
+
+export type AccountManagerKind =
+  | "native_oauth"
+  | "import_only"
+  | "static_credential";
+
+export type AccountRefreshCapability =
+  | "oauth_request"
+  | "provider_dynamic"
+  | "unavailable";
+
+export type AccountQuotaCapability =
+  | "live_refresh"
+  | "imported_snapshot"
+  | "cached_only"
+  | "unavailable";
+
+export type AccountCredentialOwnership =
+  | "managed_account"
+  | "provider"
+  | "metadata_only";
+
+type AccountManagerCapabilityWire = Omit<
+  AccountManagerCapability,
+  | "managerKind"
+  | "supportsCachedQuota"
+  | "supportsLiveQuotaRefresh"
+  | "refreshCapability"
+  | "quotaCapability"
+  | "inferenceBindingSupported"
+  | "credentialOwnership"
+  | "deprecatedForInference"
+  | "migrationTarget"
+> &
+  Partial<
+    Pick<
+      AccountManagerCapability,
+      | "managerKind"
+      | "supportsCachedQuota"
+      | "supportsLiveQuotaRefresh"
+      | "refreshCapability"
+      | "quotaCapability"
+      | "inferenceBindingSupported"
+      | "credentialOwnership"
+      | "deprecatedForInference"
+      | "migrationTarget"
+    >
+  >;
+
+export interface AccountCapabilitiesResponse {
+  ok: boolean;
+  capabilities: AccountManagerCapabilityWire[];
 }
 
 export interface AccountLoginFlowCapability {
@@ -163,6 +231,109 @@ export interface AccountLoginFlowCapability {
   supportsCallback: boolean;
   supportsPoll: boolean;
   supportsCancel: boolean;
+}
+
+const LEGACY_MANAGED_ACCOUNT_PROVIDER_TYPES = new Set([
+  "claude_oauth",
+  "codex_oauth",
+  "grok_oauth",
+  "gemini_cli",
+  "github_copilot",
+  "deepseek_account",
+  "kiro_oauth",
+  "cursor_oauth",
+  "antigravity_oauth",
+  "agy_oauth",
+]);
+
+const LEGACY_LIVE_QUOTA_PROVIDER_TYPES = new Set([
+  "claude_oauth",
+  "codex_oauth",
+  "grok_oauth",
+  "gemini_cli",
+  "kiro_oauth",
+  "antigravity_oauth",
+  "agy_oauth",
+  "ollama_cloud",
+]);
+
+const LEGACY_IMPORTED_QUOTA_PROVIDER_TYPES = new Set([
+  "github_copilot",
+  "cursor_oauth",
+  "cursor_apikey",
+]);
+
+export function normalizeAccountManagerCapability(
+  wire: AccountManagerCapabilityWire,
+): AccountManagerCapability {
+  const credentialOwnership =
+    wire.credentialOwnership ??
+    (LEGACY_MANAGED_ACCOUNT_PROVIDER_TYPES.has(wire.providerType)
+      ? "managed_account"
+      : "metadata_only");
+  const managerKind =
+    wire.managerKind ??
+    (wire.providerType === "deepseek_account"
+      ? "import_only"
+      : credentialOwnership === "managed_account"
+        ? "native_oauth"
+        : "static_credential");
+  const refreshCapability =
+    wire.refreshCapability ??
+    (wire.supportsRefresh
+      ? wire.providerType === "kiro_oauth"
+        ? "provider_dynamic"
+        : "oauth_request"
+      : "unavailable");
+  const quotaCapability =
+    wire.quotaCapability ??
+    (LEGACY_LIVE_QUOTA_PROVIDER_TYPES.has(wire.providerType)
+      ? "live_refresh"
+      : LEGACY_IMPORTED_QUOTA_PROVIDER_TYPES.has(wire.providerType)
+        ? "imported_snapshot"
+        : wire.supportsQuota
+          ? "cached_only"
+          : "unavailable");
+  const deprecatedForInference =
+    wire.deprecatedForInference ?? credentialOwnership === "metadata_only";
+
+  return {
+    ...wire,
+    managerKind,
+    supportsCachedQuota:
+      wire.supportsCachedQuota ?? quotaCapability !== "unavailable",
+    supportsLiveQuotaRefresh:
+      wire.supportsLiveQuotaRefresh ?? quotaCapability === "live_refresh",
+    refreshCapability,
+    quotaCapability,
+    inferenceBindingSupported:
+      wire.inferenceBindingSupported ??
+      (credentialOwnership === "managed_account" && !deprecatedForInference),
+    credentialOwnership,
+    deprecatedForInference,
+    migrationTarget:
+      wire.migrationTarget ?? (deprecatedForInference ? "provider" : null),
+  };
+}
+
+export function normalizeAccountCapabilitiesResponse(
+  response: AccountCapabilitiesResponse,
+): AccountManagerCapability[] {
+  if (!response.ok || !Array.isArray(response.capabilities)) {
+    throw new Error("account capability response is invalid");
+  }
+  return response.capabilities.map(normalizeAccountManagerCapability);
+}
+
+export async function loadAccountCapabilities(): Promise<
+  AccountManagerCapability[]
+> {
+  const response = await invokeCommand<AccountCapabilitiesResponse>(
+    "get_account_capabilities",
+    undefined,
+    { cache: "no-store" },
+  );
+  return normalizeAccountCapabilitiesResponse(response);
 }
 
 export interface AccountImportTemplate {

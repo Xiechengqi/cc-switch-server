@@ -4,8 +4,8 @@
 
 ## 能力边界
 
-- 直连入口为 `POST /v1/messages`、`POST /claude/v1/messages` 及对应的 `count_tokens` 路径。
-- 当前 Claude Provider 是唯一的直连执行目标；OAuth Provider 必须绑定一个明确账号。
+- 直连入口为 `POST /r/:routeKey/v1/messages` 及对应的 `count_tokens` 路径。
+- Route Key 精确绑定一个已启用的 Claude Surface；OAuth Provider Bundle 必须绑定一个明确账号。
 - Share 请求继续使用 Share 自身不可变的 Provider/账号绑定。
 - 不按并发、配额、健康度或错误类型切换到其他 Claude Provider 或账号。
 - 可在同一 Provider、同一账号上执行文档中列出的有限重放。
@@ -29,13 +29,13 @@
 
 直连请求的选择过程如下：
 
-1. 解析 `currentProviderClaude`。
-2. 如果请求包含 `x-cc-provider-id`，它必须与当前 Provider 完全一致。
-3. 解析该 Provider 的不可变账号绑定。
+1. 从 `/r/:routeKey` 解析唯一的 Claude Surface。
+2. 编译后的 RuntimePlan 必须与该 Surface 的已提交 revision 一致。
+3. 解析 Provider Bundle 的不可变账号绑定。
 4. 检查账号登录状态、配额/冷却状态和并发上限。
 5. 获取该账号的 in-flight lease 后开始转发。
 
-当前 Provider 不存在、账号需要重新登录、账号处于冷却或并发已满时，请求直接失败。系统不会查找第二个 Claude Provider。
+Route Key 不存在、Surface 已禁用、账号需要重新登录、账号处于冷却或并发已满时，请求直接失败。系统不会查找第二个 Claude Provider。
 
 ## OAuth 刷新一致性
 
@@ -95,21 +95,21 @@ Messages 的建连重放只发生在请求尚未到达可产生计费副作用�
 
 ## 真实账号验收
 
-先确保当前 Claude Provider 已绑定待验收的真实 OAuth 账号，然后运行：
+先确保待测 Route Key 的 Claude Surface 已绑定真实 OAuth 账号，然后运行：
 
 ```bash
 CC_SWITCH_BASE_URL=http://127.0.0.1:15721 \
 CC_SWITCH_INFERENCE_TOKEN='<one-time-issued-token>' \
+CC_SWITCH_CLAUDE_ROUTE_KEY='<provider-route-key>' \
 node scripts/smoke/claude-oauth-real.mjs
 ```
 
 可选变量：
 
 - `CC_SWITCH_CLAUDE_MODEL`：覆盖默认模型 `claude-sonnet-4-6`。
-- `CC_SWITCH_CLAUDE_PROVIDER_ID`：显式断言当前 Provider ID；不匹配时验收失败。
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 
-验收依次检查 readiness、count_tokens、非流式 Messages 和完整 SSE lifecycle。缺少 `CC_SWITCH_BASE_URL` 或 `CC_SWITCH_INFERENCE_TOKEN` 时脚本明确输出 `SKIP` 并退出，不把缺少真实凭据记为通过。
+验收依次检查 readiness、Route Key 下的 count_tokens、非流式 Messages 和完整 SSE lifecycle。缺少 `CC_SWITCH_BASE_URL`、`CC_SWITCH_INFERENCE_TOKEN` 或 `CC_SWITCH_CLAUDE_ROUTE_KEY` 时脚本明确输出 `SKIP` 并退出，不把缺少真实凭据记为通过。
 
 ## 非目标与剩余外部风险
 

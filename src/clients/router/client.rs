@@ -156,6 +156,20 @@ pub enum ClientTunnelClaimError {
 }
 
 impl ClientTunnelClaimError {
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Rejected {
+                status: reqwest::StatusCode::CONFLICT,
+                ..
+            }
+        )
+    }
+
+    pub fn outcome_is_uncertain(&self) -> bool {
+        matches!(self, Self::Request(_) | Self::Timeout { .. }) || self.is_conflict()
+    }
+
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Request(error) => error.is_connect() || error.is_timeout(),

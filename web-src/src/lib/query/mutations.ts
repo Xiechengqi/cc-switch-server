@@ -8,7 +8,6 @@ import { toast } from "sonner";
 import { providersApi, sessionsApi, settingsApi, type AppId } from "@/lib/api";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { DeleteSessionOptions } from "@/lib/api/sessions";
-import type { SwitchResult } from "@/lib/api/providers";
 import type {
   ProviderCredentialPatches,
   ProviderCustomBinding,
@@ -334,127 +333,6 @@ export const useDeleteProviderMutation = (appId: AppId) => {
           defaultValue: "删除供应商失败: {{error}}",
           error: detail,
         }),
-      );
-    },
-  });
-};
-
-export const useSwitchProviderMutation = (appId: AppId) => {
-  const queryClient = useQueryClient();
-  const { t } = useTranslation();
-
-  return useMutation({
-    mutationFn: async (providerId: string): Promise<SwitchResult> => {
-      return await providersApi.switch(providerId, appId);
-    },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      if (appId === "claude-desktop") {
-        await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-        await queryClient.invalidateQueries({
-          queryKey: ["claudeDesktopStatus"],
-        });
-      }
-
-      // OpenCode/OpenClaw: also invalidate live provider IDs cache to update button state
-      if (appId === "opencode") {
-        await queryClient.invalidateQueries({
-          queryKey: ["opencodeLiveProviderIds"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["omo", "current-provider-id"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["omo-slim", "current-provider-id"],
-        });
-      }
-      if (appId === "openclaw") {
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.liveProviderIds,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.defaultModel,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.health,
-        });
-      }
-      if (appId === "hermes") {
-        await invalidateHermesProviderCaches(queryClient);
-      }
-
-      try {
-        await providersApi.updateTrayMenu();
-      } catch (trayError) {
-        console.error(
-          "Failed to update tray menu after switching provider",
-          trayError,
-        );
-      }
-    },
-    onError: (error: Error) => {
-      const detail = extractErrorMessage(error) || t("common.unknown");
-
-      toast.error(
-        t("notifications.switchFailedTitle", { defaultValue: "切换失败" }),
-        {
-          description: t("notifications.switchFailed", {
-            defaultValue: "切换失败：{{error}}",
-            error: detail,
-          }),
-          duration: 6000,
-          action: {
-            label: t("common.copy", { defaultValue: "复制" }),
-            onClick: () => {
-              navigator.clipboard?.writeText(detail).catch(() => undefined);
-            },
-          },
-        },
-      );
-    },
-  });
-};
-
-export const useClearCurrentProviderMutation = (appId: AppId) => {
-  const queryClient = useQueryClient();
-  const { t } = useTranslation();
-
-  return useMutation({
-    mutationFn: async (): Promise<SwitchResult> => {
-      return await providersApi.clearCurrent(appId);
-    },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      if (appId === "claude-desktop") {
-        await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-        await queryClient.invalidateQueries({
-          queryKey: ["claudeDesktopStatus"],
-        });
-      }
-
-      try {
-        await providersApi.updateTrayMenu();
-      } catch (trayError) {
-        console.error(
-          "Failed to update tray menu after clearing current provider",
-          trayError,
-        );
-      }
-    },
-    onError: (error: Error) => {
-      const detail = extractErrorMessage(error) || t("common.unknown");
-
-      toast.error(
-        t("notifications.clearCurrentFailedTitle", {
-          defaultValue: "取消启用失败",
-        }),
-        {
-          description: t("notifications.clearCurrentFailed", {
-            defaultValue: "取消启用失败：{{error}}",
-            error: detail,
-          }),
-          duration: 6000,
-        },
       );
     },
   });

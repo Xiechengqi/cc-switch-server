@@ -1,16 +1,15 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::domain::accounts::oauth::{
-    build_refresh_request, oauth_provider_spec, provider_login_request_shape_available,
-    token_expires_soon, OAuthHttpRequest, OAuthProfileStrategy, OAuthQuotaStrategy,
+    oauth_provider_spec, provider_login_request_shape_available, OAuthErrorKind,
+    OAuthProfileStrategy, OAuthQuotaCapability, OAuthQuotaStrategy, OAuthRefreshCapability,
     OAuthSupportStage,
 };
 use crate::domain::accounts::store::{Account, AccountQuota, AccountStore, UpsertAccountInput};
@@ -23,6 +22,7 @@ use crate::domain::providers::model::ProviderType;
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum AccountManagerSupport {
+    #[serde(rename = "native_oauth")]
     NativeOAuth,
     ManualTokenStore,
     Planned,
@@ -51,6 +51,7 @@ pub struct AccountLoginFlowCapability {
 pub struct AccountManagerCapability {
     pub provider_type: ProviderType,
     pub manager: &'static str,
+    pub manager_kind: AccountManagerKind,
     pub support: AccountManagerSupport,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,6 +62,15 @@ pub struct AccountManagerCapability {
     pub supports_refresh: bool,
     pub supports_quota: bool,
     pub supports_refresh_plan: bool,
+    pub supports_cached_quota: bool,
+    pub supports_live_quota_refresh: bool,
+    pub refresh_capability: OAuthRefreshCapability,
+    pub quota_capability: OAuthQuotaCapability,
+    pub inference_binding_supported: bool,
+    pub credential_ownership: AccountCredentialOwnership,
+    pub deprecated_for_inference: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_target: Option<&'static str>,
     pub supports_import: bool,
     pub supports_delete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,8 +85,18 @@ pub struct AccountManagerCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountManagerKind {
-    ManualTokenStore,
+    #[serde(rename = "native_oauth")]
     NativeOAuth,
+    ImportOnly,
+    StaticCredential,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountCredentialOwnership {
+    ManagedAccount,
+    Provider,
+    MetadataOnly,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -175,28 +195,122 @@ pub trait AccountManager {
     ) -> Result<bool, AccountManagerError>;
 }
 
-pub struct ManualTokenAccountManager;
-
-#[derive(Debug, Default)]
-pub struct CodexOAuthAccountManager {
-    refresh_locks: AccountRefreshLocks,
+#[derive(Debug, Clone, Copy)]
+pub struct AccountProviderDriver {
+    provider_type: ProviderType,
+    kind: AccountManagerKind,
 }
 
 #[derive(Debug, Default)]
 pub struct AccountRefreshLocks {
-    active: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
+    active: Mutex<BTreeMap<String, Arc<AsyncMutex<AccountRefreshFlightState>>>>,
 }
 
 #[derive(Debug)]
 pub struct AccountRefreshGuard {
-    _guard: Option<OwnedMutexGuard<()>>,
+    guard: Option<OwnedMutexGuard<AccountRefreshFlightState>>,
+    waited: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountRefreshFlightFailure {
+    pub stage: AccountRefreshFlightStage,
+    pub auth_identity_generation: u64,
+    pub token_refresh_generation: u64,
+    pub status_code: u16,
+    pub upstream_status: Option<u16>,
+    pub message: String,
+    pub public_message: Option<String>,
+    pub kind: OAuthErrorKind,
+    pub retryable: bool,
+    pub retry_after_ms: Option<i64>,
+    retry_not_before_ms: Option<i64>,
+    pub immediate_relogin: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountRefreshFlightFailureDetails {
+    pub status_code: u16,
+    pub upstream_status: Option<u16>,
+    pub message: String,
+    pub public_message: Option<String>,
+    pub kind: OAuthErrorKind,
+    pub retryable: bool,
+    pub retry_after_ms: Option<i64>,
+    pub immediate_relogin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRefreshFlightStage {
+    NativeRefresh,
+    QuotaRefresh,
+    GeminiProjectDiscovery,
+}
+
+impl AccountRefreshFlightFailure {
+    pub fn for_account(
+        account: &Account,
+        stage: AccountRefreshFlightStage,
+        details: AccountRefreshFlightFailureDetails,
+    ) -> Self {
+        let retry_not_before_ms = details.retry_after_ms.map(|retry_after_ms| {
+            (crate::infra::time::now_ms().min(i64::MAX as u128) as i64)
+                .saturating_add(retry_after_ms.max(0))
+        });
+        Self {
+            stage,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+            status_code: details.status_code,
+            upstream_status: details.upstream_status,
+            message: details.message,
+            public_message: details.public_message,
+            kind: details.kind,
+            retryable: details.retryable,
+            retry_after_ms: details.retry_after_ms,
+            retry_not_before_ms,
+            immediate_relogin: details.immediate_relogin,
+        }
+    }
+
+    fn matches_account(&self, account: &Account) -> bool {
+        self.auth_identity_generation == account.auth_identity_generation
+            && self.token_refresh_generation == account.token_refresh_generation
+    }
+
+    fn cooldown_active(&self) -> bool {
+        self.retry_not_before_ms.is_some_and(|retry_not_before_ms| {
+            retry_not_before_ms > crate::infra::time::now_ms().min(i64::MAX as u128) as i64
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct AccountRefreshFlightState {
+    failure: Option<AccountRefreshFlightFailure>,
 }
 
 impl AccountRefreshLocks {
     pub async fn lock(&self, provider_type: ProviderType, account_id: &str) -> AccountRefreshGuard {
         let lock = self.lock_for(provider_type, account_id);
-        AccountRefreshGuard {
-            _guard: Some(lock.lock_owned().await),
+        match Arc::clone(&lock).try_lock_owned() {
+            Ok(mut guard) => {
+                if !guard
+                    .failure
+                    .as_ref()
+                    .is_some_and(AccountRefreshFlightFailure::cooldown_active)
+                {
+                    guard.failure = None;
+                }
+                AccountRefreshGuard {
+                    guard: Some(guard),
+                    waited: false,
+                }
+            }
+            Err(_) => AccountRefreshGuard {
+                guard: Some(lock.lock_owned().await),
+                waited: true,
+            },
         }
     }
 
@@ -206,8 +320,18 @@ impl AccountRefreshLocks {
         account_id: &str,
     ) -> Option<AccountRefreshGuard> {
         let lock = self.lock_for(provider_type, account_id);
-        lock.try_lock_owned().ok().map(|guard| AccountRefreshGuard {
-            _guard: Some(guard),
+        lock.try_lock_owned().ok().map(|mut guard| {
+            if !guard
+                .failure
+                .as_ref()
+                .is_some_and(AccountRefreshFlightFailure::cooldown_active)
+            {
+                guard.failure = None;
+            }
+            AccountRefreshGuard {
+                guard: Some(guard),
+                waited: false,
+            }
         })
     }
 
@@ -216,65 +340,109 @@ impl AccountRefreshLocks {
         lock.try_lock_owned().is_err()
     }
 
-    fn lock_for(&self, provider_type: ProviderType, account_id: &str) -> Arc<AsyncMutex<()>> {
+    fn lock_for(
+        &self,
+        provider_type: ProviderType,
+        account_id: &str,
+    ) -> Arc<AsyncMutex<AccountRefreshFlightState>> {
         let key = refresh_lock_key(provider_type, account_id);
         let mut active = self.active.lock().expect("account refresh lock poisoned");
-        active
-            .entry(key)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        active.retain(|_, lock| {
+            if Arc::strong_count(lock) > 1 {
+                return true;
+            }
+            match lock.try_lock() {
+                Ok(state) => state
+                    .failure
+                    .as_ref()
+                    .is_some_and(AccountRefreshFlightFailure::cooldown_active),
+                Err(_) => true,
+            }
+        });
+        if let Some(lock) = active.get(&key) {
+            return Arc::clone(lock);
+        }
+        let lock = Arc::new(AsyncMutex::new(AccountRefreshFlightState::default()));
+        active.insert(key, Arc::clone(&lock));
+        lock
     }
 }
 
 impl AccountRefreshGuard {
-    pub fn release(mut self) {
-        self._guard.take();
-    }
-}
-
-impl CodexOAuthAccountManager {
-    pub fn capability(&self) -> AccountManagerCapability {
-        manual_capability(ProviderType::CodexOAuth)
-    }
-
-    pub fn plan_refresh_request(
+    pub fn coalesced_native_failure_for(
         &self,
-        store: &AccountStore,
-        account_id: &str,
-        now_ms: i64,
-    ) -> Result<(AccountRefreshGuard, OAuthHttpRequest), AccountManagerError> {
-        let account = store
-            .accounts
-            .iter()
-            .find(|item| item.id == account_id && item.provider_type == ProviderType::CodexOAuth)
-            .ok_or_else(|| AccountManagerError::NotFound(account_id.to_string()))?;
+        account: &Account,
+    ) -> Option<&AccountRefreshFlightFailure> {
+        self.coalesced_failure_for(account)
+            .filter(|failure| failure.stage == AccountRefreshFlightStage::NativeRefresh)
+    }
 
-        if !token_expires_soon(account, now_ms) {
-            return Err(AccountManagerError::CredentialUnavailable(
-                "codex oauth access token is still valid; refresh not required".to_string(),
-            ));
+    pub fn coalesced_quota_failure_for(
+        &self,
+        account: &Account,
+    ) -> Option<&AccountRefreshFlightFailure> {
+        self.coalesced_failure_for(account)
+    }
+
+    pub fn coalesced_gemini_project_failure_for(
+        &self,
+        account: &Account,
+    ) -> Option<&AccountRefreshFlightFailure> {
+        self.coalesced_failure_for(account).filter(|failure| {
+            matches!(
+                failure.stage,
+                AccountRefreshFlightStage::NativeRefresh
+                    | AccountRefreshFlightStage::GeminiProjectDiscovery
+            )
+        })
+    }
+
+    fn coalesced_failure_for(&self, account: &Account) -> Option<&AccountRefreshFlightFailure> {
+        self.guard
+            .as_ref()
+            .and_then(|guard| guard.failure.as_ref())
+            .filter(|failure| failure.matches_account(account))
+            .filter(|failure| self.waited || failure.cooldown_active())
+    }
+
+    pub fn record_failure(&mut self, failure: AccountRefreshFlightFailure) {
+        if let Some(guard) = self.guard.as_mut() {
+            guard.failure = Some(failure);
         }
+    }
 
-        let guard = self
-            .refresh_locks
-            .try_lock(ProviderType::CodexOAuth, account_id)
-            .ok_or_else(|| {
-                AccountManagerError::CredentialUnavailable(
-                    "codex oauth refresh is already in progress".to_string(),
-                )
-            })?;
-        let request = build_refresh_request(ProviderType::CodexOAuth, account)
-            .map_err(|error| AccountManagerError::CredentialUnavailable(error.message))?;
-        Ok((guard, request))
+    pub fn release(mut self) {
+        self.guard.take();
     }
 }
 
-impl AccountManager for ManualTokenAccountManager {
-    fn capability(&self, provider_type: ProviderType) -> AccountManagerCapability {
-        manual_capability(provider_type)
+impl AccountProviderDriver {
+    fn new(provider_type: ProviderType) -> Self {
+        Self {
+            provider_type,
+            kind: account_manager_kind_for(provider_type),
+        }
+    }
+
+    fn ensure_provider_type(self, provider_type: ProviderType) -> Result<(), AccountManagerError> {
+        if provider_type == self.provider_type {
+            return Ok(());
+        }
+        Err(AccountManagerError::CredentialUnavailable(format!(
+            "account driver for {} cannot manage {}",
+            self.provider_type.as_str(),
+            provider_type.as_str()
+        )))
+    }
+}
+
+impl AccountManager for AccountProviderDriver {
+    fn capability(&self, _provider_type: ProviderType) -> AccountManagerCapability {
+        manual_capability(self.provider_type)
     }
 
     fn start_login(&self, provider_type: ProviderType) -> Result<LoginStart, AccountManagerError> {
+        self.ensure_provider_type(provider_type)?;
         if provider_type == ProviderType::CursorOAuth {
             return Ok(LoginStart {
                 provider_type,
@@ -317,6 +485,8 @@ impl AccountManager for ManualTokenAccountManager {
         store: &mut AccountStore,
         mut input: UpsertAccountInput,
     ) -> Result<Account, AccountManagerError> {
+        self.ensure_provider_type(input.provider_type)?;
+        validate_required_account_credential(&input)?;
         if let Some(account_id) = input.id.as_deref() {
             if let Some(existing) = store
                 .accounts
@@ -392,6 +562,7 @@ impl AccountManager for ManualTokenAccountManager {
         account_id: Option<&str>,
         now_ms: i64,
     ) -> Result<AccountCredential, AccountManagerError> {
+        self.ensure_provider_type(provider_type)?;
         let account = store
             .find_for_provider(provider_type, account_id)
             .ok_or_else(|| {
@@ -447,6 +618,12 @@ impl AccountManager for ManualTokenAccountManager {
         account_id: &str,
         now_ms: i64,
     ) -> Result<Account, AccountManagerError> {
+        let account = store
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| AccountManagerError::NotFound(account_id.to_string()))?;
+        self.ensure_provider_type(account.provider_type)?;
         store
             .refresh_status(account_id, now_ms)
             .ok_or_else(|| AccountManagerError::NotFound(account_id.to_string()))
@@ -462,6 +639,7 @@ impl AccountManager for ManualTokenAccountManager {
             .iter()
             .find(|item| item.id == account_id)
             .ok_or_else(|| AccountManagerError::NotFound(account_id.to_string()))?;
+        self.ensure_provider_type(account.provider_type)?;
         Ok(account.quota.clone())
     }
 
@@ -470,24 +648,76 @@ impl AccountManager for ManualTokenAccountManager {
         store: &mut AccountStore,
         account_id: &str,
     ) -> Result<bool, AccountManagerError> {
+        let account = store
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| AccountManagerError::NotFound(account_id.to_string()))?;
+        self.ensure_provider_type(account.provider_type)?;
         Ok(store.delete(account_id))
     }
 }
 
 pub fn capability_for(provider_type: ProviderType) -> AccountManagerCapability {
-    ManualTokenAccountManager.capability(provider_type)
+    manager_for(provider_type).capability(provider_type)
 }
 
-pub fn manager_for(_provider_type: ProviderType) -> ManualTokenAccountManager {
-    ManualTokenAccountManager
+pub fn manager_for(provider_type: ProviderType) -> AccountProviderDriver {
+    AccountProviderDriver::new(provider_type)
 }
 
 pub fn manager_registration_for(provider_type: ProviderType) -> AccountManagerRegistration {
+    let driver = manager_for(provider_type);
     AccountManagerRegistration {
         provider_type,
-        kind: AccountManagerKind::ManualTokenStore,
-        manager: "manual_token_store",
+        kind: driver.kind,
+        manager: match driver.kind {
+            AccountManagerKind::NativeOAuth => "native_oauth_account",
+            AccountManagerKind::ImportOnly => "import_only_account",
+            AccountManagerKind::StaticCredential => "static_credential_metadata",
+        },
     }
+}
+
+fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
+    match provider_type {
+        ProviderType::ClaudeOAuth
+        | ProviderType::CodexOAuth
+        | ProviderType::GrokOAuth
+        | ProviderType::GeminiCli
+        | ProviderType::GitHubCopilot
+        | ProviderType::KiroOAuth
+        | ProviderType::CursorOAuth
+        | ProviderType::AntigravityOAuth
+        | ProviderType::AgyOAuth => AccountManagerKind::NativeOAuth,
+        ProviderType::DeepSeekAccount => AccountManagerKind::ImportOnly,
+        ProviderType::Claude
+        | ProviderType::ClaudeAuth
+        | ProviderType::Codex
+        | ProviderType::Gemini
+        | ProviderType::OpenRouter
+        | ProviderType::CursorApiKey
+        | ProviderType::OllamaCloud
+        | ProviderType::AwsBedrock
+        | ProviderType::Nvidia
+        | ProviderType::DeepSeekApi => AccountManagerKind::StaticCredential,
+    }
+}
+
+fn validate_required_account_credential(
+    input: &UpsertAccountInput,
+) -> Result<(), AccountManagerError> {
+    if input.provider_type == ProviderType::DeepSeekAccount
+        && input
+            .access_token
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "deepseek_account requires a non-empty accessToken".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn registered_account_managers() -> Vec<AccountManagerRegistration> {
@@ -536,11 +766,27 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
     let login_flows = login_flows_for(provider_type);
     let supports_start_login = !login_flows.is_empty();
     let supports_callback = login_flows.iter().any(|flow| flow.supports_callback);
-    let supports_refresh_plan = oauth_spec.is_some_and(|spec| !spec.token_urls.is_empty());
-    let supports_native_refresh = oauth_spec
-        .is_some_and(|spec| !spec.token_urls.is_empty() && spec.server_native_refresh_enabled());
-    let supports_quota = oauth_spec
-        .is_some_and(|spec| !matches!(spec.quota_strategy, OAuthQuotaStrategy::NotAvailable));
+    let refresh_capability = oauth_spec
+        .map(|spec| spec.refresh_capability)
+        .unwrap_or(OAuthRefreshCapability::Unavailable);
+    let quota_capability = oauth_spec
+        .map(|spec| spec.quota_capability)
+        .unwrap_or(OAuthQuotaCapability::Unavailable);
+    let supports_native_refresh =
+        !matches!(refresh_capability, OAuthRefreshCapability::Unavailable);
+    let supports_refresh_plan = supports_native_refresh;
+    let supports_cached_quota = !matches!(quota_capability, OAuthQuotaCapability::Unavailable);
+    let supports_live_quota_refresh = matches!(quota_capability, OAuthQuotaCapability::LiveRefresh);
+    let credential_ownership = account_credential_ownership(provider_type);
+    let inference_binding_supported = matches!(
+        credential_ownership,
+        AccountCredentialOwnership::ManagedAccount
+    );
+    let manager_kind = account_manager_kind_for(provider_type);
+    let deprecated_for_inference = matches!(
+        credential_ownership,
+        AccountCredentialOwnership::MetadataOnly
+    );
     let native_oauth_planned = matches!(
         provider_type,
         ProviderType::ClaudeOAuth
@@ -561,8 +807,11 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         } else {
             "manual_token_store"
         },
+        manager_kind,
         support: AccountManagerSupport::ManualTokenStore,
-        status: if supports_start_login && supports_native_refresh {
+        status: if deprecated_for_inference {
+            "metadata_only"
+        } else if supports_start_login && supports_native_refresh {
             "native_login_refresh"
         } else if supports_start_login {
             "native_login"
@@ -573,7 +822,11 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         } else {
             "manual_api_key_available"
         },
-        blocking_reason: if supports_start_login {
+        blocking_reason: if deprecated_for_inference {
+            Some(
+                "static credentials are Provider-owned; this Account record is metadata/quota compatibility only",
+            )
+        } else if supports_start_login {
             None
         } else if supports_native_refresh {
             Some("native browser login/callback is disabled; import refresh credentials first")
@@ -586,14 +839,49 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         supports_start_login,
         supports_callback,
         supports_refresh: supports_native_refresh,
-        supports_quota,
+        supports_quota: supports_cached_quota,
         supports_refresh_plan,
+        supports_cached_quota,
+        supports_live_quota_refresh,
+        refresh_capability,
+        quota_capability,
+        inference_binding_supported,
+        credential_ownership,
+        deprecated_for_inference,
+        migration_target: deprecated_for_inference.then_some("provider"),
         supports_import: true,
         supports_delete: true,
         server_native_stage: oauth_spec.map(|spec| spec.stage),
         profile_strategy: oauth_spec.map(|spec| spec.profile_strategy),
         quota_strategy: oauth_spec.map(|spec| spec.quota_strategy),
         subscription_expiry_capability: subscription_expiry_capability(provider_type),
+    }
+}
+
+pub(crate) fn account_credential_ownership(
+    provider_type: ProviderType,
+) -> AccountCredentialOwnership {
+    match provider_type {
+        ProviderType::ClaudeOAuth
+        | ProviderType::CodexOAuth
+        | ProviderType::GrokOAuth
+        | ProviderType::GeminiCli
+        | ProviderType::GitHubCopilot
+        | ProviderType::DeepSeekAccount
+        | ProviderType::KiroOAuth
+        | ProviderType::CursorOAuth
+        | ProviderType::AntigravityOAuth
+        | ProviderType::AgyOAuth => AccountCredentialOwnership::ManagedAccount,
+        ProviderType::CursorApiKey
+        | ProviderType::OllamaCloud
+        | ProviderType::AwsBedrock
+        | ProviderType::Nvidia
+        | ProviderType::DeepSeekApi => AccountCredentialOwnership::MetadataOnly,
+        ProviderType::Claude
+        | ProviderType::ClaudeAuth
+        | ProviderType::Codex
+        | ProviderType::Gemini
+        | ProviderType::OpenRouter => AccountCredentialOwnership::Provider,
     }
 }
 
@@ -814,12 +1102,23 @@ mod tests {
         let capability = capability_for(ProviderType::CodexOAuth);
         assert_eq!(capability.support, AccountManagerSupport::ManualTokenStore);
         assert_eq!(capability.manager, "manual_token_store_with_native_refresh");
+        assert_eq!(capability.manager_kind, AccountManagerKind::NativeOAuth);
         assert_eq!(capability.status, "native_login_refresh");
         assert!(capability.blocking_reason.is_none());
         assert!(capability.supports_start_login);
         assert!(capability.supports_callback);
         assert_eq!(capability.login_flows.len(), 3);
         assert!(capability.supports_refresh);
+        assert_eq!(
+            capability.refresh_capability,
+            OAuthRefreshCapability::OAuthRequest
+        );
+        assert!(capability.supports_live_quota_refresh);
+        assert!(capability.inference_binding_supported);
+        assert_eq!(
+            capability.credential_ownership,
+            AccountCredentialOwnership::ManagedAccount
+        );
         assert!(capability.supports_import);
         assert!(capability.supports_delete);
         assert_eq!(
@@ -835,7 +1134,7 @@ mod tests {
     #[test]
     fn cursor_account_manager_rejects_a_second_proxy_credential() {
         for provider_type in [ProviderType::CursorOAuth, ProviderType::CursorApiKey] {
-            let manager = ManualTokenAccountManager;
+            let manager = manager_for(provider_type);
             let mut store = AccountStore::default();
             let mut first = codex_account_input("cursor-1", "refresh-1");
             first.provider_type = provider_type;
@@ -852,6 +1151,57 @@ mod tests {
             let updated = manager.finish_login(&mut store, first).unwrap();
             assert_eq!(updated.email.as_deref(), Some("updated@example.com"));
         }
+    }
+
+    #[test]
+    fn deepseek_account_manager_requires_access_token_before_create_or_update() {
+        let manager = manager_for(ProviderType::DeepSeekAccount);
+
+        for access_token in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut store = AccountStore::default();
+            let mut input = codex_account_input("deepseek-new", "unused-refresh");
+            input.provider_type = ProviderType::DeepSeekAccount;
+            input.access_token = access_token;
+            input.refresh_token = None;
+
+            let error = manager.finish_login(&mut store, input).unwrap_err();
+
+            assert!(matches!(
+                error,
+                AccountManagerError::CredentialUnavailable(ref message)
+                    if message.contains("non-empty accessToken")
+            ));
+            assert!(store.accounts.is_empty());
+        }
+
+        let mut store = AccountStore::default();
+        let mut initial = codex_account_input("deepseek-existing", "unused-refresh");
+        initial.provider_type = ProviderType::DeepSeekAccount;
+        initial.access_token = Some("deepseek-access-token".to_string());
+        initial.refresh_token = None;
+        initial.email = Some("original@example.com".to_string());
+        manager.finish_login(&mut store, initial).unwrap();
+
+        let mut invalid_update = codex_account_input("deepseek-existing", "unused-refresh");
+        invalid_update.provider_type = ProviderType::DeepSeekAccount;
+        invalid_update.access_token = None;
+        invalid_update.refresh_token = None;
+        invalid_update.email = Some("changed@example.com".to_string());
+
+        let error = manager
+            .finish_login(&mut store, invalid_update)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("non-empty accessToken"));
+        assert_eq!(store.accounts.len(), 1);
+        assert_eq!(
+            store.accounts[0].access_token.as_deref(),
+            Some("deepseek-access-token")
+        );
+        assert_eq!(
+            store.accounts[0].email.as_deref(),
+            Some("original@example.com")
+        );
     }
 
     #[test]
@@ -910,7 +1260,10 @@ mod tests {
             assert_eq!(capability.supports_start_login, expected_login);
             if matches!(
                 provider_type,
-                ProviderType::CursorOAuth | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+                ProviderType::CursorOAuth
+                    | ProviderType::KiroOAuth
+                    | ProviderType::AntigravityOAuth
+                    | ProviderType::AgyOAuth
             ) {
                 assert!(capability.supports_refresh);
             } else {
@@ -942,53 +1295,196 @@ mod tests {
             Some(OAuthQuotaStrategy::ProviderSpecific)
         );
         assert!(ollama.supports_quota);
-        assert_eq!(ollama.status, "manual_api_key_available");
+        assert_eq!(ollama.status, "metadata_only");
+        assert!(ollama.deprecated_for_inference);
+        assert_eq!(ollama.migration_target, Some("provider"));
     }
 
     #[test]
-    fn refresh_plan_is_exposed_only_for_request_shape_ready_oauth_specs() {
-        for provider_type in [
-            ProviderType::CodexOAuth,
-            ProviderType::ClaudeOAuth,
-            ProviderType::GeminiCli,
-            ProviderType::CursorOAuth,
-            ProviderType::AntigravityOAuth,
-            ProviderType::AgyOAuth,
-        ] {
+    fn account_capability_execution_truth_table_is_complete() {
+        let cases = [
+            (
+                ProviderType::ClaudeOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::CodexOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::GrokOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::GeminiCli,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::GitHubCopilot,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::ImportedSnapshot,
+                true,
+            ),
+            (
+                ProviderType::DeepSeekAccount,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+                true,
+            ),
+            (
+                ProviderType::KiroOAuth,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::CursorOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::ImportedSnapshot,
+                true,
+            ),
+            (
+                ProviderType::CursorApiKey,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::ImportedSnapshot,
+                false,
+            ),
+            (
+                ProviderType::AntigravityOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::AgyOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::OllamaCloud,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::LiveRefresh,
+                false,
+            ),
+            (
+                ProviderType::AwsBedrock,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+                false,
+            ),
+            (
+                ProviderType::Nvidia,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+                false,
+            ),
+            (
+                ProviderType::DeepSeekApi,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+                false,
+            ),
+        ];
+
+        assert_eq!(cases.len(), account_provider_types().len());
+        for (provider_type, refresh, quota, binding_supported) in cases {
             let capability = capability_for(provider_type);
-            assert!(capability.supports_refresh_plan);
-            assert!(capability.supports_refresh);
-            assert_eq!(capability.support, AccountManagerSupport::ManualTokenStore);
+            assert_eq!(capability.refresh_capability, refresh, "{provider_type:?}");
+            assert_eq!(capability.quota_capability, quota, "{provider_type:?}");
+            assert_eq!(
+                capability.supports_refresh,
+                refresh != OAuthRefreshCapability::Unavailable,
+                "{provider_type:?}"
+            );
+            assert_eq!(
+                capability.supports_refresh_plan,
+                capability.supports_refresh
+            );
+            assert_eq!(
+                capability.supports_live_quota_refresh,
+                quota == OAuthQuotaCapability::LiveRefresh,
+                "{provider_type:?}"
+            );
+            assert_eq!(
+                capability.supports_cached_quota,
+                quota != OAuthQuotaCapability::Unavailable,
+                "{provider_type:?}"
+            );
+            assert_eq!(capability.supports_quota, capability.supports_cached_quota);
+            assert_eq!(capability.inference_binding_supported, binding_supported);
+            assert_eq!(
+                capability.credential_ownership,
+                if binding_supported {
+                    AccountCredentialOwnership::ManagedAccount
+                } else {
+                    AccountCredentialOwnership::MetadataOnly
+                }
+            );
+            assert_eq!(capability.deprecated_for_inference, !binding_supported);
+            assert_eq!(
+                capability.migration_target,
+                (!binding_supported).then_some("provider")
+            );
         }
 
-        for provider_type in [
-            ProviderType::GitHubCopilot,
-            ProviderType::DeepSeekAccount,
-            ProviderType::KiroOAuth,
-            ProviderType::CursorApiKey,
-            ProviderType::OllamaCloud,
-            ProviderType::AwsBedrock,
-            ProviderType::Nvidia,
-            ProviderType::DeepSeekApi,
-        ] {
-            let capability = capability_for(provider_type);
-            assert!(!capability.supports_refresh_plan);
-            assert!(!capability.supports_refresh);
-        }
+        let kiro = serde_json::to_value(capability_for(ProviderType::KiroOAuth)).unwrap();
+        assert_eq!(kiro["supportsRefresh"], true);
+        assert_eq!(kiro["supportsRefreshPlan"], true);
+        assert_eq!(kiro["supportsQuota"], true);
+        assert_eq!(kiro["refreshCapability"], "provider_dynamic");
+        assert_eq!(kiro["quotaCapability"], "live_refresh");
+        assert_eq!(kiro["credentialOwnership"], "managed_account");
+        assert_eq!(kiro["managerKind"], "native_oauth");
+        assert_eq!(kiro["deprecatedForInference"], false);
+
+        let codex = serde_json::to_value(capability_for(ProviderType::CodexOAuth)).unwrap();
+        assert_eq!(codex["refreshCapability"], "oauth_request");
+        assert_eq!(codex["managerKind"], "native_oauth");
     }
 
     #[test]
-    fn account_manager_registry_is_explicit_and_conservative() {
+    fn account_manager_registry_reports_driver_kind() {
         let registrations = registered_account_managers();
         assert_eq!(registrations.len(), all_capabilities().len());
         let codex = manager_registration_for(ProviderType::CodexOAuth);
 
         assert_eq!(codex.provider_type, ProviderType::CodexOAuth);
-        assert_eq!(codex.kind, AccountManagerKind::ManualTokenStore);
-        assert_eq!(codex.manager, "manual_token_store");
-        assert!(!registrations
-            .iter()
-            .any(|item| item.kind == AccountManagerKind::NativeOAuth));
+        assert_eq!(codex.kind, AccountManagerKind::NativeOAuth);
+        assert_eq!(codex.manager, "native_oauth_account");
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
+                .count(),
+            9
+        );
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|item| item.kind == AccountManagerKind::ImportOnly)
+                .count(),
+            1
+        );
+        assert_eq!(
+            registrations
+                .iter()
+                .filter(|item| item.kind == AccountManagerKind::StaticCredential)
+                .count(),
+            5
+        );
+        assert_eq!(
+            account_credential_ownership(ProviderType::Claude),
+            AccountCredentialOwnership::Provider
+        );
     }
 
     #[test]
@@ -1050,6 +1546,59 @@ mod tests {
         codex.release();
         assert!(!locks.is_locked(ProviderType::CodexOAuth, "acct-1"));
         assert!(locks.try_lock(ProviderType::CodexOAuth, "acct-1").is_some());
+    }
+
+    #[test]
+    fn inactive_refresh_locks_are_pruned() {
+        let locks = AccountRefreshLocks::default();
+        {
+            let _guard = locks
+                .try_lock(ProviderType::CodexOAuth, "retired-account")
+                .expect("refresh lock");
+            assert_eq!(locks.active.lock().unwrap().len(), 1);
+        }
+
+        let _guard = locks
+            .try_lock(ProviderType::ClaudeOAuth, "active-account")
+            .expect("replacement refresh lock");
+        let active = locks.active.lock().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains_key(&refresh_lock_key(
+            ProviderType::ClaudeOAuth,
+            "active-account"
+        )));
+    }
+
+    #[tokio::test]
+    async fn gemini_project_waiters_and_cooldown_consume_native_refresh_failure() {
+        let mut store = AccountStore::default();
+        let mut input = codex_account_input("gemini-flight-account", "gemini-refresh");
+        input.provider_type = ProviderType::GeminiCli;
+        let account = store.upsert(input);
+        let locks = AccountRefreshLocks::default();
+        let mut leader = locks.lock(ProviderType::GeminiCli, &account.id).await;
+        leader.record_failure(AccountRefreshFlightFailure::for_account(
+            &account,
+            AccountRefreshFlightStage::NativeRefresh,
+            AccountRefreshFlightFailureDetails {
+                status_code: 503,
+                upstream_status: None,
+                message: "credential commit failed".to_string(),
+                public_message: Some("credential commit failed".to_string()),
+                kind: OAuthErrorKind::Unknown,
+                retryable: true,
+                retry_after_ms: Some(60_000),
+                immediate_relogin: false,
+            },
+        ));
+        leader.release();
+
+        let next = locks.lock(ProviderType::GeminiCli, &account.id).await;
+        let failure = next
+            .coalesced_gemini_project_failure_for(&account)
+            .expect("active native refresh cooldown");
+        assert_eq!(failure.stage, AccountRefreshFlightStage::NativeRefresh);
+        assert_eq!(failure.status_code, 503);
     }
 
     #[test]
@@ -1222,104 +1771,5 @@ mod tests {
 
         assert_eq!(credential.value, "api-key");
         assert_eq!(credential.credential_kind, CredentialKind::ApiKey);
-    }
-
-    #[test]
-    fn codex_oauth_manager_plans_refresh_request_and_exposes_refresh_capability() {
-        let manager = CodexOAuthAccountManager::default();
-        let mut store = AccountStore::default();
-        manager_for(ProviderType::CodexOAuth)
-            .finish_login(
-                &mut store,
-                UpsertAccountInput {
-                    id: Some("acct-1".to_string()),
-                    provider_type: ProviderType::CodexOAuth,
-                    email: None,
-                    access_token: Some("old".to_string()),
-                    refresh_token: Some("refresh".to_string()),
-                    id_token: None,
-                    token_type: None,
-                    api_key: None,
-                    extra_headers: None,
-                    scopes: Vec::new(),
-                    profile: None,
-                    raw: None,
-                    subscription_level: None,
-                    entitlement_status: None,
-                    quota: None,
-                    quota_percent: None,
-                    quota_refreshed_at: None,
-                    quota_next_refresh_at: None,
-                    expires_at: Some(1_000),
-                    rate_limited_until: None,
-                    last_refresh_error: None,
-                },
-            )
-            .unwrap();
-
-        let capability = manager.capability();
-        assert_eq!(capability.support, AccountManagerSupport::ManualTokenStore);
-        assert!(capability.supports_refresh);
-
-        let (guard, request) = manager
-            .plan_refresh_request(&store, "acct-1", 2_000)
-            .expect("refresh request");
-        assert_eq!(request.url, "https://auth.openai.com/oauth/token");
-        assert_eq!(request.body["refresh_token"], "refresh");
-        assert!(manager
-            .plan_refresh_request(&store, "acct-1", 2_000)
-            .is_err());
-        guard.release();
-        assert!(manager
-            .plan_refresh_request(&store, "acct-1", 2_000)
-            .is_ok());
-    }
-
-    #[test]
-    fn codex_refresh_planning_respects_valid_and_deleted_accounts() {
-        let manager = CodexOAuthAccountManager::default();
-        let mut store = AccountStore::default();
-        manager_for(ProviderType::CodexOAuth)
-            .finish_login(
-                &mut store,
-                UpsertAccountInput {
-                    id: Some("acct-valid".to_string()),
-                    provider_type: ProviderType::CodexOAuth,
-                    email: None,
-                    access_token: Some("still-valid".to_string()),
-                    refresh_token: Some("refresh".to_string()),
-                    id_token: None,
-                    token_type: None,
-                    api_key: None,
-                    extra_headers: None,
-                    scopes: Vec::new(),
-                    profile: None,
-                    raw: None,
-                    subscription_level: None,
-                    entitlement_status: None,
-                    quota: None,
-                    quota_percent: None,
-                    quota_refreshed_at: None,
-                    quota_next_refresh_at: None,
-                    expires_at: Some(300_000),
-                    rate_limited_until: None,
-                    last_refresh_error: None,
-                },
-            )
-            .unwrap();
-
-        let not_required = manager
-            .plan_refresh_request(&store, "acct-valid", 1_000)
-            .unwrap_err();
-        assert!(matches!(
-            not_required,
-            AccountManagerError::CredentialUnavailable(_)
-        ));
-
-        assert!(store.delete("acct-valid"));
-        let deleted = manager
-            .plan_refresh_request(&store, "acct-valid", 20_000)
-            .unwrap_err();
-        assert!(matches!(deleted, AccountManagerError::NotFound(_)));
     }
 }

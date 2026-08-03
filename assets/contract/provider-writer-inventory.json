@@ -5,23 +5,23 @@
   "currentSourceEvidence": [
     {
       "path": "src/admin.rs",
-      "sha256": "212faa68f6407864757914954d2e163a54ecf8e2b3bf33ea80450becff8cfd16"
+      "sha256": "4f689cc31e6f8ce1d1de85e89bc484ce037285744a35d3cbb23af2252b034239"
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "ef74336cdd570c7f7de5cdffc5e9179203e1ff48884fa7478c4aef8175e94491"
+      "sha256": "e4d04da75293db0672f72c953c5107e828f55b8559f0321e7d811b9ba2b29346"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "9009be52e06214d4bd38e2a3b17b1e3ae95fb0e9c79e323333e488063f9cabf8"
+      "sha256": "11c0d2fd6874e527137d461e2a2baed57d2d65f59acb0daac7b2d5b3a3781dc8"
     },
     {
       "path": "src/api/types/providers.rs",
-      "sha256": "5a546dfaa2828e748dc1dcfe885a64a9b61d6872e6dcbcaaa1605d19417b5e3a"
+      "sha256": "63265288ffd435fefec24c50cc0e42aa11c62e1b48e8eb8973054c3aa8258182"
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "71f03359c9db370ae1a6242363cf3843788c526a028aa8e7218be0d22b5fa6c3"
+      "sha256": "28d0f1f2d9500c78c241e0a4401ee9f036252c9d0e7ecdb348af664e8125e5fe"
     },
     {
       "path": "src/domain/providers/migrate.rs",
@@ -33,11 +33,11 @@
     },
     {
       "path": "src/domain/providers/store.rs",
-      "sha256": "1f5fee57d1839fa3e8a507d3afdfd3474b93ab146ffde3229c40a167c1010277"
+      "sha256": "f0a89f2a2cb5b3378ffcb228dc14badf85bc9da2ed4ed5db2fa5a6af72ab9da5"
     },
     {
       "path": "src/domain/providers/store_v2.rs",
-      "sha256": "ff094a049a0d98175f914724181c56c2953b4c39bfa754dbf8b76c9b9895dc2a"
+      "sha256": "a7ee864ccf8d4f43789a86f62fa09132e04c0a7559b73d5cd41db0030c7581e3"
     },
     {
       "path": "src/infra/backup.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "065b5d7b79d0864173fe0d026adfbeb425ead7aef01cca53af92d2c070b97378"
+      "sha256": "a74b2156d497440f48fb1f4a081c4984fefa3e47e5fa20f31e93181d719bafb0"
     }
   ],
   "entries": [

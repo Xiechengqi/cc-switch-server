@@ -21,6 +21,7 @@ import {
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { formatOauthQuotaRetryDelay } from "@/lib/query/oauthQuotaSnapshot";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
@@ -29,8 +30,13 @@ interface SubscriptionQuotaFooterProps {
   autoQueryInterval?: number;
 }
 
+export type SubscriptionQuotaDisplay = SubscriptionQuota & {
+  refreshedAt?: number | null;
+  nextRefreshAt?: number | null;
+};
+
 interface SubscriptionQuotaViewProps {
-  quota: SubscriptionQuota | undefined;
+  quota: SubscriptionQuotaDisplay | undefined;
   loading: boolean;
   refetch: () => void | Promise<unknown>;
   /** 用于 `subscription.expiredHint` 的 {tool} 插值；解耦了 hook 的 appId */
@@ -326,8 +332,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
-  const [manualRefreshLoading, setManualRefreshLoading] =
-    React.useState(false);
+  const [manualRefreshLoading, setManualRefreshLoading] = React.useState(false);
   const effectiveLoading = loading || manualRefreshLoading;
 
   const handleRefresh = React.useCallback(async () => {
@@ -337,22 +342,21 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
       await refetch();
       setLastManualRefreshAt(Date.now());
     } catch (error) {
-      toast.error(
-        extractErrorMessage(error) || t("subscription.queryFailed"),
-      );
+      toast.error(extractErrorMessage(error) || t("subscription.queryFailed"));
     } finally {
       setManualRefreshLoading(false);
     }
   }, [manualRefreshLoading, refetch, t]);
 
   React.useEffect(() => {
-    if (quota?.queriedAt && quota.queriedAt > 0) {
+    const serverRefreshedAt = quota?.refreshedAt ?? quota?.queriedAt;
+    if (serverRefreshedAt && serverRefreshedAt > 0) {
       setLastManualRefreshAt(null);
     }
-  }, [quota?.queriedAt]);
+  }, [quota?.queriedAt, quota?.refreshedAt]);
 
   const displayQueriedAt = resolveQuotaQueriedAt(
-    quota?.queriedAt,
+    quota?.refreshedAt ?? quota?.queriedAt,
     lastManualRefreshAt,
   );
 
@@ -362,34 +366,47 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     if (
       !displayQueriedAt &&
       !quota?.subscription?.expiresAt &&
-      !quota?.tiers?.some((tier) => tier.resetsAt)
+      !quota?.tiers?.some((tier) => tier.resetsAt) &&
+      !quota?.nextRefreshAt
     ) {
       return;
     }
     const interval = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(interval);
-  }, [displayQueriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
+  }, [
+    displayQueriedAt,
+    quota?.nextRefreshAt,
+    quota?.subscription?.expiresAt,
+    quota?.tiers,
+  ]);
 
-  // 无凭据 → 不显示
-  if (!quota || quota.credentialStatus === "not_found") return null;
+  const retryDelay = formatOauthQuotaRetryDelay(quota?.nextRefreshAt, now);
+  const retryText = retryDelay
+    ? t("subscription.retryAfter", { time: retryDelay })
+    : null;
 
-  // 凭据解析错误 → 不显示（静默）
-  if (quota.credentialStatus === "parse_error") return null;
+  if (!quota) return null;
+  if (quota.credentialStatus === "not_found" && !retryDelay) return null;
 
   // 凭据过期
   if (quota.credentialStatus === "expired" && !quota.success) {
+    const expiredStatusText = [t("subscription.expired"), retryText]
+      .filter(Boolean)
+      .join(" · ");
+    const expiredRefreshDisabled = effectiveLoading || Boolean(retryDelay);
+    const expiredRefreshTitle = retryText || refreshTitle;
     if (inline) {
       return (
         <div className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-2 text-xs rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 shadow-sm">
           <div className="flex min-w-0 items-center gap-1.5 text-amber-600 dark:text-amber-400">
             <AlertCircle size={12} />
-            <span className="break-words">{t("subscription.expired")}</span>
+            <span className="break-words">{expiredStatusText}</span>
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={effectiveLoading}
+            disabled={expiredRefreshDisabled}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={refreshTitle}
+            title={expiredRefreshTitle}
           >
             <RefreshCw
               size={12}
@@ -409,13 +426,18 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
               <span className="ml-2 text-amber-500/70 dark:text-amber-400/70">
                 {t("subscription.expiredHint", { tool: appIdForExpiredHint })}
               </span>
+              {retryText && (
+                <span className="ml-2 text-amber-500/70 dark:text-amber-400/70">
+                  {retryText}
+                </span>
+              )}
             </div>
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={effectiveLoading}
+            disabled={expiredRefreshDisabled}
             className="p-1 rounded hover:bg-amber-100 dark:hover:bg-amber-800/30 transition-colors disabled:opacity-50 flex-shrink-0"
-            title={refreshTitle}
+            title={expiredRefreshTitle}
           >
             <RefreshCw
               size={12}
@@ -429,16 +451,25 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 
   // API 调用失败
   if (!quota.success) {
+    const credentialError =
+      quota.credentialStatus === "parse_error"
+        ? quota.error || t("subscription.credentialParseFailed")
+        : quota.credentialStatus === "not_found"
+          ? quota.error || t("subscription.queryFailed")
+          : quota.error;
     const subscriptionSummary = quota.subscription
       ? formatQuotaSummary(quota, [], t, now)
       : null;
-    const hasQueryError = Boolean(quota.error) || !subscriptionSummary;
+    const hasQueryError = Boolean(credentialError) || !subscriptionSummary;
     const statusText = [
-      quota.error || (hasQueryError ? t("subscription.queryFailed") : null),
+      credentialError || (hasQueryError ? t("subscription.queryFailed") : null),
       subscriptionSummary,
+      retryText,
     ]
       .filter(Boolean)
       .join(" · ");
+    const refreshDisabled = effectiveLoading || Boolean(retryDelay);
+    const failureRefreshTitle = retryText || refreshTitle;
     if (inline) {
       return (
         <div className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
@@ -455,9 +486,9 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={effectiveLoading}
+            disabled={refreshDisabled}
             className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50 flex-shrink-0"
-            title={refreshTitle}
+            title={failureRefreshTitle}
           >
             <RefreshCw
               size={12}
@@ -483,9 +514,9 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </div>
           <button
             onClick={() => void handleRefresh()}
-            disabled={effectiveLoading}
+            disabled={refreshDisabled}
             className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors disabled:opacity-50 flex-shrink-0"
-            title={refreshTitle}
+            title={failureRefreshTitle}
           >
             <RefreshCw
               size={12}
@@ -500,6 +531,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   // 成功获取数据
   const allowUnknownTierNames =
     appIdForExpiredHint === "antigravity_oauth" ||
+    appIdForExpiredHint === "agy_oauth" ||
     appIdForExpiredHint === "grok_oauth";
   const tiers = (quota.tiers || []).filter((tier) => {
     if (!allowUnknownTierNames && !(tier.name in TIER_I18N_KEYS)) return false;
@@ -709,10 +741,7 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
   autoQueryInterval = 5,
 }) => {
   const queryClient = useQueryClient();
-  const {
-    data: quota,
-    isFetching: loading,
-  } = useSubscriptionQuota(
+  const { data: quota, isFetching: loading } = useSubscriptionQuota(
     appId,
     isCurrent,
     isCurrent && autoQueryInterval > 0,

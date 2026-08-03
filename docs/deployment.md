@@ -21,8 +21,10 @@ cargo clippy --all-targets -- -D warnings
 scripts/audit/validate-local.sh
 scripts/smoke/smoke-local.sh
 MODE=binary scripts/smoke/deployment-smoke.sh
-RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
+RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 ```
+
+`RUN_TESTS=0` 仅用于负向审计：脚本会记录 `local-contracts-unverified`，输出 `decision=blocked` 并以状态码 `1` 退出；不得将其作为本地合同或发布验收通过证据。
 
 `validate-local.sh` 固定执行：
 
@@ -164,7 +166,7 @@ scripts/smoke/router-market-smoke.sh
 
 建议外层使用 Caddy/Nginx/Cloudflare Tunnel 终止 TLS，再反代到 `127.0.0.1:15721` 或内网地址。`router` tunnel 暴露的 public URL 与本机管理入口可以并存，但生产管理入口必须使用强密码和最小暴露面。
 
-Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body，不能在 Worker 中调用 `.text()`、`.json()` 或 `.arrayBuffer()`。如果 Worker fetch 使用不同的源站 host，设置 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL=https://<公开域名>`，并允许 `/v1/images/files/<token>` 的匿名 GET/HEAD 回到生成图片的同一实例；多副本必须配置粘性回源，因为当前 capability store 不跨实例共享。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`codex-oauth-single-account.md`](codex-oauth-single-account.md#cloudflare-proxy)。
+Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body，不能在 Worker 中调用 `.text()`、`.json()` 或 `.arrayBuffer()`。如果 Worker fetch 使用不同的源站 host，设置 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL=https://<公开域名>`。Capability 文件默认持久化到 `<config-dir>/image-capabilities`；多副本应把 `CC_SWITCH_IMAGE_STORE_DIR` 指向同一个支持跨进程文件锁、atomic rename 和目录同步的挂载目录，让 `/v1/images/files/<token>` 的匿名 GET/HEAD 可落到任一副本。不能共享该目录时才配置生成与下载的粘性回源。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`codex-oauth-single-account.md`](codex-oauth-single-account.md#cloudflare-proxy)。
 
 ## OAuth/代理桥接运维
 
@@ -174,7 +176,7 @@ Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body�
 
 Responses JSON、SSE、WebSocket 和 WS→HTTP fallback 共享下游提交边界。`response.created` 等 lifecycle 事件不会提交响应、不会记录首 token，也不会延长 `STREAM_FIRST_BYTE_TIMEOUT_MS`；首个业务或终态事件之后才切换到 `STREAM_IDLE_TIMEOUT_MS`。Provider-origin 失败仅可在提交前 failover，client validation 失败原样返回，`response.incomplete` 按有效部分终态处理。
 
-事故回滚只设置 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 并重启服务；默认值为开启。回滚会关闭 Responses 语义分类/提交门禁，但不会关闭 HMAC reasoning envelope 验证。观察 `/metrics`：
+事故回滚只设置 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 并重启服务；默认值为开启。回滚会关闭普通 Responses 的语义分类/提交门禁，但不会关闭 HMAC reasoning envelope 验证。包含 `image_generation` tool 的 Responses 图片传输仍强制执行最小 lifecycle/terminal 检查：它已经用心跳提交 wire `200`，因此必须继续把 `response.failed`、`response.incomplete` 和客户端取消写成真实终态，不能由该事故开关回滚。观察 `/metrics`：
 
 - `cc_switch_proxy_semantic_guard_total{surface,observation}`：`lifecycle`、`business`、`success_terminal`、`incomplete_terminal`、`client_failure`、`provider_failure`、`protocol_error`。
 - `cc_switch_reasoning_bridge_total{direction,outcome}`：reasoning envelope encode/decode 成功、过大、MAC 或 envelope 校验失败。

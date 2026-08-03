@@ -12,6 +12,28 @@
   "providers": {
     "addProvider": "プロバイダーを追加"
   },
+  "providerBundle": {
+    "account": "OAuth アカウント",
+    "advancedSettings": "詳細設定 JSON",
+    "count": "{{count}} 件の Provider ノード",
+    "create": "Provider を新規作成",
+    "credential": "認証情報",
+    "credentialMissing": "認証情報が未設定",
+    "credentialReady": "認証情報を設定済み",
+    "deleteBlocked": "先にこの Provider のリモート共有を削除または解除してください",
+    "deleted": "Provider を削除しました",
+    "driverOptions": "ドライバーオプション",
+    "edit": "Provider を編集",
+    "family": "Provider タイプ",
+    "identity": "Provider",
+    "routeKey": "Route Key",
+    "saved": "Provider を保存しました",
+    "selectAccount": "OAuth アカウントを選択",
+    "surfaceCredential": "認証情報",
+    "surfaceEnabled": "API を有効化",
+    "surfaces": "API Surface",
+    "title": "Providers"
+  },
   "provider": {
     "share": {
       "sectionTitle": "リモート Share",
@@ -101,7 +123,7 @@
     "loadFailed": "設定を読み込めません。ページを再読み込みしてもう一度お試しください。",
     "selectFileFailed": "ディレクトリの選択に失敗しました",
     "authCenter": {
-      "serverDescription": "上流プロキシで使用する公式 OAuth アカウントを管理します。使用量の更新は現在有効な Provider にのみ適用されます。",
+      "serverDescription": "Provider ノードとその API Surface で使用する公式 OAuth アカウントを管理します。",
       "claudeOauthDescription": "Claude 公式サブスクリプションアカウントを管理",
       "grokOauthDescription": "Grok/xAI サブスクリプションアカウントを管理",
       "kiroOauthDescription": "Kiro AWS Builder ID アカウントを管理",
@@ -132,10 +154,5 @@
         }
       }
     }
-  },
-  "notifications": {
-    "clearCurrentSuccess": "Provider を無効にしました",
-    "clearCurrentFailedTitle": "Provider を無効にできませんでした",
-    "clearCurrentFailed": "Provider を無効にできませんでした：{{error}}"
   }
 }

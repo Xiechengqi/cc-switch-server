@@ -20,9 +20,14 @@ import {
   User,
   X,
   LogOut,
+  RefreshCw,
 } from "lucide-react";
 import { useGeminiOauth } from "./hooks/useGeminiOauth";
 import { copyText } from "@/lib/clipboard";
+import {
+  logoutAccountsAndClearSelection,
+  removeAccountAndUpdateSelection,
+} from "./accountSelectionActions";
 
 interface GeminiOAuthSectionProps {
   className?: string;
@@ -44,6 +49,9 @@ export const GeminiOAuthSection: React.FC<GeminiOAuthSectionProps> = ({
   const {
     accounts,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     pollingState,
     deviceCode,
     error,
@@ -54,22 +62,39 @@ export const GeminiOAuthSection: React.FC<GeminiOAuthSectionProps> = ({
     defaultAccountId,
     addAccount,
     cancelAuth,
-    logout,
-    removeAccount,
+    logoutAsync,
+    removeAccountAsync,
     setDefaultAccount,
+    refetchStatus,
   } = useGeminiOauth();
 
   const handleAccountSelect = (value: string) => {
     onAccountSelect?.(value === "none" ? null : value);
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
 
   const copyVerificationUrl = async () => {
@@ -78,6 +103,56 @@ export const GeminiOAuthSection: React.FC<GeminiOAuthSectionProps> = ({
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <div className={`space-y-4 ${className || ""}`}>
+        <div className="flex items-center justify-between">
+          <Label>
+            {t("geminiOauth.authStatus", {
+              defaultValue: "Google Gemini 认证",
+            })}
+          </Label>
+          <Badge variant={isStatusError ? "destructive" : "secondary"}>
+            {isStatusError ? t("common.error") : t("common.loading")}
+          </Badge>
+        </div>
+        {isStatusError ? (
+          <div
+            className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
+            role="alert"
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <RefreshCw className="h-4 w-4 shrink-0" />
+              {error ||
+                t("common.authStatusLoadFailed", {
+                  defaultValue: "Failed to load Gemini authentication status.",
+                })}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={isFetchingStatus}
+              onClick={() => void refetchStatus()}
+            >
+              {isFetchingStatus ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-2 h-4 w-4" />
+              )}
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {t("common.loading")}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className={`space-y-4 ${className || ""}`}>
@@ -215,7 +290,12 @@ export const GeminiOAuthSection: React.FC<GeminiOAuthSectionProps> = ({
       )}
 
       {!hasAnyAccount && pollingState === "idle" && (
-        <Button type="button" onClick={addAccount} className="w-full" variant="outline">
+        <Button
+          type="button"
+          onClick={addAccount}
+          className="w-full"
+          variant="outline"
+        >
           <Sparkles className="mr-2 h-4 w-4" />
           {t("geminiOauth.loginWithGoogle", {
             defaultValue: "使用 Google 登录",
@@ -263,8 +343,17 @@ export const GeminiOAuthSection: React.FC<GeminiOAuthSectionProps> = ({
               >
                 {deviceCode.verification_uri}
               </a>
-              <Button type="button" variant="ghost" size="icon" onClick={copyVerificationUrl}>
-                {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={copyVerificationUrl}
+              >
+                {copied ? (
+                  <Check className="h-4 w-4 text-green-500" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
               </Button>
               <a
                 href={deviceCode.verification_uri}
@@ -279,20 +368,27 @@ export const GeminiOAuthSection: React.FC<GeminiOAuthSectionProps> = ({
               </a>
             </div>
           </div>
-          <Button type="button" variant="outline" className="w-full" onClick={cancelAuth}>
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            onClick={cancelAuth}
+          >
             {t("common.cancel", { defaultValue: "取消" })}
           </Button>
         </div>
       )}
 
-      {error && (
-        <p className="text-sm text-destructive">
-          {error}
-        </p>
-      )}
+      {error && <p className="text-sm text-destructive">{error}</p>}
 
       {hasAnyAccount && (
-        <Button type="button" variant="outline" className="w-full" onClick={logout}>
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full"
+          onClick={() => void handleLogout()}
+          disabled={isAddingAccount}
+        >
           <LogOut className="mr-2 h-4 w-4" />
           {t("geminiOauth.logoutAll", {
             defaultValue: "退出所有账号",

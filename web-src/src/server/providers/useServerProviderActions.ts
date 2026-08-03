@@ -125,69 +125,6 @@ export function useServerProviderActions(activeApp: CoreProviderApp) {
     [activeApp, invalidate, queryClient, t],
   );
 
-  const switchProvider = useCallback(
-    async (provider: Provider) => {
-      try {
-        const result = await providersApi.switch(provider.id, activeApp);
-        await invalidate();
-        if (result.warnings.length > 0) {
-          toast.warning(result.warnings.join("\n"), { duration: 5000 });
-        } else {
-          toast.success(
-            t(
-              activeApp === "codex"
-                ? "notifications.codexRestartRequired"
-                : "notifications.switchSuccess",
-              {
-                defaultValue:
-                  activeApp === "codex"
-                    ? "切换成功，请重启客户端以生效"
-                    : "切换成功！",
-              },
-            ),
-            { closeButton: true },
-          );
-        }
-      } catch (error) {
-        const detail = extractErrorMessage(error) || t("common.unknown");
-        toast.error(
-          t("notifications.switchFailedTitle", { defaultValue: "切换失败" }),
-          {
-            description: t("notifications.switchFailed", {
-              defaultValue: "切换失败：{{error}}",
-              error: detail,
-            }),
-            duration: 6000,
-          },
-        );
-        throw error;
-      }
-    },
-    [activeApp, invalidate, t],
-  );
-
-  const clearCurrentProvider = useCallback(async () => {
-    try {
-      await providersApi.clearCurrent(activeApp);
-      await invalidate();
-      toast.success(
-        t("notifications.clearCurrentSuccess", {
-          defaultValue: "已取消启用",
-        }),
-        { closeButton: true },
-      );
-    } catch (error) {
-      const detail = extractErrorMessage(error) || t("common.unknown");
-      toast.error(
-        t("notifications.clearCurrentFailedTitle", {
-          defaultValue: "取消启用失败",
-        }),
-        { description: detail, duration: 6000 },
-      );
-      throw error;
-    }
-  }, [activeApp, invalidate, t]);
-
   const deleteProvider = useCallback(
     async (providerId: string) => {
       const resource = queryClient.getQueryData<ProvidersQueryData>([
@@ -220,8 +157,6 @@ export function useServerProviderActions(activeApp: CoreProviderApp) {
   return {
     addProvider,
     updateProvider,
-    switchProvider,
-    clearCurrentProvider,
     deleteProvider,
   };
 }

@@ -64,6 +64,20 @@ pub struct ResponsesSseAggregation {
     pub stream_status: &'static str,
 }
 
+#[derive(Debug)]
+pub struct GeminiV1InternalSseAggregator {
+    decoder: JsonStreamEventDecoder,
+    last_response: Option<Value>,
+    candidates: BTreeMap<i64, GeminiV1InternalCandidate>,
+    retained_bytes: usize,
+}
+
+#[derive(Debug)]
+struct GeminiV1InternalCandidate {
+    latest: Value,
+    parts: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesSseAggregationErrorKind {
     ParseError,
@@ -629,6 +643,185 @@ impl ResponsesSseAggregator {
     }
 }
 
+impl GeminiV1InternalSseAggregator {
+    pub fn new() -> Self {
+        Self {
+            decoder: JsonStreamEventDecoder::new(DEFAULT_MAX_STREAM_EVENT_BYTES),
+            last_response: None,
+            candidates: BTreeMap::new(),
+            retained_bytes: 0,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), ProxyError> {
+        let events = self.decoder.push(chunk).map_err(|error| {
+            ProxyError::bad_gateway(format!("Gemini v1internal stream decode failed: {error}"))
+        })?;
+        self.merge_events(events)
+    }
+
+    pub fn finish(mut self) -> Result<Value, ProxyError> {
+        let events = self.decoder.finish().map_err(|error| {
+            ProxyError::bad_gateway(format!("Gemini v1internal stream decode failed: {error}"))
+        })?;
+        self.merge_events(events)?;
+        let mut response = self.last_response.ok_or_else(|| {
+            ProxyError::bad_gateway("Gemini v1internal stream contained no JSON response")
+        })?;
+        if self.candidates.is_empty() {
+            if response
+                .pointer("/promptFeedback/blockReason")
+                .or_else(|| response.pointer("/prompt_feedback/block_reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|reason| !reason.is_empty())
+            {
+                return Ok(response);
+            }
+            return Err(ProxyError::bad_gateway(
+                "Gemini v1internal stream ended without terminal candidates or blocked prompt feedback",
+            ));
+        }
+        let Value::Object(response_object) = &mut response else {
+            return Err(ProxyError::bad_gateway(
+                "Gemini v1internal response must be a JSON object",
+            ));
+        };
+        let candidates = self
+            .candidates
+            .into_values()
+            .map(|mut candidate| {
+                let candidate_object = candidate.latest.as_object_mut().ok_or_else(|| {
+                    ProxyError::bad_gateway("Gemini v1internal candidate must be a JSON object")
+                })?;
+                if candidate_object
+                    .get("finishReason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_none_or(|reason| reason.is_empty())
+                {
+                    return Err(ProxyError::bad_gateway(
+                        "Gemini v1internal stream ended before candidate finishReason",
+                    ));
+                }
+                if !candidate.parts.is_empty() {
+                    let content = candidate_object
+                        .entry("content".to_string())
+                        .or_insert_with(|| serde_json::json!({"role": "model"}));
+                    let content_object = content.as_object_mut().ok_or_else(|| {
+                        ProxyError::bad_gateway(
+                            "Gemini v1internal candidate content must be a JSON object",
+                        )
+                    })?;
+                    content_object.insert(
+                        "parts".to_string(),
+                        Value::Array(merge_gemini_v1internal_parts(candidate.parts)),
+                    );
+                }
+                Ok(candidate.latest)
+            })
+            .collect::<Result<Vec<_>, ProxyError>>()?;
+        response_object.insert("candidates".to_string(), Value::Array(candidates));
+        Ok(response)
+    }
+
+    fn merge_events(&mut self, events: Vec<JsonStreamEvent>) -> Result<(), ProxyError> {
+        for event in events {
+            if let Some(error) = super::adapters::google_embedded_error(&event.value) {
+                return Err(error);
+            }
+            let response = super::adapters::unwrap_gemini_v1internal_value(event.value);
+            let response_object = response.as_object().ok_or_else(|| {
+                ProxyError::bad_gateway("Gemini v1internal response must be a JSON object")
+            })?;
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(serde_json::to_vec(&response).map_or(0, |bytes| bytes.len()));
+            if self.retained_bytes > DEFAULT_MAX_STREAM_EVENT_BYTES {
+                return Err(ProxyError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    message: "Gemini v1internal aggregate exceeded 128 MiB".to_string(),
+                });
+            }
+            if response
+                .get("candidates")
+                .is_some_and(|value| !value.is_array())
+            {
+                return Err(ProxyError::bad_gateway(
+                    "Gemini v1internal candidates must be an array",
+                ));
+            }
+            if let Some(candidates) = response_object.get("candidates").and_then(Value::as_array) {
+                for (position, candidate) in candidates.iter().enumerate() {
+                    if !candidate.is_object() {
+                        return Err(ProxyError::bad_gateway(
+                            "Gemini v1internal candidate must be a JSON object",
+                        ));
+                    }
+                    let index = candidate
+                        .get("index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(position as i64);
+                    let entry =
+                        self.candidates
+                            .entry(index)
+                            .or_insert_with(|| GeminiV1InternalCandidate {
+                                latest: candidate.clone(),
+                                parts: Vec::new(),
+                            });
+                    entry.latest = candidate.clone();
+                    if let Some(parts) = candidate
+                        .pointer("/content/parts")
+                        .and_then(Value::as_array)
+                    {
+                        entry.parts.extend(parts.iter().cloned());
+                    }
+                }
+            }
+            let merged_response = self
+                .last_response
+                .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+            let merged_object = merged_response.as_object_mut().ok_or_else(|| {
+                ProxyError::bad_gateway("Gemini v1internal response must be a JSON object")
+            })?;
+            for (key, value) in response_object {
+                if key != "candidates" {
+                    merged_object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn merge_gemini_v1internal_parts(parts: Vec<Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let plain_text = part.as_object().and_then(|object| {
+            (object.len() == 1)
+                .then(|| object.get("text").and_then(Value::as_str))
+                .flatten()
+        });
+        if let Some(text) = plain_text {
+            if let Some(previous) = merged.last_mut().and_then(Value::as_object_mut) {
+                if previous.len() == 1 {
+                    if let Some(previous_text) =
+                        previous.get_mut("text").and_then(|value| value.as_str())
+                    {
+                        let mut combined = String::with_capacity(previous_text.len() + text.len());
+                        combined.push_str(previous_text);
+                        combined.push_str(text);
+                        previous.insert("text".to_string(), Value::String(combined));
+                        continue;
+                    }
+                }
+            }
+        }
+        merged.push(part);
+    }
+    merged
+}
+
 impl Default for ResponsesSseAggregator {
     fn default() -> Self {
         Self::new()
@@ -731,6 +924,7 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sse_line_buffer_splits_lines_across_chunks() {
@@ -970,6 +1164,100 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         );
         let error = oversized.push(event.as_bytes()).unwrap_err();
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn gemini_v1internal_aggregator_merges_wrapped_sse_across_chunks() {
+        let stream = concat!(
+            "data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello \"}]}}]}}\r\n\r\n",
+            "data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"world\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5}}}\r\n\r\n"
+        );
+        let mut aggregator = GeminiV1InternalSseAggregator::new();
+        for chunk in stream.as_bytes().chunks(13) {
+            aggregator.push(chunk).unwrap();
+        }
+
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/candidates/0/content/parts"),
+            Some(&json!([{"text": "Hello world"}]))
+        );
+        assert_eq!(
+            response.pointer("/candidates/0/finishReason"),
+            Some(&json!("STOP"))
+        );
+        assert_eq!(
+            response.pointer("/usageMetadata/promptTokenCount"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            response.pointer("/usageMetadata/candidatesTokenCount"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            response.pointer("/usageMetadata/totalTokenCount"),
+            Some(&json!(5))
+        );
+        assert!(response.get("response").is_none());
+    }
+
+    #[test]
+    fn gemini_v1internal_aggregator_rejects_top_level_and_wrapped_errors() {
+        for event in [
+            "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"busy\"}}\n\n",
+            "data: {\"response\":{\"error\":{\"code\":403,\"status\":\"PERMISSION_DENIED\",\"message\":\"denied\"}}}\n\n",
+        ] {
+            let mut aggregator = GeminiV1InternalSseAggregator::new();
+            let error = aggregator.push(event.as_bytes()).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+            assert!(error.message.contains("embedded error"));
+        }
+    }
+
+    #[test]
+    fn gemini_v1internal_aggregator_requires_candidate_finish_reason() {
+        let mut aggregator = GeminiV1InternalSseAggregator::new();
+        aggregator
+            .push(
+                b"data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n",
+            )
+            .unwrap();
+
+        let error = aggregator.finish().unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("finishReason"));
+    }
+
+    #[test]
+    fn gemini_v1internal_aggregator_accepts_explicit_prompt_block() {
+        let mut aggregator = GeminiV1InternalSseAggregator::new();
+        aggregator
+            .push(
+                b"data: {\"response\":{\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":3}}}\n\n",
+            )
+            .unwrap();
+
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/promptFeedback/blockReason"),
+            Some(&json!("SAFETY"))
+        );
+    }
+
+    #[test]
+    fn gemini_v1internal_aggregator_rejects_non_terminal_documents() {
+        for event in [
+            "data: {}\n\n",
+            "data: {\"usageMetadata\":{\"totalTokenCount\":1}}\n\n",
+            "data: 7\n\n",
+        ] {
+            let mut aggregator = GeminiV1InternalSseAggregator::new();
+            let result = aggregator
+                .push(event.as_bytes())
+                .and_then(|_| aggregator.finish());
+            let error = result.unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ use super::registry::{CustomBindingInput, ProfileId, ProviderKey};
 use super::store::{ProviderResourceMetadata, ProviderStore, ProviderStoreFormat, StoredProvider};
 
 pub(crate) const PROVIDER_STORE_FORMAT: &str = "cc-switch-provider-store";
-pub(crate) const PROVIDER_STORE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const PROVIDER_STORE_SCHEMA_VERSION: u32 = 3;
 pub(crate) const PROVIDER_STORE_GUARD: &str = "s2-encrypted-typed-records";
 const CREDENTIAL_ENVELOPE_VERSION: u32 = 1;
 const CREDENTIAL_ALGORITHM: &str = "xchacha20poly1305";
@@ -36,6 +36,7 @@ pub(crate) struct ProviderCredentialVault {
     key_source: Option<CredentialKeySource>,
     key_id: Option<String>,
     envelopes: BTreeMap<ProviderKey, CredentialEnvelope>,
+    aliases: BTreeMap<ProviderKey, ProviderKey>,
     sealed: bool,
 }
 
@@ -46,6 +47,7 @@ impl std::fmt::Debug for ProviderCredentialVault {
             .field("key_source", &self.key_source)
             .field("key_id", &self.key_id)
             .field("envelope_count", &self.envelopes.len())
+            .field("alias_count", &self.aliases.len())
             .field("sealed", &self.sealed)
             .finish()
     }
@@ -116,6 +118,8 @@ struct ProviderRecordS2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credentials: Option<CredentialEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_source: Option<ProviderKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     custom_binding: Option<CustomBindingInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_payload: Option<LegacyPayloadS2>,
@@ -168,17 +172,49 @@ pub(crate) fn seal_store(
     let provider_key = derive_provider_key(&resolved.key)?;
     let key_id = provider_key_id(&provider_key);
     let key = Arc::new(Zeroizing::new(provider_key));
-    let mut envelopes = BTreeMap::new();
-
+    let mut plaintext_credentials = BTreeMap::new();
     for stored in &mut store.providers {
         let (redacted, credentials) = split_provider_credentials(&stored.provider)
             .with_context(|| provider_context(stored, "split credentials"))?;
         if !credentials.is_empty() {
             let provider_key = ProviderKey::new(stored.app, stored.provider.id.clone())?;
-            let envelope = encrypt_envelope(stored, &credentials, key.as_ref(), &key_id)?;
-            envelopes.insert(provider_key, envelope);
+            plaintext_credentials.insert(provider_key, credentials);
         }
         stored.provider = redacted;
+    }
+
+    let mut envelopes = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    for stored in &store.providers {
+        let provider_key = ProviderKey::new(stored.app, stored.provider.id.clone())?;
+        let source_key = super::bundle::shared_credential_source_key(stored)?;
+        let credentials = plaintext_credentials.get(&provider_key);
+        match source_key {
+            Some(source_key) if source_key != provider_key => {
+                let source_credentials =
+                    plaintext_credentials.get(&source_key).with_context(|| {
+                        format!(
+                            "shared credential source {}:{} is not configured",
+                            source_key.app.as_str(),
+                            source_key.provider_id
+                        )
+                    })?;
+                if credentials != Some(source_credentials) {
+                    anyhow::bail!(
+                        "Provider Bundle credential slots differ between {} and {}",
+                        provider_key.app.as_str(),
+                        source_key.app.as_str()
+                    );
+                }
+                aliases.insert(provider_key, source_key);
+            }
+            _ => {
+                if let Some(credentials) = credentials {
+                    let envelope = encrypt_envelope(stored, credentials, key.as_ref(), &key_id)?;
+                    envelopes.insert(provider_key, envelope);
+                }
+            }
+        }
     }
 
     store.credential_vault = Arc::new(ProviderCredentialVault {
@@ -186,6 +222,7 @@ pub(crate) fn seal_store(
         key_source: Some(resolved.source),
         key_id: Some(key_id),
         envelopes,
+        aliases,
         sealed: true,
     });
     Ok(())
@@ -211,7 +248,12 @@ pub(crate) fn materialize_provider(
     }
     let provider_key = ProviderKey::new(stored.app, stored.provider.id.clone())?;
     let (_, summary) = super::credentials::redact_provider(&stored.provider);
-    let Some(envelope) = store.credential_vault.envelopes.get(&provider_key) else {
+    let source_key = store
+        .credential_vault
+        .aliases
+        .get(&provider_key)
+        .unwrap_or(&provider_key);
+    let Some(envelope) = store.credential_vault.envelopes.get(source_key) else {
         if summary.slots.is_empty() {
             return Ok(stored.provider.clone());
         }
@@ -230,7 +272,14 @@ pub(crate) fn materialize_provider(
         .key_id
         .as_deref()
         .context("Provider credential vault has no key id")?;
-    let credentials = decrypt_envelope(stored, envelope, key.as_ref(), key_id)?;
+    let source_stored = store
+        .providers
+        .iter()
+        .find(|candidate| {
+            candidate.app == source_key.app && candidate.provider.id == source_key.provider_id
+        })
+        .context("Provider credential source record is missing")?;
+    let credentials = decrypt_envelope(source_stored, envelope, key.as_ref(), key_id)?;
     materialize_provider_credentials(&stored.provider, &credentials)
         .with_context(|| provider_context(stored, "materialize credentials"))
 }
@@ -248,10 +297,11 @@ pub(crate) fn encode_s2(store: &ProviderStore) -> anyhow::Result<Value> {
     for stored in &store.providers {
         let key = ProviderKey::new(stored.app, stored.provider.id.clone())?;
         let envelope = store.credential_vault.envelopes.get(&key).cloned();
+        let credential_source = store.credential_vault.aliases.get(&key).cloned();
         if envelope.is_some() {
             referenced_envelopes.insert(key.clone(), ());
         }
-        let record = record_from_stored(stored, envelope)?;
+        let record = record_from_stored(stored, envelope, credential_source)?;
         if records
             .entry(stored.app)
             .or_default()
@@ -263,6 +313,11 @@ pub(crate) fn encode_s2(store: &ProviderStore) -> anyhow::Result<Value> {
     }
     if referenced_envelopes.len() != store.credential_vault.envelopes.len() {
         anyhow::bail!("Provider credential vault contains orphan envelopes");
+    }
+    for (alias, source) in &store.credential_vault.aliases {
+        if alias == source || !store.credential_vault.envelopes.contains_key(source) {
+            anyhow::bail!("Provider credential vault contains an invalid alias");
+        }
     }
 
     serde_json::to_value(ProviderStoreS2 {
@@ -301,18 +356,25 @@ pub(crate) fn decode_s2(
     let key = Arc::new(Zeroizing::new(provider_key));
     let mut providers = Vec::new();
     let mut envelopes = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
 
     for (app, app_records) in persisted.records {
         for (record_key, record) in app_records {
             if record_key != record.provider_id {
                 anyhow::bail!("Provider S2 record map key does not match providerId");
             }
-            let (stored, envelope) = stored_from_record(app, record)?;
+            let (stored, envelope, credential_source) = stored_from_record(app, record)?;
             if let Some(envelope) = envelope {
                 let key_ref = ProviderKey::new(app, stored.provider.id.clone())?;
                 validate_envelope_shape(&stored, &envelope, &expected_key_id)?;
                 if envelopes.insert(key_ref, envelope).is_some() {
                     anyhow::bail!("duplicate Provider credential envelope");
+                }
+            }
+            if let Some(source) = credential_source {
+                let alias = ProviderKey::new(app, stored.provider.id.clone())?;
+                if aliases.insert(alias, source).is_some() {
+                    anyhow::bail!("duplicate Provider credential alias");
                 }
             }
             providers.push(stored);
@@ -330,10 +392,31 @@ pub(crate) fn decode_s2(
             key_source: Some(resolved.source),
             key_id: Some(expected_key_id),
             envelopes,
+            aliases,
             sealed: true,
         }),
     };
     store.validate_for_commit()?;
+    for (alias, source) in &store.credential_vault.aliases {
+        if alias == source || !store.credential_vault.envelopes.contains_key(source) {
+            anyhow::bail!("Provider credential alias references an invalid source");
+        }
+        let alias_record = store
+            .providers
+            .iter()
+            .find(|stored| stored.app == alias.app && stored.provider.id == alias.provider_id)
+            .context("Provider credential alias record is missing")?;
+        let source_record = store
+            .providers
+            .iter()
+            .find(|stored| stored.app == source.app && stored.provider.id == source.provider_id)
+            .context("Provider credential source record is missing")?;
+        if alias_record.resource.credential_generation
+            != source_record.resource.credential_generation
+        {
+            anyhow::bail!("Provider credential alias generation does not match its source");
+        }
+    }
     // Full authenticated decryption also proves every redacted slot has exactly one envelope slot.
     for stored in &store.providers {
         let _ = materialize_provider(&store, stored)?;
@@ -345,6 +428,7 @@ pub(crate) fn decode_s2(
 fn record_from_stored(
     stored: &StoredProvider,
     credentials: Option<CredentialEnvelope>,
+    credential_source: Option<ProviderKey>,
 ) -> anyhow::Result<ProviderRecordS2> {
     let mut meta = stored.provider.meta.clone();
     let account_binding = meta.as_mut().and_then(|meta| meta.auth_binding.take());
@@ -376,6 +460,7 @@ fn record_from_stored(
         },
         account_binding,
         credentials,
+        credential_source,
         custom_binding: stored.resource.custom_binding.clone(),
         legacy_payload,
         create_request_id: stored.resource.create_request_id.clone(),
@@ -385,7 +470,11 @@ fn record_from_stored(
 fn stored_from_record(
     app: AppKind,
     record: ProviderRecordS2,
-) -> anyhow::Result<(StoredProvider, Option<CredentialEnvelope>)> {
+) -> anyhow::Result<(
+    StoredProvider,
+    Option<CredentialEnvelope>,
+    Option<ProviderKey>,
+)> {
     if record.provider_id.trim().is_empty() || record.provider_id != record.provider_id.trim() {
         anyhow::bail!("Provider S2 providerId must be non-empty and trimmed");
     }
@@ -433,6 +522,10 @@ fn stored_from_record(
             (provider_type, provider_type.as_str().to_string())
         }
     };
+    let credential_source = record.credential_source;
+    if record.credentials.is_some() && credential_source.is_some() {
+        anyhow::bail!("Provider S2 record cannot contain credentials and a credential source");
+    }
     Ok((
         StoredProvider {
             app,
@@ -442,6 +535,7 @@ fn stored_from_record(
             resource,
         },
         record.credentials,
+        credential_source,
     ))
 }
 

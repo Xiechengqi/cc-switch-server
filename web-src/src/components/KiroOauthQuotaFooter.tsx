@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import type { ProviderMeta } from "@/types";
 import { useKiroOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 import type { AppId } from "@/lib/api";
 import {
@@ -20,6 +20,7 @@ import {
 } from "@/utils/providerQuotaUi";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface KiroOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -40,25 +41,44 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
   const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
     number | null
   >(null);
-  const [manualRefreshLoading, setManualRefreshLoading] =
-    React.useState(false);
+  const [manualRefreshLoading, setManualRefreshLoading] = React.useState(false);
   const {
     data: quota,
     isFetching: loading,
     refetch,
   } = useKiroOauthQuota(meta, { enabled: true });
-  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.KIRO_OAUTH);
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.KIRO_OAUTH,
+  );
+  const accountId = identity?.accountId ?? null;
   const handleRefresh = React.useCallback(async () => {
     if (manualRefreshLoading) return;
     setManualRefreshLoading(true);
     try {
-      await subscriptionApi.refreshOauthQuota("kiro_oauth", accountId);
-      await refetch();
+      await refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            "kiro_oauth",
+            accountId,
+            undefined,
+            undefined,
+            undefined,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
+      );
       setLastManualRefreshAt(Date.now());
     } finally {
       setManualRefreshLoading(false);
     }
-  }, [accountId, manualRefreshLoading, refetch]);
+  }, [
+    accountId,
+    identity?.authIdentityGeneration,
+    manualRefreshLoading,
+    refetch,
+  ]);
   const effectiveLoading = loading || manualRefreshLoading;
   const reportRefreshError = React.useCallback(
     (error: unknown) =>
@@ -141,7 +161,10 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
         />
         <div className="flex items-center gap-1.5">
           {planTitle && (
-            <KiroPlanBadge title={credentialMessage ?? planTitle} label={planTitle} />
+            <KiroPlanBadge
+              title={credentialMessage ?? planTitle}
+              label={planTitle}
+            />
           )}
           <span className="font-medium tabular-nums text-foreground">
             {used}/{limit}
@@ -168,7 +191,10 @@ const KiroOauthQuotaFooter: React.FC<KiroOauthQuotaFooterProps> = ({
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
             {planTitle && (
-              <KiroPlanBadge title={credentialMessage ?? planTitle} label={planTitle} />
+              <KiroPlanBadge
+                title={credentialMessage ?? planTitle}
+                label={planTitle}
+              />
             )}
             <span className="min-w-0 truncate text-xs font-medium text-gray-500 dark:text-gray-400">
               {t("subscription.kiroEstimatedUsage", {

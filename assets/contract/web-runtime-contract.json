@@ -153,7 +153,7 @@
     {
       "id": "automaticFailover",
       "label": "Client-side automatic provider failover",
-      "reason": "Server routes deterministically through the selected Provider; retries stay pinned to that Provider"
+      "reason": "Server resolves one explicit route target per request; retries stay pinned to that resolved Provider Surface"
     },
     {
       "id": "outboundProxy",
@@ -581,28 +581,32 @@
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Server-native Web compatibility command."
+      "endpoint": "POST /api/accounts",
+      "notes": "Imports a DeepSeek access token into the server Account store; passwords are never accepted or stored."
     },
     {
       "name": "deepseek_account_list",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Server-native Web compatibility command."
+      "endpoint": "GET /api/accounts",
+      "notes": "Lists real DeepSeek Account records from the server Account store."
     },
     {
       "name": "deepseek_account_remove",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Server-native Web compatibility command."
+      "endpoint": "DELETE /api/accounts/:id",
+      "notes": "Deletes a real DeepSeek Account record after normal Provider binding checks."
     },
     {
       "name": "deepseek_account_set_default",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Server-native Web compatibility command."
+      "endpoint": "POST /web-api/invoke/auth_set_default_account",
+      "notes": "Moves the selected DeepSeek Account to the provider-type default position in the Account store."
     },
     {
       "name": "deepseek_account_status",
@@ -747,6 +751,14 @@
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_account_capabilities",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts/capabilities",
+      "notes": "Returns the authoritative account login, refresh, quota, credential ownership, and inference binding capability matrix."
     },
     {
       "name": "get_antigravity_oauth_models",
@@ -976,14 +988,6 @@
       "notes": "Server has no per-app live config dirs; returns empty string."
     },
     {
-      "name": "get_current_provider",
-      "support": "shim",
-      "implemented": true,
-      "feature": "providers",
-      "endpoint": "GET /api/providers?app=",
-      "notes": "Returns stored current provider when ui_settings has currentProvider*; falls back to first provider only when the key is absent."
-    },
-    {
       "name": "get_custom_endpoints",
       "support": "shim",
       "implemented": true,
@@ -1113,6 +1117,46 @@
       "feature": "providers",
       "endpoint": "GET /api/provider-registry",
       "notes": "Returns the authoritative Profile/Driver registry used by Server Provider controls."
+    },
+    {
+      "name": "get_provider_bundles",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/provider-bundles",
+      "notes": "Returns Provider Bundles with their complete Claude/Codex/Gemini Surface set."
+    },
+    {
+      "name": "get_provider_bundle",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/provider-bundles/:id",
+      "notes": "Returns one Provider Bundle."
+    },
+    {
+      "name": "get_provider_bundle_delete_preview",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "GET /api/provider-bundles/:id/delete-preview",
+      "notes": "Reports Share references that block Bundle deletion."
+    },
+    {
+      "name": "upsert_provider_bundle",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST/PATCH /api/provider-bundles",
+      "notes": "Atomically creates or updates every Surface in a Provider Bundle."
+    },
+    {
+      "name": "delete_provider_bundle",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "DELETE /api/provider-bundles/:id",
+      "notes": "Atomically deletes an unreferenced Provider Bundle."
     },
     {
       "name": "get_provider_resources",
@@ -1628,6 +1672,14 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "save_provider_bundle_share",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/save_provider_bundle_share",
+      "notes": "Atomically reconciles every enabled Provider Bundle Surface binding and the shared URL settings in one Share commit."
+    },
+    {
       "name": "save_provider_share",
       "support": "native",
       "implemented": true,
@@ -1752,35 +1804,6 @@
     },
     {
       "name": "stream_check_provider",
-      "support": "shim",
-      "implemented": true,
-      "feature": "providers",
-      "notes": "Server web runtime shim."
-    },
-    {
-      "name": "clear_current_provider",
-      "support": "native",
-      "implemented": true,
-      "feature": "providers",
-      "notes": "Clears currentProvider* in ui_settings so no provider is active for the app."
-    },
-    {
-      "name": "switch_provider",
-      "support": "shim",
-      "implemented": true,
-      "feature": "providers",
-      "endpoint": "local provider existence check",
-      "notes": "Server share binding and explicit provider headers select runtime provider; switch returns warnings only."
-    },
-    {
-      "name": "switch_proxy_provider",
-      "support": "shim",
-      "implemented": true,
-      "feature": "providers",
-      "notes": "Server-native Web compatibility command."
-    },
-    {
-      "name": "sync_current_providers_live",
       "support": "shim",
       "implemented": true,
       "feature": "providers",

@@ -21,6 +21,7 @@
     "notInstalled": "Not installed",
     "success": "Success",
     "error": "Error",
+    "authStatusLoadFailed": "Failed to load authentication status.",
     "unknown": "Unknown",
     "enterValidValue": "Please enter a valid value",
     "clear": "Clear",
@@ -440,6 +441,8 @@
       "title": "OAuth Authentication Center",
       "description": "Use your other subscriptions in Claude Code — please be mindful of compliance risks.",
       "beta": "Beta",
+      "capabilityLoading": "Loading account capabilities...",
+      "capabilityLoadFailed": "Account capabilities could not be loaded. Authentication actions are paused.",
       "quotaRefreshIntervalTitle": "Usage Refresh Interval",
       "quotaRefreshIntervalDescription": "Controls how often OAuth account 5h / 7day usage bars refresh automatically. Only the currently active provider polls in the background.",
       "quotaRefreshIntervalMinutes": "min",
@@ -453,6 +456,8 @@
       "quotaSettingsSaved": "OAuth usage refresh settings saved",
       "copilotDescription": "Manage GitHub Copilot accounts",
       "codexOauthDescription": "Manage ChatGPT accounts",
+      "agyOauthTitle": "Agy OAuth",
+      "agyOauthDescription": "Manage Agy subscription accounts",
       "subscriptionExpiry": {
         "title": "Subscription expiry date",
         "notSet": "Not set",
@@ -552,7 +557,7 @@
       },
       "proxy": {
         "title": "API Routing",
-        "description": "View server API routing status and selected Providers",
+        "description": "View server API routing status and routable Bundle surfaces",
         "running": "Running",
         "stopped": "Stopped"
       },
@@ -1383,6 +1388,7 @@
     "activeAccountBadge": "Active: {{login}}",
     "selectionRequiredBadge": "Selection required",
     "activeProxyAccount": "Active proxy account",
+    "providerAccount": "Provider account",
     "selectionRequired": "Select the ChatGPT account used for proxying.",
     "selectAccount": "Select account",
     "selectAccountPlaceholder": "Choose a ChatGPT account",
@@ -2506,8 +2512,7 @@
     "panel": {
       "serviceAddress": "Service Address",
       "addressCopied": "Address copied",
-      "currentProvider": "Current Provider:",
-      "waitingFirstRequest": "Current Provider: Waiting for first request...",
+      "routableSurfaces": "Routable surfaces",
       "stoppedTitle": "Routing Service Stopped",
       "stoppedDescription": "Use the toggle above to start the service",
       "openSettings": "Configure Routing Service",
@@ -3229,10 +3234,12 @@
   },
   "deepseekAccount": {
     "authStatus": "DeepSeek account",
-    "identifier": "Email or phone number",
-    "identifierPlaceholder": "Enter an email or phone number",
-    "password": "Password",
-    "addAccount": "Add account",
+    "identifier": "Account label (optional)",
+    "identifierPlaceholder": "Email, phone number, or custom label",
+    "accessToken": "Access token",
+    "accessTokenPlaceholder": "Paste the DeepSeek access token",
+    "importAccount": "Import account",
+    "importAnotherAccount": "Import another account",
     "loginRequired": "Add a DeepSeek account first",
     "selectAccountRequired": "DeepSeek Account must be bound to a DeepSeek account"
   },
@@ -3373,7 +3380,12 @@
       "notes": "Notes"
     },
     "account": {
-      "title": "Authentication account"
+      "title": "Authentication account",
+      "loading": "Managed accounts are still loading.",
+      "loadFailed": "Managed accounts could not be loaded. Retry before saving.",
+      "selectedUnavailable": "The selected managed account is no longer available.",
+      "identityChanged": "This account now represents a different authenticated identity. Rebind it explicitly before saving this Provider.",
+      "rebindIdentity": "Rebind identity"
     },
     "aws": {
       "title": "AWS credentials"
@@ -3463,6 +3475,8 @@
     "extraUsage": "Extra Usage",
     "expiredHint": "Run the {{tool}} command to refresh your login",
     "queryFailed": "Query failed",
+    "credentialParseFailed": "Credential data could not be parsed",
+    "retryAfter": "Retry in {{time}}",
     "refresh": "Refresh"
   },
   "terminal": {

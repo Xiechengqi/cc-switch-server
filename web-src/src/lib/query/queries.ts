@@ -46,7 +46,6 @@ const sortProviders = (
 export interface ProvidersQueryData {
   providers: Record<string, Provider>;
   resources: Record<string, ProviderResource>;
-  currentProviderId: string;
 }
 
 export interface UseProvidersQueryOptions {
@@ -71,7 +70,6 @@ export const useProvidersQuery = (
     queryFn: async () => {
       let providers: Record<string, Provider> = {};
       let resources: Record<string, ProviderResource> = {};
-      let currentProviderId = "";
 
       try {
         if (isServerWebRuntime() && isCoreProviderApp(appId)) {
@@ -99,18 +97,9 @@ export const useProvidersQuery = (
         }
       }
 
-      try {
-        currentProviderId = await providersApi.getCurrent(appId);
-      } catch (error) {
-        if (import.meta.env.DEV) {
-          console.warn("获取当前供应商失败:", error);
-        }
-      }
-
       return {
         providers: sortProviders(providers),
         resources,
-        currentProviderId,
       };
     },
   });

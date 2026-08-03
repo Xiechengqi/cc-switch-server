@@ -1,3 +1,4 @@
+pub mod claude_subscription;
 pub mod cursor_import;
 pub mod login;
 pub mod managers;

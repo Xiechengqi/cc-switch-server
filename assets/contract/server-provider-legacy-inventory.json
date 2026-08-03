@@ -4,7 +4,7 @@
   "note": "This freezes the legacy Web preset inventory. Phase 2 replaces it with the Rust ProfileSpec registry.",
   "providerTypeSource": {
     "path": "src/domain/providers/model.rs",
-    "sha256": "f5aa26234ade1cfaa32503407067b734cac33408b7572a40248b4761ef60ba66"
+    "sha256": "156e712aa5f1e0811d5aea51fe5cb6ababca9b698105d6eb39c4e0fbe63994b8"
   },
   "providerTypes": [
     {
@@ -1584,6 +1584,8 @@
     ],
     "firstClassProfileAdditions": [
       "claude.anthropic_api_key",
+      "claude.bearer_relay",
+      "claude.google_oauth",
       "codex.openai_api_key",
       "gemini.google_api_key"
     ]

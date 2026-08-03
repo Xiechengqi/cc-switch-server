@@ -63,7 +63,11 @@ export interface ProviderTestConfig {
   maxRetries?: number;
 }
 
-export type AuthBindingSource = "provider_config" | "managed_account";
+export type AuthBindingSource =
+  | "provider_config"
+  | "managed_account"
+  | "account"
+  | "account_store";
 
 export interface AuthBinding {
   source: AuthBindingSource;
@@ -354,16 +358,6 @@ export interface Settings {
   openclawConfigDir?: string;
   // 覆盖 Hermes 配置目录（可选）
   hermesConfigDir?: string;
-
-  // ===== 当前供应商 ID（设备级）=====
-  // 当前 Claude 供应商 ID（优先于数据库 is_current）
-  currentProviderClaude?: string;
-  // 当前 Claude Desktop 供应商 ID（优先于数据库 is_current）
-  currentProviderClaudeDesktop?: string;
-  // 当前 Codex 供应商 ID（优先于数据库 is_current）
-  currentProviderCodex?: string;
-  // 当前 Gemini 供应商 ID（优先于数据库 is_current）
-  currentProviderGemini?: string;
 
   // ===== Skill 同步设置 =====
   // Skill 同步方式：auto（默认，优先 symlink）、symlink、copy

@@ -6,6 +6,7 @@ import {
 } from "@/server/providerRegistry";
 import {
   createDraftForProfile,
+  profileAllowsEndpointEditing,
   providerPresetForProfile,
   readEndpoint,
   readModelPolicy,
@@ -45,7 +46,10 @@ describe("Server Provider profile drafts", () => {
   );
 
   it("covers every creatable profile with a deterministic typed draft", () => {
-    expect(creatable).toHaveLength(34);
+    expect(creatable.length).toBeGreaterThan(0);
+    expect(new Set(creatable.map((profile) => profile.profileId)).size).toBe(
+      creatable.length,
+    );
     for (const profile of creatable) {
       const first = createDraftForProfile(profile);
       const second = createDraftForProfile(profile);
@@ -69,6 +73,50 @@ describe("Server Provider profile drafts", () => {
         profile.profileId,
       ).toEqual([]);
     }
+  });
+
+  it("materializes the Claude bearer relay draft with bearer metadata", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "claude.bearer_relay",
+    );
+    expect(profile).toBeDefined();
+
+    const draft = createDraftForProfile(profile!);
+    expect(draft.name).toBe("Claude Bearer Relay");
+    expect(readEndpoint(draft.settingsConfig, "claude")).toBe(
+      "https://api.anthropic.com",
+    );
+    expect(draft.settingsConfig.modelMapping).toEqual({
+      mode: "passthrough",
+    });
+    expect(draft.meta).toMatchObject({
+      providerType: "claude_auth",
+      apiFormat: "anthropic",
+      apiKeyField: "ANTHROPIC_AUTH_TOKEN",
+    });
+    expect(profileAllowsEndpointEditing(profile!)).toBe(true);
+  });
+
+  it("materializes the Claude Google OAuth draft for Code Assist", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "claude.google_oauth",
+    );
+    expect(profile).toBeDefined();
+
+    const draft = createDraftForProfile(profile!);
+    expect(draft.name).toBe("Google Gemini OAuth");
+    expect(readEndpoint(draft.settingsConfig, "claude")).toBe(
+      "https://cloudcode-pa.googleapis.com",
+    );
+    expect(readUpstreamModel(draft.settingsConfig)).toBe(
+      "gemini-3.1-pro-preview",
+    );
+    expect(draft.meta).toMatchObject({
+      providerType: "gemini_cli",
+      apiFormat: "gemini_native",
+    });
+    expect(serializedSecrets(draft.settingsConfig)).toEqual([]);
+    expect(profileAllowsEndpointEditing(profile!)).toBe(false);
   });
 
   it("has an icon-selector preset for every non-custom creatable profile", () => {

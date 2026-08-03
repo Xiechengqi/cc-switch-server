@@ -20,6 +20,44 @@ export const anthropicApiKeyPreset: ProviderPreset = {
   iconColor: "#D4915D",
 };
 
+export const claudeBearerRelayPreset: ProviderPreset = {
+  name: "Claude Bearer Relay",
+  websiteUrl: "https://www.anthropic.com/",
+  settingsConfig: {
+    env: {
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+    },
+    modelMapping: { mode: "passthrough" },
+  },
+  category: "official",
+  apiKeyField: "ANTHROPIC_AUTH_TOKEN",
+  apiFormat: "anthropic",
+  icon: "anthropic",
+  iconColor: "#D4915D",
+};
+
+export const claudeGoogleOAuthPreset: ProviderPreset = {
+  name: "Google Gemini OAuth",
+  websiteUrl: "https://codeassist.google/",
+  settingsConfig: {
+    env: {
+      ANTHROPIC_BASE_URL: "https://cloudcode-pa.googleapis.com",
+      ANTHROPIC_MODEL: "gemini-3.1-pro-preview",
+    },
+    modelMapping: {
+      mode: "single",
+      upstreamModel: "gemini-3.1-pro-preview",
+    },
+  },
+  isOfficial: true,
+  category: "official",
+  apiFormat: "gemini_native",
+  providerType: "google_gemini_oauth",
+  requiresOAuth: true,
+  icon: "gemini",
+  iconColor: "#4285F4",
+};
+
 export const openAiApiKeyPreset: CodexProviderPreset = {
   name: "OpenAI API Key",
   websiteUrl: "https://platform.openai.com/",

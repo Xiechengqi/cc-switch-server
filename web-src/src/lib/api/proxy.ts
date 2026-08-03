@@ -33,14 +33,6 @@ export const proxyApi = {
     return invokeCommand("is_live_takeover_active");
   },
 
-  // 代理模式下切换供应商
-  async switchProxyProvider(
-    appType: string,
-    providerId: string,
-  ): Promise<void> {
-    return invokeCommand("switch_proxy_provider", { appType, providerId });
-  },
-
   // ========== 接管状态 API ==========
 
   // 获取各应用接管状态

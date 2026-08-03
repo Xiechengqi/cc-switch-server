@@ -1,6 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { isOpenAiCliOAuthOriginAllowed } from "./auth";
+const runtimeMocks = vi.hoisted(() => ({
+  invokeCommand: vi.fn(),
+}));
+
+vi.mock("@/lib/runtime", () => ({
+  invokeCommand: runtimeMocks.invokeCommand,
+  isTauriRuntime: () => false,
+}));
+
+import { deepseekAccountAdd, isOpenAiCliOAuthOriginAllowed } from "./auth";
+
+beforeEach(() => {
+  runtimeMocks.invokeCommand.mockReset();
+});
 
 describe("isOpenAiCliOAuthOriginAllowed", () => {
   it.each([
@@ -59,5 +72,25 @@ describe("isOpenAiCliOAuthOriginAllowed", () => {
         true,
       ),
     ).toBe(true);
+  });
+
+  it("imports DeepSeek accounts with an access token and no password", async () => {
+    runtimeMocks.invokeCommand.mockResolvedValue({ id: "deepseek-1" });
+
+    await deepseekAccountAdd({
+      identifier: "owner@example.com",
+      accessToken: "deepseek-token",
+    });
+
+    expect(runtimeMocks.invokeCommand).toHaveBeenCalledWith(
+      "deepseek_account_add",
+      {
+        identifier: "owner@example.com",
+        accessToken: "deepseek-token",
+      },
+    );
+    expect(runtimeMocks.invokeCommand.mock.calls[0]?.[1]).not.toHaveProperty(
+      "password",
+    );
   });
 });

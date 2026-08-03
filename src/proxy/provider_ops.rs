@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 use zeroize::Zeroize;
 
-use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
-use crate::domain::accounts::oauth::oauth_provider_spec;
-use crate::domain::accounts::store::{
-    effective_codex_workspace_id, Account, AccountStore, CodexOAuthAccountSelectionStatus,
+use crate::domain::accounts::managers::{
+    account_credential_ownership, manager_for, AccountCredentialOwnership, AccountManager,
+    CredentialKind,
 };
+use crate::domain::accounts::store::{effective_codex_workspace_id, Account, AccountStore};
+use crate::domain::providers::credentials::reveal_provider_credential;
 use crate::domain::providers::model::{CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::registry::{
     provider_registry, AuthScheme, OperationSupport, UpstreamProtocol,
@@ -21,6 +22,9 @@ use crate::domain::providers::runtime::{
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
+#[cfg(test)]
+use super::account_headers::account_header_override_blocked;
+use super::account_headers::apply_account_header_overrides;
 use super::adapters::{self, AdapterRequest, ProviderAdapter};
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::router::ProxyRoute;
@@ -132,10 +136,8 @@ impl ProviderExecution {
                 account_id: None,
                 ..
             }
-        ) && provider_secret(&self.stored).is_none()
-            && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
-                spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
-            })
+        ) && account_credential_ownership(self.stored.provider_type)
+            == AccountCredentialOwnership::ManagedAccount
         {
             return Err(ProxyError::bad_request(format!(
                 "Provider {} must explicitly bind a {} managed account",
@@ -185,7 +187,12 @@ impl ProviderExecution {
     pub fn managed_account_id(&self) -> Option<&str> {
         match &self.plan.auth_ref {
             RuntimeAuthRef::ManagedAccount { account_id, .. } => Some(account_id),
-            RuntimeAuthRef::Legacy { account_id, .. } => account_id.as_deref(),
+            RuntimeAuthRef::Legacy { account_id, .. }
+                if account_credential_ownership(self.stored.provider_type)
+                    == AccountCredentialOwnership::ManagedAccount =>
+            {
+                account_id.as_deref()
+            }
             _ => None,
         }
     }
@@ -200,16 +207,26 @@ impl ProviderExecution {
             RuntimeAuthRef::Legacy {
                 account_id: Some(account_id),
                 ..
-            } if matches!(
-                self.stored.provider_type,
-                ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
-            ) || (provider_secret(&self.stored).is_none()
-                && oauth_provider_spec(self.stored.provider_type).is_some_and(|spec| {
-                    spec.server_native_refresh_enabled() && !spec.token_urls.is_empty()
-                })) =>
+            } if account_credential_ownership(self.stored.provider_type)
+                == AccountCredentialOwnership::ManagedAccount =>
             {
                 Some((self.stored.provider_type, account_id.as_str()))
             }
+            _ => None,
+        }
+    }
+
+    pub fn managed_account_identity_target(&self) -> Option<(ProviderType, &str, u64)> {
+        match &self.plan.auth_ref {
+            RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type,
+                auth_identity_generation,
+            } => Some((
+                *expected_provider_type,
+                account_id.as_str(),
+                *auth_identity_generation,
+            )),
             _ => None,
         }
     }
@@ -288,7 +305,7 @@ impl ProviderExecution {
             replace_header(&mut headers, name, &value);
         }
         let materialized_auth = self.materialize_auth(accounts)?;
-        self.apply_auth(&mut headers, &mut endpoint, materialized_auth.as_ref())?;
+        self.apply_auth(&mut headers, &mut endpoint, &materialized_auth)?;
         apply_account_header_overrides(&mut headers, &stored, accounts)?;
         self.finalize_outbound_identity(&mut headers)?;
         Ok(PreparedProviderRequest {
@@ -327,19 +344,13 @@ impl ProviderExecution {
         Ok(())
     }
 
-    pub fn materialize_auth(
-        &self,
-        accounts: &AccountStore,
-    ) -> Result<Option<MaterializedAuth>, ProxyError> {
+    pub fn materialize_auth(&self, accounts: &AccountStore) -> Result<AuthApplication, ProxyError> {
         let mut materialized = match &self.plan.auth_ref {
             RuntimeAuthRef::ManagedAccount {
                 account_id,
                 expected_provider_type,
                 auth_identity_generation,
             } => {
-                if *expected_provider_type == ProviderType::CodexOAuth {
-                    ensure_codex_managed_account_active(accounts, account_id)?;
-                }
                 let account = exact_account(accounts, account_id).ok_or_else(|| {
                     ProxyError::bad_request(format!("bound account {account_id} does not exist"))
                 })?;
@@ -361,44 +372,44 @@ impl ProviderExecution {
                         message: format!("bound account {account_id} requires login"),
                     });
                 }
-                let credential = manager_for(*expected_provider_type)
-                    .get_valid_token(
-                        accounts,
-                        *expected_provider_type,
-                        Some(account_id),
-                        now_ms_i64(),
-                    )
-                    .map_err(|error| {
-                        ProxyError::bad_request(format!(
-                            "bound account {account_id} credential is unavailable: {error}"
-                        ))
-                    })?;
-                Some(managed_auth(self, account, credential))
+                if managed_auth_is_protocol_owned(self) {
+                    AuthApplication::ProtocolOwned
+                } else {
+                    let credential = manager_for(*expected_provider_type)
+                        .get_valid_token(
+                            accounts,
+                            *expected_provider_type,
+                            Some(account_id),
+                            now_ms_i64(),
+                        )
+                        .map_err(|error| {
+                            ProxyError::bad_request(format!(
+                                "bound account {account_id} credential is unavailable: {error}"
+                            ))
+                        })?;
+                    managed_auth(self, account, credential)
+                }
             }
             RuntimeAuthRef::StaticCredential {
                 auth_scheme,
+                slots,
                 credential_generation,
-                ..
             } => {
                 self.ensure_credential_generation(*credential_generation)?;
-                let secret = provider_secret(&self.stored).ok_or_else(|| {
-                    ProxyError::bad_request("Provider credential is not configured")
-                })?;
-                Some(static_auth(self, *auth_scheme, secret)?)
+                let secret = self.provider_secret_from_slots(slots, false)?;
+                static_auth(self, *auth_scheme, secret)?
             }
             RuntimeAuthRef::CustomCredential {
                 auth_scheme,
+                slots,
                 credential_generation,
-                ..
             } => {
                 self.ensure_credential_generation(*credential_generation)?;
                 if *auth_scheme == AuthScheme::None {
-                    Some(MaterializedAuth::default())
+                    AuthApplication::NoAuth(MaterializedAuth::default())
                 } else {
-                    let secret = provider_secret(&self.stored).ok_or_else(|| {
-                        ProxyError::bad_request("custom Provider credential is not configured")
-                    })?;
-                    Some(static_auth(self, *auth_scheme, secret)?)
+                    let secret = self.provider_secret_from_slots(slots, true)?;
+                    static_auth(self, *auth_scheme, secret)?
                 }
             }
             RuntimeAuthRef::AwsCredential {
@@ -406,9 +417,9 @@ impl ProviderExecution {
                 ..
             } => {
                 self.ensure_credential_generation(*credential_generation)?;
-                Some(MaterializedAuth::default())
+                AuthApplication::ProtocolOwned
             }
-            RuntimeAuthRef::Legacy { .. } => None,
+            RuntimeAuthRef::Legacy { .. } => AuthApplication::LegacyPreserve,
             RuntimeAuthRef::Missing => {
                 return Err(ProxyError::bad_request(format!(
                     "Provider {} credential binding is incomplete",
@@ -416,10 +427,60 @@ impl ProviderExecution {
                 )))
             }
         };
-        if let Some(auth) = materialized.as_mut() {
+        if let Some(auth) = materialized.values_mut() {
             self.append_extra_headers(auth)?;
         }
         Ok(materialized)
+    }
+
+    fn provider_secret_from_slots(
+        &self,
+        slots: &[String],
+        custom: bool,
+    ) -> Result<String, ProxyError> {
+        let mut candidates = Vec::new();
+        for slot in slots {
+            if !slot.starts_with('/')
+                || self
+                    .plan
+                    .extra_headers
+                    .iter()
+                    .any(|header| header.credential_slot == *slot)
+                || (!custom && !static_credential_slot_allowed(self, slot))
+            {
+                continue;
+            }
+            if let Ok(value) = reveal_provider_credential(&self.stored.provider, slot) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    candidates.push((slot.as_str(), value.to_string()));
+                }
+            }
+        }
+
+        candidates.sort_by_key(|(slot, _)| credential_slot_priority(slot));
+        let mut unique = Vec::new();
+        for candidate in candidates {
+            if !unique.iter().any(|(_, value)| value == &candidate.1) {
+                unique.push(candidate);
+            }
+        }
+        match unique.as_slice() {
+            [] => Err(ProxyError::bad_request(if custom {
+                "custom Provider credential is not configured"
+            } else {
+                "Provider credential is not configured"
+            })),
+            [(_, value)] => Ok(value.clone()),
+            _ => Err(ProxyError::bad_request(format!(
+                "Provider has conflicting credentials in runtime slots: {}",
+                unique
+                    .iter()
+                    .map(|(slot, _)| *slot)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 
     fn append_extra_headers(&self, auth: &mut MaterializedAuth) -> Result<(), ProxyError> {
@@ -465,10 +526,11 @@ impl ProviderExecution {
         &self,
         headers: &mut Vec<(String, String)>,
         url: &mut String,
-        auth: Option<&MaterializedAuth>,
+        auth: &AuthApplication,
     ) -> Result<(), ProxyError> {
-        let Some(auth) = auth else {
-            return Ok(());
+        let auth = match auth {
+            AuthApplication::Inject(auth) | AuthApplication::NoAuth(auth) => auth,
+            AuthApplication::ProtocolOwned | AuthApplication::LegacyPreserve => return Ok(()),
         };
         headers.retain(|(name, _)| !canonical_auth_header(name));
         for (name, value) in &auth.headers {
@@ -483,9 +545,35 @@ impl ProviderExecution {
             let mut parsed = Url::parse(url).map_err(|error| {
                 ProxyError::bad_request(format!("invalid upstream URL: {error}"))
             })?;
+            let mut authoritative: Vec<(String, String)> = Vec::with_capacity(auth.query.len());
+            for (name, value) in &auth.query {
+                if let Some((_, current)) = authoritative
+                    .iter_mut()
+                    .find(|(current, _)| current == name)
+                {
+                    *current = value.clone();
+                } else {
+                    authoritative.push((name.clone(), value.clone()));
+                }
+            }
+            let retained = parsed
+                .query_pairs()
+                .filter(|(name, _)| {
+                    !authoritative
+                        .iter()
+                        .any(|(auth_name, _)| name.as_ref() == auth_name)
+                })
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
             {
                 let mut query = parsed.query_pairs_mut();
-                for (name, value) in &auth.query {
+                query.clear();
+                query.extend_pairs(
+                    retained
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                );
+                for (name, value) in &authoritative {
                     query.append_pair(name, value);
                 }
             }
@@ -538,6 +626,23 @@ impl ProviderExecution {
 
     pub fn finalize_request(&self, request: &mut AdapterRequest) -> Result<(), ProxyError> {
         adapters::finalize_runtime_request(&self.plan, &self.stored, request)
+    }
+
+    pub fn finalize_protocol_auth(
+        &self,
+        accounts: &AccountStore,
+        request: &mut AdapterRequest,
+        endpoint: &mut String,
+        headers: &mut Vec<(String, String)>,
+    ) -> Result<(), ProxyError> {
+        adapters::finalize_runtime_protocol_auth(
+            &self.plan,
+            &self.stored,
+            accounts,
+            request,
+            endpoint,
+            headers,
+        )
     }
 
     pub fn apply_openai_codex_final_request_contract(
@@ -723,37 +828,6 @@ impl ProviderExecution {
     }
 }
 
-fn ensure_codex_managed_account_active(
-    accounts: &AccountStore,
-    account_id: &str,
-) -> Result<(), ProxyError> {
-    let selection = accounts.codex_oauth_selection();
-    let Some(active_account_id) = selection.active_account_id.as_deref() else {
-        let message = match selection.status {
-            CodexOAuthAccountSelectionStatus::Unconfigured => {
-                "Codex OAuth account is not configured"
-            }
-            CodexOAuthAccountSelectionStatus::NeedsSelection => {
-                "multiple Codex OAuth accounts exist; select the active account before using managed credentials"
-            }
-            CodexOAuthAccountSelectionStatus::Ready => {
-                "Codex OAuth active account is unavailable"
-            }
-        };
-        return Err(ProxyError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: message.to_string(),
-        });
-    };
-    if active_account_id != account_id {
-        return Err(ProxyError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: format!("Codex OAuth account {account_id} is not active"),
-        });
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderOperation {
@@ -770,6 +844,41 @@ impl ProviderOperation {
             Self::Test => "test",
             Self::Discovery => "discovery",
             Self::Connectivity => "connectivity",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum AuthApplication {
+    Inject(MaterializedAuth),
+    ProtocolOwned,
+    NoAuth(MaterializedAuth),
+    LegacyPreserve,
+}
+
+impl AuthApplication {
+    fn values_mut(&mut self) -> Option<&mut MaterializedAuth> {
+        match self {
+            Self::Inject(auth) | Self::NoAuth(auth) => Some(auth),
+            Self::ProtocolOwned | Self::LegacyPreserve => None,
+        }
+    }
+
+    pub(crate) fn injected_values(&self) -> Option<&MaterializedAuth> {
+        match self {
+            Self::Inject(auth) => Some(auth),
+            Self::ProtocolOwned | Self::NoAuth(_) | Self::LegacyPreserve => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthApplication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inject(auth) => formatter.debug_tuple("Inject").field(auth).finish(),
+            Self::ProtocolOwned => formatter.write_str("ProtocolOwned"),
+            Self::NoAuth(auth) => formatter.debug_tuple("NoAuth").field(auth).finish(),
+            Self::LegacyPreserve => formatter.write_str("LegacyPreserve"),
         }
     }
 }
@@ -814,13 +923,7 @@ fn managed_auth(
     execution: &ProviderExecution,
     account: &Account,
     credential: crate::domain::accounts::managers::AccountCredential,
-) -> MaterializedAuth {
-    if matches!(
-        execution.plan.driver_id.as_str(),
-        "special.cursor" | "special.kiro" | "special.deepseek_account" | "special.copilot"
-    ) {
-        return MaterializedAuth::default();
-    }
+) -> AuthApplication {
     let mut auth = MaterializedAuth::default();
     if credential.credential_kind == CredentialKind::ApiKey
         && execution.plan.upstream_protocol == UpstreamProtocol::GeminiNative
@@ -847,17 +950,24 @@ fn managed_auth(
             crate::codex_identity::configured_version(),
         ));
     }
-    auth
+    AuthApplication::Inject(auth)
+}
+
+fn managed_auth_is_protocol_owned(execution: &ProviderExecution) -> bool {
+    matches!(
+        execution.plan.driver_id.as_str(),
+        "special.cursor" | "special.kiro" | "special.deepseek_account" | "special.copilot"
+    )
 }
 
 fn static_auth(
     execution: &ProviderExecution,
     scheme: AuthScheme,
     secret: String,
-) -> Result<MaterializedAuth, ProxyError> {
+) -> Result<AuthApplication, ProxyError> {
     let mut auth = MaterializedAuth::default();
     match scheme {
-        AuthScheme::None => {}
+        AuthScheme::None => return Ok(AuthApplication::NoAuth(auth)),
         AuthScheme::ApiKey => {
             let header = if execution.plan.upstream_protocol == UpstreamProtocol::GeminiNative {
                 "x-goog-api-key"
@@ -901,7 +1011,44 @@ fn static_auth(
             )));
         }
     }
-    Ok(auth)
+    Ok(AuthApplication::Inject(auth))
+}
+
+fn static_credential_slot_allowed(execution: &ProviderExecution, slot: &str) -> bool {
+    if slot == "/settingsConfig/apiKey" {
+        return true;
+    }
+    match execution.stored.app {
+        crate::domain::providers::model::AppKind::Claude => matches!(
+            slot,
+            "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN"
+                | "/settingsConfig/env/ANTHROPIC_API_KEY"
+                | "/settingsConfig/env/API_KEY"
+                | "/settingsConfig/env/AWS_BEARER_TOKEN_BEDROCK"
+        ),
+        crate::domain::providers::model::AppKind::Codex => matches!(
+            slot,
+            "/settingsConfig/auth/OPENAI_API_KEY"
+                | "/settingsConfig/env/OPENAI_API_KEY"
+                | "/settingsConfig/env/CODEX_API_KEY"
+                | "/settingsConfig/env/API_KEY"
+        ),
+        crate::domain::providers::model::AppKind::Gemini => matches!(
+            slot,
+            "/settingsConfig/env/GEMINI_API_KEY"
+                | "/settingsConfig/env/GOOGLE_API_KEY"
+                | "/settingsConfig/env/API_KEY"
+        ),
+    }
+}
+
+fn credential_slot_priority(slot: &str) -> (u8, &str) {
+    let priority = match slot {
+        "/settingsConfig/apiKey" => 0,
+        "/settingsConfig/auth/OPENAI_API_KEY" => 1,
+        _ => 2,
+    };
+    (priority, slot)
 }
 
 fn validate_custom_auth_header(name: &str) -> Result<(), ProxyError> {
@@ -1039,110 +1186,6 @@ fn model_requests_claude_context_1m(model: &str) -> bool {
     model.ends_with("[1m]") || model.ends_with("-1m")
 }
 
-fn apply_account_header_overrides(
-    headers: &mut Vec<(String, String)>,
-    stored: &StoredProvider,
-    accounts: &AccountStore,
-) -> Result<(), ProxyError> {
-    let Some(account_id) = stored
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.auth_binding.as_ref())
-        .and_then(|binding| binding.account_id.as_deref())
-    else {
-        return Ok(());
-    };
-    let Some(account) = accounts.find_for_provider(stored.provider_type, Some(account_id)) else {
-        return Ok(());
-    };
-    for (name, value) in &account.extra_headers {
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            ProxyError::bad_request(format!(
-                "account {} extra header name is invalid: {name}",
-                account.id
-            ))
-        })?;
-        let normalized_name = header_name.as_str();
-        if account_header_override_blocked(normalized_name, stored.provider_type) {
-            return Err(ProxyError::bad_request(format!(
-                "account {} extra header cannot override proxy-controlled header: {normalized_name}",
-                account.id
-            )));
-        }
-        HeaderValue::from_str(value).map_err(|_| {
-            ProxyError::bad_request(format!(
-                "account {} extra header value is invalid for {normalized_name}",
-                account.id
-            ))
-        })?;
-        replace_header(headers, normalized_name, value);
-    }
-    Ok(())
-}
-
-fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    if provider_type == ProviderType::ClaudeOAuth
-        && (matches!(
-            normalized.as_str(),
-            "anthropic-beta"
-                | "anthropic-version"
-                | "x-app"
-                | "sec-fetch-mode"
-                | "anthropic-dangerous-direct-browser-access"
-                | "x-claude-code-session-id"
-        ) || normalized.starts_with("x-stainless-"))
-    {
-        return true;
-    }
-    if provider_type == ProviderType::GrokOAuth
-        && matches!(
-            normalized.as_str(),
-            "x-xai-token-auth"
-                | "x-grok-client-identifier"
-                | "x-grok-client-version"
-                | "x-grok-client-surface"
-                | "x-authenticateresponse"
-                | "x-grok-conv-id"
-                | "x-grok-cache-identity"
-                | "x-grok-turn-idx"
-        )
-    {
-        return true;
-    }
-    matches!(
-        normalized.as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "host"
-            | "content-length"
-            | "content-type"
-            | "accept"
-            | "connection"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-            | "cookie"
-            | "set-cookie"
-            | "user-agent"
-            | "originator"
-            | "version"
-            | "chatgpt-account-id"
-            | "session_id"
-            | "x-client-request-id"
-            | "x-codex-window-id"
-            | "openai-beta"
-    )
-}
-
 fn canonical_auth_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -1177,6 +1220,7 @@ mod tests {
     use crate::domain::providers::model::{AppKind, Provider, ProviderType};
     use crate::domain::providers::store::ProviderResourceMetadata;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn execution_with_auth(
         auth_ref: RuntimeAuthRef,
@@ -1240,6 +1284,67 @@ mod tests {
         }
     }
 
+    fn typed_execution(
+        app: AppKind,
+        profile_id: &str,
+        provider: Provider,
+        accounts: &AccountStore,
+        credential_generation: u64,
+    ) -> ProviderExecution {
+        let mut store = ProviderStore::default();
+        let stored = store.upsert_with_resource(
+            app,
+            provider,
+            ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation,
+                ..Default::default()
+            },
+        );
+        let plan =
+            crate::domain::providers::runtime::compile_runtime_plan(&stored, accounts).unwrap();
+        assert_eq!(
+            plan.configuration_state,
+            RuntimeConfigurationState::Ready,
+            "warnings={:?}",
+            plan.warnings
+        );
+        assert_eq!(plan.profile_id.as_str(), profile_id);
+        ProviderExecution {
+            stored,
+            plan: Arc::new(plan),
+        }
+    }
+
+    fn typed_managed_provider(
+        id: &str,
+        provider_type: ProviderType,
+        account_id: &str,
+        settings_config: Value,
+    ) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            settings_config,
+            category: None,
+            meta: Some(crate::domain::providers::model::ProviderMeta {
+                provider_type: Some(provider_type.as_str().to_string()),
+                auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some(provider_type.as_str().to_string()),
+                    account_id: Some(account_id.to_string()),
+                    auth_identity_generation: Some(1),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        }
+    }
+
     #[test]
     fn single_model_policy_rewrites_body_and_preserves_requested_model() {
         let execution = ProviderExecution {
@@ -1299,6 +1404,7 @@ mod tests {
             requested_model: Some("requested-model".to_string()),
             actual_model: None,
             actual_model_source: None,
+            gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
             custom_tool_names: Default::default(),
@@ -1343,6 +1449,7 @@ mod tests {
             requested_model: Some("requested-model".to_string()),
             actual_model: None,
             actual_model_source: None,
+            gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
             custom_tool_names: Default::default(),
@@ -1401,6 +1508,7 @@ mod tests {
             requested_model: Some("gpt-5.4".to_string()),
             actual_model: Some("gpt-5.4".to_string()),
             actual_model_source: Some("request".to_string()),
+            gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
             custom_tool_names: Default::default(),
@@ -1533,6 +1641,7 @@ mod tests {
             requested_model: Some("gpt-5.4".to_string()),
             actual_model: Some("gpt-5.4".to_string()),
             actual_model_source: Some("request".to_string()),
+            gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
             custom_tool_names: Default::default(),
@@ -1575,10 +1684,8 @@ mod tests {
             json!({"apiKey": "secret-key"}),
             2,
         );
-        let api_key_auth = api_key
-            .materialize_auth(&AccountStore::default())
-            .unwrap()
-            .unwrap();
+        let api_key_application = api_key.materialize_auth(&AccountStore::default()).unwrap();
+        let api_key_auth = api_key_application.injected_values().unwrap();
         assert_eq!(
             api_key_auth.headers,
             vec![("x-api-key".to_string(), "secret-key".to_string())]
@@ -1594,14 +1701,480 @@ mod tests {
             json!({"apiKey": "secret-key"}),
             2,
         );
-        let bearer_auth = bearer
-            .materialize_auth(&AccountStore::default())
-            .unwrap()
-            .unwrap();
+        let bearer_application = bearer.materialize_auth(&AccountStore::default()).unwrap();
+        let bearer_auth = bearer_application.injected_values().unwrap();
         assert_eq!(
             bearer_auth.headers,
             vec![("authorization".to_string(), "Bearer secret-key".to_string())]
         );
+    }
+
+    #[test]
+    fn query_auth_replaces_stale_values_and_preserves_other_url_parts() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::StaticCredential {
+                auth_scheme: AuthScheme::Query,
+                slots: vec!["/settingsConfig/apiKey".to_string()],
+                credential_generation: 2,
+            },
+            UpstreamProtocol::GeminiNative,
+            json!({"apiKey": "fresh key/+"}),
+            2,
+        );
+        Arc::make_mut(&mut execution.plan)
+            .driver_options
+            .insert("apiKeyField".to_string(), json!("key"));
+        let application = execution
+            .materialize_auth(&AccountStore::default())
+            .unwrap();
+        let mut headers = Vec::new();
+        let mut url = "https://example.test/v1?key=stale&keep=a%2Fb&key=older#result".to_string();
+
+        execution
+            .apply_auth(&mut headers, &mut url, &application)
+            .unwrap();
+
+        let parsed = Url::parse(&url).unwrap();
+        let pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(name, _)| name == "key")
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![("key".to_string(), "fresh key/+".to_string())]
+        );
+        assert!(pairs.contains(&("keep".to_string(), "a/b".to_string())));
+        assert_eq!(parsed.fragment(), Some("result"));
+    }
+
+    #[test]
+    fn protocol_owned_auth_preserves_driver_authorization() {
+        let execution = execution_with_auth(
+            RuntimeAuthRef::AwsCredential {
+                slots: vec![
+                    "/settingsConfig/env/AWS_ACCESS_KEY_ID".to_string(),
+                    "/settingsConfig/env/AWS_SECRET_ACCESS_KEY".to_string(),
+                ],
+                credential_generation: 2,
+            },
+            UpstreamProtocol::Bedrock,
+            json!({}),
+            2,
+        );
+        let application = execution
+            .materialize_auth(&AccountStore::default())
+            .unwrap();
+        let mut headers = vec![
+            (
+                "authorization".to_string(),
+                "AWS4-HMAC-SHA256 signed".to_string(),
+            ),
+            ("x-amz-date".to_string(), "20260802T000000Z".to_string()),
+        ];
+        let mut url = "https://bedrock.example/model/test/converse".to_string();
+
+        execution
+            .apply_auth(&mut headers, &mut url, &application)
+            .unwrap();
+
+        assert_eq!(
+            headers[0],
+            (
+                "authorization".to_string(),
+                "AWS4-HMAC-SHA256 signed".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn typed_bedrock_pipeline_converts_and_signs_only_at_protocol_boundary() {
+        let accounts = AccountStore::default();
+        let execution = typed_execution(
+            AppKind::Claude,
+            "claude.aws_bedrock_aksk",
+            Provider {
+                id: "typed-bedrock".to_string(),
+                name: "Typed Bedrock".to_string(),
+                settings_config: json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://bedrock-runtime.us-west-2.amazonaws.com",
+                        "AWS_REGION": "us-west-2",
+                        "AWS_ACCESS_KEY_ID": "AKIA1234567890ABCD",
+                        "AWS_SECRET_ACCESS_KEY": "test-secret",
+                        "AWS_SESSION_TOKEN": "test-session"
+                    }
+                }),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            &accounts,
+            1,
+        );
+        assert_eq!(execution.plan.driver_id.as_str(), "aws.bedrock_sigv4");
+
+        let stored = execution.runtime_stored_view();
+        let adapter = adapters::adapter_for(AppKind::Claude, stored.provider_type);
+        let mut request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"global.anthropic.claude-opus-4-8","max_tokens":128,"temperature":0.25,"system":[{"type":"text","text":"keep this rule"}],"messages":[{"role":"user","content":[{"type":"text","text":"hello bedrock"}]}]}"#,
+                ),
+                &stored,
+                ProxyRoute::ClaudeMessages,
+                None,
+            )
+            .unwrap();
+        execution.enforce_model_policy(&mut request).unwrap();
+        let anthropic_body = request.body.clone();
+
+        execution.finalize_request(&mut request).unwrap();
+
+        assert_eq!(request.body, anthropic_body);
+        assert!(request.upstream_endpoint.is_none());
+        assert!(request.upstream_headers.is_empty());
+
+        let mut endpoint = execution
+            .resolve_endpoint(ProxyRoute::ClaudeMessages, None, &request)
+            .unwrap();
+        let mut headers = adapter
+            .build_headers(AppKind::Claude, &stored, &accounts)
+            .unwrap()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect::<Vec<_>>();
+        headers.extend(
+            request
+                .upstream_headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone())),
+        );
+        let auth = execution.materialize_auth(&accounts).unwrap();
+        execution
+            .apply_auth(&mut headers, &mut endpoint, &auth)
+            .unwrap();
+        apply_account_header_overrides(&mut headers, &stored, &accounts).unwrap();
+        execution.finalize_outbound_identity(&mut headers).unwrap();
+        execution
+            .finalize_protocol_auth(&accounts, &mut request, &mut endpoint, &mut headers)
+            .unwrap();
+
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body.pointer("/messages/0/content/0/text"),
+            Some(&json!("hello bedrock"))
+        );
+        assert_eq!(
+            body.pointer("/system/0/text"),
+            Some(&json!("keep this rule"))
+        );
+        assert_eq!(
+            body.pointer("/inferenceConfig/maxTokens"),
+            Some(&json!(128))
+        );
+        assert_eq!(
+            body.pointer("/inferenceConfig/temperature"),
+            Some(&json!(0.25))
+        );
+        assert!(body.get("max_tokens").is_none());
+        assert!(endpoint.ends_with("/converse"));
+
+        for name in [
+            "authorization",
+            "content-type",
+            "host",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-security-token",
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                    .count(),
+                1,
+                "header={name}"
+            );
+        }
+        let payload_hash = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-content-sha256"))
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert_eq!(payload_hash, hex::encode(Sha256::digest(&request.body)));
+    }
+
+    #[test]
+    fn typed_copilot_protocol_auth_survives_final_header_assembly_once() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "copilot-account",
+            "providerType": "github_copilot",
+            "authIdentityGeneration": 1,
+            "accessToken": "cached-copilot-token",
+            "refreshToken": "github-token",
+            "expiresAt": 1,
+            "tokenType": "Bearer"
+        }))
+        .unwrap();
+        let accounts = AccountStore {
+            accounts: vec![account],
+            ..Default::default()
+        };
+        let execution = typed_execution(
+            AppKind::Claude,
+            "claude.github_copilot",
+            typed_managed_provider(
+                "typed-copilot",
+                ProviderType::GitHubCopilot,
+                "copilot-account",
+                json!({}),
+            ),
+            &accounts,
+            0,
+        );
+        assert_eq!(execution.plan.driver_id.as_str(), "special.copilot");
+
+        let application = execution.materialize_auth(&accounts).unwrap();
+        assert!(matches!(application, AuthApplication::ProtocolOwned));
+        let mut target_headers = vec![
+            (
+                "authorization".to_string(),
+                "Bearer cached-copilot-token".to_string(),
+            ),
+            ("user-agent".to_string(), "downstream-client/1".to_string()),
+        ];
+        let mut endpoint = "https://api.githubcopilot.com/chat/completions".to_string();
+        execution
+            .apply_auth(&mut target_headers, &mut endpoint, &application)
+            .unwrap();
+        execution
+            .finalize_outbound_identity(&mut target_headers)
+            .unwrap();
+
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer untrusted-downstream-token"),
+        );
+        let headers = super::super::outbound_request::assemble_headers(
+            &client_headers,
+            &target_headers,
+            "*/*",
+            "application/json",
+        )
+        .unwrap();
+
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer cached-copilot-token")
+        );
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("GitHubCopilotChat/0.38.2")
+        );
+    }
+
+    #[test]
+    fn typed_kiro_protocol_auth_survives_final_header_assembly_once() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "kiro-account",
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "accessToken": "kiro-access-token",
+            "refreshToken": "kiro-refresh-token",
+            "tokenType": "Bearer",
+            "profile": {
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                "apiRegion": "us-east-1",
+                "machineId": "machine-test"
+            }
+        }))
+        .unwrap();
+        let accounts = AccountStore {
+            accounts: vec![account.clone()],
+            ..Default::default()
+        };
+        let execution = typed_execution(
+            AppKind::Claude,
+            "claude.kiro_oauth",
+            typed_managed_provider(
+                "typed-kiro",
+                ProviderType::KiroOAuth,
+                "kiro-account",
+                json!({}),
+            ),
+            &accounts,
+            0,
+        );
+        assert_eq!(execution.plan.driver_id.as_str(), "special.kiro");
+
+        let application = execution.materialize_auth(&accounts).unwrap();
+        assert!(matches!(application, AuthApplication::ProtocolOwned));
+        let prepared = super::super::kiro::prepare_kiro_request(
+            &account,
+            &json!({
+                "model": "claude-sonnet-4-8",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "ping"}]
+            }),
+        )
+        .unwrap();
+        let mut target_headers = prepared
+            .headers
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect::<Vec<_>>();
+        let mut endpoint = prepared.url;
+        execution
+            .apply_auth(&mut target_headers, &mut endpoint, &application)
+            .unwrap();
+        execution
+            .finalize_outbound_identity(&mut target_headers)
+            .unwrap();
+
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer untrusted-downstream-token"),
+        );
+        let headers = super::super::outbound_request::assemble_headers(
+            &client_headers,
+            &target_headers,
+            "*/*",
+            "application/json",
+        )
+        .unwrap();
+
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer kiro-access-token")
+        );
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("aws-sdk-js/1.0.34 KiroIDE-2.3.0")
+        );
+    }
+
+    #[test]
+    fn typed_gemini_api_key_is_finalized_as_one_header() {
+        let execution = typed_execution(
+            AppKind::Gemini,
+            "gemini.google_api_key",
+            Provider {
+                id: "typed-gemini".to_string(),
+                name: "Typed Gemini".to_string(),
+                settings_config: json!({
+                    "env": {"GEMINI_API_KEY": "typed-gemini-key"}
+                }),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            &AccountStore::default(),
+            3,
+        );
+        assert_eq!(execution.plan.driver_id.as_str(), "http.gemini_native");
+
+        let application = execution
+            .materialize_auth(&AccountStore::default())
+            .unwrap();
+        let mut target_headers = vec![
+            ("X-Goog-Api-Key".to_string(), "stale-key".to_string()),
+            ("x-goog-api-key".to_string(), "older-key".to_string()),
+            (
+                "authorization".to_string(),
+                "Bearer downstream-token".to_string(),
+            ),
+        ];
+        let mut endpoint = execution.plan.endpoint.clone();
+        execution
+            .apply_auth(&mut target_headers, &mut endpoint, &application)
+            .unwrap();
+        execution
+            .finalize_outbound_identity(&mut target_headers)
+            .unwrap();
+        let headers = super::super::outbound_request::assemble_headers(
+            &HeaderMap::new(),
+            &target_headers,
+            "*/*",
+            "application/json",
+        )
+        .unwrap();
+
+        assert_eq!(headers.get_all("x-goog-api-key").iter().count(), 1);
+        assert_eq!(
+            headers
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("typed-gemini-key")
+        );
+        assert!(headers.get("authorization").is_none());
+    }
+
+    #[test]
+    fn static_auth_reads_only_declared_runtime_slots() {
+        let execution = execution_with_auth(
+            RuntimeAuthRef::StaticCredential {
+                auth_scheme: AuthScheme::Bearer,
+                slots: vec!["/settingsConfig/env/OPENAI_API_KEY".to_string()],
+                credential_generation: 2,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({
+                "apiKey": "unrelated-canonical-key",
+                "env": {"OPENAI_API_KEY": "declared-key"}
+            }),
+            2,
+        );
+
+        let application = execution
+            .materialize_auth(&AccountStore::default())
+            .unwrap();
+
+        assert_eq!(
+            application.injected_values().unwrap().headers,
+            vec![(
+                "authorization".to_string(),
+                "Bearer declared-key".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn static_auth_rejects_conflicting_runtime_slots() {
+        let execution = execution_with_auth(
+            RuntimeAuthRef::StaticCredential {
+                auth_scheme: AuthScheme::Bearer,
+                slots: vec![
+                    "/settingsConfig/apiKey".to_string(),
+                    "/settingsConfig/env/OPENAI_API_KEY".to_string(),
+                ],
+                credential_generation: 2,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({
+                "apiKey": "canonical-key",
+                "env": {"OPENAI_API_KEY": "legacy-key"}
+            }),
+            2,
+        );
+
+        let error = execution
+            .materialize_auth(&AccountStore::default())
+            .unwrap_err();
+
+        assert!(error.message.contains("conflicting credentials"));
     }
 
     #[test]
@@ -1646,6 +2219,45 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn materialization_uses_the_explicit_codex_account_binding() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "account-1".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            0,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        let mut accounts = AccountStore::default();
+        for account_id in ["account-1", "account-2"] {
+            accounts.upsert(
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "codex_oauth",
+                    "accessToken": format!("access-{account_id}")
+                }))
+                .unwrap(),
+            );
+        }
+        accounts
+            .select_active_codex_oauth_account("account-2")
+            .unwrap();
+
+        let auth = execution.materialize_auth(&accounts).unwrap();
+        let injected = auth.injected_values().unwrap();
+        assert!(injected.headers.iter().any(|(name, value)| {
+            name == "authorization" && value == "Bearer access-account-1"
+        }));
+        assert!(!injected
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains("account-2")));
     }
 
     #[test]
@@ -1784,6 +2396,7 @@ mod tests {
             requested_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
             actual_model: Some("Claude-Opus-4-6[1m][1M]".to_string()),
             actual_model_source: Some("request".to_string()),
+            gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
             custom_tool_names: Default::default(),
@@ -1813,6 +2426,7 @@ mod tests {
             requested_model: Some("claude-sonnet-4-6-1m".to_string()),
             actual_model: Some("claude-sonnet-4-6-1m".to_string()),
             actual_model_source: Some("request".to_string()),
+            gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
             custom_tool_names: Default::default(),
@@ -1999,10 +2613,10 @@ mod tests {
             ..execution.plan.as_ref().clone()
         });
 
-        let auth = execution
+        let application = execution
             .materialize_auth(&AccountStore::default())
-            .unwrap()
             .unwrap();
+        let auth = application.injected_values().unwrap();
 
         assert_eq!(
             auth.headers,

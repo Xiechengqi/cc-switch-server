@@ -6,6 +6,7 @@ pub mod client_tunnel_provision;
 pub mod clients;
 pub(crate) mod codex_identity;
 pub mod domain;
+pub(crate) mod image_store;
 pub mod infra;
 pub mod logging;
 pub mod metrics;

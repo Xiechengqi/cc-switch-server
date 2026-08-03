@@ -2,8 +2,14 @@ import { useQuery } from "@tanstack/react-query";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api/types";
 import type { ProviderMeta } from "@/types";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
+import { oauthQuotaAccountKey } from "@/lib/query/oauthQuotaKeys";
+import type { ManagedAuthProvider } from "@/lib/api/auth";
+import {
+  oauthQuotaSnapshotFromEnvelope,
+  type OauthQuotaSnapshot,
+} from "@/lib/query/oauthQuotaSnapshot";
 
 const REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
@@ -22,24 +28,52 @@ async function fetchOauthQuotaWithFallback(
   providerType?: string | null,
   appId?: AppId | null,
   providerId?: string | null,
-) {
+  authIdentityGeneration?: number,
+): Promise<OauthQuotaSnapshot | undefined> {
   const cached = await subscriptionApi.getCachedOauthQuota(
     authProvider,
     accountId,
     appId,
     providerId,
+    authIdentityGeneration,
   );
-  if (cached?.quota && cached.quota.credentialStatus !== "not_found") {
-    return cached.quota;
+  const expectedIdentity =
+    accountId != null && authIdentityGeneration != null
+      ? { accountId, authIdentityGeneration }
+      : undefined;
+  const hasActiveCooldown = (cached?.nextRefreshAt ?? 0) > Date.now();
+  if (
+    cached?.quota &&
+    (cached.quota.credentialStatus !== "not_found" || hasActiveCooldown)
+  ) {
+    return oauthQuotaSnapshotFromEnvelope(cached, expectedIdentity);
   }
-  const refreshed = await subscriptionApi.refreshOauthQuota(
-    authProvider,
-    accountId,
-    providerType,
-    appId,
-    providerId,
-  );
-  return refreshed?.quota;
+  try {
+    const refreshed = await subscriptionApi.refreshOauthQuota(
+      authProvider,
+      accountId,
+      providerType,
+      appId,
+      providerId,
+      false,
+      authIdentityGeneration,
+    );
+    return oauthQuotaSnapshotFromEnvelope(refreshed, expectedIdentity);
+  } catch (error) {
+    const failedSnapshot = await subscriptionApi.getCachedOauthQuota(
+      authProvider,
+      accountId,
+      appId,
+      providerId,
+      authIdentityGeneration,
+    );
+    const quota = oauthQuotaSnapshotFromEnvelope(
+      failedSnapshot,
+      expectedIdentity,
+    );
+    if (quota) return quota;
+    throw error;
+  }
 }
 
 export function useSubscriptionQuota(
@@ -101,11 +135,26 @@ export function useClaudeOauthQuota(
   options: UseClaudeOauthQuotaOptions = {},
 ) {
   const { enabled = true } = options;
-  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.CLAUDE_OAUTH);
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.CLAUDE_OAUTH,
+  );
   return useQuery({
-    queryKey: ["claude_oauth", "quota", accountId ?? "default"],
-    queryFn: async () => fetchOauthQuotaWithFallback("claude_oauth", accountId),
-    enabled,
+    queryKey: oauthQuotaAccountKey(
+      "claude_oauth",
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
+    queryFn: async () =>
+      fetchOauthQuotaWithFallback(
+        "claude_oauth",
+        identity!.accountId,
+        undefined,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
+      ),
+    enabled: enabled && identity != null,
     refetchInterval: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
@@ -128,12 +177,23 @@ export function useCodexOauthQuota(
 ) {
   const { enabled = true } = options;
   const authProvider = resolveCodexQuotaAuthProvider();
-  const accountId = resolveManagedAccountId(meta, authProvider);
+  const identity = resolveManagedAccountIdentity(meta, authProvider);
   return useQuery({
-    queryKey: [authProvider, "quota", accountId ?? "default"],
+    queryKey: oauthQuotaAccountKey(
+      authProvider,
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
     queryFn: async () =>
-      fetchOauthQuotaWithFallback(authProvider, accountId, meta?.providerType),
-    enabled,
+      fetchOauthQuotaWithFallback(
+        authProvider,
+        identity!.accountId,
+        meta?.providerType,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
+      ),
+    enabled: enabled && identity != null,
     refetchInterval: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
@@ -146,16 +206,26 @@ export function useGrokOauthQuota(
   options: UseGrokOauthQuotaOptions = {},
 ) {
   const { enabled = true } = options;
-  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.GROK_OAUTH);
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.GROK_OAUTH,
+  );
   return useQuery({
-    queryKey: [PROVIDER_TYPES.GROK_OAUTH, "quota", accountId ?? "default"],
+    queryKey: oauthQuotaAccountKey(
+      PROVIDER_TYPES.GROK_OAUTH,
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
     queryFn: async () =>
       fetchOauthQuotaWithFallback(
         PROVIDER_TYPES.GROK_OAUTH,
-        accountId,
+        identity!.accountId,
         meta?.providerType,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
       ),
-    enabled,
+    enabled: enabled && identity != null,
     refetchInterval: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
@@ -168,15 +238,26 @@ export function useGeminiOauthQuota(
   options: UseGeminiOauthQuotaOptions = {},
 ) {
   const { enabled = true } = options;
-  const accountId = resolveManagedAccountId(
+  const identity = resolveManagedAccountIdentity(
     meta,
     PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH,
   );
   return useQuery({
-    queryKey: ["google_gemini_oauth", "quota", accountId ?? "default"],
+    queryKey: oauthQuotaAccountKey(
+      "google_gemini_oauth",
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
     queryFn: async () =>
-      fetchOauthQuotaWithFallback("google_gemini_oauth", accountId),
-    enabled,
+      fetchOauthQuotaWithFallback(
+        "google_gemini_oauth",
+        identity!.accountId,
+        undefined,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
+      ),
+    enabled: enabled && identity != null,
     refetchInterval: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
@@ -189,11 +270,26 @@ export function useKiroOauthQuota(
   options: UseKiroOauthQuotaOptions = {},
 ) {
   const { enabled = true } = options;
-  const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.KIRO_OAUTH);
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.KIRO_OAUTH,
+  );
   return useQuery({
-    queryKey: ["kiro_oauth", "quota", accountId ?? "default"],
-    queryFn: async () => fetchOauthQuotaWithFallback("kiro_oauth", accountId),
-    enabled,
+    queryKey: oauthQuotaAccountKey(
+      "kiro_oauth",
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
+    queryFn: async () =>
+      fetchOauthQuotaWithFallback(
+        "kiro_oauth",
+        identity!.accountId,
+        undefined,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
+      ),
+    enabled: enabled && identity != null,
     refetchInterval: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
@@ -206,6 +302,11 @@ export interface UseAntigravityOauthQuotaOptions {
   autoQuery?: boolean;
 }
 
+export type AntigravityQuotaAuthProvider = Extract<
+  ManagedAuthProvider,
+  "antigravity_oauth" | "agy_oauth"
+>;
+
 export interface UseCursorOauthQuotaOptions {
   enabled?: boolean;
   autoQuery?: boolean;
@@ -215,22 +316,27 @@ export interface UseCursorOauthQuotaOptions {
 
 export function useAntigravityOauthQuota(
   meta: ProviderMeta | undefined,
+  authProvider: AntigravityQuotaAuthProvider,
   options: UseAntigravityOauthQuotaOptions = {},
 ) {
   const { enabled = true } = options;
-  const accountId = resolveManagedAccountId(
-    meta,
-    PROVIDER_TYPES.ANTIGRAVITY_OAUTH,
-  );
+  const identity = resolveManagedAccountIdentity(meta, authProvider);
   return useQuery({
-    queryKey: ["antigravity_oauth", "quota", accountId ?? "default"],
+    queryKey: oauthQuotaAccountKey(
+      authProvider,
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
     queryFn: async () =>
       fetchOauthQuotaWithFallback(
-        "antigravity_oauth",
-        accountId,
+        authProvider,
+        identity!.accountId,
         meta?.providerType,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
       ),
-    enabled,
+    enabled: enabled && identity != null,
     refetchInterval: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
@@ -247,16 +353,23 @@ export function useCursorOauthQuota(
   const authProvider = isCursorApiKey
     ? PROVIDER_TYPES.CURSOR_APIKEY
     : PROVIDER_TYPES.CURSOR_OAUTH;
-  const accountId = isCursorApiKey
+  const identity = isCursorApiKey
     ? null
-    : resolveManagedAccountId(meta, PROVIDER_TYPES.CURSOR_OAUTH);
+    : resolveManagedAccountIdentity(meta, PROVIDER_TYPES.CURSOR_OAUTH);
+  const accountId = identity?.accountId ?? null;
   return useQuery({
-    queryKey: [
-      authProvider,
-      "quota",
-      accountId ?? providerId ?? "default",
-      appId ?? "unknown",
-    ],
+    queryKey: isCursorApiKey
+      ? [
+          authProvider,
+          "quota",
+          providerId ?? "default",
+          appId ?? "unknown",
+        ]
+      : oauthQuotaAccountKey(
+          authProvider,
+          identity?.accountId,
+          identity?.authIdentityGeneration,
+        ),
     queryFn: async () =>
       fetchOauthQuotaWithFallback(
         authProvider,
@@ -264,8 +377,11 @@ export function useCursorOauthQuota(
         meta?.providerType,
         appId,
         providerId,
+        identity?.authIdentityGeneration,
       ),
-    enabled: enabled && (!isCursorApiKey || Boolean(appId && providerId)),
+    enabled:
+      enabled &&
+      (isCursorApiKey ? Boolean(appId && providerId) : identity != null),
     refetchInterval: false,
     refetchOnWindowFocus: false,
     refetchOnMount: isCursorApiKey ? "always" : true,

@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::domain::accounts::oauth::{oauth_provider_spec, OAuthErrorKind};
+use crate::domain::accounts::oauth::{
+    invalid_grant_requires_immediate_relogin as oauth_invalid_grant_requires_immediate_relogin,
+    oauth_provider_spec, OAuthErrorKind,
+};
 use crate::domain::accounts::subscription_expiry::{
     SubscriptionExpiryRule, SubscriptionExpiryRuleDraft,
 };
@@ -109,7 +112,7 @@ pub struct Account {
     pub needs_relogin: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuota {
     #[serde(default)]
@@ -122,7 +125,7 @@ pub struct AccountQuota {
     pub extra_usage: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuotaTier {
     pub name: String,
@@ -138,6 +141,55 @@ pub struct AccountQuotaTier {
     pub unit: Option<String>,
     #[serde(default)]
     pub resets_at: Option<i64>,
+}
+
+pub fn gemini_v1internal_project_id(account: &Account) -> Option<String> {
+    account
+        .profile
+        .as_ref()
+        .and_then(gemini_v1internal_project_id_from_value)
+        .or_else(|| {
+            account
+                .raw
+                .as_ref()
+                .and_then(gemini_v1internal_project_id_from_value)
+        })
+        .or_else(|| {
+            account
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.extra_usage.as_ref())
+                .and_then(gemini_v1internal_project_id_from_value)
+        })
+}
+
+pub fn gemini_v1internal_project_id_from_value(value: &Value) -> Option<String> {
+    const POINTERS: &[&str] = &[
+        "/projectId",
+        "/project_id",
+        "/project",
+        "/cloudaicompanionProject",
+        "/cloudaicompanion_project",
+        "/loadCodeAssist/cloudaicompanionProject",
+        "/loadCodeAssist/cloudaicompanion_project",
+        "/profile/projectId",
+        "/profile/project_id",
+        "/profile/cloudaicompanionProject",
+    ];
+    POINTERS.iter().find_map(|pointer| {
+        let candidate = value.pointer(pointer)?;
+        let project_id = match candidate {
+            Value::String(project_id) => Some(project_id.as_str()),
+            Value::Object(object) => object
+                .get("id")
+                .or_else(|| object.get("projectId"))
+                .or_else(|| object.get("project_id"))
+                .and_then(Value::as_str),
+            _ => None,
+        }?;
+        let project_id = project_id.trim();
+        (!project_id.is_empty()).then(|| project_id.to_string())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,7 +348,8 @@ pub struct UpsertAccountInput {
     pub last_refresh_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountRefreshUpdate {
     pub email: Option<String>,
     pub access_token: Option<String>,
@@ -533,11 +586,15 @@ impl AccountStore {
 
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = accounts_path(config_dir);
+        Self::load_from_path(config_dir, &path)
+    }
+
+    pub(crate) fn load_from_path(config_dir: &Path, path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let content = fs::read_to_string(&path)
+        let content = fs::read_to_string(path)
             .with_context(|| format!("read accounts {}", path.display()))?;
         let mut value: Value = serde_json::from_str(&content)
             .with_context(|| format!("parse accounts {}", path.display()))?;
@@ -551,15 +608,23 @@ impl AccountStore {
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
+        let path = accounts_path(config_dir);
+        self.save_to_path(config_dir, &path)
+    }
+
+    pub(crate) fn save_to_path(&self, config_dir: &Path, path: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
-        let path = accounts_path(config_dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create accounts parent {}", parent.display()))?;
+        }
         let root_key = load_or_create_accounts_key(config_dir)?;
         let account_key = crate::infra::credentials::derive_account_key(&root_key)?;
         let mut value = serde_json::to_value(self).context("serialize accounts")?;
         encrypt_account_store_value(&mut value, &account_key)
             .with_context(|| format!("encrypt accounts {}", path.display()))?;
-        crate::infra::storage::write_json_pretty(&path, &value)
+        crate::infra::storage::write_json_pretty(path, &value)
             .with_context(|| format!("write accounts {}", path.display()))
     }
 
@@ -1069,11 +1134,29 @@ impl AccountStore {
         error: String,
         kind: OAuthErrorKind,
     ) -> Option<Account> {
+        let immediate_relogin = kind == OAuthErrorKind::InvalidGrant
+            && invalid_grant_requires_immediate_relogin(&error);
+        self.mark_native_refresh_failure_with_relogin_hint(
+            account_id,
+            error,
+            kind,
+            immediate_relogin,
+        )
+    }
+
+    pub fn mark_native_refresh_failure_with_relogin_hint(
+        &mut self,
+        account_id: &str,
+        error: String,
+        kind: OAuthErrorKind,
+        immediate_relogin: bool,
+    ) -> Option<Account> {
         self.mark_native_refresh_failure_with_threshold(
             account_id,
             error,
             kind,
             native_refresh_failure_threshold(),
+            immediate_relogin,
         )
     }
 
@@ -1083,6 +1166,7 @@ impl AccountStore {
         error: String,
         kind: OAuthErrorKind,
         threshold: u32,
+        immediate_relogin: bool,
     ) -> Option<Account> {
         let account = self
             .accounts
@@ -1092,10 +1176,7 @@ impl AccountStore {
         if kind == OAuthErrorKind::InvalidGrant {
             account.refresh_consecutive_failures =
                 account.refresh_consecutive_failures.saturating_add(1);
-            if invalid_grant_requires_immediate_relogin(
-                account.last_refresh_error.as_deref().unwrap_or_default(),
-            ) || account.refresh_consecutive_failures >= threshold.max(1)
-            {
+            if immediate_relogin || account.refresh_consecutive_failures >= threshold.max(1) {
                 account.needs_relogin = true;
             }
         }
@@ -1111,6 +1192,7 @@ const fn initial_auth_identity_generation() -> u64 {
 struct AccountAuthIdentitySnapshot {
     provider_type: ProviderType,
     principal: Option<AccountPrincipal>,
+    kiro_evidence: Option<KiroIdentityEvidence>,
     codex_workspace_id: Option<String>,
     fallback_email: Option<String>,
 }
@@ -1119,6 +1201,13 @@ struct AccountAuthIdentitySnapshot {
 struct AccountPrincipal {
     kind: &'static str,
     value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KiroIdentityEvidence {
+    subject: Option<String>,
+    user_id: Option<String>,
+    upstream_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1169,6 +1258,9 @@ fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnaps
     AccountAuthIdentitySnapshot {
         provider_type: account.provider_type,
         principal: strongest_account_principal(account),
+        kiro_evidence: (account.provider_type == ProviderType::KiroOAuth)
+            .then(|| kiro_identity_evidence(account))
+            .flatten(),
         codex_workspace_id: (account.provider_type == ProviderType::CodexOAuth)
             .then(|| effective_codex_workspace_id(account))
             .flatten(),
@@ -1187,6 +1279,17 @@ fn account_auth_identity_changed(
         && previous.codex_workspace_id != current.codex_workspace_id
     {
         return true;
+    }
+    if previous.provider_type == ProviderType::KiroOAuth {
+        return match (&previous.kiro_evidence, &current.kiro_evidence) {
+            (Some(previous), Some(current)) => kiro_identity_evidence_replaced(previous, current),
+            (None, None) => previous.fallback_email != current.fallback_email,
+            (None, Some(_)) => matches!(
+                (&previous.fallback_email, &current.fallback_email),
+                (Some(previous), Some(current)) if previous != current
+            ),
+            (Some(_), None) => true,
+        };
     }
     match (&previous.principal, &current.principal) {
         (Some(previous), Some(current)) => previous != current,
@@ -1215,6 +1318,18 @@ pub fn account_refresh_replaces_auth_identity(
 
     if previous.provider_type != candidate.provider_type {
         return true;
+    }
+    if previous.provider_type == ProviderType::KiroOAuth {
+        return match (&previous.kiro_evidence, &candidate.kiro_evidence) {
+            (Some(previous), Some(candidate)) => {
+                kiro_identity_evidence_replaced(previous, candidate)
+            }
+            (None, None) => {
+                identity_component_replaced(&previous.fallback_email, &candidate.fallback_email)
+            }
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+        };
     }
     if identity_component_replaced(&previous.principal, &candidate.principal) {
         return true;
@@ -1260,6 +1375,9 @@ fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
             });
         }
     }
+    if account.provider_type == ProviderType::KiroOAuth {
+        return strongest_kiro_principal(account);
+    }
 
     const PRINCIPAL_FIELDS: &[(&str, &[&str])] = &[
         ("subject", &["/sub"]),
@@ -1292,6 +1410,70 @@ fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
         }
     }
     None
+}
+
+fn strongest_kiro_principal(account: &Account) -> Option<AccountPrincipal> {
+    let evidence = kiro_identity_evidence(account)?;
+    if let Some(value) = evidence.subject {
+        return Some(AccountPrincipal {
+            kind: "kiro_subject",
+            value,
+        });
+    }
+    if let Some(value) = evidence.user_id {
+        return Some(AccountPrincipal {
+            kind: "kiro_user_id",
+            value,
+        });
+    }
+    evidence.upstream_account_id.map(|value| AccountPrincipal {
+        kind: "kiro_account_id",
+        value,
+    })
+}
+
+fn kiro_identity_evidence(account: &Account) -> Option<KiroIdentityEvidence> {
+    let evidence = KiroIdentityEvidence {
+        subject: account_principal_value(account, &["/tokenResponse/sub", "/sub"]),
+        user_id: account_principal_value(
+            account,
+            &[
+                "/tokenResponse/userId",
+                "/tokenResponse/user_id",
+                "/userId",
+                "/user_id",
+            ],
+        ),
+        upstream_account_id: account_principal_value(
+            account,
+            &[
+                "/tokenResponse/accountId",
+                "/tokenResponse/account_id",
+                "/upstreamAccountId",
+                "/upstream_account_id",
+            ],
+        ),
+    };
+    (evidence.subject.is_some()
+        || evidence.user_id.is_some()
+        || evidence.upstream_account_id.is_some())
+    .then_some(evidence)
+}
+
+fn kiro_identity_evidence_replaced(
+    previous: &KiroIdentityEvidence,
+    candidate: &KiroIdentityEvidence,
+) -> bool {
+    if let Some(subject) = previous.subject.as_ref() {
+        return candidate.subject.as_ref() != Some(subject);
+    }
+    if let Some(user_id) = previous.user_id.as_ref() {
+        return candidate.user_id.as_ref() != Some(user_id);
+    }
+    if let Some(account_id) = previous.upstream_account_id.as_ref() {
+        return candidate.upstream_account_id.as_ref() != Some(account_id);
+    }
+    false
 }
 
 const CLAUDE_ACCOUNT_UUID_POINTERS: &[&str] = &[
@@ -1704,16 +1886,8 @@ fn refresh_token_fingerprint(refresh_token: &str) -> Option<[u8; 32]> {
     Some(Sha256::digest(refresh_token.as_bytes()).into())
 }
 
-fn invalid_grant_requires_immediate_relogin(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "refresh_token_reused",
-        "refresh token reused",
-        "refresh token already used",
-        "refresh token has already been used",
-    ]
-    .iter()
-    .any(|marker| message.contains(marker))
+pub(crate) fn invalid_grant_requires_immediate_relogin(message: &str) -> bool {
+    oauth_invalid_grant_requires_immediate_relogin(message)
 }
 
 fn native_refresh_failure_threshold() -> u32 {
@@ -2096,6 +2270,49 @@ mod tests {
         input.quota_refreshed_at = Some(now_ms - 5 * 60 * 1000);
         input.quota_next_refresh_at = Some(now_ms + 25 * 60 * 1000);
         AccountStore::default().upsert(input)
+    }
+
+    #[test]
+    fn gemini_v1internal_project_id_reads_profile_and_nested_raw_shapes() {
+        let mut profile_input = fixture_input(ProviderType::GeminiCli);
+        profile_input.profile = Some(json!({"projectId": " profile-project "}));
+        let profile_account = AccountStore::default().upsert(profile_input);
+        assert_eq!(
+            gemini_v1internal_project_id(&profile_account).as_deref(),
+            Some("profile-project")
+        );
+
+        let mut raw_input = fixture_input(ProviderType::AntigravityOAuth);
+        raw_input.raw = Some(json!({"project": {"id": "raw-project"}}));
+        let raw_account = AccountStore::default().upsert(raw_input);
+        assert_eq!(
+            gemini_v1internal_project_id(&raw_account).as_deref(),
+            Some("raw-project")
+        );
+    }
+
+    #[test]
+    fn gemini_v1internal_project_id_reads_quota_and_rejects_blank_values() {
+        let quota_account = quota_account(
+            ProviderType::AgyOAuth,
+            1_000_000_000,
+            json!({
+                "loadCodeAssist": {
+                    "cloudaicompanionProject": {"projectId": "quota-project"}
+                }
+            }),
+            Vec::new(),
+        );
+        assert_eq!(
+            gemini_v1internal_project_id(&quota_account).as_deref(),
+            Some("quota-project")
+        );
+
+        assert!(gemini_v1internal_project_id_from_value(&json!({
+            "projectId": "   ",
+            "project": {"id": ""}
+        }))
+        .is_none());
     }
 
     #[test]
@@ -2632,6 +2849,195 @@ mod tests {
             )
             .unwrap();
         assert_eq!(different_email.auth_identity_generation, 2);
+    }
+
+    #[test]
+    fn kiro_identity_ignores_local_account_id_and_profile_arns() {
+        let profiles = [
+            json!({"accountId": "kiro_local_refresh_hash"}),
+            json!({
+                "profileArn": "arn:aws:codewhisperer:us-west-2:123456789012:profile/unique-profile"
+            }),
+            json!({
+                "profileArn": "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+            }),
+            json!({
+                "profileArn": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+            }),
+            json!({
+                "profileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN"
+            }),
+        ];
+
+        for (index, profile) in profiles.into_iter().enumerate() {
+            let mut store = AccountStore::default();
+            let account_id = format!("kiro-local-principal-{index}");
+            let mut input = fixture_input(ProviderType::KiroOAuth);
+            input.id = Some(account_id.clone());
+            input.email = Some("owner@example.com".to_string());
+            input.profile = Some(profile);
+            let created = store.upsert(input);
+            assert_eq!(created.auth_identity_generation, 1);
+
+            let replaced = store
+                .mark_refresh_success(
+                    &account_id,
+                    AccountRefreshUpdate {
+                        email: Some("replacement@example.com".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(replaced.auth_identity_generation, 2);
+        }
+    }
+
+    #[test]
+    fn kiro_identity_prefers_upstream_subject_over_local_markers() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::KiroOAuth);
+        input.id = Some("kiro-upstream-subject".to_string());
+        input.email = Some("owner@example.com".to_string());
+        input.profile = Some(json!({
+            "accountId": "kiro_local_refresh_hash",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        }));
+        input.raw = Some(json!({
+            "tokenResponse": {"sub": "kiro-subject-a"}
+        }));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let replacement = AccountRefreshUpdate {
+            raw: Some(json!({
+                "tokenResponse": {"sub": "kiro-subject-b"}
+            })),
+            ..Default::default()
+        };
+        assert!(account_refresh_replaces_auth_identity(
+            &created,
+            &replacement
+        ));
+        let replaced = store
+            .mark_refresh_success("kiro-upstream-subject", replacement)
+            .unwrap();
+        assert_eq!(replaced.auth_identity_generation, 2);
+    }
+
+    #[test]
+    fn kiro_subject_enrichment_does_not_replace_unique_profile_identity() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::KiroOAuth);
+        input.id = Some("kiro-subject-enrichment".to_string());
+        input.email = Some("owner@example.com".to_string());
+        input.profile = Some(json!({
+            "accountId": "kiro_local_refresh_hash",
+            "profileArn": "arn:aws:codewhisperer:us-west-2:123456789012:profile/unique-profile"
+        }));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let enrichment = AccountRefreshUpdate {
+            email: Some("OWNER@EXAMPLE.COM".to_string()),
+            raw: Some(json!({
+                "tokenResponse": {"sub": "kiro-subject-a"}
+            })),
+            ..Default::default()
+        };
+        assert!(!account_refresh_replaces_auth_identity(
+            &created,
+            &enrichment
+        ));
+        let enriched = store
+            .mark_refresh_success("kiro-subject-enrichment", enrichment)
+            .unwrap();
+        assert_eq!(enriched.auth_identity_generation, 1);
+
+        assert!(account_refresh_replaces_auth_identity(
+            &enriched,
+            &AccountRefreshUpdate {
+                raw: Some(json!({
+                    "tokenResponse": {"sub": "kiro-subject-b"}
+                })),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn kiro_subject_promotion_preserves_matching_upstream_user_id() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::KiroOAuth);
+        input.id = Some("kiro-user-subject-promotion".to_string());
+        input.raw = Some(json!({"userId": "kiro-user-123"}));
+        let created = store.upsert(input);
+
+        let promotion = AccountRefreshUpdate {
+            raw: Some(json!({
+                "userId": "kiro-user-123",
+                "tokenResponse": {"sub": "kiro-subject-123"}
+            })),
+            ..Default::default()
+        };
+        assert!(!account_refresh_replaces_auth_identity(
+            &created, &promotion
+        ));
+
+        let promoted = store
+            .mark_refresh_success("kiro-user-subject-promotion", promotion)
+            .unwrap();
+        assert_eq!(promoted.auth_identity_generation, 1);
+    }
+
+    #[test]
+    fn kiro_subject_promotion_preserves_matching_upstream_account_id() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::KiroOAuth);
+        input.id = Some("kiro-account-subject-promotion".to_string());
+        input.raw = Some(json!({"upstreamAccountId": "kiro-account-123"}));
+        let created = store.upsert(input);
+
+        let promotion = AccountRefreshUpdate {
+            raw: Some(json!({
+                "upstreamAccountId": "kiro-account-123",
+                "tokenResponse": {"sub": "kiro-subject-123"}
+            })),
+            ..Default::default()
+        };
+        assert!(!account_refresh_replaces_auth_identity(
+            &created, &promotion
+        ));
+
+        let promoted = store
+            .mark_refresh_success("kiro-account-subject-promotion", promotion)
+            .unwrap();
+        assert_eq!(promoted.auth_identity_generation, 1);
+    }
+
+    #[test]
+    fn kiro_subject_promotion_rejects_conflicting_weaker_identity() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::KiroOAuth);
+        input.id = Some("kiro-conflicting-subject-promotion".to_string());
+        input.raw = Some(json!({"userId": "kiro-user-before"}));
+        let created = store.upsert(input);
+
+        let conflicting = AccountRefreshUpdate {
+            raw: Some(json!({
+                "userId": "kiro-user-after",
+                "tokenResponse": {"sub": "kiro-subject-after"}
+            })),
+            ..Default::default()
+        };
+        assert!(account_refresh_replaces_auth_identity(
+            &created,
+            &conflicting
+        ));
+
+        let replaced = store
+            .mark_refresh_success("kiro-conflicting-subject-promotion", conflicting)
+            .unwrap();
+        assert_eq!(replaced.auth_identity_generation, 2);
     }
 
     #[test]
@@ -3421,6 +3827,7 @@ mod tests {
                 "invalid grant".to_string(),
                 OAuthErrorKind::InvalidGrant,
                 2,
+                false,
             )
             .unwrap();
         assert_eq!(first.refresh_consecutive_failures, 1);
@@ -3432,6 +3839,7 @@ mod tests {
                 "invalid grant".to_string(),
                 OAuthErrorKind::InvalidGrant,
                 2,
+                false,
             )
             .unwrap();
         assert_eq!(second.refresh_consecutive_failures, 2);
@@ -3440,12 +3848,17 @@ mod tests {
         let replay_rejected = store
             .mark_native_refresh_failure_with_threshold(
                 "acct-1",
-                "invalid_grant: refresh_token_reused".to_string(),
+                "OAuth refresh failed: [REDACTED]".to_string(),
                 OAuthErrorKind::InvalidGrant,
                 20,
+                invalid_grant_requires_immediate_relogin("invalid_grant: refresh_token_reused"),
             )
             .unwrap();
         assert!(replay_rejected.needs_relogin);
+        assert_eq!(
+            replay_rejected.last_refresh_error.as_deref(),
+            Some("OAuth refresh failed: [REDACTED]")
+        );
 
         let recovered = store
             .mark_native_refresh_success(

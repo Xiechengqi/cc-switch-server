@@ -34,6 +34,10 @@ MATRIX_TOTAL=0
 MATRIX_RUNNABLE=0
 MATRIX_SKIPPED=0
 MATRIX_SKELETON=0
+MATRIX_FIXTURE_EVIDENCE_COMPLETE=false
+MATRIX_FIXTURE_EVIDENCE_MISSING=0
+CONTRACT_TESTS_PASSED=0
+CONTRACT_FAILURES=0
 
 pass() { echo "[PASS] $*"; }
 warn() { WARNINGS=$((WARNINGS + 1)); echo "[WARN] $*"; }
@@ -89,6 +93,36 @@ const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 const value = data[process.argv[2]];
 process.stdout.write(value === undefined || value === null ? "" : String(value));
 ' "$MATRIX_SUMMARY_FILE" "$field"
+}
+
+run_contract_test_group() {
+  local label="$1"
+  local filter="$2"
+  local listing count
+  if ! listing="$(cargo test --lib "$filter" -- --list)"; then
+    fail "$label test listing"
+    return
+  fi
+  count="$(printf '%s\n' "$listing" | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+  if [[ "$count" -le 0 ]]; then
+    fail "$label matched zero tests"
+    return
+  fi
+  if cargo test --lib "$filter" --quiet; then
+    pass "$label (${count} tests)"
+  else
+    fail "$label"
+  fi
+}
+
+run_contract_command() {
+  local label="$1"
+  shift
+  if "$@"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
 }
 
 probe() {
@@ -162,9 +196,11 @@ MATRIX_TOTAL="$(read_matrix_field total)"
 MATRIX_RUNNABLE="$(read_matrix_field runnable)"
 MATRIX_SKIPPED="$(read_matrix_field skipped)"
 MATRIX_SKELETON="$(read_matrix_field skeleton)"
+MATRIX_FIXTURE_EVIDENCE_COMPLETE="$(read_matrix_field fixtureEvidenceComplete)"
+MATRIX_FIXTURE_EVIDENCE_MISSING="$(read_matrix_field fixtureEvidenceMissing)"
 echo "matrixPath=${MATRIX_PATH}"
 echo "matrixSummary=${MATRIX_SUMMARY_FILE}"
-echo "matrixTotal=${MATRIX_TOTAL} runnable=${MATRIX_RUNNABLE} skipped=${MATRIX_SKIPPED} skeleton=${MATRIX_SKELETON}"
+echo "matrixTotal=${MATRIX_TOTAL} runnable=${MATRIX_RUNNABLE} skipped=${MATRIX_SKIPPED} skeleton=${MATRIX_SKELETON} fixtureEvidenceComplete=${MATRIX_FIXTURE_EVIDENCE_COMPLETE} fixtureEvidenceMissing=${MATRIX_FIXTURE_EVIDENCE_MISSING}"
 node -e '
 const fs = require("fs");
 const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -176,11 +212,24 @@ for (const item of data.cases || []) {
 
 echo "== contract tests =="
 if [[ "$RUN_CONTRACT_TESTS" == "1" ]]; then
-  cargo test proxy:: --quiet
-  cargo test core::account_managers:: --quiet
-  cargo test core::accounts:: --quiet
-  cargo test core::oauth_clients:: --quiet
-  pass "proxy/account contract tests"
+  contract_failures_before="$FAILURES"
+  run_contract_test_group "proxy contract tests" "proxy::"
+  run_contract_test_group "account domain contract tests" "domain::accounts::"
+  run_contract_test_group "OAuth client contract tests" "clients::oauth::"
+  run_contract_command "provider coverage audit" node scripts/audit/audit-provider-coverage.mjs --check
+  run_contract_command "UI provider matrix audit" node scripts/audit/audit-ui-provider-matrix.mjs --check
+  run_contract_command "proxy bridge contract audit" node scripts/audit/audit-proxy-bridge-contract.mjs --check
+  run_contract_command "Web runtime contract audit" node scripts/audit/audit-web-runtime-contract.mjs --check
+  if [[ -d web-src/node_modules ]]; then
+    run_contract_command "Web typecheck" npm --prefix web-src run typecheck
+    run_contract_command "Web unit tests" npm --prefix web-src run test
+  else
+    fail "Web contract tests require web-src/node_modules"
+  fi
+  if [[ "$FAILURES" -eq "$contract_failures_before" ]]; then
+    CONTRACT_TESTS_PASSED=1
+  fi
+  CONTRACT_FAILURES=$((FAILURES - contract_failures_before))
 else
   skip "contract tests disabled"
 fi
@@ -225,6 +274,9 @@ if [[ -n "$INFERENCE_TOKEN" ]]; then
   if [[ "$STREAM_PROBE" == "1" ]]; then
     stream_probe "codex local responses stream" "$SERVER_URL/v1/responses" \
       '{"model":"probe","input":"stream ping","stream":true,"max_output_tokens":1}' \
+      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
+    stream_probe "codex local chat stream" "$SERVER_URL/v1/chat/completions" \
+      '{"model":"probe","messages":[{"role":"user","content":"stream ping"}],"stream":true,"max_tokens":1}' \
       "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
   fi
   else
@@ -337,41 +389,67 @@ fi
 
 echo "== summary =="
 echo "failures=${FAILURES} warnings=${WARNINGS} skipped=${SKIPPED}"
-echo "matrixTotal=${MATRIX_TOTAL} matrixRunnable=${MATRIX_RUNNABLE} matrixSkipped=${MATRIX_SKIPPED} matrixSkeleton=${MATRIX_SKELETON}"
+echo "matrixTotal=${MATRIX_TOTAL} matrixRunnable=${MATRIX_RUNNABLE} matrixSkipped=${MATRIX_SKIPPED} matrixSkeleton=${MATRIX_SKELETON} fixtureEvidenceComplete=${MATRIX_FIXTURE_EVIDENCE_COMPLETE} fixtureEvidenceMissing=${MATRIX_FIXTURE_EVIDENCE_MISSING}"
 
-if [[ "$FAILURES" -gt 0 ]]; then
-  BLOCKER_GROUP=""
-  FAILURE_CLASS="provider-auth-or-transform"
-elif [[ "$RUN_REAL" != "1" || "${MATRIX_SKIPPED:-0}" -gt 0 ]]; then
-  BLOCKER_GROUP="missing-provider-token"
-  FAILURE_CLASS=""
+gate_temp="$(mktemp /tmp/cc-switch-server-evidence-gate.XXXXXX.json)"
+FAILURES="$FAILURES" CONTRACT_FAILURES="$CONTRACT_FAILURES" SKIPPED="$SKIPPED" \
+MATRIX_TOTAL="$MATRIX_TOTAL" MATRIX_RUNNABLE="$MATRIX_RUNNABLE" \
+MATRIX_SKIPPED="$MATRIX_SKIPPED" RUN_REAL="$RUN_REAL" \
+RUN_CONTRACT_TESTS="$RUN_CONTRACT_TESTS" \
+CONTRACT_TESTS_PASSED="$CONTRACT_TESTS_PASSED" \
+STREAM_PROBE="$STREAM_PROBE" REQUIRE_STREAM_USAGE="$REQUIRE_STREAM_USAGE" \
+MATRIX_FIXTURE_EVIDENCE_COMPLETE="$MATRIX_FIXTURE_EVIDENCE_COMPLETE" \
+  node scripts/smoke/code-agent-evidence-gate.mjs > "$gate_temp"
+
+read_gate_field() {
+  local field="$1"
+  node -e '
+const fs = require("fs");
+const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const value = data[process.argv[2]];
+process.stdout.write(Array.isArray(value) ? value.join(",") : String(value ?? ""));
+' "$gate_temp" "$field"
+}
+
+if [[ "$(read_gate_field liveVerificationComplete)" == "true" ]]; then
+  LIVE_VERIFICATION_COMPLETE=1
 else
-  BLOCKER_GROUP=""
-  FAILURE_CLASS=""
+  LIVE_VERIFICATION_COMPLETE=0
 fi
+REGRESSION_EVIDENCE_STATUS="$(read_gate_field status)"
+REGRESSION_VERIFICATION_STATE="$(read_gate_field verificationState)"
+BLOCKER_GROUP="$(read_gate_field blockerGroup)"
+BLOCKED_GROUPS="$(read_gate_field blockerGroups)"
+FAILURE_CLASS="$(read_gate_field failureClass)"
+echo "verificationState=${REGRESSION_VERIFICATION_STATE} blockerGroup=${BLOCKER_GROUP:-none} blockedGroups=${BLOCKED_GROUPS:-none}"
 
 if [[ -n "$EVIDENCE_FILE" ]]; then
-  if [[ "$FAILURES" -gt 0 ]]; then
-    REGRESSION_EVIDENCE_STATUS="fail"
-  elif [[ "$RUN_REAL" != "1" || "${MATRIX_SKIPPED:-0}" -gt 0 ]]; then
-    REGRESSION_EVIDENCE_STATUS="ready-with-known-external-blockers"
-  else
-    REGRESSION_EVIDENCE_STATUS="pass"
-  fi
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-AB4-code-agent-regression}" \
   EVIDENCE_STATUS="$REGRESSION_EVIDENCE_STATUS" \
-  FAILURES="$FAILURES" WARNINGS="$WARNINGS" \
+  EVIDENCE_VERIFICATION_STATE="$REGRESSION_VERIFICATION_STATE" \
+  EVIDENCE_VERIFICATION_SCOPE="configured_matrix_routes" \
+  RUN_REAL="$RUN_REAL" \
+  RUN_CONTRACT_TESTS="$RUN_CONTRACT_TESTS" \
+  CONTRACT_TESTS_PASSED="$CONTRACT_TESTS_PASSED" \
+  CONTRACT_FAILURES="$CONTRACT_FAILURES" \
+  STREAM_PROBE="$STREAM_PROBE" REQUIRE_STREAM_USAGE="$REQUIRE_STREAM_USAGE" \
+  LIVE_VERIFICATION_COMPLETE="$LIVE_VERIFICATION_COMPLETE" \
+  FAILURES="$FAILURES" WARNINGS="$WARNINGS" SKIPPED="$SKIPPED" \
   MATRIX_TOTAL="$MATRIX_TOTAL" MATRIX_RUNNABLE="$MATRIX_RUNNABLE" \
   MATRIX_SKIPPED="$MATRIX_SKIPPED" MATRIX_SKELETON="$MATRIX_SKELETON" \
+  MATRIX_FIXTURE_EVIDENCE_COMPLETE="$MATRIX_FIXTURE_EVIDENCE_COMPLETE" \
+  MATRIX_FIXTURE_EVIDENCE_MISSING="$MATRIX_FIXTURE_EVIDENCE_MISSING" \
   EVIDENCE_TARGET="code-agent-matrix" \
-  BLOCKER_GROUP="$BLOCKER_GROUP" FAILURE_CLASS="$FAILURE_CLASS" \
-  EVIDENCE_NOTES="skipped=${SKIPPED}; RUN_REAL=${RUN_REAL}; matrixSummary=${MATRIX_SUMMARY_FILE}" \
+  BLOCKER_GROUP="$BLOCKER_GROUP" BLOCKED_GROUPS="$BLOCKED_GROUPS" \
+  FAILURE_CLASS="$FAILURE_CLASS" \
+  EVIDENCE_NOTES="skipped=${SKIPPED}; RUN_REAL=${RUN_REAL}; streamProbe=${STREAM_PROBE}; requireStreamUsage=${REQUIRE_STREAM_USAGE}; matrixSummary=${MATRIX_SUMMARY_FILE}" \
     node scripts/smoke/write-acceptance-evidence.mjs --out "$EVIDENCE_FILE"
 fi
 
 if [[ -n "$matrix_temp" && -z "${KEEP_MATRIX_SUMMARY:-}" ]]; then
   rm -f "$matrix_temp"
 fi
+rm -f "$gate_temp"
 
 if [[ "$FAILURES" -gt 0 ]]; then
   exit 1

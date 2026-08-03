@@ -4,9 +4,8 @@ import { authApi } from "@/lib/api";
 import type { DeepSeekAccountStatus } from "@/lib/api";
 
 type AddAccountInput = {
-  email?: string | null;
-  mobile?: string | null;
-  password: string;
+  identifier?: string | null;
+  accessToken: string;
 };
 
 export function useDeepSeekAccount() {
@@ -17,6 +16,8 @@ export function useDeepSeekAccount() {
   const {
     data: authStatus,
     isLoading: isLoadingStatus,
+    isError: isStatusError,
+    error: statusQueryError,
     refetch: refetchStatus,
   } = useQuery<DeepSeekAccountStatus>({
     queryKey,
@@ -24,12 +25,23 @@ export function useDeepSeekAccount() {
     staleTime: 30000,
   });
 
+  const invalidateDeepSeekAccountViews = useCallback(
+    () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey }),
+        queryClient.invalidateQueries({ queryKey: ["managed-auth-accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["providers"] }),
+        queryClient.invalidateQueries({ queryKey: ["share"] }),
+      ]),
+    [queryClient],
+  );
+
   const addAccountMutation = useMutation({
     mutationFn: (input: AddAccountInput) => authApi.deepseekAccountAdd(input),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setError(null);
-      await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateDeepSeekAccountViews();
     },
     onError: (e) => {
       setError(e instanceof Error ? e.message : String(e));
@@ -38,10 +50,10 @@ export function useDeepSeekAccount() {
 
   const removeAccountMutation = useMutation({
     mutationFn: (accountId: string) => authApi.deepseekAccountRemove(accountId),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setError(null);
-      await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateDeepSeekAccountViews();
     },
     onError: (e) => {
       setError(e instanceof Error ? e.message : String(e));
@@ -51,10 +63,10 @@ export function useDeepSeekAccount() {
   const setDefaultAccountMutation = useMutation({
     mutationFn: (accountId: string) =>
       authApi.deepseekAccountSetDefault(accountId),
+    onMutate: () => setError(null),
     onSuccess: async () => {
       setError(null);
-      await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await invalidateDeepSeekAccountViews();
     },
     onError: (e) => {
       setError(e instanceof Error ? e.message : String(e));
@@ -67,7 +79,7 @@ export function useDeepSeekAccount() {
   );
 
   const removeAccount = useCallback(
-    (accountId: string) => removeAccountMutation.mutate(accountId),
+    (accountId: string) => removeAccountMutation.mutateAsync(accountId),
     [removeAccountMutation],
   );
 
@@ -77,15 +89,21 @@ export function useDeepSeekAccount() {
   );
 
   const accounts = authStatus?.accounts ?? [];
+  const statusErrorMessage = statusQueryError
+    ? statusQueryError instanceof Error
+      ? statusQueryError.message
+      : String(statusQueryError)
+    : null;
 
   return {
     authStatus,
     isLoadingStatus,
+    isStatusError,
     accounts,
     hasAnyAccount: accounts.length > 0,
     isAuthenticated: authStatus?.authenticated ?? false,
     defaultAccountId: authStatus?.default_account_id ?? null,
-    error,
+    error: error ?? statusErrorMessage,
     isAddingAccount: addAccountMutation.isPending,
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,

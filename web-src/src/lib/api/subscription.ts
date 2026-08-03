@@ -4,12 +4,13 @@ import type { SubscriptionQuota } from "@/types/subscription";
 export interface CachedOauthQuota {
   authProvider: string;
   accountId: string;
+  authIdentityGeneration: number;
   providerId?: string | null;
   providerName?: string | null;
   appType?: string | null;
   quota: SubscriptionQuota;
-  refreshedAt: number;
-  nextRefreshAt?: number | null;
+  refreshedAt: number | null;
+  nextRefreshAt: number | null;
   source: string;
 }
 
@@ -25,12 +26,14 @@ export const subscriptionApi = {
     accountId: string | null,
     appType?: string | null,
     providerId?: string | null,
+    authIdentityGeneration?: number | null,
   ): Promise<CachedOauthQuota | null> =>
     invokeCommand("get_cached_oauth_quota", {
       authProvider,
       accountId,
       appType: appType || null,
       providerId: providerId || null,
+      authIdentityGeneration: authIdentityGeneration ?? null,
     }),
   refreshOauthQuota: (
     authProvider: string,
@@ -39,6 +42,7 @@ export const subscriptionApi = {
     appType?: string | null,
     providerId?: string | null,
     force = true,
+    authIdentityGeneration?: number | null,
   ): Promise<CachedOauthQuota | null> =>
     invokeCommand("refresh_oauth_quota", {
       authProvider,
@@ -47,5 +51,6 @@ export const subscriptionApi = {
       appType: appType || null,
       providerId: providerId || null,
       force,
+      authIdentityGeneration: authIdentityGeneration ?? null,
     }),
 };

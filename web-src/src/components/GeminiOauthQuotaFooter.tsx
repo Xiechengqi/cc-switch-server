@@ -2,10 +2,11 @@ import React from "react";
 import type { ProviderMeta } from "@/types";
 import { useGeminiOauthQuota } from "@/lib/query/subscription";
 import { subscriptionApi } from "@/lib/api/subscription";
-import { resolveManagedAccountId } from "@/lib/authBinding";
+import { resolveManagedAccountIdentity } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 import type { AppId } from "@/lib/api";
 import { SubscriptionQuotaView } from "@/components/SubscriptionQuotaFooter";
+import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface GeminiOauthQuotaFooterProps {
   meta?: ProviderMeta;
@@ -24,14 +25,28 @@ const GeminiOauthQuotaFooter: React.FC<GeminiOauthQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useGeminiOauthQuota(meta, { enabled: true });
-  const accountId = resolveManagedAccountId(
+  const identity = resolveManagedAccountIdentity(
     meta,
     PROVIDER_TYPES.GOOGLE_GEMINI_OAUTH,
   );
-  const handleRefresh = React.useCallback(async () => {
-    await subscriptionApi.refreshOauthQuota("google_gemini_oauth", accountId);
-    await refetch();
-  }, [accountId, refetch]);
+  const accountId = identity?.accountId ?? null;
+  const handleRefresh = React.useCallback(
+    () =>
+      refreshOauthQuotaAndReload(
+        () =>
+          subscriptionApi.refreshOauthQuota(
+            "google_gemini_oauth",
+            accountId,
+            undefined,
+            undefined,
+            undefined,
+            true,
+            identity?.authIdentityGeneration,
+          ),
+        () => refetch(),
+      ),
+    [accountId, identity?.authIdentityGeneration, refetch],
+  );
 
   return (
     <SubscriptionQuotaView

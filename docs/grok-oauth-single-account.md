@@ -4,10 +4,10 @@
 
 ## 能力边界
 
-- 文本入口使用 `POST /v1/responses`、`POST /responses`、`POST /v1/chat/completions` 和 `POST /chat/completions`。
-- Responses WebSocket 使用 `GET /v1/responses` 或 `GET /responses`。
+- 文本入口使用 Route Key 下的 `POST /r/:routeKey/v1/responses` 和 `POST /r/:routeKey/v1/chat/completions`。
+- Responses WebSocket 使用 `GET /r/:routeKey/v1/responses`。
 - 媒体入口包括图片生成/编辑和视频生成/状态查询；这些能力按账号 fail closed。
-- 模型目录通过 `GET /v1/models` 返回，并附带 Grok catalog 的来源和新鲜度。
+- 模型目录通过 `GET /r/:routeKey/v1/models` 返回，并附带 Grok catalog 的来源和新鲜度。
 - 本地直连的 Models、Responses HTTP/WS、Chat 和媒体入口都要求独立 inference token；可使用 Bearer、`x-api-key` 或 `x-goog-api-key`，且拒绝带 `Origin` 的浏览器请求。经签名 router ingress 的请求沿用 router 身份。
 - 每个 `grok_oauth` Provider 必须绑定一个明确的 `grok_oauth` Account。
 - 同一个生成请求只允许使用该 Provider 的绑定账号；任何错误都不能触发账号轮换或通用 Provider failover。
@@ -35,7 +35,7 @@
 
 一次 Grok 直连请求按以下顺序解析执行身份：
 
-1. 根据应用当前 Provider、显式 `x-cc-provider-id` 或 Share binding 解析一个 Provider。
+1. 根据 `/r/:routeKey` 的应用协议 Surface 或 Share binding 解析一个 Provider Bundle。
 2. 编译后的 RuntimePlan 必须绑定 `oauth.grok_responses` Driver。
 3. 从 Provider 的 managed-account binding 解析唯一账号。
 4. 检查账号登录、cooldown、配额和并发状态，并获取该账号的 in-flight lease。
@@ -97,9 +97,11 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 
 媒体请求复用文本/WS 的 CLI identity family；客户端显式提供的 `x-grok-conv-id` 在 Share/user 边界内做同样的命名空间隔离。媒体 POST 的 wire body 和逐层 gzip/deflate 解码结果都使用 32 MiB 硬上限，避免 Axum 默认 2 MiB 误拒合法图片，同时阻止压缩膨胀绕过内存边界。媒体上游 wire response 和逐层解压结果使用 64 MiB 硬上限，避免 base64 图片响应形成无界内存读取。视频状态 request id 只接受 1-128 字节 ASCII 字母、数字、`-` 和 `_`，禁止把路径、query 或 fragment 注入固定上游 URL。
 
+Grok 图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers 后，SSE 立即提交 `: connected` 并按完整事件边界转发，JSON 先提交合法空白、完整缓冲并校验一个 JSON 文档；两种模式空闲时都每 15 秒发送心跳，且逐块执行 64 MiB 上限。首个 comment/空白提交后 wire status 固定为 `200`，后续读失败、超限或 JSON 无效只能返回流内 error，不能透明换 Provider 或替换 HTTP 状态；Provider/Share 终态记账仍使用实际结果，客户端必须消费完整 Body。
+
 ## 模型目录
 
-`GET /v1/models?app=codex&providerId=<id>` 使用绑定账号 access token 请求固定的 Grok CLI models endpoint：
+`GET /r/:routeKey/v1/models` 使用该 Route Key 的 Codex Surface 绑定账号 access token 请求固定的 Grok CLI models endpoint：
 
 - 缓存按账号隔离，默认 TTL 为 300 秒，可通过 `CC_SWITCH_GROK_MODELS_TTL_SECONDS` 在 1 秒到 24 小时范围内调整。
 - 支持 ETag/304；成功目录记录抓取时间。
@@ -110,9 +112,9 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 
 模型目录降级不会绕过 single-model policy，也不会选择另一个 Grok 账号。credential persistence degraded 时不会访问上游目录，只返回明确来源的静态 fallback；刷新前已 degraded 和本次 refresh 因旋转 token 落盘失败而刚进入 degraded 都执行同一零上游门禁。生成数据面仍返回 `503`。
 
-公开 `/v1/models` 和管理端 Provider 模型发现都只接受已提交 RuntimePlan 中 driver 为 `oauth.grok_responses` 的 `ManagedAccount` 引用，并要求 Provider revision、账号类型和 `authIdentityGeneration` 全部匹配。Provider 未绑定账号、仅配置 legacy API key、绑定缺失/类型错误、RuntimePlan 过期或账号身份代际变化时，只返回 `static_fallback`，不会刷新任意账号或访问 models 上游。
+公开 Route Key models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan 中 driver 为 `oauth.grok_responses` 的 `ManagedAccount` 引用，并要求 Provider revision、账号类型和 `authIdentityGeneration` 全部匹配。Provider 未绑定账号、仅配置 legacy API key、绑定缺失/类型错误、RuntimePlan 过期或账号身份代际变化时，只返回 `static_fallback`，不会刷新任意账号或访问 models 上游。
 
-显式提供 `providerId`/`x-cc-provider-id` 但未提供 `app` 时，该 id 必须在所有 app 中全局唯一且指向 Grok Provider；跨 app 重名会直接使用静态聚合结果，不访问任何账号。未提供 Provider id 时，只有显式提供 `app` 才会解析该 app 的当前 Provider。既没有 app 也没有 Provider id 的通用模型列表同样只返回静态聚合结果，不会选择任意 Grok Provider、刷新任意账号或访问上游。
+不带 Route Key 的通用模型列表只返回静态聚合结果，不会选择任意 Grok Provider、刷新任意账号或访问上游。
 
 ## 重放矩阵
 
@@ -151,12 +153,12 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 
 ## 真实账号验收
 
-先确认 `CC_SWITCH_GROK_PROVIDER_ID` 对应的 Provider 只绑定待测账号，再运行：
+先确认 `CC_SWITCH_GROK_ROUTE_KEY` 对应的 Provider Bundle 只绑定待测账号，再运行：
 
 ```bash
 CC_SWITCH_BASE_URL=http://127.0.0.1:15721 \
 CC_SWITCH_INFERENCE_TOKEN='<one-time-issued-token>' \
-CC_SWITCH_GROK_PROVIDER_ID='<bound-provider-id>' \
+CC_SWITCH_GROK_ROUTE_KEY='<provider-route-key>' \
 node scripts/smoke/grok-oauth-real.mjs
 ```
 
@@ -167,7 +169,7 @@ node scripts/smoke/grok-oauth-real.mjs
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `EVIDENCE_FILE=/tmp/...json`：写入脱敏结果摘要。
 
-脚本依次检查 readiness、models 元数据、Responses JSON 和 Responses SSE，并对两个 Responses 请求携带固定 session id 与合法 `x-grok-turn-idx`。缺少 base URL、推理 token 或 Provider id，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
+脚本依次检查 readiness、Route Key models 元数据、Responses JSON 和 Responses SSE，并对两个 Responses 请求携带固定 session id 与合法 `x-grok-turn-idx`。缺少 base URL、推理 token 或 Route Key，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
 
 401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/real-acceptance-runbook.md` 单独留证。
 

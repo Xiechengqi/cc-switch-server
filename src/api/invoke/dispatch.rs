@@ -249,6 +249,48 @@ async fn web_invoke_dispatch(
             let _app = web_arg_app(&args).or_else(|_| web_arg_app_type(&args))?;
             Ok(json!(""))
         }
+        "get_provider_bundles" => Ok(json!(state
+            .provider_bundle_views()
+            .await
+            .map_err(ApiError::internal)?)),
+        "get_provider_bundle" => {
+            let id = web_arg_string_any(&args, &["id", "bundleId"])?;
+            let bundle = state
+                .provider_bundle_view(&id)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("Provider Bundle not found"))?;
+            Ok(json!(bundle))
+        }
+        "get_provider_bundle_delete_preview" => {
+            let id = web_arg_string_any(&args, &["id", "bundleId"])?;
+            let preview = state
+                .provider_bundle_reference_preview(&id)
+                .await
+                .map_err(map_provider_command_error)?;
+            Ok(json!(preview))
+        }
+        "upsert_provider_bundle" => {
+            require_provider_write_contract(state, headers)?;
+            let draft = web_arg_value(&args, "bundle")?;
+            let bundle = state
+                .upsert_provider_bundle_command(draft)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(bundle))
+        }
+        "delete_provider_bundle" => {
+            require_provider_write_contract(state, headers)?;
+            let id = web_arg_string_any(&args, &["id", "bundleId"])?;
+            let expected_revision = web_arg_value(&args, "expectedRevision")?;
+            let deleted = state
+                .delete_provider_bundle_command(id, expected_revision)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(deleted))
+        }
         "get_providers" => {
             let app = match web_arg_app_for_read(&args)? {
                 Some(app) => app,
@@ -291,18 +333,6 @@ async fn web_invoke_dispatch(
                 None => return Ok(json!([])),
             };
             Ok(json!(state.provider_views(Some(app)).await))
-        }
-        "get_current_provider" => {
-            let app = match web_arg_app_for_read(&args)? {
-                Some(app) => app,
-                None => return Ok(json!("")),
-            };
-            let providers = state.providers.read().await;
-            let ui_settings = state.ui_settings.read().await.for_frontend();
-            let current =
-                current_provider::resolve_current_provider_id(&providers, &ui_settings, app)
-                    .unwrap_or_default();
-            Ok(json!(current))
         }
         "add_provider" | "update_provider" => {
             require_provider_write_contract(state, headers)?;
@@ -539,39 +569,6 @@ async fn web_invoke_dispatch(
                 .map_err(map_provider_command_error)?;
             Ok(json!(deleted))
         }
-        "switch_provider" => {
-            let app = web_arg_app(&args)?;
-            let id = web_arg_string(&args, "id")?;
-            let _references = state.lock_reference_mutations().await;
-            let exists = state
-                .providers
-                .read()
-                .await
-                .providers
-                .iter()
-                .any(|provider| provider.app == app && provider.provider.id == id);
-            if !exists {
-                return Err(ApiError::not_found("provider not found"));
-            }
-            state
-                .apply_ui_settings_patch_immediate(json!({
-                    current_provider::current_provider_settings_key(app): id
-                }))
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!({ "warnings": [] }))
-        }
-        "clear_current_provider" => {
-            let app = web_arg_app(&args)?;
-            let _references = state.lock_reference_mutations().await;
-            state
-                .apply_ui_settings_patch_immediate(json!({
-                    current_provider::current_provider_settings_key(app): ""
-                }))
-                .await
-                .map_err(ApiError::internal)?;
-            Ok(json!({ "warnings": [] }))
-        }
         "get_provider_health" => {
             let app = web_arg_app_type(&args)?;
             if let Some(provider_id) = args
@@ -634,11 +631,14 @@ async fn web_invoke_dispatch(
         }
         "create_share" => {
             let input = web_share_upsert_input(state, &args).await?;
+            let value = web_payload(&args, &["params", "input", "share"]);
+            let expected_config_revision =
+                web_optional_deserialize(value, "expectedConfigRevision")?;
             let response = upsert_share(
                 State(state.clone()),
                 headers.clone(),
                 Json(UpsertShareCommand {
-                    expected_config_revision: None,
+                    expected_config_revision,
                     input,
                 }),
             )
@@ -751,6 +751,13 @@ async fn web_invoke_dispatch(
         "save_provider_share" => {
             let share = web_save_provider_share(state, &args).await?;
             Ok(json!(share))
+        }
+        "save_provider_bundle_share" => {
+            let share = web_save_provider_bundle_share(state, &args).await?;
+            match share.as_ref() {
+                Some(share) => web_share_json(&state.config_snapshot().await, share),
+                None => Ok(Value::Null),
+            }
         }
         "update_share_owner_email" => {
             let share = web_update_share_owner_email(state, headers, &args).await?;
@@ -899,7 +906,7 @@ async fn web_invoke_dispatch(
                         .map_err(ApiError::bad_request)?;
                 }
             }
-            crate::client_tunnel_provision::claim_client_tunnel_config(state, &config).await?;
+            crate::client_tunnel_provision::claim_client_tunnel_config(state).await?;
             if web_optional_bool(&args, &["autoStart", "auto_start"]).unwrap_or(true) {
                 crate::state::ensure_client_tunnel_running(state.clone(), "client_tunnel_claim")
                     .await;
@@ -984,38 +991,13 @@ async fn web_invoke_dispatch(
                 .0;
             Ok(json!(response.result))
         }
+        "get_account_capabilities" => Ok(json!({
+            "ok": true,
+            "capabilities": crate::domain::accounts::managers::all_capabilities(),
+        })),
         "deepseek_account_status" => {
             let accounts = state.accounts.read().await;
-            let deepseek_accounts = accounts
-                .accounts
-                .iter()
-                .filter(|account| account.provider_type == ProviderType::DeepSeekAccount)
-                .collect::<Vec<_>>();
-            let default_account_id = deepseek_accounts.first().map(|account| account.id.clone());
-            let authenticated = deepseek_accounts
-                .iter()
-                .any(|account| account_is_authenticated(account));
-            let mapped_accounts = deepseek_accounts
-                .iter()
-                .enumerate()
-                .map(|(index, account)| {
-                    json!({
-                        "id": account.id,
-                        "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
-                        "authenticated_at": account_authenticated_at(account),
-                        "is_default": default_account_id
-                            .as_deref()
-                            .map(|id| id == account.id)
-                            .unwrap_or(index == 0),
-                        "has_password": true
-                    })
-                })
-                .collect::<Vec<_>>();
-            Ok(json!({
-                "authenticated": authenticated,
-                "default_account_id": default_account_id,
-                "accounts": mapped_accounts
-            }))
+            Ok(deepseek_account_status_json(&accounts))
         }
         "auth_get_status" => {
             let provider_type = web_auth_provider_type(&args)?;
@@ -1305,21 +1287,6 @@ async fn web_invoke_dispatch(
         })),
         "stop_proxy_server" | "stop_proxy_with_restore" => Ok(json!(true)),
         "set_proxy_takeover_for_app" => Ok(json!(true)),
-        "switch_proxy_provider" => {
-            let app = web_arg_app_type(&args)?;
-            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id"])?;
-            let exists = state
-                .providers
-                .read()
-                .await
-                .providers
-                .iter()
-                .any(|provider| provider.app == app && provider.provider.id == provider_id);
-            if !exists {
-                return Err(ApiError::not_found("provider not found"));
-            }
-            Ok(json!(true))
-        }
         "delete_db_backup" => {
             let id = web_arg_string_any(&args, &["filename", "id", "backupId"])?;
             crate::infra::backup::delete_backup(&state.config_dir, &id)
@@ -1415,10 +1382,71 @@ async fn web_invoke_dispatch(
         "copilot_logout" | "copilot_remove_account" => Ok(json!(true)),
         "copilot_set_default_account" => Ok(json!(true)),
         "copilot_poll_for_account" => Ok(Value::Null),
-        "deepseek_account_add" | "deepseek_account_remove" | "deepseek_account_set_default" => {
+        "deepseek_account_add" => {
+            let access_token =
+                web_arg_string_any(&args, &["accessToken", "access_token", "token"])?;
+            let email = web_optional_string_any(&args, &["email", "mobile", "identifier"]);
+            let input = UpsertAccountInput {
+                id: None,
+                provider_type: ProviderType::DeepSeekAccount,
+                email,
+                access_token: Some(access_token),
+                refresh_token: None,
+                id_token: None,
+                token_type: Some("Bearer".to_string()),
+                api_key: None,
+                extra_headers: None,
+                scopes: Vec::new(),
+                profile: Some(json!({ "source": "deepseek_access_token_import" })),
+                raw: Some(json!({
+                    "source": "deepseek_access_token_import",
+                    "importedAtMs": now_ms(),
+                })),
+                subscription_level: None,
+                entitlement_status: None,
+                quota_percent: None,
+                quota: None,
+                quota_refreshed_at: None,
+                quota_next_refresh_at: None,
+                expires_at: None,
+                rate_limited_until: None,
+                last_refresh_error: None,
+            };
+            let response = upsert_account(State(state.clone()), headers.clone(), Json(input))
+                .await?
+                .0;
+            let account_id = response.account.id;
+            let accounts = state.accounts.read().await;
+            let default_account_id =
+                managed_auth_default_account_id(&accounts, ProviderType::DeepSeekAccount);
+            let account = accounts
+                .find_for_provider(ProviderType::DeepSeekAccount, Some(&account_id))
+                .ok_or_else(|| ApiError::not_found("account not found after import"))?;
+            Ok(deepseek_account_json(account, default_account_id))
+        }
+        "deepseek_account_list" => {
+            let accounts = state.accounts.read().await;
+            Ok(deepseek_account_status_json(&accounts)["accounts"].clone())
+        }
+        "deepseek_account_remove" => {
+            let mut managed_args = args;
+            managed_args
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("arguments must be an object"))?
+                .insert("authProvider".to_string(), json!("deepseek_account"));
+            web_managed_auth_remove_account(state.clone(), headers.clone(), &managed_args).await?;
             Ok(json!(true))
         }
-        "deepseek_account_list" => Ok(json!([])),
+        "deepseek_account_set_default" => {
+            let mut managed_args = args;
+            managed_args
+                .as_object_mut()
+                .ok_or_else(|| ApiError::bad_request("arguments must be an object"))?
+                .insert("authProvider".to_string(), json!("deepseek_account"));
+            web_managed_auth_set_default_account(state.clone(), headers.clone(), &managed_args)
+                .await?;
+            Ok(json!(true))
+        }
         "get_common_config_snippet" => {
             let app_type = web_arg_common_config_app_type(&args)?;
             let store = state.ui_settings.read().await;
@@ -1789,7 +1817,6 @@ async fn web_invoke_dispatch(
         "restore_env_backup" => Ok(Value::Null),
         "get_auto_launch_status" => Ok(json!(false)),
         "set_auto_launch" => Ok(Value::Null),
-        "sync_current_providers_live" => Ok(json!({ "imported": 0, "warnings": [] })),
         "sync_session_usage" => Ok(Value::Null),
         "get_usage_data_sources" => Ok(json!(["server"])),
         "get_subscription_quota" => {

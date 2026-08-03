@@ -11,6 +11,10 @@ import {
   rejectConflictMarkers,
   validateBaselineContracts,
 } from "./audit-upstream-provider-baseline.mjs";
+import {
+  assertRequiredProviderProfileCoverage,
+  requiredProviderProfilePairs,
+} from "./provider-profile-coverage.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -43,14 +47,75 @@ test("checked-in provider inventories satisfy the reviewed contract", () => {
   );
 });
 
-test("direct official API Profiles are committed additions, not candidates", () => {
+test("first-class Server Profiles are committed additions, not candidates", () => {
   const mappings = contract("server-provider-legacy-inventory.json").coverageMappings;
+  const registry = contract("provider-registry.json");
   assert.deepEqual(mappings.firstClassProfileAdditions, [
     "claude.anthropic_api_key",
+    "claude.bearer_relay",
+    "claude.google_oauth",
     "codex.openai_api_key",
     "gemini.google_api_key",
   ]);
   assert.equal("directApiCandidates" in mappings, false);
+
+  const mappedProfileIds = new Set(
+    registry.legacyPresetMappings.map((mapping) => mapping.profileId),
+  );
+  const unmappedFirstClassProfiles = registry.profiles
+    .filter(
+      (profile) =>
+        profile.formComposition !== "custom" &&
+        profile.formComposition !== "legacy" &&
+        !mappedProfileIds.has(profile.profileId),
+    )
+    .map((profile) => profile.profileId)
+    .sort();
+  assert.deepEqual(
+    unmappedFirstClassProfiles,
+    [...mappings.firstClassProfileAdditions].sort(),
+  );
+  for (const profileId of mappings.firstClassProfileAdditions) {
+    const profile = registry.profiles.find(
+      (candidate) => candidate.profileId === profileId,
+    );
+    assert.equal(profile?.visibility, "visible", profileId);
+    assert.equal(profile?.creationPolicy, "create_allowed", profileId);
+  }
+});
+
+test("inventory validation rejects altered first-class Profile additions", () => {
+  const baseline = contract("upstream-provider-source-baseline.json");
+  const server = contract("server-provider-legacy-inventory.json");
+  server.coverageMappings.firstClassProfileAdditions.pop();
+  assert.throws(
+    () => validateBaselineContracts(baseline, server),
+    /first-class Server Profile additions are incomplete/,
+  );
+});
+
+test("every required Provider type/app pair has a creatable visible Profile", () => {
+  const registry = contract("provider-registry.json");
+  assert.equal(requiredProviderProfilePairs().length, 33);
+  assert.doesNotThrow(() => assertRequiredProviderProfileCoverage(registry));
+
+  const missing = structuredClone(registry);
+  missing.profiles = missing.profiles.filter(
+    (profile) => profile.profileId !== "claude.google_oauth",
+  );
+  assert.throws(
+    () => assertRequiredProviderProfileCoverage(missing),
+    /Missing visible create_allowed Provider Profile for claude:gemini_cli/,
+  );
+
+  const mismatched = structuredClone(registry);
+  mismatched.profiles.find(
+    (profile) => profile.profileId === "gemini.google_oauth",
+  ).credentialPolicy.accountProviderType = "antigravity_oauth";
+  assert.throws(
+    () => assertRequiredProviderProfileCoverage(mismatched),
+    /gemini\.google_oauth binds antigravity_oauth, expected gemini_cli/,
+  );
 });
 
 test("inventory validation rejects omitted and duplicate presets before write", () => {

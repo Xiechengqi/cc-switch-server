@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, Github, ShieldCheck, Sparkles as SparklesIcon } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  Github,
+  LoaderCircle,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles as SparklesIcon,
+} from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -35,7 +43,14 @@ import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection"
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { settingsApi } from "@/lib/api";
-import { useSettingsQuery } from "@/lib/query";
+import {
+  accountCapabilitySupportsAuthCenter,
+  findAccountCapability,
+  hasLiveQuotaRefreshCapability,
+  liveQuotaQueryRoots,
+  useAccountCapabilitiesQuery,
+  useSettingsQuery,
+} from "@/lib/query";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES,
@@ -84,10 +99,15 @@ function AuthProviderAccordionItem({
   );
 }
 
-export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }) {
+export function AuthCenterPanel({
+  serverMode = false,
+}: {
+  serverMode?: boolean;
+}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data: settings } = useSettingsQuery();
+  const capabilityQuery = useAccountCapabilitiesQuery({ enabled: serverMode });
   const [centerOpen, setCenterOpen] = useState(false);
   const currentRefreshInterval = getOauthQuotaRefreshIntervalMinutes(settings);
   const currentRefreshTimeout = getOauthQuotaRefreshTimeoutSeconds(settings);
@@ -145,17 +165,76 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
     [currentRefreshInterval, currentRefreshTimeout, t],
   );
 
+  if (serverMode && capabilityQuery.isPending) {
+    return (
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        className="flex items-center gap-2 text-sm text-muted-foreground"
+        aria-live="polite"
+      >
+        <LoaderCircle className="h-4 w-4 animate-spin" />
+        {t("settings.authCenter.capabilityLoading", {
+          defaultValue: "正在加载账号能力...",
+        })}
+      </motion.div>
+    );
+  }
+
+  if (serverMode && capabilityQuery.isError) {
+    return (
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-destructive/40 p-4 text-sm text-destructive"
+        role="alert"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          {t("settings.authCenter.capabilityLoadFailed", {
+            defaultValue: "无法加载账号能力，认证入口已暂停。",
+          })}
+        </span>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => void capabilityQuery.refetch()}
+        >
+          <RefreshCw className="mr-2 h-4 w-4" />
+          {t("common.retry")}
+        </Button>
+      </motion.div>
+    );
+  }
+
+  const canShowAccountProvider = (providerType: string) =>
+    !serverMode ||
+    accountCapabilitySupportsAuthCenter(
+      findAccountCapability(capabilityQuery.data, providerType),
+    );
+  const showQuotaRefreshSettings =
+    !serverMode || hasLiveQuotaRefreshCapability(capabilityQuery.data);
+
   const invalidateQuotaQueries = async () => {
+    const quotaRoots = capabilityQuery.isSuccess
+      ? liveQuotaQueryRoots(capabilityQuery.data)
+      : [
+          "claude_oauth",
+          "codex_oauth",
+          "grok_oauth",
+          "google_gemini_oauth",
+          "kiro_oauth",
+          "antigravity_oauth",
+          "agy_oauth",
+          "ollama",
+        ];
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["settings"] }),
       queryClient.invalidateQueries({ queryKey: ["subscription", "quota"] }),
-      queryClient.invalidateQueries({ queryKey: ["claude_oauth", "quota"] }),
-      queryClient.invalidateQueries({ queryKey: ["codex_oauth", "quota"] }),
-      queryClient.invalidateQueries({
-        queryKey: ["google_gemini_oauth", "quota"],
-      }),
-      queryClient.invalidateQueries({ queryKey: ["kiro_oauth", "quota"] }),
-      queryClient.invalidateQueries({ queryKey: ["copilot", "quota"] }),
+      ...quotaRoots.map((root) =>
+        queryClient.invalidateQueries({ queryKey: [root, "quota"] }),
+      ),
     ]);
   };
 
@@ -203,233 +282,274 @@ export function AuthCenterPanel({ serverMode = false }: { serverMode?: boolean }
       transition={{ duration: 0.3 }}
       className="space-y-4"
     >
-      <Collapsible open={centerOpen} onOpenChange={setCenterOpen}>
-        <div className="rounded-xl border border-border bg-card/50 transition-colors hover:bg-muted/50">
-          <CollapsibleTrigger asChild>
-            <button
-              type="button"
-              className="flex w-full items-center justify-between gap-4 p-4 text-left hover:bg-muted/50"
-            >
-              <div className="flex min-w-0 items-center gap-3">
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
-                  <ShieldCheck className="h-4 w-4 text-primary" />
-                </div>
-                <div className="min-w-0 space-y-1">
-                  <p className="text-sm font-medium leading-none">
-                    {t("settings.authCenter.title", {
-                      defaultValue: "OAuth 认证中心",
-                    })}
-                  </p>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {centerSubtitle}
-                  </p>
-                </div>
-              </div>
-              <ChevronDown
-                className={cn(
-                  "h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200",
-                  centerOpen && "rotate-180",
-                )}
-              />
-            </button>
-          </CollapsibleTrigger>
-
-          <CollapsibleContent>
-            <div className="space-y-5 border-t border-border/50 px-4 pb-4 pt-4">
-              <p className="text-sm text-muted-foreground">
-                {serverMode
-                  ? t("settings.authCenter.serverDescription", {
-                      defaultValue:
-                        "管理用于反代上游的官方 OAuth 账号。用量刷新仅作用于当前激活的供应商。",
-                    })
-                  : t("settings.authCenter.description", {
-                      defaultValue:
-                        "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
-                    })}
-              </p>
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-4">
-                  <Label htmlFor="oauth-quota-refresh-interval">
-                    {t("settings.authCenter.quotaRefreshIntervalTitle", {
-                      defaultValue: "用量刷新间隔",
-                    })}
-                  </Label>
-                  <p className="text-sm text-muted-foreground">
-                    {t("settings.authCenter.quotaRefreshIntervalDescription", {
-                      defaultValue:
-                        "控制 OAuth 账号 5h / 7day 用量进度条的自动刷新频率，仅当前激活供应商会自动轮询。",
-                    })}
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <Input
-                      id="oauth-quota-refresh-interval"
-                      type="number"
-                      min={1}
-                      step={1}
-                      value={refreshIntervalInput}
-                      onChange={(event) =>
-                        setRefreshIntervalInput(event.currentTarget.value)
-                      }
-                      className="w-24"
-                      disabled={!settings}
-                    />
-                    <span className="text-sm text-muted-foreground">
-                      {t("settings.authCenter.quotaRefreshIntervalMinutes", {
-                        defaultValue: "分钟",
+      {showQuotaRefreshSettings ? (
+        <Collapsible open={centerOpen} onOpenChange={setCenterOpen}>
+          <div className="rounded-xl border border-border bg-card/50 transition-colors hover:bg-muted/50">
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-4 p-4 text-left hover:bg-muted/50"
+              >
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
+                    <ShieldCheck className="h-4 w-4 text-primary" />
+                  </div>
+                  <div className="min-w-0 space-y-1">
+                    <p className="text-sm font-medium leading-none">
+                      {t("settings.authCenter.title", {
+                        defaultValue: "OAuth 认证中心",
                       })}
-                    </span>
+                    </p>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {centerSubtitle}
+                    </p>
+                  </div>
+                </div>
+                <ChevronDown
+                  className={cn(
+                    "h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200",
+                    centerOpen && "rotate-180",
+                  )}
+                />
+              </button>
+            </CollapsibleTrigger>
+
+            <CollapsibleContent>
+              <div className="space-y-5 border-t border-border/50 px-4 pb-4 pt-4">
+                <p className="text-sm text-muted-foreground">
+                  {serverMode
+                    ? t("settings.authCenter.serverDescription", {
+                        defaultValue:
+                          "管理用于反代上游的官方 OAuth 账号。用量刷新仅作用于当前激活的供应商。",
+                      })
+                    : t("settings.authCenter.description", {
+                        defaultValue:
+                          "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
+                      })}
+                </p>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-4">
+                    <Label htmlFor="oauth-quota-refresh-interval">
+                      {t("settings.authCenter.quotaRefreshIntervalTitle", {
+                        defaultValue: "用量刷新间隔",
+                      })}
+                    </Label>
+                    <p className="text-sm text-muted-foreground">
+                      {t(
+                        "settings.authCenter.quotaRefreshIntervalDescription",
+                        {
+                          defaultValue:
+                            "控制 OAuth 账号 5h / 7day 用量进度条的自动刷新频率，仅当前激活供应商会自动轮询。",
+                        },
+                      )}
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        id="oauth-quota-refresh-interval"
+                        type="number"
+                        min={1}
+                        step={1}
+                        value={refreshIntervalInput}
+                        onChange={(event) =>
+                          setRefreshIntervalInput(event.currentTarget.value)
+                        }
+                        className="w-24"
+                        disabled={!settings}
+                      />
+                      <span className="text-sm text-muted-foreground">
+                        {t("settings.authCenter.quotaRefreshIntervalMinutes", {
+                          defaultValue: "分钟",
+                        })}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-4">
+                    <Label htmlFor="oauth-quota-refresh-timeout">
+                      {t("settings.authCenter.quotaRefreshTimeoutTitle", {
+                        defaultValue: "用量刷新超时",
+                      })}
+                    </Label>
+                    <p className="text-sm text-muted-foreground">
+                      {t("settings.authCenter.quotaRefreshTimeoutDescription", {
+                        defaultValue:
+                          "单次 OAuth 用量刷新请求的最大等待时间，超时后会按失败冷却策略重试。",
+                      })}
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        id="oauth-quota-refresh-timeout"
+                        type="number"
+                        min={1}
+                        max={120}
+                        step={1}
+                        value={refreshTimeoutInput}
+                        onChange={(event) =>
+                          setRefreshTimeoutInput(event.currentTarget.value)
+                        }
+                        className="w-24"
+                        disabled={!settings}
+                      />
+                      <span className="text-sm text-muted-foreground">
+                        {t("settings.authCenter.quotaRefreshTimeoutSeconds", {
+                          defaultValue: "秒",
+                        })}
+                      </span>
+                    </div>
                   </div>
                 </div>
 
-                <div className="space-y-2 rounded-lg border border-border/50 bg-background/60 p-4">
-                  <Label htmlFor="oauth-quota-refresh-timeout">
-                    {t("settings.authCenter.quotaRefreshTimeoutTitle", {
-                      defaultValue: "用量刷新超时",
-                    })}
-                  </Label>
-                  <p className="text-sm text-muted-foreground">
-                    {t("settings.authCenter.quotaRefreshTimeoutDescription", {
-                      defaultValue:
-                        "单次 OAuth 用量刷新请求的最大等待时间，超时后会按失败冷却策略重试。",
-                    })}
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <Input
-                      id="oauth-quota-refresh-timeout"
-                      type="number"
-                      min={1}
-                      max={120}
-                      step={1}
-                      value={refreshTimeoutInput}
-                      onChange={(event) =>
-                        setRefreshTimeoutInput(event.currentTarget.value)
-                      }
-                      className="w-24"
-                      disabled={!settings}
-                    />
-                    <span className="text-sm text-muted-foreground">
-                      {t("settings.authCenter.quotaRefreshTimeoutSeconds", {
-                        defaultValue: "秒",
-                      })}
-                    </span>
-                  </div>
+                <div className="flex justify-end border-t border-border/50 pt-4">
+                  <Button
+                    type="button"
+                    onClick={() => void handleSaveQuotaSettings()}
+                    disabled={!settings || !hasQuotaSettingChanges}
+                  >
+                    {t("common.save", { defaultValue: "保存" })}
+                  </Button>
                 </div>
               </div>
-
-              <div className="flex justify-end border-t border-border/50 pt-4">
-                <Button
-                  type="button"
-                  onClick={() => void handleSaveQuotaSettings()}
-                  disabled={!settings || !hasQuotaSettingChanges}
-                >
-                  {t("common.save", { defaultValue: "保存" })}
-                </Button>
-              </div>
-            </div>
-          </CollapsibleContent>
-        </div>
-      </Collapsible>
+            </CollapsibleContent>
+          </div>
+        </Collapsible>
+      ) : null}
 
       <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
-        <AuthProviderAccordionItem
-          value="claude"
-          icon={<ClaudeIcon size={20} />}
-          title="Claude Official"
-          description={t("settings.authCenter.claudeOauthDescription", {
-            defaultValue: "管理 Claude 官方订阅账号",
-          })}
-        >
-          <ClaudeOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("claude_oauth") ? (
+          <AuthProviderAccordionItem
+            value="claude"
+            icon={<ClaudeIcon size={20} />}
+            title="Claude Official"
+            description={t("settings.authCenter.claudeOauthDescription", {
+              defaultValue: "管理 Claude 官方订阅账号",
+            })}
+          >
+            <ClaudeOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="copilot"
-          icon={<Github className="h-5 w-5" />}
-          title="GitHub Copilot"
-          description={t("settings.authCenter.copilotDescription", {
-            defaultValue: "管理 GitHub Copilot 账号",
-          })}
-        >
-          <CopilotAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("github_copilot") ? (
+          <AuthProviderAccordionItem
+            value="copilot"
+            icon={<Github className="h-5 w-5" />}
+            title="GitHub Copilot"
+            description={t("settings.authCenter.copilotDescription", {
+              defaultValue: "管理 GitHub Copilot 账号",
+            })}
+          >
+            <CopilotAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="codex"
-          icon={<CodexIcon size={20} />}
-          title="OpenAI OAuth"
-          description={t("settings.authCenter.codexOauthDescription", {
-            defaultValue: "管理 ChatGPT 账号",
-          })}
-        >
-          <CodexOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("codex_oauth") ? (
+          <AuthProviderAccordionItem
+            value="codex"
+            icon={<CodexIcon size={20} />}
+            title="OpenAI OAuth"
+            description={t("settings.authCenter.codexOauthDescription", {
+              defaultValue: "管理 ChatGPT 账号",
+            })}
+          >
+            <CodexOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="grok"
-          icon={<ProviderIcon icon="grok" name="Grok" size={24} />}
-          title="Grok OAuth"
-          description={t("settings.authCenter.grokOauthDescription", {
-            defaultValue: "管理 Grok/xAI 订阅账号",
-          })}
-        >
-          <GrokOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("grok_oauth") ? (
+          <AuthProviderAccordionItem
+            value="grok"
+            icon={<ProviderIcon icon="grok" name="Grok" size={24} />}
+            title="Grok OAuth"
+            description={t("settings.authCenter.grokOauthDescription", {
+              defaultValue: "管理 Grok/xAI 订阅账号",
+            })}
+          >
+            <GrokOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="kiro"
-          icon={<ProviderIcon icon="kiro" name="Kiro" size={24} />}
-          title="Kiro OAuth"
-          description={t("settings.authCenter.kiroOauthDescription", {
-            defaultValue: "管理 Kiro AWS Builder ID 账号",
-          })}
-        >
-          <KiroOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("kiro_oauth") ? (
+          <AuthProviderAccordionItem
+            value="kiro"
+            icon={<ProviderIcon icon="kiro" name="Kiro" size={24} />}
+            title="Kiro OAuth"
+            description={t("settings.authCenter.kiroOauthDescription", {
+              defaultValue: "管理 Kiro AWS Builder ID 账号",
+            })}
+          >
+            <KiroOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="cursor"
-          icon={<ProviderIcon icon="cursor" name="Cursor" size={24} />}
-          title="Cursor OAuth"
-          description={t("settings.authCenter.cursorOauthDescription", {
-            defaultValue: "管理 Cursor 订阅账号",
-          })}
-        >
-          <CursorOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("cursor_oauth") ? (
+          <AuthProviderAccordionItem
+            value="cursor"
+            icon={<ProviderIcon icon="cursor" name="Cursor" size={24} />}
+            title="Cursor OAuth"
+            description={t("settings.authCenter.cursorOauthDescription", {
+              defaultValue: "管理 Cursor 订阅账号",
+            })}
+          >
+            <CursorOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="gemini"
-          icon={<GeminiIcon size={20} />}
-          title="Google Gemini"
-          description={t("settings.authCenter.geminiOauthDescription", {
-            defaultValue: "管理 Google Gemini 账号",
-          })}
-        >
-          <GeminiOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("gemini_cli") ? (
+          <AuthProviderAccordionItem
+            value="gemini"
+            icon={<GeminiIcon size={20} />}
+            title="Google Gemini"
+            description={t("settings.authCenter.geminiOauthDescription", {
+              defaultValue: "管理 Google Gemini 账号",
+            })}
+          >
+            <GeminiOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="antigravity"
-          icon={<SparklesIcon className="h-5 w-5" />}
-          title="Antigravity OAuth"
-          description={t("settings.authCenter.antigravityOauthDescription", {
-            defaultValue: "管理 Antigravity 订阅账号",
-          })}
-        >
-          <AntigravityOAuthSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("antigravity_oauth") ? (
+          <AuthProviderAccordionItem
+            value="antigravity"
+            icon={<SparklesIcon className="h-5 w-5" />}
+            title="Antigravity OAuth"
+            description={t("settings.authCenter.antigravityOauthDescription", {
+              defaultValue: "管理 Antigravity 订阅账号",
+            })}
+          >
+            <AntigravityOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
 
-        <AuthProviderAccordionItem
-          value="deepseek"
-          icon={<DeepSeekIcon size={20} />}
-          title="DeepSeek(Account)"
-          description={t("settings.authCenter.deepseekAccountDescription", {
-            defaultValue: "管理 DeepSeek 账号",
-          })}
-        >
-          <DeepSeekAccountSection showLoggedInAccounts />
-        </AuthProviderAccordionItem>
+        {canShowAccountProvider("agy_oauth") ? (
+          <AuthProviderAccordionItem
+            value="agy"
+            icon={<SparklesIcon className="h-5 w-5" />}
+            title={t("settings.authCenter.agyOauthTitle", {
+              defaultValue: "Agy OAuth",
+            })}
+            description={t("settings.authCenter.agyOauthDescription", {
+              defaultValue: "管理 Agy 订阅账号",
+            })}
+          >
+            <AntigravityOAuthSection
+              showLoggedInAccounts
+              authProvider="agy_oauth"
+            />
+          </AuthProviderAccordionItem>
+        ) : null}
+
+        {canShowAccountProvider("deepseek_account") ? (
+          <AuthProviderAccordionItem
+            value="deepseek"
+            icon={<DeepSeekIcon size={20} />}
+            title="DeepSeek(Account)"
+            description={t("settings.authCenter.deepseekAccountDescription", {
+              defaultValue: "管理 DeepSeek 账号",
+            })}
+          >
+            <DeepSeekAccountSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
       </Accordion>
     </motion.div>
   );

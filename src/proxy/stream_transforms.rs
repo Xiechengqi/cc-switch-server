@@ -7,7 +7,7 @@ use crate::domain::providers::store::StoredProvider;
 
 use super::adapters::{
     downstream_format_for_route, encode_stream_frames, transform_stream_value,
-    upstream_format_for_route, UpstreamFormat,
+    unwrap_gemini_v1internal_value, upstream_format_for_route, UpstreamFormat,
 };
 use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, responses_reasoning_item_from_anthropic_block,
@@ -26,6 +26,8 @@ pub(super) struct StreamEventTransformer {
     buffer: Vec<u8>,
     responses_tool_context: transforms::ResponsesToolContext,
     bridge: Option<StreamBridgeState>,
+    unwrap_v1internal: bool,
+    gemini_terminal: Option<GeminiStreamTerminalState>,
 }
 
 impl StreamEventTransformer {
@@ -40,6 +42,9 @@ impl StreamEventTransformer {
         let responses_tool_context = responses_tool_context.into();
         let upstream = upstream_format_for_route(stored, Some(route), &[]);
         let downstream = downstream_format_for_route(route);
+        let unwrap_v1internal =
+            super::adapters::is_gemini_v1internal_provider_type(stored.provider_type);
+        let gemini_terminal = unwrap_v1internal.then(GeminiStreamTerminalState::default);
         let bridge = match (upstream, downstream) {
             (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::AnthropicMessages) => Some(
                 StreamBridgeState::ResponsesAnthropic(ResponsesAnthropicState::default()),
@@ -47,6 +52,19 @@ impl StreamEventTransformer {
             (Some(UpstreamFormat::OpenAiChat), UpstreamFormat::AnthropicMessages) => Some(
                 StreamBridgeState::ChatAnthropic(ChatAnthropicState::default()),
             ),
+            (Some(UpstreamFormat::GeminiNative), UpstreamFormat::AnthropicMessages) => Some(
+                StreamBridgeState::GeminiAnthropic(GeminiAnthropicState::default()),
+            ),
+            (Some(UpstreamFormat::GeminiNative), UpstreamFormat::OpenAiResponses) => {
+                Some(StreamBridgeState::GeminiOpenAi(Box::new(
+                    GeminiOpenAiState::responses(responses_tool_context.clone()),
+                )))
+            }
+            (Some(UpstreamFormat::GeminiNative), UpstreamFormat::OpenAiChat) => {
+                Some(StreamBridgeState::GeminiOpenAi(Box::new(
+                    GeminiOpenAiState::chat(responses_tool_context.clone()),
+                )))
+            }
             (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::OpenAiChat) => Some(
                 StreamBridgeState::ResponsesChat(ResponsesChatState::default()),
             ),
@@ -60,6 +78,15 @@ impl StreamEventTransformer {
                     AnthropicResponsesState::new(responses_tool_context.clone()),
                 ))
             }
+            (Some(UpstreamFormat::AnthropicMessages), UpstreamFormat::GeminiNative) => Some(
+                StreamBridgeState::ToGemini(Box::new(ToGeminiState::anthropic())),
+            ),
+            (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::GeminiNative) => Some(
+                StreamBridgeState::ToGemini(Box::new(ToGeminiState::responses())),
+            ),
+            (Some(UpstreamFormat::OpenAiChat), UpstreamFormat::GeminiNative) => {
+                Some(StreamBridgeState::ToGemini(Box::new(ToGeminiState::chat())))
+            }
             _ => None,
         };
         Self {
@@ -68,6 +95,8 @@ impl StreamEventTransformer {
             buffer: Vec::new(),
             responses_tool_context,
             bridge,
+            unwrap_v1internal,
+            gemini_terminal,
         }
     }
 
@@ -75,7 +104,7 @@ impl StreamEventTransformer {
         let Some(upstream) = self.upstream else {
             return Ok(chunk);
         };
-        if upstream == self.downstream {
+        if upstream == self.downstream && !self.unwrap_v1internal {
             return Ok(chunk);
         }
         self.buffer.extend_from_slice(&chunk);
@@ -86,10 +115,13 @@ impl StreamEventTransformer {
         let Some(upstream) = self.upstream else {
             return Ok(Bytes::new());
         };
-        if upstream == self.downstream {
+        if upstream == self.downstream && !self.unwrap_v1internal {
             return Ok(Bytes::new());
         }
         let mut output = self.drain_complete_events(true)?.to_vec();
+        if let Some(terminal) = self.gemini_terminal.as_ref() {
+            terminal.validate()?;
+        }
         if let Some(bridge) = self.bridge.as_mut() {
             output.extend_from_slice(&encode_stream_frames(&bridge.finish_eof()?).into_bytes());
         }
@@ -154,27 +186,114 @@ impl StreamEventTransformer {
             return Ok(String::new());
         };
         if payload == "[DONE]" {
-            let frames = self.bridge.as_mut().map(StreamBridgeState::upstream_done);
+            if let Some(terminal) = self.gemini_terminal.as_ref() {
+                terminal.validate()?;
+            }
+            let frames = self
+                .bridge
+                .as_mut()
+                .map(StreamBridgeState::upstream_done)
+                .transpose()?;
             return Ok(match frames {
                 Some(frames) => encode_stream_frames(&frames),
                 None if self.downstream == UpstreamFormat::AnthropicMessages => String::new(),
                 None => encode_stream_frames(&[StreamFrame::done()]),
             });
         }
-        let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
+        let mut value = serde_json::from_str::<Value>(&payload).map_err(|error| {
             crate::metrics::record_stream_transform_protocol_error("invalid_json");
             ProxyError::bad_gateway(format!("upstream SSE data is not valid JSON: {error}"))
         })?;
-        let frames = match self.bridge.as_mut() {
-            Some(bridge) => bridge.transform(&value),
-            None => transform_stream_value(
-                self.upstream.expect("upstream format is present"),
-                self.downstream,
-                &value,
-                &self.responses_tool_context,
-            ),
+        if self.unwrap_v1internal {
+            if let Some(error) = super::adapters::google_embedded_error(&value) {
+                crate::metrics::record_stream_transform_protocol_error("embedded_google_error");
+                return Err(error);
+            }
+            value = unwrap_gemini_v1internal_value(value);
+        }
+        if let Some(terminal) = self.gemini_terminal.as_mut() {
+            terminal.observe(&value)?;
+        }
+        let frames = if self.upstream == Some(self.downstream) {
+            vec![StreamFrame::json(value)]
+        } else {
+            match self.bridge.as_mut() {
+                Some(bridge) => bridge.transform(&value)?,
+                None => transform_stream_value(
+                    self.upstream.expect("upstream format is present"),
+                    self.downstream,
+                    &value,
+                    &self.responses_tool_context,
+                ),
+            }
         };
         Ok(encode_stream_frames(&frames))
+    }
+}
+
+#[derive(Debug, Default)]
+struct GeminiStreamTerminalState {
+    candidates: BTreeMap<i64, bool>,
+    blocked_prompt: bool,
+}
+
+impl GeminiStreamTerminalState {
+    fn observe(&mut self, response: &Value) -> Result<(), ProxyError> {
+        let response = response.as_object().ok_or_else(|| {
+            ProxyError::bad_gateway("Gemini v1internal response must be a JSON object")
+        })?;
+        if response
+            .get("candidates")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err(ProxyError::bad_gateway(
+                "Gemini v1internal candidates must be an array",
+            ));
+        }
+        if let Some(candidates) = response.get("candidates").and_then(Value::as_array) {
+            for (position, candidate) in candidates.iter().enumerate() {
+                let candidate = candidate.as_object().ok_or_else(|| {
+                    ProxyError::bad_gateway("Gemini v1internal candidate must be a JSON object")
+                })?;
+                let index = candidate
+                    .get("index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(position as i64);
+                let finished = candidate
+                    .get("finishReason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|reason| !reason.is_empty());
+                self.candidates
+                    .entry(index)
+                    .and_modify(|terminal| *terminal |= finished)
+                    .or_insert(finished);
+            }
+        }
+        self.blocked_prompt |= response
+            .get("promptFeedback")
+            .and_then(|feedback| feedback.get("blockReason"))
+            .or_else(|| {
+                response
+                    .get("prompt_feedback")
+                    .and_then(|feedback| feedback.get("block_reason"))
+            })
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|reason| !reason.is_empty());
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ProxyError> {
+        if !self.candidates.is_empty() && self.candidates.values().all(|finished| *finished) {
+            return Ok(());
+        }
+        if self.candidates.is_empty() && self.blocked_prompt {
+            return Ok(());
+        }
+        Err(ProxyError::bad_gateway(
+            "Gemini v1internal stream ended before a terminal candidate or blocked prompt feedback",
+        ))
     }
 }
 
@@ -234,32 +353,43 @@ fn standalone_line_is_ready(line: &[u8]) -> bool {
 enum StreamBridgeState {
     ResponsesAnthropic(ResponsesAnthropicState),
     ChatAnthropic(ChatAnthropicState),
+    GeminiAnthropic(GeminiAnthropicState),
+    GeminiOpenAi(Box<GeminiOpenAiState>),
     ResponsesChat(ResponsesChatState),
     ChatResponses(Box<ChatResponsesState>),
     AnthropicResponses(AnthropicResponsesState),
+    ToGemini(Box<ToGeminiState>),
 }
 
 impl StreamBridgeState {
-    fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
-        match self {
+    fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        Ok(match self {
             Self::ResponsesAnthropic(state) => state.transform(input),
             Self::ChatAnthropic(state) => state.transform(input),
+            Self::GeminiAnthropic(state) => state.transform(input),
+            Self::GeminiOpenAi(state) => return state.transform(input),
             Self::ResponsesChat(state) => state.transform(input),
             Self::ChatResponses(state) => state.transform(input),
             Self::AnthropicResponses(state) => state.transform(input),
-        }
+            Self::ToGemini(state) => return state.transform(input),
+        })
     }
 
-    fn upstream_done(&mut self) -> Vec<StreamFrame> {
+    fn upstream_done(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
         match self {
-            Self::ChatResponses(state) => state.finish_stream(),
-            Self::ResponsesChat(state) if state.completed => Vec::new(),
-            Self::AnthropicResponses(state) if state.completed => Vec::new(),
-            Self::ResponsesAnthropic(state) if state.completed => Vec::new(),
-            Self::ChatAnthropic(state) if state.completed => Vec::new(),
+            Self::ChatResponses(state) => Ok(state.finish_stream()),
+            Self::GeminiAnthropic(state) => state.finish_stream(),
+            Self::GeminiOpenAi(state) => state.finish_stream(),
+            Self::ToGemini(state) => state.finish_stream(),
+            Self::ResponsesChat(state) if state.completed => Ok(Vec::new()),
+            Self::AnthropicResponses(state) if state.completed => Ok(Vec::new()),
+            Self::ResponsesAnthropic(state) if state.completed => Ok(Vec::new()),
+            Self::ChatAnthropic(state) if state.completed => Ok(Vec::new()),
             _ => {
                 protocol_error("done_before_terminal");
-                Vec::new()
+                Err(ProxyError::bad_gateway(
+                    "upstream stream sent DONE before a terminal event",
+                ))
             }
         }
     }
@@ -270,6 +400,12 @@ impl StreamBridgeState {
             if state.completed {
                 return Ok(frames);
             }
+        }
+        match self {
+            Self::GeminiAnthropic(state) => return state.finish_stream(),
+            Self::GeminiOpenAi(state) => return state.finish_stream(),
+            Self::ToGemini(state) => return state.finish_stream(),
+            _ => {}
         }
         if self.completed() {
             return Ok(Vec::new());
@@ -284,9 +420,12 @@ impl StreamBridgeState {
         match self {
             Self::ResponsesAnthropic(state) => state.completed,
             Self::ChatAnthropic(state) => state.completed,
+            Self::GeminiAnthropic(state) => state.completed,
+            Self::GeminiOpenAi(state) => state.completed(),
             Self::ResponsesChat(state) => state.completed,
             Self::ChatResponses(state) => state.completed,
             Self::AnthropicResponses(state) => state.completed,
+            Self::ToGemini(state) => state.completed(),
         }
     }
 }
@@ -304,6 +443,8 @@ struct ResponsesAnthropicState {
     completed_tool_items: BTreeSet<String>,
     pending_tool_arguments: BTreeMap<i64, String>,
     pending_custom_inputs: BTreeMap<i64, CustomToolInputState>,
+    pending_tool_items: BTreeMap<i64, Value>,
+    defer_tool_blocks: bool,
     saw_tool: bool,
     saw_reasoning: bool,
     completed: bool,
@@ -330,6 +471,13 @@ struct CustomToolInputState {
 }
 
 impl ResponsesAnthropicState {
+    fn deferred_for_gemini() -> Self {
+        Self {
+            defer_tool_blocks: true,
+            ..Self::default()
+        }
+    }
+
     fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
         if self.completed {
             return Vec::new();
@@ -470,6 +618,14 @@ impl ResponsesAnthropicState {
         let mut frames = self.ensure_message_start(input);
         frames.extend(self.close_reasoning_block(None));
         frames.extend(self.close_text_block());
+        if self.defer_tool_blocks {
+            self.saw_tool = true;
+            merge_bridge_item(
+                self.pending_tool_items.entry(output_index).or_default(),
+                item,
+            );
+            return frames;
+        }
         frames.extend(self.open_tool(output_index, item));
         frames
     }
@@ -498,17 +654,21 @@ impl ResponsesAnthropicState {
                 custom_input: pending_custom_input,
             },
         );
+        let mut content_block = json!({
+            "type": "tool_use",
+            "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("tool"),
+            "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+            "input": {}
+        });
+        if let Some(signature) = bridge_thought_signature(item) {
+            content_block["signature"] = Value::String(signature.to_string());
+        }
         let mut frames = vec![StreamFrame::event(
             "content_block_start",
             json!({
                 "type": "content_block_start",
                 "index": index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("tool"),
-                    "name": item.get("name").and_then(Value::as_str).unwrap_or("tool"),
-                    "input": {}
-                }
+                "content_block": content_block
             }),
         )];
         if !custom && !pending_arguments.is_empty() {
@@ -528,6 +688,7 @@ impl ResponsesAnthropicState {
         let Some(arguments) = input.get("delta").and_then(Value::as_str) else {
             return Vec::new();
         };
+        self.remember_deferred_tool_metadata(output_index, input);
         let Some(tool) = self.tools.get_mut(&output_index) else {
             self.pending_tool_arguments
                 .entry(output_index)
@@ -548,6 +709,7 @@ impl ResponsesAnthropicState {
             protocol_error("missing_output_index");
             return Vec::new();
         };
+        self.remember_deferred_tool_metadata(output_index, input);
         let Some(tool) = self.tools.get_mut(&output_index) else {
             if let Some(arguments) = input
                 .get("arguments")
@@ -707,6 +869,16 @@ impl ResponsesAnthropicState {
             return Vec::new();
         };
         let output_index = self.resolve_tool_index(output_index, item);
+        let mut effective_item = self
+            .pending_tool_items
+            .remove(&output_index)
+            .unwrap_or_else(|| json!({}));
+        merge_bridge_item(&mut effective_item, item);
+        let item = if self.defer_tool_blocks {
+            &effective_item
+        } else {
+            item
+        };
         let mut frames = self.ensure_message_start(input);
         frames.extend(self.close_reasoning_block(None));
         frames.extend(self.close_text_block());
@@ -772,16 +944,13 @@ impl ResponsesAnthropicState {
         frames.extend(self.close_open_blocks());
         let stop_reason =
             transforms::openai_response_to_anthropic_stop_with_tools(response, self.saw_tool);
-        let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
+        let usage = transforms::anthropic_usage_from_openai_usage(response.get("usage"));
         frames.push(StreamFrame::event(
             "message_delta",
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                "usage": {
-                    "input_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                    "output_tokens": usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
-                }
+                "usage": usage
             }),
         ));
         frames.push(StreamFrame::event(
@@ -804,6 +973,19 @@ impl ResponsesAnthropicState {
         self.item_ids.insert(output_index, item_id.to_string());
     }
 
+    fn remember_deferred_tool_metadata(&mut self, output_index: i64, input: &Value) {
+        if !self.defer_tool_blocks {
+            return;
+        }
+        let Some(signature) = bridge_thought_signature(input) else {
+            return;
+        };
+        self.pending_tool_items
+            .entry(output_index)
+            .or_insert_with(|| json!({}))["thought_signature"] =
+            Value::String(signature.to_string());
+    }
+
     fn resolve_tool_index(&self, output_index: i64, item: &Value) -> i64 {
         let Some(item_id) = item
             .get("id")
@@ -815,8 +997,10 @@ impl ResponsesAnthropicState {
         self.item_ids
             .iter()
             .find_map(|(known_index, known_id)| {
-                (known_id == item_id && self.tools.contains_key(known_index))
-                    .then_some(*known_index)
+                (known_id == item_id
+                    && (self.tools.contains_key(known_index)
+                        || self.pending_tool_items.contains_key(known_index)))
+                .then_some(*known_index)
             })
             .unwrap_or(output_index)
     }
@@ -860,7 +1044,21 @@ impl ResponsesAnthropicState {
     }
 
     fn close_reasoning_block(&mut self, item: Option<&Value>) -> Vec<StreamFrame> {
-        let bridge_block = item.and_then(anthropic_block_from_openai_reasoning_item);
+        let bridge_block = item.and_then(|item| {
+            let signature = bridge_thought_signature(item);
+            let mut block = anthropic_block_from_openai_reasoning_item(item).or_else(|| {
+                signature.map(|_| {
+                    json!({
+                        "type": "thinking",
+                        "thinking": super::reasoning_bridge::reasoning_summary_text(item)
+                    })
+                })
+            })?;
+            if let Some(signature) = signature {
+                block["signature"] = Value::String(signature.to_string());
+            }
+            Some(block)
+        });
         let Some(mut block) = self.reasoning_block.take() else {
             if let Some(block) = bridge_block {
                 self.saw_reasoning = true;
@@ -906,28 +1104,1220 @@ impl ResponsesAnthropicState {
 }
 
 #[derive(Debug, Default)]
+struct GeminiAnthropicState {
+    next_block_index: u64,
+    selected_candidate_index: Option<i64>,
+    message_started: bool,
+    text_block: Option<BlockState>,
+    text_seen: String,
+    thinking_block: Option<BlockState>,
+    thinking_seen: String,
+    thinking_signature: Option<String>,
+    tools: BTreeMap<GeminiAnthropicToolKey, GeminiAnthropicToolState>,
+    tool_order: Vec<GeminiAnthropicToolKey>,
+    usage: BTreeMap<String, Value>,
+    pending_finish_reason: Option<String>,
+    pending_blocked_prompt: bool,
+    saw_content: bool,
+    saw_tool: bool,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GeminiAnthropicToolKey {
+    candidate_index: i64,
+    part_index: usize,
+    occurrence: usize,
+}
+
+#[derive(Debug)]
+struct GeminiAnthropicToolState {
+    id: String,
+    name: String,
+    arguments: Value,
+    signature: Option<String>,
+    emitted: bool,
+}
+
+impl GeminiAnthropicState {
+    fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
+        self.observe_usage(input);
+        if self.completed {
+            return Vec::new();
+        }
+        if self.pending_finish_reason.is_some() {
+            return Vec::new();
+        }
+        let candidates = input.get("candidates").and_then(Value::as_array);
+        let candidate = candidates.and_then(|candidates| {
+            let selected = self.selected_candidate_index;
+            candidates
+                .iter()
+                .enumerate()
+                .find(|(position, candidate)| {
+                    let index = gemini_candidate_index(candidate, *position);
+                    selected.map_or(index == 0, |selected| selected == index)
+                })
+                .or_else(|| {
+                    selected
+                        .is_none()
+                        .then(|| candidates.iter().enumerate().next())
+                        .flatten()
+                })
+                .map(|(position, candidate)| {
+                    let index = gemini_candidate_index(candidate, position);
+                    self.selected_candidate_index.get_or_insert(index);
+                    (index, candidate)
+                })
+        });
+        let blocked_prompt = candidate
+            .is_none()
+            .then(|| {
+                input
+                    .get("promptFeedback")
+                    .and_then(|feedback| feedback.get("blockReason"))
+                    .or_else(|| {
+                        input
+                            .get("prompt_feedback")
+                            .and_then(|feedback| feedback.get("block_reason"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+            })
+            .flatten();
+        if let Some(block_reason) = blocked_prompt {
+            let frames = self.ensure_message_start(input);
+            self.pending_finish_reason = Some(block_reason.to_string());
+            self.pending_blocked_prompt = true;
+            return frames;
+        }
+        let parts = candidate
+            .and_then(|(_, candidate)| candidate.pointer("/content/parts"))
+            .and_then(Value::as_array);
+        let finish_reason = candidate.and_then(|(_, candidate)| {
+            candidate
+                .get("finishReason")
+                .or_else(|| candidate.get("finish_reason"))
+                .and_then(Value::as_str)
+        });
+        if parts.is_none_or(|parts| parts.is_empty()) && finish_reason.is_none() {
+            return Vec::new();
+        }
+
+        let mut frames = self.ensure_message_start(input);
+        if let Some(parts) = parts {
+            let candidate_index = candidate.map(|(index, _)| index).unwrap_or_default();
+            let mut occurrences = BTreeMap::<String, usize>::new();
+            for (part_index, part) in parts.iter().enumerate() {
+                if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                    if part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                        || gemini_thought_signature(part).is_some()
+                    {
+                        frames.extend(self.thinking_delta(part));
+                    }
+                } else if let Some(text) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    frames.extend(self.text_delta(text));
+                }
+                if let Some(function_call) = part
+                    .get("functionCall")
+                    .or_else(|| part.get("function_call"))
+                {
+                    let name = function_call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string();
+                    let occurrence = occurrences.entry(name).or_default();
+                    frames.extend(self.function_call(
+                        candidate_index,
+                        part_index,
+                        *occurrence,
+                        part,
+                        function_call,
+                    ));
+                    *occurrence = occurrence.saturating_add(1);
+                }
+            }
+        }
+        if let Some(finish_reason) = finish_reason {
+            self.pending_finish_reason = Some(finish_reason.to_string());
+        }
+        frames
+    }
+
+    fn ensure_message_start(&mut self, input: &Value) -> Vec<StreamFrame> {
+        if self.message_started {
+            return Vec::new();
+        }
+        self.message_started = true;
+        let response_id = input
+            .get("responseId")
+            .or_else(|| input.get("response_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("gemini");
+        let model = input
+            .get("modelVersion")
+            .or_else(|| input.get("model_version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        vec![StreamFrame::event(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": response_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }),
+        )]
+    }
+
+    fn text_delta(&mut self, text: &str) -> Vec<StreamFrame> {
+        let mut frames = self.close_thinking_block();
+        frames.extend(self.close_tool_blocks());
+        if !self.text_block.is_some_and(|block| block.open) {
+            let index = self.allocate_index();
+            self.text_block = Some(BlockState { index, open: true });
+            self.text_seen.clear();
+            self.saw_content = true;
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ));
+        }
+        let text = gemini_incremental_text(&mut self.text_seen, text);
+        if text.is_empty() {
+            return frames;
+        }
+        let index = self.text_block.expect("text block exists").index;
+        frames.push(StreamFrame::event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        ));
+        frames
+    }
+
+    fn thinking_delta(&mut self, part: &Value) -> Vec<StreamFrame> {
+        let mut frames = self.close_text_block();
+        frames.extend(self.close_tool_blocks());
+        let signature = gemini_thought_signature(part);
+        if self.thinking_signature.is_some()
+            && signature.is_some()
+            && self.thinking_signature.as_deref() != signature
+        {
+            frames.extend(self.close_thinking_block());
+        }
+        if !self.thinking_block.is_some_and(|block| block.open) {
+            let index = self.allocate_index();
+            self.thinking_block = Some(BlockState { index, open: true });
+            self.thinking_seen.clear();
+            self.saw_content = true;
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                }),
+            ));
+        }
+        if let Some(text) = part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            let text = gemini_incremental_text(&mut self.thinking_seen, text);
+            if text.is_empty() {
+                if let Some(signature) = signature {
+                    self.thinking_signature = Some(signature.to_string());
+                }
+                return frames;
+            }
+            let index = self.thinking_block.expect("thinking block exists").index;
+            frames.push(StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": text}
+                }),
+            ));
+        }
+        if let Some(signature) = signature {
+            self.thinking_signature = Some(signature.to_string());
+        }
+        frames
+    }
+
+    fn function_call(
+        &mut self,
+        candidate_index: i64,
+        part_index: usize,
+        occurrence: usize,
+        part: &Value,
+        function_call: &Value,
+    ) -> Vec<StreamFrame> {
+        let mut frames = self.close_text_block();
+        frames.extend(self.close_thinking_block());
+        let name = function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let explicit_id = function_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let slot = GeminiAnthropicToolKey {
+            candidate_index,
+            part_index,
+            occurrence,
+        };
+        let key = explicit_id
+            .and_then(|id| {
+                self.tools
+                    .iter()
+                    .find_map(|(key, tool)| (!tool.emitted && tool.id == id).then(|| key.clone()))
+            })
+            .or_else(|| {
+                self.tools
+                    .get(&slot)
+                    .filter(|tool| !tool.emitted && tool.name == name)
+                    .map(|_| slot.clone())
+            })
+            .or_else(|| {
+                self.tools.iter().find_map(|(key, tool)| {
+                    (!tool.emitted
+                        && key.candidate_index == candidate_index
+                        && key.occurrence == occurrence
+                        && tool.name == name)
+                        .then(|| key.clone())
+                })
+            })
+            .unwrap_or(slot);
+        if !self.tools.contains_key(&key) {
+            let id = explicit_id.map(str::to_string).unwrap_or_else(|| {
+                format!(
+                    "{name}_{}_{}_{}",
+                    key.candidate_index, key.part_index, key.occurrence
+                )
+            });
+            self.tool_order.push(key.clone());
+            self.tools.insert(
+                key.clone(),
+                GeminiAnthropicToolState {
+                    id,
+                    name: name.to_string(),
+                    arguments: json!({}),
+                    signature: None,
+                    emitted: false,
+                },
+            );
+        }
+        let tool = self.tools.get_mut(&key).expect("tool exists");
+        if let Some(explicit_id) = explicit_id {
+            tool.id = explicit_id.to_string();
+        }
+        if let Some(arguments) = function_call
+            .get("args")
+            .or_else(|| function_call.get("arguments"))
+            .filter(|arguments| !arguments.is_null())
+        {
+            merge_gemini_tool_arguments(&mut tool.arguments, arguments);
+        }
+        if let Some(signature) = gemini_thought_signature(part) {
+            tool.signature = Some(signature.to_string());
+        }
+        self.saw_content = true;
+        self.saw_tool = true;
+        frames
+    }
+
+    fn close_tool_blocks(&mut self) -> Vec<StreamFrame> {
+        let mut frames = Vec::new();
+        for key in self.tool_order.clone() {
+            let Some(tool) = self.tools.get_mut(&key).filter(|tool| !tool.emitted) else {
+                continue;
+            };
+            tool.emitted = true;
+            let id = tool.id.clone();
+            let name = tool.name.clone();
+            let arguments = tool.arguments.clone();
+            let signature = tool.signature.clone();
+            let index = self.allocate_index();
+            let mut content_block = json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": {}
+            });
+            if let Some(signature) = signature {
+                content_block["signature"] = Value::String(signature);
+            }
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": content_block
+                }),
+            ));
+            if !arguments.is_null() {
+                let arguments =
+                    serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+                frames.push(input_json_delta(index, &arguments));
+            }
+            frames.push(content_block_stop(index));
+        }
+        frames
+    }
+
+    fn close_text_block(&mut self) -> Vec<StreamFrame> {
+        let Some(block) = self.text_block.as_mut().filter(|block| block.open) else {
+            return Vec::new();
+        };
+        block.open = false;
+        self.text_seen.clear();
+        vec![content_block_stop(block.index)]
+    }
+
+    fn close_thinking_block(&mut self) -> Vec<StreamFrame> {
+        let Some(block) = self.thinking_block.as_mut().filter(|block| block.open) else {
+            self.thinking_signature = None;
+            return Vec::new();
+        };
+        block.open = false;
+        self.thinking_seen.clear();
+        let mut frames = Vec::new();
+        if let Some(signature) = self.thinking_signature.take() {
+            frames.push(StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": block.index,
+                    "delta": {"type": "signature_delta", "signature": signature}
+                }),
+            ));
+        }
+        frames.push(content_block_stop(block.index));
+        frames
+    }
+
+    fn finish_stream(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if self.completed {
+            return Ok(Vec::new());
+        }
+        let finish_reason = self.pending_finish_reason.take().ok_or_else(|| {
+            ProxyError::bad_gateway("Gemini stream ended before candidate.finishReason")
+        })?;
+        Ok(self.finish(&finish_reason))
+    }
+
+    fn finish(&mut self, finish_reason: &str) -> Vec<StreamFrame> {
+        let mut frames = Vec::new();
+        if !self.saw_content && !self.pending_blocked_prompt {
+            let index = self.allocate_index();
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ));
+            frames.push(content_block_stop(index));
+            self.saw_content = true;
+        } else {
+            frames.extend(self.close_text_block());
+            frames.extend(self.close_thinking_block());
+        }
+        frames.extend(self.close_tool_blocks());
+        let stop_reason = if self.pending_blocked_prompt {
+            "refusal"
+        } else {
+            let mapped_stop_reason =
+                transforms::gemini_finish_reason_to_anthropic(Some(finish_reason));
+            match mapped_stop_reason {
+                reason @ ("refusal" | "max_tokens") => reason,
+                _ if self.saw_tool => "tool_use",
+                reason => reason,
+            }
+        };
+        let usage = self.normalized_usage();
+        frames.push(StreamFrame::event(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "usage": transforms::anthropic_usage_from_gemini_usage(Some(&usage))
+            }),
+        ));
+        frames.push(StreamFrame::event(
+            "message_stop",
+            json!({"type": "message_stop"}),
+        ));
+        self.completed = true;
+        frames
+    }
+
+    fn observe_usage(&mut self, input: &Value) {
+        let Some(usage) = input
+            .get("usageMetadata")
+            .or_else(|| input.get("usage_metadata"))
+            .and_then(Value::as_object)
+        else {
+            return;
+        };
+        for (key, value) in usage {
+            self.usage.insert(key.clone(), value.clone());
+        }
+    }
+
+    fn normalized_usage(&self) -> Value {
+        let mut usage = self
+            .usage
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let prompt_tokens = usage_value_u64(&usage, &["promptTokenCount", "prompt_token_count"]);
+        let total_tokens = usage_value_u64(&usage, &["totalTokenCount", "total_token_count"]);
+        if let (Some(prompt_tokens), Some(total_tokens)) = (prompt_tokens, total_tokens) {
+            let output_tokens = total_tokens.saturating_sub(prompt_tokens);
+            let candidate_tokens =
+                usage_value_u64(&usage, &["candidatesTokenCount", "candidates_token_count"]);
+            let thought_tokens =
+                usage_value_u64(&usage, &["thoughtsTokenCount", "thoughts_token_count"]);
+            match (candidate_tokens, thought_tokens) {
+                (None, Some(thought_tokens)) => {
+                    usage.insert(
+                        "candidatesTokenCount".to_string(),
+                        json!(output_tokens.saturating_sub(thought_tokens)),
+                    );
+                }
+                (Some(candidate_tokens), None) => {
+                    usage.insert(
+                        "thoughtsTokenCount".to_string(),
+                        json!(output_tokens.saturating_sub(candidate_tokens)),
+                    );
+                }
+                (None, None) => {
+                    usage.insert("candidatesTokenCount".to_string(), json!(output_tokens));
+                }
+                (Some(_), Some(_)) => {}
+            }
+        }
+        Value::Object(usage)
+    }
+
+    fn allocate_index(&mut self) -> u64 {
+        let index = self.next_block_index;
+        self.next_block_index = self.next_block_index.saturating_add(1);
+        index
+    }
+}
+
+fn gemini_candidate_index(candidate: &Value, position: usize) -> i64 {
+    candidate
+        .get("index")
+        .and_then(Value::as_i64)
+        .unwrap_or(position as i64)
+}
+
+fn merge_gemini_tool_arguments(current: &mut Value, incoming: &Value) {
+    match (current, incoming) {
+        (Value::Object(current), Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                match current.get_mut(key) {
+                    Some(current) => merge_gemini_tool_arguments(current, value),
+                    None => {
+                        current.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (current, incoming) => *current = incoming.clone(),
+    }
+}
+
+fn usage_value_u64(usage: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(Value::as_u64))
+}
+
+fn gemini_incremental_text(seen: &mut String, incoming: &str) -> String {
+    let incoming = incoming.trim_end_matches('\0');
+    if incoming.is_empty() {
+        return String::new();
+    }
+    if incoming.starts_with(seen.as_str()) {
+        let delta = incoming[seen.len()..].to_string();
+        *seen = incoming.to_string();
+        return delta;
+    }
+    if seen.starts_with(incoming) {
+        return String::new();
+    }
+    seen.push_str(incoming);
+    incoming.to_string()
+}
+
+fn gemini_thought_signature(part: &Value) -> Option<&str> {
+    part.get("thoughtSignature")
+        .or_else(|| part.get("thought_signature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+}
+
+#[derive(Debug)]
+struct GeminiOpenAiState {
+    source: GeminiAnthropicState,
+    target: GeminiOpenAiTarget,
+}
+
+#[derive(Debug)]
+enum GeminiOpenAiTarget {
+    Responses(AnthropicResponsesState),
+    Chat {
+        responses: AnthropicResponsesState,
+        chat: ResponsesChatState,
+    },
+}
+
+impl GeminiOpenAiState {
+    fn responses(responses_tool_context: transforms::ResponsesToolContext) -> Self {
+        Self {
+            source: GeminiAnthropicState::default(),
+            target: GeminiOpenAiTarget::Responses(AnthropicResponsesState::new(
+                responses_tool_context,
+            )),
+        }
+    }
+
+    fn chat(responses_tool_context: transforms::ResponsesToolContext) -> Self {
+        Self {
+            source: GeminiAnthropicState::default(),
+            target: GeminiOpenAiTarget::Chat {
+                responses: AnthropicResponsesState::new(responses_tool_context),
+                chat: ResponsesChatState::default(),
+            },
+        }
+    }
+
+    fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        let anthropic = self.source.transform(input);
+        Ok(self.relay(anthropic))
+    }
+
+    fn finish_stream(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if self.completed() {
+            return Ok(Vec::new());
+        }
+        let anthropic = self.source.finish_stream()?;
+        let frames = self.relay(anthropic);
+        if self.completed() {
+            Ok(frames)
+        } else {
+            Err(ProxyError::bad_gateway(
+                "Gemini stream ended before the downstream bridge completed",
+            ))
+        }
+    }
+
+    fn relay(&mut self, anthropic: Vec<StreamFrame>) -> Vec<StreamFrame> {
+        match &mut self.target {
+            GeminiOpenAiTarget::Responses(responses) => {
+                relay_json_frames(anthropic, |event| responses.transform(event))
+            }
+            GeminiOpenAiTarget::Chat { responses, chat } => {
+                let response_events =
+                    relay_json_frames(anthropic, |event| responses.transform(event));
+                relay_json_frames(response_events, |event| chat.transform(event))
+            }
+        }
+    }
+
+    fn completed(&self) -> bool {
+        match &self.target {
+            GeminiOpenAiTarget::Responses(state) => state.completed,
+            GeminiOpenAiTarget::Chat { chat, .. } => chat.completed,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ToGeminiState {
+    source: ToAnthropicSource,
+    target: AnthropicGeminiState,
+}
+
+#[derive(Debug)]
+enum ToAnthropicSource {
+    Anthropic,
+    Responses(ResponsesAnthropicState),
+    Chat(ChatAnthropicState),
+}
+
+impl ToGeminiState {
+    fn anthropic() -> Self {
+        Self {
+            source: ToAnthropicSource::Anthropic,
+            target: AnthropicGeminiState::default(),
+        }
+    }
+
+    fn responses() -> Self {
+        Self {
+            source: ToAnthropicSource::Responses(ResponsesAnthropicState::deferred_for_gemini()),
+            target: AnthropicGeminiState::default(),
+        }
+    }
+
+    fn chat() -> Self {
+        Self {
+            source: ToAnthropicSource::Chat(ChatAnthropicState::deferred_for_gemini()),
+            target: AnthropicGeminiState::default(),
+        }
+    }
+
+    fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        let anthropic = match &mut self.source {
+            ToAnthropicSource::Anthropic => vec![StreamFrame::json(input.clone())],
+            ToAnthropicSource::Responses(state) => state.transform(input),
+            ToAnthropicSource::Chat(state) => state.transform(input),
+        };
+        relay_json_frames_fallible(anthropic, |event| self.target.transform(event))
+    }
+
+    fn finish_stream(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if self.completed() {
+            return Ok(Vec::new());
+        }
+        let anthropic = match &mut self.source {
+            ToAnthropicSource::Chat(state) => state.finish_stream()?,
+            ToAnthropicSource::Anthropic => {
+                return Err(ProxyError::bad_gateway(
+                    "Anthropic stream ended before message_stop",
+                ))
+            }
+            ToAnthropicSource::Responses(state) if !state.completed => {
+                return Err(ProxyError::bad_gateway(
+                    "OpenAI Responses stream ended before a terminal response event",
+                ))
+            }
+            ToAnthropicSource::Responses(_) => Vec::new(),
+        };
+        let frames = relay_json_frames_fallible(anthropic, |event| self.target.transform(event))?;
+        if self.completed() {
+            Ok(frames)
+        } else {
+            Err(ProxyError::bad_gateway(
+                "upstream stream ended before the Gemini bridge completed",
+            ))
+        }
+    }
+
+    fn completed(&self) -> bool {
+        self.target.completed
+    }
+}
+
+fn relay_json_frames(
+    frames: Vec<StreamFrame>,
+    mut transform: impl FnMut(&Value) -> Vec<StreamFrame>,
+) -> Vec<StreamFrame> {
+    let mut output = Vec::new();
+    for frame in frames {
+        if let transforms::StreamPayload::Json(value) = frame.payload {
+            output.extend(transform(&value));
+        }
+    }
+    output
+}
+
+fn relay_json_frames_fallible(
+    frames: Vec<StreamFrame>,
+    mut transform: impl FnMut(&Value) -> Result<Vec<StreamFrame>, ProxyError>,
+) -> Result<Vec<StreamFrame>, ProxyError> {
+    let mut output = Vec::new();
+    for frame in frames {
+        if let transforms::StreamPayload::Json(value) = frame.payload {
+            output.extend(transform(&value)?);
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Debug, Default)]
+struct AnthropicGeminiState {
+    response_id: String,
+    model: String,
+    blocks: BTreeMap<i64, AnthropicGeminiBlock>,
+    usage: BTreeMap<String, Value>,
+    stop_reason: Option<String>,
+    completed: bool,
+}
+
+#[derive(Debug)]
+enum AnthropicGeminiBlock {
+    Text,
+    Thinking {
+        signature: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        arguments: String,
+        signature: Option<String>,
+        saw_delta: bool,
+    },
+}
+
+impl AnthropicGeminiState {
+    fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        if self.completed {
+            return Ok(Vec::new());
+        }
+        match input.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                self.message_start(input);
+                Ok(Vec::new())
+            }
+            Some("content_block_start") => self.content_block_start(input),
+            Some("content_block_delta") => self.content_block_delta(input),
+            Some("content_block_stop") => self.content_block_stop(input),
+            Some("message_delta") => {
+                self.message_delta(input);
+                Ok(Vec::new())
+            }
+            Some("message_stop") => self.complete(),
+            Some("error") => Err(ProxyError::bad_gateway(format!(
+                "upstream stream failed: {}",
+                input
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown upstream error")
+            ))),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn message_start(&mut self, input: &Value) {
+        let message = input.get("message").unwrap_or(input);
+        if let Some(id) = message.get("id").and_then(Value::as_str) {
+            self.response_id = id.to_string();
+        }
+        if let Some(model) = message.get("model").and_then(Value::as_str) {
+            self.model = model.to_string();
+        }
+        self.observe_usage(message.get("usage"));
+    }
+
+    fn content_block_start(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        let index = anthropic_block_index(input)?;
+        if self.blocks.contains_key(&index) {
+            return Err(ProxyError::bad_gateway(format!(
+                "Anthropic stream reopened content block index {index}"
+            )));
+        }
+        let block = input.get("content_block").ok_or_else(|| {
+            ProxyError::bad_gateway("Anthropic content_block_start is missing content_block")
+        })?;
+        let frames = match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                self.blocks.insert(index, AnthropicGeminiBlock::Text);
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| vec![self.content_frame(json!({"text": text}))])
+                    .unwrap_or_default()
+            }
+            Some("thinking") => {
+                let signature = bridge_thought_signature(block)
+                    .unwrap_or_default()
+                    .to_string();
+                self.blocks
+                    .insert(index, AnthropicGeminiBlock::Thinking { signature });
+                block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| vec![self.content_frame(json!({"text": text, "thought": true}))])
+                    .unwrap_or_default()
+            }
+            Some("redacted_thinking") => {
+                let signature = block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.blocks
+                    .insert(index, AnthropicGeminiBlock::Thinking { signature });
+                Vec::new()
+            }
+            Some("tool_use") => {
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("tool_{index}"));
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("tool")
+                    .to_string();
+                let arguments = block
+                    .get("input")
+                    .filter(|value| {
+                        value.is_object() && value.as_object().is_some_and(|v| !v.is_empty())
+                    })
+                    .map(Value::to_string)
+                    .unwrap_or_default();
+                let signature = bridge_thought_signature(block).map(str::to_string);
+                self.blocks.insert(
+                    index,
+                    AnthropicGeminiBlock::Tool {
+                        id,
+                        name,
+                        arguments,
+                        signature,
+                        saw_delta: false,
+                    },
+                );
+                Vec::new()
+            }
+            Some(kind) => {
+                return Err(ProxyError::bad_gateway(format!(
+                    "unsupported Anthropic streaming content block type: {kind}"
+                )));
+            }
+            None => {
+                return Err(ProxyError::bad_gateway(
+                    "Anthropic streaming content block is missing type",
+                ));
+            }
+        };
+        Ok(frames)
+    }
+
+    fn content_block_delta(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        let index = anthropic_block_index(input)?;
+        let delta = input.get("delta").ok_or_else(|| {
+            ProxyError::bad_gateway("Anthropic content_block_delta is missing delta")
+        })?;
+        let Some(block) = self.blocks.get_mut(&index) else {
+            return Err(ProxyError::bad_gateway(format!(
+                "Anthropic stream referenced unknown content block index {index}"
+            )));
+        };
+        let part = match block {
+            AnthropicGeminiBlock::Text => delta
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| json!({"text": text})),
+            AnthropicGeminiBlock::Thinking { signature } => {
+                if let Some(fragment) = delta
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    signature.push_str(fragment);
+                }
+                delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| json!({"text": text, "thought": true}))
+            }
+            AnthropicGeminiBlock::Tool {
+                arguments,
+                saw_delta,
+                ..
+            } => {
+                let Some(fragment) = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    return Ok(Vec::new());
+                };
+                if !*saw_delta {
+                    arguments.clear();
+                    *saw_delta = true;
+                }
+                arguments.push_str(fragment);
+                None
+            }
+        };
+        Ok(part
+            .map(|part| vec![self.content_frame(part)])
+            .unwrap_or_default())
+    }
+
+    fn content_block_stop(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
+        let index = anthropic_block_index(input)?;
+        let block = self.blocks.remove(&index).ok_or_else(|| {
+            ProxyError::bad_gateway(format!(
+                "Anthropic stream closed unknown content block index {index}"
+            ))
+        })?;
+        let part = match block {
+            AnthropicGeminiBlock::Text => return Ok(Vec::new()),
+            AnthropicGeminiBlock::Thinking { signature } => {
+                if signature.is_empty() {
+                    return Ok(Vec::new());
+                }
+                json!({"text": "", "thought": true, "thoughtSignature": signature})
+            }
+            AnthropicGeminiBlock::Tool {
+                id,
+                name,
+                arguments,
+                signature,
+                ..
+            } => {
+                let arguments = if arguments.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(&arguments).map_err(|error| {
+                        ProxyError::bad_gateway(format!(
+                            "Anthropic tool arguments are not complete JSON: {error}"
+                        ))
+                    })?
+                };
+                if !arguments.is_object() {
+                    return Err(ProxyError::bad_gateway(
+                        "Anthropic tool arguments must decode to a JSON object",
+                    ));
+                }
+                let mut part = json!({
+                    "functionCall": {"id": id, "name": name, "args": arguments}
+                });
+                if let Some(signature) = signature.filter(|value| !value.is_empty()) {
+                    part["thoughtSignature"] = Value::String(signature);
+                }
+                part
+            }
+        };
+        Ok(vec![self.content_frame(part)])
+    }
+
+    fn message_delta(&mut self, input: &Value) {
+        if let Some(reason) = input.pointer("/delta/stop_reason").and_then(Value::as_str) {
+            self.stop_reason = Some(reason.to_string());
+        }
+        self.observe_usage(input.get("usage"));
+    }
+
+    fn complete(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if !self.blocks.is_empty() {
+            return Err(ProxyError::bad_gateway(
+                "Anthropic stream ended with open content blocks",
+            ));
+        }
+        let stop_reason = self.stop_reason.as_deref().ok_or_else(|| {
+            ProxyError::bad_gateway("Anthropic stream ended before message_delta.stop_reason")
+        })?;
+        let finish_reason = match stop_reason {
+            "max_tokens" | "model_context_window_exceeded" => "MAX_TOKENS",
+            "refusal" => "SAFETY",
+            _ => "STOP",
+        };
+        let mut terminal = json!({
+            "candidates": [{"index": 0, "finishReason": finish_reason}],
+            "usageMetadata": gemini_usage_from_anthropic_stream_usage(&self.usage)
+        });
+        self.attach_identity(&mut terminal);
+        self.completed = true;
+        Ok(vec![StreamFrame::json(terminal)])
+    }
+
+    fn observe_usage(&mut self, usage: Option<&Value>) {
+        let Some(object) = usage.and_then(Value::as_object) else {
+            return;
+        };
+        for (key, value) in object {
+            if value.is_number() {
+                self.usage.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    fn content_frame(&self, part: Value) -> StreamFrame {
+        let mut frame = json!({
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": [part]}
+            }]
+        });
+        self.attach_identity(&mut frame);
+        StreamFrame::json(frame)
+    }
+
+    fn attach_identity(&self, frame: &mut Value) {
+        if !self.response_id.is_empty() {
+            frame["responseId"] = Value::String(self.response_id.clone());
+        }
+        if !self.model.is_empty() {
+            frame["modelVersion"] = Value::String(self.model.clone());
+        }
+    }
+}
+
+fn anthropic_block_index(input: &Value) -> Result<i64, ProxyError> {
+    input
+        .get("index")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ProxyError::bad_gateway("Anthropic stream event is missing block index"))
+}
+
+fn gemini_usage_from_anthropic_stream_usage(usage: &BTreeMap<String, Value>) -> Value {
+    let fresh_input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let input = fresh_input
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "promptTokenCount": input,
+        "candidatesTokenCount": output,
+        "totalTokenCount": input.saturating_add(output),
+        "cachedContentTokenCount": cache_read
+    })
+}
+
+fn bridge_thought_signature(value: &Value) -> Option<&str> {
+    value
+        .get("signature")
+        .or_else(|| value.get("thoughtSignature"))
+        .or_else(|| value.get("thought_signature"))
+        .or_else(|| value.pointer("/extra_content/google/thought_signature"))
+        .or_else(|| value.pointer("/function/extra_content/google/thought_signature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+}
+
+fn merge_bridge_item(target: &mut Value, incoming: &Value) {
+    let Some(incoming) = incoming.as_object() else {
+        return;
+    };
+    if !target.is_object() {
+        *target = json!({});
+    }
+    let target = target.as_object_mut().expect("bridge item is an object");
+    for (key, value) in incoming {
+        if !value.is_null() {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn attach_responses_thought_signature(item: &mut Value, signature: Option<&str>) {
+    if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+        item["thought_signature"] = Value::String(signature.to_string());
+    }
+}
+
+fn attach_chat_thought_signature(tool_call: &mut Value, signature: Option<&str>) {
+    if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+        tool_call["extra_content"] = json!({"google": {"thought_signature": signature}});
+    }
+}
+
+#[derive(Debug, Default)]
 struct ChatAnthropicState {
     next_block_index: u64,
     message_started: bool,
     text_block: Option<BlockState>,
     reasoning_block: Option<BlockState>,
+    reasoning_signature: String,
     tools: BTreeMap<i64, ToolBlockState>,
+    deferred_tools: BTreeMap<i64, DeferredChatToolState>,
+    usage: Option<Value>,
+    pending_finish_reason: Option<String>,
+    defer_terminal: bool,
     saw_tool: bool,
     completed: bool,
 }
 
+#[derive(Debug, Default)]
+struct DeferredChatToolState {
+    id: String,
+    name: String,
+    arguments: String,
+    signature: Option<String>,
+}
+
 impl ChatAnthropicState {
+    fn deferred_for_gemini() -> Self {
+        Self {
+            defer_terminal: true,
+            ..Self::default()
+        }
+    }
+
     fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
         if self.completed {
             return Vec::new();
         }
+        let usage_only = input.get("usage").is_some()
+            && input
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty);
+        if let Some(usage) = input.get("usage") {
+            self.usage = Some(usage.clone());
+        }
         let Some(choice) = input.pointer("/choices/0") else {
+            if self.defer_terminal && usage_only && self.pending_finish_reason.is_some() {
+                return self.finish_pending();
+            }
             return Vec::new();
         };
         let mut frames = self.ensure_message_start(input);
         let delta = transforms::openai_chat_choice_payload(choice);
         if let Some(reasoning) = chat_reasoning_delta(delta) {
             frames.extend(self.reasoning_delta(reasoning));
+        }
+        if let Some(signature) = bridge_thought_signature(delta) {
+            frames.extend(self.reasoning_signature(signature));
         }
         for text in transforms::openai_chat_visible_text_fragments(delta) {
             frames.extend(self.text_delta(text));
@@ -939,6 +2329,10 @@ impl ChatAnthropicState {
                     protocol_error("missing_tool_index");
                     continue;
                 };
+                if self.defer_terminal {
+                    frames.extend(self.deferred_tool_delta(tool_index, tool_call));
+                    continue;
+                }
                 if !self.tools.contains_key(&tool_index)
                     && (tool_call.get("id").is_some()
                         || tool_call.pointer("/function/name").is_some())
@@ -956,17 +2350,21 @@ impl ChatAnthropicState {
                             custom_input: CustomToolInputState::default(),
                         },
                     );
+                    let mut content_block = json!({
+                        "type": "tool_use",
+                        "id": tool_call.get("id").and_then(Value::as_str).unwrap_or("tool"),
+                        "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool"),
+                        "input": {}
+                    });
+                    if let Some(signature) = bridge_thought_signature(tool_call) {
+                        content_block["signature"] = Value::String(signature.to_string());
+                    }
                     frames.push(StreamFrame::event(
                         "content_block_start",
                         json!({
                             "type": "content_block_start",
                             "index": index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_call.get("id").and_then(Value::as_str).unwrap_or("tool"),
-                                "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool"),
-                                "input": {}
-                            }
+                            "content_block": content_block
                         }),
                     ));
                 }
@@ -991,46 +2389,54 @@ impl ChatAnthropicState {
         if tool_calls.is_none_or(|tool_calls| tool_calls.is_empty()) {
             if let Some(tool_call) = transforms::openai_chat_legacy_tool_delta(delta) {
                 let tool_index = 0;
-                if !self.tools.contains_key(&tool_index) {
-                    frames.extend(self.close_text_block());
-                    frames.extend(self.close_reasoning_block());
-                    let index = self.allocate_index();
-                    self.saw_tool = true;
-                    self.tools.insert(
-                        tool_index,
-                        ToolBlockState {
-                            block: BlockState { index, open: true },
-                            argument_delta_seen: false,
-                            custom: false,
-                            custom_input: CustomToolInputState::default(),
-                        },
-                    );
-                    frames.push(StreamFrame::event(
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start",
-                            "index": index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_call.get("id").and_then(Value::as_str).unwrap_or("call_0"),
-                                "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool"),
-                                "input": {}
-                            }
-                        }),
-                    ));
-                }
-                if let Some(arguments) = tool_call
-                    .pointer("/function/arguments")
-                    .and_then(Value::as_str)
-                    .filter(|arguments| !arguments.is_empty())
-                {
-                    if let Some(tool) = self
-                        .tools
-                        .get_mut(&tool_index)
-                        .filter(|tool| tool.block.open)
+                if self.defer_terminal {
+                    frames.extend(self.deferred_tool_delta(tool_index, &tool_call));
+                } else {
+                    if !self.tools.contains_key(&tool_index) {
+                        frames.extend(self.close_text_block());
+                        frames.extend(self.close_reasoning_block());
+                        let index = self.allocate_index();
+                        self.saw_tool = true;
+                        self.tools.insert(
+                            tool_index,
+                            ToolBlockState {
+                                block: BlockState { index, open: true },
+                                argument_delta_seen: false,
+                                custom: false,
+                                custom_input: CustomToolInputState::default(),
+                            },
+                        );
+                        let mut content_block = json!({
+                            "type": "tool_use",
+                            "id": tool_call.get("id").and_then(Value::as_str).unwrap_or("call_0"),
+                            "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool"),
+                            "input": {}
+                        });
+                        if let Some(signature) = bridge_thought_signature(&tool_call) {
+                            content_block["signature"] = Value::String(signature.to_string());
+                        }
+                        frames.push(StreamFrame::event(
+                            "content_block_start",
+                            json!({
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": content_block
+                            }),
+                        ));
+                    }
+                    if let Some(arguments) = tool_call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .filter(|arguments| !arguments.is_empty())
                     {
-                        tool.argument_delta_seen = true;
-                        frames.push(input_json_delta(tool.block.index, arguments));
+                        if let Some(tool) = self
+                            .tools
+                            .get_mut(&tool_index)
+                            .filter(|tool| tool.block.open)
+                        {
+                            tool.argument_delta_seen = true;
+                            frames.push(input_json_delta(tool.block.index, arguments));
+                        }
                     }
                 }
             }
@@ -1039,7 +2445,74 @@ impl ChatAnthropicState {
             .get("finish_reason")
             .is_some_and(|value| !value.is_null())
         {
-            frames.extend(self.finish(input));
+            self.pending_finish_reason = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if !self.defer_terminal {
+                frames.extend(self.finish_pending());
+            }
+        }
+        frames
+    }
+
+    fn deferred_tool_delta(&mut self, tool_index: i64, tool_call: &Value) -> Vec<StreamFrame> {
+        let mut frames = self.close_text_block();
+        frames.extend(self.close_reasoning_block());
+        let tool = self.deferred_tools.entry(tool_index).or_default();
+        if let Some(id) = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            tool.id = id.to_string();
+        }
+        if let Some(name) = tool_call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            tool.name = name.to_string();
+        }
+        if let Some(arguments) = tool_call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+        {
+            tool.arguments.push_str(arguments);
+        }
+        if let Some(signature) = bridge_thought_signature(tool_call) {
+            tool.signature = Some(signature.to_string());
+        }
+        self.saw_tool = true;
+        frames
+    }
+
+    fn flush_deferred_tools(&mut self) -> Vec<StreamFrame> {
+        let mut frames = Vec::new();
+        let tools = std::mem::take(&mut self.deferred_tools);
+        for (tool_index, tool) in tools {
+            let index = self.allocate_index();
+            let mut content_block = json!({
+                "type": "tool_use",
+                "id": if tool.id.is_empty() {format!("call_{tool_index}")} else {tool.id},
+                "name": if tool.name.is_empty() {"tool".to_string()} else {tool.name},
+                "input": {}
+            });
+            if let Some(signature) = tool.signature {
+                content_block["signature"] = Value::String(signature);
+            }
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": content_block
+                }),
+            ));
+            if !tool.arguments.is_empty() {
+                frames.push(input_json_delta(index, &tool.arguments));
+            }
+            frames.push(content_block_stop(index));
         }
         frames
     }
@@ -1080,6 +2553,20 @@ impl ChatAnthropicState {
         frames
     }
 
+    fn reasoning_signature(&mut self, signature: &str) -> Vec<StreamFrame> {
+        let mut frames = self.close_text_block();
+        if !self.reasoning_block.is_some_and(|block| block.open) {
+            let index = self.allocate_index();
+            self.reasoning_block = Some(BlockState { index, open: true });
+            frames.push(StreamFrame::event(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": index, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            ));
+        }
+        self.reasoning_signature.push_str(signature);
+        frames
+    }
+
     fn close_text_block(&mut self) -> Vec<StreamFrame> {
         let Some(block) = self.text_block.as_mut().filter(|block| block.open) else {
             return Vec::new();
@@ -1090,10 +2577,23 @@ impl ChatAnthropicState {
 
     fn close_reasoning_block(&mut self) -> Vec<StreamFrame> {
         let Some(block) = self.reasoning_block.as_mut().filter(|block| block.open) else {
+            self.reasoning_signature.clear();
             return Vec::new();
         };
         block.open = false;
-        vec![content_block_stop(block.index)]
+        let mut frames = Vec::new();
+        if !self.reasoning_signature.is_empty() {
+            frames.push(StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": block.index,
+                    "delta": {"type": "signature_delta", "signature": std::mem::take(&mut self.reasoning_signature)}
+                }),
+            ));
+        }
+        frames.push(content_block_stop(block.index));
+        frames
     }
 
     fn ensure_message_start(&mut self, input: &Value) -> Vec<StreamFrame> {
@@ -1118,9 +2618,29 @@ impl ChatAnthropicState {
         )]
     }
 
-    fn finish(&mut self, input: &Value) -> Vec<StreamFrame> {
+    fn finish_stream(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if self.completed {
+            return Ok(Vec::new());
+        }
+        if self.pending_finish_reason.is_none() {
+            return Err(ProxyError::bad_gateway(
+                "OpenAI Chat stream ended before choices[0].finish_reason",
+            ));
+        }
+        Ok(self.finish_pending())
+    }
+
+    fn finish_pending(&mut self) -> Vec<StreamFrame> {
+        let finish_reason = self
+            .pending_finish_reason
+            .take()
+            .unwrap_or_else(|| "stop".to_string());
         let mut frames = Vec::new();
-        if self.text_block.is_none() && self.reasoning_block.is_none() && self.tools.is_empty() {
+        if self.text_block.is_none()
+            && self.reasoning_block.is_none()
+            && self.tools.is_empty()
+            && self.deferred_tools.is_empty()
+        {
             let index = self.allocate_index();
             self.text_block = Some(BlockState { index, open: true });
             frames.push(StreamFrame::event(
@@ -1134,27 +2654,24 @@ impl ChatAnthropicState {
             tool.block.open = false;
             frames.push(content_block_stop(tool.block.index));
         }
-        let output_tokens = input
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let finish_reason = input
-            .pointer("/choices/0/finish_reason")
-            .and_then(Value::as_str);
-        let stop_reason = match finish_reason {
-            Some(reason @ ("length" | "content_filter")) => {
+        if !matches!(finish_reason.as_str(), "length" | "content_filter") {
+            frames.extend(self.flush_deferred_tools());
+        } else {
+            self.deferred_tools.clear();
+        }
+        let stop_reason = match finish_reason.as_str() {
+            reason @ ("length" | "content_filter") => {
                 transforms::openai_finish_reason_to_anthropic(reason)
             }
             _ if self.saw_tool => "tool_use",
-            Some(reason) => transforms::openai_finish_reason_to_anthropic(reason),
-            None => "end_turn",
+            reason => transforms::openai_finish_reason_to_anthropic(reason),
         };
         frames.push(StreamFrame::event(
             "message_delta",
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                "usage": {"output_tokens": output_tokens}
+                "usage": transforms::anthropic_usage_from_openai_usage(self.usage.as_ref())
             }),
         ));
         frames.push(StreamFrame::event(
@@ -1193,6 +2710,7 @@ struct ResponsesChatToolState {
     arguments: String,
     emitted_arguments: usize,
     custom_input: String,
+    thought_signature: Option<String>,
     custom: bool,
     added: bool,
     done: bool,
@@ -1376,6 +2894,7 @@ impl ResponsesChatState {
         };
         self.remember_item_identity(input, item);
         if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+            let mut frames = Vec::new();
             if !response_item_was_emitted(
                 &self.emitted_reasoning_items,
                 input,
@@ -1386,10 +2905,24 @@ impl ResponsesChatState {
                 if !summary.is_empty() {
                     let mut packed = input.clone();
                     packed["delta"] = Value::String(summary);
-                    return self.reasoning_delta(&packed);
+                    frames.extend(self.reasoning_delta(&packed));
                 }
             }
-            return Vec::new();
+            if let Some(signature) = bridge_thought_signature(item) {
+                let mut delta = json!({
+                    "reasoning_signature": signature,
+                    "extra_content": {"google": {"thought_signature": signature}}
+                });
+                delta["role"] = Value::String("assistant".to_string());
+                frames.push(chat_stream_chunk(
+                    &self.response_id,
+                    &self.model,
+                    delta,
+                    Value::Null,
+                    None,
+                ));
+            }
+            return frames;
         }
         if item.get("type").and_then(Value::as_str) == Some("message") {
             if !response_item_was_emitted(
@@ -1454,6 +2987,9 @@ impl ResponsesChatState {
                 name.to_string()
             };
         }
+        if let Some(signature) = bridge_thought_signature(item) {
+            state.thought_signature = Some(signature.to_string());
+        }
     }
 
     fn remember_item_identity(&mut self, input: &Value, item: &Value) {
@@ -1490,7 +3026,7 @@ impl ResponsesChatState {
         }
         let downstream_index = self.next_tool_index;
         self.next_tool_index = self.next_tool_index.saturating_add(1);
-        let (call_id, name, arguments) = {
+        let (call_id, name, arguments, thought_signature) = {
             let state = self
                 .tools
                 .get_mut(&output_index)
@@ -1499,20 +3035,25 @@ impl ResponsesChatState {
             state.added = true;
             let arguments = state.arguments.clone();
             state.emitted_arguments = arguments.len();
-            (state.call_id.clone(), state.name.clone(), arguments)
+            (
+                state.call_id.clone(),
+                state.name.clone(),
+                arguments,
+                state.thought_signature.clone(),
+            )
         };
+        let mut tool_call = json!({
+            "index": downstream_index,
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments}
+        });
+        attach_chat_thought_signature(&mut tool_call, thought_signature.as_deref());
         let mut frames = self.ensure_role_chunk();
         frames.push(chat_stream_chunk(
             &self.response_id,
             &self.model,
-            json!({
-                "tool_calls": [{
-                    "index": downstream_index,
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments}
-                }]
-            }),
+            json!({"tool_calls": [tool_call]}),
             Value::Null,
             None,
         ));
@@ -2340,6 +3881,7 @@ enum AnthropicResponsesBlock {
         call_id: String,
         name: String,
         arguments: String,
+        signature: Option<String>,
         custom: bool,
         done: bool,
     },
@@ -2522,6 +4064,7 @@ impl AnthropicResponsesState {
                     .and_then(|value| serde_json::to_string(value).ok())
                     .filter(|value| value != "{}")
                     .unwrap_or_default();
+                let signature = bridge_thought_signature(block).map(str::to_string);
                 let custom = self.responses_tool_context.is_custom_tool_chat_name(&name);
                 let item_id = self
                     .responses_tool_context
@@ -2534,17 +4077,19 @@ impl AnthropicResponsesState {
                         call_id: call_id.clone(),
                         name: name.clone(),
                         arguments: arguments.clone(),
+                        signature: signature.clone(),
                         custom,
                         done: false,
                     },
                 );
-                let item = self.responses_tool_context.response_item(
+                let mut item = self.responses_tool_context.response_item(
                     &item_id,
                     "in_progress",
                     &call_id,
                     &name,
                     "",
                 );
+                attach_responses_thought_signature(&mut item, signature.as_deref());
                 frames.push(StreamFrame::json(json!({
                     "type": "response.output_item.added",
                     "output_index": output_index,
@@ -2712,9 +4257,16 @@ impl AnthropicResponsesState {
                 } else {
                     json!({"type": "thinking", "thinking": text, "signature": signature})
                 };
-                let item = responses_reasoning_item_from_anthropic_block(item_id, &anthropic_block)
-                    .or_else(|| unsigned_responses_reasoning_item(item_id, text))
-                    .unwrap_or_else(|| json!({"id": item_id, "type": "reasoning", "summary": []}));
+                let mut item =
+                    responses_reasoning_item_from_anthropic_block(item_id, &anthropic_block)
+                        .or_else(|| unsigned_responses_reasoning_item(item_id, text))
+                        .unwrap_or_else(
+                            || json!({"id": item_id, "type": "reasoning", "summary": []}),
+                        );
+                attach_responses_thought_signature(
+                    &mut item,
+                    (!signature.is_empty()).then_some(signature.as_str()),
+                );
                 self.output_items.push((*output_index, item.clone()));
                 vec![
                     StreamFrame::json(json!({
@@ -2744,6 +4296,7 @@ impl AnthropicResponsesState {
                 call_id,
                 name,
                 arguments,
+                signature,
                 custom,
                 done,
             } => {
@@ -2753,13 +4306,14 @@ impl AnthropicResponsesState {
                 *done = true;
                 let arguments = canonicalize_arguments(arguments);
                 if *custom {
-                    let item = self.responses_tool_context.response_item(
+                    let mut item = self.responses_tool_context.response_item(
                         item_id,
                         "completed",
                         call_id,
                         name,
                         &arguments,
                     );
+                    attach_responses_thought_signature(&mut item, signature.as_deref());
                     let input = item
                         .get("input")
                         .and_then(Value::as_str)
@@ -2788,13 +4342,14 @@ impl AnthropicResponsesState {
                     })));
                     return frames;
                 }
-                let item = self.responses_tool_context.response_item(
+                let mut item = self.responses_tool_context.response_item(
                     item_id,
                     "completed",
                     call_id,
                     name,
                     &arguments,
                 );
+                attach_responses_thought_signature(&mut item, signature.as_deref());
                 self.output_items.push((*output_index, item.clone()));
                 vec![
                     StreamFrame::json(json!({
@@ -2932,6 +4487,26 @@ fn protocol_error(kind: &'static str) {
 mod tests {
     use super::*;
 
+    fn gemini_v1internal_stored_provider(
+        app: crate::domain::providers::model::AppKind,
+        provider_type: crate::domain::providers::model::ProviderType,
+    ) -> StoredProvider {
+        StoredProvider {
+            app,
+            provider: crate::domain::providers::model::Provider {
+                id: format!("{}-stream-fixture", provider_type.as_str()),
+                name: provider_type.as_str().to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
+            resource: Default::default(),
+        }
+    }
+
     fn responses_transformer() -> StreamEventTransformer {
         StreamEventTransformer {
             upstream: Some(UpstreamFormat::OpenAiResponses),
@@ -2941,6 +4516,8 @@ mod tests {
             bridge: Some(StreamBridgeState::ResponsesAnthropic(
                 ResponsesAnthropicState::default(),
             )),
+            unwrap_v1internal: false,
+            gemini_terminal: None,
         }
     }
 
@@ -2972,6 +4549,1026 @@ mod tests {
             .push(Bytes::from_static(b"hi\"}\n"))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn gemini_v1internal_gemini_cli_stream_unwraps_at_every_chunk_boundary() {
+        let wire = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1}}}\r\n\r\n"
+        );
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Gemini,
+            crate::domain::providers::model::ProviderType::GeminiCli,
+        );
+
+        for split in 1..wire.len() {
+            let mut transformer = StreamEventTransformer::new(
+                &stored,
+                ProxyRoute::Gemini,
+                transforms::ResponsesToolContext::default(),
+            );
+            let mut output = transformer
+                .push(Bytes::copy_from_slice(&wire.as_bytes()[..split]))
+                .unwrap()
+                .to_vec();
+            output.extend_from_slice(
+                &transformer
+                    .push(Bytes::copy_from_slice(&wire.as_bytes()[split..]))
+                    .unwrap(),
+            );
+            output.extend_from_slice(&transformer.finish().unwrap());
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("\"text\":\"hello\""), "split={split}");
+            assert!(
+                output.contains("\"finishReason\":\"STOP\""),
+                "split={split}"
+            );
+            assert!(output.contains("\"promptTokenCount\":2"), "split={split}");
+            assert!(!output.contains("\"response\":"), "split={split}");
+        }
+    }
+
+    #[test]
+    fn gemini_v1internal_same_format_rejects_truncated_eof_and_done() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Gemini,
+            crate::domain::providers::model::ProviderType::GeminiCli,
+        );
+        let partial = Bytes::from_static(
+            b"data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n",
+        );
+
+        let mut eof = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::Gemini,
+            transforms::ResponsesToolContext::default(),
+        );
+        assert!(!eof.push(partial.clone()).unwrap().is_empty());
+        let error = eof.finish().unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("terminal candidate"));
+
+        let mut done = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::Gemini,
+            transforms::ResponsesToolContext::default(),
+        );
+        assert!(!done.push(partial).unwrap().is_empty());
+        let error = done
+            .push(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("terminal candidate"));
+    }
+
+    #[test]
+    fn gemini_v1internal_same_format_accepts_blocked_prompt_terminal() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Gemini,
+            crate::domain::providers::model::ProviderType::GeminiCli,
+        );
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::Gemini,
+            transforms::ResponsesToolContext::default(),
+        );
+        let output = transformer
+            .push(Bytes::from_static(
+                b"data: {\"response\":{\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}}\n\n",
+            ))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("\"blockReason\":\"SAFETY\""));
+        assert!(transformer.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gemini_v1internal_blocked_prompt_bridges_to_claude_refusal() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Claude,
+            crate::domain::providers::model::ProviderType::AntigravityOAuth,
+        );
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::ClaudeMessages,
+            transforms::ResponsesToolContext::default(),
+        );
+        let mut output = transformer
+            .push(Bytes::from_static(
+                b"data: {\"response\":{\"responseId\":\"blocked\",\"modelVersion\":\"gemini-2.5-flash\",\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":0}}}\n\n",
+            ))
+            .unwrap()
+            .to_vec();
+        output.extend_from_slice(&transformer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("event: message_start"));
+        assert!(output.contains("\"stop_reason\":\"refusal\""));
+        assert!(output.contains("event: message_stop"));
+        assert!(output.contains("\"input_tokens\":4"));
+        assert!(!output.contains("event: content_block_start"));
+    }
+
+    #[test]
+    fn gemini_v1internal_candidate_safety_stop_bridges_to_claude_refusal() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Claude,
+            crate::domain::providers::model::ProviderType::AntigravityOAuth,
+        );
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::ClaudeMessages,
+            transforms::ResponsesToolContext::default(),
+        );
+        let mut output = transformer
+            .push(Bytes::from_static(
+                b"data: {\"response\":{\"responseId\":\"candidate-blocked\",\"modelVersion\":\"gemini-2.5-flash\",\"candidates\":[{\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":0}}}\n\n",
+            ))
+            .unwrap()
+            .to_vec();
+        output.extend_from_slice(&transformer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("event: message_start"));
+        assert!(output.contains("\"stop_reason\":\"refusal\""));
+        assert!(output.contains("event: message_stop"));
+        assert!(output.contains("\"input_tokens\":4"));
+        assert!(!output.contains("\"finishReason\":\"SAFETY\""));
+    }
+
+    #[test]
+    fn antigravity_v1internal_gemini_stream_bridges_to_claude_after_unwrap() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Claude,
+            crate::domain::providers::model::ProviderType::AntigravityOAuth,
+        );
+        let wire = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"bridged\"}]},\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":2}}}\n\n"
+        );
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::ClaudeMessages,
+            transforms::ResponsesToolContext::default(),
+        );
+        let mut output = Vec::new();
+        for chunk in wire.as_bytes().chunks(11) {
+            output.extend_from_slice(&transformer.push(Bytes::copy_from_slice(chunk)).unwrap());
+        }
+        output.extend_from_slice(&transformer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+
+        let message_start = output.find("event: message_start").unwrap();
+        let content_start = output.find("event: content_block_start").unwrap();
+        let content_delta = output.find("event: content_block_delta").unwrap();
+        let content_stop = output.find("event: content_block_stop").unwrap();
+        let message_delta = output.find("event: message_delta").unwrap();
+        let message_stop = output.find("event: message_stop").unwrap();
+        assert!(message_start < content_start);
+        assert!(content_start < content_delta);
+        assert!(content_delta < content_stop);
+        assert!(content_stop < message_delta);
+        assert!(message_delta < message_stop);
+        assert!(output.contains("\"type\":\"text_delta\""));
+        assert!(output.contains("\"text\":\"bridged\""));
+        assert!(output.contains("\"input_tokens\":4"));
+        assert!(output.contains("\"output_tokens\":5"));
+        assert!(!output.contains("\"response\":"));
+    }
+
+    #[test]
+    fn gemini_v1internal_embedded_errors_fail_before_stream_unwrap() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Claude,
+            crate::domain::providers::model::ProviderType::AntigravityOAuth,
+        );
+        for event in [
+            "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"busy\"}}\n\n",
+            "data: {\"response\":{\"error\":{\"code\":403,\"status\":\"PERMISSION_DENIED\",\"message\":\"denied\"}}}\n\n",
+        ] {
+            let mut transformer = StreamEventTransformer::new(
+                &stored,
+                ProxyRoute::ClaudeMessages,
+                transforms::ResponsesToolContext::default(),
+            );
+            let error = transformer.push(Bytes::from(event)).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+            assert!(error.message.contains("embedded error"));
+        }
+    }
+
+    #[test]
+    fn non_gemini_error_events_keep_their_protocol_bridge() {
+        let mut transformer = responses_transformer();
+        let output = transformer
+            .push(Bytes::from_static(
+                b"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"error\":{\"message\":\"upstream failed\"}}}\n\n",
+            ))
+            .unwrap();
+        let output = String::from_utf8(output.to_vec()).unwrap();
+
+        assert!(output.contains("\"type\":\"upstream_error\""));
+        assert!(output.contains("upstream failed"));
+        assert!(!output.contains("Google upstream embedded error"));
+    }
+
+    #[test]
+    fn gemini_anthropic_bridge_closes_tool_block_and_reports_tool_stop() {
+        let mut state = GeminiAnthropicState::default();
+        let mut frames = state.transform(&json!({
+            "responseId": "gem-tool",
+            "modelVersion": "gemini-test",
+            "candidates": [{
+                "content": {"parts": [{
+                    "functionCall": {
+                        "id": "call_lookup",
+                        "name": "lookup",
+                        "args": {"query": "server"}
+                    }
+                }]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
+        }));
+        frames.extend(state.finish_stream().unwrap());
+        let types = frames
+            .iter()
+            .map(|frame| frame.payload_json()["type"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(frames[4].payload_json()["delta"]["stop_reason"], "tool_use");
+        assert!(state.completed);
+    }
+
+    #[test]
+    fn gemini_anthropic_bridge_separates_signed_thinking_text_and_tool_blocks() {
+        let mut state = GeminiAnthropicState::default();
+        let mut frames = state.transform(&json!({
+            "responseId": "gem-thought",
+            "modelVersion": "gemini-3-pro-preview",
+            "candidates": [{
+                "content": {"parts": [{"text": "private ", "thought": true}]}
+            }]
+        }));
+        frames.extend(state.transform(&json!({
+            "candidates": [{
+                "content": {"parts": [{
+                    "text": "plan",
+                    "thought": true,
+                    "thoughtSignature": "thought-signature"
+                }]}
+            }]
+        })));
+        frames.extend(state.transform(&json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "visible answer"}]}
+            }]
+        })));
+        frames.extend(state.transform(&json!({
+            "candidates": [{
+                "content": {"parts": [{
+                    "functionCall": {
+                        "id": "call_lookup",
+                        "name": "lookup",
+                        "args": {"query": "server"}
+                    },
+                    "thoughtSignature": "tool-signature"
+                }]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2}
+        })));
+        frames.extend(state.finish_stream().unwrap());
+
+        let starts = frames
+            .iter()
+            .filter(|frame| frame.payload_json()["type"] == "content_block_start")
+            .map(|frame| frame.payload_json()["content_block"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thinking", "text", "tool_use"]
+        );
+        assert_eq!(starts[2]["id"], "call_lookup");
+        assert_eq!(starts[2]["signature"], "tool-signature");
+
+        let thinking = frames
+            .iter()
+            .filter(|frame| {
+                frame
+                    .payload_json()
+                    .pointer("/delta/type")
+                    .and_then(Value::as_str)
+                    == Some("thinking_delta")
+            })
+            .map(|frame| frame.payload_json()["delta"]["thinking"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(thinking, ["private ", "plan"]);
+
+        let visible = frames
+            .iter()
+            .filter(|frame| {
+                frame
+                    .payload_json()
+                    .pointer("/delta/type")
+                    .and_then(Value::as_str)
+                    == Some("text_delta")
+            })
+            .map(|frame| frame.payload_json()["delta"]["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["visible answer"]);
+        assert!(frames.iter().any(|frame| {
+            frame
+                .payload_json()
+                .pointer("/delta/signature")
+                .and_then(Value::as_str)
+                == Some("thought-signature")
+        }));
+
+        let thinking_stop = frames
+            .iter()
+            .position(|frame| {
+                frame.payload_json()["type"] == "content_block_stop"
+                    && frame.payload_json()["index"] == 0
+            })
+            .unwrap();
+        let text_start = frames
+            .iter()
+            .position(|frame| {
+                frame.payload_json()["type"] == "content_block_start"
+                    && frame.payload_json()["content_block"]["type"] == "text"
+            })
+            .unwrap();
+        assert!(thinking_stop < text_start);
+        assert_eq!(
+            frames
+                .iter()
+                .find(|frame| frame.payload_json()["type"] == "message_delta")
+                .unwrap()
+                .payload_json()["delta"]["stop_reason"],
+            "tool_use"
+        );
+        assert!(state.completed);
+    }
+
+    #[test]
+    fn gemini_cross_protocol_routes_use_stateful_bridges() {
+        use crate::domain::providers::model::{AppKind, ProviderType};
+
+        let cases = [
+            (
+                AppKind::Codex,
+                ProviderType::Gemini,
+                ProxyRoute::CodexResponses,
+                "gemini_openai",
+            ),
+            (
+                AppKind::Codex,
+                ProviderType::Gemini,
+                ProxyRoute::CodexChatCompletions,
+                "gemini_openai",
+            ),
+            (
+                AppKind::Gemini,
+                ProviderType::Claude,
+                ProxyRoute::Gemini,
+                "to_gemini",
+            ),
+            (
+                AppKind::Gemini,
+                ProviderType::Codex,
+                ProxyRoute::Gemini,
+                "to_gemini",
+            ),
+            (
+                AppKind::Gemini,
+                ProviderType::OpenRouter,
+                ProxyRoute::Gemini,
+                "to_gemini",
+            ),
+        ];
+        for (app, provider_type, route, expected) in cases {
+            let stored = gemini_v1internal_stored_provider(app, provider_type);
+            let transformer = StreamEventTransformer::new(
+                &stored,
+                route,
+                transforms::ResponsesToolContext::default(),
+            );
+            assert!(matches!(
+                (expected, transformer.bridge.as_ref()),
+                ("gemini_openai", Some(StreamBridgeState::GeminiOpenAi(_)))
+                    | ("to_gemini", Some(StreamBridgeState::ToGemini(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn gemini_cross_protocol_to_openai_preserves_content_tools_usage_and_terminal() {
+        let responses = gemini_openai_fixture(GeminiOpenAiState::responses(
+            transforms::ResponsesToolContext::default(),
+        ));
+        let response_json = json_stream_frames(&responses);
+        assert_eq!(
+            response_json
+                .iter()
+                .filter_map(
+                    |value| (value["type"] == "response.reasoning_summary_text.delta")
+                        .then(|| value["delta"].as_str())
+                        .flatten()
+                )
+                .collect::<String>(),
+            "private plan"
+        );
+        assert_eq!(
+            response_json
+                .iter()
+                .filter_map(|value| (value["type"] == "response.output_text.delta")
+                    .then(|| value["delta"].as_str())
+                    .flatten())
+                .collect::<String>(),
+            "hello"
+        );
+        let reasoning = response_json
+            .iter()
+            .find(|value| {
+                value["type"] == "response.output_item.done" && value["item"]["type"] == "reasoning"
+            })
+            .unwrap();
+        assert_eq!(reasoning["item"]["thought_signature"], "thought-signature");
+        let tool = response_json
+            .iter()
+            .find(|value| {
+                value["type"] == "response.output_item.done"
+                    && value["item"]["type"] == "function_call"
+            })
+            .unwrap();
+        assert_eq!(tool["output_index"], 2);
+        assert_eq!(tool["item"]["call_id"], "call_lookup");
+        assert_eq!(tool["item"]["arguments"], r#"{"query":"server"}"#);
+        assert_eq!(tool["item"]["thought_signature"], "tool-signature");
+        let terminal = response_json
+            .iter()
+            .find(|value| value["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(terminal["response"]["usage"]["input_tokens"], 8);
+        assert_eq!(terminal["response"]["usage"]["output_tokens"], 5);
+        assert_eq!(done_frame_count(&responses), 1);
+
+        let chat = gemini_openai_fixture(GeminiOpenAiState::chat(
+            transforms::ResponsesToolContext::default(),
+        ));
+        let chat_json = json_stream_frames(&chat);
+        assert_eq!(
+            chat_json
+                .iter()
+                .filter_map(|value| value
+                    .pointer("/choices/0/delta/content")
+                    .and_then(Value::as_str))
+                .collect::<String>(),
+            "hello"
+        );
+        assert_eq!(
+            chat_json
+                .iter()
+                .filter_map(|value| value
+                    .pointer("/choices/0/delta/reasoning_content")
+                    .and_then(Value::as_str))
+                .collect::<String>(),
+            "private plan"
+        );
+        assert!(chat_json.iter().any(|value| {
+            value
+                .pointer("/choices/0/delta/reasoning_signature")
+                .and_then(Value::as_str)
+                == Some("thought-signature")
+        }));
+        let tool_call = chat_json
+            .iter()
+            .find_map(|value| value.pointer("/choices/0/delta/tool_calls/0"))
+            .unwrap();
+        assert_eq!(tool_call["index"], 0);
+        assert_eq!(tool_call["id"], "call_lookup");
+        assert_eq!(
+            tool_call.pointer("/extra_content/google/thought_signature"),
+            Some(&json!("tool-signature"))
+        );
+        assert_eq!(
+            chat_json
+                .iter()
+                .filter_map(|value| value
+                    .pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                    .and_then(Value::as_str))
+                .collect::<String>(),
+            r#"{"query":"server"}"#
+        );
+        let terminal = chat_json
+            .iter()
+            .find(|value| value.pointer("/choices/0/finish_reason") == Some(&json!("tool_calls")))
+            .unwrap();
+        assert_eq!(terminal["usage"]["prompt_tokens"], 8);
+        assert_eq!(terminal["usage"]["completion_tokens"], 5);
+        assert_eq!(done_frame_count(&chat), 1);
+    }
+
+    #[test]
+    fn gemini_cross_protocol_from_all_sources_preserves_native_semantics() {
+        let mut anthropic = ToGeminiState::anthropic();
+        let anthropic_frames = drive_to_gemini(
+            &mut anthropic,
+            &[
+                json!({"type":"message_start","message":{"id":"gem-a","model":"claude","usage":{"input_tokens":4,"cache_read_input_tokens":1}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"anthropic-signature"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_a","name":"lookup","input":{},"signature":"tool-a"}}),
+                json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"q\":1}"}}),
+                json!({"type":"content_block_stop","index":2}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}),
+                json!({"type":"message_stop"}),
+            ],
+        );
+        assert_native_gemini_frames(
+            &anthropic_frames,
+            NativeGeminiExpectation {
+                thinking: "plan",
+                text: "answer",
+                call_id: "call_a",
+                thinking_signature: "anthropic-signature",
+                tool_signature: "tool-a",
+                input_tokens: 5,
+                output_tokens: 3,
+            },
+        );
+
+        let mut responses = ToGeminiState::responses();
+        let responses_frames = drive_to_gemini(
+            &mut responses,
+            &[
+                json!({"type":"response.created","response":{"id":"resp-g","model":"gpt"}}),
+                json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"plan"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","summary":[{"type":"summary_text","text":"plan"}],"thought_signature":"responses-signature"}}),
+                json!({"type":"response.output_text.delta","output_index":1,"delta":"answer"}),
+                json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_r","name":"lookup","thought_signature":"tool-r"}}),
+                json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"q\":2}"}),
+                json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","call_id":"call_r","name":"lookup","arguments":"{\"q\":2}","thought_signature":"tool-r"}}),
+                json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":6,"output_tokens":4}}}),
+            ],
+        );
+        assert_native_gemini_frames(
+            &responses_frames,
+            NativeGeminiExpectation {
+                thinking: "plan",
+                text: "answer",
+                call_id: "call_r",
+                thinking_signature: "responses-signature",
+                tool_signature: "tool-r",
+                input_tokens: 6,
+                output_tokens: 4,
+            },
+        );
+
+        let mut chat = ToGeminiState::chat();
+        let chat_frames = drive_to_gemini(
+            &mut chat,
+            &[
+                json!({"id":"chat-g","model":"chat","choices":[{"delta":{"reasoning_content":"plan","extra_content":{"google":{"thought_signature":"chat-signature"}}},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"content":"answer"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_c","type":"function","function":{"name":"lookup","arguments":"{\"q\":"},"extra_content":{"google":{"thought_signature":"tool-c"}}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"3}"}}]},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":2}}}),
+            ],
+        );
+        assert_native_gemini_frames(
+            &chat_frames,
+            NativeGeminiExpectation {
+                thinking: "plan",
+                text: "answer",
+                call_id: "call_c",
+                thinking_signature: "chat-signature",
+                tool_signature: "tool-c",
+                input_tokens: 7,
+                output_tokens: 5,
+            },
+        );
+    }
+
+    #[test]
+    fn gemini_cross_protocol_refusal_terminal_and_unexpected_eof_fail_closed() {
+        for mut state in [
+            GeminiOpenAiState::responses(transforms::ResponsesToolContext::default()),
+            GeminiOpenAiState::chat(transforms::ResponsesToolContext::default()),
+        ] {
+            let initial = state
+                .transform(&json!({
+                    "responseId":"blocked",
+                    "promptFeedback":{"blockReason":"SAFETY"}
+                }))
+                .unwrap();
+            assert_eq!(done_frame_count(&initial), 0);
+            assert!(!json_stream_frames(&initial).iter().any(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|event| {
+                        matches!(event, "response.incomplete" | "response.completed")
+                    })
+                    || value
+                        .pointer("/choices/0/finish_reason")
+                        .is_some_and(|reason| !reason.is_null())
+            }));
+            assert!(state
+                .transform(&json!({
+                    "usageMetadata":{"promptTokenCount":2,"totalTokenCount":7}
+                }))
+                .unwrap()
+                .is_empty());
+            let frames = state.finish_stream().unwrap();
+            let payloads = json_stream_frames(&frames);
+            assert!(payloads.iter().any(|value| {
+                value.pointer("/response/incomplete_details/reason")
+                    == Some(&json!("content_filter"))
+                    || value.pointer("/choices/0/finish_reason") == Some(&json!("content_filter"))
+            }));
+            assert!(payloads.iter().any(|value| {
+                value.pointer("/response/usage/input_tokens") == Some(&json!(2))
+                    && value.pointer("/response/usage/output_tokens") == Some(&json!(5))
+                    || value.pointer("/usage/prompt_tokens") == Some(&json!(2))
+                        && value.pointer("/usage/completion_tokens") == Some(&json!(5))
+            }));
+            assert_eq!(done_frame_count(&frames), 1);
+            assert!(state.finish_stream().unwrap().is_empty());
+        }
+
+        for mut state in [
+            ToGeminiState::anthropic(),
+            ToGeminiState::responses(),
+            ToGeminiState::chat(),
+        ] {
+            let events = match &state.source {
+                ToAnthropicSource::Anthropic => {
+                    vec![json!({"type":"message_start","message":{"id":"partial"}})]
+                }
+                ToAnthropicSource::Responses(_) => {
+                    vec![json!({"type":"response.output_text.delta","delta":"partial"})]
+                }
+                ToAnthropicSource::Chat(_) => {
+                    vec![json!({"choices":[{"delta":{"content":"partial"},"finish_reason":null}]})]
+                }
+            };
+            drive_to_gemini(&mut state, &events);
+            let mut bridge = StreamBridgeState::ToGemini(Box::new(state));
+            assert!(bridge.finish_eof().is_err());
+        }
+
+        let mut gemini = StreamBridgeState::GeminiOpenAi(Box::new(GeminiOpenAiState::responses(
+            transforms::ResponsesToolContext::default(),
+        )));
+        gemini
+            .transform(&json!({"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}))
+            .unwrap();
+        assert!(gemini.finish_eof().is_err());
+    }
+
+    #[test]
+    fn gemini_anthropic_tracks_same_name_idless_tools_and_merges_nested_arguments() {
+        let mut state = GeminiAnthropicState::default();
+        let first = json!({
+            "responseId":"gem-parallel",
+            "candidates":[{"index":0,"content":{"parts":[
+                {"functionCall":{"name":"lookup","args":{"query":{"left":"a"}}}},
+                {"functionCall":{"name":"lookup","args":{"query":{"left":"b"}}}}
+            ]}}]
+        });
+        let second = json!({
+            "candidates":[{"index":0,"content":{"parts":[
+                {"functionCall":{"name":"lookup","args":{"query":{"right":1}}}},
+                {"functionCall":{"name":"lookup","args":{"query":{"right":2}}}}
+            ]},"finishReason":"STOP"}]
+        });
+        let mut frames = state.transform(&first);
+        frames.extend(state.transform(&second));
+        frames.extend(state.finish_stream().unwrap());
+
+        let starts = json_stream_frames(&frames)
+            .into_iter()
+            .filter(|value| {
+                value["type"] == "content_block_start"
+                    && value["content_block"]["type"] == "tool_use"
+            })
+            .map(|value| value["content_block"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0]["id"], starts[1]["id"]);
+
+        let arguments = json_stream_frames(&frames)
+            .into_iter()
+            .filter_map(|value| {
+                (value.pointer("/delta/type") == Some(&json!("input_json_delta")))
+                    .then(|| value.pointer("/delta/partial_json")?.as_str())
+                    .flatten()
+            })
+            .map(|arguments| serde_json::from_str::<Value>(arguments).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                json!({"query":{"left":"a","right":1}}),
+                json!({"query":{"left":"b","right":2}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_truncation_reason_wins_over_tool_output() {
+        for (finish_reason, expected_stop) in [("SAFETY", "refusal"), ("MAX_TOKENS", "max_tokens")]
+        {
+            let mut state = GeminiAnthropicState::default();
+            let mut frames = state.transform(&json!({
+                "candidates":[{
+                    "content":{"parts":[{"functionCall":{"name":"lookup","args":{"q":1}}}]},
+                    "finishReason":finish_reason
+                }]
+            }));
+            frames.extend(state.finish_stream().unwrap());
+            assert!(json_stream_frames(&frames).iter().any(|value| {
+                value.pointer("/delta/stop_reason") == Some(&json!(expected_stop))
+            }));
+        }
+
+        let mut responses =
+            GeminiOpenAiState::responses(transforms::ResponsesToolContext::default());
+        responses
+            .transform(&json!({
+                "candidates":[{
+                    "content":{"parts":[{"functionCall":{"name":"lookup","args":{"q":1}}}]},
+                    "finishReason":"MAX_TOKENS"
+                }]
+            }))
+            .unwrap();
+        let terminal = responses.finish_stream().unwrap();
+        assert!(json_stream_frames(&terminal)
+            .iter()
+            .any(|value| value["type"] == "response.incomplete"));
+        assert!(!json_stream_frames(&terminal)
+            .iter()
+            .any(|value| value["type"] == "response.completed"));
+    }
+
+    #[test]
+    fn gemini_usage_only_frames_merge_around_finish_and_emit_one_terminal() {
+        for usage_after_finish in [false, true] {
+            let mut state = GeminiAnthropicState::default();
+            let usage = json!({
+                "usageMetadata":{"promptTokenCount":3,"totalTokenCount":8}
+            });
+            if !usage_after_finish {
+                assert!(state.transform(&usage).is_empty());
+            }
+            let mut frames = state.transform(&json!({
+                "responseId":"gem-usage",
+                "candidates":[{"finishReason":"STOP"}]
+            }));
+            if usage_after_finish {
+                assert!(state.transform(&usage).is_empty());
+            }
+            frames.extend(state.finish_stream().unwrap());
+            frames.extend(state.finish_stream().unwrap());
+
+            let terminals = json_stream_frames(&frames)
+                .into_iter()
+                .filter(|value| value["type"] == "message_delta")
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 1);
+            assert_eq!(terminals[0]["usage"]["input_tokens"], 3);
+            assert_eq!(terminals[0]["usage"]["output_tokens"], 5);
+        }
+    }
+
+    #[test]
+    fn to_gemini_waits_for_chat_usage_tail_and_late_tool_signatures() {
+        let mut state = ToGeminiState::chat();
+        let first = state
+            .transform(&json!({
+                "id":"chat-late",
+                "choices":[{"delta":{"tool_calls":[{
+                    "index":0,
+                    "id":"call_late",
+                    "function":{"name":"lookup","arguments":"{\"q\":"}
+                }]},"finish_reason":null}]
+            }))
+            .unwrap();
+        assert!(!state.completed());
+        let finish = state
+            .transform(&json!({
+                "choices":[{"delta":{"tool_calls":[{
+                    "index":0,
+                    "function":{"arguments":"1}"},
+                    "extra_content":{"google":{"thought_signature":"late-chat-signature"}}
+                }]},"finish_reason":"tool_calls"}]
+            }))
+            .unwrap();
+        assert!(!state.completed());
+        assert!(!json_stream_frames(&first)
+            .iter()
+            .chain(json_stream_frames(&finish).iter())
+            .any(|value| value.pointer("/candidates/0/finishReason").is_some()));
+
+        let terminal = state
+            .transform(&json!({
+                "choices":[],
+                "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+            }))
+            .unwrap();
+        assert!(state.completed());
+        let payloads = json_stream_frames(&terminal);
+        let tool = payloads
+            .iter()
+            .find_map(|value| value.pointer("/candidates/0/content/parts/0"))
+            .unwrap();
+        assert_eq!(tool["functionCall"]["id"], "call_late");
+        assert_eq!(tool["functionCall"]["args"], json!({"q":1}));
+        assert_eq!(tool["thoughtSignature"], "late-chat-signature");
+        let terminals = payloads
+            .iter()
+            .filter(|value| value.pointer("/candidates/0/finishReason").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["usageMetadata"]["promptTokenCount"], 4);
+        assert_eq!(terminals[0]["usageMetadata"]["candidatesTokenCount"], 2);
+        assert!(state.finish_stream().unwrap().is_empty());
+    }
+
+    #[test]
+    fn to_gemini_uses_signature_from_responses_item_done() {
+        let mut state = ToGeminiState::responses();
+        let frames = drive_to_gemini(
+            &mut state,
+            &[
+                json!({"type":"response.created","response":{"id":"resp-late"}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_late","name":"lookup"}}),
+                json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"q\":1}"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_late","name":"lookup","arguments":"{\"q\":1}","thought_signature":"late-responses-signature"}}),
+                json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}),
+            ],
+        );
+        let tool = json_stream_frames(&frames)
+            .into_iter()
+            .find_map(|value| value.pointer("/candidates/0/content/parts/0"))
+            .unwrap();
+        assert_eq!(tool["functionCall"]["id"], "call_late");
+        assert_eq!(tool["thoughtSignature"], "late-responses-signature");
+    }
+
+    #[test]
+    fn gemini_bridge_done_and_eof_are_fail_closed_and_idempotent_after_terminal() {
+        let mut premature_done =
+            StreamBridgeState::GeminiAnthropic(GeminiAnthropicState::default());
+        premature_done
+            .transform(&json!({"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}))
+            .unwrap();
+        assert!(premature_done.upstream_done().is_err());
+
+        let mut premature_eof = StreamBridgeState::GeminiAnthropic(GeminiAnthropicState::default());
+        premature_eof
+            .transform(&json!({"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}))
+            .unwrap();
+        assert!(premature_eof.finish_eof().is_err());
+
+        let mut completed = StreamBridgeState::GeminiOpenAi(Box::new(
+            GeminiOpenAiState::responses(transforms::ResponsesToolContext::default()),
+        ));
+        completed
+            .transform(&json!({"candidates":[{"finishReason":"STOP"}]}))
+            .unwrap();
+        let terminal = completed.upstream_done().unwrap();
+        assert_eq!(done_frame_count(&terminal), 1);
+        assert!(completed.upstream_done().unwrap().is_empty());
+        assert!(completed.finish_eof().unwrap().is_empty());
+    }
+
+    fn gemini_openai_fixture(mut state: GeminiOpenAiState) -> Vec<StreamFrame> {
+        let events = [
+            json!({"responseId":"gem-cross","modelVersion":"gemini-test","candidates":[{"content":{"parts":[{"text":"private ","thought":true}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"text":"private plan","thought":true,"thoughtSignature":"thought-signature"}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"text":"hel"}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_lookup","name":"lookup","args":{"query":"ser"}}}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_lookup","name":"lookup","args":{"query":"server"}},"thoughtSignature":"tool-signature"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8,"cachedContentTokenCount":2,"candidatesTokenCount":3,"thoughtsTokenCount":2}}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.transform(&event).unwrap());
+        }
+        frames.extend(state.finish_stream().unwrap());
+        assert!(state.completed());
+        frames
+    }
+
+    fn drive_to_gemini(state: &mut ToGeminiState, events: &[Value]) -> Vec<StreamFrame> {
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.transform(event).unwrap());
+        }
+        frames
+    }
+
+    struct NativeGeminiExpectation<'a> {
+        thinking: &'a str,
+        text: &'a str,
+        call_id: &'a str,
+        thinking_signature: &'a str,
+        tool_signature: &'a str,
+        input_tokens: u64,
+        output_tokens: u64,
+    }
+
+    fn assert_native_gemini_frames(frames: &[StreamFrame], expected: NativeGeminiExpectation<'_>) {
+        let payloads = json_stream_frames(frames);
+        assert_eq!(
+            payloads
+                .iter()
+                .filter_map(|value| value
+                    .pointer("/candidates/0/content/parts/0")
+                    .filter(|part| part["thought"] == true)
+                    .and_then(|part| part["text"].as_str())
+                    .filter(|text| !text.is_empty()))
+                .collect::<String>(),
+            expected.thinking
+        );
+        assert_eq!(
+            payloads
+                .iter()
+                .filter_map(|value| value
+                    .pointer("/candidates/0/content/parts/0")
+                    .filter(|part| part.get("thought").is_none())
+                    .and_then(|part| part["text"].as_str()))
+                .collect::<String>(),
+            expected.text
+        );
+        assert!(payloads.iter().any(|value| {
+            value.pointer("/candidates/0/content/parts/0/thoughtSignature")
+                == Some(&json!(expected.thinking_signature))
+        }));
+        let tool = payloads
+            .iter()
+            .find_map(|value| {
+                value
+                    .pointer("/candidates/0/content/parts/0")
+                    .filter(|part| part.get("functionCall").is_some())
+            })
+            .unwrap();
+        assert_eq!(tool["functionCall"]["id"], expected.call_id);
+        assert_eq!(tool["thoughtSignature"], expected.tool_signature);
+        let terminals = payloads
+            .iter()
+            .filter(|value| value.pointer("/candidates/0/finishReason").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(
+            terminals[0]["usageMetadata"]["promptTokenCount"],
+            expected.input_tokens
+        );
+        assert_eq!(
+            terminals[0]["usageMetadata"]["candidatesTokenCount"],
+            expected.output_tokens
+        );
+        assert_eq!(done_frame_count(frames), 0);
+    }
+
+    fn json_stream_frames(frames: &[StreamFrame]) -> Vec<&Value> {
+        frames
+            .iter()
+            .filter_map(|frame| match &frame.payload {
+                transforms::StreamPayload::Json(value) => Some(value),
+                transforms::StreamPayload::Done => None,
+            })
+            .collect()
+    }
+
+    fn done_frame_count(frames: &[StreamFrame]) -> usize {
+        frames
+            .iter()
+            .filter(|frame| matches!(frame.payload, transforms::StreamPayload::Done))
+            .count()
     }
 
     #[test]

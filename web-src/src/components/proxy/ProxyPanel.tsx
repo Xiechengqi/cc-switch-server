@@ -98,13 +98,15 @@ export function ProxyPanel() {
 
             <div className="space-y-2 border-t border-border pt-3">
               <p className="text-xs text-muted-foreground">
-                {t("provider.inUse")}
+                {t("proxy.panel.routableSurfaces", {
+                  defaultValue: "可路由 Surface",
+                })}
               </p>
               {status.active_targets?.length ? (
                 <div className="grid gap-2 sm:grid-cols-2">
                   {status.active_targets.map((target) => (
                     <div
-                      key={target.app_type}
+                      key={`${target.app_type}:${target.provider_id}`}
                       className="flex min-w-0 items-center justify-between rounded-md border border-border bg-background/60 px-2 py-1.5 text-xs"
                     >
                       <span className="text-muted-foreground">

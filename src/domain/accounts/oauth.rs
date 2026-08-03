@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::claude_subscription::{
+    resolve_claude_subscription, ClaudeSubscriptionCandidate, ClaudeSubscriptionResolution,
+    ClaudeSubscriptionSource,
+};
 use crate::domain::accounts::cursor_import::{
     cursor_account_id_from_stable_subject, cursor_workos_user_id_from_access_token,
 };
@@ -60,6 +64,24 @@ pub enum OAuthQuotaStrategy {
     NotAvailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRefreshCapability {
+    #[serde(rename = "oauth_request")]
+    OAuthRequest,
+    ProviderDynamic,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthQuotaCapability {
+    LiveRefresh,
+    ImportedSnapshot,
+    CachedOnly,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthProviderSpec {
@@ -79,6 +101,8 @@ pub struct OAuthProviderSpec {
     pub profile_url: Option<&'static str>,
     pub profile_strategy: OAuthProfileStrategy,
     pub quota_strategy: OAuthQuotaStrategy,
+    pub refresh_capability: OAuthRefreshCapability,
+    pub quota_capability: OAuthQuotaCapability,
 }
 
 impl OAuthProviderSpec {
@@ -119,6 +143,7 @@ pub struct OAuthErrorClassification {
     pub kind: OAuthErrorKind,
     pub retryable: bool,
     pub refresh_token_may_have_rotated: bool,
+    pub immediate_relogin: bool,
     pub message: String,
 }
 
@@ -212,6 +237,7 @@ pub fn parse_claude_authorization_code_input(
                 .to_string(),
             retryable: false,
             refresh_token_may_have_rotated: false,
+            immediate_relogin: false,
         });
     }
 
@@ -226,6 +252,7 @@ pub fn parse_claude_authorization_code_input(
             message: "authorization code format is invalid: missing code segment".to_string(),
             retryable: false,
             refresh_token_may_have_rotated: false,
+            immediate_relogin: false,
         });
     }
 
@@ -238,6 +265,7 @@ pub fn parse_claude_authorization_code_input(
                     message: format!("state mismatch: expected {expected_state}, received {state}"),
                     retryable: false,
                     refresh_token_may_have_rotated: false,
+                    immediate_relogin: false,
                 });
             }
             state.to_string()
@@ -259,6 +287,7 @@ pub fn parse_grok_authorization_code_input(
             message: "Grok authorization input is empty; paste the full callback URL, query string, or code".to_string(),
             retryable: false,
             refresh_token_may_have_rotated: false,
+            immediate_relogin: false,
         });
     }
 
@@ -292,6 +321,7 @@ pub fn parse_grok_authorization_code_input(
                 message: "Grok callback URL/query is missing code".to_string(),
                 retryable: false,
                 refresh_token_may_have_rotated: false,
+                immediate_relogin: false,
             })?;
         (code, state)
     } else {
@@ -308,6 +338,7 @@ pub fn parse_grok_authorization_code_input(
                 message: "Grok callback state does not match the login session".to_string(),
                 retryable: false,
                 refresh_token_may_have_rotated: false,
+                immediate_relogin: false,
             });
         }
     }
@@ -350,6 +381,7 @@ fn validate_oauth_endpoint_url(
         kind: OAuthErrorKind::Unsupported,
         retryable: false,
         refresh_token_may_have_rotated: false,
+        immediate_relogin: false,
         message: format!("invalid xAI OAuth endpoint URL: {error}"),
     })?;
     #[cfg(test)]
@@ -375,6 +407,7 @@ fn validate_oauth_endpoint_url(
         kind: OAuthErrorKind::Unsupported,
         retryable: false,
         refresh_token_may_have_rotated: false,
+        immediate_relogin: false,
         message: format!("xAI OAuth endpoint is not allowed: {url}"),
     })
 }
@@ -416,7 +449,8 @@ pub fn oauth_quota_auth_provider_label(provider_type: ProviderType) -> &'static 
         ProviderType::GitHubCopilot => "github_copilot",
         ProviderType::CodexOAuth => "codex_oauth",
         ProviderType::ClaudeOAuth => "claude_oauth",
-        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => "antigravity_oauth",
+        ProviderType::AntigravityOAuth => "antigravity_oauth",
+        ProviderType::AgyOAuth => "agy_oauth",
         ProviderType::GrokOAuth => "grok_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::CursorApiKey => "cursor_apikey",
@@ -445,6 +479,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: None,
             profile_strategy: OAuthProfileStrategy::JwtClaims,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::ClaudeOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -467,6 +503,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: None,
             profile_strategy: OAuthProfileStrategy::TokenResponseAccount,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::GeminiCli => Some(OAuthProviderSpec {
             provider_type,
@@ -489,6 +527,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: Some("https://www.googleapis.com/oauth2/v2/userinfo"),
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::CursorOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -507,6 +547,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: Some("https://cursor.com/api/auth/me"),
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::ImportedSnapshot,
         }),
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -527,6 +569,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: Some("https://www.googleapis.com/oauth2/v1/userinfo"),
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::GrokOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -545,6 +589,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: None,
             profile_strategy: OAuthProfileStrategy::JwtClaims,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::KiroOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -563,6 +609,8 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             profile_url: None,
             profile_strategy: OAuthProfileStrategy::ProviderSpecific,
             quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
+            refresh_capability: OAuthRefreshCapability::ProviderDynamic,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
@@ -590,6 +638,18 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
                 OAuthQuotaStrategy::ProviderSpecific
             } else {
                 OAuthQuotaStrategy::ProviderSnapshot
+            },
+            refresh_capability: OAuthRefreshCapability::Unavailable,
+            quota_capability: match provider_type {
+                ProviderType::GitHubCopilot | ProviderType::CursorApiKey => {
+                    OAuthQuotaCapability::ImportedSnapshot
+                }
+                ProviderType::OllamaCloud => OAuthQuotaCapability::LiveRefresh,
+                ProviderType::DeepSeekAccount
+                | ProviderType::AwsBedrock
+                | ProviderType::Nvidia
+                | ProviderType::DeepSeekApi => OAuthQuotaCapability::CachedOnly,
+                _ => unreachable!("manual account provider group is exhaustive"),
             },
         }),
         _ => None,
@@ -1019,6 +1079,38 @@ pub fn refresh_update_from_token_response(
     }
 }
 
+pub fn merge_account_refresh_raw(existing: Option<&Value>, refreshed: Value) -> Value {
+    let Some(existing) = existing.and_then(Value::as_object) else {
+        return refreshed;
+    };
+    let refreshed = match refreshed {
+        Value::Object(refreshed) => refreshed,
+        other => return other,
+    };
+
+    let mut merged = existing.clone();
+    for key in [
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "refreshToken",
+        "id_token",
+        "idToken",
+        "token_type",
+        "tokenType",
+        "expires_in",
+        "expiresIn",
+        "scope",
+    ] {
+        merged.remove(key);
+    }
+    if merged.contains_key("token") {
+        merged.insert("token".to_string(), Value::Object(refreshed.clone()));
+    }
+    merged.extend(refreshed);
+    Value::Object(merged)
+}
+
 pub fn refresh_update_from_verified_openai_token_response(
     response: &OAuthTokenResponse,
     raw: Value,
@@ -1037,6 +1129,21 @@ pub fn refresh_update_from_verified_openai_token_response(
     update.subscription_level = verified_identity.plan_type.clone();
     update.profile = profile_value(ProviderType::CodexOAuth, verified_identity, &raw);
     update
+}
+
+pub fn enrich_refresh_update_with_verified_openai_identity(
+    update: &mut AccountRefreshUpdate,
+    raw: &Value,
+    identity: &OAuthIdentity,
+    canonical_claims: Value,
+) {
+    update.email = identity.email.clone();
+    update.subscription_level = identity.plan_type.clone();
+    update.profile = profile_value(ProviderType::CodexOAuth, identity, raw);
+    crate::domain::accounts::store::set_verified_openai_claims(
+        &mut update.profile,
+        Some(canonical_claims),
+    );
 }
 
 pub fn refresh_update_from_verified_grok_token_response(
@@ -1063,6 +1170,21 @@ pub fn refresh_update_from_verified_grok_token_response(
     update
 }
 
+pub fn enrich_refresh_update_with_verified_grok_identity(
+    update: &mut AccountRefreshUpdate,
+    raw: &Value,
+    identity: &OAuthIdentity,
+    canonical_claims: Value,
+) {
+    update.email = identity.email.clone();
+    update.subscription_level = identity.plan_type.clone();
+    update.profile = profile_value(ProviderType::GrokOAuth, identity, raw);
+    crate::domain::accounts::store::set_verified_grok_claims(
+        &mut update.profile,
+        Some(canonical_claims),
+    );
+}
+
 pub fn refresh_update_from_profile_response(
     provider_type: ProviderType,
     raw: Value,
@@ -1070,6 +1192,9 @@ pub fn refresh_update_from_profile_response(
     quota_refresh_interval_ms: i64,
 ) -> AccountRefreshUpdate {
     let identity = identity_from_provider_value(&raw).unwrap_or_default();
+    let claude_subscription = (provider_type == ProviderType::ClaudeOAuth)
+        .then(|| claude_subscription_from_bootstrap_profile(&raw))
+        .flatten();
     let quota = quota_from_provider_snapshot(provider_type, &raw);
     let quota_percent = quota
         .as_ref()
@@ -1077,19 +1202,27 @@ pub fn refresh_update_from_profile_response(
         .and_then(|tier| tier.utilization)
         .map(|utilization| utilization * 100.0)
         .or_else(|| quota_percent_from_value(&raw));
+    let subscription_level = claude_subscription
+        .as_ref()
+        .map(|resolution| resolution.plan.label().to_string())
+        .or_else(|| identity.plan_type.clone());
+    let mut profile = json!({
+        "providerType": provider_type.as_str(),
+        "source": "profile_response",
+        "accountId": identity.account_id,
+        "email": identity.email,
+        "planType": identity.plan_type,
+        "subscriptionExpiresAt": identity.subscription_expires_at,
+        "subscription": {"expiresAt": identity.subscription_expires_at},
+        "raw": raw
+    });
+    if let Some(resolution) = claude_subscription.as_ref() {
+        apply_claude_subscription_to_profile(&mut profile, resolution);
+    }
     AccountRefreshUpdate {
         email: identity.email.clone(),
-        profile: Some(json!({
-            "providerType": provider_type.as_str(),
-            "source": "profile_response",
-            "accountId": identity.account_id,
-            "email": identity.email,
-            "planType": identity.plan_type,
-            "subscriptionExpiresAt": identity.subscription_expires_at,
-            "subscription": {"expiresAt": identity.subscription_expires_at},
-            "raw": raw
-        })),
-        subscription_level: identity.plan_type,
+        profile: Some(profile),
+        subscription_level,
         quota_percent,
         quota,
         quota_refreshed_at: quota_percent.map(|_| now_ms),
@@ -1658,11 +1791,11 @@ pub fn classify_oauth_error(status_code: Option<u16>, body: &str) -> OAuthErrorC
             string_at(
                 &value,
                 &[
-                    "/error",
                     "/error_description",
                     "/message",
                     "/detail",
                     "/error/message",
+                    "/error",
                 ],
             )
         })
@@ -1698,12 +1831,26 @@ pub fn classify_oauth_error(status_code: Option<u16>, body: &str) -> OAuthErrorC
                 | OAuthErrorKind::Network
         ),
         refresh_token_may_have_rotated: matches!(kind, OAuthErrorKind::InvalidGrant),
+        immediate_relogin: kind == OAuthErrorKind::InvalidGrant
+            && invalid_grant_requires_immediate_relogin(&haystack),
         message: if json_message.is_empty() {
             "oauth request failed".to_string()
         } else {
             json_message
         },
     }
+}
+
+pub fn invalid_grant_requires_immediate_relogin(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "refresh_token_reused",
+        "refresh token reused",
+        "refresh token already used",
+        "refresh token has already been used",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 pub fn is_refresh_race_recoverable(error: &OAuthErrorClassification) -> bool {
@@ -1889,6 +2036,11 @@ fn login_profile_value(
     if identity == &OAuthIdentity::default() && profile_raw.is_none() {
         return None;
     }
+    let claude_subscription = if provider_type == ProviderType::ClaudeOAuth {
+        profile_raw.and_then(claude_subscription_from_bootstrap_profile)
+    } else {
+        None
+    };
     let mut value = json!({
         "providerType": provider_type.as_str(),
         "source": "login_exchange",
@@ -1903,6 +2055,9 @@ fn login_profile_value(
     });
     enrich_codex_profile_value(provider_type, identity, &mut value);
     enrich_grok_profile_value(provider_type, token_raw, &mut value);
+    if let Some(resolution) = claude_subscription.as_ref() {
+        apply_claude_subscription_to_profile(&mut value, resolution);
+    }
     if let Some(profile_raw) = profile_raw {
         value["profileRaw"] = profile_raw.clone();
         if provider_type == ProviderType::ClaudeOAuth {
@@ -1928,6 +2083,49 @@ fn login_profile_value(
             Value::String("project_and_tier_deferred_to_quota_refresh".to_string());
     }
     Some(value)
+}
+
+fn claude_subscription_from_bootstrap_profile(
+    profile: &Value,
+) -> Option<ClaudeSubscriptionResolution> {
+    resolve_claude_subscription(
+        [
+            profile
+                .pointer("/organizationRateLimitTier")
+                .and_then(Value::as_str)
+                .map(|value| {
+                    ClaudeSubscriptionCandidate::new(
+                        ClaudeSubscriptionSource::BootstrapRateLimitTier,
+                        value,
+                    )
+                }),
+            profile
+                .pointer("/organizationType")
+                .and_then(Value::as_str)
+                .map(|value| {
+                    ClaudeSubscriptionCandidate::new(
+                        ClaudeSubscriptionSource::BootstrapOrganizationType,
+                        value,
+                    )
+                }),
+        ]
+        .into_iter()
+        .flatten(),
+    )
+}
+
+fn apply_claude_subscription_to_profile(
+    profile: &mut Value,
+    resolution: &ClaudeSubscriptionResolution,
+) {
+    profile["planType"] = Value::String(resolution.plan.plan_type().to_string());
+    profile["planLabel"] = Value::String(resolution.plan.label().to_string());
+    profile["claudeSubscriptionEvidence"] = json!({
+        "source": resolution.source.as_str(),
+        "stale": resolution.stale,
+        "conflict": resolution.conflict,
+        "conflictingPlanTypes": resolution.conflicting_plan_types,
+    });
 }
 
 fn login_raw_value(token_raw: Value, profile_raw: Option<Value>) -> Value {
@@ -2195,6 +2393,7 @@ fn unsupported(provider_type: ProviderType) -> OAuthErrorClassification {
         kind: OAuthErrorKind::Unsupported,
         retryable: false,
         refresh_token_may_have_rotated: false,
+        immediate_relogin: false,
         message: format!(
             "{} server-native oauth flow is not enabled",
             provider_type.as_str()
@@ -2207,6 +2406,7 @@ fn unsupported_login(provider_type: ProviderType) -> OAuthErrorClassification {
         kind: OAuthErrorKind::Unsupported,
         retryable: false,
         refresh_token_may_have_rotated: false,
+        immediate_relogin: false,
         message: format!(
             "{} browser login request shape is not available",
             provider_type.as_str()
@@ -2219,6 +2419,7 @@ fn missing_credential(message: impl Into<String>) -> OAuthErrorClassification {
         kind: OAuthErrorKind::MissingCredential,
         retryable: false,
         refresh_token_may_have_rotated: false,
+        immediate_relogin: false,
         message: message.into(),
     }
 }
@@ -2769,6 +2970,69 @@ mod tests {
     }
 
     #[test]
+    fn claude_profile_refresh_resolves_max_multiplier_labels() {
+        for (rate_limit_tier, expected_type, expected_label) in [
+            ("default_claude_max_5x", "claude_max_5x", "Claude Max 5x"),
+            ("default_claude_max_20x", "claude_max_20x", "Claude Max 20x"),
+        ] {
+            let update = refresh_update_from_profile_response(
+                ProviderType::ClaudeOAuth,
+                json!({
+                    "accountUUID": "claude-account-uuid",
+                    "email": "owner@example.com",
+                    "organizationType": "claude_max",
+                    "organizationRateLimitTier": rate_limit_tier,
+                }),
+                1_000,
+                30 * 60 * 1000,
+            );
+
+            assert_eq!(update.subscription_level.as_deref(), Some(expected_label));
+            let profile = update.profile.unwrap();
+            assert_eq!(profile["planType"], expected_type);
+            assert_eq!(profile["planLabel"], expected_label);
+            assert_eq!(
+                profile["claudeSubscriptionEvidence"]["source"],
+                "bootstrap_rate_limit_tier"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_login_persists_resolved_max_multiplier() {
+        let token_raw = json!({
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "expires_in": 3600,
+            "account": {
+                "uuid": "claude-account-uuid",
+                "email_address": "owner@example.com"
+            }
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(token_raw.clone()).unwrap();
+        let input = upsert_input_from_login_response(
+            ProviderType::ClaudeOAuth,
+            &response,
+            token_raw,
+            Some(json!({
+                "accountUUID": "claude-account-uuid",
+                "email": "owner@example.com",
+                "organizationType": "claude_max",
+                "organizationRateLimitTier": "default_claude_max_20x",
+                "bootstrapRefreshedAt": 999
+            })),
+            1_000,
+            30 * 60 * 1000,
+        )
+        .expect("account input");
+
+        assert_eq!(input.subscription_level.as_deref(), Some("Claude Max 20x"));
+        let profile = input.profile.unwrap();
+        assert_eq!(profile["planType"], "claude_max_20x");
+        assert_eq!(profile["planLabel"], "Claude Max 20x");
+    }
+
+    #[test]
     fn gemini_login_import_uses_userinfo_email() {
         let raw = json!({
             "access_token": "access-new",
@@ -2964,6 +3228,8 @@ mod tests {
         );
         assert_eq!(error.kind, OAuthErrorKind::InvalidGrant);
         assert!(error.refresh_token_may_have_rotated);
+        assert!(error.immediate_relogin);
+        assert_eq!(error.message, "refresh token already used");
         assert!(is_refresh_race_recoverable(&error));
 
         let pending = classify_oauth_error(Some(400), r#"{"error":"authorization_pending"}"#);
@@ -2996,6 +3262,7 @@ mod tests {
         let unauthorized = classify_oauth_error(Some(401), r#"{"message":"unauthorized"}"#);
         assert_eq!(unauthorized.kind, OAuthErrorKind::InvalidGrant);
         assert!(unauthorized.refresh_token_may_have_rotated);
+        assert!(!unauthorized.immediate_relogin);
     }
 
     #[test]
@@ -3091,6 +3358,97 @@ mod tests {
         let kiro = oauth_provider_spec(ProviderType::KiroOAuth).unwrap();
         assert_eq!(kiro.stage, OAuthSupportStage::NativeRefreshProfile);
         assert!(kiro.token_urls.is_empty());
+    }
+
+    #[test]
+    fn oauth_specs_publish_refresh_and_quota_execution_truth() {
+        let cases = [
+            (
+                ProviderType::ClaudeOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::CodexOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::GrokOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::GeminiCli,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::GitHubCopilot,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::ImportedSnapshot,
+            ),
+            (
+                ProviderType::DeepSeekAccount,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+            ),
+            (
+                ProviderType::KiroOAuth,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::CursorOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::ImportedSnapshot,
+            ),
+            (
+                ProviderType::CursorApiKey,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::ImportedSnapshot,
+            ),
+            (
+                ProviderType::AntigravityOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::AgyOAuth,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::OllamaCloud,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::LiveRefresh,
+            ),
+            (
+                ProviderType::AwsBedrock,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+            ),
+            (
+                ProviderType::Nvidia,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+            ),
+            (
+                ProviderType::DeepSeekApi,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+            ),
+        ];
+
+        assert_eq!(cases.len(), 15);
+        for (provider_type, refresh_capability, quota_capability) in cases {
+            let spec = oauth_provider_spec(provider_type).expect("provider spec");
+            assert_eq!(
+                spec.refresh_capability, refresh_capability,
+                "{provider_type:?}"
+            );
+            assert_eq!(spec.quota_capability, quota_capability, "{provider_type:?}");
+        }
     }
 
     #[test]

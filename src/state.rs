@@ -26,9 +26,15 @@ use crate::clients::oauth::grok_device::{
 use crate::clients::oauth::kiro_device::{
     KiroDeviceFlowStore, PendingKiroDeviceFlow, PendingKiroSocialDeviceFlow,
 };
-use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
+use crate::clients::oauth::quota::{
+    load_gemini_v1internal_project, refresh_account_quota, QuotaRefreshResult,
+    QUOTA_FAILURE_COOLDOWN_MS,
+};
 use crate::clients::oauth::refresh::{
-    account_needs_native_refresh, execute_native_account_refresh,
+    account_has_refresh_token, account_needs_native_refresh,
+    execute_native_account_refresh_with_receipt_hook as execute_native_account_refresh_client,
+    provider_native_refresh_available, record_refresh_flight_failure,
+    validate_native_account_refresh_receipt, AccountRefreshFailure,
 };
 use crate::clients::router::client::{
     self, ActivateTunnelPayload, NamespaceLeasePayload, NamespaceLeaseResponse,
@@ -39,13 +45,21 @@ use crate::clients::router::tunnel::{
     TunnelStateFn, TunnelSupervisor,
 };
 use crate::domain::accounts::login::OAuthLoginStore;
-use crate::domain::accounts::managers::AccountRefreshLocks;
+use crate::domain::accounts::managers::{
+    account_credential_ownership, AccountCredentialOwnership, AccountRefreshFlightFailure,
+    AccountRefreshFlightFailureDetails, AccountRefreshFlightStage, AccountRefreshLocks,
+};
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    active_account_usage_block, native_refresh_snapshot_matches, Account, AccountRefreshUpdate,
-    AccountStore, ManualSubscriptionExpiryError,
+    active_account_usage_block, gemini_v1internal_project_id, native_refresh_snapshot_matches,
+    Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
+use crate::domain::providers::bundle::{
+    bundle_id as provider_bundle_id, credential_source_app, has_bundle_managed_metadata,
+    is_explicit_bundle_surface, route_key as provider_route_key, surface_enabled,
+    ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
+};
 use crate::domain::providers::credentials::{
     merge_provider_credentials, reveal_provider_credential, CredentialPatch,
     ProviderAccountBindingMigrationItem, ProviderAccountBindingMigrationPreview,
@@ -54,15 +68,20 @@ use crate::domain::providers::credentials::{
     ProviderImportPreview, ProviderReferencePreview, ProviderRuntimeTransitionPreview,
     ProviderView, ProviderWriteDraft,
 };
-use crate::domain::providers::model::{AppKind, AuthBinding, Provider, ProviderMeta, ProviderType};
+use crate::domain::providers::model::{
+    AppKind, AuthBinding, Provider, ProviderMeta, ProviderType, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE,
+};
 use crate::domain::providers::registry::{
     profile_by_id, resolve_custom_binding, CreationPolicy, CredentialPolicy, CustomBindingInput,
-    DriverBinding, ProfileId, ProviderKey,
+    DriverBinding, ProfileId, ProviderFieldScope, ProviderKey,
+};
+use crate::domain::providers::runtime::{
+    compile_runtime_plan, managed_account_binding, managed_account_provider_type,
 };
 use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
-    RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
+    ClientTunnelClaimIntent, RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
@@ -71,7 +90,7 @@ use crate::domain::sharing::router_contract::{
 };
 use crate::domain::sharing::shares::{
     RouterDescriptorSyncMode, Share, ShareDeleteTombstone, ShareInvocation,
-    ShareInvocationRejection, ShareStore,
+    ShareInvocationRejection, ShareRejectReason, ShareStore,
 };
 use crate::domain::usage::store::{UsageLog, UsageStore};
 use crate::logging::{LogTailAccessError, LogTailResponse, SharedLogCapture};
@@ -86,10 +105,6 @@ const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA: u32 = 1;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_FILE: &str = ".codex-workspace-rebind-transaction.json";
 const CODEX_WORKSPACE_REBIND_STAGE_DIRECTORY: &str = ".codex-workspace-rebind-stage";
-const EPHEMERAL_IMAGE_TTL_MS: i64 = 60 * 60 * 1000;
-const EPHEMERAL_IMAGE_MAX_ENTRIES: usize = 128;
-const EPHEMERAL_IMAGE_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
-
 #[cfg(test)]
 pub(crate) async fn install_openai_test_jwk(jwk: jsonwebtoken::jwk::Jwk) {
     crate::clients::oauth::openai_jwks::install_test_jwk(jwk).await;
@@ -116,18 +131,12 @@ pub(crate) struct CodexWorkspaceRebindResult {
 pub(crate) enum CodexActiveAccountSelectionError {
     #[error("Codex OAuth account not found: {0}")]
     AccountNotFound(String),
-    #[error(
-        "Codex OAuth account selection would rebind Provider(s) reserved by Share(s) {}",
-        .share_ids.join(", ")
-    )]
-    ShareConflict { share_ids: Vec<String> },
 }
 
 impl CodexActiveAccountSelectionError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::AccountNotFound(_) => "cc_switch_codex_active_account_not_found",
-            Self::ShareConflict { .. } => "cc_switch_codex_active_account_share_conflict",
         }
     }
 }
@@ -136,6 +145,12 @@ impl CodexActiveAccountSelectionError {
 pub(crate) enum ConditionalShareDeleteError {
     NotFound,
     RevisionConflict { current_revision: u64 },
+    InFlight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShareDeleteError {
+    InFlight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -233,107 +248,33 @@ impl DeviceFlowPrincipalStore {
         self.bindings.remove(&key).is_some()
     }
 
+    fn remove_all_for_principal(
+        &mut self,
+        provider_type: ProviderType,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> Vec<String> {
+        self.cleanup(now_ms);
+        let provider_type = provider_type.as_str();
+        let device_codes = self
+            .bindings
+            .iter()
+            .filter(|((binding_provider_type, _), binding)| {
+                binding_provider_type.as_str() == provider_type
+                    && binding.principal_id == principal_id
+            })
+            .map(|((_, device_code), _)| device_code.clone())
+            .collect::<Vec<_>>();
+        for device_code in &device_codes {
+            self.bindings
+                .remove(&(provider_type.to_string(), device_code.clone()));
+        }
+        device_codes
+    }
+
     fn cleanup(&mut self, now_ms: i64) {
         self.bindings
             .retain(|_, binding| binding.expires_at_ms > now_ms);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct EphemeralImage {
-    pub(crate) data: bytes::Bytes,
-    pub(crate) mime_type: String,
-    pub(crate) expires_at_ms: i64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct EphemeralImageHandle {
-    pub(crate) token: String,
-}
-
-#[derive(Debug, Default)]
-struct EphemeralImageStore {
-    entries: BTreeMap<String, EphemeralImageEntry>,
-    total_bytes: usize,
-}
-
-#[derive(Debug)]
-struct EphemeralImageEntry {
-    image: EphemeralImage,
-    inserted_at_ms: i64,
-}
-
-impl EphemeralImageStore {
-    fn insert(
-        &mut self,
-        data: bytes::Bytes,
-        mime_type: String,
-        now_ms: i64,
-    ) -> anyhow::Result<EphemeralImageHandle> {
-        anyhow::ensure!(
-            data.len() <= EPHEMERAL_IMAGE_MAX_TOTAL_BYTES,
-            "generated image exceeds the ephemeral image store capacity"
-        );
-        self.prune(now_ms);
-        while self.entries.len() >= EPHEMERAL_IMAGE_MAX_ENTRIES
-            || self.total_bytes.saturating_add(data.len()) > EPHEMERAL_IMAGE_MAX_TOTAL_BYTES
-        {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.inserted_at_ms)
-                .map(|(token, _)| token.clone())
-            else {
-                break;
-            };
-            self.remove(&oldest);
-        }
-
-        let token = loop {
-            let mut random = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut random);
-            let candidate = hex::encode(random);
-            if !self.entries.contains_key(&candidate) {
-                break candidate;
-            }
-        };
-        let expires_at_ms = now_ms.saturating_add(EPHEMERAL_IMAGE_TTL_MS);
-        self.total_bytes = self.total_bytes.saturating_add(data.len());
-        self.entries.insert(
-            token.clone(),
-            EphemeralImageEntry {
-                image: EphemeralImage {
-                    data,
-                    mime_type,
-                    expires_at_ms,
-                },
-                inserted_at_ms: now_ms,
-            },
-        );
-        Ok(EphemeralImageHandle { token })
-    }
-
-    fn get(&mut self, token: &str, now_ms: i64) -> Option<EphemeralImage> {
-        self.prune(now_ms);
-        self.entries.get(token).map(|entry| entry.image.clone())
-    }
-
-    fn prune(&mut self, now_ms: i64) {
-        let expired = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.image.expires_at_ms <= now_ms)
-            .map(|(token, _)| token.clone())
-            .collect::<Vec<_>>();
-        for token in expired {
-            self.remove(&token);
-        }
-    }
-
-    fn remove(&mut self, token: &str) {
-        if let Some(entry) = self.entries.remove(token) {
-            self.total_bytes = self.total_bytes.saturating_sub(entry.image.data.len());
-        }
     }
 }
 
@@ -353,15 +294,17 @@ pub struct ServerStateInner {
     #[cfg(test)]
     provider_commit_delay_ms: std::sync::atomic::AtomicU64,
     pub(crate) accounts: RwLock<AccountStore>,
+    managed_auth_operations: AsyncMutex<()>,
     pub(crate) usage: RwLock<UsageStore>,
     pub(crate) shares: RwLock<ShareStore>,
     share_quota_mutations: AsyncMutex<()>,
+    share_lifecycle: AsyncMutex<()>,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
     grok_media_sessions: Mutex<BTreeMap<String, GrokMediaSessionBinding>>,
-    ephemeral_images: Mutex<EphemeralImageStore>,
+    image_capabilities: Arc<crate::image_store::ImageCapabilityStore>,
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
@@ -371,10 +314,12 @@ pub struct ServerStateInner {
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
     cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
     pub account_refresh_locks: AccountRefreshLocks,
+    native_refresh_receipt_journal: Mutex<NativeRefreshReceiptJournal>,
     pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
     pub control_nonces: Arc<ControlNonceCache>,
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
+    client_tunnel_claim: AsyncMutex<()>,
     setup_flight: AsyncMutex<()>,
     router_share_sync: AsyncMutex<()>,
     share_edit_sync: AsyncMutex<()>,
@@ -385,6 +330,12 @@ pub struct ServerStateInner {
     credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     account_refresh_persist_failures: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    account_refresh_commit_state_failures: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    gemini_project_commit_failures: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    client_tunnel_claim_commit_failures: std::sync::atomic::AtomicU64,
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
     pub tunnels: Arc<TunnelSupervisor>,
@@ -475,8 +426,10 @@ pub enum ManagedAccountRefreshError {
     Conflict {
         provider_type: ProviderType,
     },
+    IdentityChanged {
+        provider_type: ProviderType,
+    },
     NotFound,
-    InactiveCodexAccount,
     CredentialPersistenceDegraded,
     Refresh {
         status_code: u16,
@@ -485,23 +438,124 @@ pub enum ManagedAccountRefreshError {
     },
 }
 
+#[derive(Debug)]
+enum GeminiProjectCommitSkip {
+    NotFound,
+    Stale(Box<Account>),
+}
+
+#[derive(Debug)]
+pub(crate) enum AccountQuotaCommitSkip {
+    NotFound,
+    Stale(Box<Account>),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NativeRefreshCommitError {
+    #[error("OAuth refresh result was superseded by newer account credentials")]
+    Superseded(Box<Account>),
     #[error("OAuth credential state commit failed: {0:#}")]
     State(#[source] anyhow::Error),
     #[error("rotated OAuth credentials are live but could not be durably persisted: {0:#}")]
     Persistence(#[source] anyhow::Error),
 }
 
+#[derive(Debug)]
+pub(crate) enum QuotaUnauthorizedRecoveryError {
+    Unavailable,
+    Refresh {
+        failure: AccountRefreshFailure,
+        updated: Option<Box<Account>>,
+    },
+    Commit(NativeRefreshCommitError),
+    State(anyhow::Error),
+}
+
 impl NativeRefreshCommitError {
     pub(crate) fn is_persistence_degraded(&self) -> bool {
         matches!(self, Self::Persistence(_))
     }
+
+    pub(crate) fn is_superseded(&self) -> bool {
+        matches!(self, Self::Superseded(_))
+    }
+}
+
+fn ensure_account_identity_generation(
+    account: &Account,
+    provider_type: ProviderType,
+    expected: Option<u64>,
+) -> Result<(), ManagedAccountRefreshError> {
+    if expected.is_some_and(|expected| account.auth_identity_generation != expected) {
+        return Err(ManagedAccountRefreshError::IdentityChanged { provider_type });
+    }
+    Ok(())
+}
+
+fn quota_refresh_snapshot_matches(current: &Account, expected: &Account) -> bool {
+    native_refresh_snapshot_matches(current, expected)
+        && current.email == expected.email
+        && current.scopes == expected.scopes
+        && current.profile == expected.profile
+        && current.raw == expected.raw
+        && current.subscription_level == expected.subscription_level
+        && current.entitlement_status == expected.entitlement_status
+        && current.quota_percent == expected.quota_percent
+        && current.quota == expected.quota
+        && current.quota_refreshed_at == expected.quota_refreshed_at
+        && current.quota_next_refresh_at == expected.quota_next_refresh_at
+        && current.rate_limited_until == expected.rate_limited_until
+        && current.last_refresh_error == expected.last_refresh_error
+        && current.refresh_consecutive_failures == expected.refresh_consecutive_failures
+        && current.needs_relogin == expected.needs_relogin
+}
+
+fn native_refresh_recovery_candidate(
+    current: &AccountStore,
+    expected: &Account,
+    update: &AccountRefreshUpdate,
+) -> Option<(AccountStore, Account, &'static str)> {
+    let live = current
+        .accounts
+        .iter()
+        .find(|account| account.id == expected.id)?;
+    if !native_refresh_snapshot_matches(live, expected) {
+        return None;
+    }
+
+    let credentials_with_raw = AccountRefreshUpdate {
+        access_token: update.access_token.clone(),
+        refresh_token: update.refresh_token.clone(),
+        id_token: update.id_token.clone(),
+        token_type: update.token_type.clone(),
+        scopes: update.scopes.clone(),
+        raw: update.raw.clone(),
+        expires_at: update.expires_at,
+        last_refresh_error: None,
+        ..Default::default()
+    };
+    let credentials_only = AccountRefreshUpdate {
+        raw: None,
+        ..credentials_with_raw.clone()
+    };
+    for (recovery_scope, recovery_update) in [
+        ("complete", update.clone()),
+        ("credentials_with_raw", credentials_with_raw),
+        ("credentials_only", credentials_only),
+    ] {
+        let mut candidate = current.clone();
+        let recovered = candidate.mark_native_refresh_success(&expected.id, recovery_update)?;
+        if recovered.auth_identity_generation == live.auth_identity_generation {
+            return Some((candidate, recovered, recovery_scope));
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
 pub enum CopilotUpstreamAuthError {
     NotFound,
+    CredentialPersistenceDegraded,
     MissingGitHubToken { account_id: String },
     TokenExchange { status_code: u16, message: String },
 }
@@ -509,6 +563,8 @@ pub enum CopilotUpstreamAuthError {
 #[derive(Debug)]
 pub enum DeepSeekUpstreamError {
     NotFound,
+    IdentityChanged,
+    CredentialPersistenceDegraded,
     MissingToken,
     Client(String),
 }
@@ -526,16 +582,48 @@ pub(crate) struct CachedCopilotUpstreamAuth {
     token: String,
     api_endpoint: String,
     expires_at_ms: Option<i64>,
+    rejected: bool,
+    auth_identity_generation: u64,
+    token_refresh_generation: u64,
+    domain: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct GrokMediaSessionBinding {
     pub provider_id: String,
-    pub account_id: Option<String>,
+    pub account_id: String,
+    pub auth_identity_generation: u64,
     pub expires_at_ms: i64,
 }
 
 const GROK_MEDIA_SESSION_MAX_BINDINGS: usize = 4_096;
+const NATIVE_REFRESH_RECOVERY_DIR: &str = "oauth-refresh-recovery";
+const NATIVE_REFRESH_PENDING_DIR: &str = "oauth-refresh-pending";
+const NATIVE_REFRESH_QUARANTINE_DIR: &str = "oauth-refresh-quarantine";
+const NATIVE_REFRESH_PENDING_FIELD: &str = "nativeRefreshPendingReceipt";
+const NATIVE_REFRESH_RECEIPT_RETRY_BACKOFF_MS: i64 = 5_000;
+
+#[derive(Clone)]
+struct NativeRefreshPendingReceipt {
+    expected: Account,
+    update: AccountRefreshUpdate,
+}
+
+#[derive(Debug, Default)]
+struct NativeRefreshReceiptJournal {
+    pending: BTreeMap<String, NativeRefreshPendingReceipt>,
+    unresolved_loads: BTreeSet<PathBuf>,
+}
+
+impl std::fmt::Debug for NativeRefreshPendingReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeRefreshPendingReceipt")
+            .field("account_id", &self.expected.id)
+            .field("provider_type", &self.expected.provider_type)
+            .finish_non_exhaustive()
+    }
+}
 
 pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
     vec![
@@ -561,6 +649,373 @@ fn remove_obsolete_model_pricing_file(config_dir: &Path) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
     }
+}
+
+fn native_refresh_recovery_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join(NATIVE_REFRESH_RECOVERY_DIR)
+}
+
+fn native_refresh_recovery_path(config_dir: &Path, account: &Account) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-native-refresh-recovery-v1\0");
+    digest.update(account.provider_type.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(account.id.as_bytes());
+    native_refresh_recovery_dir(config_dir).join(format!("{}.json", hex::encode(digest.finalize())))
+}
+
+fn native_refresh_pending_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join(NATIVE_REFRESH_PENDING_DIR)
+}
+
+fn native_refresh_pending_path(config_dir: &Path, account: &Account) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-native-refresh-pending-v1\0");
+    digest.update(account.provider_type.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(account.id.as_bytes());
+    native_refresh_pending_dir(config_dir).join(format!("{}.json", hex::encode(digest.finalize())))
+}
+
+fn native_refresh_pending_key(account: &Account) -> String {
+    format!("{}:{}", account.provider_type.as_str(), account.id)
+}
+
+fn native_refresh_pending_journal(
+    expected: &Account,
+    update: &AccountRefreshUpdate,
+) -> anyhow::Result<AccountStore> {
+    let mut envelope = expected.clone();
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        NATIVE_REFRESH_PENDING_FIELD.to_string(),
+        serde_json::to_value(update).context("serialize native refresh pending receipt")?,
+    );
+    envelope.raw = Some(Value::Object(payload));
+    Ok(AccountStore {
+        accounts: vec![expected.clone(), envelope],
+        ..AccountStore::default()
+    })
+}
+
+fn decode_native_refresh_pending_journal(
+    journal: AccountStore,
+    path: &Path,
+) -> anyhow::Result<NativeRefreshPendingReceipt> {
+    if journal.accounts.len() != 2 {
+        anyhow::bail!(
+            "native refresh pending journal {} must contain expected and receipt accounts",
+            path.display()
+        );
+    }
+    let expected = journal.accounts[0].clone();
+    let envelope = &journal.accounts[1];
+    if expected.id != envelope.id || expected.provider_type != envelope.provider_type {
+        anyhow::bail!(
+            "native refresh pending journal {} has inconsistent account identity",
+            path.display()
+        );
+    }
+    let update = envelope
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get(NATIVE_REFRESH_PENDING_FIELD))
+        .cloned()
+        .with_context(|| {
+            format!(
+                "native refresh pending journal {} has no receipt payload",
+                path.display()
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value(value).with_context(|| {
+                format!(
+                    "parse native refresh pending receipt from {}",
+                    path.display()
+                )
+            })
+        })?;
+    Ok(NativeRefreshPendingReceipt { expected, update })
+}
+
+fn write_native_refresh_pending_receipt(
+    config_dir: &Path,
+    expected: &Account,
+    update: &AccountRefreshUpdate,
+) -> anyhow::Result<PathBuf> {
+    let path = native_refresh_pending_path(config_dir, expected);
+    native_refresh_pending_journal(expected, update)?
+        .save_to_path(config_dir, &path)
+        .with_context(|| format!("persist native refresh pending receipt {}", path.display()))?;
+    Ok(path)
+}
+
+fn load_native_refresh_pending_receipt(
+    config_dir: &Path,
+    account: &Account,
+) -> anyhow::Result<Option<NativeRefreshPendingReceipt>> {
+    let path = native_refresh_pending_path(config_dir, account);
+    load_native_refresh_pending_receipt_from_path(config_dir, &path)
+}
+
+fn load_native_refresh_pending_receipt_from_path(
+    config_dir: &Path,
+    path: &Path,
+) -> anyhow::Result<Option<NativeRefreshPendingReceipt>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let journal = AccountStore::load_from_path(config_dir, path)
+        .with_context(|| format!("load native refresh pending receipt {}", path.display()))?;
+    decode_native_refresh_pending_journal(journal, path).map(Some)
+}
+
+fn remove_native_refresh_pending_receipt(
+    config_dir: &Path,
+    account: &Account,
+) -> anyhow::Result<()> {
+    remove_native_refresh_recovery_journal(&native_refresh_pending_path(config_dir, account))
+}
+
+fn quarantine_native_refresh_pending_receipt_path(
+    config_dir: &Path,
+    source: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !source.exists() {
+        return Ok(None);
+    }
+    let directory = config_dir.join(NATIVE_REFRESH_QUARANTINE_DIR);
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "create native refresh quarantine directory {}",
+            directory.display()
+        )
+    })?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("receipt");
+    let now_ms = crate::infra::time::now_ms();
+    let mut suffix = 0u32;
+    let destination = loop {
+        let destination = directory.join(format!("{stem}-{now_ms}-{suffix}.json"));
+        if !destination.exists() {
+            break destination;
+        }
+        suffix = suffix.saturating_add(1);
+    };
+    std::fs::rename(source, &destination).with_context(|| {
+        format!(
+            "quarantine native refresh pending receipt {} as {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(Some(destination))
+}
+
+fn native_refresh_pending_load_has_io_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+}
+
+fn native_refresh_recovery_journal(
+    expected: &Account,
+    update: &AccountRefreshUpdate,
+) -> anyhow::Result<AccountStore> {
+    let current = AccountStore {
+        accounts: vec![expected.clone()],
+        ..AccountStore::default()
+    };
+    let (_, recovered, _) = native_refresh_recovery_candidate(&current, expected, update)
+        .context("build native refresh recovery candidate")?;
+    Ok(AccountStore {
+        accounts: vec![expected.clone(), recovered],
+        ..AccountStore::default()
+    })
+}
+
+fn write_native_refresh_recovery_journal(
+    config_dir: &Path,
+    expected: &Account,
+    update: &AccountRefreshUpdate,
+) -> anyhow::Result<PathBuf> {
+    let path = native_refresh_recovery_path(config_dir, expected);
+    native_refresh_recovery_journal(expected, update)?
+        .save_to_path(config_dir, &path)
+        .with_context(|| format!("persist native refresh recovery journal {}", path.display()))?;
+    Ok(path)
+}
+
+fn remove_native_refresh_recovery_journal(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove native refresh recovery journal {}", path.display())),
+    }
+}
+
+fn refresh_update_from_recovery_account(account: &Account) -> AccountRefreshUpdate {
+    AccountRefreshUpdate {
+        email: account.email.clone(),
+        access_token: account.access_token.clone(),
+        refresh_token: account.refresh_token.clone(),
+        id_token: account.id_token.clone(),
+        token_type: account.token_type.clone(),
+        scopes: Some(account.scopes.clone()),
+        profile: account.profile.clone(),
+        raw: account.raw.clone(),
+        subscription_level: account.subscription_level.clone(),
+        entitlement_status: account.entitlement_status.clone(),
+        quota_percent: account.quota_percent,
+        quota: account.quota.clone(),
+        quota_refreshed_at: account.quota_refreshed_at,
+        quota_next_refresh_at: account.quota_next_refresh_at,
+        expires_at: account.expires_at,
+        rate_limited_until: account.rate_limited_until,
+        last_refresh_error: None,
+    }
+}
+
+fn recover_pending_native_refresh_journals(
+    config_dir: &Path,
+    accounts: &mut AccountStore,
+) -> anyhow::Result<()> {
+    let directory = native_refresh_recovery_dir(config_dir);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read native refresh recovery directory {}",
+                    directory.display()
+                )
+            })
+        }
+    };
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.retain(|path| path.extension().and_then(|value| value.to_str()) == Some("json"));
+    paths.sort();
+
+    let mut candidate = accounts.clone();
+    let mut changed = false;
+    let mut recovered_paths = Vec::new();
+    for path in paths {
+        let journal = AccountStore::load_from_path(config_dir, &path)
+            .with_context(|| format!("load native refresh recovery journal {}", path.display()))?;
+        if journal.accounts.len() != 2 {
+            anyhow::bail!(
+                "native refresh recovery journal {} must contain expected and recovered accounts",
+                path.display()
+            );
+        }
+        let expected = &journal.accounts[0];
+        let recovered = &journal.accounts[1];
+        if expected.id != recovered.id || expected.provider_type != recovered.provider_type {
+            anyhow::bail!(
+                "native refresh recovery journal {} has inconsistent account identity",
+                path.display()
+            );
+        }
+        let Some(live) = candidate
+            .accounts
+            .iter()
+            .find(|account| account.id == expected.id)
+        else {
+            recovered_paths.push(path);
+            continue;
+        };
+        if !native_refresh_snapshot_matches(live, expected) {
+            recovered_paths.push(path);
+            continue;
+        }
+        let update = refresh_update_from_recovery_account(recovered);
+        let (next, _, recovery_scope) = native_refresh_recovery_candidate(
+            &candidate, expected, &update,
+        )
+        .with_context(|| {
+            format!(
+                "native refresh recovery journal {} cannot be applied",
+                path.display()
+            )
+        })?;
+        tracing::warn!(
+            account_id = %expected.id,
+            provider_type = %expected.provider_type.as_str(),
+            recovery_scope,
+            "recovered rotated OAuth credentials from journal"
+        );
+        candidate = next;
+        changed = true;
+        recovered_paths.push(path);
+    }
+    if changed {
+        candidate
+            .save(config_dir)
+            .context("persist accounts recovered from native refresh journal")?;
+        *accounts = candidate;
+    }
+    for path in recovered_paths {
+        remove_native_refresh_recovery_journal(&path)?;
+    }
+    let _ = std::fs::remove_dir(&directory);
+    Ok(())
+}
+
+fn remove_superseded_native_refresh_journals(
+    config_dir: &Path,
+    accounts: &AccountStore,
+) -> anyhow::Result<()> {
+    let directory = native_refresh_recovery_dir(config_dir);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read native refresh recovery directory {}",
+                    directory.display()
+                )
+            })
+        }
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let journal = AccountStore::load_from_path(config_dir, &path)
+            .with_context(|| format!("load native refresh recovery journal {}", path.display()))?;
+        if journal.accounts.len() != 2 {
+            anyhow::bail!(
+                "native refresh recovery journal {} must contain expected and recovered accounts",
+                path.display()
+            );
+        }
+        let expected = &journal.accounts[0];
+        let recovered = &journal.accounts[1];
+        if expected.id != recovered.id || expected.provider_type != recovered.provider_type {
+            anyhow::bail!(
+                "native refresh recovery journal {} has inconsistent account identity",
+                path.display()
+            );
+        }
+        let remains_pending = accounts
+            .accounts
+            .iter()
+            .find(|account| account.id == expected.id)
+            .is_some_and(|account| native_refresh_snapshot_matches(account, expected));
+        if !remains_pending {
+            remove_native_refresh_recovery_journal(&path)?;
+        }
+    }
+    let _ = std::fs::remove_dir(&directory);
+    Ok(())
 }
 
 fn codex_workspace_rebind_transaction_path(config_dir: &Path) -> PathBuf {
@@ -945,6 +1400,8 @@ pub struct ServerEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_identity_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
     pub created_at_ms: u128,
 }
@@ -959,6 +1416,7 @@ impl ServerEvent {
             message: None,
             auth_provider: None,
             account_id: None,
+            auth_identity_generation: None,
             success: None,
             created_at_ms: crate::infra::time::now_ms(),
         }
@@ -971,6 +1429,11 @@ impl ServerEvent {
 
     pub fn account_id(mut self, account_id: impl Into<String>) -> Self {
         self.account_id = Some(account_id.into());
+        self
+    }
+
+    pub fn auth_identity_generation(mut self, auth_identity_generation: u64) -> Self {
+        self.auth_identity_generation = Some(auth_identity_generation);
         self
     }
 
@@ -1055,6 +1518,13 @@ struct StoreSaveDebounceState {
 }
 
 impl ShareInFlightTracker {
+    pub fn has_in_flight(&self, share_id: &str) -> bool {
+        self.counts
+            .lock()
+            .map(|counts| counts.get(share_id).is_some_and(|count| *count > 0))
+            .unwrap_or(true)
+    }
+
     pub fn try_acquire(
         self: &Arc<Self>,
         share_id: &str,
@@ -1206,9 +1676,11 @@ fn account_in_flight_key(provider_type: ProviderType, account_id: &str) -> Strin
 
 impl CachedCopilotUpstreamAuth {
     fn is_valid(&self, now_ms: i64) -> bool {
-        self.expires_at_ms
-            .map(|expires_at| expires_at.saturating_sub(60_000) > now_ms)
-            .unwrap_or(true)
+        !self.rejected
+            && self
+                .expires_at_ms
+                .map(|expires_at| expires_at.saturating_sub(60_000) > now_ms)
+                .unwrap_or(true)
             && !self.token.trim().is_empty()
             && !self.api_endpoint.trim().is_empty()
     }
@@ -1220,6 +1692,16 @@ impl CachedCopilotUpstreamAuth {
             api_endpoint: self.api_endpoint,
             expires_at_ms: self.expires_at_ms,
         }
+    }
+
+    fn binding_matches(&self, account: &Account, domain: &str) -> bool {
+        self.auth_identity_generation == account.auth_identity_generation
+            && self.token_refresh_generation == account.token_refresh_generation
+            && self.domain == domain
+    }
+
+    fn is_valid_for(&self, account: &Account, domain: &str, now_ms: i64) -> bool {
+        self.binding_matches(account, domain) && self.is_valid(now_ms)
     }
 }
 
@@ -1237,6 +1719,10 @@ fn cached_copilot_auth_from_account(
         token: token.to_string(),
         api_endpoint: copilot_account_api_endpoint(account, domain),
         expires_at_ms: account.expires_at,
+        rejected: false,
+        auth_identity_generation: account.auth_identity_generation,
+        token_refresh_generation: account.token_refresh_generation,
+        domain: domain.to_string(),
     };
     cached.is_valid(now_ms).then_some(cached)
 }
@@ -1406,11 +1892,129 @@ fn schedule_debounced_save(state: ServerState, kind: DebouncedStoreKind) {
     });
 }
 
+fn provider_bundle_views_from_store(
+    store: &ProviderStore,
+) -> anyhow::Result<Vec<ProviderBundleView>> {
+    let mut grouped = BTreeMap::<String, Vec<ProviderView>>::new();
+    for stored in store.list(None) {
+        if !is_explicit_bundle_surface(&stored.provider) {
+            continue;
+        }
+        grouped
+            .entry(provider_bundle_id(&stored.provider).to_string())
+            .or_default()
+            .push(ProviderView::from_stored_with_order(
+                &stored,
+                store.provider_order_index(&stored),
+            ));
+    }
+    let mut bundles = grouped
+        .into_values()
+        .map(ProviderBundleView::from_surface_views)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    bundles.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.route_key.cmp(&right.route_key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(bundles)
+}
+
+fn validate_provider_bundle_field_scopes(
+    family: &crate::domain::providers::registry::ProviderFamilySpec,
+    surfaces: &[StoredProvider],
+    accounts: &AccountStore,
+) -> Result<(), ProviderCommandError> {
+    let enabled_surfaces = surfaces
+        .iter()
+        .filter(|surface| surface_enabled(&surface.provider))
+        .collect::<Vec<_>>();
+    if enabled_surfaces.len() < 2 {
+        return Ok(());
+    }
+    let plans = enabled_surfaces
+        .iter()
+        .map(|surface| {
+            compile_runtime_plan(surface, accounts)
+                .map_err(|error| ProviderCommandError::Invalid(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = plans.first().expect("multi-Surface Bundle has a plan");
+    if family.endpoint_scope == ProviderFieldScope::Bundle
+        && plans.iter().any(|plan| plan.endpoint != first.endpoint)
+    {
+        return Err(ProviderCommandError::Invalid(format!(
+            "Provider family {} requires one Bundle-scoped endpoint",
+            family.family_id
+        )));
+    }
+    if family.headers_scope == ProviderFieldScope::Bundle
+        && plans
+            .iter()
+            .any(|plan| plan.extra_headers != first.extra_headers)
+    {
+        return Err(ProviderCommandError::Invalid(format!(
+            "Provider family {} requires one Bundle-scoped header configuration",
+            family.family_id
+        )));
+    }
+    if family.driver_options_scope == ProviderFieldScope::Bundle
+        && plans
+            .iter()
+            .any(|plan| plan.driver_options != first.driver_options)
+    {
+        return Err(ProviderCommandError::Invalid(format!(
+            "Provider family {} requires one Bundle-scoped Driver option configuration",
+            family.family_id
+        )));
+    }
+    Ok(())
+}
+
+fn provider_bundle_surface_managed_error() -> ProviderCommandError {
+    ProviderCommandError::Conflict {
+        code: "cc_switch_provider_bundle_surface_managed",
+        message: "Provider Bundle Surfaces must be managed through the Bundle API".to_string(),
+    }
+}
+
+fn ensure_ordinary_provider_not_bundle_managed(
+    provider: &Provider,
+) -> Result<(), ProviderCommandError> {
+    if has_bundle_managed_metadata(provider) {
+        return Err(provider_bundle_surface_managed_error());
+    }
+    Ok(())
+}
+
+fn validate_ordinary_provider_write_drafts(
+    current: &ProviderStore,
+    drafts: &[ProviderWriteDraft],
+) -> Result<(), ProviderCommandError> {
+    for draft in drafts {
+        ensure_ordinary_provider_not_bundle_managed(&draft.provider)?;
+        let existing = current.providers.iter().find(|stored| {
+            (stored.app == draft.app && stored.provider.id == draft.provider.id)
+                || draft
+                    .client_request_id
+                    .as_deref()
+                    .is_some_and(|request_id| {
+                        stored.resource.create_request_id.as_deref() == Some(request_id)
+                    })
+        });
+        if let Some(existing) = existing {
+            ensure_ordinary_provider_not_bundle_managed(&existing.provider)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_provider_write_drafts(
     store: &mut ProviderStore,
     drafts: Vec<ProviderWriteDraft>,
     accounts: &AccountStore,
-    enforce_codex_active_account: bool,
 ) -> Result<(Vec<StoredProvider>, bool), ProviderCommandError> {
     let mut stored = Vec::with_capacity(drafts.len());
     let mut any_changed = false;
@@ -1517,12 +2121,7 @@ fn apply_provider_write_drafts(
             .to_string(),
             resource: resource.clone(),
         };
-        validate_and_resolve_provider_binding(
-            &mut candidate,
-            existing.as_ref(),
-            accounts,
-            enforce_codex_active_account,
-        )?;
+        validate_and_resolve_provider_binding(&mut candidate, existing.as_ref(), accounts)?;
         provider = candidate.provider.clone();
         let unchanged = existing
             .as_ref()
@@ -1585,7 +2184,6 @@ fn validate_and_resolve_provider_binding(
     candidate: &mut StoredProvider,
     existing: Option<&StoredProvider>,
     accounts: &AccountStore,
-    enforce_codex_active_account: bool,
 ) -> Result<(), ProviderCommandError> {
     let Some(profile_id) = candidate
         .resource
@@ -1593,29 +2191,19 @@ fn validate_and_resolve_provider_binding(
         .as_ref()
         .map(|profile_id| profile_id.as_str().to_string())
     else {
-        if candidate.provider_type == ProviderType::CodexOAuth {
-            let account_id = provider_account_id(candidate)
-                .map(str::trim)
-                .filter(|account_id| !account_id.is_empty())
-                .ok_or_else(|| ProviderCommandError::Conflict {
-                    code: "cc_switch_codex_inactive_account",
-                    message: "Codex OAuth Provider must be bound to the active account".to_string(),
-                })?;
-            if accounts
-                .find_for_provider(ProviderType::CodexOAuth, Some(account_id))
-                .is_none()
-            {
-                return Err(ProviderCommandError::Conflict {
-                    code: "cc_switch_codex_inactive_account",
-                    message: format!(
-                        "Codex OAuth Provider accountId {account_id} is not an available Codex OAuth account"
-                    ),
-                });
-            }
-            if enforce_codex_active_account {
-                validate_codex_provider_active_account(accounts, account_id)?;
-            }
+        if account_credential_ownership(candidate.provider_type)
+            == AccountCredentialOwnership::ManagedAccount
+        {
+            let account_provider_type = candidate.provider_type;
+            return validate_managed_provider_binding(
+                candidate,
+                existing,
+                accounts,
+                account_provider_type,
+                None,
+            );
         }
+        clear_provider_auth_binding(candidate);
         return Ok(());
     };
     let profile = profile_by_id(&profile_id)
@@ -1632,46 +2220,83 @@ fn validate_and_resolve_provider_binding(
     }
     crate::domain::providers::runtime::validate_custom_extra_headers(candidate, profile)
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
-    validate_profile_credentials(candidate, profile)?;
-    let CredentialPolicy::ManagedAccount {
-        account_provider_type,
-    } = &profile.credential_policy
-    else {
-        return Ok(());
+    if !is_explicit_bundle_surface(&candidate.provider) || surface_enabled(&candidate.provider) {
+        validate_profile_credentials(candidate, profile)?;
+    }
+    let account_provider_type = match &profile.credential_policy {
+        CredentialPolicy::ManagedAccount {
+            account_provider_type,
+        } => *account_provider_type,
+        CredentialPolicy::Legacy
+            if account_credential_ownership(candidate.provider_type)
+                == AccountCredentialOwnership::ManagedAccount =>
+        {
+            candidate.provider_type
+        }
+        _ => {
+            clear_provider_auth_binding(candidate);
+            return Ok(());
+        }
     };
-    let account_provider_type = *account_provider_type;
 
-    let account_id = provider_account_id(candidate)
-        .map(str::to_string)
-        .ok_or_else(|| {
+    validate_managed_provider_binding(
+        candidate,
+        existing,
+        accounts,
+        account_provider_type,
+        Some(&profile_id),
+    )
+}
+
+fn validate_managed_provider_binding(
+    candidate: &mut StoredProvider,
+    existing: Option<&StoredProvider>,
+    accounts: &AccountStore,
+    account_provider_type: ProviderType,
+    profile_id: Option<&str>,
+) -> Result<(), ProviderCommandError> {
+    let missing_binding_error = || {
+        if let Some(profile_id) = profile_id {
             ProviderCommandError::Invalid(format!(
                 "Provider profile {profile_id} requires an explicit accountId"
             ))
-        })?;
+        } else {
+            ProviderCommandError::Invalid(format!(
+                "{} Provider requires an explicit accountId",
+                account_provider_type.as_str()
+            ))
+        }
+    };
+
+    let Some(account_id) = provider_account_id(candidate).map(str::to_string) else {
+        return Err(missing_binding_error());
+    };
     let account_id = account_id.trim();
     if account_id.is_empty() {
-        return Err(ProviderCommandError::Invalid(format!(
-            "Provider profile {profile_id} requires a non-empty accountId"
-        )));
+        return Err(missing_binding_error());
     }
     let account = accounts
         .accounts
         .iter()
         .find(|account| account.id == account_id)
-        .ok_or_else(|| {
-            ProviderCommandError::Invalid(format!(
+        .ok_or_else(|| match profile_id {
+            Some(profile_id) => ProviderCommandError::Invalid(format!(
                 "accountId {account_id} does not exist for Provider profile {profile_id}"
-            ))
+            )),
+            None => ProviderCommandError::Invalid(format!(
+                "accountId {account_id} does not exist for {} Provider",
+                account_provider_type.as_str()
+            )),
         })?;
     if account.provider_type != account_provider_type {
+        let context = profile_id
+            .map(|profile_id| format!("Provider profile {profile_id}"))
+            .unwrap_or_else(|| format!("{} Provider", account_provider_type.as_str()));
         return Err(ProviderCommandError::Invalid(format!(
-            "accountId {account_id} has providerType {}, expected {} for Provider profile {profile_id}",
+            "accountId {account_id} has providerType {}, expected {} for {context}",
             account.provider_type.as_str(),
-            account_provider_type.as_str()
+            account_provider_type.as_str(),
         )));
-    }
-    if account_provider_type == ProviderType::CodexOAuth && enforce_codex_active_account {
-        validate_codex_provider_active_account(accounts, account_id)?;
     }
     let binding_unchanged = existing.and_then(provider_account_id) == Some(account_id);
     let expected_generation = if binding_unchanged {
@@ -1695,7 +2320,7 @@ fn validate_and_resolve_provider_binding(
         .meta
         .get_or_insert_with(ProviderMeta::default);
     meta.auth_binding = Some(AuthBinding {
-        source: Some("account".to_string()),
+        source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
         auth_provider: Some(account_provider_type.as_str().to_string()),
         account_id: Some(account_id.to_string()),
         auth_identity_generation: Some(expected_generation),
@@ -1703,28 +2328,10 @@ fn validate_and_resolve_provider_binding(
     Ok(())
 }
 
-fn validate_codex_provider_active_account(
-    accounts: &AccountStore,
-    account_id: &str,
-) -> Result<(), ProviderCommandError> {
-    let active_account =
-        accounts
-            .active_codex_oauth_account()
-            .ok_or_else(|| ProviderCommandError::Conflict {
-                code: "cc_switch_codex_inactive_account",
-                message: "Codex OAuth Provider cannot be saved until an active account is selected"
-                    .to_string(),
-            })?;
-    if active_account.id == account_id {
-        return Ok(());
+fn clear_provider_auth_binding(candidate: &mut StoredProvider) {
+    if let Some(meta) = candidate.provider.meta.as_mut() {
+        meta.auth_binding = None;
     }
-    Err(ProviderCommandError::Conflict {
-        code: "cc_switch_codex_inactive_account",
-        message: format!(
-            "Codex OAuth Provider accountId {account_id} is not the active account {}",
-            active_account.id
-        ),
-    })
 }
 
 fn normalize_provider_outbound_identity(
@@ -2008,6 +2615,7 @@ fn prepare_provider_import(
             "Provider import is limited to {MAX_PROVIDER_IMPORT_ITEMS} items"
         )));
     }
+    validate_ordinary_provider_write_drafts(current, &drafts)?;
     let mut keys = BTreeSet::new();
     for draft in &drafts {
         let provider_id = draft.provider.id.trim();
@@ -2042,7 +2650,7 @@ fn prepare_provider_import(
     let preview_token = hex::encode(digest.finalize().into_bytes());
 
     let mut candidate = current.clone();
-    let (written, _) = apply_provider_write_drafts(&mut candidate, drafts, accounts, true)?;
+    let (written, _) = apply_provider_write_drafts(&mut candidate, drafts, accounts)?;
     candidate
         .validate_for_commit()
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
@@ -2203,6 +2811,7 @@ fn prepare_adopt_provider_profile(
         .find(|stored| stored.app == app && stored.provider.id == provider_id)
         .cloned()
         .ok_or(ProviderCommandError::NotFound)?;
+    ensure_ordinary_provider_not_bundle_managed(&source.provider)?;
     if source.resource.revision != expected_revision {
         return Err(provider_revision_conflict(
             expected_revision,
@@ -2265,13 +2874,13 @@ fn prepare_adopt_provider_profile(
             .meta
             .get_or_insert_with(ProviderMeta::default);
         meta.auth_binding = Some(AuthBinding {
-            source: Some("account".to_string()),
+            source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
             auth_provider: Some(account_provider_type.as_str().to_string()),
             account_id: Some(account_id.to_string()),
             auth_identity_generation: None,
         });
     }
-    validate_and_resolve_provider_binding(&mut target, Some(&source), accounts, true)?;
+    validate_and_resolve_provider_binding(&mut target, Some(&source), accounts)?;
 
     let mut candidate = current.clone();
     let target_index = candidate
@@ -2321,6 +2930,7 @@ fn prepare_rebind_custom_provider(
         .find(|stored| stored.app == app && stored.provider.id == provider_id)
         .cloned()
         .ok_or(ProviderCommandError::NotFound)?;
+    ensure_ordinary_provider_not_bundle_managed(&source.provider)?;
     if source.resource.revision != expected_revision {
         return Err(provider_revision_conflict(
             expected_revision,
@@ -2426,6 +3036,7 @@ fn prepare_clone_provider_as_custom(
         .find(|stored| stored.app == app && stored.provider.id == source_provider_id)
         .cloned()
         .ok_or(ProviderCommandError::NotFound)?;
+    ensure_ordinary_provider_not_bundle_managed(&source.provider)?;
     if source.resource.revision != expected_revision {
         return Err(provider_revision_conflict(
             expected_revision,
@@ -2510,9 +3121,9 @@ fn prepare_clone_provider_as_custom(
         client_request_id: Some(client_request_id),
         credential_patches: BTreeMap::new(),
     };
+    validate_ordinary_provider_write_drafts(current, std::slice::from_ref(&draft))?;
     let mut candidate = current.clone();
-    let (mut written, _) =
-        apply_provider_write_drafts(&mut candidate, vec![draft], accounts, true)?;
+    let (mut written, _) = apply_provider_write_drafts(&mut candidate, vec![draft], accounts)?;
     let target = written
         .pop()
         .expect("clone-as-custom writes exactly one Provider");
@@ -2560,32 +3171,6 @@ fn validate_provider_action_preview_token(
     Ok(())
 }
 
-fn expected_account_provider_type(stored: &StoredProvider) -> Option<ProviderType> {
-    if let Some(profile_id) = stored.resource.profile_id.as_ref() {
-        let profile = profile_by_id(profile_id.as_str())?;
-        if let CredentialPolicy::ManagedAccount {
-            account_provider_type,
-        } = profile.credential_policy
-        {
-            return Some(account_provider_type);
-        }
-        return None;
-    }
-    match stored.provider_type {
-        ProviderType::ClaudeOAuth
-        | ProviderType::CodexOAuth
-        | ProviderType::GeminiCli
-        | ProviderType::AntigravityOAuth
-        | ProviderType::AgyOAuth
-        | ProviderType::GitHubCopilot
-        | ProviderType::DeepSeekAccount
-        | ProviderType::KiroOAuth
-        | ProviderType::CursorOAuth
-        | ProviderType::GrokOAuth => Some(stored.provider_type),
-        _ => None,
-    }
-}
-
 fn prepare_account_binding_migration_preview(
     current: &ProviderStore,
     accounts: &AccountStore,
@@ -2593,7 +3178,10 @@ fn prepare_account_binding_migration_preview(
 ) -> Result<ProviderAccountBindingMigrationPreview, ProviderCommandError> {
     let mut items = Vec::new();
     for stored in &current.providers {
-        let Some(expected_provider_type) = expected_account_provider_type(stored) else {
+        if has_bundle_managed_metadata(&stored.provider) {
+            continue;
+        }
+        let Some(expected_provider_type) = managed_account_provider_type(stored) else {
             continue;
         };
         let matching_account_ids = accounts
@@ -2626,24 +3214,6 @@ fn prepare_account_binding_migration_preview(
                         expected_provider_type.as_str()
                     )),
                 ),
-                Some(account)
-                    if expected_provider_type == ProviderType::CodexOAuth
-                        && active_codex_account_id != Some(account.id.as_str()) =>
-                {
-                    (
-                        ProviderAccountBindingMigrationStatus::InvalidAccount,
-                        Some(account_id.to_string()),
-                        Some(match active_codex_account_id {
-                            Some(active_account_id) => format!(
-                                "bound Codex OAuth account is not the active account {active_account_id}"
-                            ),
-                            None => {
-                                "select the active Codex OAuth account before migrating Provider bindings"
-                                    .to_string()
-                            }
-                        }),
-                    )
-                }
                 Some(account)
                     if provider_auth_identity_generation(stored).is_some_and(|generation| {
                         generation != account.auth_identity_generation
@@ -2740,6 +3310,7 @@ fn prepare_account_binding_migration_preview(
                 item.status,
                 ProviderAccountBindingMigrationStatus::Bindable
                     | ProviderAccountBindingMigrationStatus::Ambiguous
+                    | ProviderAccountBindingMigrationStatus::StaleIdentity
             ) && item.selected_account_id.is_some()
         })
         .count();
@@ -2819,7 +3390,8 @@ impl ServerStateInner {
             );
         }
         let mut providers = ProviderStore::load_runtime_or_default(&config_dir)?;
-        let accounts = AccountStore::load_or_default(&config_dir)?;
+        let mut accounts = AccountStore::load_or_default(&config_dir)?;
+        recover_pending_native_refresh_journals(&config_dir, &mut accounts)?;
         let reasoning_root_key = crate::infra::credentials::load_or_create_root_key(&config_dir)
             .context("resolve proxy reasoning bridge root key")?;
         crate::proxy::reasoning_bridge::initialize(&reasoning_root_key.key)?;
@@ -2891,6 +3463,10 @@ impl ServerStateInner {
         let upgrade = Arc::new(crate::self_update::upgrade::UpgradeRegistry::load(
             &config_dir,
         )?);
+        let image_capabilities = Arc::new(
+            crate::image_store::ImageCapabilityStore::from_config_dir(&config_dir)
+                .context("initialize image capability store")?,
+        );
 
         Ok(Arc::new(Self {
             bind_addr,
@@ -2907,15 +3483,17 @@ impl ServerStateInner {
             #[cfg(test)]
             provider_commit_delay_ms: std::sync::atomic::AtomicU64::new(0),
             accounts: RwLock::new(accounts),
+            managed_auth_operations: AsyncMutex::new(()),
             usage: RwLock::new(usage),
             shares: RwLock::new(shares),
             share_quota_mutations: AsyncMutex::new(()),
+            share_lifecycle: AsyncMutex::new(()),
             ui_settings: RwLock::new(ui_settings),
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
             grok_media_sessions: Mutex::new(BTreeMap::new()),
-            ephemeral_images: Mutex::new(EphemeralImageStore::default()),
+            image_capabilities,
             grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
@@ -2927,10 +3505,12 @@ impl ServerStateInner {
                 crate::proxy::cursor::credential_cache::CursorModelCatalogCache::default(),
             cursor_api_key_verifier,
             account_refresh_locks: AccountRefreshLocks::default(),
+            native_refresh_receipt_journal: Mutex::new(NativeRefreshReceiptJournal::default()),
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
             router_registration_flight: AsyncMutex::new(None),
+            client_tunnel_claim: AsyncMutex::new(()),
             setup_flight: AsyncMutex::new(()),
             router_share_sync: AsyncMutex::new(()),
             share_edit_sync: AsyncMutex::new(()),
@@ -2940,6 +3520,12 @@ impl ServerStateInner {
             credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             account_refresh_persist_failures: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            account_refresh_commit_state_failures: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            gemini_project_commit_failures: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            client_tunnel_claim_commit_failures: std::sync::atomic::AtomicU64::new(0),
             http_client: RwLock::new(http_client),
             events,
             tunnels,
@@ -2967,21 +3553,25 @@ impl ServerStateInner {
         crate::logging::reload_log_level(level);
     }
 
-    pub(crate) fn store_ephemeral_image(
+    pub(crate) async fn store_image_capability(
         &self,
         data: bytes::Bytes,
         mime_type: String,
-    ) -> anyhow::Result<EphemeralImageHandle> {
-        let now_ms = now_ms_i64();
-        self.ephemeral_images
-            .lock()
-            .map_err(|_| anyhow::anyhow!("ephemeral image store lock poisoned"))?
-            .insert(data, mime_type, now_ms)
+    ) -> anyhow::Result<crate::image_store::ImageCapabilityHandle> {
+        let store = Arc::clone(&self.image_capabilities);
+        tokio::task::spawn_blocking(move || store.insert(data, mime_type))
+            .await
+            .context("join image capability insert task")?
     }
 
-    pub(crate) fn ephemeral_image(&self, token: &str) -> Option<EphemeralImage> {
-        let now_ms = now_ms_i64();
-        self.ephemeral_images.lock().ok()?.get(token, now_ms)
+    pub(crate) async fn image_capability(
+        &self,
+        token: String,
+    ) -> anyhow::Result<Option<crate::image_store::ImageCapability>> {
+        let store = Arc::clone(&self.image_capabilities);
+        tokio::task::spawn_blocking(move || store.get(&token))
+            .await
+            .context("join image capability read task")?
     }
 
     pub async fn read_admin_log_tail(
@@ -3005,6 +3595,7 @@ impl ServerStateInner {
         let mut current = self.config.write().await;
         preserve_router_identity_from_stale_snapshot(&current, &mut config);
         preserve_setup_completion_from_stale_snapshot(&current, &mut config);
+        preserve_client_tunnel_claim_from_stale_snapshot(&current, &mut config);
         let http_client = build_http_client()?;
         config.save(&self.config_dir)?;
         *self.http_client.write().await = http_client;
@@ -3033,6 +3624,143 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub(crate) async fn lock_client_tunnel_claim(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.client_tunnel_claim.lock().await
+    }
+
+    pub(crate) async fn begin_client_tunnel_claim(
+        &self,
+        intent: &ClientTunnelClaimIntent,
+    ) -> anyhow::Result<ServerConfig> {
+        let mut current = self.config.write().await;
+        if !intent.matches_config(&current) {
+            anyhow::bail!("client tunnel claim configuration changed before intent commit");
+        }
+        let mut next = current.clone();
+        next.client.claim_pending = Some(intent.clone());
+        next.client.tunnel_status = Some("claim_pending".to_string());
+        next.router.last_register_error = None;
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    pub(crate) async fn commit_client_tunnel_claim_success(
+        &self,
+        intent: &ClientTunnelClaimIntent,
+    ) -> anyhow::Result<ServerConfig> {
+        let mut current = self.config.write().await;
+        ensure_current_client_tunnel_claim(&current, intent)?;
+        let mut next = current.clone();
+        next.client.claim_pending = None;
+        next.client.tunnel_status = Some("claimed_remote".to_string());
+        next.router.last_register_error = None;
+        #[cfg(test)]
+        if self
+            .client_tunnel_claim_commit_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected client tunnel claim commit failure");
+        }
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    pub(crate) async fn commit_client_tunnel_claim_failure(
+        &self,
+        intent: &ClientTunnelClaimIntent,
+        conflict: bool,
+        message: String,
+    ) -> anyhow::Result<ServerConfig> {
+        let mut current = self.config.write().await;
+        ensure_current_client_tunnel_claim(&current, intent)?;
+        let mut next = current.clone();
+        next.client.claim_pending = None;
+        next.client.tunnel_status = Some(if conflict {
+            "claim_conflict".to_string()
+        } else {
+            "claim_failed".to_string()
+        });
+        next.router.last_register_error = Some(message);
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    pub(crate) async fn retain_client_tunnel_claim_pending(
+        &self,
+        intent: &ClientTunnelClaimIntent,
+        message: String,
+    ) -> anyhow::Result<ServerConfig> {
+        let mut current = self.config.write().await;
+        ensure_current_client_tunnel_claim(&current, intent)?;
+        let mut next = current.clone();
+        next.client.tunnel_status = Some("claim_pending".to_string());
+        next.router.last_register_error = Some(message);
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    pub(crate) async fn mark_client_tunnel_claim_skipped(&self) -> anyhow::Result<ServerConfig> {
+        let _claim = self.client_tunnel_claim.lock().await;
+        let mut current = self.config.write().await;
+        if current.client.claim_pending.is_none()
+            && matches!(
+                current.client.tunnel_status.as_deref(),
+                Some("claimed_remote" | "connected" | "active" | "running")
+            )
+        {
+            return Ok(current.clone());
+        }
+        let mut next = current.clone();
+        next.client.tunnel_status = Some("claim_skipped".to_string());
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    pub(crate) async fn commit_client_tunnel_lease(
+        &self,
+        intent: &ClientTunnelClaimIntent,
+        ssh_host: String,
+    ) -> anyhow::Result<ServerConfig> {
+        let mut current = self.config.write().await;
+        if !intent.matches_config(&current) {
+            anyhow::bail!("client tunnel configuration changed before lease commit");
+        }
+        let mut next = current.clone();
+        next.client.tunnel_status = Some("connected".to_string());
+        next.router.ssh_host = Some(ssh_host);
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    pub(crate) async fn record_client_tunnel_heartbeat(
+        &self,
+        heartbeat_ms: u128,
+    ) -> anyhow::Result<ServerConfig> {
+        let mut current = self.config.write().await;
+        let mut next = current.clone();
+        next.client.last_heartbeat_ms = Some(heartbeat_ms);
+        next.save(&self.config_dir)?;
+        *current = next.clone();
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_client_tunnel_claim_commit(&self) {
+        self.client_tunnel_claim_commit_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub async fn reported_public_ip(&self) -> Option<String> {
@@ -3591,6 +4319,7 @@ impl ServerStateInner {
             ServerEvent::new("oauth-quota-updated", "quota")
                 .auth_provider(oauth_quota_auth_provider_label(account.provider_type))
                 .account_id(account.id.clone())
+                .auth_identity_generation(account.auth_identity_generation)
                 .success(success),
         );
     }
@@ -3622,6 +4351,126 @@ impl ServerStateInner {
             .collect()
     }
 
+    pub async fn provider_bundle_views(&self) -> anyhow::Result<Vec<ProviderBundleView>> {
+        let store = self.providers.read().await;
+        provider_bundle_views_from_store(&store)
+    }
+
+    pub async fn provider_bundle_view(
+        &self,
+        bundle_id: &str,
+    ) -> anyhow::Result<Option<ProviderBundleView>> {
+        Ok(self
+            .provider_bundle_views()
+            .await?
+            .into_iter()
+            .find(|bundle| bundle.id == bundle_id))
+    }
+
+    pub async fn provider_id_for_route_key(&self, app: AppKind, route_key: &str) -> Option<String> {
+        self.providers
+            .read()
+            .await
+            .providers
+            .iter()
+            .find(|stored| {
+                stored.app == app
+                    && crate::domain::providers::bundle::surface_enabled(&stored.provider)
+                    && provider_route_key(&stored.provider) == route_key
+            })
+            .map(|stored| stored.provider.id.clone())
+    }
+
+    pub async fn provider_bundle_reference_preview(
+        &self,
+        bundle_id: &str,
+    ) -> Result<ProviderBundleReferencePreview, ProviderCommandError> {
+        let providers = self.providers.read().await;
+        let surfaces = providers
+            .providers
+            .iter()
+            .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+            .collect::<Vec<_>>();
+        if surfaces.is_empty() {
+            return Err(ProviderCommandError::NotFound);
+        }
+        let revision = surfaces
+            .iter()
+            .map(|stored| stored.resource.revision)
+            .max()
+            .unwrap_or_default();
+        let shares = self.shares.read().await;
+        let mut share_ids = surfaces
+            .iter()
+            .flat_map(|stored| shares.share_ids_for_provider(stored.app, &stored.provider.id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        share_ids.sort();
+        Ok(ProviderBundleReferencePreview {
+            bundle_id: bundle_id.to_string(),
+            revision,
+            blocked: !share_ids.is_empty(),
+            share_ids,
+        })
+    }
+
+    pub async fn delete_provider_bundle_command(
+        self: &Arc<Self>,
+        bundle_id: String,
+        expected_revision: u64,
+    ) -> anyhow::Result<Result<bool, ProviderCommandError>> {
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
+        let preview = match self.provider_bundle_reference_preview(&bundle_id).await {
+            Ok(preview) => preview,
+            Err(error) => return Ok(Err(error)),
+        };
+        if preview.revision != expected_revision {
+            return Ok(Err(provider_revision_conflict(
+                expected_revision,
+                preview.revision,
+            )));
+        }
+        if preview.blocked {
+            return Ok(Err(ProviderCommandError::Conflict {
+                code: "cc_switch_provider_bundle_in_use",
+                message: format!(
+                    "Provider Bundle is still referenced by {} Share(s)",
+                    preview.share_ids.len()
+                ),
+            }));
+        }
+        self.commit_provider_change_under_reference_guard(reference_guard, move |providers| {
+            let surfaces = providers
+                .providers
+                .iter()
+                .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+                .map(|stored| (stored.app, stored.provider.id.clone()))
+                .collect::<Vec<_>>();
+            if surfaces.is_empty() {
+                return Err(ProviderCommandError::NotFound);
+            }
+            let actual_revision = providers
+                .providers
+                .iter()
+                .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+                .map(|stored| stored.resource.revision)
+                .max()
+                .unwrap_or_default();
+            if actual_revision != expected_revision {
+                return Err(provider_revision_conflict(
+                    expected_revision,
+                    actual_revision,
+                ));
+            }
+            for (app, provider_id) in surfaces {
+                providers.remove(app, &provider_id);
+            }
+            Ok((true, true))
+        })
+        .await
+    }
+
     pub async fn reveal_provider_credential_command(
         &self,
         key: &ProviderKey,
@@ -3651,6 +4500,7 @@ impl ServerStateInner {
             .iter()
             .find(|stored| stored.app == app && stored.provider.id == provider_id)
             .ok_or(ProviderCommandError::NotFound)?;
+        ensure_ordinary_provider_not_bundle_managed(&stored.provider)?;
         let revision = stored.resource.revision;
         let mut share_ids = self
             .shares
@@ -3658,18 +4508,12 @@ impl ServerStateInner {
             .await
             .share_ids_for_provider(app, provider_id);
         share_ids.sort();
-        let current_provider = crate::domain::providers::current_provider::read_current_provider_id(
-            &self.ui_settings.read().await.for_frontend(),
-            app,
-        )
-        .as_deref() == Some(provider_id);
         Ok(ProviderReferencePreview {
             app,
             provider_id: provider_id.to_string(),
             revision,
-            blocked: !share_ids.is_empty() || current_provider,
+            blocked: !share_ids.is_empty(),
             share_ids,
-            current_provider,
         })
     }
 
@@ -3697,13 +4541,8 @@ impl ServerStateInner {
             return Ok(Err(ProviderCommandError::Conflict {
                 code: "cc_switch_provider_in_use",
                 message: format!(
-                    "Provider is still referenced by {} Share(s){}",
-                    preview.share_ids.len(),
-                    if preview.current_provider {
-                        " and is the current Provider"
-                    } else {
-                        ""
-                    }
+                    "Provider is still referenced by {} Share(s)",
+                    preview.share_ids.len()
                 ),
             }));
         }
@@ -3715,6 +4554,7 @@ impl ServerStateInner {
             else {
                 return Err(ProviderCommandError::NotFound);
             };
+            ensure_ordinary_provider_not_bundle_managed(&stored.provider)?;
             if stored.resource.revision != expected_revision {
                 return Err(ProviderCommandError::Conflict {
                     code: "cc_switch_provider_revision_conflict",
@@ -3749,6 +4589,7 @@ impl ServerStateInner {
     async fn validate_cursor_api_key_provider_drafts(
         &self,
         drafts: &[ProviderWriteDraft],
+        allow_bundle_managed: bool,
     ) -> Result<(), ProviderCommandError> {
         let mut candidate_store =
             self.providers
@@ -3760,9 +4601,12 @@ impl ServerStateInner {
                         "could not materialize Provider credentials for validation".to_string(),
                     )
                 })?;
+        if !allow_bundle_managed {
+            validate_ordinary_provider_write_drafts(&candidate_store, drafts)?;
+        }
         let accounts = self.accounts.read().await.clone();
         let (candidates, _) =
-            apply_provider_write_drafts(&mut candidate_store, drafts.to_vec(), &accounts, false)?;
+            apply_provider_write_drafts(&mut candidate_store, drafts.to_vec(), &accounts)?;
         for candidate in candidates
             .iter()
             .filter(|candidate| candidate.provider_type == ProviderType::CursorApiKey)
@@ -3777,16 +4621,6 @@ impl ServerStateInner {
             ]
             .iter()
             .find_map(|key| provider_setting(&candidate.provider, key))
-            .or_else(|| {
-                provider_account_id(candidate)
-                    .and_then(|account_id| {
-                        accounts.find_for_provider(ProviderType::CursorApiKey, Some(account_id))
-                    })
-                    .and_then(|account| account.api_key.as_deref())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            })
             .ok_or_else(|| {
                 ProviderCommandError::Invalid(
                     "Cursor API-key Provider requires one API key".to_string(),
@@ -3826,6 +4660,244 @@ impl ServerStateInner {
         .await
     }
 
+    pub async fn upsert_provider_bundle_command(
+        self: &Arc<Self>,
+        draft: ProviderBundleWriteDraft,
+    ) -> anyhow::Result<Result<ProviderBundleView, ProviderCommandError>> {
+        let family = match draft.validate() {
+            Ok(family) => family,
+            Err(error) => return Ok(Err(ProviderCommandError::Invalid(error.to_string()))),
+        };
+        let credential_profile = profile_by_id(family.credential_profile_id.as_str())
+            .expect("Provider family credential profile is registry-validated");
+        let shared_static_credentials = family.surfaces.len() > 1
+            && matches!(
+                credential_profile.credential_policy,
+                CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Aws { .. }
+            );
+        if matches!(
+            credential_profile.credential_policy,
+            CredentialPolicy::Custom
+                | CredentialPolicy::ManagedAccount { .. }
+                | CredentialPolicy::Legacy
+        ) && !draft.credential_patches.is_empty()
+        {
+            return Ok(Err(ProviderCommandError::Invalid(
+                "bundle credentialPatches are not supported by this Provider family".to_string(),
+            )));
+        }
+        if shared_static_credentials
+            && draft
+                .surfaces
+                .iter()
+                .any(|surface| !surface.credential_patches.is_empty())
+        {
+            return Ok(Err(ProviderCommandError::Invalid(
+                "shared Provider credentials must be submitted at Bundle scope".to_string(),
+            )));
+        }
+        if matches!(
+            credential_profile.credential_policy,
+            CredentialPolicy::ManagedAccount { .. }
+        ) {
+            let account_ids = draft
+                .surfaces
+                .iter()
+                .map(|surface| {
+                    surface
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.auth_binding.as_ref())
+                        .and_then(|binding| binding.account_id.as_deref())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .collect::<Vec<_>>();
+            let unique = account_ids
+                .iter()
+                .filter_map(|account_id| *account_id)
+                .collect::<BTreeSet<_>>();
+            if account_ids.iter().any(|account_id| account_id.is_none()) || unique.len() != 1 {
+                return Ok(Err(ProviderCommandError::Invalid(
+                    "all Provider Bundle Surfaces must use the same managed account".to_string(),
+                )));
+            }
+        }
+
+        let credential_source = match credential_source_app(family) {
+            Ok(app) => app,
+            Err(error) => return Ok(Err(ProviderCommandError::Invalid(error.to_string()))),
+        };
+        if !draft
+            .surfaces
+            .iter()
+            .any(|surface| surface.app == credential_source)
+        {
+            return Ok(Err(ProviderCommandError::Invalid(
+                "Provider Bundle credential source Surface is missing".to_string(),
+            )));
+        }
+
+        let mut provider_drafts = Vec::with_capacity(draft.surfaces.len());
+        for surface in &draft.surfaces {
+            let mut credential_patches = surface.credential_patches.clone();
+            if shared_static_credentials || family.surfaces.len() == 1 {
+                for (slot, patch) in &draft.credential_patches {
+                    if credential_patches
+                        .insert(slot.clone(), patch.clone())
+                        .is_some()
+                    {
+                        return Ok(Err(ProviderCommandError::Invalid(format!(
+                            "credential patch slot {slot} is repeated at Bundle and Surface scope"
+                        ))));
+                    }
+                }
+            }
+            provider_drafts.push(ProviderWriteDraft {
+                app: surface.app,
+                provider: draft.provider_for_surface(surface),
+                profile_id: Some(surface.profile_id.clone()),
+                custom_binding: surface.custom_binding.clone(),
+                expected_revision: None,
+                client_request_id: draft
+                    .client_request_id
+                    .as_ref()
+                    .map(|request_id| format!("{request_id}:{}", surface.app.as_str())),
+                credential_patches,
+            });
+        }
+        if let Err(error) = self
+            .validate_cursor_api_key_provider_drafts(&provider_drafts, true)
+            .await
+        {
+            return Ok(Err(error));
+        }
+
+        let bundle_id = draft.id.clone();
+        let family_id = draft.family_id.clone();
+        let route_key = draft.route_key.clone();
+        let expected_revision = draft.expected_revision;
+        let reference_guard = self.reference_mutations.clone().lock_owned().await;
+        let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
+        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
+            let existing = store
+                .providers
+                .iter()
+                .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let actual_revision = existing
+                .iter()
+                .map(|stored| stored.resource.revision)
+                .max()
+                .unwrap_or_default();
+            let is_create_replay = !existing.is_empty()
+                && expected_revision.is_none()
+                && provider_drafts.iter().all(|draft| {
+                    draft
+                        .client_request_id
+                        .as_deref()
+                        .is_some_and(|request_id| {
+                            existing.iter().any(|stored| {
+                                stored.app == draft.app
+                                    && stored.resource.create_request_id.as_deref()
+                                        == Some(request_id)
+                            })
+                        })
+                });
+            match (existing.is_empty(), expected_revision) {
+                (true, Some(expected)) if expected != 0 => {
+                    return Err(provider_revision_conflict(expected, 0));
+                }
+                (false, None) if !is_create_replay => {
+                    return Err(ProviderCommandError::Conflict {
+                        code: "cc_switch_provider_revision_conflict",
+                        message: "expectedRevision is required when updating a Provider Bundle"
+                            .to_string(),
+                    });
+                }
+                (false, Some(expected)) if expected != actual_revision => {
+                    return Err(provider_revision_conflict(expected, actual_revision));
+                }
+                _ => {}
+            }
+            if existing.iter().any(|stored| {
+                stored
+                    .provider
+                    .extra
+                    .get("familyId")
+                    .and_then(Value::as_str)
+                    != Some(family_id.as_str())
+            }) {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_bundle_family_conflict",
+                    message: "Provider Bundle family is immutable".to_string(),
+                });
+            }
+            let existing_apps = existing
+                .iter()
+                .map(|stored| stored.app)
+                .collect::<BTreeSet<_>>();
+            let requested_apps = provider_drafts
+                .iter()
+                .map(|provider| provider.app)
+                .collect::<BTreeSet<_>>();
+            if !existing.is_empty() && existing_apps != requested_apps {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_bundle_surface_conflict",
+                    message: "Provider Bundle Surface set is immutable".to_string(),
+                });
+            }
+            if store.providers.iter().any(|stored| {
+                provider_bundle_id(&stored.provider) != bundle_id
+                    && provider_route_key(&stored.provider) == route_key
+            }) {
+                return Err(ProviderCommandError::Conflict {
+                    code: "cc_switch_provider_route_key_conflict",
+                    message: format!("routeKey {route_key} is already in use"),
+                });
+            }
+            for provider_draft in &mut provider_drafts {
+                provider_draft.expected_revision = existing
+                    .iter()
+                    .find(|stored| stored.app == provider_draft.app)
+                    .map(|stored| stored.resource.revision);
+            }
+            let current = store.clone();
+            let mut result = apply_provider_write_drafts(store, provider_drafts, &accounts)?;
+            if result.1 {
+                let bundle_revision = actual_revision.saturating_add(1);
+                for surface in &mut result.0 {
+                    if surface.resource.revision == bundle_revision {
+                        continue;
+                    }
+                    surface.resource.revision = bundle_revision;
+                    *surface = store.upsert_with_resource(
+                        surface.app,
+                        surface.provider.clone(),
+                        surface.resource.clone(),
+                    );
+                }
+            }
+            validate_provider_bundle_field_scopes(family, &result.0, &accounts)?;
+            if result.1 {
+                validate_ordinary_provider_subscription_change(
+                    &current, store, &accounts, &shares,
+                )?;
+            }
+            let views = result
+                .0
+                .iter()
+                .map(ProviderView::from_stored)
+                .collect::<Vec<_>>();
+            let bundle = ProviderBundleView::from_surface_views(views)
+                .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
+            Ok((bundle, result.1))
+        })
+        .await
+    }
+
     pub async fn upsert_provider_draft_command(
         self: &Arc<Self>,
         draft: ProviderWriteDraft,
@@ -3846,31 +4918,23 @@ impl ServerStateInner {
         self: &Arc<Self>,
         drafts: Vec<ProviderWriteDraft>,
     ) -> anyhow::Result<Result<Vec<StoredProvider>, ProviderCommandError>> {
-        if let Err(error) = self.validate_cursor_api_key_provider_drafts(&drafts).await {
+        if let Err(error) = self
+            .validate_cursor_api_key_provider_drafts(&drafts, false)
+            .await
+        {
             return Ok(Err(error));
         }
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
         let shares = self.shares.read().await.clone();
         self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
+            validate_ordinary_provider_write_drafts(store, &drafts)?;
             let current = store.clone();
-            let result = apply_provider_write_drafts(store, drafts, &accounts, false)?;
+            let result = apply_provider_write_drafts(store, drafts, &accounts)?;
             if result.1 {
                 validate_ordinary_provider_subscription_change(
                     &current, store, &accounts, &shares,
                 )?;
-            }
-            for provider in &result.0 {
-                if provider.provider_type == ProviderType::CodexOAuth {
-                    let account_id = provider_account_id(provider).ok_or_else(|| {
-                        ProviderCommandError::Conflict {
-                            code: "cc_switch_codex_inactive_account",
-                            message: "Codex OAuth Provider must be bound to the active account"
-                                .to_string(),
-                        }
-                    })?;
-                    validate_codex_provider_active_account(&accounts, account_id)?;
-                }
             }
             Ok(result)
         })
@@ -3897,7 +4961,10 @@ impl ServerStateInner {
         drafts: Vec<ProviderWriteDraft>,
         expected_preview_token: String,
     ) -> anyhow::Result<Result<ProviderImportPreview, ProviderCommandError>> {
-        if let Err(error) = self.validate_cursor_api_key_provider_drafts(&drafts).await {
+        if let Err(error) = self
+            .validate_cursor_api_key_provider_drafts(&drafts, false)
+            .await
+        {
             return Ok(Err(error));
         }
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
@@ -4172,6 +5239,7 @@ impl ServerStateInner {
                     item.status,
                     ProviderAccountBindingMigrationStatus::Bindable
                         | ProviderAccountBindingMigrationStatus::Ambiguous
+                        | ProviderAccountBindingMigrationStatus::StaleIdentity
                 ) {
                     continue;
                 }
@@ -4199,7 +5267,7 @@ impl ServerStateInner {
                     .meta
                     .get_or_insert_with(ProviderMeta::default);
                 meta.auth_binding = Some(AuthBinding {
-                    source: Some("account".to_string()),
+                    source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
                     auth_provider: Some(item.expected_provider_type.as_str().to_string()),
                     account_id: Some(account.id.clone()),
                     auth_identity_generation: Some(account.auth_identity_generation),
@@ -4219,6 +5287,10 @@ impl ServerStateInner {
 
     pub(crate) async fn lock_reference_mutations(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.reference_mutations.clone().lock_owned().await
+    }
+
+    pub(crate) async fn lock_managed_auth_operations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.managed_auth_operations.lock().await
     }
 
     pub async fn mutate_providers_immediate<R>(
@@ -4265,6 +5337,23 @@ impl ServerStateInner {
         }
 
         let mut providers = self.providers.write().await;
+        let stored = providers
+            .providers
+            .iter_mut()
+            .find(|stored| stored.app == app && stored.provider.id == provider_id)
+            .with_context(|| format!("test Provider not found: {}/{provider_id}", app.as_str()))?;
+        if !stored.provider.settings_config.is_object() {
+            stored.provider.settings_config = serde_json::json!({});
+        }
+        stored
+            .provider
+            .settings_config
+            .as_object_mut()
+            .expect("test Provider settingsConfig object")
+            .insert(
+                "testRuntimeEndpoint".to_string(),
+                serde_json::Value::String(endpoint.clone()),
+            );
         let mut plan = providers
             .runtime_plan(app, provider_id)
             .with_context(|| {
@@ -4583,15 +5672,421 @@ impl ServerStateInner {
         }
     }
 
+    fn pending_native_refresh_receipt(
+        &self,
+        account: &Account,
+    ) -> anyhow::Result<Option<NativeRefreshPendingReceipt>> {
+        let key = native_refresh_pending_key(account);
+        let path = native_refresh_pending_path(&self.config_dir, account);
+        let mut journal = self
+            .native_refresh_receipt_journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native refresh receipt journal lock poisoned"))?;
+        let pending = match journal.pending.get(&key).cloned() {
+            Some(pending) => Some(pending),
+            None => match load_native_refresh_pending_receipt(&self.config_dir, account) {
+                Ok(pending) => {
+                    journal.unresolved_loads.remove(&path);
+                    pending
+                }
+                Err(error) if !native_refresh_pending_load_has_io_error(&error) => {
+                    quarantine_native_refresh_pending_receipt_path(&self.config_dir, &path)
+                        .with_context(|| {
+                            format!(
+                                "quarantine unreadable OAuth refresh receipt {} after: {error:#}",
+                                path.display()
+                            )
+                        })?;
+                    journal.unresolved_loads.remove(&path);
+                    anyhow::bail!(
+                        "quarantined unreadable OAuth refresh receipt {}: {error:#}",
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    journal.unresolved_loads.insert(path.clone());
+                    return Err(error);
+                }
+            },
+        };
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        if !native_refresh_snapshot_matches(account, &pending.expected) {
+            quarantine_native_refresh_pending_receipt_path(&self.config_dir, &path)?;
+            journal.pending.remove(&key);
+            journal.unresolved_loads.remove(&path);
+            tracing::warn!(
+                account_id = %pending.expected.id,
+                provider_type = %pending.expected.provider_type.as_str(),
+                "quarantined superseded OAuth refresh receipt"
+            );
+            return Ok(None);
+        }
+        journal.pending.insert(key, pending.clone());
+        Ok(Some(pending))
+    }
+
+    fn remember_native_refresh_pending_receipt(
+        self: &Arc<Self>,
+        expected: &Account,
+        update: &AccountRefreshUpdate,
+    ) -> Result<(), AccountRefreshFailure> {
+        let pending = NativeRefreshPendingReceipt {
+            expected: expected.clone(),
+            update: update.clone(),
+        };
+        let mut journal = self.native_refresh_receipt_journal.lock().map_err(|_| {
+            AccountRefreshFailure::bad_gateway("native refresh receipt journal lock is unavailable")
+        })?;
+        journal
+            .pending
+            .insert(native_refresh_pending_key(expected), pending);
+        if let Err(error) = write_native_refresh_pending_receipt(&self.config_dir, expected, update)
+        {
+            self.mark_credential_persistence_degraded();
+            self.schedule_credential_persistence_retry();
+            tracing::error!(
+                account_id = %expected.id,
+                provider_type = %expected.provider_type.as_str(),
+                %error,
+                "could not persist OAuth refresh receipt before identity validation"
+            );
+            return Err(AccountRefreshFailure::bad_gateway(
+                "OAuth refresh receipt is waiting for durable persistence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist_in_memory_native_refresh_receipts(&self) -> anyhow::Result<()> {
+        let mut journal = self
+            .native_refresh_receipt_journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native refresh receipt journal lock poisoned"))?;
+        let unresolved = journal.unresolved_loads.iter().cloned().collect::<Vec<_>>();
+        for path in unresolved {
+            match load_native_refresh_pending_receipt_from_path(&self.config_dir, &path) {
+                Ok(Some(pending))
+                    if native_refresh_pending_path(&self.config_dir, &pending.expected) == path =>
+                {
+                    journal
+                        .pending
+                        .insert(native_refresh_pending_key(&pending.expected), pending);
+                    journal.unresolved_loads.remove(&path);
+                }
+                Ok(Some(_)) => {
+                    quarantine_native_refresh_pending_receipt_path(&self.config_dir, &path)?;
+                    journal.unresolved_loads.remove(&path);
+                    tracing::warn!(
+                        path = %path.display(),
+                        "quarantined OAuth refresh receipt stored under the wrong account path"
+                    );
+                }
+                Ok(None) => {
+                    journal.unresolved_loads.remove(&path);
+                }
+                Err(error) if !native_refresh_pending_load_has_io_error(&error) => {
+                    quarantine_native_refresh_pending_receipt_path(&self.config_dir, &path)?;
+                    journal.unresolved_loads.remove(&path);
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "quarantined unreadable OAuth refresh receipt during persistence retry"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !journal.unresolved_loads.is_empty() {
+            anyhow::bail!(
+                "{} OAuth refresh receipt journal(s) remain unreadable",
+                journal.unresolved_loads.len()
+            );
+        }
+        for receipt in journal.pending.values() {
+            write_native_refresh_pending_receipt(
+                &self.config_dir,
+                &receipt.expected,
+                &receipt.update,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn clear_native_refresh_pending_receipt(&self, account: &Account) {
+        match self.native_refresh_receipt_journal.lock() {
+            Ok(mut journal) => {
+                journal.pending.remove(&native_refresh_pending_key(account));
+                journal
+                    .unresolved_loads
+                    .remove(&native_refresh_pending_path(&self.config_dir, account));
+                if let Err(error) = remove_native_refresh_pending_receipt(&self.config_dir, account)
+                {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        provider_type = %account.provider_type.as_str(),
+                        %error,
+                        "could not remove committed OAuth refresh receipt"
+                    );
+                }
+            }
+            Err(_) => tracing::error!(
+                account_id = %account.id,
+                provider_type = %account.provider_type.as_str(),
+                "native refresh receipt journal lock is unavailable during commit cleanup"
+            ),
+        }
+    }
+
+    fn quarantine_native_refresh_pending_receipt(
+        self: &Arc<Self>,
+        account: &Account,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let key = native_refresh_pending_key(account);
+        let path = native_refresh_pending_path(&self.config_dir, account);
+        let mut journal = self
+            .native_refresh_receipt_journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native refresh receipt journal lock poisoned"))?;
+        let pending = journal.pending.get(&key).cloned();
+        if let Some(pending) = pending.as_ref() {
+            write_native_refresh_pending_receipt(
+                &self.config_dir,
+                &pending.expected,
+                &pending.update,
+            )?;
+        }
+        let quarantined = quarantine_native_refresh_pending_receipt_path(&self.config_dir, &path)?;
+        journal.pending.remove(&key);
+        journal.unresolved_loads.remove(&path);
+        if let Some(path) = quarantined {
+            tracing::warn!(
+                account_id = %account.id,
+                provider_type = %account.provider_type.as_str(),
+                quarantine_path = %path.display(),
+                reason,
+                "quarantined OAuth refresh receipt without activating it"
+            );
+        }
+        Ok(())
+    }
+
+    fn handle_native_refresh_receipt_validation_failure(
+        self: &Arc<Self>,
+        account: &Account,
+        error: &AccountRefreshFailure,
+    ) -> anyhow::Result<()> {
+        if error.retryable {
+            return Ok(());
+        }
+        self.quarantine_native_refresh_pending_receipt(account, &error.message)
+    }
+
+    fn report_native_refresh_receipt_handling_error(
+        self: &Arc<Self>,
+        account: &Account,
+        error: anyhow::Error,
+    ) {
+        self.mark_credential_persistence_degraded();
+        self.schedule_credential_persistence_retry();
+        tracing::error!(
+            account_id = %account.id,
+            %error,
+            "could not preserve rejected OAuth refresh receipt"
+        );
+    }
+
+    pub(crate) async fn execute_native_account_refresh_with_recovery(
+        self: &Arc<Self>,
+        http: &reqwest::Client,
+        account: &Account,
+        now_ms: i64,
+        quota_refresh_interval_ms: i64,
+        refresh_guard: &mut crate::domain::accounts::managers::AccountRefreshGuard,
+    ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+        if let Some(failure) = refresh_guard.coalesced_native_failure_for(account) {
+            return Err(AccountRefreshFailure {
+                status_code: failure.status_code,
+                upstream_status: failure.upstream_status,
+                message: failure.message.clone(),
+                kind: failure.kind,
+                retryable: failure.retryable,
+                retry_after_ms: failure.retry_after_ms,
+                immediate_relogin: failure.immediate_relogin,
+                endpoint_fallback_safe: false,
+            });
+        }
+        let pending = match self.pending_native_refresh_receipt(account) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.mark_credential_persistence_degraded();
+                self.schedule_credential_persistence_retry();
+                let result = Err(AccountRefreshFailure::bad_gateway(format!(
+                    "load OAuth refresh receipt failed: {error}"
+                )));
+                record_refresh_flight_failure(refresh_guard, account, &result);
+                return result;
+            }
+        };
+        if let Some(pending) = pending {
+            let mut result =
+                validate_native_account_refresh_receipt(http, account, pending.update).await;
+            if let Err(error) = &mut result {
+                if error.retryable && error.retry_after_ms.is_none() {
+                    error.retry_after_ms = Some(NATIVE_REFRESH_RECEIPT_RETRY_BACKOFF_MS);
+                }
+            }
+            record_refresh_flight_failure(refresh_guard, account, &result);
+            if let Err(error) = &result {
+                if let Err(handling_error) =
+                    self.handle_native_refresh_receipt_validation_failure(account, error)
+                {
+                    self.report_native_refresh_receipt_handling_error(account, handling_error);
+                }
+            }
+            return result;
+        }
+
+        let result = execute_native_account_refresh_client(
+            http,
+            account,
+            now_ms,
+            quota_refresh_interval_ms,
+            refresh_guard,
+            |update| self.remember_native_refresh_pending_receipt(account, update),
+        )
+        .await;
+        if let Err(error) = &result {
+            if let Err(handling_error) =
+                self.handle_native_refresh_receipt_validation_failure(account, error)
+            {
+                self.report_native_refresh_receipt_handling_error(account, handling_error);
+            }
+        }
+        result
+    }
+
+    pub(crate) async fn recover_quota_unauthorized(
+        self: &Arc<Self>,
+        http: &reqwest::Client,
+        account: &Account,
+        now_ms: i64,
+        quota_refresh_interval_ms: i64,
+        refresh_guard: &mut crate::domain::accounts::managers::AccountRefreshGuard,
+    ) -> Result<Account, QuotaUnauthorizedRecoveryError> {
+        if account.needs_relogin
+            || !provider_native_refresh_available(account.provider_type)
+            || !account_has_refresh_token(account)
+        {
+            return Err(QuotaUnauthorizedRecoveryError::Unavailable);
+        }
+        if self.credential_persistence_degraded() {
+            return Err(QuotaUnauthorizedRecoveryError::State(anyhow::anyhow!(
+                "managed account credentials are waiting for durable persistence"
+            )));
+        }
+
+        let update = match self
+            .execute_native_account_refresh_with_recovery(
+                http,
+                account,
+                now_ms,
+                quota_refresh_interval_ms,
+                refresh_guard,
+            )
+            .await
+        {
+            Ok(update) => update,
+            Err(failure) => {
+                let updated = self
+                    .commit_native_refresh_failure_with_quota_cooldown(
+                        account,
+                        failure.message.clone(),
+                        failure.kind,
+                        failure.immediate_relogin,
+                        now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS),
+                    )
+                    .await
+                    .map_err(QuotaUnauthorizedRecoveryError::State)?;
+                if let Some(current) = updated.as_ref() {
+                    if !native_refresh_snapshot_matches(current, account) {
+                        return Err(QuotaUnauthorizedRecoveryError::Commit(
+                            NativeRefreshCommitError::Superseded(Box::new(current.clone())),
+                        ));
+                    }
+                }
+                return Err(QuotaUnauthorizedRecoveryError::Refresh {
+                    failure,
+                    updated: updated.map(Box::new),
+                });
+            }
+        };
+
+        self.commit_native_refresh_success(account, update)
+            .await
+            .map_err(QuotaUnauthorizedRecoveryError::Commit)
+    }
+
     pub(crate) async fn commit_native_refresh_success(
         self: &Arc<Self>,
         expected: &Account,
         update: AccountRefreshUpdate,
     ) -> Result<Account, NativeRefreshCommitError> {
+        let recovery_update = update.clone();
+        let recovery_journal =
+            match write_native_refresh_recovery_journal(&self.config_dir, expected, &update) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    tracing::error!(
+                        account_id = %expected.id,
+                        provider_type = %expected.provider_type.as_str(),
+                        %error,
+                        "could not persist OAuth credential recovery journal"
+                    );
+                    None
+                }
+            };
         let _references = self.reference_mutations.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
-        self.recover_pending_codex_workspace_rebind_transaction("OAuth credential commit")
-            .map_err(NativeRefreshCommitError::State)?;
+        if let Err(error) =
+            self.recover_pending_codex_workspace_rebind_transaction("OAuth credential commit")
+        {
+            drop(_workspace_transaction);
+            drop(_references);
+            return self
+                .recover_native_refresh_credentials(
+                    expected,
+                    recovery_update,
+                    error,
+                    false,
+                    recovery_journal,
+                )
+                .await;
+        }
+        #[cfg(test)]
+        if self
+            .account_refresh_commit_state_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            drop(_workspace_transaction);
+            drop(_references);
+            return self
+                .recover_native_refresh_credentials(
+                    expected,
+                    recovery_update,
+                    anyhow::anyhow!("injected OAuth credential commit state failure"),
+                    true,
+                    recovery_journal,
+                )
+                .await;
+        }
 
         let providers = self.providers.read().await;
         let mut accounts = self.accounts.write().await;
@@ -4614,21 +6109,50 @@ impl ServerStateInner {
                 current_token_generation = live.token_refresh_generation,
                 "discarded superseded OAuth refresh result"
             );
-            return Ok(live);
+            if let Some(path) = recovery_journal.as_deref() {
+                if let Err(error) = remove_native_refresh_recovery_journal(path) {
+                    tracing::warn!(%error, "could not remove superseded OAuth refresh journal");
+                }
+            }
+            if let Err(error) = self.quarantine_native_refresh_pending_receipt(
+                expected,
+                "account credentials changed before refresh commit",
+            ) {
+                tracing::warn!(%error, "could not quarantine superseded OAuth refresh receipt");
+            }
+            return Err(NativeRefreshCommitError::Superseded(Box::new(live)));
         }
         let mut candidate = current.clone();
-        let updated = candidate
+        let mut updated = candidate
             .mark_native_refresh_success(&expected.id, update)
             .with_context(|| format!("managed account not found: {}", expected.id))
             .map_err(NativeRefreshCommitError::State)?;
-        crate::domain::sharing::subscription_identity::validate_ordinary_account_subscription_change(
-            &providers,
-            &current,
-            &candidate,
-            &shares,
-        )
-        .map_err(anyhow::Error::new)
-        .map_err(NativeRefreshCommitError::State)?;
+        if let Err(error) = crate::domain::sharing::subscription_identity::validate_ordinary_account_subscription_change(
+                &providers,
+                &current,
+                &candidate,
+                &shares,
+            )
+        {
+            let (recovery_candidate, recovery_account, recovery_scope) =
+                native_refresh_recovery_candidate(&current, expected, &recovery_update)
+                    .with_context(|| {
+                        format!(
+                            "managed account credential recovery candidate is unavailable: {}",
+                            expected.id
+                        )
+                    })
+                    .map_err(NativeRefreshCommitError::State)?;
+            tracing::warn!(
+                account_id = %expected.id,
+                provider_type = %expected.provider_type.as_str(),
+                recovery_scope,
+                %error,
+                "preserving rotated OAuth credentials without rejected identity metadata"
+            );
+            candidate = recovery_candidate;
+            updated = recovery_account;
+        }
 
         let persistence_state_before_save = self
             .credential_persistence_state
@@ -4671,6 +6195,98 @@ impl ServerStateInner {
         }
 
         self.clear_credential_persistence_degraded_if_unchanged(persistence_state_before_save);
+        if let Some(path) = recovery_journal.as_deref() {
+            if let Err(error) = remove_native_refresh_recovery_journal(path) {
+                tracing::warn!(%error, "could not remove committed OAuth refresh journal");
+            }
+        }
+        self.clear_native_refresh_pending_receipt(expected);
+        Ok(updated)
+    }
+
+    async fn recover_native_refresh_credentials(
+        self: &Arc<Self>,
+        expected: &Account,
+        update: AccountRefreshUpdate,
+        state_error: anyhow::Error,
+        persistence_allowed: bool,
+        recovery_journal: Option<PathBuf>,
+    ) -> Result<Account, NativeRefreshCommitError> {
+        let _references = self.reference_mutations.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        let mut accounts = self.accounts.write().await;
+        let current = accounts.clone();
+        let live = current
+            .accounts
+            .iter()
+            .find(|account| account.id == expected.id)
+            .cloned()
+            .with_context(|| format!("managed account not found: {}", expected.id))
+            .map_err(NativeRefreshCommitError::State)?;
+        if !native_refresh_snapshot_matches(&live, expected) {
+            tracing::info!(
+                account_id = %expected.id,
+                provider_type = %expected.provider_type.as_str(),
+                "discarded superseded OAuth credential recovery result"
+            );
+            if let Some(path) = recovery_journal.as_deref() {
+                if let Err(error) = remove_native_refresh_recovery_journal(path) {
+                    tracing::warn!(%error, "could not remove superseded OAuth refresh journal");
+                }
+            }
+            if let Err(error) = self.quarantine_native_refresh_pending_receipt(
+                expected,
+                "account credentials changed before refresh recovery",
+            ) {
+                tracing::warn!(%error, "could not quarantine superseded OAuth refresh receipt");
+            }
+            return Err(NativeRefreshCommitError::Superseded(Box::new(live)));
+        }
+        let (candidate, updated, recovery_scope) =
+            native_refresh_recovery_candidate(&current, expected, &update)
+                .with_context(|| {
+                    format!(
+                        "managed account credential recovery candidate is unavailable: {}",
+                        expected.id
+                    )
+                })
+                .map_err(NativeRefreshCommitError::State)?;
+        tracing::warn!(
+            account_id = %expected.id,
+            provider_type = %expected.provider_type.as_str(),
+            recovery_scope,
+            error = %state_error,
+            "recovering rotated OAuth credentials after local state commit failure"
+        );
+
+        let persistence_state_before_save = self
+            .credential_persistence_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        let persist_result = if persistence_allowed {
+            candidate.save(&self.config_dir)
+        } else {
+            Err(state_error
+                .context("rotated OAuth credentials are waiting for local state recovery"))
+        };
+        if persist_result.is_err() {
+            self.mark_credential_persistence_degraded();
+        }
+        *accounts = candidate;
+        drop(accounts);
+        drop(_workspace_transaction);
+        drop(_references);
+
+        if let Err(error) = persist_result {
+            self.schedule_credential_persistence_retry();
+            return Err(NativeRefreshCommitError::Persistence(error));
+        }
+        self.clear_credential_persistence_degraded_if_unchanged(persistence_state_before_save);
+        if let Some(path) = recovery_journal.as_deref() {
+            if let Err(error) = remove_native_refresh_recovery_journal(path) {
+                tracing::warn!(%error, "could not remove recovered OAuth refresh journal");
+            }
+        }
+        self.clear_native_refresh_pending_receipt(expected);
         Ok(updated)
     }
 
@@ -4679,6 +6295,37 @@ impl ServerStateInner {
         expected: &Account,
         message: String,
         kind: crate::domain::accounts::oauth::OAuthErrorKind,
+        immediate_relogin: bool,
+    ) -> anyhow::Result<Option<Account>> {
+        self.commit_native_refresh_failure_state(expected, message, kind, immediate_relogin, None)
+            .await
+    }
+
+    async fn commit_native_refresh_failure_with_quota_cooldown(
+        self: &Arc<Self>,
+        expected: &Account,
+        message: String,
+        kind: crate::domain::accounts::oauth::OAuthErrorKind,
+        immediate_relogin: bool,
+        quota_next_refresh_at: i64,
+    ) -> anyhow::Result<Option<Account>> {
+        self.commit_native_refresh_failure_state(
+            expected,
+            message,
+            kind,
+            immediate_relogin,
+            Some(quota_next_refresh_at),
+        )
+        .await
+    }
+
+    async fn commit_native_refresh_failure_state(
+        self: &Arc<Self>,
+        expected: &Account,
+        message: String,
+        kind: crate::domain::accounts::oauth::OAuthErrorKind,
+        immediate_relogin: bool,
+        quota_next_refresh_at: Option<i64>,
     ) -> anyhow::Result<Option<Account>> {
         let expected = expected.clone();
         self.mutate_accounts_immediate(move |accounts| {
@@ -4701,7 +6348,25 @@ impl ServerStateInner {
                 .find(|account| account.id == expected.id)
                 .map(|account| redact_account_error_for_log(account, &message))
                 .unwrap_or_else(|| crate::logging::redact_sensitive_text(&message));
-            accounts.mark_native_refresh_failure(&expected.id, message, kind)
+            accounts.mark_native_refresh_failure_with_relogin_hint(
+                &expected.id,
+                message,
+                kind,
+                immediate_relogin,
+            )?;
+            let account = accounts
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == expected.id)?;
+            if let Some(quota_next_refresh_at) = quota_next_refresh_at {
+                account.quota_next_refresh_at = Some(
+                    account
+                        .quota_next_refresh_at
+                        .unwrap_or(quota_next_refresh_at)
+                        .max(quota_next_refresh_at),
+                );
+            }
+            Some(account.clone())
         })
         .await
     }
@@ -4728,8 +6393,21 @@ impl ServerStateInner {
                 let observed = state
                     .credential_persistence_state
                     .load(std::sync::atomic::Ordering::Acquire);
-                match state.save_accounts().await {
+                match state
+                    .save_accounts()
+                    .await
+                    .and_then(|()| state.persist_in_memory_native_refresh_receipts())
+                {
                     Ok(()) => {
+                        let accounts = state.accounts_snapshot().await;
+                        if let Err(error) =
+                            remove_superseded_native_refresh_journals(&state.config_dir, &accounts)
+                        {
+                            tracing::warn!(
+                                %error,
+                                "could not clean OAuth refresh journals after persistence retry"
+                            );
+                        }
                         if state.clear_credential_persistence_degraded_if_unchanged(observed) {
                             tracing::info!("durably persisted OAuth credentials after retry");
                         }
@@ -4769,8 +6447,37 @@ impl ServerStateInner {
             .store(count, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_account_refresh_commit_state_failures(&self, count: u64) {
+        self.account_refresh_commit_state_failures
+            .store(count, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_gemini_project_commit_failures(&self, count: u64) {
+        self.gemini_project_commit_failures
+            .store(count, std::sync::atomic::Ordering::Release);
+    }
+
     pub async fn accounts_snapshot(&self) -> AccountStore {
         self.accounts.read().await.clone()
+    }
+
+    pub async fn accounts_snapshot_if_credentials_persisted(&self) -> Option<AccountStore> {
+        self.accounts_snapshot_after_initial_credential_gate(|| {})
+            .await
+    }
+
+    async fn accounts_snapshot_after_initial_credential_gate(
+        &self,
+        after_initial_gate: impl FnOnce(),
+    ) -> Option<AccountStore> {
+        if self.credential_persistence_degraded() {
+            return None;
+        }
+        after_initial_gate();
+        let accounts = self.accounts.read().await.clone();
+        (!self.credential_persistence_degraded()).then_some(accounts)
     }
 
     pub async fn find_account_by_id(&self, account_id: &str) -> Option<Account> {
@@ -4786,12 +6493,12 @@ impl ServerStateInner {
     pub async fn find_account_for_provider(
         &self,
         provider_type: ProviderType,
-        account_id: Option<&str>,
+        account_id: &str,
     ) -> Option<Account> {
         self.accounts
             .read()
             .await
-            .find_for_provider(provider_type, account_id)
+            .find_for_provider(provider_type, Some(account_id))
             .cloned()
     }
 
@@ -4836,7 +6543,7 @@ impl ServerStateInner {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Accounts commit")?;
 
-        let providers = self.providers.read().await;
+        let mut providers = self.providers.write().await;
         let mut accounts = self.accounts.write().await;
         let shares = self.shares.read().await;
         let current = accounts.clone();
@@ -4852,6 +6559,10 @@ impl ServerStateInner {
             &shares,
         )
         .map_err(anyhow::Error::new)?;
+        let mut candidate_providers = providers.clone();
+        candidate_providers
+            .rebuild_runtime_index(&candidate)
+            .context("rebuild Provider runtime index for account commit")?;
 
         if let Err(error) = candidate.save(&self.config_dir) {
             let disk_matches = AccountStore::load_or_default(&self.config_dir)
@@ -4868,6 +6579,7 @@ impl ServerStateInner {
             );
         }
         *accounts = candidate;
+        *providers = candidate_providers;
         Ok(Ok(result))
     }
 
@@ -4893,205 +6605,13 @@ impl ServerStateInner {
         self: &Arc<Self>,
         account_id: String,
     ) -> anyhow::Result<Result<Account, CodexActiveAccountSelectionError>> {
-        let account_id = account_id.trim();
-        if account_id.is_empty() {
-            return Ok(Err(CodexActiveAccountSelectionError::AccountNotFound(
-                account_id.to_string(),
-            )));
-        }
-
-        let mut codex_account_ids = self
-            .accounts
-            .read()
-            .await
-            .accounts
-            .iter()
-            .filter(|account| account.provider_type == ProviderType::CodexOAuth)
-            .map(|account| account.id.clone())
-            .collect::<Vec<_>>();
-        codex_account_ids.push(account_id.to_string());
-        codex_account_ids.sort();
-        codex_account_ids.dedup();
-        let mut _refresh_guards = Vec::with_capacity(codex_account_ids.len());
-        for codex_account_id in &codex_account_ids {
-            _refresh_guards.push(
-                self.account_refresh_locks
-                    .lock(ProviderType::CodexOAuth, codex_account_id)
-                    .await,
-            );
-        }
-        let _references = self.reference_mutations.lock().await;
-        let _provider_commit = self.provider_commits.lock().await;
-        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
-        self.recover_pending_codex_workspace_rebind_transaction("Codex active account selection")?;
-
-        let mut providers = self.providers.write().await;
-        let mut accounts = self.accounts.write().await;
-        let shares = self.shares.read().await;
-        let Some(selected_account) = accounts
-            .accounts
-            .iter()
-            .find(|account| {
-                account.id == account_id && account.provider_type == ProviderType::CodexOAuth
-            })
-            .cloned()
-        else {
-            return Ok(Err(CodexActiveAccountSelectionError::AccountNotFound(
-                account_id.to_string(),
-            )));
-        };
-
-        let shared_provider_keys = shares
-            .shares
-            .iter()
-            .filter(|share| share.status != "deleted")
-            .flat_map(|share| {
-                std::iter::once((share.app, share.provider_id.clone())).chain(
-                    share
-                        .bindings
-                        .iter()
-                        .map(|binding| (binding.app, binding.provider_id.clone())),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let mut share_ids = shares
-            .shares
-            .iter()
-            .filter(|share| share.status != "deleted")
-            .filter(|share| {
-                std::iter::once((share.app, share.provider_id.as_str()))
-                    .chain(
-                        share
-                            .bindings
-                            .iter()
-                            .map(|binding| (binding.app, binding.provider_id.as_str())),
-                    )
-                    .any(|(app, provider_id)| {
-                        providers
-                            .providers
-                            .iter()
-                            .find(|provider| {
-                                provider.app == app && provider.provider.id == provider_id
-                            })
-                            .filter(|provider| provider.provider_type == ProviderType::CodexOAuth)
-                            .is_some_and(|provider| {
-                                provider_account_id(provider) != Some(account_id)
-                            })
-                    })
-            })
-            .map(|share| share.id.clone())
-            .collect::<Vec<_>>();
-        share_ids.sort();
-        share_ids.dedup();
-        if !share_ids.is_empty() {
-            return Ok(Err(CodexActiveAccountSelectionError::ShareConflict {
-                share_ids,
-            }));
-        }
-
-        let mut candidate_accounts = accounts.clone();
-        candidate_accounts
-            .select_active_codex_oauth_account(account_id)
-            .map_err(|_| {
-                anyhow::anyhow!("selected Codex OAuth account disappeared during transaction")
-            })?;
-        let accounts_changed =
-            accounts.active_codex_oauth_account_id.as_deref() != Some(account_id);
-        let mut candidate_providers = providers
-            .materialized_clone()
-            .context("materialize Provider credentials for Codex active account selection")?;
-        let mut providers_changed = false;
-        for provider in &mut candidate_providers.providers {
-            if provider.provider_type != ProviderType::CodexOAuth
-                || shared_provider_keys.contains(&(provider.app, provider.provider.id.clone()))
-            {
-                continue;
-            }
-            let meta = provider
-                .provider
-                .meta
-                .get_or_insert_with(ProviderMeta::default);
-            let binding_changed = meta.auth_binding.as_ref().is_none_or(|binding| {
-                binding.source.as_deref() != Some("account")
-                    || binding.auth_provider.as_deref() != Some("codex_oauth")
-                    || binding.account_id.as_deref() != Some(account_id)
-                    || binding.auth_identity_generation
-                        != Some(selected_account.auth_identity_generation)
-            });
-            if !binding_changed {
-                continue;
-            }
-            meta.auth_binding = Some(AuthBinding {
-                source: Some("account".to_string()),
-                auth_provider: Some("codex_oauth".to_string()),
-                account_id: Some(account_id.to_string()),
-                auth_identity_generation: Some(selected_account.auth_identity_generation),
-            });
-            provider.resource.revision = provider.resource.revision.saturating_add(1);
-            providers_changed = true;
-        }
-
-        if !providers_changed {
-            if accounts_changed {
-                if let Err(error) = candidate_accounts.save(&self.config_dir) {
-                    let disk_matches = AccountStore::load_or_default(&self.config_dir)
-                        .ok()
-                        .and_then(|store| serde_json::to_value(store).ok())
-                        .zip(serde_json::to_value(&candidate_accounts).ok())
-                        .is_some_and(|(disk, expected)| disk == expected);
-                    if !disk_matches {
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        %error,
-                        "Codex active account selection reached the commit point despite a persistence error; reconciled live state"
-                    );
-                }
-                *accounts = candidate_accounts;
-            }
-            return Ok(Ok(selected_account));
-        }
-
-        let candidate_shares = shares.clone();
-        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
-            &providers,
-            &accounts,
-            &shares,
-            &candidate_providers,
-            &candidate_accounts,
-            &candidate_shares,
-        )
-        .map_err(anyhow::Error::new)?;
-        candidate_providers.validate_for_commit()?;
-        candidate_providers
-            .rebuild_runtime_index(&candidate_accounts)
-            .context("compile Provider runtime index for Codex active account selection")?;
-        candidate_providers
-            .seal_for_commit(&self.config_dir)
-            .context("seal Provider credentials for Codex active account selection")?;
-        candidate_providers
-            .rebuild_runtime_index(&candidate_accounts)
-            .context("compile sealed Provider runtime index for Codex active account selection")?;
-
-        prepare_codex_workspace_rebind_transaction(
-            &self.config_dir,
-            &accounts,
-            &providers,
-            &shares,
-            &candidate_accounts,
-            &candidate_providers,
-            &candidate_shares,
-        )?;
-        if let Err(error) = apply_codex_workspace_rebind_transaction(&self.config_dir) {
-            tracing::error!(
-                %error,
-                marker = %codex_workspace_rebind_transaction_path(&self.config_dir).display(),
-                "Codex active account selection is committed but its file application remains pending"
-            );
-        }
-        *providers = candidate_providers;
-        *accounts = candidate_accounts;
-        Ok(Ok(selected_account))
+        let account_id = account_id.trim().to_string();
+        self.try_mutate_accounts_immediate(|accounts| {
+            accounts
+                .select_active_codex_oauth_account(&account_id)
+                .map_err(|_| CodexActiveAccountSelectionError::AccountNotFound(account_id))
+        })
+        .await
     }
 
     pub(crate) async fn select_codex_workspace_command(
@@ -5670,32 +7190,17 @@ impl ServerStateInner {
             return Ok(Vec::new());
         }
 
-        let mut default_account_ids = BTreeMap::new();
-        for account in &accounts.accounts {
-            default_account_ids
-                .entry(account.provider_type.as_str())
-                .or_insert(account.id.as_str());
-        }
         let providers = self.providers.read().await.clone();
         let provider_keys = providers
             .providers
             .iter()
             .filter(|provider| {
-                let bound_account_id = provider
-                    .provider
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.auth_binding.as_ref())
-                    .and_then(|binding| binding.account_id.as_deref());
-                let account_id = bound_account_id.or_else(|| {
-                    default_account_ids
-                        .get(provider.provider_type.as_str())
-                        .copied()
-                });
-                account_id.is_some_and(|account_id| {
-                    changed_accounts
-                        .contains(&(provider.provider_type.as_str().to_string(), account_id))
-                })
+                managed_account_binding(provider).is_some_and(
+                    |(account_provider_type, account_id)| {
+                        changed_accounts
+                            .contains(&(account_provider_type.as_str().to_string(), account_id))
+                    },
+                )
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
@@ -5717,31 +7222,16 @@ impl ServerStateInner {
         changed_account_id: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
         let providers = self.providers.read().await.clone();
-        let accounts = self.accounts.read().await.clone();
-        let default_account_id = accounts
-            .accounts
-            .iter()
-            .find(|account| account.provider_type == provider_type)
-            .map(|account| account.id.as_str());
-        let include_unbound = changed_account_id.is_none()
-            || changed_account_id.is_some_and(|account_id| default_account_id == Some(account_id));
         let provider_keys = providers
             .providers
             .iter()
-            .filter(|provider| provider.provider_type == provider_type)
             .filter(|provider| {
-                let bound_account_id = provider
-                    .provider
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.auth_binding.as_ref())
-                    .and_then(|binding| binding.account_id.as_deref());
-                match (changed_account_id, bound_account_id) {
-                    (Some(changed), Some(bound)) => changed == bound,
-                    (Some(_), None) => include_unbound,
-                    (None, None) => true,
-                    (None, Some(_)) => false,
-                }
+                managed_account_binding(provider).is_some_and(
+                    |(account_provider_type, bound_account_id)| {
+                        account_provider_type == provider_type
+                            && changed_account_id.is_none_or(|changed| changed == bound_account_id)
+                    },
+                )
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
@@ -5753,21 +7243,18 @@ impl ServerStateInner {
         self: &Arc<Self>,
         provider_type: ProviderType,
         account_id: &str,
-        was_default: bool,
+        _was_default: bool,
     ) -> anyhow::Result<Vec<String>> {
         let providers = self.providers.read().await.clone();
         let provider_keys = providers
             .providers
             .iter()
-            .filter(|provider| provider.provider_type == provider_type)
             .filter(|provider| {
-                let bound_account_id = provider
-                    .provider
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.auth_binding.as_ref())
-                    .and_then(|binding| binding.account_id.as_deref());
-                bound_account_id == Some(account_id) || (was_default && bound_account_id.is_none())
+                managed_account_binding(provider).is_some_and(
+                    |(account_provider_type, bound_account_id)| {
+                        account_provider_type == provider_type && bound_account_id == account_id
+                    },
+                )
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
@@ -5994,73 +7481,117 @@ impl ServerStateInner {
     pub async fn refresh_managed_account_if_needed(
         self: &Arc<Self>,
         provider_type: ProviderType,
-        account_id: Option<&str>,
+        account_id: &str,
     ) -> Result<(), ManagedAccountRefreshError> {
-        self.refresh_managed_account_inner(provider_type, account_id, false)
+        self.refresh_managed_account_inner(provider_type, account_id, None, false)
             .await
+    }
+
+    pub async fn refresh_managed_account_if_needed_for_generation(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.refresh_managed_account_inner(
+            provider_type,
+            account_id,
+            Some(expected_auth_identity_generation),
+            false,
+        )
+        .await
     }
 
     pub async fn refresh_managed_account_now(
         self: &Arc<Self>,
         provider_type: ProviderType,
-        account_id: Option<&str>,
+        account_id: &str,
     ) -> Result<(), ManagedAccountRefreshError> {
-        self.refresh_managed_account_inner(provider_type, account_id, true)
+        self.refresh_managed_account_inner(provider_type, account_id, None, true)
             .await
+    }
+
+    pub async fn refresh_managed_account_now_for_generation(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.refresh_managed_account_inner(
+            provider_type,
+            account_id,
+            Some(expected_auth_identity_generation),
+            true,
+        )
+        .await
     }
 
     async fn refresh_managed_account_inner(
         self: &Arc<Self>,
         provider_type: ProviderType,
-        account_id: Option<&str>,
+        account_id: &str,
+        expected_auth_identity_generation: Option<u64>,
         force: bool,
     ) -> Result<(), ManagedAccountRefreshError> {
         let now = crate::infra::time::now_ms() as i64;
         let account = {
             let accounts = self.accounts.read().await;
-            if provider_type == ProviderType::CodexOAuth {
-                let active = accounts.active_codex_oauth_account();
-                if account_id
-                    .is_some_and(|account_id| active.is_none_or(|active| active.id != account_id))
-                {
-                    return Err(ManagedAccountRefreshError::InactiveCodexAccount);
-                }
-                active.cloned()
-            } else {
-                accounts
-                    .find_for_provider(provider_type, account_id)
-                    .cloned()
-            }
+            accounts
+                .find_for_provider(provider_type, Some(account_id))
+                .cloned()
         };
         let Some(account) = account else {
-            return Ok(());
+            return if expected_auth_identity_generation.is_some() {
+                Err(ManagedAccountRefreshError::NotFound)
+            } else {
+                Ok(())
+            };
         };
+        ensure_account_identity_generation(
+            &account,
+            provider_type,
+            expected_auth_identity_generation,
+        )?;
         if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
         }
-        let access_token_before_lock = account.access_token.clone();
+        let refresh_generation_before_lock = (
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        );
 
-        let _refresh_guard = self
+        let mut refresh_guard = self
             .account_refresh_locks
             .lock(account.provider_type, &account.id)
             .await;
 
         let account = {
             let accounts = self.accounts.read().await;
-            if provider_type == ProviderType::CodexOAuth {
-                let active = accounts.active_codex_oauth_account();
-                if active.is_none_or(|active| active.id != account.id) {
-                    return Err(ManagedAccountRefreshError::InactiveCodexAccount);
-                }
-                active.cloned()
-            } else {
-                accounts
-                    .find_for_provider(provider_type, account_id)
-                    .cloned()
-            }
+            accounts
+                .find_for_provider(provider_type, Some(account_id))
+                .cloned()
         }
         .ok_or(ManagedAccountRefreshError::NotFound)?;
-        if force && account.access_token != access_token_before_lock {
+        ensure_account_identity_generation(
+            &account,
+            provider_type,
+            expected_auth_identity_generation,
+        )?;
+        if let Some(failure) = refresh_guard.coalesced_native_failure_for(&account) {
+            return Err(ManagedAccountRefreshError::Refresh {
+                status_code: failure.status_code,
+                message: failure.public_message.clone().unwrap_or_else(|| {
+                    managed_account_refresh_public_message(failure.kind).to_string()
+                }),
+                retry_after_ms: failure.retry_after_ms,
+            });
+        }
+        if force
+            && (
+                account.auth_identity_generation,
+                account.token_refresh_generation,
+            ) != refresh_generation_before_lock
+        {
             return Ok(());
         }
         if !force && !account_needs_native_refresh(&account, now) {
@@ -6072,7 +7603,14 @@ impl ServerStateInner {
 
         let http_client = self.http_client().await;
         let interval_ms = self.oauth_quota_refresh_interval_ms().await;
-        let update = match execute_native_account_refresh(&http_client, &account, now, interval_ms)
+        let update = match self
+            .execute_native_account_refresh_with_recovery(
+                &http_client,
+                &account,
+                now,
+                interval_ms,
+                &mut refresh_guard,
+            )
             .await
         {
             Ok(update) => update,
@@ -6086,7 +7624,12 @@ impl ServerStateInner {
                     "managed OAuth account refresh failed"
                 );
                 let updated = match self
-                    .commit_native_refresh_failure(&account, error.message.clone(), error.kind)
+                    .commit_native_refresh_failure(
+                        &account,
+                        error.message.clone(),
+                        error.kind,
+                        error.immediate_relogin,
+                    )
                     .await
                 {
                     Ok(updated) => updated,
@@ -6122,15 +7665,54 @@ impl ServerStateInner {
         let updated = match self.commit_native_refresh_success(&account, update).await {
             Ok(updated) => updated,
             Err(error) => {
-                if !error.is_persistence_degraded() {
+                if error.is_superseded() {
+                    return Err(ManagedAccountRefreshError::Refresh {
+                        status_code: 409,
+                        message: "managed account credentials changed during OAuth refresh"
+                            .to_string(),
+                        retry_after_ms: None,
+                    });
+                }
+                let persistence_degraded = error.is_persistence_degraded();
+                let (status_code, public_message, retryable) = if persistence_degraded {
+                    (
+                        503,
+                        "rotated credentials are live but durable persistence is degraded",
+                        true,
+                    )
+                } else {
+                    (500, "managed OAuth credential state commit failed", false)
+                };
+                let failure_account = if persistence_degraded {
+                    self.find_account_by_id(&account.id)
+                        .await
+                        .unwrap_or_else(|| account.clone())
+                } else {
+                    account.clone()
+                };
+                refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                    &failure_account,
+                    AccountRefreshFlightStage::NativeRefresh,
+                    AccountRefreshFlightFailureDetails {
+                        status_code,
+                        upstream_status: None,
+                        message: error.to_string(),
+                        public_message: Some(public_message.to_string()),
+                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                        retryable,
+                        retry_after_ms: None,
+                        immediate_relogin: false,
+                    },
+                ));
+                if !persistence_degraded {
                     tracing::error!(
                         account_id = %account.id,
                         error = %error,
                         "managed OAuth credential state commit failed"
                     );
                     return Err(ManagedAccountRefreshError::Refresh {
-                        status_code: 500,
-                        message: "managed OAuth credential state commit failed".to_string(),
+                        status_code,
+                        message: public_message.to_string(),
                         retry_after_ms: None,
                     });
                 }
@@ -6153,9 +7735,8 @@ impl ServerStateInner {
                     "managed OAuth refresh entered credential persistence degraded mode"
                 );
                 return Err(ManagedAccountRefreshError::Refresh {
-                    status_code: 503,
-                    message: "rotated credentials are live but durable persistence is degraded"
-                        .to_string(),
+                    status_code,
+                    message: public_message.to_string(),
                     retry_after_ms: None,
                 });
             }
@@ -6173,11 +7754,543 @@ impl ServerStateInner {
         Ok(())
     }
 
+    pub async fn ensure_gemini_v1internal_project(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.ensure_gemini_v1internal_project_inner(provider_type, account_id, None)
+            .await
+    }
+
+    pub async fn ensure_gemini_v1internal_project_for_generation(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.ensure_gemini_v1internal_project_inner(
+            provider_type,
+            account_id,
+            Some(expected_auth_identity_generation),
+        )
+        .await
+    }
+
+    async fn ensure_gemini_v1internal_project_inner(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: Option<u64>,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        if !matches!(
+            provider_type,
+            ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ) {
+            return Ok(());
+        }
+
+        let initial = self
+            .find_account_for_provider(provider_type, account_id)
+            .await
+            .ok_or(ManagedAccountRefreshError::NotFound)?;
+        ensure_account_identity_generation(
+            &initial,
+            provider_type,
+            expected_auth_identity_generation,
+        )?;
+        if gemini_v1internal_project_id(&initial).is_some() {
+            return Ok(());
+        }
+
+        let mut refresh_guard = self
+            .account_refresh_locks
+            .lock(provider_type, account_id)
+            .await;
+        let mut account = self
+            .find_account_for_provider(provider_type, account_id)
+            .await
+            .ok_or(ManagedAccountRefreshError::NotFound)?;
+        ensure_account_identity_generation(
+            &account,
+            provider_type,
+            expected_auth_identity_generation,
+        )?;
+        if gemini_v1internal_project_id(&account).is_some() {
+            return Ok(());
+        }
+        if let Some(failure) = refresh_guard.coalesced_gemini_project_failure_for(&account) {
+            return Err(ManagedAccountRefreshError::Refresh {
+                status_code: failure.status_code,
+                message: failure
+                    .public_message
+                    .clone()
+                    .unwrap_or_else(|| "Gemini Code Assist project discovery failed".to_string()),
+                retry_after_ms: failure.retry_after_ms,
+            });
+        }
+        if self.credential_persistence_degraded() {
+            return Err(ManagedAccountRefreshError::CredentialPersistenceDegraded);
+        }
+        if account.needs_relogin {
+            return Err(ManagedAccountRefreshError::Refresh {
+                status_code: 401,
+                message: "managed account must sign in again before project discovery".to_string(),
+                retry_after_ms: None,
+            });
+        }
+
+        let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if account.last_refresh_error.is_some() {
+            if let Some(next_refresh_at) = account.quota_next_refresh_at {
+                if next_refresh_at > now {
+                    return Err(ManagedAccountRefreshError::Refresh {
+                        status_code: 429,
+                        message: "Gemini Code Assist project discovery is cooling down after a failed request"
+                            .to_string(),
+                        retry_after_ms: Some(next_refresh_at.saturating_sub(now)),
+                    });
+                }
+            }
+        }
+
+        let http_client = self.http_client().await;
+        let timeout_ms = self.oauth_quota_refresh_timeout_ms().await;
+        let mut retried_after_unauthorized = false;
+        loop {
+            match load_gemini_v1internal_project(&http_client, &account, now, timeout_ms).await {
+                Ok(update) => {
+                    let updated = match self.commit_gemini_project_update(&account, update).await {
+                        Ok(Ok(updated)) => updated,
+                        Ok(Err(GeminiProjectCommitSkip::Stale(live)))
+                            if expected_auth_identity_generation.is_none_or(|expected| {
+                                live.auth_identity_generation == expected
+                            }) && gemini_v1internal_project_id(&live).is_some() =>
+                        {
+                            return Ok(())
+                        }
+                        Ok(Err(GeminiProjectCommitSkip::Stale(_))) => {
+                            return Err(ManagedAccountRefreshError::Refresh {
+                                status_code: 409,
+                                message: "managed account changed during project discovery"
+                                    .to_string(),
+                                retry_after_ms: None,
+                            })
+                        }
+                        Ok(Err(GeminiProjectCommitSkip::NotFound)) => {
+                            return Err(ManagedAccountRefreshError::NotFound)
+                        }
+                        Err(error) => {
+                            let retry_after_ms = QUOTA_FAILURE_COOLDOWN_MS;
+                            let public_message =
+                                "Gemini Code Assist project metadata could not be persisted"
+                                    .to_string();
+                            tracing::error!(
+                                account_id = %account.id,
+                                provider_type = %account.provider_type.as_str(),
+                                %error,
+                                "persisting Gemini Code Assist project metadata failed"
+                            );
+                            refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                                &account,
+                                AccountRefreshFlightStage::GeminiProjectDiscovery,
+                                AccountRefreshFlightFailureDetails {
+                                    status_code: 500,
+                                    upstream_status: None,
+                                    message: error.to_string(),
+                                    public_message: Some(public_message.clone()),
+                                    kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                                    retryable: true,
+                                    retry_after_ms: Some(retry_after_ms),
+                                    immediate_relogin: false,
+                                },
+                            ));
+                            return Err(ManagedAccountRefreshError::Refresh {
+                                status_code: 500,
+                                message: public_message,
+                                retry_after_ms: Some(retry_after_ms),
+                            });
+                        }
+                    };
+                    if gemini_v1internal_project_id(&updated).is_none() {
+                        return Err(ManagedAccountRefreshError::Refresh {
+                            status_code: 502,
+                            message: "loadCodeAssist returned no usable projectId".to_string(),
+                            retry_after_ms: None,
+                        });
+                    }
+                    if let Err(error) = self
+                        .refresh_account_subscription_metadata(
+                            updated.provider_type,
+                            Some(&updated.id),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id = %updated.id,
+                            %error,
+                            "Gemini project discovery Share metadata sync remains pending"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error)
+                    if error.upstream_status == Some(401)
+                        && !retried_after_unauthorized
+                        && !account.needs_relogin
+                        && account
+                            .refresh_token
+                            .as_deref()
+                            .is_some_and(|token| !token.trim().is_empty()) =>
+                {
+                    retried_after_unauthorized = true;
+                    account = self
+                        .refresh_gemini_project_account_after_unauthorized(
+                            &http_client,
+                            account,
+                            now,
+                            &mut refresh_guard,
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    let next_refresh_at = error
+                        .next_refresh_at
+                        .unwrap_or_else(|| now.saturating_add(QUOTA_FAILURE_COOLDOWN_MS));
+                    let diagnostic = redact_account_error_for_log(&account, &error.message);
+                    let mut update = error
+                        .partial_update
+                        .map(|update| *update)
+                        .unwrap_or_default();
+                    update.quota_next_refresh_at = Some(next_refresh_at);
+                    update.last_refresh_error = Some(diagnostic.clone());
+                    let commit = self.commit_gemini_project_update(&account, update).await;
+                    if let Err(commit_error) = &commit {
+                        tracing::error!(
+                            account_id = %account.id,
+                            provider_type = %account.provider_type.as_str(),
+                            error = %commit_error,
+                            "persisting Gemini project discovery failure cooldown failed"
+                        );
+                    }
+                    let public_message = "Gemini Code Assist project discovery failed".to_string();
+                    let retry_after_ms = Some(next_refresh_at.saturating_sub(now));
+                    refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                        &account,
+                        AccountRefreshFlightStage::GeminiProjectDiscovery,
+                        AccountRefreshFlightFailureDetails {
+                            status_code: error.status_code,
+                            upstream_status: error.upstream_status,
+                            message: diagnostic,
+                            public_message: Some(public_message.clone()),
+                            kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                            retryable: error.retryable,
+                            retry_after_ms,
+                            immediate_relogin: false,
+                        },
+                    ));
+                    return Err(ManagedAccountRefreshError::Refresh {
+                        status_code: error.status_code,
+                        message: public_message,
+                        retry_after_ms,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn refresh_gemini_project_account_after_unauthorized(
+        self: &Arc<Self>,
+        http_client: &reqwest::Client,
+        account: Account,
+        now: i64,
+        refresh_guard: &mut crate::domain::accounts::managers::AccountRefreshGuard,
+    ) -> Result<Account, ManagedAccountRefreshError> {
+        let interval_ms = self.oauth_quota_refresh_interval_ms().await;
+        let update = match self
+            .execute_native_account_refresh_with_recovery(
+                http_client,
+                &account,
+                now,
+                interval_ms,
+                refresh_guard,
+            )
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                let before = account.clone();
+                let updated = self
+                    .commit_native_refresh_failure(
+                        &account,
+                        error.message,
+                        error.kind,
+                        error.immediate_relogin,
+                    )
+                    .await
+                    .map_err(|commit_error| ManagedAccountRefreshError::Refresh {
+                        status_code: 500,
+                        message: format!(
+                            "managed account refresh failure could not be persisted: {commit_error}"
+                        ),
+                        retry_after_ms: None,
+                    })?;
+                if let Some(updated) = updated {
+                    if let Err(sync_error) = self
+                        .refresh_account_runtime_metadata_if_changed(&before, &updated)
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id = %before.id,
+                            error = %sync_error,
+                            "Gemini project recovery failure Share metadata sync remains pending"
+                        );
+                    }
+                }
+                return Err(ManagedAccountRefreshError::Refresh {
+                    status_code: error.status_code,
+                    message: "managed account refresh after loadCodeAssist rejection failed"
+                        .to_string(),
+                    retry_after_ms: error.retry_after_ms,
+                });
+            }
+        };
+        let before = account.clone();
+        let updated = match self.commit_native_refresh_success(&account, update).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                if error.is_superseded() {
+                    return Err(ManagedAccountRefreshError::Refresh {
+                        status_code: 409,
+                        message: "managed account credentials changed during OAuth refresh"
+                            .to_string(),
+                        retry_after_ms: None,
+                    });
+                }
+                let persistence_degraded = error.is_persistence_degraded();
+                let failure_account = if persistence_degraded {
+                    self.find_account_by_id(&account.id)
+                        .await
+                        .unwrap_or_else(|| account.clone())
+                } else {
+                    account.clone()
+                };
+                let status_code = if persistence_degraded { 503 } else { 500 };
+                let public_message = if persistence_degraded {
+                    "rotated credentials are live but durable persistence is degraded"
+                } else {
+                    "managed account refresh state commit failed"
+                };
+                refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                    &failure_account,
+                    AccountRefreshFlightStage::NativeRefresh,
+                    AccountRefreshFlightFailureDetails {
+                        status_code,
+                        upstream_status: None,
+                        message: error.to_string(),
+                        public_message: Some(public_message.to_string()),
+                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                        retryable: true,
+                        retry_after_ms: Some(QUOTA_FAILURE_COOLDOWN_MS),
+                        immediate_relogin: false,
+                    },
+                ));
+                if persistence_degraded {
+                    return Err(ManagedAccountRefreshError::CredentialPersistenceDegraded);
+                }
+                return Err(ManagedAccountRefreshError::Refresh {
+                    status_code,
+                    message: public_message.to_string(),
+                    retry_after_ms: Some(QUOTA_FAILURE_COOLDOWN_MS),
+                });
+            }
+        };
+        if let Err(error) = self
+            .refresh_account_runtime_metadata_if_changed(&before, &updated)
+            .await
+        {
+            tracing::warn!(
+                account_id = %updated.id,
+                %error,
+                "Gemini project recovery Share metadata sync remains pending"
+            );
+        }
+        Ok(updated)
+    }
+
+    async fn commit_gemini_project_update(
+        self: &Arc<Self>,
+        expected: &Account,
+        update: AccountRefreshUpdate,
+    ) -> anyhow::Result<Result<Account, GeminiProjectCommitSkip>> {
+        #[cfg(test)]
+        if self
+            .gemini_project_commit_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected Gemini project metadata persistence failure");
+        }
+        let expected = expected.clone();
+        self.try_mutate_accounts_immediate(move |accounts| {
+            let current = accounts
+                .accounts
+                .iter()
+                .find(|account| {
+                    account.id == expected.id && account.provider_type == expected.provider_type
+                })
+                .cloned()
+                .ok_or(GeminiProjectCommitSkip::NotFound)?;
+            if !native_refresh_snapshot_matches(&current, &expected)
+                || current.profile != expected.profile
+                || current.subscription_level != expected.subscription_level
+            {
+                return Err(GeminiProjectCommitSkip::Stale(Box::new(current)));
+            }
+            accounts
+                .mark_refresh_success(&expected.id, update)
+                .ok_or(GeminiProjectCommitSkip::NotFound)
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_account_quota_refresh_update(
+        self: &Arc<Self>,
+        expected: &Account,
+        update: AccountRefreshUpdate,
+    ) -> anyhow::Result<Result<Account, AccountQuotaCommitSkip>> {
+        let expected = expected.clone();
+        self.try_mutate_accounts_immediate(move |accounts| {
+            let current = accounts
+                .accounts
+                .iter()
+                .find(|account| {
+                    account.id == expected.id && account.provider_type == expected.provider_type
+                })
+                .cloned()
+                .ok_or(AccountQuotaCommitSkip::NotFound)?;
+            if !quota_refresh_snapshot_matches(&current, &expected) {
+                return Err(AccountQuotaCommitSkip::Stale(Box::new(current)));
+            }
+            accounts
+                .mark_refresh_success(&expected.id, update)
+                .ok_or(AccountQuotaCommitSkip::NotFound)
+        })
+        .await
+    }
+
+    pub fn schedule_gemini_v1internal_project_enrichment(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+    ) {
+        if !matches!(
+            provider_type,
+            ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ) {
+            return;
+        }
+        let state = Arc::clone(self);
+        let account_id = account_id.to_string();
+        tokio::spawn(async move {
+            #[cfg(test)]
+            {
+                let explicitly_mocked = state
+                    .find_account_for_provider(provider_type, &account_id)
+                    .await
+                    .and_then(|account| account.raw)
+                    .and_then(|raw| raw.get("testGeminiCodeAssistBaseUrl").cloned())
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .is_some();
+                if !explicitly_mocked {
+                    return;
+                }
+            }
+            if state
+                .refresh_managed_account_if_needed(provider_type, &account_id)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if state
+                .ensure_gemini_v1internal_project(provider_type, &account_id)
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    account_id,
+                    provider_type = %provider_type.as_str(),
+                    "best-effort Gemini project enrichment remains pending"
+                );
+            }
+        });
+    }
+
     pub async fn mark_account_rate_limited_until(
         self: &Arc<Self>,
         account_id: &str,
         rate_limited_until: i64,
         message: Option<String>,
+    ) -> Option<Account> {
+        self.mark_account_rate_limited_until_matching(
+            account_id,
+            rate_limited_until,
+            message,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_account_rate_limited_until_if_current(
+        self: &Arc<Self>,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        rate_limited_until: i64,
+        message: Option<String>,
+    ) -> Option<Account> {
+        self.mark_account_rate_limited_until_matching(
+            account_id,
+            rate_limited_until,
+            message,
+            Some((provider_type, auth_identity_generation)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_account_auth_cooldown_if_current(
+        self: &Arc<Self>,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        rejected_access_token: &str,
+        rate_limited_until: i64,
+        message: Option<String>,
+    ) -> Option<Account> {
+        self.mark_account_rate_limited_until_matching(
+            account_id,
+            rate_limited_until,
+            message,
+            Some((provider_type, auth_identity_generation)),
+            Some(rejected_access_token),
+        )
+        .await
+    }
+
+    async fn mark_account_rate_limited_until_matching(
+        self: &Arc<Self>,
+        account_id: &str,
+        rate_limited_until: i64,
+        message: Option<String>,
+        expected_identity: Option<(ProviderType, u64)>,
+        rejected_access_token: Option<&str>,
     ) -> Option<Account> {
         let (before, account) = {
             let mut accounts = self.accounts.write().await;
@@ -6186,7 +8299,23 @@ impl ServerStateInner {
                 .iter()
                 .find(|account| account.id == account_id)
                 .cloned();
-            let account = accounts.mark_rate_limited_until(account_id, rate_limited_until);
+            let matches_expected_identity =
+                expected_identity.is_none_or(|(provider_type, auth_identity_generation)| {
+                    before.as_ref().is_some_and(|account| {
+                        account.provider_type == provider_type
+                            && account.auth_identity_generation == auth_identity_generation
+                    })
+                });
+            let matches_rejected_token =
+                rejected_access_token.is_none_or(|rejected_access_token| {
+                    before.as_ref().is_some_and(|account| {
+                        account.access_token.as_deref().map(str::trim)
+                            == Some(rejected_access_token.trim())
+                    })
+                });
+            let account = (matches_expected_identity && matches_rejected_token)
+                .then(|| accounts.mark_rate_limited_until(account_id, rate_limited_until))
+                .flatten();
             (before, account)
         };
         if let Some(account) = account.as_ref() {
@@ -6234,17 +8363,66 @@ impl ServerStateInner {
         entitlement_status: Option<String>,
         updated_at_ms: i64,
     ) -> Option<Account> {
+        self.update_account_entitlement_snapshot_matching(
+            account_id,
+            subscription_level,
+            entitlement_status,
+            updated_at_ms,
+            None,
+        )
+        .await
+    }
+
+    pub async fn update_account_entitlement_snapshot_if_current(
+        self: &Arc<Self>,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        subscription_level: Option<String>,
+        entitlement_status: Option<String>,
+        updated_at_ms: i64,
+    ) -> Option<Account> {
+        self.update_account_entitlement_snapshot_matching(
+            account_id,
+            subscription_level,
+            entitlement_status,
+            updated_at_ms,
+            Some((provider_type, auth_identity_generation)),
+        )
+        .await
+    }
+
+    async fn update_account_entitlement_snapshot_matching(
+        self: &Arc<Self>,
+        account_id: &str,
+        subscription_level: Option<String>,
+        entitlement_status: Option<String>,
+        updated_at_ms: i64,
+        expected_identity: Option<(ProviderType, u64)>,
+    ) -> Option<Account> {
         if subscription_level.is_none() && entitlement_status.is_none() {
             return None;
         }
         let account = {
             let mut accounts = self.accounts.write().await;
-            accounts.update_entitlement_snapshot(
-                account_id,
-                subscription_level,
-                entitlement_status,
-                updated_at_ms,
-            )
+            let matches_expected_identity =
+                expected_identity.is_none_or(|(provider_type, auth_identity_generation)| {
+                    accounts.accounts.iter().any(|account| {
+                        account.id == account_id
+                            && account.provider_type == provider_type
+                            && account.auth_identity_generation == auth_identity_generation
+                    })
+                });
+            matches_expected_identity
+                .then(|| {
+                    accounts.update_entitlement_snapshot(
+                        account_id,
+                        subscription_level,
+                        entitlement_status,
+                        updated_at_ms,
+                    )
+                })
+                .flatten()
         };
         if account.is_some() {
             save_accounts_debounced(self);
@@ -6258,20 +8436,57 @@ impl ServerStateInner {
         capability: crate::domain::accounts::store::GrokAccountCapability,
         source: &'static str,
     ) -> anyhow::Result<bool> {
-        if self
-            .find_account_by_id(account_id)
+        self.record_grok_capability_evidence_matching(account_id, capability, source, None)
             .await
-            .is_some_and(|account| {
-                crate::domain::accounts::store::grok_account_capability_evidence_present(
-                    &account, capability,
-                )
-            })
-        {
+    }
+
+    pub async fn record_grok_capability_evidence_if_current(
+        &self,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        capability: crate::domain::accounts::store::GrokAccountCapability,
+        source: &'static str,
+    ) -> anyhow::Result<bool> {
+        self.record_grok_capability_evidence_matching(
+            account_id,
+            capability,
+            source,
+            Some((provider_type, auth_identity_generation)),
+        )
+        .await
+    }
+
+    async fn record_grok_capability_evidence_matching(
+        &self,
+        account_id: &str,
+        capability: crate::domain::accounts::store::GrokAccountCapability,
+        source: &'static str,
+        expected_identity: Option<(ProviderType, u64)>,
+    ) -> anyhow::Result<bool> {
+        let Some(account) = self.find_account_by_id(account_id).await else {
+            return Ok(false);
+        };
+        if expected_identity.is_some_and(|(provider_type, auth_identity_generation)| {
+            account.provider_type != provider_type
+                || account.auth_identity_generation != auth_identity_generation
+        }) || crate::domain::accounts::store::grok_account_capability_evidence_present(
+            &account, capability,
+        ) {
             return Ok(false);
         }
         let account_id = account_id.to_string();
         let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         self.mutate_accounts_immediate(move |accounts| {
+            if expected_identity.is_some_and(|(provider_type, auth_identity_generation)| {
+                accounts
+                    .find_for_provider(provider_type, Some(&account_id))
+                    .is_none_or(|account| {
+                        account.auth_identity_generation != auth_identity_generation
+                    })
+            }) {
+                return false;
+            }
             accounts.record_grok_capability_evidence(
                 &account_id,
                 capability,
@@ -6286,7 +8501,8 @@ impl ServerStateInner {
         &self,
         session_key: String,
         provider_id: String,
-        account_id: Option<String>,
+        account_id: String,
+        auth_identity_generation: u64,
         ttl_ms: i64,
     ) {
         let now = crate::infra::time::now_ms() as i64;
@@ -6315,6 +8531,7 @@ impl ServerStateInner {
             GrokMediaSessionBinding {
                 provider_id,
                 account_id,
+                auth_identity_generation,
                 expires_at_ms,
             },
         );
@@ -6373,6 +8590,71 @@ impl ServerStateInner {
             .write()
             .await
             .remove_for_principal(provider_type, device_code, principal_id, now_ms)
+    }
+
+    pub(crate) async fn remove_device_flow_for_principal_under_managed_auth_guard(
+        &self,
+        _operation: &tokio::sync::MutexGuard<'_, ()>,
+        provider_type: ProviderType,
+        device_code: &str,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> bool {
+        let owned = self
+            .remove_device_flow_principal(provider_type, device_code, principal_id, now_ms)
+            .await;
+        if !owned {
+            return false;
+        }
+        match provider_type {
+            ProviderType::KiroOAuth => {
+                self.remove_kiro_device_flow(device_code).await;
+                self.remove_kiro_social_device_flow(device_code).await;
+            }
+            ProviderType::CodexOAuth => {
+                self.cancel_codex_device_flow(device_code).await;
+            }
+            ProviderType::GrokOAuth => {
+                self.cancel_grok_device_flow(device_code).await;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    pub(crate) async fn cancel_managed_auth_for_principal_under_operation_guard(
+        &self,
+        _operation: &tokio::sync::MutexGuard<'_, ()>,
+        provider_type: ProviderType,
+        principal_id: &str,
+        now_ms: i64,
+    ) -> usize {
+        let device_codes = self
+            .device_flow_principals
+            .write()
+            .await
+            .remove_all_for_principal(provider_type, principal_id, now_ms);
+        for device_code in &device_codes {
+            match provider_type {
+                ProviderType::KiroOAuth => {
+                    self.remove_kiro_device_flow(device_code).await;
+                    self.remove_kiro_social_device_flow(device_code).await;
+                }
+                ProviderType::CodexOAuth => {
+                    self.cancel_codex_device_flow(device_code).await;
+                }
+                ProviderType::GrokOAuth => {
+                    self.cancel_grok_device_flow(device_code).await;
+                }
+                _ => {}
+            }
+        }
+        let browser_logins = self
+            .mutate_oauth_logins(|store| {
+                store.cancel_all_for_principal(provider_type, principal_id, now_ms)
+            })
+            .await;
+        device_codes.len().saturating_add(browser_logins)
     }
 
     pub async fn insert_kiro_device_flow(
@@ -6529,22 +8811,45 @@ impl ServerStateInner {
 
     pub async fn prepare_copilot_upstream_auth(
         self: &Arc<Self>,
-        account_id: Option<&str>,
+        account_id: &str,
     ) -> Result<CopilotUpstreamAuth, CopilotUpstreamAuthError> {
-        let now_ms = crate::infra::time::now_ms() as i64;
-        let account = self
-            .find_account_for_provider(ProviderType::GitHubCopilot, account_id)
+        let accounts = self
+            .accounts_snapshot_if_credentials_persisted()
             .await
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?;
+        let account = accounts
+            .find_for_provider(ProviderType::GitHubCopilot, Some(account_id))
+            .cloned()
             .ok_or(CopilotUpstreamAuthError::NotFound)?;
         let account_id = account.id.clone();
-        let domain = copilot_account_domain(&account)?;
-
-        if let Some(cached) = self
-            .copilot_upstream_auth
-            .read()
+        let _refresh_guard = self
+            .account_refresh_locks
+            .lock(ProviderType::GitHubCopilot, &account_id)
+            .await;
+        let accounts = self
+            .accounts_snapshot_if_credentials_persisted()
             .await
-            .get(&account_id)
-            .filter(|cached| cached.is_valid(now_ms))
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?;
+        let account = accounts
+            .find_for_provider(ProviderType::GitHubCopilot, Some(&account_id))
+            .cloned()
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        let domain = copilot_account_domain(&account)?;
+        let now_ms = crate::infra::time::now_ms() as i64;
+
+        let cached_state = {
+            let mut cache = self.copilot_upstream_auth.write().await;
+            if cache
+                .get(&account_id)
+                .is_some_and(|cached| !cached.binding_matches(&account, &domain))
+            {
+                cache.remove(&account_id);
+            }
+            cache.get(&account_id).cloned()
+        };
+        if let Some(cached) = cached_state
+            .as_ref()
+            .filter(|cached| cached.is_valid_for(&account, &domain, now_ms))
             .cloned()
         {
             return Ok(cached.into_auth(account_id));
@@ -6552,26 +8857,134 @@ impl ServerStateInner {
 
         if !copilot_device::is_ghes(&domain) {
             if let Some(cached) = cached_copilot_auth_from_account(&account, &domain, now_ms) {
-                self.copilot_upstream_auth
-                    .write()
-                    .await
-                    .insert(account_id.clone(), cached.clone());
-                return Ok(cached.into_auth(account_id));
+                let rejected_token = cached_state
+                    .as_ref()
+                    .filter(|cached| cached.rejected && cached.binding_matches(&account, &domain))
+                    .map(|cached| cached.token.as_str());
+                if rejected_token != Some(cached.token.as_str()) {
+                    self.copilot_upstream_auth
+                        .write()
+                        .await
+                        .insert(account_id.clone(), cached.clone());
+                    return Ok(cached.into_auth(account_id));
+                }
             }
         }
 
-        let github_token = copilot_github_token(&account).ok_or_else(|| {
+        let cached = self
+            .exchange_copilot_upstream_auth(&account, &domain)
+            .await?;
+        self.copilot_upstream_auth
+            .write()
+            .await
+            .insert(account_id.clone(), cached.clone());
+        Ok(cached.into_auth(account_id))
+    }
+
+    pub async fn refresh_copilot_upstream_auth_now(
+        self: &Arc<Self>,
+        account_id: &str,
+        rejected_token: Option<&str>,
+    ) -> Result<CopilotUpstreamAuth, CopilotUpstreamAuthError> {
+        let accounts = self
+            .accounts_snapshot_if_credentials_persisted()
+            .await
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?;
+        let account = accounts
+            .find_for_provider(ProviderType::GitHubCopilot, Some(account_id))
+            .cloned()
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        let account_id = account.id.clone();
+        let _refresh_guard = self
+            .account_refresh_locks
+            .lock(ProviderType::GitHubCopilot, &account_id)
+            .await;
+        let accounts = self
+            .accounts_snapshot_if_credentials_persisted()
+            .await
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?;
+        let account = accounts
+            .find_for_provider(ProviderType::GitHubCopilot, Some(&account_id))
+            .cloned()
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        let domain = copilot_account_domain(&account)?;
+        let now_ms = crate::infra::time::now_ms() as i64;
+        let cached = {
+            let mut cache = self.copilot_upstream_auth.write().await;
+            if cache
+                .get(&account_id)
+                .is_some_and(|cached| !cached.binding_matches(&account, &domain))
+            {
+                cache.remove(&account_id);
+            }
+            cache.get(&account_id).cloned()
+        };
+        if let Some(cached) = cached
+            .as_ref()
+            .filter(|cached| {
+                cached.is_valid_for(&account, &domain, now_ms)
+                    && rejected_token.is_some_and(|rejected| cached.token != rejected)
+            })
+            .cloned()
+        {
+            return Ok(cached.into_auth(account_id));
+        }
+
+        let rejected_token = rejected_token
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .or_else(|| cached.as_ref().map(|cached| cached.token.clone()))
+            .or_else(|| account.access_token.clone());
+        if let Some(rejected_token) = rejected_token {
+            let api_endpoint = cached
+                .as_ref()
+                .map(|cached| cached.api_endpoint.clone())
+                .unwrap_or_else(|| copilot_account_api_endpoint(&account, &domain));
+            self.copilot_upstream_auth.write().await.insert(
+                account_id.clone(),
+                CachedCopilotUpstreamAuth {
+                    token: rejected_token,
+                    api_endpoint,
+                    expires_at_ms: None,
+                    rejected: true,
+                    auth_identity_generation: account.auth_identity_generation,
+                    token_refresh_generation: account.token_refresh_generation,
+                    domain: domain.clone(),
+                },
+            );
+        } else {
+            self.copilot_upstream_auth.write().await.remove(&account_id);
+        }
+        let cached = self
+            .exchange_copilot_upstream_auth(&account, &domain)
+            .await?;
+        self.copilot_upstream_auth
+            .write()
+            .await
+            .insert(account_id.clone(), cached.clone());
+        Ok(cached.into_auth(account_id))
+    }
+
+    async fn exchange_copilot_upstream_auth(
+        &self,
+        account: &Account,
+        domain: &str,
+    ) -> Result<CachedCopilotUpstreamAuth, CopilotUpstreamAuthError> {
+        let account_id = account.id.clone();
+
+        let github_token = copilot_github_token(account).ok_or_else(|| {
             CopilotUpstreamAuthError::MissingGitHubToken {
                 account_id: account_id.clone(),
             }
         })?;
         let http_client = self.http_client().await;
 
-        let (token, expires_at_ms) = if copilot_device::is_ghes(&domain) {
+        let (token, expires_at_ms) = if copilot_device::is_ghes(domain) {
             (github_token.clone(), None)
         } else {
             let token =
-                copilot_device::fetch_copilot_internal_token(&http_client, &domain, &github_token)
+                copilot_device::fetch_copilot_internal_token(&http_client, domain, &github_token)
                     .await
                     .map_err(|error| CopilotUpstreamAuthError::TokenExchange {
                         status_code: error.status.as_u16(),
@@ -6582,7 +8995,7 @@ impl ServerStateInner {
 
         let api_endpoint = match copilot_device::fetch_copilot_api_endpoint(
             &http_client,
-            &domain,
+            domain,
             &github_token,
         )
         .await
@@ -6594,37 +9007,45 @@ impl ServerStateInner {
                     account_id,
                     error
                 );
-                copilot_device::copilot_api_base(&domain)
+                copilot_device::copilot_api_base(domain)
             }
         };
 
-        let cached = CachedCopilotUpstreamAuth {
+        Ok(CachedCopilotUpstreamAuth {
             token,
             api_endpoint,
             expires_at_ms,
-        };
-        self.copilot_upstream_auth
-            .write()
-            .await
-            .insert(account_id.clone(), cached.clone());
-        Ok(cached.into_auth(account_id))
+            rejected: false,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+            domain: domain.to_string(),
+        })
     }
 
     pub async fn start_deepseek_chat_completion(
         self: &Arc<Self>,
-        account_id: Option<&str>,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
         model: &str,
         prompt: &str,
     ) -> Result<reqwest::Response, DeepSeekUpstreamError> {
-        let account = self
-            .find_account_for_provider(ProviderType::DeepSeekAccount, account_id)
+        let accounts = self
+            .accounts_snapshot_if_credentials_persisted()
             .await
+            .ok_or(DeepSeekUpstreamError::CredentialPersistenceDegraded)?;
+        let account = accounts
+            .find_for_provider(ProviderType::DeepSeekAccount, Some(account_id))
+            .cloned()
             .ok_or(DeepSeekUpstreamError::NotFound)?;
+        if account.auth_identity_generation != expected_auth_identity_generation {
+            return Err(DeepSeekUpstreamError::IdentityChanged);
+        }
         let token = account
             .access_token
             .filter(|value| !value.trim().is_empty())
             .ok_or(DeepSeekUpstreamError::MissingToken)?;
-        let client = crate::clients::deepseek::DeepSeekWebClient::new();
+        let client =
+            crate::clients::deepseek::DeepSeekWebClient::with_http_client(self.http_client().await);
         client
             .start_completion(&token, model, prompt)
             .await
@@ -6763,10 +9184,11 @@ impl ServerStateInner {
         result
     }
 
-    pub async fn delete_share_immediate(
+    pub(crate) async fn delete_share_immediate(
         &self,
         share_id: &str,
-    ) -> anyhow::Result<Option<ShareDeleteTombstone>> {
+    ) -> anyhow::Result<Result<Option<ShareDeleteTombstone>, ShareDeleteError>> {
+        let _lifecycle = self.share_lifecycle.lock().await;
         let config = self.config_snapshot().await;
         let router_target = config.registered_router_identity().and_then(|identity| {
             config.router_api_base().map(|router_api_base| {
@@ -6776,11 +9198,16 @@ impl ServerStateInner {
                 )
             })
         });
-        self.mutate_shares_immediate(|store| match router_target.as_ref() {
-            Some((router_api_base, installation_id)) => {
-                store.delete_for_router_target(share_id, router_api_base, installation_id)
+        self.try_mutate_shares_immediate(|store| {
+            if store.get(share_id).is_some() && self.share_in_flight.has_in_flight(share_id) {
+                return Err(ShareDeleteError::InFlight);
             }
-            None => store.delete(share_id),
+            Ok(match router_target.as_ref() {
+                Some((router_api_base, installation_id)) => {
+                    store.delete_for_router_target(share_id, router_api_base, installation_id)
+                }
+                None => store.delete(share_id),
+            })
         })
         .await
     }
@@ -6790,6 +9217,7 @@ impl ServerStateInner {
         share_id: &str,
         expected_config_revision: u64,
     ) -> anyhow::Result<Result<ShareDeleteTombstone, ConditionalShareDeleteError>> {
+        let _lifecycle = self.share_lifecycle.lock().await;
         let config = self.config_snapshot().await;
         let router_target = config.registered_router_identity().and_then(|identity| {
             config.router_api_base().map(|router_api_base| {
@@ -6808,6 +9236,9 @@ impl ServerStateInner {
                     current_revision: current.config_revision,
                 });
             }
+            if self.share_in_flight.has_in_flight(share_id) {
+                return Err(ConditionalShareDeleteError::InFlight);
+            }
             Ok(match router_target.as_ref() {
                 Some((router_api_base, installation_id)) => store
                     .delete_for_router_target(share_id, router_api_base, installation_id)
@@ -6820,13 +9251,14 @@ impl ServerStateInner {
         .await
     }
 
-    pub async fn validate_share_invocation(
+    pub async fn validate_and_acquire_share_invocation(
         self: &Arc<Self>,
         share_id: &str,
         app: AppKind,
         user_email: Option<&str>,
         now_ms: i64,
-    ) -> Result<ShareInvocation, ShareInvocationRejection> {
+    ) -> Result<(ShareInvocation, ShareInFlightGuard), ShareInvocationRejection> {
+        let _lifecycle = self.share_lifecycle.lock().await;
         let result = self
             .mutate_shares(|shares| {
                 shares.validate_for_invocation(share_id, app, user_email, now_ms)
@@ -6839,7 +9271,26 @@ impl ServerStateInner {
         {
             save_shares_debounced(self);
         }
-        result
+        let invocation = result?;
+        let guard = self
+            .share_in_flight
+            .try_acquire_for_user(
+                &invocation.share_id,
+                invocation.parallel_limit,
+                invocation.user_email.as_deref(),
+                invocation.user_parallel_limit,
+            )
+            .map_err(|limit| ShareInvocationRejection {
+                reason: match limit {
+                    ShareInFlightAcquireError::ShareLimit => ShareRejectReason::ParallelLimit,
+                    ShareInFlightAcquireError::UserLimit => ShareRejectReason::UserParallelLimit,
+                },
+                message:
+                    "Share parallel limit has been reached. Wait for an in-flight request to finish."
+                        .to_string(),
+                status_changed: false,
+            })?;
+        Ok((invocation, guard))
     }
 
     pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
@@ -6968,6 +9419,42 @@ fn preserve_router_identity_from_stale_snapshot(
         incoming.router.last_register_error = current.router.last_register_error.clone();
         incoming.router.last_registered_at_ms = current.router.last_registered_at_ms;
     }
+}
+
+fn ensure_current_client_tunnel_claim(
+    current: &ServerConfig,
+    intent: &ClientTunnelClaimIntent,
+) -> anyhow::Result<()> {
+    if current.client.claim_pending.as_ref() != Some(intent) || !intent.matches_config(current) {
+        anyhow::bail!("client tunnel claim configuration changed while claim was in progress");
+    }
+    Ok(())
+}
+
+fn preserve_client_tunnel_claim_from_stale_snapshot(
+    current: &ServerConfig,
+    incoming: &mut ServerConfig,
+) {
+    let current_fingerprint = ClientTunnelClaimIntent::from_config(current).ok();
+    let incoming_fingerprint = ClientTunnelClaimIntent::from_config(incoming).ok();
+    if current_fingerprint != incoming_fingerprint {
+        if current.client.claim_pending.is_some() {
+            incoming.client.claim_pending = None;
+            incoming.client.tunnel_status = Some("claim_failed".to_string());
+            incoming.router.last_register_error = Some(
+                "pending client tunnel claim was invalidated by a configuration change".to_string(),
+            );
+        } else if incoming.client.claim_pending.is_some() {
+            incoming.client.claim_pending = None;
+        }
+        return;
+    }
+    if current.client.claim_pending == incoming.client.claim_pending {
+        return;
+    }
+    incoming.client.claim_pending = current.client.claim_pending.clone();
+    incoming.client.tunnel_status = current.client.tunnel_status.clone();
+    incoming.router.last_register_error = current.router.last_register_error.clone();
 }
 
 fn preserve_setup_completion_from_stale_snapshot(
@@ -7113,7 +9600,17 @@ pub async fn refresh_router_installation_registration(state: &ServerState) -> bo
 pub async fn restore_tunnels(state: ServerState) {
     let registration_completed = refresh_router_installation_registration(&state).await;
 
-    if state.config.read().await.is_setup_complete()
+    if state.config.read().await.client.claim_pending.is_some() {
+        if let Err(error) =
+            crate::client_tunnel_provision::reconcile_pending_client_tunnel_claim(&state).await
+        {
+            tracing::warn!(error = %error, "startup client tunnel claim reconciliation remains pending");
+        }
+    }
+
+    let restore_config = state.config_snapshot().await;
+    if restore_config.client.claim_pending.is_none()
+        && restore_config.is_setup_complete()
         && should_restore_client_tunnel(
             state
                 .tunnels
@@ -7725,7 +10222,7 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
     if state.credential_persistence_degraded() {
         return;
     }
-    let Some(_guard) = state
+    let Some(mut refresh_guard) = state
         .account_refresh_locks
         .try_lock(account.provider_type, &account.id)
     else {
@@ -7751,7 +10248,16 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
 
     let http_client = state.http_client().await;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-    match execute_native_account_refresh(&http_client, &account, now, interval_ms).await {
+    match state
+        .execute_native_account_refresh_with_recovery(
+            &http_client,
+            &account,
+            now,
+            interval_ms,
+            &mut refresh_guard,
+        )
+        .await
+    {
         Ok(update) => {
             let updated = match state.commit_native_refresh_success(&account, update).await {
                 Ok(updated) => {
@@ -7759,6 +10265,13 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                     Some(updated)
                 }
                 Err(error) => {
+                    if error.is_superseded() {
+                        crate::metrics::record_warm_refresh(
+                            account.provider_type.as_str(),
+                            "superseded",
+                        );
+                        return;
+                    }
                     crate::metrics::record_warm_refresh(
                         account.provider_type.as_str(),
                         if error.is_persistence_degraded() {
@@ -7767,14 +10280,44 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                             "commit_failure"
                         },
                     );
-                    if error.is_persistence_degraded() {
+                    let persistence_degraded = error.is_persistence_degraded();
+                    let failure_account = if persistence_degraded {
+                        state
+                            .find_account_by_id(&account.id)
+                            .await
+                            .unwrap_or_else(|| account.clone())
+                    } else {
+                        account.clone()
+                    };
+                    refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                        &failure_account,
+                        AccountRefreshFlightStage::NativeRefresh,
+                        AccountRefreshFlightFailureDetails {
+                            status_code: if persistence_degraded { 503 } else { 500 },
+                            upstream_status: None,
+                            message: error.to_string(),
+                            public_message: Some(
+                                if persistence_degraded {
+                                    "rotated credentials are live but durable persistence is degraded"
+                                } else {
+                                    "background OAuth credential state commit failed"
+                                }
+                                .to_string(),
+                            ),
+                            kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                            retryable: persistence_degraded,
+                            retry_after_ms: None,
+                            immediate_relogin: false,
+                        },
+                    ));
+                    if persistence_degraded {
                         tracing::error!(
                             account_id = %account.id,
                             provider_type = %account.provider_type.as_str(),
                             %error,
                             "background OAuth refresh kept rotated credentials live but persistence is degraded"
                         );
-                        state.find_account_by_id(&account.id).await
+                        Some(failure_account)
                     } else {
                         tracing::error!(
                             account_id = %account.id,
@@ -7815,7 +10358,12 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                 "background OAuth token warm-refresh failed"
             );
             let updated = match state
-                .commit_native_refresh_failure(&account, error.message, error.kind)
+                .commit_native_refresh_failure(
+                    &account,
+                    error.message,
+                    error.kind,
+                    error.immediate_relogin,
+                )
                 .await
             {
                 Ok(updated) => updated,
@@ -7893,17 +10441,10 @@ async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
     let now = crate::infra::time::now_ms() as i64;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     let accounts = state.accounts_snapshot().await;
-    let active_codex_account_id = accounts
-        .active_codex_oauth_account()
-        .map(|account| account.id.clone());
     let next_due = accounts
         .accounts
         .iter()
-        .filter(|account| account_quota_refresh_candidate(account))
-        .filter(|account| {
-            account.provider_type != ProviderType::CodexOAuth
-                || active_codex_account_id.as_deref() == Some(account.id.as_str())
-        })
+        .filter(|account| account_quota_refresh_candidate(&accounts, account))
         .filter_map(|account| account.quota_next_refresh_at)
         .min();
     let delay_ms = next_due
@@ -7912,7 +10453,18 @@ async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
     Duration::from_millis(delay_ms.clamp(1_000, (interval_ms as u64).min(60_000)))
 }
 
-fn account_quota_refresh_candidate(account: &Account) -> bool {
+fn account_quota_refresh_candidate(accounts: &AccountStore, account: &Account) -> bool {
+    if account.needs_relogin {
+        return false;
+    }
+    if account.provider_type == ProviderType::CodexOAuth
+        && accounts
+            .active_codex_oauth_account()
+            .map(|active| active.id.as_str())
+            != Some(account.id.as_str())
+    {
+        return false;
+    }
     match account.provider_type {
         ProviderType::CodexOAuth
         | ProviderType::ClaudeOAuth
@@ -7949,25 +10501,24 @@ fn emit_oauth_quota_updated(state: &ServerState, account: &Account, success: boo
 async fn refresh_due_account_quotas(state: &ServerState) {
     let now = crate::infra::time::now_ms() as i64;
     let accounts = state.accounts_snapshot().await;
-    let active_codex_account_id = accounts
-        .active_codex_oauth_account()
-        .map(|account| account.id.clone());
-    for account in accounts
+    let due_accounts = accounts
         .accounts
-        .into_iter()
-        .filter(|account| account_quota_refresh_due(account, now))
-        .filter(|account| {
-            account.provider_type != ProviderType::CodexOAuth
-                || active_codex_account_id.as_deref() == Some(account.id.as_str())
-        })
-    {
+        .iter()
+        .filter(|account| account_quota_refresh_due(&accounts, account, now))
+        .cloned()
+        .collect::<Vec<_>>();
+    for account in due_accounts {
         refresh_one_account_quota(state, account, now).await;
     }
 }
 
 async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i64) {
     let locked_provider_type = account.provider_type;
-    let Some(_guard) = state
+    let refresh_generation_before_lock = (
+        account.auth_identity_generation,
+        account.token_refresh_generation,
+    );
+    let Some(mut refresh_guard) = state
         .account_refresh_locks
         .try_lock(locked_provider_type, &account.id)
     else {
@@ -7976,41 +10527,96 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     // The periodic scan clones accounts before acquiring the per-account lock.
     // A workspace switch may complete between those two operations, so always
     // re-read under the lock and re-check due state before issuing requests.
-    let Some(account) = state.find_account_by_id(&account.id).await else {
+    let accounts = state.accounts_snapshot().await;
+    let Some(account) = accounts
+        .accounts
+        .iter()
+        .find(|candidate| candidate.id == account.id)
+        .cloned()
+    else {
         return;
     };
-    if account.provider_type != locked_provider_type || !account_quota_refresh_due(&account, now) {
+    if account.provider_type != locked_provider_type
+        || !account_quota_refresh_due(&accounts, &account, now)
+    {
         return;
     }
-    if state.credential_persistence_degraded() {
+    if !background_quota_outbound_allowed(state, &account).await {
         return;
-    }
-    if account.provider_type == ProviderType::CodexOAuth {
-        let accounts = state.accounts_snapshot().await;
-        if accounts
-            .active_codex_oauth_account()
-            .is_none_or(|active| active.id != account.id)
-        {
-            return;
-        }
     }
     let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
     let account_before_refresh = account.clone();
     let mut active_account = account;
+    let mut native_refresh_attempted = (
+        active_account.auth_identity_generation,
+        active_account.token_refresh_generation,
+    ) != refresh_generation_before_lock;
     if account_needs_native_refresh(&active_account, now) {
         let http_client = state.http_client().await;
-        let update = match execute_native_account_refresh(
-            &http_client,
-            &active_account,
-            now,
-            success_cooldown_ms,
-        )
-        .await
+        let update = match state
+            .execute_native_account_refresh_with_recovery(
+                &http_client,
+                &active_account,
+                now,
+                success_cooldown_ms,
+                &mut refresh_guard,
+            )
+            .await
         {
             Ok(update) => update,
             Err(error) => {
-                mark_account_quota_refresh_error(state, &active_account.id, error.message, now)
-                    .await;
+                let diagnostic = redact_account_error_for_log(&active_account, &error.message);
+                tracing::warn!(
+                    account_id = %active_account.id,
+                    provider_type = %active_account.provider_type.as_str(),
+                    error_kind = ?error.kind,
+                    error = %diagnostic,
+                    "background quota OAuth token refresh failed"
+                );
+                let quota_next_refresh_at =
+                    now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS);
+                let updated = match state
+                    .commit_native_refresh_failure_with_quota_cooldown(
+                        &active_account,
+                        error.message,
+                        error.kind,
+                        error.immediate_relogin,
+                        quota_next_refresh_at,
+                    )
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(persist_error) => {
+                        tracing::error!(
+                            account_id = %active_account.id,
+                            error = %persist_error,
+                            "persisting background quota OAuth refresh failure state failed"
+                        );
+                        return;
+                    }
+                };
+                if let Some(updated) = updated {
+                    if updated.needs_relogin {
+                        tracing::error!(
+                            account_id = %updated.id,
+                            provider_type = %updated.provider_type.as_str(),
+                            "background quota OAuth account requires re-login"
+                        );
+                    }
+                    if let Err(sync_error) = state
+                        .refresh_account_runtime_metadata_if_changed(
+                            &account_before_refresh,
+                            &updated,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id = %updated.id,
+                            error = %sync_error,
+                            "background quota OAuth refresh failure Share descriptor sync remains pending"
+                        );
+                    }
+                }
                 return;
             }
         };
@@ -8018,9 +10624,51 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
             .commit_native_refresh_success(&active_account, update)
             .await
         {
-            Ok(account) => account,
+            Ok(account) => {
+                native_refresh_attempted = true;
+                account
+            }
             Err(error) => {
-                if error.is_persistence_degraded() {
+                if error.is_superseded() {
+                    tracing::info!(
+                        account_id = %active_account.id,
+                        "discarded background quota token refresh after credentials changed"
+                    );
+                    return;
+                }
+                let persistence_degraded = error.is_persistence_degraded();
+                let failure_account = if persistence_degraded {
+                    state
+                        .find_account_by_id(&active_account.id)
+                        .await
+                        .unwrap_or_else(|| active_account.clone())
+                } else {
+                    active_account.clone()
+                };
+                refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                    &failure_account,
+                    AccountRefreshFlightStage::NativeRefresh,
+                    AccountRefreshFlightFailureDetails {
+                        status_code: if persistence_degraded { 503 } else { 500 },
+                        upstream_status: None,
+                        message: error.to_string(),
+                        public_message: Some(
+                            if persistence_degraded {
+                                "rotated credentials are live but durable persistence is degraded"
+                            } else {
+                                "background quota OAuth credential state commit failed"
+                            }
+                            .to_string(),
+                        ),
+                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                        retryable: persistence_degraded,
+                        retry_after_ms: Some(
+                            crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS,
+                        ),
+                        immediate_relogin: false,
+                    },
+                ));
+                if persistence_degraded {
                     tracing::error!(
                         account_id = %active_account.id,
                         %error,
@@ -8048,12 +10696,12 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         }
     }
 
-    if state.credential_persistence_degraded() {
+    if !background_quota_outbound_allowed(state, &active_account).await {
         return;
     }
     let http_client = state.http_client().await;
     let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
-    match refresh_account_quota(
+    let mut quota_result = refresh_account_quota(
         &http_client,
         &active_account,
         now,
@@ -8061,16 +10709,102 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         success_cooldown_ms,
         timeout_ms,
     )
-    .await
+    .await;
+    if !native_refresh_attempted
+        && quota_result
+            .as_ref()
+            .is_err_and(|error| error.upstream_status == Some(401))
     {
+        match state
+            .recover_quota_unauthorized(
+                &http_client,
+                &active_account,
+                now,
+                success_cooldown_ms,
+                &mut refresh_guard,
+            )
+            .await
+        {
+            Ok(refreshed) => {
+                active_account = refreshed;
+                if !background_quota_outbound_allowed(state, &active_account).await {
+                    return;
+                }
+                quota_result = refresh_account_quota(
+                    &http_client,
+                    &active_account,
+                    now,
+                    true,
+                    success_cooldown_ms,
+                    timeout_ms,
+                )
+                .await;
+            }
+            Err(QuotaUnauthorizedRecoveryError::Unavailable) => {}
+            Err(QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
+                let diagnostic = redact_account_error_for_log(&active_account, &failure.message);
+                tracing::warn!(
+                    account_id = %active_account.id,
+                    provider_type = %active_account.provider_type.as_str(),
+                    error = %diagnostic,
+                    "background quota 401 OAuth recovery failed"
+                );
+                if let Some(updated) = updated {
+                    if let Err(error) = state
+                        .refresh_account_runtime_metadata_if_changed(
+                            &account_before_refresh,
+                            &updated,
+                        )
+                        .await
+                    {
+                        tracing::warn!(account_id = %updated.id, %error, "background quota auth recovery Share descriptor sync remains pending");
+                    }
+                }
+                return;
+            }
+            Err(QuotaUnauthorizedRecoveryError::Commit(error)) => {
+                tracing::warn!(
+                    account_id = %active_account.id,
+                    %error,
+                    "background quota 401 OAuth recovery commit was not applied"
+                );
+                return;
+            }
+            Err(QuotaUnauthorizedRecoveryError::State(error)) => {
+                tracing::error!(
+                    account_id = %active_account.id,
+                    %error,
+                    "background quota 401 OAuth recovery state update failed"
+                );
+                return;
+            }
+        }
+    }
+    match quota_result {
         Ok(QuotaRefreshResult::Updated { update, .. }) => {
-            let account = {
-                let mut store = state.accounts.write().await;
-                store
-                    .mark_refresh_success(&active_account.id, update)
-                    .unwrap_or(active_account)
+            let account = match state
+                .commit_account_quota_refresh_update(&active_account, update)
+                .await
+            {
+                Ok(Ok(account)) => account,
+                Ok(Err(AccountQuotaCommitSkip::Stale(current))) => {
+                    tracing::info!(
+                        account_id = %current.id,
+                        provider_type = %current.provider_type.as_str(),
+                        "discarded background quota response for superseded credentials"
+                    );
+                    return;
+                }
+                Ok(Err(AccountQuotaCommitSkip::NotFound)) => return,
+                Err(error) => {
+                    tracing::error!(
+                        account_id = %active_account.id,
+                        %error,
+                        "background quota success persistence failed"
+                    );
+                    return;
+                }
             };
-            save_accounts_debounced(state);
             if let Err(error) = state
                 .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
                 .await
@@ -8085,85 +10819,76 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         }
         Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {}
         Err(error) => {
-            let mut update = AccountRefreshUpdate {
-                quota_next_refresh_at: error.next_refresh_at,
-                last_refresh_error: Some(error.message),
-                ..Default::default()
-            };
+            let mut update = error
+                .partial_update
+                .map(|update| *update)
+                .unwrap_or_default();
+            update.quota_next_refresh_at = error.next_refresh_at;
+            update.last_refresh_error = Some(error.message);
             if update.quota_next_refresh_at.is_none() {
                 update.quota_next_refresh_at = Some(
                     now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS),
                 );
             }
-            let account = {
-                let mut store = state.accounts.write().await;
-                store.mark_refresh_success(&active_account.id, update)
-            };
-            save_accounts_debounced(state);
-            if let Some(account) = account {
-                if let Err(error) = state
-                    .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
-                    .await
-                {
-                    tracing::warn!(
-                        account_id = %account.id,
-                        %error,
-                        "background quota refresh failure Share descriptor sync remains pending"
+            let account = match state
+                .commit_account_quota_refresh_update(&active_account, update)
+                .await
+            {
+                Ok(Ok(account)) => account,
+                Ok(Err(AccountQuotaCommitSkip::Stale(current))) => {
+                    tracing::info!(
+                        account_id = %current.id,
+                        provider_type = %current.provider_type.as_str(),
+                        "discarded background quota failure for superseded credentials"
                     );
+                    return;
                 }
+                Ok(Err(AccountQuotaCommitSkip::NotFound)) => return,
+                Err(error) => {
+                    tracing::error!(
+                        account_id = %active_account.id,
+                        %error,
+                        "background quota failure metadata persistence failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = state
+                .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &account)
+                .await
+            {
+                tracing::warn!(
+                    account_id = %account.id,
+                    %error,
+                    "background quota refresh failure Share descriptor sync remains pending"
+                );
             }
         }
     }
 }
 
-async fn mark_account_quota_refresh_error(
-    state: &ServerState,
-    account_id: &str,
-    message: String,
-    now: i64,
-) {
-    let (before, after) = {
-        let mut store = state.accounts.write().await;
-        let before = store
-            .accounts
-            .iter()
-            .find(|account| account.id == account_id)
-            .cloned();
-        let after = store.mark_refresh_success(
-            account_id,
-            AccountRefreshUpdate {
-                quota_next_refresh_at: Some(
-                    now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS),
-                ),
-                last_refresh_error: Some(message),
-                ..Default::default()
-            },
-        );
-        (before, after)
-    };
-    save_accounts_debounced(state);
-    if let (Some(before), Some(after)) = (before, after) {
-        if let Err(error) = state
-            .refresh_account_runtime_metadata_if_changed(&before, &after)
-            .await
-        {
-            tracing::warn!(
-                account_id,
-                %error,
-                "quota refresh error Share descriptor sync remains pending"
-            );
-        }
+async fn background_quota_outbound_allowed(state: &ServerState, account: &Account) -> bool {
+    if state.credential_persistence_degraded() {
+        return false;
     }
+    if account.provider_type != ProviderType::CodexOAuth {
+        return true;
+    }
+    let accounts = state.accounts_snapshot().await;
+    accounts
+        .active_codex_oauth_account()
+        .map(|active| active.id.as_str())
+        == Some(account.id.as_str())
 }
 
-fn account_quota_refresh_due(account: &Account, now: i64) -> bool {
+fn account_quota_refresh_due(accounts: &AccountStore, account: &Account, now: i64) -> bool {
     if account
         .quota_next_refresh_at
         .is_some_and(|next_refresh_at| next_refresh_at > now)
     {
         return false;
     }
-    account_quota_refresh_candidate(account)
+    account_quota_refresh_candidate(accounts, account)
 }
 
 fn should_restore_client_tunnel(
@@ -9709,46 +12434,13 @@ async fn issue_client_tunnel_lease(
     if !config.is_setup_complete() {
         anyhow::bail!("setup is incomplete");
     }
-    if !config.has_registered_router_identity() {
-        state.register_router_installation().await?;
-        config = state.config_snapshot().await;
-        state
-            .complete_router_registration_control_plane("implicit_client_tunnel_registration")
-            .await?;
-    }
-
-    if let Err(error) = ensure_router_installation_owner_bound(&state, &config).await {
-        record_router_error(&state, &config, error.to_string()).await;
-        return Err(error);
-    }
-
-    let owner_email = config
-        .owner
-        .email
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("owner email is not configured"))?;
-    let subdomain = config
-        .client
-        .tunnel_subdomain
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
+    config = crate::client_tunnel_provision::claim_client_tunnel_config(&state)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let intent = ClientTunnelClaimIntent::from_config(&config)?;
+    let subdomain = intent.subdomain.clone();
     ClientSubdomain::parse(&subdomain)?;
     let http_client = state.http_client().await;
-    if let Err(error) = client::claim_client_tunnel(
-        &http_client,
-        &config,
-        client::ClientTunnelConfig {
-            owner_email,
-            subdomain: subdomain.clone(),
-            enabled: true,
-        },
-    )
-    .await
-    {
-        record_router_error(&state, &config, error.to_string()).await;
-        return Err(error);
-    }
-    crate::client_tunnel_provision::mark_claim_success(&state, &mut config).await;
     let installation_id = config
         .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?
@@ -9773,10 +12465,9 @@ async fn issue_client_tunnel_lease(
         }
     };
 
-    let mut next = config;
-    next.client.tunnel_status = Some("connected".to_string());
-    next.router.ssh_host = Some(lease.ssh_addr.clone());
-    state.replace_config(next).await?;
+    state
+        .commit_client_tunnel_lease(&intent, lease.ssh_addr.clone())
+        .await?;
     Ok(lease)
 }
 
@@ -9893,43 +12584,6 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
-
-    #[test]
-    fn ephemeral_image_store_enforces_token_ttl_and_entry_capacity() {
-        let mut expiring = EphemeralImageStore::default();
-        let handle = expiring
-            .insert(
-                bytes::Bytes::from_static(b"image"),
-                "image/png".to_string(),
-                10,
-            )
-            .unwrap();
-        assert_eq!(handle.token.len(), 64);
-        assert!(handle.token.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert!(expiring
-            .get(&handle.token, 10 + EPHEMERAL_IMAGE_TTL_MS - 1)
-            .is_some());
-        assert!(expiring
-            .get(&handle.token, 10 + EPHEMERAL_IMAGE_TTL_MS)
-            .is_none());
-
-        let mut bounded = EphemeralImageStore::default();
-        let mut handles = Vec::new();
-        for now_ms in 0..=EPHEMERAL_IMAGE_MAX_ENTRIES {
-            handles.push(
-                bounded
-                    .insert(
-                        bytes::Bytes::from_static(b"x"),
-                        "image/png".to_string(),
-                        now_ms as i64,
-                    )
-                    .unwrap(),
-            );
-        }
-        assert_eq!(bounded.entries.len(), EPHEMERAL_IMAGE_MAX_ENTRIES);
-        assert!(bounded.get(&handles[0].token, 1_000).is_none());
-        assert!(bounded.get(&handles.last().unwrap().token, 1_000).is_some());
-    }
 
     fn router_sync_share_input(share_id: &str, provider_id: &str) -> UpsertShareInput {
         UpsertShareInput {
@@ -10425,17 +13079,245 @@ mod tests {
         assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms).is_none());
     }
 
+    #[tokio::test]
+    async fn rejected_copilot_seed_is_not_reused_after_exchange_failure() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-rejected-seed-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "copilot-rejected-seed-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {"githubDomain": "github.com"}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let seeded = state
+            .prepare_copilot_upstream_auth("copilot-rejected-seed-account")
+            .await
+            .unwrap();
+        assert_eq!(seeded.token, "copilot-rejected-seed-token");
+        assert!(matches!(
+            state
+                .refresh_copilot_upstream_auth_now(
+                    "copilot-rejected-seed-account",
+                    Some("copilot-rejected-seed-token"),
+                )
+                .await,
+            Err(CopilotUpstreamAuthError::MissingGitHubToken { .. })
+        ));
+        assert!(matches!(
+            state
+                .prepare_copilot_upstream_auth("copilot-rejected-seed-account")
+                .await,
+            Err(CopilotUpstreamAuthError::MissingGitHubToken { .. })
+        ));
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copilot_cache_is_bound_to_live_account_generation_and_domain() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-cache-binding-account",
+                        "providerType": "github_copilot",
+                        "email": "old@example.com",
+                        "accessToken": "copilot-cache-old-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "copilotApiBase": "https://old.example.com"
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let old = state
+            .prepare_copilot_upstream_auth("copilot-cache-binding-account")
+            .await
+            .unwrap();
+        assert_eq!(old.token, "copilot-cache-old-token");
+        assert_eq!(old.api_endpoint, "https://old.example.com");
+
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-cache-binding-account",
+                        "providerType": "github_copilot",
+                        "email": "new@example.com",
+                        "accessToken": "copilot-cache-new-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "copilotApiBase": "https://new.example.com"
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let refreshed = state
+            .prepare_copilot_upstream_auth("copilot-cache-binding-account")
+            .await
+            .unwrap();
+        assert_eq!(refreshed.token, "copilot-cache-new-token");
+        assert_eq!(refreshed.api_endpoint, "https://new.example.com");
+
+        {
+            let mut cache = state.copilot_upstream_auth.write().await;
+            let cached = cache.get_mut("copilot-cache-binding-account").unwrap();
+            cached.token = "copilot-cache-wrong-domain-token".to_string();
+            cached.domain = "ghe.old.example.com".to_string();
+        }
+        let domain_rebound = state
+            .prepare_copilot_upstream_auth("copilot-cache-binding-account")
+            .await
+            .unwrap();
+        assert_eq!(domain_rebound.token, "copilot-cache-new-token");
+        assert_eq!(domain_rebound.api_endpoint, "https://new.example.com");
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[test]
     fn grok_oauth_accounts_are_background_quota_refresh_candidates() {
         let mut account = copilot_account_fixture(None);
         account.provider_type = ProviderType::GrokOAuth;
+        let accounts = AccountStore::default();
 
-        assert!(account_quota_refresh_candidate(&account));
+        assert!(account_quota_refresh_candidate(&accounts, &account));
 
         account.access_token = None;
         account.refresh_token = None;
         account.api_key = None;
-        assert!(!account_quota_refresh_candidate(&account));
+        assert!(!account_quota_refresh_candidate(&accounts, &account));
+    }
+
+    #[test]
+    fn background_codex_quota_candidates_require_the_active_account() {
+        let mut accounts = AccountStore::default();
+        for account_id in ["codex-quota-a", "codex-quota-b"] {
+            accounts.upsert(
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "codex_oauth",
+                    "accessToken": format!("{account_id}-access"),
+                    "refreshToken": format!("{account_id}-refresh"),
+                    "expiresAt": 1,
+                    "profile": {
+                        "verifiedOpenAIClaims": {
+                            "subject": format!("{account_id}-subject"),
+                            "chatgpt_account_id": format!("{account_id}-workspace")
+                        }
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+
+        let account_a = accounts
+            .find_for_provider(ProviderType::CodexOAuth, Some("codex-quota-a"))
+            .unwrap()
+            .clone();
+        let account_b = accounts
+            .find_for_provider(ProviderType::CodexOAuth, Some("codex-quota-b"))
+            .unwrap()
+            .clone();
+        assert!(!account_quota_refresh_candidate(&accounts, &account_a));
+        assert!(!account_quota_refresh_candidate(&accounts, &account_b));
+
+        accounts
+            .select_active_codex_oauth_account("codex-quota-b")
+            .unwrap();
+        assert!(!account_quota_refresh_candidate(&accounts, &account_a));
+        assert!(account_quota_refresh_candidate(&accounts, &account_b));
+    }
+
+    #[tokio::test]
+    async fn background_codex_quota_rechecks_active_before_outbound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let upstream = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error": "invalid_grant"})),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for account_id in ["background-codex-a", "background-codex-b"] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": account_id,
+                            "providerType": "codex_oauth",
+                            "accessToken": format!("{account_id}-access"),
+                            "refreshToken": format!("{account_id}-refresh"),
+                            "expiresAt": 1,
+                            "profile": {
+                                "verifiedOpenAIClaims": {
+                                    "subject": format!("{account_id}-subject"),
+                                    "chatgpt_account_id": format!("{account_id}-workspace")
+                                }
+                            },
+                            "raw": {"testOAuthTokenUrl": token_url}
+                        }))
+                        .unwrap(),
+                    );
+                }
+                accounts
+                    .select_active_codex_oauth_account("background-codex-b")
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        let inactive = state
+            .find_account_by_id("background-codex-a")
+            .await
+            .unwrap();
+
+        refresh_one_account_quota(&state, inactive, crate::infra::time::now_ms() as i64).await;
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[test]
@@ -12604,6 +15486,7 @@ mod tests {
             .delete_share_immediate("targeteddelete")
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
         assert!(tombstone.router_target_matches(&first_url, "inst-delete-first"));
 
@@ -12872,6 +15755,7 @@ mod tests {
         let tombstone = state
             .delete_share_immediate("recreatedshare")
             .await
+            .unwrap()
             .unwrap()
             .unwrap();
         let retry_state = state.clone();
@@ -13426,7 +16310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_delete_checks_revision_current_provider_and_concurrent_share_gate() {
+    async fn provider_delete_checks_revision_and_concurrent_share_gate() {
         let state = test_state();
         let created = state
             .upsert_provider_command(
@@ -13457,35 +16341,6 @@ mod tests {
                 ..
             }
         ));
-
-        state
-            .apply_ui_settings_patch_immediate(json!({
-                crate::domain::providers::current_provider::current_provider_settings_key(AppKind::Codex): created.provider.id
-            }))
-            .await
-            .unwrap();
-        let current = state
-            .delete_provider_command(
-                AppKind::Codex,
-                created.provider.id.clone(),
-                created.resource.revision,
-            )
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert!(matches!(
-            current,
-            ProviderCommandError::Conflict {
-                code: "cc_switch_provider_in_use",
-                ..
-            }
-        ));
-        state
-            .apply_ui_settings_patch_immediate(json!({
-                crate::domain::providers::current_provider::current_provider_settings_key(AppKind::Codex): ""
-            }))
-            .await
-            .unwrap();
 
         let provider_commit = state.provider_commits.lock().await;
         let delete_state = state.clone();
@@ -13656,7 +16511,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_write_rejects_codex_oauth_binding_until_account_is_selected() {
+    async fn provider_write_accepts_the_only_explicit_codex_oauth_binding() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(active_codex_test_account(
+                    "provider-only-account",
+                    "workspace-only",
+                ));
+            })
+            .await
+            .unwrap();
+
+        let stored = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                active_codex_test_provider("provider-only-binding", "provider-only-account"),
+                Some(ProfileId::parse("codex.openai_oauth").unwrap()),
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(provider_account_id(&stored), Some("provider-only-account"));
+        assert_eq!(
+            state
+                .accounts_snapshot()
+                .await
+                .active_codex_oauth_account()
+                .map(|account| account.id.as_str()),
+            Some("provider-only-account")
+        );
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_write_accepts_codex_oauth_binding_without_account_selection() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
         state
@@ -13673,7 +16567,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = state
+        let stored = state
             .upsert_provider_command(
                 AppKind::Codex,
                 active_codex_test_provider("provider-selection-required", "provider-selection-a"),
@@ -13684,21 +16578,19 @@ mod tests {
             )
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ProviderCommandError::Conflict {
-                code: "cc_switch_codex_inactive_account",
-                ref message,
-            } if message.contains("until an active account is selected")
-        ));
-        assert!(state.providers_snapshot().await.providers.is_empty());
+        assert_eq!(provider_account_id(&stored), Some("provider-selection-a"));
+        assert!(state
+            .accounts_snapshot()
+            .await
+            .active_codex_oauth_account_id
+            .is_none());
         fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]
-    async fn provider_write_rejects_inactive_codex_oauth_binding() {
+    async fn provider_write_accepts_binding_independent_of_active_codex_account() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
         state
@@ -13718,7 +16610,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = state
+        let stored = state
             .upsert_provider_command(
                 AppKind::Codex,
                 active_codex_test_provider(
@@ -13732,22 +16624,25 @@ mod tests {
             )
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ProviderCommandError::Conflict {
-                code: "cc_switch_codex_inactive_account",
-                ref message,
-            } if message.contains("provider-active-account")
-                && message.contains("provider-inactive-account")
-        ));
-        assert!(state.providers_snapshot().await.providers.is_empty());
+        assert_eq!(
+            provider_account_id(&stored),
+            Some("provider-inactive-account")
+        );
+        assert_eq!(
+            state
+                .accounts_snapshot()
+                .await
+                .active_codex_oauth_account_id
+                .as_deref(),
+            Some("provider-active-account")
+        );
         fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]
-    async fn compatibility_provider_write_rejects_inactive_codex_oauth_binding() {
+    async fn compatibility_provider_write_accepts_explicit_codex_oauth_binding() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
         state
@@ -13767,7 +16662,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = state
+        let stored = state
             .upsert_provider_command(
                 AppKind::Codex,
                 active_codex_test_provider(
@@ -13781,17 +16676,12 @@ mod tests {
             )
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ProviderCommandError::Conflict {
-                code: "cc_switch_codex_inactive_account",
-                ref message,
-            } if message.contains("compatibility-active-account")
-                && message.contains("compatibility-inactive-account")
-        ));
-        assert!(state.providers_snapshot().await.providers.is_empty());
+        assert_eq!(
+            provider_account_id(&stored),
+            Some("compatibility-inactive-account")
+        );
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -13822,17 +16712,152 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProviderCommandError::Conflict {
-                code: "cc_switch_codex_inactive_account",
-                ref message,
-            } if message.contains("must be bound to the active account")
+            ProviderCommandError::Invalid(ref message)
+                if message.contains("codex_oauth Provider requires an explicit accountId")
         ));
         assert!(state.providers_snapshot().await.providers.is_empty());
         fs::remove_dir_all(config_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn compatibility_managed_provider_write_requires_explicit_account_binding() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "kiro-explicit-account",
+                        "providerType": "kiro_oauth",
+                        "accessToken": "kiro-token"
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let mut provider = test_provider("kiro-missing-binding", "Kiro OAuth");
+        provider.settings_config = json!({
+            "modelMapping": {
+                "mode": "single",
+                "upstreamModel": "claude-sonnet-4"
+            }
+        });
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some(ProviderType::KiroOAuth.as_str().to_string()),
+            ..ProviderMeta::default()
+        });
+
+        let error = state
+            .upsert_provider_command(AppKind::Claude, provider, None, None, None, BTreeMap::new())
+            .await
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderCommandError::Invalid(ref message)
+                if message.contains("kiro_oauth Provider requires an explicit accountId")
+        ));
+        assert!(state.providers_snapshot().await.providers.is_empty());
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatibility_managed_provider_write_normalizes_binding_generation() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "kiro-bound-account",
+                        "providerType": "kiro_oauth",
+                        "accessToken": "kiro-token"
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let mut provider = test_provider("kiro-bound-provider", "Kiro OAuth");
+        provider.settings_config = json!({
+            "modelMapping": {
+                "mode": "single",
+                "upstreamModel": "claude-sonnet-4"
+            }
+        });
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some(ProviderType::KiroOAuth.as_str().to_string()),
+            auth_binding: Some(AuthBinding {
+                source: Some("legacy".to_string()),
+                auth_provider: Some(ProviderType::KiroOAuth.as_str().to_string()),
+                account_id: Some("kiro-bound-account".to_string()),
+                auth_identity_generation: None,
+            }),
+            ..ProviderMeta::default()
+        });
+
+        let stored = state
+            .upsert_provider_command(AppKind::Claude, provider, None, None, None, BTreeMap::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let binding = stored
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.auth_binding.as_ref())
+            .unwrap();
+        assert_eq!(
+            binding.source.as_deref(),
+            Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE)
+        );
+        assert_eq!(binding.account_id.as_deref(), Some("kiro-bound-account"));
+        assert_eq!(binding.auth_identity_generation, Some(1));
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn static_provider_write_clears_stale_account_binding() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let mut provider = test_provider("static-stale-binding", "OpenRouter");
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some(ProviderType::OpenRouter.as_str().to_string()),
+            auth_binding: Some(AuthBinding {
+                source: Some("account".to_string()),
+                auth_provider: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                account_id: Some("stale-metadata-account".to_string()),
+                auth_identity_generation: Some(9),
+            }),
+            ..ProviderMeta::default()
+        });
+
+        let stored = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                provider,
+                Some(ProfileId::parse("codex.openrouter").unwrap()),
+                None,
+                None,
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(stored
+            .provider
+            .meta
+            .as_ref()
+            .is_none_or(|meta| meta.auth_binding.is_none()));
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[test]
-    fn codex_account_binding_migration_requires_the_active_account() {
+    fn codex_account_binding_migration_uses_default_only_for_unbound_providers() {
         let mut accounts = AccountStore::default();
         accounts.upsert(active_codex_test_account(
             "migration-account-a",
@@ -13875,27 +16900,27 @@ mod tests {
             .as_mut()
             .unwrap()
             .auth_binding = Some(AuthBinding {
-            source: Some("account".to_string()),
+            source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
             auth_provider: Some("codex_oauth".to_string()),
             account_id: Some("migration-account-a".to_string()),
             auth_identity_generation: None,
         });
-        let inactive =
+        let bound =
             prepare_account_binding_migration_preview(&providers, &accounts, &[7; 32]).unwrap();
-        assert_eq!(inactive.bindable_count, 0);
-        assert_eq!(inactive.attention_count, 1);
+        assert_eq!(bound.bindable_count, 1);
+        assert_eq!(bound.attention_count, 0);
         assert_eq!(
-            inactive.items[0].status,
-            ProviderAccountBindingMigrationStatus::InvalidAccount
+            bound.items[0].status,
+            ProviderAccountBindingMigrationStatus::Bindable
         );
         assert_eq!(
-            inactive.items[0].selected_account_id.as_deref(),
+            bound.items[0].selected_account_id.as_deref(),
             Some("migration-account-a")
         );
     }
 
     #[tokio::test]
-    async fn active_codex_account_selection_rebinds_unshared_providers_atomically() {
+    async fn active_codex_account_selection_leaves_provider_bindings_unchanged() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
         state
@@ -13918,6 +16943,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let providers_before = serde_json::to_value(state.providers_snapshot().await).unwrap();
+        let providers_file_before = fs::read(providers_path(&config_dir)).unwrap();
 
         let selected = state
             .select_active_codex_oauth_account_command("codex-b")
@@ -13931,27 +16958,25 @@ mod tests {
             accounts.active_codex_oauth_account_id.as_deref(),
             Some("codex-b")
         );
-        let providers = state.providers_snapshot().await;
-        assert!(providers.providers.iter().all(|provider| {
-            provider.provider_type != ProviderType::CodexOAuth
-                || provider_account_id(provider) == Some("codex-b")
-        }));
+        assert_eq!(
+            serde_json::to_value(state.providers_snapshot().await).unwrap(),
+            providers_before
+        );
 
         let persisted_accounts = AccountStore::load_or_default(&config_dir).unwrap();
         assert_eq!(
             persisted_accounts.active_codex_oauth_account_id.as_deref(),
             Some("codex-b")
         );
-        let persisted_providers = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
-        assert!(persisted_providers.providers.iter().all(|provider| {
-            provider.provider_type != ProviderType::CodexOAuth
-                || provider_account_id(provider) == Some("codex-b")
-        }));
+        assert_eq!(
+            fs::read(providers_path(&config_dir)).unwrap(),
+            providers_file_before
+        );
         fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]
-    async fn active_codex_account_selection_rejects_share_locked_provider() {
+    async fn active_codex_account_selection_leaves_shared_provider_unchanged() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
         state
@@ -13983,39 +17008,26 @@ mod tests {
             .await
             .unwrap();
         let providers_before = serde_json::to_value(state.providers_snapshot().await).unwrap();
-        let accounts_before = fs::read(accounts_path(&config_dir)).unwrap();
         let providers_file_before = fs::read(providers_path(&config_dir)).unwrap();
 
-        let error = state
+        let selected = state
             .select_active_codex_oauth_account_command("shared-codex-b")
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(
-            error.code(),
-            "cc_switch_codex_active_account_share_conflict"
-        );
-        assert!(matches!(
-            error,
-            CodexActiveAccountSelectionError::ShareConflict { ref share_ids }
-                if share_ids == &["active-account-share"]
-        ));
+        assert_eq!(selected.id, "shared-codex-b");
         assert_eq!(
             state
                 .accounts_snapshot()
                 .await
                 .active_codex_oauth_account_id
                 .as_deref(),
-            Some("shared-codex-a")
+            Some("shared-codex-b")
         );
         assert_eq!(
             serde_json::to_value(state.providers_snapshot().await).unwrap(),
             providers_before
-        );
-        assert_eq!(
-            fs::read(accounts_path(&config_dir)).unwrap(),
-            accounts_before
         );
         assert_eq!(
             fs::read(providers_path(&config_dir)).unwrap(),
@@ -14481,6 +17493,866 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_bound_operations_reject_replaced_account_identity() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "generation-bound-gemini",
+                        "providerType": "gemini_cli",
+                        "authIdentityGeneration": 2,
+                        "accessToken": "replacement-token",
+                        "raw": {"projectId": "replacement-project"}
+                    }))
+                    .unwrap(),
+                );
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "generation-bound-deepseek",
+                        "providerType": "deepseek_account",
+                        "authIdentityGeneration": 2,
+                        "accessToken": "replacement-token"
+                    }))
+                    .unwrap(),
+                );
+                for account in &mut accounts.accounts {
+                    if matches!(
+                        account.id.as_str(),
+                        "generation-bound-gemini" | "generation-bound-deepseek"
+                    ) {
+                        account.auth_identity_generation = 2;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        let refresh_error = state
+            .refresh_managed_account_if_needed_for_generation(
+                ProviderType::GeminiCli,
+                "generation-bound-gemini",
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refresh_error,
+            ManagedAccountRefreshError::IdentityChanged {
+                provider_type: ProviderType::GeminiCli
+            }
+        ));
+
+        let project_error = state
+            .ensure_gemini_v1internal_project_for_generation(
+                ProviderType::GeminiCli,
+                "generation-bound-gemini",
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            project_error,
+            ManagedAccountRefreshError::IdentityChanged {
+                provider_type: ProviderType::GeminiCli
+            }
+        ));
+
+        let deepseek_error = state
+            .start_deepseek_chat_completion(
+                "generation-bound-deepseek",
+                1,
+                "deepseek-chat",
+                "hello",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            deepseek_error,
+            DeepSeekUpstreamError::IdentityChanged
+        ));
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_native_refresh_receipt_recovers_after_restart() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "restart-receipt-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "restart-access-original",
+                        "refreshToken": "restart-refresh-original",
+                        "profile": {"accountUUID": "restart-principal"},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let account = state
+            .find_account_by_id("restart-receipt-account")
+            .await
+            .unwrap();
+        let pending_path = native_refresh_pending_path(&config_dir, &account);
+        state
+            .remember_native_refresh_pending_receipt(
+                &account,
+                &AccountRefreshUpdate {
+                    access_token: Some("restart-access-rotated".to_string()),
+                    refresh_token: Some("restart-refresh-rotated".to_string()),
+                    raw: Some(json!({"account": {"uuid": "restart-principal"}})),
+                    expires_at: Some(i64::MAX),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(pending_path.exists());
+        assert!(!fs::read_to_string(&pending_path)
+            .unwrap()
+            .contains("restart-refresh-rotated"));
+
+        drop(state);
+        let restarted = test_state_at(config_dir.clone());
+        restarted
+            .refresh_managed_account_now(ProviderType::ClaudeOAuth, "restart-receipt-account")
+            .await
+            .unwrap();
+        let recovered = restarted
+            .find_account_by_id("restart-receipt-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.access_token.as_deref(),
+            Some("restart-access-rotated")
+        );
+        assert_eq!(
+            recovered.refresh_token.as_deref(),
+            Some("restart-refresh-rotated")
+        );
+        assert!(!pending_path.exists());
+
+        drop(restarted);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nonretryable_pending_receipt_is_quarantined_without_activation() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "rejected-receipt-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "rejected-access-original",
+                        "refreshToken": "rejected-refresh-original",
+                        "profile": {"accountUUID": "original-principal"},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let account = state
+            .find_account_by_id("rejected-receipt-account")
+            .await
+            .unwrap();
+        let pending_path = native_refresh_pending_path(&config_dir, &account);
+        state
+            .remember_native_refresh_pending_receipt(
+                &account,
+                &AccountRefreshUpdate {
+                    access_token: Some("rejected-access-rotated".to_string()),
+                    refresh_token: Some("rejected-refresh-rotated".to_string()),
+                    profile: Some(json!({"accountUUID": "replacement-principal"})),
+                    raw: Some(json!({"account": {"uuid": "replacement-principal"}})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let error = state
+            .refresh_managed_account_now(ProviderType::ClaudeOAuth, "rejected-receipt-account")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ManagedAccountRefreshError::Refresh {
+                status_code: 409,
+                ..
+            }
+        ));
+        assert!(!pending_path.exists());
+        assert_eq!(
+            fs::read_dir(config_dir.join(NATIVE_REFRESH_QUARANTINE_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+        let live = state
+            .find_account_by_id("rejected-receipt-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            live.refresh_token.as_deref(),
+            Some("rejected-refresh-original")
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_pending_receipt_is_quarantined_by_source_path() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "corrupt-receipt-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "corrupt-access-original",
+                        "refreshToken": "corrupt-refresh-original"
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let account = state
+            .find_account_by_id("corrupt-receipt-account")
+            .await
+            .unwrap();
+        let pending_path = native_refresh_pending_path(&config_dir, &account);
+        state
+            .remember_native_refresh_pending_receipt(
+                &account,
+                &AccountRefreshUpdate {
+                    access_token: Some("corrupt-access-rotated".to_string()),
+                    refresh_token: Some("corrupt-refresh-rotated".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fs::write(&pending_path, b"{not-json").unwrap();
+
+        drop(state);
+        let restarted = test_state_at(config_dir.clone());
+        let account = restarted
+            .find_account_by_id("corrupt-receipt-account")
+            .await
+            .unwrap();
+        let error = restarted
+            .pending_native_refresh_receipt(&account)
+            .unwrap_err();
+        assert!(error.to_string().contains("quarantined unreadable"));
+        assert!(!pending_path.exists());
+        assert_eq!(
+            fs::read_dir(config_dir.join(NATIVE_REFRESH_QUARANTINE_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        drop(restarted);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_pending_receipt_io_error_blocks_persistence_recovery() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "io-error-receipt-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "io-error-access",
+                        "refreshToken": "io-error-refresh"
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let account = state
+            .find_account_by_id("io-error-receipt-account")
+            .await
+            .unwrap();
+        let pending_path = native_refresh_pending_path(&config_dir, &account);
+        fs::create_dir_all(&pending_path).unwrap();
+
+        assert!(state.pending_native_refresh_receipt(&account).is_err());
+        let error = state
+            .persist_in_memory_native_refresh_receipts()
+            .unwrap_err();
+        assert!(error.to_string().contains("native refresh pending receipt"));
+
+        fs::remove_dir_all(&pending_path).unwrap();
+        state.persist_in_memory_native_refresh_receipts().unwrap();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_quota_response_does_not_overwrite_concurrent_account_metadata() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "quota-metadata-cas-account",
+                        "providerType": "gemini_cli",
+                        "accessToken": "quota-metadata-token",
+                        "profile": {"metadataVersion": "old"},
+                        "raw": {"projectId": "project-old"},
+                        "subscriptionLevel": "old-plan",
+                        "quotaPercent": 10.0
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let expected = state
+            .find_account_by_id("quota-metadata-cas-account")
+            .await
+            .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "quota-metadata-cas-account")
+                    .unwrap();
+                account.profile = Some(json!({"metadataVersion": "new"}));
+                account.raw = Some(json!({"projectId": "project-new"}));
+                account.subscription_level = Some("new-plan".to_string());
+            })
+            .await
+            .unwrap();
+
+        let result = state
+            .commit_account_quota_refresh_update(
+                &expected,
+                AccountRefreshUpdate {
+                    profile: Some(json!({"metadataVersion": "stale-response"})),
+                    raw: Some(json!({"projectId": "project-old"})),
+                    subscription_level: Some("stale-plan".to_string()),
+                    quota_percent: Some(90.0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(AccountQuotaCommitSkip::Stale(_))));
+        let live = state
+            .find_account_by_id("quota-metadata-cas-account")
+            .await
+            .unwrap();
+        assert_eq!(live.profile, Some(json!({"metadataVersion": "new"})));
+        assert_eq!(live.raw, Some(json!({"projectId": "project-new"})));
+        assert_eq!(live.subscription_level.as_deref(), Some("new-plan"));
+        assert_eq!(live.quota_percent, Some(10.0));
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_account_refreshes_share_one_state_owned_flight() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let request_started_for_route = Arc::clone(&request_started);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let request_started = Arc::clone(&request_started_for_route);
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    request_started.notify_waiters();
+                    sleep(Duration::from_millis(75)).await;
+                    Json(json!({
+                        "access_token": "state-singleflight-access-original",
+                        "refresh_token": "state-singleflight-refresh-rotated",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "state-singleflight-principal"}
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "state-refresh-singleflight-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "state-singleflight-access-original",
+                        "refreshToken": "state-singleflight-refresh-original",
+                        "tokenType": "Bearer",
+                        "profile": {"accountUUID": "state-singleflight-principal"},
+                        "raw": {"testOAuthTokenUrl": token_url},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let first_request_started = request_started.notified();
+        tokio::pin!(first_request_started);
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "state-refresh-singleflight-account",
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut first_request_started)
+            .await
+            .expect("first refresh request did not reach the token endpoint");
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "state-refresh-singleflight-account",
+                )
+                .await
+        });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        let account = state
+            .find_account_by_id("state-refresh-singleflight-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("state-singleflight-access-original")
+        );
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("state-singleflight-refresh-rotated")
+        );
+        assert_eq!(account.token_refresh_generation, 2);
+
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_refresh_failure_is_recorded_once() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let request_started_for_route = Arc::clone(&request_started);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let request_started = Arc::clone(&request_started_for_route);
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    request_started.notify_waiters();
+                    sleep(Duration::from_millis(75)).await;
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": "refresh token was rejected"
+                        })),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "state-refresh-failure-singleflight-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "state-failure-access-original",
+                        "refreshToken": "state-failure-refresh-original",
+                        "tokenType": "Bearer",
+                        "raw": {"testOAuthTokenUrl": token_url},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let first_request_started = request_started.notified();
+        tokio::pin!(first_request_started);
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "state-refresh-failure-singleflight-account",
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut first_request_started)
+            .await
+            .expect("first failed refresh did not reach the token endpoint");
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "state-refresh-failure-singleflight-account",
+                )
+                .await
+        });
+
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 400,
+                ..
+            })
+        ));
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 400,
+                ..
+            })
+        ));
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        let account = state
+            .find_account_by_id("state-refresh-failure-singleflight-account")
+            .await
+            .unwrap();
+        assert_eq!(account.refresh_consecutive_failures, 1);
+
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    async fn background_native_refresh_failure_fixture(
+        account_id: &str,
+        refresh_token: &str,
+        error_description: String,
+        refresh_consecutive_failures: u32,
+    ) -> (
+        ServerState,
+        Account,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let error_description = error_description.clone();
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "invalid_grant",
+                            "error_description": error_description
+                        })),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state();
+        let account_id = account_id.to_string();
+        let refresh_token = refresh_token.to_string();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "claude_oauth",
+                        "accessToken": "background-expired-access-token",
+                        "refreshToken": refresh_token,
+                        "tokenType": "Bearer",
+                        "raw": {"testOAuthTokenUrl": token_url},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                );
+                let account = accounts.accounts.last_mut().expect("background account");
+                account.refresh_consecutive_failures = refresh_consecutive_failures;
+            })
+            .await
+            .unwrap();
+        let account = state
+            .accounts_snapshot()
+            .await
+            .accounts
+            .into_iter()
+            .next()
+            .expect("background account snapshot");
+        (state, account, requests, server)
+    }
+
+    #[tokio::test]
+    async fn background_quota_native_refresh_failure_reaches_relogin_threshold() {
+        let account_id = "background-refresh-threshold-account";
+        let (state, account, requests, server) = background_native_refresh_failure_fixture(
+            account_id,
+            "background-threshold-refresh-token",
+            "refresh token was rejected".to_string(),
+            19,
+        )
+        .await;
+        let config_dir = state.config_dir.clone();
+        let now = 10_000_000;
+
+        refresh_one_account_quota(&state, account, now).await;
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        let updated = state.find_account_by_id(account_id).await.unwrap();
+        assert_eq!(updated.refresh_consecutive_failures, 20);
+        assert!(updated.needs_relogin);
+        assert_eq!(
+            updated.quota_next_refresh_at,
+            Some(now + crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
+        );
+        let accounts = state.accounts_snapshot().await;
+        assert!(!account_quota_refresh_due(&accounts, &updated, i64::MAX));
+        let diagnostic = updated.last_refresh_error.as_deref().unwrap();
+        assert!(diagnostic.contains("[REDACTED]"), "{diagnostic}");
+        assert!(!diagnostic.contains("background-threshold-refresh-token"));
+
+        let persisted = AccountStore::load_or_default(&config_dir).unwrap();
+        let persisted = persisted
+            .find_for_provider(ProviderType::ClaudeOAuth, Some(account_id))
+            .unwrap();
+        assert_eq!(persisted.refresh_consecutive_failures, 20);
+        assert!(persisted.needs_relogin);
+        assert_eq!(
+            persisted.quota_next_refresh_at,
+            updated.quota_next_refresh_at
+        );
+
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_quota_reused_refresh_token_requires_immediate_relogin() {
+        let account_id = "background-refresh-reused-account";
+        let refresh_token = "background-reused-refresh-secret";
+        let (state, account, requests, server) = background_native_refresh_failure_fixture(
+            account_id,
+            refresh_token,
+            format!("refresh token has already been used: {refresh_token}"),
+            0,
+        )
+        .await;
+        let config_dir = state.config_dir.clone();
+        let now = 20_000_000;
+
+        refresh_one_account_quota(&state, account, now).await;
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        let updated = state.find_account_by_id(account_id).await.unwrap();
+        assert_eq!(updated.refresh_consecutive_failures, 1);
+        assert!(updated.needs_relogin);
+        assert_eq!(
+            updated.quota_next_refresh_at,
+            Some(now + crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS)
+        );
+        let accounts = state.accounts_snapshot().await;
+        assert!(!account_quota_refresh_due(&accounts, &updated, i64::MAX));
+        let diagnostic = updated.last_refresh_error.as_deref().unwrap();
+        assert!(!diagnostic.contains(refresh_token));
+        assert!(diagnostic.contains("[REDACTED]"));
+
+        let persisted = AccountStore::load_or_default(&config_dir).unwrap();
+        let persisted = persisted
+            .find_for_provider(ProviderType::ClaudeOAuth, Some(account_id))
+            .unwrap();
+        assert_eq!(persisted.refresh_consecutive_failures, 1);
+        assert!(persisted.needs_relogin);
+        assert_eq!(persisted.last_refresh_error, updated.last_refresh_error);
+
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_refresh_waiter_observes_persistence_degraded_outcome() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let request_started_for_route = Arc::clone(&request_started);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let request_started = Arc::clone(&request_started_for_route);
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    request_started.notify_waiters();
+                    sleep(Duration::from_millis(150)).await;
+                    Json(json!({
+                        "access_token": "state-degraded-access-rotated",
+                        "refresh_token": "state-degraded-refresh-rotated",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "state-degraded-principal"}
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "state-refresh-degraded-singleflight-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "state-degraded-access-original",
+                        "refreshToken": "state-degraded-refresh-original",
+                        "tokenType": "Bearer",
+                        "profile": {"accountUUID": "state-degraded-principal"},
+                        "raw": {"testOAuthTokenUrl": token_url},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        state.inject_account_refresh_persist_failures(1);
+
+        let first_request_started = request_started.notified();
+        tokio::pin!(first_request_started);
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "state-refresh-degraded-singleflight-account",
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut first_request_started)
+            .await
+            .expect("degraded refresh request did not reach the token endpoint");
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            second_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "state-refresh-degraded-singleflight-account",
+                )
+                .await
+        });
+
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        let account = state
+            .find_account_by_id("state-refresh-degraded-singleflight-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("state-degraded-refresh-rotated")
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.credential_persistence_degraded() {
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn codex_workspace_selection_waits_for_refresh_before_locking_references() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
@@ -14836,10 +18708,10 @@ mod tests {
         let stored = providers.providers[0].clone();
         let execution =
             crate::proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
-        let auth = execution
+        let auth_application = execution
             .materialize_auth(&AccountStore::default())
-            .unwrap()
             .unwrap();
+        let auth = auth_application.injected_values().unwrap();
         assert_eq!(
             auth.headers,
             vec![(
@@ -14847,7 +18719,7 @@ mod tests {
                 "Bearer s2-plaintext-secret".to_string()
             )]
         );
-        drop(auth);
+        drop(auth_application);
         drop(providers);
 
         let persisted = fs::read_to_string(providers_path(&config_dir)).unwrap();
@@ -15398,14 +19270,16 @@ mod tests {
         state.remember_grok_media_session(
             "grok-video:earliest".to_string(),
             "grok-provider".to_string(),
-            Some("grok-account".to_string()),
+            "grok-account".to_string(),
+            1,
             60_000,
         );
         for index in 0..GROK_MEDIA_SESSION_MAX_BINDINGS - 1 {
             state.remember_grok_media_session(
                 format!("grok-video:retained-{index}"),
                 "grok-provider".to_string(),
-                Some("grok-account".to_string()),
+                "grok-account".to_string(),
+                1,
                 120_000,
             );
         }
@@ -15413,7 +19287,8 @@ mod tests {
         state.remember_grok_media_session(
             "grok-video:newest".to_string(),
             "grok-provider".to_string(),
-            Some("grok-account".to_string()),
+            "grok-account".to_string(),
+            1,
             120_000,
         );
 
@@ -15590,6 +19465,7 @@ mod tests {
             .find_account_by_id("rotating-credential-account")
             .await
             .unwrap();
+        let recovery_path = native_refresh_recovery_path(&state.config_dir, &refresh_snapshot);
 
         let result = state
             .commit_native_refresh_success(
@@ -15644,12 +19520,14 @@ mod tests {
             disk_after_retry.refresh_token.as_deref(),
             Some("new-refresh")
         );
+        assert!(!recovery_path.exists());
 
         let failed = state
             .commit_native_refresh_failure(
                 &live,
                 "invalid_grant refresh_token=new-refresh".to_string(),
                 crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+                false,
             )
             .await
             .unwrap()
@@ -15690,6 +19568,384 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_commit_state_failure_preserves_rotated_credentials() {
+        let state = test_state();
+        let expected = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "state-recovery-account",
+                    ProviderType::ClaudeOAuth,
+                    Some("before@example.com"),
+                    "old-access",
+                    "old-refresh",
+                    1,
+                ))
+            })
+            .await
+            .unwrap();
+        state.inject_account_refresh_commit_state_failures(1);
+
+        let updated = state
+            .commit_native_refresh_success(
+                &expected,
+                AccountRefreshUpdate {
+                    email: Some("different-principal@example.com".to_string()),
+                    access_token: Some("rotated-access".to_string()),
+                    refresh_token: Some("rotated-refresh".to_string()),
+                    expires_at: Some(i64::MAX / 2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("credential recovery commit");
+
+        assert_eq!(updated.email.as_deref(), Some("before@example.com"));
+        assert_eq!(updated.access_token.as_deref(), Some("rotated-access"));
+        assert_eq!(updated.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert!(!state.credential_persistence_degraded());
+        let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
+        let persisted = persisted
+            .find_for_provider(ProviderType::ClaudeOAuth, Some("state-recovery-account"))
+            .unwrap();
+        assert_eq!(persisted.access_token.as_deref(), Some("rotated-access"));
+        assert_eq!(persisted.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(persisted.email.as_deref(), Some("before@example.com"));
+    }
+
+    #[tokio::test]
+    async fn native_refresh_journal_recovers_rotated_credentials_after_restart_boundary() {
+        let state = test_state();
+        let expected = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "journal-recovery-account",
+                    ProviderType::GeminiCli,
+                    Some("journal@example.com"),
+                    "journal-old-access",
+                    "journal-old-refresh",
+                    1,
+                ))
+            })
+            .await
+            .unwrap();
+        let path = write_native_refresh_recovery_journal(
+            &state.config_dir,
+            &expected,
+            &AccountRefreshUpdate {
+                access_token: Some("journal-new-access".to_string()),
+                refresh_token: Some("journal-new-refresh".to_string()),
+                expires_at: Some(i64::MAX / 2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let journal_on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!journal_on_disk.contains("journal-new-access"));
+        assert!(!journal_on_disk.contains("journal-new-refresh"));
+
+        let mut restarted_accounts = AccountStore::load_or_default(&state.config_dir).unwrap();
+        remove_superseded_native_refresh_journals(&state.config_dir, &restarted_accounts).unwrap();
+        assert!(path.exists());
+        recover_pending_native_refresh_journals(&state.config_dir, &mut restarted_accounts)
+            .unwrap();
+        let recovered = restarted_accounts
+            .find_for_provider(ProviderType::GeminiCli, Some("journal-recovery-account"))
+            .unwrap();
+        assert_eq!(
+            recovered.access_token.as_deref(),
+            Some("journal-new-access")
+        );
+        assert_eq!(
+            recovered.refresh_token.as_deref(),
+            Some("journal-new-refresh")
+        );
+        assert!(!path.exists());
+        let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            persisted
+                .find_for_provider(ProviderType::GeminiCli, Some("journal-recovery-account"),)
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("journal-new-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_snapshot_rechecks_degraded_gate_after_waiting_for_accounts() {
+        let state = test_state();
+        let accounts_guard = state.accounts.write().await;
+        let initial_gate_passed = Arc::new(tokio::sync::Notify::new());
+        let initial_gate_passed_for_task = Arc::clone(&initial_gate_passed);
+        let state_for_task = state.clone();
+        let snapshot = tokio::spawn(async move {
+            state_for_task
+                .accounts_snapshot_after_initial_credential_gate(|| {
+                    initial_gate_passed_for_task.notify_one();
+                })
+                .await
+        });
+        initial_gate_passed.notified().await;
+        state.mark_credential_persistence_degraded();
+        drop(accounts_guard);
+
+        assert!(snapshot.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_cooldown_does_not_mark_a_token_superseded_by_refresh() {
+        let state = test_state();
+        let stale = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "cooldown-refreshed-token",
+                    ProviderType::ClaudeOAuth,
+                    Some("refresh@example.com"),
+                    "rejected-access",
+                    "refresh-token",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        let refreshed = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .mark_refresh_success(
+                        "cooldown-refreshed-token",
+                        AccountRefreshUpdate {
+                            access_token: Some("current-access".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.auth_identity_generation,
+            stale.auth_identity_generation
+        );
+
+        let result = state
+            .mark_account_auth_cooldown_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                "rejected-access",
+                i64::MAX / 2,
+                Some("rejected stale token".to_string()),
+            )
+            .await;
+
+        assert!(result.is_none());
+        let live = state.find_account_by_id(&stale.id).await.unwrap();
+        assert_eq!(live.access_token.as_deref(), Some("current-access"));
+        assert!(live.rate_limited_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_cooldown_does_not_cross_an_auth_identity_generation() {
+        let state = test_state();
+        let stale = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "cooldown-relogin-generation",
+                    ProviderType::ClaudeOAuth,
+                    Some("before@example.com"),
+                    "same-access",
+                    "same-refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        let relogged = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "cooldown-relogin-generation",
+                    ProviderType::ClaudeOAuth,
+                    Some("after@example.com"),
+                    "same-access",
+                    "same-refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(relogged.auth_identity_generation > stale.auth_identity_generation);
+        assert_eq!(relogged.access_token, stale.access_token);
+
+        let result = state
+            .mark_account_auth_cooldown_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                "same-access",
+                i64::MAX / 2,
+                Some("rejected previous login".to_string()),
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert!(state
+            .find_account_by_id(&stale.id)
+            .await
+            .unwrap()
+            .rate_limited_until
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_cooldown_marks_the_current_generation_and_token() {
+        let state = test_state();
+        let current = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "cooldown-current-token",
+                    ProviderType::ClaudeOAuth,
+                    Some("current@example.com"),
+                    "current-access",
+                    "current-refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        let cooldown_until = i64::MAX / 2;
+
+        let updated = state
+            .mark_account_auth_cooldown_if_current(
+                &current.id,
+                current.provider_type,
+                current.auth_identity_generation,
+                "current-access",
+                cooldown_until,
+                Some("current token rejected".to_string()),
+            )
+            .await
+            .expect("current credential snapshot must accept cooldown");
+
+        assert_eq!(updated.rate_limited_until, Some(cooldown_until));
+        assert_eq!(
+            state
+                .find_account_by_id(&current.id)
+                .await
+                .unwrap()
+                .rate_limited_until,
+            Some(cooldown_until)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_observations_do_not_cross_an_auth_identity_generation() {
+        let state = test_state();
+        let stale = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "grok-response-generation-cas",
+                    ProviderType::GrokOAuth,
+                    Some("before@example.com"),
+                    "same-access",
+                    "same-refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        let relogged = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "grok-response-generation-cas",
+                    ProviderType::GrokOAuth,
+                    Some("after@example.com"),
+                    "same-access",
+                    "same-refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(relogged.auth_identity_generation > stale.auth_identity_generation);
+
+        assert!(state
+            .mark_account_rate_limited_until_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                i64::MAX / 2,
+                Some("stale 429".to_string()),
+            )
+            .await
+            .is_none());
+        assert!(state
+            .update_account_entitlement_snapshot_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                Some("stale-tier".to_string()),
+                Some("stale-entitlement".to_string()),
+                123,
+            )
+            .await
+            .is_none());
+        assert!(!state
+            .record_grok_capability_evidence_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+                "stale_response",
+            )
+            .await
+            .unwrap());
+
+        let unchanged = state.find_account_by_id(&stale.id).await.unwrap();
+        assert!(unchanged.rate_limited_until.is_none());
+        assert!(unchanged.subscription_level.is_none());
+        assert!(unchanged.entitlement_status.is_none());
+        assert!(
+            !crate::domain::accounts::store::grok_account_capability_evidence_present(
+                &unchanged,
+                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+            )
+        );
+
+        let cooldown_until = i64::MAX / 2;
+        assert!(state
+            .mark_account_rate_limited_until_if_current(
+                &relogged.id,
+                relogged.provider_type,
+                relogged.auth_identity_generation,
+                cooldown_until,
+                Some("current 429".to_string()),
+            )
+            .await
+            .is_some());
+        assert!(state
+            .update_account_entitlement_snapshot_if_current(
+                &relogged.id,
+                relogged.provider_type,
+                relogged.auth_identity_generation,
+                Some("current-tier".to_string()),
+                Some("current-entitlement".to_string()),
+                456,
+            )
+            .await
+            .is_some());
+        assert!(state
+            .record_grok_capability_evidence_if_current(
+                &relogged.id,
+                relogged.provider_type,
+                relogged.auth_identity_generation,
+                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+                "current_response",
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn stale_refresh_success_and_failure_cannot_overwrite_reauthorization() {
         let state = test_state();
         let stale = state
@@ -15721,7 +19977,7 @@ mod tests {
         assert!(reauthorized.auth_identity_generation > stale.auth_identity_generation);
         assert!(reauthorized.token_refresh_generation > stale.token_refresh_generation);
 
-        let after_success = state
+        let after_success = match state
             .commit_native_refresh_success(
                 &stale,
                 AccountRefreshUpdate {
@@ -15731,7 +19987,10 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+        {
+            Err(NativeRefreshCommitError::Superseded(live)) => *live,
+            other => panic!("expected superseded refresh commit, got {other:?}"),
+        };
         assert_eq!(
             after_success.access_token.as_deref(),
             Some("reauthorized-access")
@@ -15742,6 +20001,7 @@ mod tests {
                 &stale,
                 "invalid_grant".to_string(),
                 crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+                false,
             )
             .await
             .unwrap()
@@ -15797,11 +20057,77 @@ mod tests {
         let first = tracker.try_acquire("share-1", Some(1));
 
         assert!(first.is_some());
+        assert!(tracker.has_in_flight("share-1"));
+        assert!(!tracker.has_in_flight("share-2"));
         assert!(tracker.try_acquire("share-1", Some(1)).is_none());
         assert!(tracker.try_acquire("share-2", Some(1)).is_some());
 
         drop(first);
+        assert!(!tracker.has_in_flight("share-1"));
         assert!(tracker.try_acquire("share-1", Some(1)).is_some());
+    }
+
+    #[tokio::test]
+    async fn share_delete_is_blocked_until_in_flight_accounting_finishes() {
+        let state = test_state();
+        let share = state
+            .mutate_shares_immediate(|store| {
+                store.upsert(router_sync_share_input(
+                    "inflightdelete",
+                    "provider-before-delete",
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (_invocation, guard) = state
+            .validate_and_acquire_share_invocation(
+                &share.id,
+                AppKind::Codex,
+                None,
+                crate::infra::time::now_ms() as i64,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .delete_share_immediate_at_revision(&share.id, share.config_revision)
+                .await
+                .unwrap(),
+            Err(ConditionalShareDeleteError::InFlight)
+        );
+        assert_eq!(
+            state.delete_share_immediate(&share.id).await.unwrap(),
+            Err(ShareDeleteError::InFlight)
+        );
+
+        state
+            .record_share_invocation_result(&share.id, None, 37, 1)
+            .await;
+        let accounted = state.shares.read().await.get(&share.id).cloned().unwrap();
+        assert_eq!(accounted.requests_count, 1);
+        assert_eq!(accounted.tokens_used, 37);
+        drop(guard);
+        let deleted = state
+            .delete_share_immediate(&share.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deleted.is_some());
+
+        let recreated = state
+            .mutate_shares_immediate(|store| {
+                store.upsert(router_sync_share_input(
+                    "inflightdelete",
+                    "provider-after-delete",
+                ))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recreated.requests_count, 0);
+        assert_eq!(recreated.tokens_used, 0);
     }
 
     #[test]
@@ -15893,6 +20219,29 @@ mod tests {
             1_000,
         );
         assert!(!store.is_owned_by(ProviderType::GrokOAuth, "device-2", "alice:admin", 2_000));
+
+        for (provider_type, device_code, principal_id) in [
+            (ProviderType::GitHubCopilot, "device-3", "alice:admin"),
+            (ProviderType::GitHubCopilot, "device-4", "alice:admin"),
+            (ProviderType::GitHubCopilot, "device-5", "bob:admin"),
+            (ProviderType::KiroOAuth, "device-6", "alice:admin"),
+        ] {
+            store.insert(
+                provider_type,
+                device_code.to_string(),
+                principal_id.to_string(),
+                4_000,
+                2_000,
+            );
+        }
+        let removed =
+            store.remove_all_for_principal(ProviderType::GitHubCopilot, "alice:admin", 3_000);
+        assert_eq!(
+            removed,
+            vec!["device-3".to_string(), "device-4".to_string()]
+        );
+        assert!(store.is_owned_by(ProviderType::GitHubCopilot, "device-5", "bob:admin", 3_000));
+        assert!(store.is_owned_by(ProviderType::KiroOAuth, "device-6", "alice:admin", 3_000));
     }
 
     #[test]

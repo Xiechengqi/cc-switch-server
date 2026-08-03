@@ -25,6 +25,11 @@ import {
 import { useCopilotAuth } from "./hooks/useCopilotAuth";
 import { copyText } from "@/lib/clipboard";
 import type { GitHubAccount } from "@/lib/api";
+import {
+  logoutAccountsAndClearSelection,
+  removeAccountAndUpdateSelection,
+} from "./accountSelectionActions";
+import { ManagedAuthStatusNotice } from "./ManagedAuthStatusNotice";
 
 interface CopilotAuthSectionProps {
   className?: string;
@@ -68,6 +73,9 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
     accounts,
     migrationError,
     hasAnyAccount,
+    isLoadingStatus,
+    isFetchingStatus,
+    isStatusError,
     pollingState,
     deviceCode,
     error,
@@ -78,9 +86,10 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
     defaultAccountId,
     addAccount,
     cancelAuth,
-    logout,
-    removeAccount,
+    logoutAsync,
+    removeAccountAsync,
     setDefaultAccount,
+    refetchStatus,
   } = useCopilotAuth(effectiveGithubDomain);
 
   // 复制用户码
@@ -104,14 +113,43 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
     onAccountSelect?.(value === "none" ? null : value);
   };
 
-  const handleRemoveAccount = (accountId: string, e: React.MouseEvent) => {
+  const handleRemoveAccount = async (
+    accountId: string,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation();
     e.preventDefault();
-    removeAccount(accountId);
-    if (selectedAccountId === accountId) {
-      onAccountSelect?.(null);
-    }
+    try {
+      await removeAccountAndUpdateSelection({
+        accountId,
+        selectedAccountId,
+        removeAccount: removeAccountAsync,
+        onAccountSelect,
+      });
+    } catch {}
   };
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccountsAndClearSelection({
+        logout: logoutAsync,
+        onAccountSelect,
+      });
+    } catch {}
+  };
+
+  if (isLoadingStatus || isStatusError) {
+    return (
+      <ManagedAuthStatusNotice
+        className={className}
+        title={t("copilot.authStatus", "GitHub Copilot 认证")}
+        error={error}
+        isError={isStatusError}
+        isFetching={isFetchingStatus}
+        onRetry={() => void refetchStatus()}
+      />
+    );
+  }
 
   // 渲染账号头像
   const renderAvatar = (account: GitHubAccount) => {
@@ -318,10 +356,7 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
         <div className="space-y-3 p-4 rounded-lg border border-border bg-muted/50">
           <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            {t(
-              "copilot.waitingForAuth",
-              "请手动打开下方授权链接并完成登录...",
-            )}
+            {t("copilot.waitingForAuth", "请手动打开下方授权链接并完成登录...")}
           </div>
 
           {/* 用户码 */}
@@ -409,27 +444,29 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
       )}
 
       {/* 错误状态 */}
-      {pollingState === "error" && error && (
+      {error && (
         <div className="space-y-2">
           <p className="text-sm text-red-500">{error}</p>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              onClick={addAccount}
-              variant="outline"
-              size="sm"
-            >
-              {t("copilot.retry", "重试")}
-            </Button>
-            <Button
-              type="button"
-              onClick={cancelAuth}
-              variant="ghost"
-              size="sm"
-            >
-              {t("common.cancel", "取消")}
-            </Button>
-          </div>
+          {pollingState === "error" && (
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={addAccount}
+                variant="outline"
+                size="sm"
+              >
+                {t("copilot.retry", "重试")}
+              </Button>
+              <Button
+                type="button"
+                onClick={cancelAuth}
+                variant="ghost"
+                size="sm"
+              >
+                {t("common.cancel", "取消")}
+              </Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -438,7 +475,8 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
         <Button
           type="button"
           variant="outline"
-          onClick={logout}
+          onClick={() => void handleLogout()}
+          disabled={isAddingAccount}
           className="w-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
         >
           <LogOut className="mr-2 h-4 w-4" />

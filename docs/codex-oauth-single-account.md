@@ -1,30 +1,30 @@
 # Codex OAuth 单账号反代
 
-本文描述 cc-switch-server 对 OpenAI/Codex OAuth 的生产边界、账号选择、数据面行为和验收方式。目标是把一个明确选定的 ChatGPT OAuth 账号稳定暴露给 Codex/OpenAI-compatible 客户端；不提供账号池、轮询、权重调度、配额溢出或跨账号故障转移。
+本文描述 cc-switch-server 对 OpenAI/Codex OAuth 的生产边界、账号绑定、数据面行为和验收方式。目标是把 Provider Bundle 明确绑定的 ChatGPT OAuth 账号稳定暴露给 Codex/OpenAI-compatible 客户端；不提供账号池、轮询、权重调度、配额溢出或跨账号故障转移。
 
 ## 能力边界
 
-- 文本入口包括 `POST /v1/responses`、`POST /v1/chat/completions` 及兼容别名。
-- 原生 compact 入口包括 `POST /v1/responses/compact` 及兼容别名。
-- Responses WebSocket 使用 `GET /v1/responses` 及兼容别名。
+- 文本入口包括 Route Key 下的 `POST /r/:routeKey/v1/responses`、`POST /r/:routeKey/v1/chat/completions` 及兼容别名。
+- 原生 compact 入口包括 `POST /r/:routeKey/v1/responses/compact` 及兼容别名。
+- Responses WebSocket 使用 `GET /r/:routeKey/v1/responses` 及兼容别名。
 - Codex 专用 surface 包括 models manifest、alpha search、图片生成和图片编辑。
 - 本地直连推理入口使用独立 inference token；经过 Router 签名验证的请求沿用 Router 身份。
-- 每个 `codex_oauth` Provider 必须绑定当前活动的 `codex_oauth` Account。
+- 每个 `codex_oauth` Provider Bundle 必须绑定一个明确的 `codex_oauth` Account。
 - 一次请求从开始到结束只使用解析出的 Provider、账号和 workspace；任何错误都不能触发通用 Provider failover 或账号轮换。
 
 单账号边界用于避免重复执行、重复计费、会话漂移，以及 OAuth token、workspace、WebSocket 连接或 prompt cache identity 在账号之间串用。
 
-## 活动账号状态
+## 账号中心选择
 
 `accounts.json` 持久化 `activeCodexOauthAccountId`。`GET /api/accounts` 的 `codexOauth` 字段和 Web 兼容命令 `auth_get_status` 的 `codex_oauth` 字段都返回以下状态：
 
-| 状态 | 含义 | 数据面 |
+| 状态 | 含义 | 账号中心 |
 | --- | --- | --- |
-| `unconfigured` | 没有 Codex OAuth 账号 | 拒绝 Codex OAuth 出站 |
-| `ready` | 已解析出唯一活动账号 | 仅允许该账号出站 |
-| `needs_selection` | 存在多个账号但没有有效的显式选择 | 拒绝所有 Codex OAuth 出站 |
+| `unconfigured` | 没有 Codex OAuth 账号 | 无默认操作目标 |
+| `ready` | 已解析出唯一活动账号 | quota 等独立账号操作使用该账号 |
+| `needs_selection` | 存在多个账号但没有有效的显式选择 | 要求先选择账号中心操作目标 |
 
-只有一个账号时，该账号自动成为活动账号，不要求额外写入选择。存在两个或更多账号时，管理员必须在 Web 中选择“当前反代账号”，或调用：
+只有一个账号时，该账号自动成为账号中心操作目标，不要求额外写入选择。存在两个或更多账号时，管理员可在 Web 中选择账号中心目标，或调用：
 
 ```http
 POST /api/accounts/codex/active
@@ -33,20 +33,18 @@ Content-Type: application/json
 {"accountId":"<codex-oauth-account-id>"}
 ```
 
-兼容命令 `auth_set_default_account` 的 Codex 分支执行同一操作；这里的“default”不表示候选顺序，而是系统唯一的当前反代账号。
+兼容命令 `auth_set_default_account` 的 Codex 分支执行同一操作。该选择不参与数据面路由，也不会改变任何 Provider Bundle 或 Share binding。
 
-## 原子 Provider 重绑
+## 与 Provider 解耦
 
-选择活动账号时，Server 会在一个协调事务中：
+选择账号中心目标时，Server：
 
-1. 锁定所有 Codex OAuth 账号的 refresh、Provider commit 和引用变更。
-2. 验证目标账号存在且类型为 `codex_oauth`。
-3. 将所有未被 Share 占用的 Codex OAuth Provider 重绑到目标账号及其当前 `authIdentityGeneration`。
-4. 增加发生绑定变化的 Provider revision，重建并校验 RuntimePlan。
-5. 通过带 commit marker 的事务提交 `accounts.json`、`providers.json` 和引用图。
-6. 发布同一代内存快照；启动和后续写入前会恢复已提交但尚未应用完整的事务。
+1. 验证目标账号存在且类型为 `codex_oauth`。
+2. 只更新并持久化 `accounts.json` 中的 `activeCodexOauthAccountId`。
+3. 不修改 `providers.json`、Provider revision、RuntimePlan 或 Share binding。
+4. 不改变任何 Route Key 的执行身份。
 
-如果任一非删除 Share 仍引用需要切换身份的 Codex OAuth Provider，选择操作返回冲突并列出 Share，不进行部分重绑。管理员必须先按 Share 的 paused/revision-CAS 规则处理该绑定。Share 不是活动账号规则的例外：引用非活动账号的 Codex 请求同样不能出站。
+数据面执行身份只能在 Provider Bundle 编辑器中通过账号绑定变更。Route Key 和 Share 请求始终使用各自 Bundle 已提交的账号，即使账号中心选择了另一个 Codex 账号也不会漂移。
 
 ## OpenAI 信任边界
 
@@ -65,15 +63,15 @@ Content-Type: application/json
 
 一次直连请求按以下顺序解析执行身份：
 
-1. 解析 Codex 当前 Provider；显式 `x-cc-provider-id` 只表示调用方主动固定一个 Provider。
+1. 从 `/r/:routeKey` 解析唯一的 Codex Surface；Share 请求使用 Share 自身的不可变 binding。
 2. 编译后的 RuntimePlan 必须与已提交的 Provider revision、类型和账号身份代际一致。
-3. 对 `codex_oauth` Driver，绑定账号必须等于当前活动账号。
+3. 对 `codex_oauth` Driver，解析 Provider Bundle 明确绑定的账号。
 4. 检查账号登录、cooldown、quota 和并发状态，并获取该账号的 in-flight lease。
 5. 对即将过期的 token 执行同账号 refresh，再物化 Authorization、workspace 和 Codex CLI identity headers。
 
-当前/显式 Provider 不可用、活动账号未选择、绑定过期、账号需要重登、处于 cooldown、quota 耗尽或并发饱和时，请求直接失败。系统不会查询另一个 Codex Provider 或账号。Share 请求额外固定其不可变 Provider binding，但仍必须通过活动账号门禁。
+Route Key 不存在、Surface 已禁用、绑定过期、账号需要重登、处于 cooldown、quota 耗尽或并发饱和时，请求直接失败。系统不会查询另一个 Codex Provider 或账号。账号中心是否选择 active account 不影响该判定。
 
-models manifest、alpha search、Provider 网络测试、模型发现、quota refresh、Images、HTTP、SSE、WebSocket 和 WS 到 HTTP fallback 使用同一活动账号规则。credential persistence degraded 时，这些需要 OAuth 凭据的出站操作在网络前返回 `503`。
+models manifest、alpha search、Provider 网络测试、模型发现、Images、HTTP、SSE、WebSocket 和 WS 到 HTTP fallback 使用同一 Bundle 绑定账号规则。账号中心 quota refresh 可独立使用 active account；credential persistence degraded 时，需要 OAuth 凭据的出站操作在网络前返回 `503`。
 
 ## HTTP、SSE 与 Images
 
@@ -91,7 +89,7 @@ models manifest、alpha search、Provider 网络测试、模型发现、quota re
 
 ### Images 兼容与资源边界
 
-Codex OAuth 图片桥覆盖 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一活动账号上的 Responses `image_generation` tool 调用；上游始终使用增量 SSE，generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
+Codex OAuth 图片桥覆盖 Route Key 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游始终使用增量 SSE，generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
 
 - 输入模型只接受 `gpt-image-*`；`gpt-image-2-2k` 和 `gpt-image-2-4k` 会规范化为 `gpt-image-2` 及对应方向尺寸。
 - `response_format` 支持 `b64_json` 和 `url`；同时校验 `size`、`quality`、`background`、`output_format`、`moderation`、`input_fidelity`、`output_compression`、`partial_images` 和 `stream` 的类型、范围及组合关系。
@@ -101,16 +99,18 @@ Codex OAuth 图片桥覆盖 `POST /v1/images/generations`、`POST /images/genera
 
 下游 `stream=true` 会立即发送 `: connected`，空闲期间每 15 秒发送 `: keepalive`；partial、completed 和 error 按 Images SSE 事件输出。`stream=false` 仍保持一个合法 JSON 文档：先发送 JSON 合法空白，并每 15 秒发送空白心跳，最终再写入 JSON 对象。这样 Cloudflare 可以持续看到源站字节，而 Server 不需要把整个生成结果缓冲到内存后才响应。
 
-首个有效上游事件使用 `STREAM_FIRST_BYTE_TIMEOUT_MS`，之后使用 `STREAM_IDLE_TIMEOUT_MS`。`response.failed`、`response.incomplete`、cancel/error 事件、缺失终止事件的 EOF、超限、网络错误和超时都不会记为 Provider 成功。客户端中断会记为 HTTP `499`/`client_cancelled`，并在 Body 释放时归还账号与 Share in-flight lease。
+首个有效上游事件使用 `STREAM_FIRST_BYTE_TIMEOUT_MS`，之后使用 `STREAM_IDLE_TIMEOUT_MS`。`response.failed`、`response.incomplete`、cancel/error 事件、缺失终止事件的 EOF、超限、网络错误和超时都不会记为 Provider 成功。客户端中断会记为 HTTP `499`/`client_cancelled`，并在 usage 与 Share 终态记账完成后归还账号与 Share in-flight lease。`CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 只回滚普通 Responses 的语义提交门禁，不关闭图片传输的最小 lifecycle/terminal 检查。
 
 由于首个空白或 SSE comment 已提交 HTTP headers，后续流内失败不能再把 wire status 从 `200` 改成 `502/504`：stream 模式返回 `event: error`，JSON 模式返回标准 error JSON；本地 usage log 的 `statusCode`、`streamStatus` 和 `errorMessage` 记录真实终态。调用方不能只看初始 HTTP 200 判断图片成功，必须消费完整 Body 并验证 completed/data 或 error。
 
 ### `response_format=url`
 
-URL 模式不会返回伪造或上游私有 URL。Server 将解码后的图片放入进程内 capability store，并返回同源 `/v1/images/files/<256-bit-token>`：
+URL 模式不会返回伪造或上游私有 URL。Server 将解码后的图片放入持久化 capability store，并返回同源 `/v1/images/files/<256-bit-token>`：
 
 - token 具有 256-bit 随机熵，GET/HEAD 不再要求 inference token；token 本身就是短期访问能力。
-- TTL 为 1 小时，最多 128 项、合计 256 MiB；达到上限会淘汰最旧项，进程重启会使 URL 不可用。多副本部署必须让生成请求及其后续文件 GET/HEAD 粘性回到同一实例；当前实现没有共享对象存储，无法保证跨实例 URL 可用。
+- TTL 为 1 小时，最多 128 项、合计 256 MiB；达到上限会淘汰最旧项。默认目录是 `<config-dir>/image-capabilities`，也可用 `CC_SWITCH_IMAGE_STORE_DIR` 指定绝对路径或相对 config dir 的路径。过期、孤立、元数据损坏、长度或 SHA-256 不匹配的条目会在启动、读写或命中校验时清理。
+- payload 先以 `0600` 数据文件原子落盘，随后才提交带长度、MIME、SHA-256 和过期时间的元数据；所有读写通过同一锁文件串行化。因此同一目录中的 URL 可跨进程重启继续使用，也可由挂载该目录的其他副本读取。
+- 多副本共享目录必须支持跨进程 advisory file lock、同一文件系统内的 atomic rename 和目录同步，并让所有副本以兼容的文件权限访问。无法满足这些条件时，每个副本使用独立 store，并对生成请求及后续 GET/HEAD 配置粘性回源。
 - 下载响应带 `private, no-store`、`nosniff`、准确 Content-Type/Length，不应被 Cloudflare Cache、浏览器或下游代理持久化。
 - public origin 优先使用 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL`，其次使用 Router 已验证的 Client tunnel host，再按 Host/forwarded headers 推导。环境变量必须是无 path/query/fragment 的 HTTP(S) origin。
 
@@ -126,10 +126,12 @@ Worker 必须把上游 Body 当作 `ReadableStream` 原样返回，例如 `new R
 
 - 透传或正确生成公开 Host、`CF-Visitor`/`X-Forwarded-Proto`，不要覆盖 Server 的 `Cache-Control: no-store` 和 `X-Accel-Buffering: no`。
 - 对 Images SSE/JSON 关闭 Worker 自定义缓冲、响应重写和 cache；允许至少每 15 秒一个很小的 chunk 立即流向客户端。
-- 允许 `/v1/images/files/<token>` 的匿名 GET/HEAD 到达同一 Server 实例，不把 inference bearer 追加到生成 URL，也不缓存 capability 响应。
+- 允许 `/v1/images/files/<token>` 的匿名 GET/HEAD 到达共享同一 `CC_SWITCH_IMAGE_STORE_DIR` 的任一 Server 副本；副本没有共享目录时才要求回到生成实例。不要把 inference bearer 追加到生成 URL，也不要缓存 capability 响应。
 - 确认 WAF、请求体和上传规则允许 Codex Images 的 48 MiB HTTP envelope（解码图片聚合仍为 32 MiB）；真实验证首块、15 秒以上生成、URL 下载和客户端取消。
 
 Cloudflare 524 是否消失、Worker 是否实际 flush 小 chunk、订阅账号是否拥有 image entitlement，仍是外部部署/真实 OAuth gate，离线测试不能替代。
+
+`/metrics` 暴露 capability insert/hit/miss/expiry/corruption/eviction、当前条目与字节数，以及 Responses/Images/Grok 图片传输的首字节、心跳次数和最大静默时间。共享目录下的 size gauge 是各进程最近一次扫描到的 store 快照，不是跨副本聚合值。
 
 ## WebSocket 与 HTTP Fallback
 
@@ -171,11 +173,10 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 
 ## 验收清单
 
-- 0/1/2 个 Codex OAuth 账号分别得到 `unconfigured`、自动 `ready`、`needs_selection`。
-- `needs_selection` 时 HTTP、SSE、WS、Images、models、alpha search、quota 和 Provider test 的上游请求数均为零。
-- 选择活动账号后，所有未共享 Codex OAuth Provider 原子重绑并增加 revision；进程重启后选择保持。
-- Share 冲突返回 409，`accounts.json`、`providers.json` 和 `shares.json` 不出现部分提交。
-- current Provider 和显式 Provider 都只能使用活动账号；并发饱和、cooldown、quota 耗尽及第二次 401 时其他 Provider/账号上游请求数为零。
+- 0/1/2 个 Codex OAuth 账号分别得到 `unconfigured`、自动 `ready`、`needs_selection`，这些状态只约束账号中心操作。
+- `needs_selection` 不阻断具有完整账号绑定的 Route Key 或 Share 数据面。
+- 选择账号中心目标后，Provider、Share、revision 和 RuntimePlan 均保持不变；进程重启后账号中心选择保持。
+- Route Key 和 Share 都只使用各自 Bundle 的绑定账号；并发饱和、cooldown、quota 耗尽及第二次 401 时其他 Provider/账号上游请求数为零。
 - HTTP、SSE、Images、WS 握手和 WS 到 HTTP fallback 的首次 401 都只刷新同一账号一次。
 - Claude/Codex/Gemini 经 OpenAI OAuth 转出的普通 Responses 最终出站均为 `store=false`、`stream=true`；客户端非流请求得到单个 JSON，成功终止 SSE usage 记录为 `observed` 而不是零值占位，失败聚合则按 `missing`、`parse_error` 或 `interrupted` 记录并保留已明确观测到的 usage。
 - Router 收到 pending 后可由更高 `usageRevision` 的终态覆盖；低 revision 重放不能回退状态，显式 observed zero 与 missing/parse error/interrupted 在 API 和 UI 中保持可区分。

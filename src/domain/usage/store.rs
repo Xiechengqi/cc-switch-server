@@ -1278,6 +1278,7 @@ pub fn usage_from_json_with_semantics(
         .or_else(|| value.get("usage"))
         .or_else(|| value.pointer("/message/usage"))
         .or_else(|| value.pointer("/response/usage"))
+        .or_else(|| value.pointer("/response/usageMetadata"))
         .or_else(|| value.pointer("/delta/usage"))
         .or_else(|| value.get("usageMetadata"))
         .unwrap_or(value);
@@ -1299,10 +1300,19 @@ pub fn usage_from_json_with_semantics(
             "outputTokens",
             "completion_tokens",
             "completionTokens",
-            "candidatesTokenCount",
             "outputTokenCount",
         ],
-    );
+    )
+    .or_else(|| {
+        let candidates = first_u64(usage, &["candidatesTokenCount"]);
+        let thoughts = first_u64(usage, &["thoughtsTokenCount", "thoughts_token_count"]);
+        match (candidates, thoughts) {
+            (Some(candidates), Some(thoughts)) => Some(candidates.saturating_add(thoughts)),
+            (Some(candidates), None) => Some(candidates),
+            (None, Some(thoughts)) => Some(thoughts),
+            (None, None) => None,
+        }
+    });
     let cache_read_tokens = first_u64(
         usage,
         &[
@@ -2361,15 +2371,31 @@ mod tests {
             "usageMetadata": {
                 "promptTokenCount": 12,
                 "candidatesTokenCount": 8,
+                "thoughtsTokenCount": 7,
                 "cachedContentTokenCount": 4,
-                "totalTokenCount": 20
+                "totalTokenCount": 27
             }
         }));
 
         assert_eq!(usage.input_tokens, Some(8));
-        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.output_tokens, Some(15));
         assert_eq!(usage.cache_read_tokens, Some(4));
-        assert_eq!(usage.total_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(27));
+    }
+
+    #[test]
+    fn gemini_thought_tokens_are_counted_without_explicit_total() {
+        let usage = usage_from_json(&json!({
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 8,
+                "thoughtsTokenCount": 7
+            }
+        }));
+
+        assert_eq!(usage.raw_input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.total_tokens, Some(27));
     }
 
     #[test]

@@ -1,18 +1,20 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Mutex as StdMutex, OnceLock};
 
+use crate::domain::accounts::managers::{
+    AccountRefreshFlightFailure, AccountRefreshFlightFailureDetails, AccountRefreshFlightStage,
+    AccountRefreshGuard,
+};
 use crate::domain::accounts::oauth::{
     build_refresh_request, build_refresh_request_for_token_url, classify_oauth_error,
-    oauth_provider_spec, refresh_update_from_token_response, token_expires_soon,
-    OAuthErrorClassification, OAuthErrorKind, OAuthHttpRequest, OAuthRequestBodyFormat,
-    OAuthTokenResponse,
+    merge_account_refresh_raw, oauth_provider_spec, refresh_update_from_token_response,
+    token_expires_soon, OAuthErrorClassification, OAuthErrorKind, OAuthHttpRequest,
+    OAuthRequestBodyFormat, OAuthTokenResponse,
 };
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate};
 use crate::domain::providers::model::ProviderType;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as AsyncMutex;
 
-const REFRESH_RECENT_SUCCESS_TTL_MS: i64 = 10_000;
 const REFRESH_INITIAL_BACKOFF_MS: i64 = 5_000;
 const REFRESH_MAX_BACKOFF_MS: i64 = 5 * 60_000;
 const MAX_OAUTH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -26,6 +28,7 @@ pub struct AccountRefreshFailure {
     pub kind: OAuthErrorKind,
     pub retryable: bool,
     pub retry_after_ms: Option<i64>,
+    pub immediate_relogin: bool,
     pub(crate) endpoint_fallback_safe: bool,
 }
 
@@ -38,6 +41,7 @@ impl AccountRefreshFailure {
             kind: OAuthErrorKind::Unsupported,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -50,6 +54,7 @@ impl AccountRefreshFailure {
             kind: OAuthErrorKind::Network,
             retryable: true,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -74,6 +79,7 @@ impl AccountRefreshFailure {
             kind,
             retryable,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe,
         }
     }
@@ -86,6 +92,7 @@ impl AccountRefreshFailure {
             kind: OAuthErrorKind::AuthorizationPending,
             retryable: true,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -98,6 +105,7 @@ impl AccountRefreshFailure {
             kind: OAuthErrorKind::RateLimited,
             retryable: true,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -110,6 +118,7 @@ impl AccountRefreshFailure {
             kind: OAuthErrorKind::Parse,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -121,6 +130,7 @@ impl AccountRefreshFailure {
     ) -> Self {
         let status_code = refresh_status_code(upstream_status, classification.kind);
         let context = context.into();
+        let immediate_relogin = classification.immediate_relogin;
         Self {
             status_code,
             upstream_status,
@@ -132,6 +142,7 @@ impl AccountRefreshFailure {
             kind: classification.kind,
             retryable: classification.retryable,
             retry_after_ms: None,
+            immediate_relogin,
             endpoint_fallback_safe: false,
         }
     }
@@ -173,7 +184,43 @@ pub async fn execute_native_account_refresh(
     account: &Account,
     now_ms: i64,
     quota_refresh_interval_ms: i64,
+    refresh_guard: &mut AccountRefreshGuard,
 ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    execute_native_account_refresh_with_receipt_hook(
+        http,
+        account,
+        now_ms,
+        quota_refresh_interval_ms,
+        refresh_guard,
+        |_| Ok(()),
+    )
+    .await
+}
+
+pub async fn execute_native_account_refresh_with_receipt_hook<F>(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+    refresh_guard: &mut AccountRefreshGuard,
+    mut receipt_hook: F,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure>
+where
+    F: FnMut(&AccountRefreshUpdate) -> Result<(), AccountRefreshFailure>,
+{
+    if let Some(failure) = refresh_guard.coalesced_native_failure_for(account) {
+        return Err(AccountRefreshFailure {
+            status_code: failure.status_code,
+            upstream_status: failure.upstream_status,
+            message: failure.message.clone(),
+            kind: failure.kind,
+            retryable: failure.retryable,
+            retry_after_ms: failure.retry_after_ms,
+            immediate_relogin: failure.immediate_relogin,
+            endpoint_fallback_safe: false,
+        });
+    }
+
     #[cfg(test)]
     if let Some(token_url) = account
         .raw
@@ -184,25 +231,55 @@ pub async fn execute_native_account_refresh(
         .filter(|value| !value.is_empty())
     {
         let token_urls = [token_url];
-        return execute_native_account_refresh_with_token_urls(
+        let result = execute_native_account_refresh_with_token_urls_and_receipt_hook(
             http,
             account,
             now_ms,
             quota_refresh_interval_ms,
             Some(&token_urls),
+            &mut receipt_hook,
         )
         .await;
+        record_refresh_flight_failure(refresh_guard, account, &result);
+        return result;
     }
-    execute_native_account_refresh_with_token_urls(
+    let result = execute_native_account_refresh_with_token_urls_and_receipt_hook(
         http,
         account,
         now_ms,
         quota_refresh_interval_ms,
         None,
+        &mut receipt_hook,
     )
-    .await
+    .await;
+    record_refresh_flight_failure(refresh_guard, account, &result);
+    result
 }
 
+pub(crate) fn record_refresh_flight_failure(
+    refresh_guard: &mut AccountRefreshGuard,
+    account: &Account,
+    result: &Result<AccountRefreshUpdate, AccountRefreshFailure>,
+) {
+    if let Err(error) = result {
+        refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+            account,
+            AccountRefreshFlightStage::NativeRefresh,
+            AccountRefreshFlightFailureDetails {
+                status_code: error.status_code,
+                upstream_status: error.upstream_status,
+                message: error.message.clone(),
+                public_message: None,
+                kind: error.kind,
+                retryable: error.retryable,
+                retry_after_ms: error.retry_after_ms,
+                immediate_relogin: error.immediate_relogin,
+            },
+        ));
+    }
+}
+
+#[cfg(test)]
 async fn execute_native_account_refresh_with_token_urls(
     http: &reqwest::Client,
     account: &Account,
@@ -210,6 +287,28 @@ async fn execute_native_account_refresh_with_token_urls(
     quota_refresh_interval_ms: i64,
     token_urls: Option<&[&str]>,
 ) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    execute_native_account_refresh_with_token_urls_and_receipt_hook(
+        http,
+        account,
+        now_ms,
+        quota_refresh_interval_ms,
+        token_urls,
+        &mut |_| Ok(()),
+    )
+    .await
+}
+
+async fn execute_native_account_refresh_with_token_urls_and_receipt_hook<F>(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    quota_refresh_interval_ms: i64,
+    token_urls: Option<&[&str]>,
+    receipt_hook: &mut F,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure>
+where
+    F: FnMut(&AccountRefreshUpdate) -> Result<(), AccountRefreshFailure>,
+{
     let Some(refresh_key) = refresh_lock_key(account) else {
         return execute_native_account_refresh_inner(
             http,
@@ -217,20 +316,11 @@ async fn execute_native_account_refresh_with_token_urls(
             now_ms,
             quota_refresh_interval_ms,
             token_urls,
+            receipt_hook,
         )
         .await;
     };
 
-    if let Some(blocked) = refresh_backoff_blocked(&refresh_key, now_ms) {
-        return Err(blocked);
-    }
-
-    let lock = refresh_lock(&refresh_key);
-    let _guard = lock.lock().await;
-
-    if let Some(update) = recent_refresh_success(&refresh_key, now_ms) {
-        return Ok(update);
-    }
     if let Some(blocked) = refresh_backoff_blocked(&refresh_key, now_ms) {
         return Err(blocked);
     }
@@ -241,11 +331,11 @@ async fn execute_native_account_refresh_with_token_urls(
         now_ms,
         quota_refresh_interval_ms,
         token_urls,
+        receipt_hook,
     )
     .await;
     match &result {
-        Ok(update) => {
-            remember_refresh_success(&refresh_key, now_ms, update);
+        Ok(_) => {
             clear_refresh_backoff(&refresh_key);
         }
         Err(error) => remember_refresh_failure(&refresh_key, now_ms, error),
@@ -253,21 +343,27 @@ async fn execute_native_account_refresh_with_token_urls(
     result
 }
 
-async fn execute_native_account_refresh_inner(
+async fn execute_native_account_refresh_inner<F>(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
     quota_refresh_interval_ms: i64,
     token_urls: Option<&[&str]>,
-) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    receipt_hook: &mut F,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure>
+where
+    F: FnMut(&AccountRefreshUpdate) -> Result<(), AccountRefreshFailure>,
+{
     if account.provider_type == ProviderType::KiroOAuth {
-        return crate::clients::oauth::kiro::refresh_kiro_account(
+        let receipt = crate::clients::oauth::kiro::refresh_kiro_account(
             http,
             account,
             now_ms,
             quota_refresh_interval_ms,
+            receipt_hook,
         )
-        .await;
+        .await?;
+        return validate_native_account_refresh_receipt(http, account, receipt).await;
     }
 
     let spec = oauth_provider_spec(account.provider_type).ok_or_else(|| {
@@ -351,127 +447,139 @@ async fn execute_native_account_refresh_inner(
                     "OAuth refresh response is missing token fields: {error}"
                 ))
             })?;
-        let verified_openai_identity = if account.provider_type == ProviderType::CodexOAuth {
-            let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
-                http,
-                token_response.id_token.as_deref(),
-                &token_response.access_token,
-            )
-            .await
-            .map_err(|error| AccountRefreshFailure {
-                status_code: 400,
-                upstream_status: None,
-                message: error.to_string(),
-                kind: OAuthErrorKind::InvalidGrant,
-                retryable: false,
-                retry_after_ms: None,
-                endpoint_fallback_safe: false,
-            })?;
-            ensure_openai_refresh_subject_matches(account, &verified.identity)?;
-            Some(verified)
-        } else {
-            None
-        };
-        let verified_grok_identity = if account.provider_type == ProviderType::GrokOAuth {
-            if let Some(id_token) = token_response
-                .id_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-            {
-                let verified =
-                    crate::clients::oauth::grok_jwks::verify_grok_id_token(http, id_token, None)
-                        .await
-                        .map_err(|error| AccountRefreshFailure {
-                            status_code: 400,
-                            upstream_status: None,
-                            message: error.to_string(),
-                            kind: OAuthErrorKind::InvalidGrant,
-                            retryable: false,
-                            retry_after_ms: None,
-                            endpoint_fallback_safe: false,
-                        })?;
-                ensure_grok_refresh_subject_matches(account, &verified.identity)?;
-                Some(verified)
-            } else {
-                require_existing_verified_grok_subject(account)?;
-                None
-            }
-        } else {
-            None
-        };
-        let mut update = if let Some(verified) = verified_openai_identity.as_ref() {
-            crate::domain::accounts::oauth::refresh_update_from_verified_openai_token_response(
-                &token_response,
-                raw,
-                &verified.identity,
-                now_ms,
-                quota_refresh_interval_ms,
-            )
-        } else if let Some(verified) = verified_grok_identity.as_ref() {
-            crate::domain::accounts::oauth::refresh_update_from_verified_grok_token_response(
-                &token_response,
-                raw,
-                &verified.identity,
-                now_ms,
-                quota_refresh_interval_ms,
-            )
-        } else {
-            refresh_update_from_token_response(
-                account.provider_type,
-                &token_response,
-                raw,
-                now_ms,
-                quota_refresh_interval_ms,
-            )
-        };
-
-        if let Some(verified) = verified_openai_identity {
-            if verified.identity.email.is_some() {
-                update.email = verified.identity.email;
-            }
-            if verified.identity.plan_type.is_some() {
-                update.subscription_level = verified.identity.plan_type;
-            }
-            crate::domain::accounts::store::set_verified_openai_claims(
-                &mut update.profile,
-                Some(verified.canonical_claims),
-            );
-        }
-        if let Some(verified) = verified_grok_identity {
-            if verified.identity.email.is_some() {
-                update.email = verified.identity.email;
-            }
-            if verified.identity.plan_type.is_some() {
-                update.subscription_level = verified.identity.plan_type;
-            }
-            crate::domain::accounts::store::set_verified_grok_claims(
-                &mut update.profile,
-                Some(verified.canonical_claims),
-            );
-        }
-        if crate::domain::accounts::store::account_refresh_replaces_auth_identity(account, &update)
-        {
-            return Err(AccountRefreshFailure {
-                status_code: 409,
-                upstream_status: None,
-                message: format!(
-                    "{} OAuth refresh returned a different subscription identity; re-login as a new account",
-                    account.provider_type.as_str()
-                ),
-                kind: OAuthErrorKind::InvalidGrant,
-                retryable: false,
-                retry_after_ms: None,
-                endpoint_fallback_safe: false,
-            });
-        }
-
-        return Ok(update);
+        let receipt = refresh_update_from_token_response(
+            account.provider_type,
+            &token_response,
+            raw,
+            now_ms,
+            quota_refresh_interval_ms,
+        );
+        receipt_hook(&receipt)?;
+        return validate_native_account_refresh_receipt(http, account, receipt).await;
     }
 
     Err(last_error.unwrap_or_else(|| {
         AccountRefreshFailure::bad_request("OAuth refresh did not produce a request")
     }))
+}
+
+pub async fn validate_native_account_refresh_receipt(
+    http: &reqwest::Client,
+    account: &Account,
+    mut update: AccountRefreshUpdate,
+) -> Result<AccountRefreshUpdate, AccountRefreshFailure> {
+    let raw = update.raw.clone().unwrap_or(serde_json::Value::Null);
+    if account.provider_type == ProviderType::CodexOAuth {
+        let access_token = update
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                AccountRefreshFailure::parse("Codex refresh receipt has no access token")
+            })?;
+        let verified = crate::clients::oauth::openai_jwks::verify_openai_identity_tokens(
+            http,
+            update.id_token.as_deref(),
+            access_token,
+        )
+        .await
+        .map_err(openai_jwt_refresh_failure)?;
+        ensure_openai_refresh_subject_matches(account, &verified.identity)?;
+        crate::domain::accounts::oauth::enrich_refresh_update_with_verified_openai_identity(
+            &mut update,
+            &raw,
+            &verified.identity,
+            verified.canonical_claims,
+        );
+    } else if account.provider_type == ProviderType::GrokOAuth {
+        if let Some(id_token) = update
+            .id_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let verified =
+                crate::clients::oauth::grok_jwks::verify_grok_id_token(http, id_token, None)
+                    .await
+                    .map_err(grok_jwt_refresh_failure)?;
+            ensure_grok_refresh_subject_matches(account, &verified.identity)?;
+            crate::domain::accounts::oauth::enrich_refresh_update_with_verified_grok_identity(
+                &mut update,
+                &raw,
+                &verified.identity,
+                verified.canonical_claims,
+            );
+        } else {
+            require_existing_verified_grok_subject(account)?;
+        }
+    }
+    if let Some(raw) = update.raw.take() {
+        update.raw = Some(merge_account_refresh_raw(account.raw.as_ref(), raw));
+    }
+    if crate::domain::accounts::store::account_refresh_replaces_auth_identity(account, &update) {
+        return Err(AccountRefreshFailure {
+            status_code: 409,
+            upstream_status: None,
+            message: format!(
+                "{} OAuth refresh returned a different subscription identity; re-login as a new account",
+                account.provider_type.as_str()
+            ),
+            kind: OAuthErrorKind::InvalidGrant,
+            retryable: false,
+            retry_after_ms: None,
+            immediate_relogin: false,
+            endpoint_fallback_safe: false,
+        });
+    }
+    Ok(update)
+}
+
+fn openai_jwt_refresh_failure(
+    error: crate::clients::oauth::openai_jwks::OpenAiJwtError,
+) -> AccountRefreshFailure {
+    let retryable = matches!(
+        &error,
+        crate::clients::oauth::openai_jwks::OpenAiJwtError::Fetch(_)
+    );
+    AccountRefreshFailure {
+        status_code: if retryable { 502 } else { 400 },
+        upstream_status: None,
+        message: error.to_string(),
+        kind: if retryable {
+            OAuthErrorKind::Network
+        } else {
+            OAuthErrorKind::InvalidGrant
+        },
+        retryable,
+        retry_after_ms: None,
+        immediate_relogin: false,
+        endpoint_fallback_safe: false,
+    }
+}
+
+fn grok_jwt_refresh_failure(
+    error: crate::clients::oauth::grok_jwks::GrokJwtError,
+) -> AccountRefreshFailure {
+    let retryable = matches!(
+        &error,
+        crate::clients::oauth::grok_jwks::GrokJwtError::Discovery(_)
+            | crate::clients::oauth::grok_jwks::GrokJwtError::Fetch(_)
+    );
+    AccountRefreshFailure {
+        status_code: if retryable { 502 } else { 400 },
+        upstream_status: None,
+        message: error.to_string(),
+        kind: if retryable {
+            OAuthErrorKind::Network
+        } else {
+            OAuthErrorKind::InvalidGrant
+        },
+        retryable,
+        retry_after_ms: None,
+        immediate_relogin: false,
+        endpoint_fallback_safe: false,
+    }
 }
 
 fn ensure_openai_refresh_subject_matches(
@@ -497,6 +605,7 @@ fn ensure_openai_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         })?;
 
@@ -508,6 +617,7 @@ fn ensure_openai_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         });
     }
@@ -525,6 +635,7 @@ fn require_existing_verified_grok_subject(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         }
     })
@@ -547,6 +658,7 @@ fn ensure_grok_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         })?;
     if existing_subject != refreshed_subject {
@@ -557,6 +669,7 @@ fn ensure_grok_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
+            immediate_relogin: false,
             endpoint_fallback_safe: false,
         });
     }
@@ -569,38 +682,9 @@ struct RefreshBackoffState {
     next_delay_ms: i64,
 }
 
-#[derive(Debug, Clone)]
-struct RefreshRecentSuccess {
-    completed_at_ms: i64,
-    update: AccountRefreshUpdate,
-}
-
-fn refresh_locks() -> &'static StdMutex<HashMap<String, Weak<AsyncMutex<()>>>> {
-    static LOCKS: OnceLock<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
 fn refresh_backoffs() -> &'static StdMutex<HashMap<String, RefreshBackoffState>> {
     static BACKOFFS: OnceLock<StdMutex<HashMap<String, RefreshBackoffState>>> = OnceLock::new();
     BACKOFFS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn refresh_recent_successes() -> &'static StdMutex<HashMap<String, RefreshRecentSuccess>> {
-    static SUCCESSES: OnceLock<StdMutex<HashMap<String, RefreshRecentSuccess>>> = OnceLock::new();
-    SUCCESSES.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn refresh_lock(key: &str) -> Arc<AsyncMutex<()>> {
-    let mut locks = refresh_locks()
-        .lock()
-        .expect("refresh lock registry poisoned");
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(AsyncMutex::new(()));
-    locks.insert(key.to_string(), Arc::downgrade(&lock));
-    lock
 }
 
 fn refresh_lock_key(account: &Account) -> Option<String> {
@@ -635,32 +719,6 @@ fn hex_prefix(bytes: &[u8], max_chars: usize) -> String {
     output
 }
 
-fn recent_refresh_success(key: &str, now_ms: i64) -> Option<AccountRefreshUpdate> {
-    let mut successes = refresh_recent_successes()
-        .lock()
-        .expect("refresh success registry poisoned");
-    successes.retain(|_, success| {
-        now_ms.saturating_sub(success.completed_at_ms) <= REFRESH_RECENT_SUCCESS_TTL_MS
-    });
-    successes.get(key).and_then(|success| {
-        (now_ms.saturating_sub(success.completed_at_ms) <= REFRESH_RECENT_SUCCESS_TTL_MS)
-            .then(|| success.update.clone())
-    })
-}
-
-fn remember_refresh_success(key: &str, now_ms: i64, update: &AccountRefreshUpdate) {
-    let mut successes = refresh_recent_successes()
-        .lock()
-        .expect("refresh success registry poisoned");
-    successes.insert(
-        key.to_string(),
-        RefreshRecentSuccess {
-            completed_at_ms: now_ms,
-            update: update.clone(),
-        },
-    );
-}
-
 fn refresh_backoff_blocked(key: &str, now_ms: i64) -> Option<AccountRefreshFailure> {
     let backoffs = refresh_backoffs()
         .lock()
@@ -668,9 +726,12 @@ fn refresh_backoff_blocked(key: &str, now_ms: i64) -> Option<AccountRefreshFailu
     let state = backoffs.get(key)?;
     if now_ms < state.blocked_until_ms {
         let retry_after_ms = state.blocked_until_ms.saturating_sub(now_ms);
-        return Some(AccountRefreshFailure::rate_limited(format!(
-            "OAuth refresh temporarily blocked for {retry_after_ms}ms after recent failure"
-        )));
+        return Some(
+            AccountRefreshFailure::rate_limited(format!(
+                "OAuth refresh temporarily blocked for {retry_after_ms}ms after recent failure"
+            ))
+            .with_retry_after(Some(retry_after_ms)),
+        );
     }
     None
 }
@@ -1041,13 +1102,15 @@ fn refresh_status_code(upstream_status: Option<u16>, kind: OAuthErrorKind) -> u1
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::domain::accounts::managers::AccountRefreshLocks;
 
     fn request(url: &str) -> OAuthHttpRequest {
         OAuthHttpRequest {
@@ -1295,7 +1358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_refresh_rotates_tokens_and_is_singleflight() {
+    async fn claude_refresh_rotates_tokens() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -1333,49 +1396,313 @@ mod tests {
             Some("original-refresh-token"),
             Some(1),
         );
-        account.id = "claude-refresh-singleflight".to_string();
+        account.id = "claude-refresh-rotation".to_string();
         let http = reqwest::Client::new();
         let token_url = format!("http://{address}/token");
         let token_urls = [token_url.as_str()];
         let now_ms = 10_000_000;
 
-        let (first, second) = tokio::join!(
-            execute_native_account_refresh_with_token_urls(
-                &http,
-                &account,
-                now_ms,
-                60_000,
-                Some(&token_urls),
-            ),
-            execute_native_account_refresh_with_token_urls(
-                &http,
-                &account,
-                now_ms,
-                60_000,
-                Some(&token_urls),
-            )
-        );
-        let first = first.unwrap();
-        let second = second.unwrap();
+        let update = execute_native_account_refresh_with_token_urls(
+            &http,
+            &account,
+            now_ms,
+            60_000,
+            Some(&token_urls),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert_eq!(first.access_token.as_deref(), Some("rotated-access-token"));
+        assert_eq!(update.access_token.as_deref(), Some("rotated-access-token"));
         assert_eq!(
-            first.refresh_token.as_deref(),
+            update.refresh_token.as_deref(),
             Some("rotated-refresh-token")
         );
-        assert_eq!(first.token_type.as_deref(), Some("Bearer"));
-        assert!(first
+        assert_eq!(update.token_type.as_deref(), Some("Bearer"));
+        assert!(update
             .expires_at
             .is_some_and(|expires_at| expires_at > now_ms));
-        assert_eq!(second.access_token, first.access_token);
-        assert_eq!(second.refresh_token, first.refresh_token);
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(
             captured[0]["refresh_token"],
             serde_json::json!("original-refresh-token")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_is_replayed_to_waiters_without_second_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_grant",
+                            "error_description": "shared refresh token was rejected"
+                        })),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired-access-token"),
+            Some("flight-failure-refresh-token"),
+            Some(1),
+        );
+        account.id = "refresh-flight-failure".to_string();
+        account.raw = Some(serde_json::json!({
+            "testOAuthTokenUrl": format!("http://{address}/token")
+        }));
+        let locks = Arc::new(AccountRefreshLocks::default());
+        let mut first_guard = locks.lock(account.provider_type, &account.id).await;
+        let waiter_started = Arc::new(tokio::sync::Notify::new());
+        let waiter_started_signal = waiter_started.notified();
+        tokio::pin!(waiter_started_signal);
+        let waiter_locks = Arc::clone(&locks);
+        let waiter_provider_type = account.provider_type;
+        let waiter_account_id = account.id.clone();
+        let waiter_started_for_task = Arc::clone(&waiter_started);
+        let waiter = tokio::spawn(async move {
+            waiter_started_for_task.notify_waiters();
+            waiter_locks
+                .lock(waiter_provider_type, &waiter_account_id)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut waiter_started_signal)
+            .await
+            .expect("refresh waiter did not start");
+
+        let first_error = execute_native_account_refresh(
+            &reqwest::Client::new(),
+            &account,
+            1_000_000,
+            60_000,
+            &mut first_guard,
+        )
+        .await
+        .unwrap_err();
+        first_guard.release();
+        let mut second_guard = waiter.await.unwrap();
+        let second_error = execute_native_account_refresh(
+            &reqwest::Client::new(),
+            &account,
+            1_000_000,
+            60_000,
+            &mut second_guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(second_error.status_code, first_error.status_code);
+        assert_eq!(second_error.upstream_status, first_error.upstream_status);
+        assert_eq!(second_error.message, first_error.message);
+        assert_eq!(second_error.kind, first_error.kind);
+        assert_eq!(second_error.retryable, first_error.retryable);
+        assert_eq!(second_error.retry_after_ms, first_error.retry_after_ms);
+        assert_eq!(
+            second_error.immediate_relogin,
+            first_error.immediate_relogin
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_is_not_replayed_after_account_credentials_change() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    let attempt = requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid_grant",
+                            "error_description": format!("refresh attempt {attempt} was rejected")
+                        })),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::ClaudeOAuth,
+            Some("expired-access-token"),
+            Some("old-refresh-token"),
+            Some(1),
+        );
+        account.id = "refresh-flight-generation-change".to_string();
+        account.raw = Some(serde_json::json!({
+            "testOAuthTokenUrl": format!("http://{address}/token")
+        }));
+        let locks = Arc::new(AccountRefreshLocks::default());
+        let mut leader_guard = locks.lock(account.provider_type, &account.id).await;
+        let waiter_started = Arc::new(tokio::sync::Notify::new());
+        let waiter_started_signal = waiter_started.notified();
+        tokio::pin!(waiter_started_signal);
+        let waiter_locks = Arc::clone(&locks);
+        let waiter_provider_type = account.provider_type;
+        let waiter_account_id = account.id.clone();
+        let waiter_started_for_task = Arc::clone(&waiter_started);
+        let waiter = tokio::spawn(async move {
+            waiter_started_for_task.notify_waiters();
+            waiter_locks
+                .lock(waiter_provider_type, &waiter_account_id)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut waiter_started_signal)
+            .await
+            .expect("refresh generation waiter did not start");
+
+        let first_error = execute_native_account_refresh(
+            &reqwest::Client::new(),
+            &account,
+            1_000_000,
+            60_000,
+            &mut leader_guard,
+        )
+        .await
+        .unwrap_err();
+        account.refresh_token = Some("new-refresh-token".to_string());
+        account.token_refresh_generation = account.token_refresh_generation.saturating_add(1);
+        leader_guard.release();
+        let mut waiter_guard = waiter.await.unwrap();
+        let second_error = execute_native_account_refresh(
+            &reqwest::Client::new(),
+            &account,
+            1_000_000,
+            60_000,
+            &mut waiter_guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_ne!(second_error.message, first_error.message);
+        assert!(second_error.message.contains("attempt 2"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn google_refresh_preserves_imported_client_credentials_across_rotations() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let bodies = Arc::new(StdMutex::new(Vec::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let upstream = Router::new().route(
+            "/token",
+            post(move |body: String| {
+                let requests = Arc::clone(&requests_for_route);
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let request = requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "access_token": format!("google-access-{request}"),
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let token_url = format!("http://{address}/token");
+
+        for (index, provider_type) in [ProviderType::GeminiCli, ProviderType::AntigravityOAuth]
+            .into_iter()
+            .enumerate()
+        {
+            let mut account = account(
+                provider_type,
+                Some("expired-google-access"),
+                Some("manual-google-refresh"),
+                Some(1),
+            );
+            account.id = format!("google-import-refresh-{index}");
+            account.raw = Some(serde_json::json!({
+                "clientId": "manual-google-client",
+                "clientSecret": "manual-google-secret",
+                "testOAuthTokenUrl": token_url.clone(),
+                "profile": {"email": "google@example.com"},
+                "token": {
+                    "access_token": "expired-google-access",
+                    "refresh_token": "manual-google-refresh"
+                }
+            }));
+            let locks = AccountRefreshLocks::default();
+
+            for refresh_index in 0..2 {
+                let mut guard = locks.lock(provider_type, &account.id).await;
+                let update = execute_native_account_refresh(
+                    &reqwest::Client::new(),
+                    &account,
+                    1_000_000 + refresh_index,
+                    60_000,
+                    &mut guard,
+                )
+                .await
+                .unwrap();
+                if let Some(access_token) = update.access_token {
+                    account.access_token = Some(access_token);
+                }
+                if let Some(refresh_token) = update.refresh_token {
+                    account.refresh_token = Some(refresh_token);
+                }
+                if let Some(expires_at) = update.expires_at {
+                    account.expires_at = Some(expires_at);
+                }
+                if let Some(raw) = update.raw {
+                    account.raw = Some(raw);
+                }
+            }
+
+            let raw = account.raw.as_ref().unwrap();
+            assert_eq!(raw["clientId"], "manual-google-client");
+            assert_eq!(raw["clientSecret"], "manual-google-secret");
+            assert_eq!(raw["profile"]["email"], "google@example.com");
+            assert!(raw["token"]["access_token"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("google-access-")));
+        }
+
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+        for body in bodies.lock().unwrap().iter() {
+            assert!(body.contains("client_id=manual-google-client"));
+            assert!(body.contains("client_secret=manual-google-secret"));
+            assert!(body.contains("refresh_token=manual-google-refresh"));
+        }
+        server.abort();
     }
 
     #[test]
@@ -1387,6 +1714,20 @@ mod tests {
         assert_eq!(parse_retry_after_ms(&headers), Some(2_500));
         headers.insert("retry-after-ms", "999999999".parse().unwrap());
         assert_eq!(parse_retry_after_ms(&headers), Some(24 * 60 * 60 * 1_000));
+    }
+
+    #[test]
+    fn refresh_backoff_reports_the_remaining_retry_after() {
+        let key = "refresh-backoff-retry-after";
+        clear_refresh_backoff(key);
+        let now_ms = 1_000_000;
+        let failure =
+            AccountRefreshFailure::rate_limited("upstream cooldown").with_retry_after(Some(45_000));
+        remember_refresh_failure(key, now_ms, &failure);
+
+        let blocked = refresh_backoff_blocked(key, now_ms + 5_000).unwrap();
+        assert_eq!(blocked.retry_after_ms, Some(40_000));
+        clear_refresh_backoff(key);
     }
 
     #[test]
@@ -1404,6 +1745,7 @@ mod tests {
                 kind,
                 retryable: true,
                 retry_after_ms: None,
+                immediate_relogin: false,
                 endpoint_fallback_safe: false,
             };
             assert!(!oauth_endpoint_fallback_allowed(&error), "{kind:?}");
@@ -1655,6 +1997,251 @@ mod tests {
         assert_eq!(update.access_token.as_deref(), Some("fallback-access"));
         assert_eq!(fallback_requests.load(Ordering::SeqCst), 1);
         fallback_server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_rotated_token_receipt_precedes_blocked_usage_failure() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let usage_started = Arc::new(tokio::sync::Notify::new());
+        let usage_started_for_route = Arc::clone(&usage_started);
+        let release_usage = Arc::new(tokio::sync::Notify::new());
+        let release_usage_for_route = Arc::clone(&release_usage);
+        let usage_requests = Arc::new(AtomicUsize::new(0));
+        let usage_requests_for_route = Arc::clone(&usage_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "accessToken": "kiro-rotated-access",
+                        "refreshToken": "kiro-rotated-refresh",
+                        "expiresIn": 3600
+                    }))
+                }),
+            )
+            .route(
+                "/usage",
+                get(move || {
+                    let usage_started = Arc::clone(&usage_started_for_route);
+                    let release_usage = Arc::clone(&release_usage_for_route);
+                    let usage_requests = Arc::clone(&usage_requests_for_route);
+                    async move {
+                        usage_requests.fetch_add(1, Ordering::SeqCst);
+                        usage_started.notify_one();
+                        release_usage.notified().await;
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({"error": "usage unavailable"})),
+                        )
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::KiroOAuth,
+            Some("expired-kiro-access"),
+            Some("kiro-old-refresh-blocked-usage"),
+            Some(1),
+        );
+        account.id = "kiro-receipt-before-blocked-usage".to_string();
+        account.raw = Some(serde_json::json!({
+            "authMethod": "social",
+            "apiRegion": "us-east-1",
+            "machineId": "kiro-receipt-test-machine",
+            "testOAuthTokenUrl": format!("http://{address}/token"),
+            "testKiroUsageUrl": format!("http://{address}/usage")
+        }));
+        let locks = AccountRefreshLocks::default();
+        let mut guard = locks.lock(account.provider_type, &account.id).await;
+        let receipts = Arc::new(StdMutex::new(Vec::<AccountRefreshUpdate>::new()));
+        let receipts_for_hook = Arc::clone(&receipts);
+        let http = reqwest::Client::new();
+        let refresh = execute_native_account_refresh_with_receipt_hook(
+            &http,
+            &account,
+            7_000_000,
+            60_000,
+            &mut guard,
+            move |update| {
+                receipts_for_hook.lock().unwrap().push(update.clone());
+                Ok(())
+            },
+        );
+        tokio::pin!(refresh);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = usage_started.notified() => {}
+                result = &mut refresh => panic!("refresh completed before usage blocked: {result:?}"),
+            }
+        })
+        .await
+        .expect("Kiro usage request did not start");
+
+        let receipt = receipts
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("rotated token receipt was not recorded before usage");
+        assert_eq!(receipt.access_token.as_deref(), Some("kiro-rotated-access"));
+        assert_eq!(
+            receipt.refresh_token.as_deref(),
+            Some("kiro-rotated-refresh")
+        );
+        assert_eq!(usage_requests.load(Ordering::SeqCst), 1);
+
+        release_usage.notify_one();
+        let update = tokio::time::timeout(Duration::from_secs(1), &mut refresh)
+            .await
+            .expect("Kiro refresh did not finish after failed usage response")
+            .unwrap();
+        assert_eq!(update.access_token, receipt.access_token);
+        assert_eq!(update.refresh_token, receipt.refresh_token);
+        assert!(update.quota.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_receipt_failure_prevents_usage_enrichment_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let usage_requests = Arc::new(AtomicUsize::new(0));
+        let usage_requests_for_route = Arc::clone(&usage_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "accessToken": "kiro-unpersisted-access",
+                        "refreshToken": "kiro-unpersisted-refresh",
+                        "expiresIn": 3600
+                    }))
+                }),
+            )
+            .route(
+                "/usage",
+                get(move || {
+                    let usage_requests = Arc::clone(&usage_requests_for_route);
+                    async move {
+                        usage_requests.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::KiroOAuth,
+            Some("expired-kiro-access"),
+            Some("kiro-old-refresh-receipt-failure"),
+            Some(1),
+        );
+        account.id = "kiro-receipt-failure-stops-usage".to_string();
+        account.raw = Some(serde_json::json!({
+            "authMethod": "social",
+            "apiRegion": "us-east-1",
+            "machineId": "kiro-receipt-failure-machine",
+            "testOAuthTokenUrl": format!("http://{address}/token"),
+            "testKiroUsageUrl": format!("http://{address}/usage")
+        }));
+        let locks = AccountRefreshLocks::default();
+        let mut guard = locks.lock(account.provider_type, &account.id).await;
+        let receipt_attempts = Arc::new(AtomicUsize::new(0));
+        let receipt_attempts_for_hook = Arc::clone(&receipt_attempts);
+        let error = execute_native_account_refresh_with_receipt_hook(
+            &reqwest::Client::new(),
+            &account,
+            8_000_000,
+            60_000,
+            &mut guard,
+            move |update| {
+                receipt_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    update.access_token.as_deref(),
+                    Some("kiro-unpersisted-access")
+                );
+                assert_eq!(
+                    update.refresh_token.as_deref(),
+                    Some("kiro-unpersisted-refresh")
+                );
+                Err(AccountRefreshFailure::bad_gateway(
+                    "rotated token receipt persistence failed",
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.message, "rotated token receipt persistence failed");
+        assert_eq!(receipt_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(usage_requests.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_normal_refresh_uses_pending_receipt_identity_validator() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "accessToken": "kiro-replacement-access",
+                        "refreshToken": "kiro-replacement-refresh",
+                        "expiresIn": 3600,
+                        "sub": "kiro-subject-b"
+                    }))
+                }),
+            )
+            .route("/usage", get(|| async { Json(serde_json::json!({})) }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::KiroOAuth,
+            Some("expired-kiro-access"),
+            Some("kiro-old-refresh"),
+            Some(1),
+        );
+        account.id = "kiro-refresh-identity-validator".to_string();
+        account.profile = Some(serde_json::json!({
+            "accountId": "kiro_local_refresh_hash",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        }));
+        account.raw = Some(serde_json::json!({
+            "authMethod": "social",
+            "apiRegion": "us-east-1",
+            "machineId": "kiro-identity-validator-machine",
+            "tokenResponse": {"sub": "kiro-subject-a"},
+            "testOAuthTokenUrl": format!("http://{address}/token"),
+            "testKiroUsageUrl": format!("http://{address}/usage")
+        }));
+        let locks = AccountRefreshLocks::default();
+        let mut guard = locks.lock(account.provider_type, &account.id).await;
+        let http = reqwest::Client::new();
+
+        let error = execute_native_account_refresh(&http, &account, 9_000_000, 60_000, &mut guard)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status_code, 409);
+        assert!(error.message.contains("different subscription identity"));
+        server.abort();
     }
 
     #[tokio::test]

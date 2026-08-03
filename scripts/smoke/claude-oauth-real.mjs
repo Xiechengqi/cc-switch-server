@@ -2,16 +2,16 @@
 
 const baseUrl = (process.env.CC_SWITCH_BASE_URL || "").trim().replace(/\/+$/, "");
 const inferenceToken = (process.env.CC_SWITCH_INFERENCE_TOKEN || "").trim();
-const providerId = (process.env.CC_SWITCH_CLAUDE_PROVIDER_ID || "").trim();
+const routeKey = (process.env.CC_SWITCH_CLAUDE_ROUTE_KEY || "").trim();
 const model = (process.env.CC_SWITCH_CLAUDE_MODEL || "claude-sonnet-4-6").trim();
 const timeoutMs = Math.max(
   1_000,
   Math.min(300_000, Number(process.env.CC_SWITCH_REAL_TIMEOUT_MS || 120_000)),
 );
 
-if (!baseUrl || !inferenceToken) {
+if (!baseUrl || !inferenceToken || !routeKey) {
   console.log(
-    "[SKIP] Claude OAuth real-account gate requires CC_SWITCH_BASE_URL and CC_SWITCH_INFERENCE_TOKEN",
+    "[SKIP] Claude OAuth real-account gate requires CC_SWITCH_BASE_URL, CC_SWITCH_INFERENCE_TOKEN, and CC_SWITCH_CLAUDE_ROUTE_KEY",
   );
   process.exit(0);
 }
@@ -36,11 +36,9 @@ async function request(path, init = {}) {
     headers.set("content-type", "application/json");
   }
   headers.set("x-api-key", inferenceToken);
-  if (providerId) {
-    headers.set("x-cc-provider-id", providerId);
-  }
+  const routedPath = `/r/${encodeURIComponent(routeKey)}${path}`;
   try {
-    const response = await fetch(`${baseUrl}${path}`, {
+    const response = await fetch(`${baseUrl}${routedPath}`, {
       ...init,
       headers,
       signal: controller.signal,
