@@ -6404,6 +6404,20 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     update.as_object_mut().unwrap().remove("clientRequestId");
     update["expectedRevision"] = json!(1);
     update["surfaces"][0]["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.3");
+    let divergent = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/bundle-grok",
+            update.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(divergent.status(), StatusCode::BAD_REQUEST);
+    for surface in update["surfaces"].as_array_mut().unwrap() {
+        surface["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.3");
+    }
     let updated = app
         .clone()
         .oneshot(json_request(
@@ -6439,8 +6453,9 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     );
 
     update["expectedRevision"] = json!(2);
-    update["surfaces"][1]["settingsConfig"]["modelMapping"]["upstreamModel"] =
-        json!("grok-4.20-multi-agent");
+    for surface in update["surfaces"].as_array_mut().unwrap() {
+        surface["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.20-multi-agent");
+    }
     let updated = app
         .clone()
         .oneshot(json_request(
@@ -6745,7 +6760,7 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
                 "enabled": false,
                 "profileId": "codex.custom_http",
                 "settingsConfig": {
-                    "modelMapping": {"mode": "single", "upstreamModel": "gpt-test"}
+                    "modelMapping": {"mode": "single", "upstreamModel": "claude-test"}
                 },
                 "customBinding": {
                     "upstreamProtocol": "open_ai_responses",
@@ -6757,7 +6772,7 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
                 "enabled": false,
                 "profileId": "gemini.custom_http",
                 "settingsConfig": {
-                    "modelMapping": {"mode": "single", "upstreamModel": "gemini-test"}
+                    "modelMapping": {"mode": "single", "upstreamModel": "claude-test"}
                 },
                 "customBinding": {
                     "upstreamProtocol": "gemini_native",
@@ -6885,6 +6900,7 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
                     "subdomain": "bundle-share-grok-url",
                     "description": "One Bundle Share",
                     "forSale": "No",
+                    "marketAccessMode": "all",
                     "tokenLimit": 500,
                     "parallelLimit": 5,
                     "expiresAt": "2035-01-01T00:00:00Z",
@@ -6899,6 +6915,7 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     let created_share = json_body(created_share).await;
     assert_eq!(status, StatusCode::OK, "response body: {created_share}");
     assert_eq!(created_share["configRevision"], 1);
+    assert_eq!(created_share["acl"]["marketAccessMode"], "all");
     assert_eq!(created_share["bindings"].as_array().map(Vec::len), Some(3));
     assert!(created_share["bindings"]
         .as_array()

@@ -6,6 +6,9 @@ use serde_json::Value;
 
 use super::credentials::{CredentialPatch, ProviderView};
 use super::model::{AppKind, Provider, ProviderMeta};
+use super::model_routing::{
+    normalize_and_validate_provider_model_routing, policy_from_settings, ModelRoutingPolicy,
+};
 use super::registry::{
     family_by_id, family_for_profile, profile_by_id, CredentialPolicy, CustomBindingInput,
     ProfileId, ProviderFamilySpec,
@@ -109,6 +112,7 @@ impl ProviderBundleWriteDraft {
         }
         let mut apps = BTreeSet::new();
         let mut enabled = 0usize;
+        let mut bundle_model_policy: Option<ModelRoutingPolicy> = None;
         for surface in &self.surfaces {
             if !apps.insert(surface.app) {
                 bail!(
@@ -135,6 +139,23 @@ impl ProviderBundleWriteDraft {
                     surface.app.as_str()
                 );
             }
+            let profile = profile_by_id(surface.profile_id.as_str())
+                .with_context(|| format!("unknown Provider profile {}", surface.profile_id))?;
+            let mut provider = self.provider_for_surface(surface);
+            normalize_and_validate_provider_model_routing(
+                surface.app,
+                &mut provider,
+                Some(profile),
+            )?;
+            let surface_model_policy = policy_from_settings(&provider.settings_config)
+                .context("Provider Bundle Surface has no resolved model policy")?;
+            if bundle_model_policy
+                .as_ref()
+                .is_some_and(|policy| policy != &surface_model_policy)
+            {
+                bail!("Provider Bundle Surfaces must share one model policy and upstream model");
+            }
+            bundle_model_policy.get_or_insert(surface_model_policy);
             enabled += usize::from(surface.enabled);
         }
         if enabled == 0 {
@@ -393,5 +414,67 @@ fn extra_string_ref<'a>(provider: &'a Provider, key: &str) -> Option<&'a str> {
 fn insert_optional_string(target: &mut BTreeMap<String, Value>, key: &str, value: Option<&str>) {
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         target.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn grok_surface(
+        app: AppKind,
+        profile_id: &str,
+        upstream_model: &str,
+    ) -> ProviderBundleSurfaceWriteDraft {
+        ProviderBundleSurfaceWriteDraft {
+            app,
+            enabled: true,
+            profile_id: ProfileId::parse(profile_id).unwrap(),
+            settings_config: json!({
+                "modelMapping": {
+                    "mode": "single",
+                    "upstreamModel": upstream_model,
+                }
+            }),
+            category: None,
+            meta: None,
+            custom_binding: None,
+            credential_patches: BTreeMap::new(),
+        }
+    }
+
+    fn grok_bundle(upstream_models: [&str; 3]) -> ProviderBundleWriteDraft {
+        ProviderBundleWriteDraft {
+            id: "grok-bundle".to_string(),
+            family_id: "family.grok_oauth".to_string(),
+            route_key: "grok-bundle".to_string(),
+            name: "Grok Bundle".to_string(),
+            website_url: None,
+            notes: None,
+            icon: None,
+            icon_color: None,
+            surfaces: vec![
+                grok_surface(AppKind::Claude, "claude.grok_oauth", upstream_models[0]),
+                grok_surface(AppKind::Codex, "codex.grok_oauth", upstream_models[1]),
+                grok_surface(AppKind::Gemini, "gemini.grok_oauth", upstream_models[2]),
+            ],
+            credential_patches: BTreeMap::new(),
+            expected_revision: None,
+            client_request_id: None,
+        }
+    }
+
+    #[test]
+    fn bundle_surfaces_require_one_model_policy_and_upstream_model() {
+        assert!(grok_bundle(["grok-4.5"; 3]).validate().is_ok());
+
+        let error = grok_bundle(["grok-4.5", "grok-4.5", "grok-other"])
+            .validate()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must share one model policy and upstream model"));
     }
 }

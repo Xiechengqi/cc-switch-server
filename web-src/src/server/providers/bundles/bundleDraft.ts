@@ -80,15 +80,18 @@ export interface ProviderBundleEditorDraft {
   accountGeneration?: number;
   endpoint: string;
   awsRegion: string;
+  modelPolicy: ProviderModelPolicy;
+  upstreamModel: string;
   secrets: Record<string, BundleSecretDraft>;
   surfaces: BundleSurfaceEditorDraft[];
 }
 
-const DEFAULT_CUSTOM_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> = {
-  claude: { upstreamProtocol: "anthropic_messages", authScheme: "api_key" },
-  codex: { upstreamProtocol: "open_ai_responses", authScheme: "bearer" },
-  gemini: { upstreamProtocol: "gemini_native", authScheme: "api_key" },
-};
+const DEFAULT_CUSTOM_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
+  {
+    claude: { upstreamProtocol: "anthropic_messages", authScheme: "api_key" },
+    codex: { upstreamProtocol: "open_ai_responses", authScheme: "bearer" },
+    gemini: { upstreamProtocol: "gemini_native", authScheme: "api_key" },
+  };
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -114,8 +117,40 @@ function sourceSurface(
 ): BundleSurfaceEditorDraft {
   const sourceProfile = profileById(family.credentialProfileId);
   const source = surfaces.find((surface) => surface.app === sourceProfile?.app);
-  if (!source) throw new Error(`Family ${family.familyId} has no credential Surface`);
+  if (!source)
+    throw new Error(`Family ${family.familyId} has no credential Surface`);
   return source;
+}
+
+export function modelPoliciesForFamily(
+  family: ProviderFamilySpec,
+): ProviderModelPolicy[] {
+  const profiles = family.surfaces.map((surface) =>
+    profileById(surface.profileId),
+  );
+  if (profiles.some((profile) => !profile)) return [];
+  const credentialProfile = profileById(family.credentialProfileId);
+  if (!credentialProfile) return [];
+  return modelPoliciesForProfile(credentialProfile).filter((policy) =>
+    profiles.every((profile) =>
+      modelPoliciesForProfile(profile!).includes(policy),
+    ),
+  );
+}
+
+function initialBundleModel(
+  family: ProviderFamilySpec,
+  surfaces: BundleSurfaceEditorDraft[],
+): { policy: ProviderModelPolicy; upstreamModel: string } {
+  const source = sourceSurface(family, surfaces);
+  const sourceModel = surfaceModelState(source);
+  const allowedPolicies = modelPoliciesForFamily(family);
+  return {
+    policy: allowedPolicies.includes(sourceModel.policy)
+      ? sourceModel.policy
+      : (allowedPolicies[0] ?? sourceModel.policy),
+    upstreamModel: sourceModel.upstreamModel,
+  };
 }
 
 function credentialSlotsForFamily(
@@ -124,7 +159,12 @@ function credentialSlotsForFamily(
   const profile = profileById(family.credentialProfileId);
   if (!profile) return [];
   if (profile.credentialPolicy.mode === "static_secret") {
-    return [{ logical: profile.credentialPolicy.slots[0] ?? "api_key", pointer: PRIMARY_SECRET_SLOT }];
+    return [
+      {
+        logical: profile.credentialPolicy.slots[0] ?? "api_key",
+        pointer: PRIMARY_SECRET_SLOT,
+      },
+    ];
   }
   if (profile.credentialPolicy.mode === "aws") {
     return profile.credentialPolicy.slots.map((logical) => ({
@@ -157,7 +197,10 @@ function surfaceFromResource(
   const preset = createDraftForProfile(profile);
   const provider = resource?.provider;
   const settings = clone(
-    (provider?.settingsConfig ?? preset.settingsConfig) as Record<string, unknown>,
+    (provider?.settingsConfig ?? preset.settingsConfig) as Record<
+      string,
+      unknown
+    >,
   );
   const meta = clone((provider?.meta ?? preset.meta) as ProviderMeta);
   const headersValue = settings.extraHeaders;
@@ -167,7 +210,9 @@ function surfaceFromResource(
     ),
   );
   const headers =
-    headersValue && typeof headersValue === "object" && !Array.isArray(headersValue)
+    headersValue &&
+    typeof headersValue === "object" &&
+    !Array.isArray(headersValue)
       ? Object.keys(headersValue as Record<string, unknown>).map((name) => ({
           id: crypto.randomUUID(),
           name,
@@ -218,6 +263,7 @@ export function createProviderBundleDraft(
   const sourceProfile = profileById(source.profileId)!;
   const sourceSettings = parseSettings(source.settingsText);
   const sourcePreset = createDraftForProfile(sourceProfile);
+  const model = initialBundleModel(family, surfaces);
   const secrets = Object.fromEntries(
     credentialSlotsForFamily(family).map(({ pointer }) => [
       pointer,
@@ -237,8 +283,12 @@ export function createProviderBundleDraft(
     accountId: "",
     endpoint: readEndpoint(sourceSettings, source.app),
     awsRegion: readAwsRegion(sourceSettings),
+    modelPolicy: model.policy,
+    upstreamModel: model.upstreamModel,
     secrets,
-    surfaces,
+    surfaces: surfaces.map((surface) =>
+      updateSurfaceModel(surface, model.policy, model.upstreamModel),
+    ),
   };
 }
 
@@ -260,6 +310,7 @@ export function editProviderBundleDraft(
   const sourceResource = bundle.surfaces[source.app];
   const sourceSettings = parseSettings(source.settingsText);
   const binding = sourceResource?.provider.meta?.authBinding;
+  const model = initialBundleModel(family, surfaces);
   const secrets = Object.fromEntries(
     credentialSlotsForFamily(family).map(({ pointer }) => {
       const actual = configuredSlot(bundle.credentialSlots, pointer) ?? pointer;
@@ -287,8 +338,12 @@ export function editProviderBundleDraft(
     accountGeneration: binding?.authIdentityGeneration,
     endpoint: readEndpoint(sourceSettings, source.app),
     awsRegion: readAwsRegion(sourceSettings),
+    modelPolicy: model.policy,
+    upstreamModel: model.upstreamModel,
     secrets,
-    surfaces,
+    surfaces: surfaces.map((surface) =>
+      updateSurfaceModel(surface, model.policy, model.upstreamModel),
+    ),
   };
 }
 
@@ -309,7 +364,8 @@ export function surfaceModelState(surface: BundleSurfaceEditorDraft): {
   const settings = parseSettings(surface.settingsText);
   return {
     policy: readModelPolicy(settings, profile),
-    upstreamModel: readUpstreamModel(settings) ?? profile.defaultUpstreamModel ?? "",
+    upstreamModel:
+      readUpstreamModel(settings) ?? profile.defaultUpstreamModel ?? "",
   };
 }
 
@@ -322,6 +378,25 @@ export function updateSurfaceModel(
   if (policy === "single") setSingleModel(settings, surface.app, upstreamModel);
   else setPassthroughModel(settings);
   return { ...surface, settingsText: prettySettings(settings) };
+}
+
+export function updateBundleModel(
+  draft: ProviderBundleEditorDraft,
+  policy: ProviderModelPolicy,
+  upstreamModel: string,
+): ProviderBundleEditorDraft {
+  return {
+    ...draft,
+    modelPolicy: policy,
+    upstreamModel,
+    surfaces: draft.surfaces.map((surface) => {
+      try {
+        return updateSurfaceModel(surface, policy, upstreamModel);
+      } catch {
+        return surface;
+      }
+    }),
+  };
 }
 
 export function surfaceEndpoint(surface: BundleSurfaceEditorDraft): string {
@@ -410,10 +485,19 @@ function surfaceWriteDraft(
   const profile = profileById(surface.profileId);
   if (!profile) throw new Error(`Unknown profile ${surface.profileId}`);
   const settings = parseSettings(surface.settingsText);
-  if (family.endpointScope === "bundle" && profileAllowsEndpointEditing(profile)) {
+  if (
+    family.endpointScope === "bundle" &&
+    profileAllowsEndpointEditing(profile)
+  ) {
     setEndpoint(settings, surface.app, draft.endpoint);
   }
-  if (profile.formComposition === "aws") setAwsRegion(settings, draft.awsRegion);
+  if (profile.formComposition === "aws")
+    setAwsRegion(settings, draft.awsRegion);
+  if (draft.modelPolicy === "single") {
+    setSingleModel(settings, surface.app, draft.upstreamModel);
+  } else {
+    setPassthroughModel(settings);
+  }
   const meta = clone(surface.meta);
   meta.providerType = profile.compatibilityProviderType;
   if (profile.credentialPolicy.mode === "managed_account") {
@@ -485,16 +569,20 @@ export function validateProviderBundleDraft(
     if (!optional && !secret.configured && !secret.value.trim()) {
       return "Configure the required credential";
     }
-    if (!optional && secret.clear) return "A required credential cannot be cleared";
+    if (!optional && secret.clear)
+      return "A required credential cannot be cleared";
   }
-  if (
-    credentialProfile.formComposition === "aws" &&
-    !draft.awsRegion.trim()
-  ) {
+  if (credentialProfile.formComposition === "aws" && !draft.awsRegion.trim()) {
     return "AWS region is required";
   }
+  const allowedModelPolicies = modelPoliciesForFamily(family);
+  if (!allowedModelPolicies.includes(draft.modelPolicy)) {
+    return "Provider model policy is invalid";
+  }
+  if (draft.modelPolicy === "single" && !draft.upstreamModel.trim()) {
+    return "Upstream model is required";
+  }
   for (const surface of draft.surfaces) {
-    if (!surface.enabled) continue;
     const profile = profileById(surface.profileId);
     if (!profile) return `Profile ${surface.profileId} is unavailable`;
     let settings: Record<string, unknown>;
@@ -503,18 +591,16 @@ export function validateProviderBundleDraft(
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
-    const modelPolicy = readModelPolicy(settings, profile);
-    if (!modelPoliciesForProfile(profile).includes(modelPolicy)) {
-      return `${surface.app} model policy is invalid`;
-    }
-    if (modelPolicy === "single" && !readUpstreamModel(settings)?.trim()) {
-      return `${surface.app} upstream model is required`;
-    }
+    if (!surface.enabled) continue;
     if (profile.formComposition === "custom") {
       const endpoint = readEndpoint(settings, surface.app);
       try {
         const parsed = new URL(endpoint);
-        if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) {
+        if (
+          !/^https?:$/.test(parsed.protocol) ||
+          parsed.username ||
+          parsed.password
+        ) {
           return `${surface.app} endpoint is invalid`;
         }
       } catch {

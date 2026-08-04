@@ -976,11 +976,17 @@ struct SaveProviderBundleShareCommand {
     #[serde(default)]
     description: Option<String>,
     for_sale: String,
+    #[serde(default = "default_provider_bundle_market_access_mode")]
+    market_access_mode: String,
     token_limit: i64,
     parallel_limit: i64,
     expires_at: String,
     #[serde(default)]
     shared_with_emails: Vec<String>,
+}
+
+fn default_provider_bundle_market_access_mode() -> String {
+    "all".to_string()
 }
 
 fn provider_bundle_share_conflict(message: impl Into<String>) -> ApiError {
@@ -1081,6 +1087,16 @@ fn provider_bundle_share_sale(value: &str) -> Result<(bool, bool), ApiError> {
     }
 }
 
+fn provider_bundle_market_access_mode(value: &str) -> Result<String, ApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "all" => Ok("all".to_string()),
+        "selected" => Ok("selected".to_string()),
+        _ => Err(ApiError::bad_request(
+            "marketAccessMode must be all or selected",
+        )),
+    }
+}
+
 fn normalized_provider_bundle_share_emails(emails: &[String], owner_email: &str) -> Vec<String> {
     emails
         .iter()
@@ -1111,6 +1127,7 @@ fn stage_provider_bundle_share(
     let (token_limit, parallel_limit) = provider_bundle_share_limits(command)?;
     let expires_at = provider_bundle_share_expiration(&command.expires_at)?;
     let (for_sale, free_access) = provider_bundle_share_sale(&command.for_sale)?;
+    let market_access_mode = provider_bundle_market_access_mode(&command.market_access_mode)?;
     let subdomain =
         (!command.subdomain.trim().is_empty()).then(|| command.subdomain.trim().to_string());
     let shared_with_emails =
@@ -1132,6 +1149,7 @@ fn stage_provider_bundle_share(
                 ShareSettingsPatch {
                     description: Some(description),
                     for_sale: Some(command.for_sale.clone()),
+                    market_access_mode: Some(market_access_mode),
                     shared_with_emails: Some(shared_with_emails),
                     token_limit: Some(command.token_limit),
                     parallel_limit: Some(command.parallel_limit),
@@ -1167,7 +1185,7 @@ fn stage_provider_bundle_share(
                 acl: Some(ShareAcl {
                     shared_with_emails,
                     public_market_email: None,
-                    market_access_mode: Some("selected".to_string()),
+                    market_access_mode: Some(market_access_mode),
                 }),
                 token_limit,
                 parallel_limit,
@@ -1219,6 +1237,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     provider_bundle_share_limits(&command)?;
     provider_bundle_share_expiration(&command.expires_at)?;
     provider_bundle_share_sale(&command.for_sale)?;
+    provider_bundle_market_access_mode(&command.market_access_mode)?;
 
     let config = state.config.read().await.clone();
     let owner_email = config

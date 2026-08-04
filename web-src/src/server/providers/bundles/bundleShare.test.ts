@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ShareRecord } from "@/lib/api/share";
+import { PERMANENT_EXPIRES_AT } from "@/utils/shareUtils";
 
 const shareApiMock = vi.hoisted(() => ({
   saveProviderBundleShare: vi.fn(),
@@ -12,12 +13,17 @@ vi.mock("@/lib/api/share", async (importOriginal) => {
 });
 
 import {
+  BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
   saveBundleShare,
   shareForBundle,
 } from "./bundleShare";
 
-function share(bindings: ShareRecord["bindings"], revision = 1): ShareRecord {
+function share(
+  bindings: ShareRecord["bindings"],
+  revision = 1,
+  expiresAt = PERMANENT_EXPIRES_AT,
+): ShareRecord {
   return {
     id: "share-1",
     capacityPoolId: "pool-1",
@@ -33,7 +39,7 @@ function share(bindings: ShareRecord["bindings"], revision = 1): ShareRecord {
     parallelLimit: -1,
     tokensUsed: 0,
     requestsCount: 0,
-    expiresAt: "2099-12-31T23:59:59Z",
+    expiresAt,
     shareSlug: "bundle-share",
     status: "active",
     autoStart: true,
@@ -49,6 +55,51 @@ function share(bindings: ShareRecord["bindings"], revision = 1): ShareRecord {
 describe("Provider Bundle sharing", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("restores the original defaults for a new Share", () => {
+    expect(createBundleShareDraft()).toMatchObject({
+      enabled: false,
+      forSale: "Yes",
+      marketAccessMode: "all",
+      tokenLimit: "",
+      parallelLimit: "",
+      expiry: "permanent",
+    });
+  });
+
+  it("maps every quick expiry preset to and from an absolute timestamp", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-08-04T12:00:00Z");
+    vi.setSystemTime(now);
+    shareApiMock.saveProviderBundleShare.mockResolvedValue(undefined);
+
+    for (const preset of BUNDLE_SHARE_EXPIRY_PRESETS) {
+      const expiresAt = new Date(
+        now.getTime() + preset.seconds * 1000,
+      ).toISOString();
+      expect(
+        createBundleShareDraft(share({ claude: "bundle-1" }, 1, expiresAt))
+          .expiry,
+      ).toBe(preset.value);
+
+      const draft = createBundleShareDraft();
+      draft.expiry = preset.value;
+      await saveBundleShare("bundle-1", draft);
+      expect(
+        shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0].expiresAt,
+      ).toBe(expiresAt);
+    }
+
+    const permanent = createBundleShareDraft();
+    await saveBundleShare("bundle-1", permanent);
+    expect(
+      shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0].expiresAt,
+    ).toBe(PERMANENT_EXPIRES_AT);
   });
 
   it("finds one Share through any Bundle Surface binding", () => {
@@ -77,6 +128,7 @@ describe("Provider Bundle sharing", () => {
         bundleId: "bundle-1",
         enabled: true,
         subdomain: "bundle-share",
+        marketAccessMode: "all",
       }),
     );
     expect(
@@ -107,6 +159,7 @@ describe("Provider Bundle sharing", () => {
         shareId: "share-1",
         expectedConfigRevision: 4,
         description: "Shared Bundle",
+        marketAccessMode: "selected",
       }),
     );
   });

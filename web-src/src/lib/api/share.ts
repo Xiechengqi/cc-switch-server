@@ -233,6 +233,7 @@ export interface SaveProviderBundleShareParams {
   subdomain: string;
   description?: string;
   forSale: "Yes" | "No" | "Free";
+  marketAccessMode: "selected" | "all";
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;

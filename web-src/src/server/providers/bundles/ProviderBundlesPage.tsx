@@ -9,7 +9,6 @@ import {
   Plus,
   RefreshCw,
   Route,
-  Share2,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -17,9 +16,10 @@ import { toast } from "sonner";
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIcon } from "@/components/ProviderIcon";
-import { Badge } from "@/components/ui/badge";
+import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
 import { Button } from "@/components/ui/button";
 import type { ProviderBundleView } from "@/lib/api/providers";
+import type { ShareRecord } from "@/lib/api/share";
 import { providersApi } from "@/lib/api/providers";
 import { copyText } from "@/lib/clipboard";
 import { useSharesQuery } from "@/lib/query";
@@ -46,12 +46,12 @@ function AppLogo({ app }: { app: CoreProviderApp }) {
 
 function BundleCard({
   bundle,
-  shared,
+  share,
   onEdit,
   onDelete,
 }: {
   bundle: ProviderBundleView;
-  shared: boolean;
+  share?: ShareRecord;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -59,32 +59,32 @@ function BundleCard({
   const family = familyById(bundle.familyId);
   const routeBase = `${window.location.origin}/r/${bundle.routeKey}`;
   return (
-    <article className="rounded-lg border border-border/70 bg-background p-4 shadow-sm transition-colors hover:border-border">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-3">
-          <div
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border bg-muted/40"
-            style={bundle.iconColor ? { color: bundle.iconColor } : undefined}
-          >
+    <article className="group relative overflow-hidden rounded-xl border border-border bg-card p-4 text-card-foreground transition-all duration-300 hover:border-border-active hover:shadow-sm">
+      <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105">
             <ProviderIcon
               icon={bundle.icon}
               name={bundle.name}
-              size={23}
+              color={bundle.iconColor}
+              size={20}
               showFallback
             />
           </div>
-          <div className="min-w-0">
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <h2 className="truncate text-sm font-semibold">{bundle.name}</h2>
-              <div className="flex shrink-0 items-center gap-1.5">
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex min-h-7 min-w-0 flex-wrap items-center gap-2">
+              <h2 className="truncate text-base font-semibold leading-none">
+                {bundle.name}
+              </h2>
+              <div className="flex shrink-0 items-center gap-1">
                 {bundle.supportedApps.map((app) => (
                   <span
                     key={app}
                     className={cn(
-                      "flex h-6 w-6 items-center justify-center rounded border",
+                      "flex h-5 w-5 items-center justify-center",
                       bundle.enabledApps.includes(app)
-                        ? "border-border bg-background"
-                        : "border-transparent bg-muted opacity-35 grayscale",
+                        ? "opacity-100"
+                        : "opacity-30 grayscale",
                     )}
                     title={`${app}${bundle.enabledApps.includes(app) ? "" : " (disabled)"}`}
                   >
@@ -92,13 +92,41 @@ function BundleCard({
                   </span>
                 ))}
               </div>
+              <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                {family?.label ?? bundle.familyId}
+              </span>
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold",
+                  bundle.credentialConfigured
+                    ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                    : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+                )}
+              >
+                <KeyRound className="h-3 w-3" />
+                {bundle.credentialConfigured
+                  ? t("providerBundle.credentialReady", {
+                      defaultValue: "凭据已配置",
+                    })
+                  : t("providerBundle.credentialMissing", {
+                      defaultValue: "缺少凭据",
+                    })}
+              </span>
+              {share ? <ProviderShareStatusTag share={share} /> : null}
             </div>
-            <p className="mt-1 truncate text-xs text-muted-foreground">
-              {family?.label ?? bundle.familyId}
-            </p>
+            <button
+              type="button"
+              className="inline-flex max-w-full items-center gap-1.5 overflow-hidden text-left text-sm text-blue-500 transition-colors hover:underline dark:text-blue-400"
+              title={`${routeBase} - ${t("common.copy")}`}
+              onClick={() => void copyText(routeBase)}
+            >
+              <Route className="h-3.5 w-3.5 shrink-0" />
+              <code className="min-w-0 truncate">{routeBase}</code>
+              <Copy className="h-3.5 w-3.5 shrink-0" />
+            </button>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex shrink-0 justify-end gap-1 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100 max-sm:opacity-100">
           <Button
             type="button"
             size="icon"
@@ -118,45 +146,6 @@ function BundleCard({
             <Trash2 className="h-4 w-4" />
           </Button>
         </div>
-      </div>
-
-      <div className="mt-4 flex flex-wrap items-center gap-2">
-        <Badge variant="outline" className="gap-1.5 font-mono font-normal">
-          <Route className="h-3.5 w-3.5" />
-          {bundle.routeKey}
-        </Badge>
-        <Badge
-          variant={bundle.credentialConfigured ? "secondary" : "destructive"}
-          className="gap-1.5"
-        >
-          <KeyRound className="h-3.5 w-3.5" />
-          {bundle.credentialConfigured
-            ? t("providerBundle.credentialReady", {
-                defaultValue: "凭据已配置",
-              })
-            : t("providerBundle.credentialMissing", {
-                defaultValue: "缺少凭据",
-              })}
-        </Badge>
-        {shared ? (
-          <Badge variant="secondary" className="gap-1.5">
-            <Share2 className="h-3.5 w-3.5" />
-            {t("provider.share.stateActive", { defaultValue: "分享已启用" })}
-          </Badge>
-        ) : null}
-      </div>
-
-      <div className="mt-4 flex min-w-0 items-center gap-2 rounded-md bg-muted/40 px-3 py-2">
-        <code className="min-w-0 flex-1 truncate text-xs">{routeBase}</code>
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          title={t("common.copy")}
-          onClick={() => void copyText(routeBase)}
-        >
-          <Copy className="h-4 w-4" />
-        </Button>
       </div>
     </article>
   );
@@ -179,12 +168,12 @@ export function ProviderBundlesPage({
   const [deleting, setDeleting] = useState<ProviderBundleView | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const bundles = bundlesQuery.data ?? [];
-  const shareIdsByBundle = useMemo(
+  const sharesByBundle = useMemo(
     () =>
       new Map(
         bundles.map((bundle) => [
           bundle.id,
-          shareForBundle(sharesQuery.data, bundle.id)?.id,
+          shareForBundle(sharesQuery.data, bundle.id),
         ]),
       ),
     [bundles, sharesQuery.data],
@@ -312,12 +301,12 @@ export function ProviderBundlesPage({
           </Button>
         </div>
       ) : (
-        <div className="grid gap-3 lg:grid-cols-2">
+        <div className="space-y-3">
           {bundles.map((bundle) => (
             <BundleCard
               key={bundle.id}
               bundle={bundle}
-              shared={Boolean(shareIdsByBundle.get(bundle.id))}
+              share={sharesByBundle.get(bundle.id)}
               onEdit={() => setEditing(bundle)}
               onDelete={() => setDeleting(bundle)}
             />

@@ -10,11 +10,31 @@ export interface ProviderBundleShareDraft {
   subdomain: string;
   description: string;
   forSale: "Yes" | "No" | "Free";
+  marketAccessMode: "selected" | "all";
   tokenLimit: string;
   parallelLimit: string;
-  expiry: "permanent" | "7d" | "30d";
+  expiry: ProviderBundleShareExpiry;
   sharedWithEmails: string;
 }
+
+export const BUNDLE_SHARE_EXPIRY_PRESETS = [
+  { value: "1h", seconds: 60 * 60, labelKey: "share.expiry.oneHour" },
+  { value: "6h", seconds: 6 * 60 * 60, labelKey: "share.expiry.sixHours" },
+  { value: "1d", seconds: 24 * 60 * 60, labelKey: "share.expiry.oneDay" },
+  {
+    value: "7d",
+    seconds: 7 * 24 * 60 * 60,
+    labelKey: "share.expiry.sevenDays",
+  },
+  {
+    value: "30d",
+    seconds: 30 * 24 * 60 * 60,
+    labelKey: "share.expiry.thirtyDays",
+  },
+] as const;
+
+export type ProviderBundleShareExpiry =
+  "permanent" | (typeof BUNDLE_SHARE_EXPIRY_PRESETS)[number]["value"];
 
 export function shareForBundle(
   shares: ShareRecord[] | undefined,
@@ -33,16 +53,20 @@ export function createBundleShareDraft(
   const expiry =
     !Number.isFinite(expiresAt) || expiresAt >= Date.parse(PERMANENT_EXPIRES_AT)
       ? "permanent"
-      : remaining > 14 * 24 * 60 * 60 * 1000
-        ? "30d"
-        : "7d";
+      : BUNDLE_SHARE_EXPIRY_PRESETS.reduce((closest, preset) =>
+          Math.abs(preset.seconds * 1000 - remaining) <
+          Math.abs(closest.seconds * 1000 - remaining)
+            ? preset
+            : closest,
+        ).value;
   return {
     enabled: Boolean(
       share && share.status !== "paused" && share.status !== "deleted",
     ),
     subdomain: share?.shareSlug ?? "",
     description: share?.description ?? "",
-    forSale: share?.forSale ?? "No",
+    forSale: share?.forSale ?? "Yes",
+    marketAccessMode: share?.marketAccessMode ?? "all",
     tokenLimit: share && share.tokenLimit >= 0 ? String(share.tokenLimit) : "",
     parallelLimit:
       share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "",
@@ -62,8 +86,11 @@ function limitValue(value: string, fallback: number): number {
 
 function expiresAt(draft: ProviderBundleShareDraft): string {
   if (draft.expiry === "permanent") return PERMANENT_EXPIRES_AT;
-  const days = draft.expiry === "30d" ? 30 : 7;
-  return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+  const preset = BUNDLE_SHARE_EXPIRY_PRESETS.find(
+    (candidate) => candidate.value === draft.expiry,
+  );
+  if (!preset) throw new Error("Share expiry preset is invalid");
+  return new Date(Date.now() + preset.seconds * 1000).toISOString();
 }
 
 function normalizedEmails(value: string): string[] {
@@ -94,6 +121,7 @@ export async function saveBundleShare(
     subdomain: draft.subdomain.trim() || existing?.shareSlug || "",
     description: draft.description.trim() || undefined,
     forSale: draft.forSale,
+    marketAccessMode: draft.marketAccessMode,
     tokenLimit,
     parallelLimit,
     expiresAt: expiry,

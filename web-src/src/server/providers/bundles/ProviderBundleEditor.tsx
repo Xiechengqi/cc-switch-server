@@ -16,6 +16,7 @@ import { toast } from "sonner";
 
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -48,12 +49,10 @@ import {
   customPolicyForProfile,
   driverForProfile,
   familyById,
-  modelPoliciesForProfile,
   profileById,
   providerRegistry,
   type CoreProviderApp,
   type ProviderFamilySpec,
-  type ProviderModelPolicy,
 } from "@/server/providerRegistry";
 import {
   createDraftForProfile,
@@ -61,7 +60,10 @@ import {
 } from "@/server/providers/editor/providerDraft";
 import { SecretInput } from "@/server/ui/SecretInput";
 import { cn } from "@/lib/utils";
+import { SHARE_TOKEN_PRESETS } from "@/utils/shareFormUtils";
+import { DEFAULT_PARALLEL_LIMIT } from "@/utils/shareUtils";
 import {
+  BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
   saveBundleShare,
   shareForBundle,
@@ -71,12 +73,12 @@ import {
   createProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
+  modelPoliciesForFamily,
   parseSettings,
   surfaceEndpoint,
-  surfaceModelState,
   toProviderBundleWriteDraft,
+  updateBundleModel,
   updateSurfaceEndpoint,
-  updateSurfaceModel,
   validateProviderBundleDraft,
   type BundleSurfaceEditorDraft,
   type ProviderBundleEditorDraft,
@@ -192,7 +194,6 @@ function SurfaceEditor({
   const profile = profileById(surface.profileId);
   if (!profile) return null;
   const settingsValid = surfaceSettingsValid(surface);
-  const model = settingsValid ? surfaceModelState(surface) : null;
   const customPolicy = customPolicyForProfile(profile);
   const endpoint = settingsValid ? surfaceEndpoint(surface) : "";
 
@@ -222,56 +223,6 @@ function SurfaceEditor({
           />
         </div>
       </div>
-
-      {model ? (
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="space-y-2">
-            <Label>{t("serverProviderForm.model.title")}</Label>
-            <Select
-              value={model.policy}
-              onValueChange={(value) =>
-                onChange(
-                  updateSurfaceModel(
-                    surface,
-                    value as ProviderModelPolicy,
-                    model.upstreamModel,
-                  ),
-                )
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {modelPoliciesForProfile(profile).map((policy) => (
-                  <SelectItem key={policy} value={policy}>
-                    {policy === "single"
-                      ? t("serverProviderForm.model.single")
-                      : t("serverProviderForm.model.passthrough")}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          {model.policy === "single" ? (
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.model.upstreamModel")}</Label>
-              <Input
-                value={model.upstreamModel}
-                onChange={(event) =>
-                  onChange(
-                    updateSurfaceModel(
-                      surface,
-                      model.policy,
-                      event.target.value,
-                    ),
-                  )
-                }
-              />
-            </div>
-          ) : null}
-        </div>
-      ) : null}
 
       {profile.formComposition === "custom" && customPolicy ? (
         <div className="space-y-5">
@@ -620,26 +571,88 @@ function BundleShareEditor({
               {t("provider.share.tokenLimit", { defaultValue: "Token 限额" })}
             </Label>
             <Input
-              inputMode="numeric"
+              type="number"
+              min={0}
+              placeholder={t("share.unlimited", { defaultValue: "无上限" })}
               value={draft.tokenLimit}
               onChange={(event) =>
                 onChange({ ...draft, tokenLimit: event.target.value })
               }
             />
+            <div className="flex flex-wrap gap-1.5">
+              <Button
+                type="button"
+                variant={draft.tokenLimit === "" ? "secondary" : "outline"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => onChange({ ...draft, tokenLimit: "" })}
+              >
+                {t("share.unlimited", { defaultValue: "无上限" })}
+              </Button>
+              {SHARE_TOKEN_PRESETS.map((preset) => (
+                <Button
+                  key={preset}
+                  type="button"
+                  variant={
+                    draft.tokenLimit === String(preset)
+                      ? "secondary"
+                      : "outline"
+                  }
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={() =>
+                    onChange({ ...draft, tokenLimit: String(preset) })
+                  }
+                >
+                  {preset.toLocaleString()}
+                </Button>
+              ))}
+            </div>
           </div>
           <div className="space-y-2">
             <Label>
               {t("provider.share.parallelLimit", { defaultValue: "并发限额" })}
             </Label>
             <Input
-              inputMode="numeric"
+              type="number"
+              min={1}
+              placeholder={t("share.unlimited", { defaultValue: "无上限" })}
               value={draft.parallelLimit}
               onChange={(event) =>
                 onChange({ ...draft, parallelLimit: event.target.value })
               }
             />
+            <div className="flex flex-wrap gap-1.5">
+              <Button
+                type="button"
+                variant={draft.parallelLimit === "" ? "secondary" : "outline"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => onChange({ ...draft, parallelLimit: "" })}
+              >
+                {t("share.unlimited", { defaultValue: "无上限" })}
+              </Button>
+              <Button
+                type="button"
+                variant={
+                  draft.parallelLimit === String(DEFAULT_PARALLEL_LIMIT)
+                    ? "secondary"
+                    : "outline"
+                }
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() =>
+                  onChange({
+                    ...draft,
+                    parallelLimit: String(DEFAULT_PARALLEL_LIMIT),
+                  })
+                }
+              >
+                {DEFAULT_PARALLEL_LIMIT}
+              </Button>
+            </div>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2 md:col-span-2">
             <Label>
               {t("provider.share.expiry", { defaultValue: "有效期" })}
             </Label>
@@ -657,16 +670,40 @@ function BundleShareEditor({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="permanent">
-                  {t("common.permanent", { defaultValue: "永久" })}
+                  {t("share.expiry.permanent", { defaultValue: "永久有效" })}
                 </SelectItem>
-                <SelectItem value="7d">
-                  7 {t("common.days", { defaultValue: "天" })}
-                </SelectItem>
-                <SelectItem value="30d">
-                  30 {t("common.days", { defaultValue: "天" })}
-                </SelectItem>
+                {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
+                  <SelectItem key={preset.value} value={preset.value}>
+                    {t(preset.labelKey)}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
+            <div className="flex flex-wrap gap-1.5">
+              <Button
+                type="button"
+                variant={draft.expiry === "permanent" ? "secondary" : "outline"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => onChange({ ...draft, expiry: "permanent" })}
+              >
+                {t("share.expiry.permanent", { defaultValue: "永久有效" })}
+              </Button>
+              {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
+                <Button
+                  key={preset.value}
+                  type="button"
+                  variant={
+                    draft.expiry === preset.value ? "secondary" : "outline"
+                  }
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => onChange({ ...draft, expiry: preset.value })}
+                >
+                  {t(preset.labelKey)}
+                </Button>
+              ))}
+            </div>
           </div>
         </div>
       ) : null}
@@ -701,6 +738,13 @@ export function ProviderBundleEditor({
   );
   const accountsQuery = useManagedAccountsQuery();
   const credentialProfile = profileById(family.credentialProfileId);
+  const allowedModelPolicies = modelPoliciesForFamily(family);
+  const defaultSharedModel =
+    credentialProfile?.defaultUpstreamModel ??
+    family.surfaces
+      .map((surface) => profileById(surface.profileId)?.defaultUpstreamModel)
+      .find(Boolean) ??
+    "";
   const managedProviderType =
     credentialProfile?.credentialPolicy.mode === "managed_account"
       ? credentialProfile.credentialPolicy.accountProviderType
@@ -864,14 +908,30 @@ export function ProviderBundleEditor({
           title={t("providerBundle.identity", { defaultValue: "供应商" })}
         >
           <div className="grid gap-4 md:grid-cols-2">
-            <div className={cn("space-y-2", !persisted && "md:col-span-2")}>
-              <Label>
+            <div className="space-y-2 md:col-span-2">
+              <Label className={persisted ? "block text-center" : undefined}>
                 {t("providerBundle.family", { defaultValue: "供应商类型" })}
               </Label>
               {persisted ? (
-                <div className="flex h-10 items-center gap-2 rounded-md border px-3 text-sm">
-                  <FamilyLogo family={family} />
-                  {family.label}
+                <div className="space-y-4">
+                  <ProviderIconControl
+                    icon={draft.icon}
+                    iconColor={draft.iconColor}
+                    providerName={draft.name}
+                    onChange={(icon, iconColor) =>
+                      setDraft((current) => ({
+                        ...current,
+                        icon,
+                        iconColor,
+                      }))
+                    }
+                  />
+                  <div className="flex justify-center">
+                    <Badge variant="outline" className="gap-2">
+                      <FamilyLogo family={family} />
+                      {family.label}
+                    </Badge>
+                  </div>
                 </div>
               ) : (
                 <div
@@ -1068,6 +1128,77 @@ export function ProviderBundleEditor({
             </div>
           </Section>
         ) : null}
+
+        <Section title={t("serverProviderForm.model.title")}>
+          <div className="space-y-3">
+            {allowedModelPolicies.length > 1 ? (
+              <Tabs
+                value={draft.modelPolicy}
+                onValueChange={(value) => {
+                  if (value !== "single" && value !== "passthrough") return;
+                  if (!allowedModelPolicies.includes(value)) return;
+                  setDraft((current) =>
+                    updateBundleModel(
+                      current,
+                      value,
+                      value === "single" && !current.upstreamModel.trim()
+                        ? defaultSharedModel
+                        : current.upstreamModel,
+                    ),
+                  );
+                }}
+              >
+                <TabsList className="w-full justify-start sm:w-auto">
+                  {allowedModelPolicies.map((policy) => (
+                    <TabsTrigger
+                      key={policy}
+                      value={policy}
+                      className="min-w-0 flex-1 sm:min-w-[10rem]"
+                    >
+                      {policy === "single"
+                        ? t("serverProviderForm.model.single")
+                        : t("serverProviderForm.model.passthrough")}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+            ) : (
+              <Badge variant="secondary">
+                {draft.modelPolicy === "single"
+                  ? t("serverProviderForm.model.single")
+                  : t("serverProviderForm.model.passthrough")}
+              </Badge>
+            )}
+
+            {draft.modelPolicy === "single" ? (
+              <div className="space-y-2">
+                <Label htmlFor="provider-bundle-model">
+                  {t("serverProviderForm.model.upstreamModel")}
+                </Label>
+                <Input
+                  id="provider-bundle-model"
+                  value={draft.upstreamModel}
+                  onChange={(event) =>
+                    setDraft((current) =>
+                      updateBundleModel(
+                        current,
+                        current.modelPolicy,
+                        event.target.value,
+                      ),
+                    )
+                  }
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("serverProviderForm.model.singleHint")}
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {t("serverProviderForm.model.passthroughHint")}
+              </p>
+            )}
+          </div>
+        </Section>
 
         {commonEndpointEditable ? (
           <Section title={t("serverProviderForm.endpoint.title")}>

@@ -1,15 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  familyById,
-  providerRegistry,
-} from "@/server/providerRegistry";
+import { familyById, providerRegistry } from "@/server/providerRegistry";
 import { readEndpoint } from "@/server/providers/editor/providerDraft";
 import {
   createProviderBundleDraft,
   familyCredentialSlots,
+  modelPoliciesForFamily,
   parseSettings,
   toProviderBundleWriteDraft,
+  updateBundleModel,
   updateSurfaceEndpoint,
   validateProviderBundleDraft,
 } from "./bundleDraft";
@@ -34,6 +33,51 @@ describe("Provider Bundle drafts", () => {
       );
       expect(draft.routeKey, family.familyId).toMatch(
         /^(?=.{3,64}$)(?=.*[a-z])[a-z0-9_-]+$/,
+      );
+      expect(modelPoliciesForFamily(family), family.familyId).toContain(
+        draft.modelPolicy,
+      );
+    }
+  });
+
+  it("writes one shared model policy and upstream model to every Surface", () => {
+    const family = familyById("family.grok_oauth")!;
+    const draft = updateBundleModel(
+      createProviderBundleDraft(family),
+      "single",
+      "grok-shared-model",
+    );
+    const write = toProviderBundleWriteDraft(draft);
+
+    for (const surface of write.surfaces) {
+      expect(surface.settingsConfig.modelMapping).toEqual({
+        mode: "single",
+        upstreamModel: "grok-shared-model",
+      });
+    }
+
+    const passthrough = toProviderBundleWriteDraft(
+      updateBundleModel(draft, "passthrough", "grok-shared-model"),
+    );
+    for (const surface of passthrough.surfaces) {
+      expect(surface.settingsConfig.modelMapping).toEqual({
+        mode: "passthrough",
+      });
+    }
+  });
+
+  it("locks official Claude and Codex families to passthrough", () => {
+    for (const familyId of ["family.claude_oauth", "family.openai_oauth"]) {
+      const family = familyById(familyId)!;
+      const draft = createProviderBundleDraft(family);
+      expect(modelPoliciesForFamily(family), familyId).toEqual(["passthrough"]);
+      expect(draft.modelPolicy, familyId).toBe("passthrough");
+
+      draft.accountId = "official-account";
+      draft.modelPolicy = "single";
+      draft.upstreamModel = "forced-model";
+      expect(validateProviderBundleDraft(draft), familyId).toBe(
+        "Provider model policy is invalid",
       );
     }
   });
@@ -109,7 +153,10 @@ describe("Provider Bundle drafts", () => {
         },
       });
       expect(
-        readEndpoint(parseSettings(JSON.stringify(surface.settingsConfig)), surface.app),
+        readEndpoint(
+          parseSettings(JSON.stringify(surface.settingsConfig)),
+          surface.app,
+        ),
       ).toContain(`${surface.app}.example`);
     }
   });
@@ -118,9 +165,10 @@ describe("Provider Bundle drafts", () => {
     const family = familyById("family.custom_http")!;
     const draft = createProviderBundleDraft(family);
     draft.surfaces = draft.surfaces.map((surface, index) => {
-      const next = index === 0
-        ? updateSurfaceEndpoint(surface, "https://claude.example/v1")
-        : surface;
+      const next =
+        index === 0
+          ? updateSurfaceEndpoint(surface, "https://claude.example/v1")
+          : surface;
       return {
         ...next,
         enabled: index === 0,
