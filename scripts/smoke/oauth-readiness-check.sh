@@ -69,7 +69,7 @@ check_any_var() {
 check_grok_external_gate() {
   local missing=()
   local var
-  for var in GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_ROUTE_KEY; do
+  for var in GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_SHARE_URL ROUTER_API_TOKEN; do
     if ! env_present "$var"; then
       missing+=("$var")
     fi

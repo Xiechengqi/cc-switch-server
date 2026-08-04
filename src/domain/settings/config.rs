@@ -135,8 +135,6 @@ pub struct AuthConfig {
     #[serde(default)]
     pub api_token_hash: Option<String>,
     #[serde(default)]
-    pub inference_token_hash: Option<String>,
-    #[serde(default)]
     pub debug_token_hash: Option<String>,
     #[serde(default)]
     pub debug_token_expires_at_ms: Option<i64>,
@@ -425,25 +423,6 @@ impl ServerConfig {
         verify_secret(hash, api_token)
     }
 
-    pub fn inference_token_configured(&self) -> bool {
-        self.auth
-            .inference_token_hash
-            .as_deref()
-            .and_then(inference_token_digest)
-            .is_some()
-    }
-
-    pub fn verify_inference_token(&self, token: &str) -> bool {
-        let Some(hash) = self.auth.inference_token_hash.as_deref() else {
-            return false;
-        };
-        let Some(expected) = inference_token_digest(hash) else {
-            return false;
-        };
-        let actual = hex::encode(Keccak256::digest(token.as_bytes()));
-        constant_time_eq(expected.as_bytes(), actual.as_bytes())
-    }
-
     pub fn verify_debug_token(&self, token: &str, now_ms: i64) -> bool {
         let Some(hash) = self.auth.debug_token_hash.as_deref() else {
             return false;
@@ -478,17 +457,6 @@ impl ServerConfig {
         Ok(())
     }
 
-    pub fn set_inference_token(&mut self, token: &str) -> anyhow::Result<()> {
-        if token.len() < 16 {
-            bail!("secret must be at least 16 characters");
-        }
-        self.auth.inference_token_hash = Some(format!(
-            "keccak256:{}",
-            hex::encode(Keccak256::digest(token.as_bytes()))
-        ));
-        Ok(())
-    }
-
     pub fn set_password(&mut self, new_password: &str) -> anyhow::Result<()> {
         self.auth.password_hash = Some(hash_secret(new_password.trim(), 8)?);
         Ok(())
@@ -519,7 +487,6 @@ impl ServerConfig {
             auth: AuthConfig {
                 password_hash: Some(hash_secret(&input.password, 8)?),
                 api_token_hash: None,
-                inference_token_hash: None,
                 debug_token_hash: None,
                 debug_token_expires_at_ms: None,
             },
@@ -596,15 +563,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right)
         .fold(0u8, |difference, (left, right)| difference | (left ^ right))
         == 0
-}
-
-fn inference_token_digest(hash: &str) -> Option<&str> {
-    let digest = hash.strip_prefix("keccak256:")?;
-    (digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
-    .then_some(digest)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -896,34 +854,6 @@ mod tests {
         assert!(config
             .change_password("wrong-password", "anotherpass1")
             .is_err());
-    }
-
-    #[test]
-    fn inference_token_is_independent_from_admin_api_token() {
-        let mut config = ServerConfig::empty();
-        config.set_api_token("admin-token-0123456789").unwrap();
-        config
-            .set_inference_token("inference-token-0123456789")
-            .unwrap();
-
-        assert!(config.inference_token_configured());
-        assert!(config.verify_api_token("admin-token-0123456789"));
-        assert!(!config.verify_api_token("inference-token-0123456789"));
-        assert!(config.verify_inference_token("inference-token-0123456789"));
-        assert!(!config.verify_inference_token("admin-token-0123456789"));
-    }
-
-    #[test]
-    fn inference_token_rejects_expensive_or_malformed_hash_formats() {
-        let mut config = ServerConfig::empty();
-        config.auth.inference_token_hash = Some(hash_secret("legacy-inference-token", 16).unwrap());
-
-        assert!(!config.inference_token_configured());
-        assert!(!config.verify_inference_token("legacy-inference-token"));
-
-        config.auth.inference_token_hash = Some("keccak256:not-a-valid-digest".to_string());
-        assert!(!config.inference_token_configured());
-        assert!(!config.verify_inference_token("legacy-inference-token"));
     }
 
     #[test]

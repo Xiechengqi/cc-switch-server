@@ -2,19 +2,13 @@
   "common": {
     "copied": "コピーしました"
   },
-  "server": {
-    "auth": {
-      "inferenceTokenTitle": "Claude 推論 Token",
-      "inferenceTokenOneTime": "この Token は一度だけ表示されます。コンソールに進む前に安全に保存してください。",
-      "continueToConsole": "保存しました。コンソールへ進む"
-    }
-  },
   "providers": {
     "addProvider": "プロバイダーを追加"
   },
   "providerBundle": {
     "account": "OAuth アカウント",
     "advancedSettings": "詳細設定 JSON",
+    "basic": "基本情報",
     "count": "{{count}} 件の Provider ノード",
     "create": "Provider を新規作成",
     "credential": "認証情報",
@@ -25,8 +19,8 @@
     "driverOptions": "ドライバーオプション",
     "edit": "Provider を編集",
     "family": "Provider タイプ",
-    "identity": "Provider",
-    "routeKey": "Route Key",
+    "modelPassthrough": "透過",
+    "modelSingle": "固定モデル",
     "saved": "Provider を保存しました",
     "selectAccount": "OAuth アカウントを選択",
     "surfaceCredential": "認証情報",
@@ -110,6 +104,7 @@
     }
   },
   "proxy": {
+    "alwaysOn": "Router Share ingress",
     "routing": {
       "ready": "ルーティング済み",
       "needsProvider": "要設定"
@@ -118,6 +113,9 @@
       "stopped": "プロキシサーバーを停止しました",
       "stopFailed": "プロキシサーバーの停止に失敗しました"
     }
+  },
+  "proxyConfig": {
+    "proxyEnabled": "Router Share データプレーン"
   },
   "settings": {
     "loadFailed": "設定を読み込めません。ページを再読み込みしてもう一度お試しください。",
@@ -132,17 +130,20 @@
       "antigravityOauthDescription": "Antigravity サブスクリプションアカウントを管理",
       "deepseekAccountDescription": "DeepSeek アカウントを管理"
     },
+    "advanced": {
+      "proxy": {
+        "title": "Router Share ルーティング",
+        "description": "Router Share ingress の状態とルーティング可能な Bundle Surface を表示します",
+        "running": "実行中",
+        "stopped": "停止"
+      }
+    },
     "serverConfigDir": {
       "title": "Server 設定ディレクトリ",
       "description": "providers、shares、ui-settings などの永続化ファイルを保存するディレクトリです。リッスンアドレスとポートはプロセス起動引数で指定します。"
     },
     "serverSecurity": {
-      "currentPasswordRequired": "現在のパスワードを入力してください",
-      "inferenceTokenRotated": "推論 Token を更新しました",
-      "inferenceTokenTitle": "Claude 推論 Token",
-      "inferenceTokenDescription": "ローカルの Claude API リクエストに使用し、管理者ログイン権限とは分離されています",
-      "rotateInferenceToken": "Token を更新",
-      "rotateInferenceTokenConfirm": "推論 Token を更新しますか？既存のクライアントは直ちに認証できなくなります。"
+      "currentPasswordRequired": "現在のパスワードを入力してください"
     },
     "share": {
       "health": {

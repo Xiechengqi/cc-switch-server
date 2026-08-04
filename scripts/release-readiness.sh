@@ -46,7 +46,7 @@ fi
 echo "== AB env gates =="
 need_var CC_SWITCH_SERVER_TOKEN
 need_var SHARE_ID
-need_var DIRECT_SHARE_URL
+need_var CC_SWITCH_SHARE_URL
 need_var ROUTER_API_TOKEN
 need_var MARKET_API_URL
 need_var CLAUDE_PROVIDER_TOKEN
@@ -56,7 +56,7 @@ case "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" in
   0) ;;
   1)
     CODEX_IMAGES_GATE_STATUS=configured-not-run
-    for name in CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_CODEX_ROUTE_KEY; do
+    for name in CC_SWITCH_SHARE_URL ROUTER_API_TOKEN; do
       if [[ -z "${!name:-}" || "${!name}" == \<* ]]; then
         CODEX_IMAGES_GATE_STATUS=blocked-inputs
       fi

@@ -56,7 +56,6 @@ export interface ProviderResource {
 export interface ProviderBundleView {
   id: string;
   familyId: string;
-  routeKey: string;
   revision: number;
   name: string;
   websiteUrl?: string;
@@ -84,7 +83,6 @@ export interface ProviderBundleSurfaceWriteDraft {
 export interface ProviderBundleWriteDraft {
   id: string;
   familyId: string;
-  routeKey: string;
   name: string;
   websiteUrl?: string;
   notes?: string;
@@ -184,6 +182,12 @@ export const providersApi = {
 
   async getBundle(id: string): Promise<ProviderBundleView> {
     return await invokeCommand("get_provider_bundle", { id });
+  },
+
+  async updateBundleSortOrder(updates: ProviderSortUpdate[]): Promise<boolean> {
+    return await invokeCommand("update_provider_bundles_sort_order", {
+      updates,
+    });
   },
 
   async upsertBundle(

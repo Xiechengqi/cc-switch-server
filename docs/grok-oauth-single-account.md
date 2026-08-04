@@ -4,11 +4,11 @@
 
 ## 能力边界
 
-- 文本入口使用 Route Key 下的 `POST /r/:routeKey/v1/responses` 和 `POST /r/:routeKey/v1/chat/completions`。
-- Responses WebSocket 使用 `GET /r/:routeKey/v1/responses`。
+- 文本入口使用 Router Share URL 下的 `POST /v1/responses` 和 `POST /v1/chat/completions`。
+- Responses WebSocket 使用同一 Share URL 下的 `GET /v1/responses`。
 - 媒体入口包括图片生成/编辑和视频生成/状态查询；这些能力按账号 fail closed。
-- 模型目录通过 `GET /r/:routeKey/v1/models` 返回，并附带 Grok catalog 的来源和新鲜度。
-- 本地直连的 Models、Responses HTTP/WS、Chat 和媒体入口都要求独立 inference token；可使用 Bearer、`x-api-key` 或 `x-goog-api-key`，且拒绝带 `Origin` 的浏览器请求。经签名 router ingress 的请求沿用 router 身份。
+- 模型目录通过同一 Share URL 下的 `GET /v1/models` 返回，并附带 Grok catalog 的来源和新鲜度。
+- Models、Responses HTTP/WS、Chat 和媒体入口都要求 Router 签名验证且必须携带 Share 身份。Server 不接受本地推理 token，也不提供 Provider 专属公开路径。
 - 每个 `grok_oauth` Provider 必须绑定一个明确的 `grok_oauth` Account。
 - 同一个生成请求只允许使用该 Provider 的绑定账号；任何错误都不能触发账号轮换或通用 Provider failover。
 
@@ -33,9 +33,9 @@
 
 ## Provider 与账号固定
 
-一次 Grok 直连请求按以下顺序解析执行身份：
+一次 Grok Share 请求按以下顺序解析执行身份：
 
-1. 根据 `/r/:routeKey` 的应用协议 Surface 或 Share binding 解析一个 Provider Bundle。
+1. 校验 Router ingress 签名，根据 Share binding 的应用协议 Surface 解析一个 Provider Bundle。
 2. 编译后的 RuntimePlan 必须绑定 `oauth.grok_responses` Driver。
 3. 从 Provider 的 managed-account binding 解析唯一账号。
 4. 检查账号登录、cooldown、配额和并发状态，并获取该账号的 in-flight lease。
@@ -101,7 +101,7 @@ Grok 图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers
 
 ## 模型目录
 
-`GET /r/:routeKey/v1/models` 使用该 Route Key 的 Codex Surface 绑定账号 access token 请求固定的 Grok CLI models endpoint：
+Share URL 下的 `GET /v1/models` 使用该 Share 的 Codex Surface 绑定账号 access token 请求固定的 Grok CLI models endpoint：
 
 - 缓存按账号隔离，默认 TTL 为 300 秒，可通过 `CC_SWITCH_GROK_MODELS_TTL_SECONDS` 在 1 秒到 24 小时范围内调整。
 - 支持 ETag/304；成功目录记录抓取时间。
@@ -112,9 +112,9 @@ Grok 图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers
 
 模型目录降级不会绕过 single-model policy，也不会选择另一个 Grok 账号。credential persistence degraded 时不会访问上游目录，只返回明确来源的静态 fallback；刷新前已 degraded 和本次 refresh 因旋转 token 落盘失败而刚进入 degraded 都执行同一零上游门禁。生成数据面仍返回 `503`。
 
-公开 Route Key models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan 中 driver 为 `oauth.grok_responses` 的 `ManagedAccount` 引用，并要求 Provider revision、账号类型和 `authIdentityGeneration` 全部匹配。Provider 未绑定账号、仅配置 legacy API key、绑定缺失/类型错误、RuntimePlan 过期或账号身份代际变化时，只返回 `static_fallback`，不会刷新任意账号或访问 models 上游。
+Share models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan 中 driver 为 `oauth.grok_responses` 的 `ManagedAccount` 引用，并要求 Provider revision、账号类型和 `authIdentityGeneration` 全部匹配。Provider 未绑定账号、仅配置 legacy API key、绑定缺失/类型错误、RuntimePlan 过期或账号身份代际变化时，只返回 `static_fallback`，不会刷新任意账号或访问 models 上游。
 
-不带 Route Key 的通用模型列表只返回静态聚合结果，不会选择任意 Grok Provider、刷新任意账号或访问上游。
+不存在不带 Share 身份的公共模型列表；未签名或签名但无 Share 的 `/v1/models` 请求分别返回 `401` 或 `403`。
 
 ## 重放矩阵
 
@@ -153,12 +153,11 @@ Grok 图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers
 
 ## 真实账号验收
 
-先确认 `CC_SWITCH_GROK_ROUTE_KEY` 对应的 Provider Bundle 只绑定待测账号，再运行：
+先确认待测 Share 的 Grok Provider Bundle 只绑定待测账号，再运行：
 
 ```bash
-CC_SWITCH_BASE_URL=http://127.0.0.1:15721 \
-CC_SWITCH_INFERENCE_TOKEN='<one-time-issued-token>' \
-CC_SWITCH_GROK_ROUTE_KEY='<provider-route-key>' \
+CC_SWITCH_SHARE_URL='https://share.example.com' \
+ROUTER_API_TOKEN='<router-user-token>' \
 node scripts/smoke/grok-oauth-real.mjs
 ```
 
@@ -169,7 +168,7 @@ node scripts/smoke/grok-oauth-real.mjs
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `EVIDENCE_FILE=/tmp/...json`：写入脱敏结果摘要。
 
-脚本依次检查 readiness、Route Key models 元数据、Responses JSON 和 Responses SSE，并对两个 Responses 请求携带固定 session id 与合法 `x-grok-turn-idx`。缺少 base URL、推理 token 或 Route Key，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
+脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON 和 Responses SSE，并对两个 Responses 请求携带固定 session id 与合法 `x-grok-turn-idx`。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
 
 401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/real-acceptance-runbook.md` 单独留证。
 

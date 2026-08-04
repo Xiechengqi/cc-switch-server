@@ -24,7 +24,7 @@ use super::registry::{CustomBindingInput, ProfileId, ProviderKey};
 use super::store::{ProviderResourceMetadata, ProviderStore, ProviderStoreFormat, StoredProvider};
 
 pub(crate) const PROVIDER_STORE_FORMAT: &str = "cc-switch-provider-store";
-pub(crate) const PROVIDER_STORE_SCHEMA_VERSION: u32 = 3;
+pub(crate) const PROVIDER_STORE_SCHEMA_VERSION: u32 = 4;
 pub(crate) const PROVIDER_STORE_GUARD: &str = "s2-encrypted-typed-records";
 const CREDENTIAL_ENVELOPE_VERSION: u32 = 1;
 const CREDENTIAL_ALGORITHM: &str = "xchacha20poly1305";
@@ -92,6 +92,8 @@ struct ProviderStoreS2 {
     records: BTreeMap<AppKind, BTreeMap<String, ProviderRecordS2>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     order_by_app: BTreeMap<AppKind, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bundle_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +332,7 @@ pub(crate) fn encode_s2(store: &ProviderStore) -> anyhow::Result<Value> {
         },
         records,
         order_by_app: store.order.clone(),
+        bundle_order: store.bundle_order.clone(),
     })
     .context("encode Provider S2 store")
 }
@@ -384,6 +387,7 @@ pub(crate) fn decode_s2(
     let mut store = ProviderStore {
         providers,
         order: persisted.order_by_app,
+        bundle_order: persisted.bundle_order,
         runtime_index: Default::default(),
         format: ProviderStoreFormat::S2,
         store_generation: persisted.store_generation,

@@ -554,22 +554,6 @@ pub(in crate::api) async fn rotate_api_token(
     }))
 }
 
-pub(in crate::api) async fn rotate_inference_token(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<InferenceTokenResponse>, ApiError> {
-    require_local_server_owner_session(&state, &headers).await?;
-    let inference_token = generate_session_token();
-    state
-        .set_inference_token(&inference_token)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(InferenceTokenResponse {
-        ok: true,
-        inference_token,
-    }))
-}
-
 pub(in crate::api) async fn auth_me(
     State(state): State<ServerState>,
     headers: HeaderMap,

@@ -24,13 +24,11 @@ function runEnvCheck(overrides) {
       STRICT: "0",
       EVIDENCE_FILE: evidenceFile,
       GROK_OAUTH_TEST_ACCOUNT: "",
-      CC_SWITCH_BASE_URL: "",
-      CC_SWITCH_INFERENCE_TOKEN: "",
-      CC_SWITCH_GROK_ROUTE_KEY: "",
+      CC_SWITCH_SHARE_URL: "",
+      ROUTER_API_TOKEN: "",
       CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT: "",
       CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT: "",
       CC_SWITCH_CODEX_IMAGES_SMOKE: "0",
-      CC_SWITCH_CODEX_ROUTE_KEY: "",
       ...overrides,
     },
     encoding: "utf8",
@@ -47,9 +45,8 @@ function runEnvCheck(overrides) {
 test("Claude Max and Grok external input gates remain isolated", () => {
   const grokReady = runEnvCheck({
     GROK_OAUTH_TEST_ACCOUNT: "grok-test-account",
-    CC_SWITCH_BASE_URL: "http://127.0.0.1:15721",
-    CC_SWITCH_INFERENCE_TOKEN: "test-inference-token",
-    CC_SWITCH_GROK_ROUTE_KEY: "grok-route",
+    CC_SWITCH_SHARE_URL: "https://grok-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
   });
   assert.equal(grokReady.checks.grokGateStatus, "inputs-ready");
   assert.equal(grokReady.checks.claudeMax5xGateStatus, "blocked-inputs");
@@ -77,9 +74,8 @@ test("Codex Images gate distinguishes disabled, blocked, and input-ready states"
   const ready = runEnvCheck({
     STAGE: "AB5",
     CC_SWITCH_CODEX_IMAGES_SMOKE: "1",
-    CC_SWITCH_BASE_URL: "https://images.example.test",
-    CC_SWITCH_INFERENCE_TOKEN: "test-inference-token",
-    CC_SWITCH_CODEX_ROUTE_KEY: "codex-images-route",
+    CC_SWITCH_SHARE_URL: "https://images-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
   });
   assert.equal(ready.checks.codexImagesGateStatus, "inputs-ready");
 });

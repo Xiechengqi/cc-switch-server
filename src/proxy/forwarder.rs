@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::header::{
-    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
@@ -30,6 +30,7 @@ use crate::domain::accounts::store::{
     grok_account_capability_enabled, AccountStore, GrokAccountCapability,
 };
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
+use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::runtime::managed_account_binding_with_generation;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
@@ -66,11 +67,12 @@ use super::response_semantics::{
     SemanticTerminal,
 };
 use super::retry_policy::{self, AuthRecoveryDecision};
+#[cfg(test)]
+use super::router::select_test_provider;
 use super::router::{
     account_concurrency_for_provider, codex_image_generation_provider,
     ensure_provider_account_does_not_need_relogin, ensure_provider_account_usage_available,
-    provider_supports_claude_count_tokens, select_failover_provider, select_provider_for_route_key,
-    ProxyRoute,
+    provider_supports_claude_count_tokens, select_failover_provider, ProxyRoute,
 };
 use super::streaming::{
     ClaudeSseError, ClaudeSseErrorDetector, GeminiV1InternalSseAggregator,
@@ -384,7 +386,7 @@ struct ForwardAttemptContext {
     codex_body_override: Option<Bytes>,
     excluded_provider_ids: BTreeSet<String>,
     grok_session_id: Option<String>,
-    route_binding_pinned: bool,
+    provider_binding_pinned: bool,
 }
 
 impl Default for ForwardAttemptContext {
@@ -399,7 +401,7 @@ impl Default for ForwardAttemptContext {
             codex_body_override: None,
             excluded_provider_ids: BTreeSet::new(),
             grok_session_id: None,
-            route_binding_pinned: false,
+            provider_binding_pinned: false,
         }
     }
 }
@@ -467,27 +469,23 @@ pub async fn forward(
     .await
 }
 
-pub async fn forward_for_route_key(
+#[cfg(test)]
+async fn forward_for_test_surface(
     state: ServerState,
     route: ProxyRoute,
-    route_key: String,
+    provider_id: String,
     gemini_path: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    if request_context_from_headers(&headers).share_id.is_some() {
-        return Err(ProxyError::bad_request(
-            "Share inference must use the Share URL without a route-key prefix",
-        ));
-    }
     let accounts = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
     let snapshot = state.account_in_flight.snapshot();
-    let selection = select_provider_for_route_key(
+    let selection = select_test_provider(
         &providers,
         &accounts,
         route.app(),
-        &route_key,
+        &provider_id,
         Some(&snapshot),
     )?;
     if route == ProxyRoute::ClaudeCountTokens
@@ -500,7 +498,7 @@ pub async fn forward_for_route_key(
     drop(providers);
     let mut attempt_context = ForwardAttemptContext::default();
     attempt_context.execution = Some(selection.execution);
-    attempt_context.route_binding_pinned = true;
+    attempt_context.provider_binding_pinned = true;
     forward_with_attempt(state, route, gemini_path, headers, body, attempt_context).await
 }
 
@@ -515,25 +513,16 @@ struct CodexAuthContext {
 async fn select_codex_oauth_surface_execution(
     state: &ServerState,
     headers: &HeaderMap,
-    route_key: Option<&str>,
 ) -> Result<ProviderExecution, ProxyError> {
     let request_context = request_context_from_headers(headers);
-    if route_key.is_some() && request_context.share_id.is_some() {
-        return Err(ProxyError::bad_request(
-            "Share requests must use the Share URL without a route-key prefix",
-        ));
-    }
     let accounts = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
     let execution = if let Some(share_id) = request_context.share_id.as_deref() {
         let shares = state.shares.read().await.clone();
         select_share_execution(&providers, &shares, &accounts, AppKind::Codex, share_id)?.0
-    } else if let Some(route_key) = route_key {
-        select_provider_for_route_key(&providers, &accounts, AppKind::Codex, route_key, None)?
-            .execution
     } else {
         return Err(ProxyError::bad_request(
-            "direct Codex auxiliary requests require a route-scoped endpoint under /r/:routeKey",
+            "Codex auxiliary requests require a Router Share binding",
         ));
     };
     if !execution.driver_is("oauth.openai_codex") {
@@ -633,24 +622,6 @@ pub async fn forward_codex_models_manifest(
     headers: HeaderMap,
     client_version: Option<String>,
 ) -> Result<Response, ProxyError> {
-    forward_codex_models_manifest_inner(state, headers, client_version, None).await
-}
-
-pub async fn forward_codex_models_manifest_for_route_key(
-    state: ServerState,
-    route_key: String,
-    headers: HeaderMap,
-    client_version: Option<String>,
-) -> Result<Response, ProxyError> {
-    forward_codex_models_manifest_inner(state, headers, client_version, Some(route_key)).await
-}
-
-async fn forward_codex_models_manifest_inner(
-    state: ServerState,
-    headers: HeaderMap,
-    client_version: Option<String>,
-    route_key: Option<String>,
-) -> Result<Response, ProxyError> {
     let request_context = request_context_from_headers(&headers);
     let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
         Some(
@@ -666,8 +637,7 @@ async fn forward_codex_models_manifest_inner(
     } else {
         None
     };
-    let execution =
-        select_codex_oauth_surface_execution(&state, &headers, route_key.as_deref()).await?;
+    let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
     let accounts = state.accounts_snapshot().await;
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
@@ -757,24 +727,6 @@ pub async fn forward_codex_alpha_search(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    forward_codex_alpha_search_inner(state, headers, body, None).await
-}
-
-pub async fn forward_codex_alpha_search_for_route_key(
-    state: ServerState,
-    route_key: String,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ProxyError> {
-    forward_codex_alpha_search_inner(state, headers, body, Some(route_key)).await
-}
-
-async fn forward_codex_alpha_search_inner(
-    state: ServerState,
-    headers: HeaderMap,
-    body: Bytes,
-    route_key: Option<String>,
-) -> Result<Response, ProxyError> {
     let body = prepare_codex_alpha_search_body(&headers, body)?;
     let request_context = request_context_from_headers(&headers);
     let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
@@ -791,8 +743,7 @@ async fn forward_codex_alpha_search_inner(
     } else {
         None
     };
-    let execution =
-        select_codex_oauth_surface_execution(&state, &headers, route_key.as_deref()).await?;
+    let execution = select_codex_oauth_surface_execution(&state, &headers).await?;
     let body = apply_codex_alpha_search_policy(&body, &execution)?;
     let accounts = state.accounts_snapshot().await;
     let snapshot = state.account_in_flight.snapshot();
@@ -1214,6 +1165,10 @@ async fn forward_with_attempt(
         let accounts_for_selection = state.accounts_snapshot().await;
         let (execution, account_in_flight_guard) =
             if let Some(execution) = attempt_context.execution.clone() {
+                if let Some(share_id) = request_context.share_id.as_deref() {
+                    let shares = state.shares.read().await;
+                    ensure_execution_matches_share_binding(&execution, &shares, app, share_id)?;
+                }
                 execution.ensure_operation_supported(ProviderOperation::Forward)?;
                 let snapshot = state.account_in_flight.snapshot();
                 let guard = acquire_account_in_flight(
@@ -1251,7 +1206,7 @@ async fn forward_with_attempt(
                     (execution, guard)
                 } else {
                     return Err(ProxyError::bad_request(
-                        "direct inference requires a route-scoped endpoint under /r/:routeKey",
+                        "inference requires a Router Share binding",
                     ));
                 }
             };
@@ -3472,33 +3427,10 @@ pub async fn forward_codex_responses_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ProxyError> {
-    forward_codex_responses_ws_inner(state, headers, ws, None).await
-}
-
-pub async fn forward_codex_responses_ws_for_route_key(
-    state: ServerState,
-    route_key: String,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Result<Response, ProxyError> {
-    forward_codex_responses_ws_inner(state, headers, ws, Some(route_key)).await
-}
-
-async fn forward_codex_responses_ws_inner(
-    state: ServerState,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-    route_key: Option<String>,
-) -> Result<Response, ProxyError> {
     let downstream_connection_guard = acquire_responses_downstream_connection()?;
     let route = ProxyRoute::CodexResponses;
     let app = route.app();
     let mut request_context = request_context_from_headers(&headers);
-    if route_key.is_some() && request_context.share_id.is_some() {
-        return Err(ProxyError::bad_request(
-            "Share requests must use the Share URL without a route-key prefix",
-        ));
-    }
     request_context.session_id = session_id_from_request(route, &headers, b"");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
@@ -3520,12 +3452,9 @@ async fn forward_codex_responses_ws_inner(
         let (execution, _share_name) =
             select_share_execution(&providers, &shares, &accounts_for_selection, app, share_id)?;
         execution
-    } else if let Some(route_key) = route_key.as_deref() {
-        select_provider_for_route_key(&providers, &accounts_for_selection, app, route_key, None)?
-            .execution
     } else {
         return Err(ProxyError::bad_request(
-            "direct inference requires a route-scoped endpoint under /r/:routeKey",
+            "Responses WebSocket requires a Router Share binding",
         ));
     };
     drop(providers);
@@ -3669,34 +3598,65 @@ fn apply_codex_policy_metadata(
     context.service_tier_decision = metadata.service_tier_decision;
 }
 
+#[cfg(test)]
+async fn forward_grok_media_for_test_surface(
+    state: ServerState,
+    provider_id: String,
+    method: Method,
+    upstream_path: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    super::grok::validate_media_request(&method, &upstream_path)?;
+    let body = decode_request_body_for_proxy_with_limit(
+        &headers,
+        body,
+        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+    )?;
+    let request_context = request_context_from_headers(&headers);
+    let sticky_media_binding = super::grok::sticky_media_session_key(&upstream_path, &body)
+        .and_then(|session_key| state.grok_media_session_binding(&session_key));
+    let accounts = state.accounts_snapshot().await;
+    let providers = state.providers.read().await;
+    let snapshot = state.account_in_flight.snapshot();
+    let execution = select_test_provider(
+        &providers,
+        &accounts,
+        AppKind::Codex,
+        &provider_id,
+        Some(&snapshot),
+    )?
+    .execution;
+    let account_in_flight_guard =
+        acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
+    drop(providers);
+    if !execution.driver_is("oauth.grok_responses") {
+        return Err(ProxyError::bad_request(
+            "Grok media endpoints require a grok_oauth provider",
+        ));
+    }
+    forward_grok_media_with_execution(
+        state,
+        execution,
+        method,
+        upstream_path,
+        headers,
+        body,
+        sticky_media_binding,
+        request_context.share_id,
+        request_context.user_email,
+        account_in_flight_guard,
+        None,
+    )
+    .await
+}
+
 pub async fn forward_grok_media(
     state: ServerState,
     method: Method,
     upstream_path: String,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ProxyError> {
-    forward_grok_media_inner(state, method, upstream_path, headers, body, None).await
-}
-
-pub async fn forward_grok_media_for_route_key(
-    state: ServerState,
-    route_key: String,
-    method: Method,
-    upstream_path: String,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ProxyError> {
-    forward_grok_media_inner(state, method, upstream_path, headers, body, Some(route_key)).await
-}
-
-async fn forward_grok_media_inner(
-    state: ServerState,
-    method: Method,
-    upstream_path: String,
-    headers: HeaderMap,
-    body: Bytes,
-    route_key: Option<String>,
 ) -> Result<Response, ProxyError> {
     super::grok::validate_media_request(&method, &upstream_path)?;
     let body = decode_request_body_for_proxy_with_limit(
@@ -3705,11 +3665,6 @@ async fn forward_grok_media_inner(
         super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
-    if route_key.is_some() && request_context.share_id.is_some() {
-        return Err(ProxyError::bad_request(
-            "Share requests must use the Share URL without a route-key prefix",
-        ));
-    }
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
@@ -3738,18 +3693,9 @@ async fn forward_grok_media_inner(
             share_id,
         )?;
         execution
-    } else if let Some(route_key) = route_key.as_deref() {
-        select_provider_for_route_key(
-            &providers,
-            &accounts_for_selection,
-            AppKind::Codex,
-            route_key,
-            Some(&account_in_flight),
-        )?
-        .execution
     } else {
         return Err(ProxyError::bad_request(
-            "direct Grok media requests require a route-scoped endpoint under /r/:routeKey",
+            "Grok media requests require a Router Share binding",
         ));
     };
     let account_in_flight_guard = acquire_account_in_flight(
@@ -3785,24 +3731,6 @@ pub async fn forward_images_generations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    forward_images_generations_inner(state, headers, body, None).await
-}
-
-pub async fn forward_images_generations_for_route_key(
-    state: ServerState,
-    route_key: String,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ProxyError> {
-    forward_images_generations_inner(state, headers, body, Some(route_key)).await
-}
-
-async fn forward_images_generations_inner(
-    state: ServerState,
-    headers: HeaderMap,
-    body: Bytes,
-    route_key: Option<String>,
-) -> Result<Response, ProxyError> {
     let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
@@ -3810,11 +3738,6 @@ async fn forward_images_generations_inner(
         super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
-    if route_key.is_some() && request_context.share_id.is_some() {
-        return Err(ProxyError::bad_request(
-            "Share requests must use the Share URL without a route-key prefix",
-        ));
-    }
     request_context.session_id =
         session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
@@ -3849,25 +3772,9 @@ async fn forward_images_generations_inner(
                 &snapshot,
             )?;
             (execution, guard)
-        } else if let Some(route_key) = route_key.as_deref() {
-            select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-                let selection = select_provider_for_route_key(
-                    &providers,
-                    &accounts_for_selection,
-                    AppKind::Codex,
-                    route_key,
-                    Some(snapshot),
-                )?;
-                if !codex_image_generation_provider(&selection.execution.stored) {
-                    return Err(ProxyError::bad_request(
-                        "selected Codex Provider Surface does not support image generation",
-                    ));
-                }
-                Ok(selection.execution)
-            })?
         } else {
             return Err(ProxyError::bad_request(
-                "direct image requests require a route-scoped endpoint under /r/:routeKey",
+                "image requests require a Router Share binding",
             ));
         };
     drop(providers);
@@ -3912,24 +3819,6 @@ pub async fn forward_images_edits(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    forward_images_edits_inner(state, headers, body, None).await
-}
-
-pub async fn forward_images_edits_for_route_key(
-    state: ServerState,
-    route_key: String,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ProxyError> {
-    forward_images_edits_inner(state, headers, body, Some(route_key)).await
-}
-
-async fn forward_images_edits_inner(
-    state: ServerState,
-    headers: HeaderMap,
-    body: Bytes,
-    route_key: Option<String>,
-) -> Result<Response, ProxyError> {
     let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
@@ -3937,11 +3826,6 @@ async fn forward_images_edits_inner(
         super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let mut request_context = request_context_from_headers(&headers);
-    if route_key.is_some() && request_context.share_id.is_some() {
-        return Err(ProxyError::bad_request(
-            "Share requests must use the Share URL without a route-key prefix",
-        ));
-    }
     request_context.session_id =
         session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
@@ -3976,25 +3860,9 @@ async fn forward_images_edits_inner(
                 &snapshot,
             )?;
             (execution, guard)
-        } else if let Some(route_key) = route_key.as_deref() {
-            select_and_acquire_account_in_flight(&state, &accounts_for_selection, |snapshot| {
-                let selection = select_provider_for_route_key(
-                    &providers,
-                    &accounts_for_selection,
-                    AppKind::Codex,
-                    route_key,
-                    Some(snapshot),
-                )?;
-                if !codex_image_generation_provider(&selection.execution.stored) {
-                    return Err(ProxyError::bad_request(
-                        "selected Codex Provider Surface does not support image generation",
-                    ));
-                }
-                Ok(selection.execution)
-            })?
         } else {
             return Err(ProxyError::bad_request(
-                "direct image requests require a route-scoped endpoint under /r/:routeKey",
+                "image requests require a Router Share binding",
             ));
         };
     drop(providers);
@@ -7030,55 +6898,12 @@ fn apply_codex_images_streaming_headers(response: &mut Response) {
 }
 
 fn codex_images_public_origin(headers: &HeaderMap) -> Result<String, ProxyError> {
-    let configured = std::env::var("CC_SWITCH_IMAGE_PUBLIC_BASE_URL").ok();
-    codex_images_public_origin_with_base(headers, configured.as_deref())
-}
-
-fn codex_images_public_origin_with_base(
-    headers: &HeaderMap,
-    configured: Option<&str>,
-) -> Result<String, ProxyError> {
-    if let Some(configured) = configured {
-        if let Some(origin) = normalize_codex_images_public_origin(configured) {
-            return Ok(origin);
-        }
-        return Err(ProxyError::bad_request(
-            "CC_SWITCH_IMAGE_PUBLIC_BASE_URL must be an HTTP(S) origin without path, query, or fragment",
-        ));
-    }
-    let authority = optional_header(headers, "x-cc-switch-client-tunnel-host")
-        .or_else(|| copy_header(headers, HOST).map(str::to_string))
-        .or_else(|| optional_header(headers, "x-forwarded-host"))
-        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+    let authority = optional_header(headers, "x-cc-switch-share-host")
         .filter(|value| value.parse::<http::uri::Authority>().is_ok())
-        .ok_or_else(|| ProxyError::bad_request(
-            "response_format=url requires a valid public Host header or CC_SWITCH_IMAGE_PUBLIC_BASE_URL",
-        ))?;
-    let cf_scheme = optional_header(headers, "cf-visitor").and_then(|value| {
-        serde_json::from_str::<Value>(&value)
-            .ok()?
-            .get("scheme")?
-            .as_str()
-            .map(str::to_string)
-    });
-    let scheme = cf_scheme
-        .or_else(|| optional_header(headers, "x-forwarded-proto"))
-        .and_then(|value| {
-            value
-                .split(',')
-                .next()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-        })
-        .filter(|value| matches!(value.as_str(), "http" | "https"))
-        .unwrap_or_else(|| {
-            if headers.contains_key("cf-ray") {
-                "https".to_string()
-            } else {
-                "http".to_string()
-            }
-        });
-    normalize_codex_images_public_origin(&format!("{scheme}://{authority}"))
+        .ok_or_else(|| {
+            ProxyError::bad_request("response_format=url requires a verified Router Share host")
+        })?;
+    normalize_codex_images_public_origin(&format!("https://{authority}"))
         .ok_or_else(|| ProxyError::bad_request("could not derive a valid image public origin"))
 }
 
@@ -11623,7 +11448,7 @@ fn account_concurrency_proxy_error(stored: &StoredProvider) -> ProxyError {
     )
 }
 
-async fn validate_and_acquire_share_invocation(
+pub(crate) async fn validate_and_acquire_share_invocation(
     state: &ServerState,
     share_id: &str,
     app: AppKind,
@@ -11643,6 +11468,29 @@ async fn validate_and_acquire_share_invocation(
         Err(rejection) => return Err(share_rejection_to_proxy_error(rejection)),
     };
     Ok((invocation.share_name, guard))
+}
+
+fn ensure_execution_matches_share_binding(
+    execution: &ProviderExecution,
+    shares: &ShareStore,
+    app: AppKind,
+    share_id: &str,
+) -> Result<(), ProxyError> {
+    let provider_id = shares
+        .get(share_id)
+        .and_then(|share| share.bindings.iter().find(|binding| binding.app == app))
+        .map(|binding| binding.provider_id.as_str())
+        .ok_or_else(|| {
+            ProxyError::conflict(format!(
+                "Share {share_id} binding changed while the request was retrying"
+            ))
+        })?;
+    if provider_id != execution.stored.provider.id {
+        return Err(ProxyError::conflict(format!(
+            "Share {share_id} binding changed while the request was retrying"
+        )));
+    }
+    Ok(())
 }
 
 fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyError {
@@ -12283,7 +12131,7 @@ fn request_is_provider_pinned(
     attempt_context: &ForwardAttemptContext,
     request_context: &UsageLogContext,
 ) -> bool {
-    attempt_context.route_binding_pinned || request_context.share_id.is_some()
+    attempt_context.provider_binding_pinned || request_context.share_id.is_some()
 }
 
 fn supports_forced_auth_refresh(_route: ProxyRoute, execution: &ProviderExecution) -> bool {
@@ -14848,9 +14696,13 @@ fn select_share_provider(
     let stored = providers
         .providers
         .iter()
-        .find(|item| item.app == app && item.provider.id == provider_id)
+        .find(|item| {
+            item.app == app && item.provider.id == provider_id && surface_enabled(&item.provider)
+        })
         .cloned()
-        .ok_or_else(|| ProxyError::not_found(format!("provider not found: {provider_id}")))?;
+        .ok_or_else(|| {
+            ProxyError::not_found(format!("enabled Share provider not found: {provider_id}"))
+        })?;
     Ok((
         stored,
         share
@@ -15335,7 +15187,7 @@ mod tests {
             let mut selection_calls = 0;
             let error = select_and_acquire_account_in_flight(&state, &accounts, |snapshot| {
                 selection_calls += 1;
-                let selection = select_provider_for_route_key(
+                let selection = select_test_provider(
                     &providers,
                     &accounts,
                     AppKind::Codex,
@@ -15548,7 +15400,7 @@ mod tests {
             br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
         );
         let (first, second) = tokio::join!(
-            forward_for_route_key(
+            forward_for_test_surface(
                 state.clone(),
                 ProxyRoute::ClaudeMessages,
                 "legacy-refresh-provider".to_string(),
@@ -15556,7 +15408,7 @@ mod tests {
                 headers.clone(),
                 body.clone(),
             ),
-            forward_for_route_key(
+            forward_for_test_surface(
                 state.clone(),
                 ProxyRoute::ClaudeMessages,
                 "legacy-refresh-provider".to_string(),
@@ -15826,7 +15678,7 @@ mod tests {
             let provider_id = format!("unauthorized-{kind}-provider");
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            let response = forward_for_route_key(
+            let response = forward_for_test_surface(
                 state.clone(),
                 route,
                 provider_id,
@@ -16067,7 +15919,7 @@ mod tests {
             .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::ClaudeMessages,
             "auth-failover-oauth".to_string(),
@@ -16135,7 +15987,7 @@ mod tests {
             .unwrap();
         let mut pinned_headers = HeaderMap::new();
         pinned_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let pinned = forward_for_route_key(
+        let pinned = forward_for_test_surface(
             state.clone(),
             ProxyRoute::ClaudeMessages,
             "auth-failover-oauth".to_string(),
@@ -16758,7 +16610,7 @@ mod tests {
             true,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::Gemini,
             provider_id,
@@ -16920,7 +16772,7 @@ mod tests {
             false,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::Gemini,
             provider_id.clone(),
@@ -16968,7 +16820,7 @@ mod tests {
             false,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::Gemini,
             provider_id,
@@ -17021,7 +16873,7 @@ mod tests {
             true,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::Gemini,
             provider_id,
@@ -17074,7 +16926,7 @@ mod tests {
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::ClaudeMessages,
             provider_id,
@@ -17108,7 +16960,7 @@ mod tests {
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::ClaudeMessages,
             provider_id.clone(),
@@ -17156,7 +17008,7 @@ mod tests {
         )
         .await;
         let request = || {
-            forward_for_route_key(
+            forward_for_test_surface(
                 state.clone(),
                 ProxyRoute::Gemini,
                 provider_id.clone(),
@@ -17299,7 +17151,7 @@ mod tests {
             false,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::Gemini,
             provider_id,
@@ -17345,7 +17197,7 @@ mod tests {
             true,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::Gemini,
             provider_id,
@@ -17397,7 +17249,7 @@ mod tests {
             true,
         )
         .await;
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::Gemini,
             provider_id,
@@ -17656,7 +17508,7 @@ mod tests {
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::ClaudeMessages,
             provider_id,
@@ -17764,7 +17616,7 @@ mod tests {
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state,
             ProxyRoute::ClaudeMessages,
             provider_id,
@@ -20900,9 +20752,9 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
-    fn route_key_requests_always_pin_their_provider() {
+    fn explicit_provider_fixtures_always_pin_their_provider() {
         let attempt_context = ForwardAttemptContext {
-            route_binding_pinned: true,
+            provider_binding_pinned: true,
             ..ForwardAttemptContext::default()
         };
         assert!(request_is_provider_pinned(
@@ -21399,32 +21251,23 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
     }
 
     #[test]
-    fn codex_images_public_origin_prefers_verified_tunnel_and_cloudflare_scheme() {
+    fn codex_images_public_origin_uses_only_verified_share_host() {
         let mut headers = HeaderMap::new();
-        headers.insert(HOST, HeaderValue::from_static("origin.internal:15721"));
         headers.insert(
-            "x-cc-switch-client-tunnel-host",
-            HeaderValue::from_static("images.example.com"),
+            axum::http::header::HOST,
+            HeaderValue::from_static("origin.internal:15721"),
         );
         headers.insert(
-            "cf-visitor",
-            HeaderValue::from_static(r#"{"scheme":"https"}"#),
+            "x-cc-switch-share-host",
+            HeaderValue::from_static("share.example.com"),
         );
 
         assert_eq!(
-            codex_images_public_origin_with_base(&headers, None).unwrap(),
-            "https://images.example.com"
+            codex_images_public_origin(&headers).unwrap(),
+            "https://share.example.com"
         );
-        assert_eq!(
-            codex_images_public_origin_with_base(&headers, Some("https://cdn.example.com/"),)
-                .unwrap(),
-            "https://cdn.example.com"
-        );
-        assert!(codex_images_public_origin_with_base(
-            &headers,
-            Some("https://cdn.example.com/images"),
-        )
-        .is_err());
+        headers.remove("x-cc-switch-share-host");
+        assert!(codex_images_public_origin(&headers).is_err());
     }
 
     #[tokio::test]
@@ -25418,7 +25261,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("x-session-id", HeaderValue::from_static("client-session"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::CodexResponses,
             execution.stored.provider.id.clone(),
@@ -25574,7 +25417,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("session_id", HeaderValue::from_static("client-session-17"));
         headers.insert("x-grok-turn-idx", HeaderValue::from_static("17"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::CodexResponses,
             execution.stored.provider.id.clone(),
@@ -25607,7 +25450,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("session_id", HeaderValue::from_static("client-session-17"));
         headers.insert("x-grok-turn-idx", HeaderValue::from_static("17"));
-        let response = forward_for_route_key(
+        let response = forward_for_test_surface(
             state.clone(),
             ProxyRoute::CodexResponses,
             execution.stored.provider.id.clone(),
@@ -25727,7 +25570,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let body = Bytes::from_static(br#"{"model":"grok-4.5","prompt":"draw"}"#);
-        let blocked = forward_grok_media_for_route_key(
+        let blocked = forward_grok_media_for_test_surface(
             state.clone(),
             execution.stored.provider.id.clone(),
             Method::POST,
@@ -25749,7 +25592,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             )
             .await
             .unwrap());
-        let first = forward_grok_media_for_route_key(
+        let first = forward_grok_media_for_test_surface(
             state.clone(),
             execution.stored.provider.id.clone(),
             Method::POST,
@@ -25760,7 +25603,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         .await
         .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        let second = forward_grok_media_for_route_key(
+        let second = forward_grok_media_for_test_surface(
             state.clone(),
             execution.stored.provider.id.clone(),
             Method::POST,
@@ -25852,7 +25695,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             auth_identity_generation,
             60_000,
         );
-        let provider_drift = forward_grok_media_for_route_key(
+        let provider_drift = forward_grok_media_for_test_surface(
             state.clone(),
             provider_id.clone(),
             Method::GET,
@@ -25871,7 +25714,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             auth_identity_generation,
             60_000,
         );
-        let account_drift = forward_grok_media_for_route_key(
+        let account_drift = forward_grok_media_for_test_surface(
             state.clone(),
             provider_id.clone(),
             Method::GET,
@@ -25890,7 +25733,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             auth_identity_generation.saturating_add(1),
             60_000,
         );
-        let generation_drift = forward_grok_media_for_route_key(
+        let generation_drift = forward_grok_media_for_test_surface(
             state.clone(),
             provider_id.clone(),
             Method::GET,
@@ -25920,7 +25763,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             auth_identity_generation,
             60_000,
         );
-        let response = forward_grok_media_for_route_key(
+        let response = forward_grok_media_for_test_surface(
             state,
             execution.stored.provider.id.clone(),
             Method::GET,

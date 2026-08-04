@@ -11,6 +11,7 @@ use crate::domain::providers::model::{AppKind, Provider, ProviderType};
 use crate::domain::providers::registry::{
     CustomBindingInput, ProfileId, ProviderKey, ProviderRegistry,
 };
+use crate::domain::providers::store::ProviderSortUpdate;
 use crate::proxy::adapters::AdapterSupport;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +42,19 @@ pub(in crate::api) struct ListProviderBundlesResponse {
 pub(in crate::api) struct ProviderBundleResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) bundle: ProviderBundleView,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::api) struct UpdateProviderBundleOrderRequest {
+    pub(in crate::api) updates: Vec<ProviderSortUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct UpdateProviderBundleOrderResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) changed: bool,
 }
 
 #[derive(Debug, Deserialize)]

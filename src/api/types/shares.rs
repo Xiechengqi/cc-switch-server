@@ -92,7 +92,7 @@ pub(in crate::api) struct RemoveShareBindingResponse {
 pub(in crate::api) struct ShareConnectInfoResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) share_id: String,
-    pub(in crate::api) direct_url: String,
+    pub(in crate::api) tunnel_url: String,
     pub(in crate::api) subdomain: String,
     pub(in crate::api) router_domain: String,
     pub(in crate::api) snippets: Vec<ShareConnectSnippet>,

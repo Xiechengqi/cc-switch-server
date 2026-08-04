@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 
-const baseUrl = (process.env.CC_SWITCH_BASE_URL || "").trim().replace(/\/+$/, "");
-const inferenceToken = (process.env.CC_SWITCH_INFERENCE_TOKEN || "").trim();
-const routeKey = (process.env.CC_SWITCH_CLAUDE_ROUTE_KEY || "").trim();
+const shareUrl = (process.env.CC_SWITCH_SHARE_URL || "").trim().replace(/\/+$/, "");
+const routerToken = (process.env.ROUTER_API_TOKEN || "").trim();
+const routerTokenHeader = (process.env.ROUTER_API_TOKEN_HEADER || "Authorization").trim();
 const model = (process.env.CC_SWITCH_CLAUDE_MODEL || "claude-sonnet-4-6").trim();
 const timeoutMs = Math.max(
   1_000,
   Math.min(300_000, Number(process.env.CC_SWITCH_REAL_TIMEOUT_MS || 120_000)),
 );
 
-if (!baseUrl || !inferenceToken || !routeKey) {
+if (!shareUrl || !routerToken) {
   console.log(
-    "[SKIP] Claude OAuth real-account gate requires CC_SWITCH_BASE_URL, CC_SWITCH_INFERENCE_TOKEN, and CC_SWITCH_CLAUDE_ROUTE_KEY",
+    "[SKIP] Claude OAuth real-account gate requires CC_SWITCH_SHARE_URL and ROUTER_API_TOKEN",
   );
   process.exit(0);
 }
@@ -21,7 +21,19 @@ function fail(message) {
 }
 
 function redact(value) {
-  return String(value).split(inferenceToken).join("[REDACTED]");
+  return String(value).split(routerToken).join("[REDACTED]");
+}
+
+function applyRouterAuth(headers) {
+  if (/^authorization$/i.test(routerTokenHeader)) {
+    headers.set("authorization", `Bearer ${routerToken}`);
+    return;
+  }
+  if (/^(x-api-key|x-goog-api-key)$/i.test(routerTokenHeader)) {
+    headers.set(routerTokenHeader, routerToken);
+    return;
+  }
+  fail(`unsupported ROUTER_API_TOKEN_HEADER: ${routerTokenHeader}`);
 }
 
 function isNonNegativeInteger(value) {
@@ -35,10 +47,9 @@ async function request(path, init = {}) {
   if (init.body !== undefined) {
     headers.set("content-type", "application/json");
   }
-  headers.set("x-api-key", inferenceToken);
-  const routedPath = `/r/${encodeURIComponent(routeKey)}${path}`;
+  applyRouterAuth(headers);
   try {
-    const response = await fetch(`${baseUrl}${routedPath}`, {
+    const response = await fetch(`${shareUrl}${path}`, {
       ...init,
       headers,
       signal: controller.signal,
@@ -179,12 +190,6 @@ async function validateStream() {
 }
 
 async function main() {
-  const ready = await fetch(`${baseUrl}/ready`);
-  if (!ready.ok) {
-    fail(`/ready returned HTTP ${ready.status}: ${(await ready.text()).slice(0, 500)}`);
-  }
-  console.log("[PASS] server readiness");
-
   const count = await requireJson(
     "/v1/messages/count_tokens",
     {
@@ -196,6 +201,7 @@ async function main() {
   if (!isNonNegativeInteger(count.input_tokens)) {
     fail("count_tokens response is missing non-negative input_tokens");
   }
+  console.log("[PASS] Router Share ingress");
   console.log("[PASS] count_tokens contract");
 
   const message = await requireJson(

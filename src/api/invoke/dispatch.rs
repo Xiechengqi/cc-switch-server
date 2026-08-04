@@ -270,6 +270,16 @@ async fn web_invoke_dispatch(
                 .map_err(map_provider_command_error)?;
             Ok(json!(preview))
         }
+        "update_provider_bundles_sort_order" => {
+            require_provider_write_contract(state, headers)?;
+            let updates: Vec<ProviderSortUpdate> = web_arg_value(&args, "updates")?;
+            let changed = state
+                .update_provider_bundle_order_command(updates)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(changed))
+        }
         "upsert_provider_bundle" => {
             require_provider_write_contract(state, headers)?;
             let draft = web_arg_value(&args, "bundle")?;

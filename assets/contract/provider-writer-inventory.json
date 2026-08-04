@@ -9,15 +9,15 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "e4d04da75293db0672f72c953c5107e828f55b8559f0321e7d811b9ba2b29346"
+      "sha256": "ac999738c66799f88c4b4411a389723032ab849c17cc1c9c478c6933d357722a"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "11c0d2fd6874e527137d461e2a2baed57d2d65f59acb0daac7b2d5b3a3781dc8"
+      "sha256": "5f85eb07e5d3e704cf5d4797e92a064c2276c29ad8d7c06bd68d572420804fe1"
     },
     {
       "path": "src/api/types/providers.rs",
-      "sha256": "63265288ffd435fefec24c50cc0e42aa11c62e1b48e8eb8973054c3aa8258182"
+      "sha256": "0c0a310348c2217eacb7f8b37fcb027a36550e154bec08cc3a2d13f9a052aead"
     },
     {
       "path": "src/domain/providers/credentials.rs",
@@ -33,11 +33,11 @@
     },
     {
       "path": "src/domain/providers/store.rs",
-      "sha256": "f0a89f2a2cb5b3378ffcb228dc14badf85bc9da2ed4ed5db2fa5a6af72ab9da5"
+      "sha256": "75871c5936cf9ec71a24484db1a7fb3282b0891690f1d945303a295847d36770"
     },
     {
       "path": "src/domain/providers/store_v2.rs",
-      "sha256": "a7ee864ccf8d4f43789a86f62fa09132e04c0a7559b73d5cd41db0030c7581e3"
+      "sha256": "03fdfa359faa490d74167779cba476f4cf1af9c1ddef17b72f324553551eb9eb"
     },
     {
       "path": "src/infra/backup.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "a74b2156d497440f48fb1f4a081c4984fefa3e47e5fa20f31e93181d719bafb0"
+      "sha256": "a09c1dea0c7021a597e6c1dbc9e7c7b451b9f5d50a14695c46d73d3cfb218601"
     }
   ],
   "entries": [
@@ -134,6 +134,21 @@
       "evidence": [
         "src/api/invoke/dispatch.rs::update_providers_sort_order",
         "src/domain/providers/store.rs::update_sort_order"
+      ]
+    },
+    {
+      "id": "bundle-sort",
+      "source": "src/api/providers.rs::update_provider_bundle_order|src/api/invoke/dispatch.rs::update_provider_bundles_sort_order",
+      "currentBehavior": "REST and Web runtime writes delegate to update_provider_bundle_order_command, which validates one complete global Bundle order and persists ProviderStore.bundle_order through the shared commit coordinator without changing Surface revisions",
+      "targetCommand": "retain provider_commands::update_provider_bundle_order over ProviderStore::update_bundle_sort_order",
+      "closePhase": "phase-3",
+      "closureStatus": "closed",
+      "risk": "a per-Surface sort writer could split one multi-app Provider Bundle into conflicting Claude, Codex, and Gemini presentation orders",
+      "evidence": [
+        "src/api/providers.rs::update_provider_bundle_order",
+        "src/api/invoke/dispatch.rs::update_provider_bundles_sort_order",
+        "src/state.rs::update_provider_bundle_order_command",
+        "src/domain/providers/store.rs::update_bundle_sort_order"
       ]
     },
     {

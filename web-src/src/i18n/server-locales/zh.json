@@ -2,19 +2,13 @@
   "common": {
     "copied": "已复制"
   },
-  "server": {
-    "auth": {
-      "inferenceTokenTitle": "Claude 推理 Token",
-      "inferenceTokenOneTime": "此 Token 仅显示一次，请在进入控制台前妥善保存。",
-      "continueToConsole": "我已保存，进入控制台"
-    }
-  },
   "providers": {
     "addProvider": "添加供应商"
   },
   "providerBundle": {
     "account": "OAuth 账号",
     "advancedSettings": "高级设置 JSON",
+    "basic": "基本信息",
     "count": "{{count}} 个供应商节点",
     "create": "新建供应商",
     "credential": "凭据",
@@ -25,8 +19,8 @@
     "driverOptions": "驱动选项",
     "edit": "编辑供应商",
     "family": "供应商类型",
-    "identity": "供应商",
-    "routeKey": "Route Key",
+    "modelPassthrough": "模型透传",
+    "modelSingle": "固定上游模型",
     "saved": "供应商已保存",
     "selectAccount": "选择 OAuth 账号",
     "surfaceCredential": "认证凭据",
@@ -110,6 +104,7 @@
     }
   },
   "proxy": {
+    "alwaysOn": "Router Share 接入",
     "routing": {
       "ready": "已路由",
       "needsProvider": "待配置"
@@ -118,6 +113,9 @@
       "stopped": "代理服务已停止",
       "stopFailed": "停止代理服务失败"
     }
+  },
+  "proxyConfig": {
+    "proxyEnabled": "Router Share 数据面"
   },
   "settings": {
     "loadFailed": "无法加载设置，请刷新页面后重试。",
@@ -132,17 +130,20 @@
       "antigravityOauthDescription": "管理 Antigravity 订阅账号",
       "deepseekAccountDescription": "管理 DeepSeek 账号"
     },
+    "advanced": {
+      "proxy": {
+        "title": "Router Share 路由",
+        "description": "查看 Router Share ingress 状态和可路由的 Bundle Surface",
+        "running": "运行中",
+        "stopped": "已停止"
+      }
+    },
     "serverConfigDir": {
       "title": "Server 配置目录",
       "description": "providers、shares、ui-settings 等持久化文件所在目录。监听地址与端口由进程启动参数决定。"
     },
     "serverSecurity": {
-      "currentPasswordRequired": "请输入当前密码",
-      "inferenceTokenRotated": "推理 Token 已轮换",
-      "inferenceTokenTitle": "Claude 推理 Token",
-      "inferenceTokenDescription": "用于本机 Claude API 请求，与管理员登录权限隔离",
-      "rotateInferenceToken": "轮换 Token",
-      "rotateInferenceTokenConfirm": "确定轮换推理 Token？现有客户端将立即无法继续认证。"
+      "currentPasswordRequired": "请输入当前密码"
     },
     "share": {
       "health": {

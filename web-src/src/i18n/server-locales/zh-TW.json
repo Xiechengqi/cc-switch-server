@@ -2,19 +2,13 @@
   "common": {
     "copied": "已複製"
   },
-  "server": {
-    "auth": {
-      "inferenceTokenTitle": "Claude 推理 Token",
-      "inferenceTokenOneTime": "此 Token 僅顯示一次，請在進入主控台前妥善儲存。",
-      "continueToConsole": "我已儲存，進入主控台"
-    }
-  },
   "providers": {
     "addProvider": "新增供應商"
   },
   "providerBundle": {
     "account": "OAuth 帳號",
     "advancedSettings": "進階設定 JSON",
+    "basic": "基本資訊",
     "count": "{{count}} 個供應商節點",
     "create": "新增供應商",
     "credential": "憑證",
@@ -25,8 +19,8 @@
     "driverOptions": "驅動程式選項",
     "edit": "編輯供應商",
     "family": "供應商類型",
-    "identity": "供應商",
-    "routeKey": "Route Key",
+    "modelPassthrough": "模型透傳",
+    "modelSingle": "固定上游模型",
     "saved": "供應商已儲存",
     "selectAccount": "選擇 OAuth 帳號",
     "surfaceCredential": "驗證憑證",
@@ -110,6 +104,7 @@
     }
   },
   "proxy": {
+    "alwaysOn": "Router Share 接入",
     "routing": {
       "ready": "已路由",
       "needsProvider": "待設定"
@@ -118,6 +113,9 @@
       "stopped": "代理服務已停止",
       "stopFailed": "停止代理服務失敗"
     }
+  },
+  "proxyConfig": {
+    "proxyEnabled": "Router Share 資料面"
   },
   "settings": {
     "loadFailed": "無法載入設定，請重新整理頁面後再試。",
@@ -132,17 +130,20 @@
       "antigravityOauthDescription": "管理 Antigravity 訂閱帳號",
       "deepseekAccountDescription": "管理 DeepSeek 帳號"
     },
+    "advanced": {
+      "proxy": {
+        "title": "Router Share 路由",
+        "description": "查看 Router Share ingress 狀態和可路由的 Bundle Surface",
+        "running": "執行中",
+        "stopped": "已停止"
+      }
+    },
     "serverConfigDir": {
       "title": "Server 設定目錄",
       "description": "providers、shares、ui-settings 等持久化檔案所在目錄。監聽位址與連接埠由程序啟動參數決定。"
     },
     "serverSecurity": {
-      "currentPasswordRequired": "請輸入目前密碼",
-      "inferenceTokenRotated": "推理 Token 已輪換",
-      "inferenceTokenTitle": "Claude 推理 Token",
-      "inferenceTokenDescription": "用於本機 Claude API 請求，並與管理員登入權限隔離",
-      "rotateInferenceToken": "輪換 Token",
-      "rotateInferenceTokenConfirm": "確定要輪換推理 Token？現有用戶端將立即無法繼續驗證。"
+      "currentPasswordRequired": "請輸入目前密碼"
     },
     "share": {
       "health": {

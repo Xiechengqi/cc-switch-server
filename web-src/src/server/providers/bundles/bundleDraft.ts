@@ -68,7 +68,6 @@ export interface BundleSurfaceEditorDraft {
 export interface ProviderBundleEditorDraft {
   id: string;
   familyId: string;
-  routeKey: string;
   name: string;
   websiteUrl: string;
   notes: string;
@@ -101,16 +100,6 @@ function prettySettings(value: Record<string, unknown>): string {
   return JSON.stringify(value, null, 2);
 }
 
-function routeSlug(value: string): string {
-  const slug = value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
-  return slug.length >= 3 ? slug : "provider";
-}
-
 function sourceSurface(
   family: ProviderFamilySpec,
   surfaces: BundleSurfaceEditorDraft[],
@@ -120,6 +109,23 @@ function sourceSurface(
   if (!source)
     throw new Error(`Family ${family.familyId} has no credential Surface`);
   return source;
+}
+
+export function providerBundleIdentityEditable(
+  family: ProviderFamilySpec,
+): boolean {
+  return profileById(family.credentialProfileId)?.formComposition === "custom";
+}
+
+function canonicalBundleIdentity(family: ProviderFamilySpec): {
+  name: string;
+  websiteUrl: string;
+} {
+  const profile = profileById(family.credentialProfileId);
+  if (!profile)
+    throw new Error(`Unknown profile ${family.credentialProfileId}`);
+  const preset = createDraftForProfile(profile);
+  return { name: family.label, websiteUrl: preset.websiteUrl };
 }
 
 export function modelPoliciesForFamily(
@@ -273,7 +279,6 @@ export function createProviderBundleDraft(
   return {
     id,
     familyId: family.familyId,
-    routeKey: `${routeSlug(family.label)}-${id.slice(0, 8)}`,
     name: family.label,
     websiteUrl: sourcePreset.websiteUrl,
     notes: "",
@@ -311,6 +316,9 @@ export function editProviderBundleDraft(
   const sourceSettings = parseSettings(source.settingsText);
   const binding = sourceResource?.provider.meta?.authBinding;
   const model = initialBundleModel(family, surfaces);
+  const identity = providerBundleIdentityEditable(family)
+    ? { name: bundle.name, websiteUrl: bundle.websiteUrl ?? "" }
+    : canonicalBundleIdentity(family);
   const secrets = Object.fromEntries(
     credentialSlotsForFamily(family).map(({ pointer }) => {
       const actual = configuredSlot(bundle.credentialSlots, pointer) ?? pointer;
@@ -327,9 +335,8 @@ export function editProviderBundleDraft(
   return {
     id: bundle.id,
     familyId: bundle.familyId,
-    routeKey: bundle.routeKey,
-    name: bundle.name,
-    websiteUrl: bundle.websiteUrl ?? "",
+    name: identity.name,
+    websiteUrl: identity.websiteUrl,
     notes: bundle.notes ?? "",
     icon: bundle.icon,
     iconColor: bundle.iconColor,
@@ -344,6 +351,44 @@ export function editProviderBundleDraft(
     surfaces: surfaces.map((surface) =>
       updateSurfaceModel(surface, model.policy, model.upstreamModel),
     ),
+  };
+}
+
+export function duplicateProviderBundleDraft(
+  bundle: ProviderBundleView,
+): ProviderBundleEditorDraft {
+  const source = editProviderBundleDraft(bundle);
+  const family = familyById(bundle.familyId);
+  if (!family) throw new Error(`Unknown family ${bundle.familyId}`);
+  const id = crypto.randomUUID();
+  return {
+    ...source,
+    id,
+    name: providerBundleIdentityEditable(family)
+      ? `${source.name} copy`
+      : source.name,
+    expectedRevision: undefined,
+    clientRequestId: crypto.randomUUID(),
+    secrets: Object.fromEntries(
+      Object.entries(source.secrets).map(([slot, secret]) => [
+        slot,
+        { ...secret, configured: false, value: "", clear: false },
+      ]),
+    ),
+    surfaces: source.surfaces.map((surface) => ({
+      ...surface,
+      secret: {
+        ...surface.secret,
+        configured: false,
+        value: "",
+        clear: false,
+      },
+      headers: surface.headers.map((header) => ({
+        ...header,
+        configured: false,
+        value: "",
+      })),
+    })),
   };
 }
 
@@ -550,9 +595,6 @@ export function validateProviderBundleDraft(
   const family = familyById(draft.familyId);
   if (!family) return "Provider family is unavailable";
   if (!draft.name.trim()) return "Provider name is required";
-  if (!/^(?=.{3,64}$)(?=.*[a-z])[a-z0-9_-]+$/.test(draft.routeKey)) {
-    return "Route key must use 3-64 lowercase letters, digits, hyphens, or underscores";
-  }
   if (!draft.surfaces.some((surface) => surface.enabled)) {
     return "Enable at least one API Surface";
   }
@@ -638,12 +680,14 @@ export function toProviderBundleWriteDraft(
 ): ProviderBundleWriteDraft {
   const family = familyById(draft.familyId);
   if (!family) throw new Error(`Unknown family ${draft.familyId}`);
+  const identity = providerBundleIdentityEditable(family)
+    ? { name: draft.name.trim(), websiteUrl: draft.websiteUrl.trim() }
+    : canonicalBundleIdentity(family);
   return {
     id: draft.id,
     familyId: draft.familyId,
-    routeKey: draft.routeKey.trim(),
-    name: draft.name.trim(),
-    websiteUrl: draft.websiteUrl.trim() || undefined,
+    name: identity.name,
+    websiteUrl: identity.websiteUrl || undefined,
     notes: draft.notes.trim() || undefined,
     icon: draft.icon,
     iconColor: draft.iconColor,

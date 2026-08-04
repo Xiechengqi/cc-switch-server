@@ -81,12 +81,6 @@ function missingFor(testCase) {
   if (testCase.requiresServerToken && !present("CC_SWITCH_SERVER_TOKEN")) {
     missing.push("CC_SWITCH_SERVER_TOKEN");
   }
-  if (
-    testCase.requiresInferenceToken &&
-    !present("CC_SWITCH_INFERENCE_TOKEN")
-  ) {
-    missing.push("CC_SWITCH_INFERENCE_TOKEN");
-  }
   if (testCase.requiresRouterToken && !present("ROUTER_API_TOKEN")) {
     missing.push("ROUTER_API_TOKEN");
   }

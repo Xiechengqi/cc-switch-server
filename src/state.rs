@@ -57,8 +57,8 @@ use crate::domain::accounts::store::{
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
     bundle_id as provider_bundle_id, credential_source_app, has_bundle_managed_metadata,
-    is_explicit_bundle_surface, route_key as provider_route_key, surface_enabled,
-    ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
+    is_explicit_bundle_surface, surface_enabled, ProviderBundleReferencePreview,
+    ProviderBundleView, ProviderBundleWriteDraft,
 };
 use crate::domain::providers::credentials::{
     merge_provider_credentials, reveal_provider_credential, CredentialPatch,
@@ -1912,11 +1912,28 @@ fn provider_bundle_views_from_store(
         .into_values()
         .map(ProviderBundleView::from_surface_views)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let bundle_order = store
+        .bundle_order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
     bundles.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.route_key.cmp(&right.route_key))
+        bundle_order
+            .get(left.id.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(
+                &bundle_order
+                    .get(right.id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(bundles)
@@ -3613,15 +3630,6 @@ impl ServerStateInner {
         Ok(())
     }
 
-    pub async fn set_inference_token(&self, token: &str) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        let mut next = config.clone();
-        next.set_inference_token(token)?;
-        next.save(&self.config_dir)?;
-        config.auth.inference_token_hash = next.auth.inference_token_hash;
-        Ok(())
-    }
-
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
     }
@@ -4367,18 +4375,17 @@ impl ServerStateInner {
             .find(|bundle| bundle.id == bundle_id))
     }
 
-    pub async fn provider_id_for_route_key(&self, app: AppKind, route_key: &str) -> Option<String> {
-        self.providers
-            .read()
-            .await
-            .providers
-            .iter()
-            .find(|stored| {
-                stored.app == app
-                    && crate::domain::providers::bundle::surface_enabled(&stored.provider)
-                    && provider_route_key(&stored.provider) == route_key
-            })
-            .map(|stored| stored.provider.id.clone())
+    pub async fn update_provider_bundle_order_command(
+        self: &Arc<Self>,
+        updates: Vec<crate::domain::providers::store::ProviderSortUpdate>,
+    ) -> anyhow::Result<Result<bool, ProviderCommandError>> {
+        self.try_mutate_providers_immediate_if_changed(move |providers| {
+            providers
+                .update_bundle_sort_order(updates)
+                .map(|changed| (changed, changed))
+                .map_err(|error| ProviderCommandError::Invalid(error.to_string()))
+        })
+        .await
     }
 
     pub async fn provider_bundle_reference_preview(
@@ -4775,7 +4782,6 @@ impl ServerStateInner {
 
         let bundle_id = draft.id.clone();
         let family_id = draft.family_id.clone();
-        let route_key = draft.route_key.clone();
         let expected_revision = draft.expected_revision;
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
@@ -4847,15 +4853,6 @@ impl ServerStateInner {
                 return Err(ProviderCommandError::Conflict {
                     code: "cc_switch_provider_bundle_surface_conflict",
                     message: "Provider Bundle Surface set is immutable".to_string(),
-                });
-            }
-            if store.providers.iter().any(|stored| {
-                provider_bundle_id(&stored.provider) != bundle_id
-                    && provider_route_key(&stored.provider) == route_key
-            }) {
-                return Err(ProviderCommandError::Conflict {
-                    code: "cc_switch_provider_route_key_conflict",
-                    message: format!("routeKey {route_key} is already in use"),
                 });
             }
             for provider_draft in &mut provider_drafts {
@@ -5287,6 +5284,18 @@ impl ServerStateInner {
 
     pub(crate) async fn lock_reference_mutations(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.reference_mutations.clone().lock_owned().await
+    }
+
+    pub(crate) async fn lock_share_binding_mutation(
+        &self,
+        share_id: &str,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.share_lifecycle.lock().await;
+        if self.share_in_flight.has_in_flight(share_id) {
+            None
+        } else {
+            Some(guard)
+        }
     }
 
     pub(crate) async fn lock_managed_auth_operations(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -19372,61 +19381,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(candidate_ids, vec!["warm-codex-b"]);
-    }
-
-    #[tokio::test]
-    async fn inference_token_update_preserves_concurrent_config_changes() {
-        let state = test_state();
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
-        let policy = crate::domain::settings::config::UpgradePolicyConfig {
-            delegate_upgrade_to_router_owner: false,
-            auto_upgrade_enabled: true,
-            auto_upgrade_check_interval_minutes: 15,
-        };
-
-        let policy_state = state.clone();
-        let policy_barrier = Arc::clone(&barrier);
-        let expected_policy = policy.clone();
-        let policy_task = tokio::spawn(async move {
-            policy_barrier.wait().await;
-            policy_state.set_upgrade_policy(policy).await.unwrap();
-        });
-
-        let token_state = state.clone();
-        let token_barrier = Arc::clone(&barrier);
-        let token_task = tokio::spawn(async move {
-            token_barrier.wait().await;
-            token_state
-                .set_inference_token("concurrent-inference-token-0123456789")
-                .await
-                .unwrap();
-        });
-
-        barrier.wait().await;
-        policy_task.await.unwrap();
-        token_task.await.unwrap();
-
-        let config = state.config_snapshot().await;
-        assert_eq!(
-            config.upgrade_policy.delegate_upgrade_to_router_owner,
-            expected_policy.delegate_upgrade_to_router_owner
-        );
-        assert_eq!(
-            config.upgrade_policy.auto_upgrade_enabled,
-            expected_policy.auto_upgrade_enabled
-        );
-        assert_eq!(
-            config.upgrade_policy.auto_upgrade_check_interval_minutes,
-            expected_policy.auto_upgrade_check_interval_minutes
-        );
-        assert!(config.verify_inference_token("concurrent-inference-token-0123456789"));
-
-        let persisted = ServerConfig::load_or_default(&state.config_dir).unwrap();
-        assert_eq!(
-            persisted.upgrade_policy.auto_upgrade_check_interval_minutes,
-            expected_policy.auto_upgrade_check_interval_minutes
-        );
-        assert!(persisted.verify_inference_token("concurrent-inference-token-0123456789"));
     }
 
     #[tokio::test]

@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 
+import type { ProviderBundleView, ProviderResource } from "@/lib/api/providers";
 import { familyById, providerRegistry } from "@/server/providerRegistry";
 import { readEndpoint } from "@/server/providers/editor/providerDraft";
 import {
   createProviderBundleDraft,
+  duplicateProviderBundleDraft,
+  editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
   parseSettings,
+  providerBundleIdentityEditable,
   toProviderBundleWriteDraft,
   updateBundleModel,
   updateSurfaceEndpoint,
@@ -30,9 +34,6 @@ describe("Provider Bundle drafts", () => {
           profileId: surface.profileId,
           enabled: surface.defaultEnabled,
         })),
-      );
-      expect(draft.routeKey, family.familyId).toMatch(
-        /^(?=.{3,64}$)(?=.*[a-z])[a-z0-9_-]+$/,
       );
       expect(modelPoliciesForFamily(family), family.familyId).toContain(
         draft.modelPolicy,
@@ -64,6 +65,30 @@ describe("Provider Bundle drafts", () => {
         mode: "passthrough",
       });
     }
+  });
+
+  it("keeps preset identity canonical while Custom HTTP remains editable", () => {
+    const presetFamily = familyById("family.nvidia")!;
+    const preset = createProviderBundleDraft(presetFamily);
+    preset.name = "Renamed NVIDIA";
+    preset.websiteUrl = "https://example.invalid";
+
+    expect(providerBundleIdentityEditable(presetFamily)).toBe(false);
+    expect(toProviderBundleWriteDraft(preset)).toMatchObject({
+      name: "NVIDIA",
+      websiteUrl: "https://build.nvidia.com",
+    });
+
+    const customFamily = familyById("family.custom_http")!;
+    const custom = createProviderBundleDraft(customFamily);
+    custom.name = "Private gateway";
+    custom.websiteUrl = "https://gateway.example";
+
+    expect(providerBundleIdentityEditable(customFamily)).toBe(true);
+    expect(toProviderBundleWriteDraft(custom)).toMatchObject({
+      name: "Private gateway",
+      websiteUrl: "https://gateway.example",
+    });
   });
 
   it("locks official Claude and Codex families to passthrough", () => {
@@ -180,5 +205,71 @@ describe("Provider Bundle drafts", () => {
     });
 
     expect(validateProviderBundleDraft(draft)).toBeNull();
+  });
+
+  it("duplicates Bundle configuration without reusing stored secrets", () => {
+    const family = familyById("family.openrouter")!;
+    const source = createProviderBundleDraft(family);
+    const [{ pointer }] = familyCredentialSlots(family);
+    const write = toProviderBundleWriteDraft(source);
+    const surfaces = Object.fromEntries(
+      write.surfaces.map((surface) => [
+        surface.app,
+        {
+          app: surface.app,
+          provider: {
+            id: source.id,
+            name: source.name,
+            settingsConfig: surface.settingsConfig,
+            category: surface.category,
+            meta: surface.meta,
+          },
+          providerType: surface.meta?.providerType ?? "openrouter",
+          providerTypeId: surface.meta?.providerType ?? "openrouter",
+          revision: 4,
+          profileId: surface.profileId,
+          customBinding: surface.customBinding,
+          identity: { status: "bound" as const },
+          credentialConfigured: true,
+          credentialSlots: [pointer],
+        } satisfies ProviderResource,
+      ]),
+    ) as ProviderBundleView["surfaces"];
+    const view: ProviderBundleView = {
+      id: source.id,
+      familyId: family.familyId,
+      revision: 4,
+      name: source.name,
+      websiteUrl: source.websiteUrl,
+      notes: source.notes,
+      icon: source.icon,
+      iconColor: source.iconColor,
+      supportedApps: family.surfaces.map((surface) => surface.app),
+      enabledApps: family.surfaces.map((surface) => surface.app),
+      credentialConfigured: true,
+      credentialSlots: [pointer],
+      surfaces,
+    };
+
+    view.name = "Legacy custom name";
+    view.websiteUrl = "https://legacy.example";
+    expect(editProviderBundleDraft(view)).toMatchObject({
+      name: source.name,
+      websiteUrl: source.websiteUrl,
+    });
+
+    const duplicate = duplicateProviderBundleDraft(view);
+
+    expect(duplicate.id).not.toBe(source.id);
+    expect(duplicate.name).toBe(source.name);
+    expect(duplicate.expectedRevision).toBeUndefined();
+    expect(duplicate.clientRequestId).toBeTruthy();
+    expect(Object.values(duplicate.secrets)).toEqual([
+      { configured: false, value: "", clear: false },
+    ]);
+    expect(toProviderBundleWriteDraft(duplicate).credentialPatches).toEqual({});
+    expect(validateProviderBundleDraft(duplicate)).toBe(
+      "Configure the required credential",
+    );
   });
 });

@@ -3,7 +3,14 @@
   "product": "cc-switch-server",
   "uiAutomationAllowed": false,
   "shareUserTokenPeriods": {
-    "wireValues": ["lifetime", "day", "week", "sevenDays", "calendarMonth", "thirtyDays"],
+    "wireValues": [
+      "lifetime",
+      "day",
+      "week",
+      "sevenDays",
+      "calendarMonth",
+      "thirtyDays"
+    ],
     "weekSemantics": "utc_calendar_week_monday",
     "anchoredPeriods": ["sevenDays", "thirtyDays"],
     "anchorField": "tokenPeriodAnchorAtMs",
@@ -38,12 +45,7 @@
       "/web-api/admin/upgrade/stream",
       "/web-api/debug/upgrade/stream"
     ],
-    "deniedPrefixes": [
-      "/api/",
-      "/v1/",
-      "/_ctl/",
-      "/_share-router/"
-    ],
+    "deniedPrefixes": ["/api/", "/v1/", "/_ctl/", "/_share-router/"],
     "authentication": "authorization_header",
     "queryTokensAllowed": false
   },
@@ -1157,6 +1159,14 @@
       "feature": "providers",
       "endpoint": "DELETE /api/provider-bundles/:id",
       "notes": "Atomically deletes an unreferenced Provider Bundle."
+    },
+    {
+      "name": "update_provider_bundles_sort_order",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "PUT /api/provider-bundles/order",
+      "notes": "Atomically persists one global presentation order for multi-Surface Provider Bundles."
     },
     {
       "name": "get_provider_resources",

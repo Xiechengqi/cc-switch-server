@@ -12,18 +12,24 @@ use crate::state::ServerState;
 
 pub(in crate::api) async fn gemini_models_response(
     state: &ServerState,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     path: &str,
 ) -> Result<Option<Response>, ApiError> {
     let path = path.trim_matches('/');
     if path != "models" && !path.starts_with("models/") {
         return Ok(None);
     }
+    let (provider_id, _share_guard) =
+        super::validate_router_share_surface(state, headers, AppKind::Gemini).await?;
     let providers = state.providers.read().await;
-    let models = openai_model_list(&providers.providers, Some(AppKind::Gemini), None)
-        .into_iter()
-        .map(gemini_model_from_openai)
-        .collect::<Vec<_>>();
+    let models = openai_model_list(
+        &providers.providers,
+        Some(AppKind::Gemini),
+        Some(&provider_id),
+    )
+    .into_iter()
+    .map(gemini_model_from_openai)
+    .collect::<Vec<_>>();
     if path == "models" {
         return Ok(Some(Json(GeminiModelsResponse { models }).into_response()));
     }

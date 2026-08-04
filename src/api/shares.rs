@@ -430,6 +430,10 @@ pub(in crate::api) async fn add_share_binding(
             &root_key.key,
         )
         .map_err(map_credential_source_error)?;
+    let _binding_mutation = state
+        .lock_share_binding_mutation(&id)
+        .await
+        .ok_or_else(share_in_flight_error)?;
     let share = state
         .try_mutate_shares_immediate(|store| {
             let current = store
@@ -514,7 +518,7 @@ pub(in crate::api) async fn remove_share_binding(
                 ));
             }
             Err(crate::state::ConditionalShareDeleteError::InFlight) => {
-                return Err(share_delete_in_flight_error());
+                return Err(share_in_flight_error());
             }
         };
         crate::state::stop_share_tunnel(&state, &id).await;
@@ -530,6 +534,10 @@ pub(in crate::api) async fn remove_share_binding(
             share: None,
         }));
     }
+    let _binding_mutation = state
+        .lock_share_binding_mutation(&id)
+        .await
+        .ok_or_else(share_in_flight_error)?;
     let share = state
         .try_mutate_shares_immediate(|store| {
             let current = store
@@ -608,6 +616,10 @@ pub(in crate::api) async fn update_share_binding(
         )
         .map_err(map_credential_source_error)?;
 
+    let _binding_mutation = state
+        .lock_share_binding_mutation(&id)
+        .await
+        .ok_or_else(share_in_flight_error)?;
     let share = state
         .try_mutate_shares_immediate(|store| {
             let current = store
@@ -841,7 +853,7 @@ pub(in crate::api) async fn delete_share(
         .await
         .map_err(ApiError::internal)?
         .map_err(|error| match error {
-            crate::state::ShareDeleteError::InFlight => share_delete_in_flight_error(),
+            crate::state::ShareDeleteError::InFlight => share_in_flight_error(),
         })?;
     if let Some(tombstone) = tombstone.as_ref() {
         crate::state::stop_share_tunnel(&state, &id).await;
@@ -858,10 +870,10 @@ pub(in crate::api) async fn delete_share(
     }))
 }
 
-fn share_delete_in_flight_error() -> ApiError {
+pub(in crate::api) fn share_in_flight_error() -> ApiError {
     ApiError::conflict_code(
         "cc_switch_share_in_flight",
-        "Share cannot be deleted while requests are in flight",
+        "Share bindings cannot be changed or deleted while requests are in flight",
     )
 }
 
@@ -1092,13 +1104,13 @@ pub(in crate::api) fn connect_info_for_share(
         .clone()
         .or_else(|| router_domain_from_url(config.router.url.as_deref()))
         .ok_or_else(|| ApiError::conflict("router domain is not configured"))?;
-    let direct_url = format!("https://{subdomain}.{router_domain}");
+    let tunnel_url = format!("https://{subdomain}.{router_domain}");
     let snippets = [
         (
             AppKind::Claude,
             "Claude / Anthropic",
             vec![
-                ("ANTHROPIC_BASE_URL", direct_url.clone()),
+                ("ANTHROPIC_BASE_URL", tunnel_url.clone()),
                 ("ANTHROPIC_AUTH_TOKEN", "<user_api_token>".to_string()),
             ],
         ),
@@ -1108,7 +1120,7 @@ pub(in crate::api) fn connect_info_for_share(
             vec![
                 (
                     "OPENAI_BASE_URL",
-                    format!("{}/v1", direct_url.trim_end_matches('/')),
+                    format!("{}/v1", tunnel_url.trim_end_matches('/')),
                 ),
                 ("OPENAI_API_KEY", "<user_api_token>".to_string()),
             ],
@@ -1117,7 +1129,7 @@ pub(in crate::api) fn connect_info_for_share(
             AppKind::Gemini,
             "Gemini",
             vec![
-                ("GEMINI_BASE_URL", direct_url.clone()),
+                ("GEMINI_BASE_URL", tunnel_url.clone()),
                 ("GEMINI_API_KEY", "<user_api_token>".to_string()),
             ],
         ),
@@ -1139,7 +1151,7 @@ pub(in crate::api) fn connect_info_for_share(
     Ok(ShareConnectInfoResponse {
         ok: true,
         share_id: share.id.clone(),
-        direct_url,
+        tunnel_url,
         subdomain,
         router_domain,
         snippets,
@@ -1218,7 +1230,7 @@ mod tests {
         let response = connect_info_for_share(&config, &share).expect("connect info");
         assert_eq!(response.subdomain, "codex-pro--client-alpha");
         assert_eq!(
-            response.direct_url,
+            response.tunnel_url,
             "https://codex-pro--client-alpha.router.example.com"
         );
         assert_eq!(response.router_domain, "router.example.com");

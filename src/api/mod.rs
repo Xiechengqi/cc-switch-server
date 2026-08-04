@@ -127,7 +127,7 @@ use crate::domain::sharing::shares::{
 use crate::domain::usage::store::{UsageStatsFilter, UsageStore};
 use crate::proxy::adapters::ProviderAdapter;
 use crate::proxy::{self, ProxyRoute};
-use crate::state::{ServerEvent, ServerState, Session};
+use crate::state::{ServerEvent, ServerState, Session, ShareInFlightGuard};
 
 pub const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 pub const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
@@ -187,7 +187,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/auth/email/verify-code", post(verify_email_login_code))
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/api-token", post(rotate_api_token))
-        .route("/api/auth/inference-token", post(rotate_inference_token))
         .route("/api/admin/version", get(admin_version))
         .route("/api/admin/restart", post(admin_restart))
         .route("/api/admin/rollback", post(admin_rollback))
@@ -204,6 +203,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/provider-bundles",
             get(list_provider_bundles).post(create_provider_bundle),
+        )
+        .route(
+            "/api/provider-bundles/order",
+            put(update_provider_bundle_order),
         )
         .route(
             "/api/provider-bundles/:id",
@@ -485,6 +488,38 @@ pub fn app_router(state: ServerState) -> Router {
             "/web-api/admin/logs/tail",
             get(crate::api::logs::admin_logs_tail),
         )
+        .merge(inference_router())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            verify_router_ingress,
+        ))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state.clone());
+
+    match state.web_dist_dir.as_ref() {
+        Some(web_dist_dir) if web_dist_dir.is_dir() => {
+            app = app.fallback_service(ServeDir::new(web_dist_dir));
+        }
+        Some(web_dist_dir) => {
+            tracing::warn!(
+                web_dist_dir = %web_dist_dir.display(),
+                "configured web dist directory is missing; using embedded web assets"
+            );
+            app = app.fallback(embedded_web_asset);
+        }
+        None if web_assets::asset_count() > 0 => {
+            app = app.fallback(embedded_web_asset);
+        }
+        None => {
+            app = app.fallback(web_dist_missing);
+        }
+    }
+    app
+}
+
+fn inference_router() -> Router<ServerState> {
+    Router::new()
         .route("/v1/models", get(proxy_models_or_manifest))
         .route("/models", get(proxy_models_or_manifest))
         .route(
@@ -602,121 +637,21 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/v1beta/*path", any(proxy_gemini))
         .route("/gemini/v1/*path", any(proxy_gemini))
         .route("/gemini/v1beta/*path", any(proxy_gemini))
-        .route(
-            "/r/:route_key/v1/messages",
-            post(proxy_route_claude_messages),
-        )
-        .route(
-            "/r/:route_key/v1/messages/count_tokens",
-            post(proxy_route_claude_count_tokens),
-        )
-        .route(
-            "/r/:route_key/v1/models",
-            get(proxy_route_models_or_manifest),
-        )
-        .route("/r/:route_key/models", get(proxy_route_models_or_manifest))
-        .route(
-            "/r/:route_key/backend-api/codex/models",
-            get(proxy_route_codex_models_manifest),
-        )
-        .route(
-            "/r/:route_key/v1/chat/completions",
-            post(proxy_route_codex_chat_completions),
-        )
-        .route(
-            "/r/:route_key/v1/responses",
-            post(proxy_route_codex_responses).get(proxy_route_codex_responses_ws),
-        )
-        .route(
-            "/r/:route_key/v1/responses/compact",
-            post(proxy_route_codex_responses_compact).get(proxy_route_codex_responses_ws),
-        )
-        .route(
-            "/r/:route_key/v1/responses/input_tokens",
-            post(proxy_responses_input_tokens),
-        )
-        .route(
-            "/r/:route_key/v1/alpha/search",
-            post(proxy_route_codex_alpha_search),
-        )
-        .route(
-            "/r/:route_key/alpha/search",
-            post(proxy_route_codex_alpha_search),
-        )
-        .route(
-            "/r/:route_key/backend-api/codex/alpha/search",
-            post(proxy_route_codex_alpha_search),
-        )
-        .route(
-            "/r/:route_key/v1/images/generations",
-            post(proxy_route_images_generations).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
-        )
-        .route(
-            "/r/:route_key/images/generations",
-            post(proxy_route_images_generations).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
-        )
-        .route(
-            "/r/:route_key/v1/images/edits",
-            post(proxy_route_images_edits).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
-        )
-        .route(
-            "/r/:route_key/images/edits",
-            post(proxy_route_images_edits).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
-        )
-        .route(
-            "/r/:route_key/v1/videos/generations",
-            post(proxy_route_grok_videos_generations)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/r/:route_key/videos/generations",
-            post(proxy_route_grok_videos_generations)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/r/:route_key/v1/videos/:request_id",
-            get(proxy_route_grok_video_status),
-        )
-        .route(
-            "/r/:route_key/videos/:request_id",
-            get(proxy_route_grok_video_status),
-        )
-        .route("/r/:route_key/v1beta/*path", any(proxy_route_gemini))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            verify_router_ingress,
-        ))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+        .layer(middleware::from_fn(require_router_share_ingress))
+}
 
-    match state.web_dist_dir.as_ref() {
-        Some(web_dist_dir) if web_dist_dir.is_dir() => {
-            app = app.fallback_service(ServeDir::new(web_dist_dir));
-        }
-        Some(web_dist_dir) => {
-            tracing::warn!(
-                web_dist_dir = %web_dist_dir.display(),
-                "configured web dist directory is missing; using embedded web assets"
-            );
-            app = app.fallback(embedded_web_asset);
-        }
-        None if web_assets::asset_count() > 0 => {
-            app = app.fallback(embedded_web_asset);
-        }
-        None => {
-            app = app.fallback(web_dist_missing);
-        }
+async fn require_router_share_ingress(request: Request, next: Next) -> Response {
+    let Some(context) = request
+        .extensions()
+        .get::<crate::clients::router::ingress::IngressContext>()
+    else {
+        return ApiError::unauthorized("inference requires signed Router Share ingress")
+            .into_response();
+    };
+    if context.share_id.is_none() {
+        return ApiError::forbidden("inference requires a Router Share binding").into_response();
     }
-    app
+    next.run(request).await
 }
 
 async fn verify_router_ingress(
@@ -741,6 +676,7 @@ async fn verify_router_ingress(
         INGRESS_SIGNATURE_HEADER,
         "x-cc-switch-share-id",
         "x-cc-switch-share-subdomain",
+        "x-cc-switch-share-host",
         "x-cc-switch-user-email",
         "x-cc-switch-user-country",
         "x-cc-switch-request-id",
@@ -753,8 +689,8 @@ async fn verify_router_ingress(
         request.headers_mut().remove(name);
     }
 
-    let (context, router_verified) = match (encoded, signature) {
-        (None, None) => (None, false),
+    let context = match (encoded, signature) {
+        (None, None) => None,
         (Some(encoded), Some(signature)) => {
             let config = state.config.read().await;
             let Some(identity) = config.registered_router_identity() else {
@@ -775,7 +711,7 @@ async fn verify_router_ingress(
                 &identity.installation_id,
                 chrono::Utc::now().timestamp_millis(),
             ) {
-                Ok(context) => (Some(context), true),
+                Ok(context) => Some(context),
                 Err(error) => {
                     tracing::warn!(error = %error, "router ingress context rejected");
                     return StatusCode::UNAUTHORIZED.into_response();
@@ -785,37 +721,23 @@ async fn verify_router_ingress(
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    if is_direct_inference_path(request.uri().path()) && !router_verified {
-        if request.headers().contains_key(header::ORIGIN) {
-            return ApiError::forbidden(
-                "browser-originated direct inference requests are not allowed",
-            )
-            .into_response();
-        }
-        let config = state.config.read().await;
-        if !config.inference_token_configured() {
-            return ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "inference token is not configured; rotate one at /api/auth/inference-token",
-            )
-            .into_response();
-        }
-        let authorized =
-            inference_tokens(request.headers()).any(|token| config.verify_inference_token(token));
-        if !authorized {
-            return ApiError::unauthorized("missing or invalid inference token").into_response();
-        }
-    }
-
     let Some(context) = context else {
         return next.run(request).await;
     };
+    request.extensions_mut().insert(context.clone());
     let headers = request.headers_mut();
     for (name, value) in [
         ("x-cc-switch-share-id", context.share_id.as_deref()),
         (
             "x-cc-switch-share-subdomain",
             context.public_host.split('.').next(),
+        ),
+        (
+            "x-cc-switch-share-host",
+            context
+                .share_id
+                .as_ref()
+                .map(|_| context.public_host.as_str()),
         ),
         ("x-cc-switch-user-email", context.user_email.as_deref()),
         ("x-cc-switch-user-country", context.user_country.as_deref()),
@@ -848,67 +770,6 @@ async fn verify_router_ingress(
         }
     }
     next.run(request).await
-}
-
-fn is_direct_inference_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/models"
-            | "/models"
-            | "/backend-api/codex/models"
-            | "/v1/messages"
-            | "/claude/v1/messages"
-            | "/v1/messages/count_tokens"
-            | "/claude/v1/messages/count_tokens"
-            | "/v1/chat/completions"
-            | "/v1/v1/chat/completions"
-            | "/chat/completions"
-            | "/codex/v1/chat/completions"
-            | "/v1/responses"
-            | "/v1/responses/compact"
-            | "/v1/v1/responses"
-            | "/v1/v1/responses/compact"
-            | "/responses"
-            | "/responses/compact"
-            | "/codex/v1/responses"
-            | "/codex/v1/responses/compact"
-            | "/backend-api/codex/responses"
-            | "/backend-api/codex/responses/compact"
-            | "/v1/responses/input_tokens"
-            | "/responses/input_tokens"
-            | "/alpha/search"
-            | "/v1/alpha/search"
-            | "/backend-api/codex/alpha/search"
-            | "/v1/images/generations"
-            | "/images/generations"
-            | "/v1/images/edits"
-            | "/images/edits"
-            | "/v1/videos/generations"
-            | "/videos/generations"
-    ) || path
-        .strip_prefix("/v1/videos/")
-        .is_some_and(|request_id| !request_id.is_empty())
-        || path
-            .strip_prefix("/videos/")
-            .is_some_and(|request_id| !request_id.is_empty())
-        || path.starts_with("/v1beta/")
-        || path.starts_with("/gemini/v1/")
-        || path.starts_with("/gemini/v1beta/")
-}
-
-fn inference_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
-    bearer_token(headers)
-        .into_iter()
-        .chain(inference_header_token(headers, "x-api-key"))
-        .chain(inference_header_token(headers, "x-goog-api-key"))
-}
-
-fn inference_header_token<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 async fn embedded_web_asset(method: Method, uri: Uri) -> Response {
@@ -975,10 +836,6 @@ async fn readiness(State(state): State<ServerState>) -> Response {
     if state.credential_persistence_degraded() {
         reasons.push("oauth_credential_persistence_degraded");
     }
-    let config = state.config.read().await;
-    if config.is_setup_complete() && !config.inference_token_configured() {
-        reasons.push("inference_token_not_configured");
-    }
     let ready = reasons.is_empty();
     (
         if ready {
@@ -1036,36 +893,50 @@ async fn proxy_models(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<ModelsQuery>,
-) -> Json<OpenAiModelsResponse> {
+) -> Result<Json<OpenAiModelsResponse>, ApiError> {
+    let app = query.app.unwrap_or(AppKind::Codex);
+    let (provider_id, _share_guard) = validate_router_share_surface(&state, &headers, app).await?;
+    Ok(proxy_models_for_selection(&state, Some(app), Some(&provider_id)).await)
+}
+
+pub(super) async fn validate_router_share_surface(
+    state: &ServerState,
+    headers: &HeaderMap,
+    app: AppKind,
+) -> Result<(String, ShareInFlightGuard), ApiError> {
     let share_id = headers
         .get("x-cc-switch-share-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthorized("inference requires signed Router Share ingress"))?;
+    let user_email = headers
+        .get("x-cc-switch-user-email")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
         .filter(|value| !value.is_empty());
-    let app = if share_id.is_some() {
-        Some(query.app.unwrap_or(AppKind::Codex))
-    } else {
-        query.app
-    };
-    let provider_id = if let (Some(share_id), Some(app)) = (share_id, app) {
-        state
-            .shares
-            .read()
-            .await
-            .shares
-            .iter()
-            .find(|share| share.id == share_id && share.enabled && share.status == "active")
-            .and_then(|share| {
-                share
-                    .bindings
-                    .iter()
-                    .find(|binding| binding.app == app)
-                    .map(|binding| binding.provider_id.clone())
-            })
-    } else {
-        None
-    };
-    proxy_models_for_selection(&state, app, provider_id.as_deref()).await
+    let (_, guard) = proxy::validate_and_acquire_share_invocation(state, share_id, app, user_email)
+        .await
+        .map_err(ApiError::proxy)?;
+    let provider_id = state
+        .shares
+        .read()
+        .await
+        .get(share_id)
+        .and_then(|share| share.bindings.iter().find(|binding| binding.app == app))
+        .map(|binding| binding.provider_id.clone())
+        .ok_or_else(|| ApiError::conflict("Share binding changed during validation"))?;
+    let provider_enabled = state.providers.read().await.providers.iter().any(|stored| {
+        stored.app == app
+            && stored.provider.id == provider_id
+            && crate::domain::providers::bundle::surface_enabled(&stored.provider)
+    });
+    if !provider_enabled {
+        return Err(ApiError::not_found(format!(
+            "enabled Share provider not found: {provider_id}"
+        )));
+    }
+    Ok((provider_id, guard))
 }
 
 async fn proxy_models_for_selection(
@@ -1435,42 +1306,7 @@ async fn proxy_models_or_manifest(
 
     Ok(
         proxy_models(State(state), headers, Query(ModelsQuery { app: query.app }))
-            .await
-            .into_response(),
-    )
-}
-
-async fn proxy_route_models_or_manifest(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<ModelsDispatchQuery>,
-) -> Result<Response, ApiError> {
-    if query
-        .client_version
-        .as_deref()
-        .is_some_and(|version| !version.trim().is_empty())
-    {
-        return proxy::forward_codex_models_manifest_for_route_key(
-            state,
-            route_key,
-            headers,
-            query.client_version,
-        )
-        .await
-        .map_err(ApiError::proxy);
-    }
-    let provider_id = state
-        .provider_id_for_route_key(AppKind::Codex, &route_key)
-        .await
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "no enabled codex Surface is configured for route key {route_key}"
-            ))
-        })?;
-    Ok(
-        proxy_models_for_selection(&state, Some(AppKind::Codex), Some(&provider_id))
-            .await
+            .await?
             .into_response(),
     )
 }
@@ -1490,22 +1326,6 @@ async fn proxy_codex_models_manifest(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_codex_models_manifest(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<CodexModelsManifestQuery>,
-) -> Result<Response, ApiError> {
-    proxy::forward_codex_models_manifest_for_route_key(
-        state,
-        route_key,
-        headers,
-        query.client_version,
-    )
-    .await
-    .map_err(ApiError::proxy)
-}
-
 async fn proxy_codex_alpha_search(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1516,24 +1336,20 @@ async fn proxy_codex_alpha_search(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_codex_alpha_search(
+async fn proxy_responses_input_tokens(
     State(state): State<ServerState>,
-    Path(route_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    proxy::forward_codex_alpha_search_for_route_key(state, route_key, headers, body)
-        .await
-        .map_err(ApiError::proxy)
+    let (_provider_id, _share_guard) =
+        validate_router_share_surface(&state, &headers, AppKind::Codex).await?;
+    responses_input_tokens_response(&headers, body)
 }
 
-async fn proxy_responses_input_tokens(
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
+fn responses_input_tokens_response(headers: &HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     const BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
     let body =
-        crate::proxy::decode_request_body_for_proxy_with_limit(&headers, body, BODY_LIMIT_BYTES)
+        crate::proxy::decode_request_body_for_proxy_with_limit(headers, body, BODY_LIMIT_BYTES)
             .map_err(ApiError::proxy)?;
     let request = serde_json::from_slice::<Value>(&body)
         .map_err(|error| ApiError::bad_request(format!("invalid token count JSON: {error}")))?;
@@ -1585,9 +1401,7 @@ mod responses_input_token_tests {
             HeaderValue::from_static("gzip"),
         );
 
-        let error = proxy_responses_input_tokens(headers, Bytes::from(compressed))
-            .await
-            .unwrap_err();
+        let error = responses_input_tokens_response(&headers, Bytes::from(compressed)).unwrap_err();
 
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(error.message.contains("2097152 byte limit"));
@@ -1636,7 +1450,16 @@ mod grok_catalog_provider_tests {
     use super::*;
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta};
     use crate::domain::providers::store::ProviderStore;
+    use crate::domain::settings::config::RouterIdentity;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use tower::ServiceExt;
+
+    const TEST_ROUTER_DOMAIN: &str = "router.test";
+    const TEST_INSTALLATION_ID: &str = "inst-api-tests";
+    const TEST_CONTROL_SECRET: &str = "api-test-control-secret-0123456789";
 
     fn catalog_test_state(name: &str) -> ServerState {
         let nanos = SystemTime::now()
@@ -1660,6 +1483,122 @@ mod grok_catalog_provider_tests {
             )),
         )
         .unwrap()
+    }
+
+    async fn configure_test_router(state: &ServerState) {
+        let mut config = state.config_snapshot().await;
+        config.router.domain = Some(TEST_ROUTER_DOMAIN.to_string());
+        config.router.identity = Some(RouterIdentity {
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            public_key: "public-key".to_string(),
+            private_key: "private-key".to_string(),
+            control_secret: Some(TEST_CONTROL_SECRET.to_string()),
+        });
+        state.replace_config(config).await.unwrap();
+    }
+
+    async fn configure_test_share(state: &ServerState, share_id: &str, app: AppKind) {
+        let provider_id = format!("{share_id}-provider");
+        let provider_id_for_store = provider_id.clone();
+        let provider_name = format!("{share_id} Provider");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    app,
+                    Provider {
+                        id: provider_id_for_store,
+                        name: provider_name,
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some(ProviderType::GrokOAuth.as_str().to_string()),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_shares_immediate(|shares| {
+                shares
+                    .upsert(UpsertShareInput {
+                        id: Some(share_id.to_string()),
+                        owner_email: Some("owner@example.com".to_string()),
+                        app,
+                        provider_id: provider_id.clone(),
+                        provider_type: ProviderType::GrokOAuth,
+                        display_name: Some(share_id.to_string()),
+                        enabled: Some(true),
+                        status: Some("active".to_string()),
+                        subscription_level: None,
+                        account_email: None,
+                        quota_percent: None,
+                        tunnel_subdomain: Some(share_id.to_string()),
+                        acl: None,
+                        token_limit: None,
+                        parallel_limit: None,
+                        expires_at: None,
+                        for_sale: Some(false),
+                        free_access: Some(false),
+                        access_by_app: Default::default(),
+                        app_settings: Default::default(),
+                        for_sale_official_price_percent_by_app: Default::default(),
+                        official_price_percent: None,
+                        auto_start: Some(true),
+                        description: None,
+                        bindings: vec![ShareBinding {
+                            app,
+                            provider_id,
+                            provider_type: ProviderType::GrokOAuth,
+                        }],
+                        runtime_snapshot: None,
+                        user_grants: Default::default(),
+                    })
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+    }
+
+    fn router_ingress_request(
+        mut request: Request,
+        request_id: &str,
+        share_id: Option<&str>,
+    ) -> Request {
+        let context = crate::clients::router::ingress::IngressContext {
+            protocol_epoch: crate::clients::router::ingress::PROTOCOL_EPOCH.to_string(),
+            router_id: TEST_ROUTER_DOMAIN.to_string(),
+            route_id: share_id
+                .map(|share_id| format!("share:{share_id}"))
+                .unwrap_or_else(|| format!("client:{TEST_INSTALLATION_ID}")),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            target_lane_id: TEST_INSTALLATION_ID.to_string(),
+            public_host: "share--client.router.test".to_string(),
+            share_id: share_id.map(str::to_string),
+            request_id: request_id.to_string(),
+            user_email: Some("owner@example.com".to_string()),
+            user_role: share_id.is_none().then(|| "owner".to_string()),
+            user_country: Some("JP".to_string()),
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).unwrap());
+        let mut mac = Hmac::<Sha256>::new_from_slice(TEST_CONTROL_SECRET.as_bytes()).unwrap();
+        mac.update(b"cc-switch-router-ingress-v1\n");
+        mac.update(crate::clients::router::ingress::PROTOCOL_EPOCH.as_bytes());
+        mac.update(b"\n");
+        mac.update(encoded.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        request.headers_mut().insert(
+            crate::clients::router::ingress::INGRESS_CONTEXT_HEADER,
+            encoded.parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            crate::clients::router::ingress::INGRESS_SIGNATURE_HEADER,
+            signature.parse().unwrap(),
+        );
+        request
     }
 
     fn grok_provider(id: &str) -> StoredProvider {
@@ -1722,50 +1661,58 @@ mod grok_catalog_provider_tests {
     #[tokio::test]
     async fn media_routes_override_the_default_body_limit_but_remain_bounded() {
         let state = catalog_test_state("media-body-limit");
-        let inference_token = "media-inference-token-0123456789";
-        state.set_inference_token(inference_token).await.unwrap();
+        configure_test_router(&state).await;
         let app = app_router(state);
 
-        let above_default = axum::http::Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/edits")
-            .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(vec![b' '; 2 * 1024 * 1024 + 1]))
-            .unwrap();
+        let above_default = router_ingress_request(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(vec![b' '; 2 * 1024 * 1024 + 1]))
+                .unwrap(),
+            "media-above-default",
+            Some("share-media"),
+        );
         let accepted_by_extractor = app.clone().oneshot(above_default).await.unwrap();
         assert_ne!(
             accepted_by_extractor.status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
 
-        let codex_envelope = axum::http::Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/edits")
-            .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(vec![
-                b' ';
-                proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1
-            ]))
-            .unwrap();
+        let codex_envelope = router_ingress_request(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(vec![
+                    b' ';
+                    proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1
+                ]))
+                .unwrap(),
+            "media-codex-envelope",
+            Some("share-media"),
+        );
         let accepted_codex_envelope = app.clone().oneshot(codex_envelope).await.unwrap();
         assert_ne!(
             accepted_codex_envelope.status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
 
-        let above_images_envelope = axum::http::Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/edits")
-            .header(header::AUTHORIZATION, format!("Bearer {inference_token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(vec![
-                b' ';
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
-                    + 1
-            ]))
-            .unwrap();
+        let above_images_envelope = router_ingress_request(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(vec![
+                    b' ';
+                    proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
+                        + 1
+                ]))
+                .unwrap(),
+            "media-above-images-envelope",
+            Some("share-media"),
+        );
         let rejected = app.oneshot(above_images_envelope).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -1773,6 +1720,8 @@ mod grok_catalog_provider_tests {
     #[tokio::test]
     async fn ephemeral_image_capability_url_supports_get_head_and_rejects_invalid_tokens() {
         let state = catalog_test_state("ephemeral-image-download");
+        configure_test_router(&state).await;
+        configure_test_share(&state, "share-image", AppKind::Codex).await;
         let image = Bytes::from_static(b"\x89PNG\r\n\x1a\nfixture");
         let handle = state
             .store_image_capability(image.clone(), "image/png".to_string())
@@ -1781,15 +1730,47 @@ mod grok_catalog_provider_tests {
         let path = format!("/v1/images/files/{}", handle.token);
         let app = app_router(state);
 
+        for method in [Method::GET, Method::HEAD] {
+            let unsigned = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method.clone())
+                        .uri(&path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+            let client_ingress = app
+                .clone()
+                .oneshot(router_ingress_request(
+                    axum::http::Request::builder()
+                        .method(method.clone())
+                        .uri(&path)
+                        .body(Body::empty())
+                        .unwrap(),
+                    &format!("image-client-{}", method.as_str().to_ascii_lowercase()),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(client_ingress.status(), StatusCode::FORBIDDEN);
+        }
+
         let get_response = app
             .clone()
-            .oneshot(
+            .oneshot(router_ingress_request(
                 axum::http::Request::builder()
                     .method(Method::GET)
                     .uri(&path)
                     .body(Body::empty())
                     .unwrap(),
-            )
+                "image-get",
+                Some("share-image"),
+            ))
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
@@ -1806,13 +1787,15 @@ mod grok_catalog_provider_tests {
 
         let head_response = app
             .clone()
-            .oneshot(
+            .oneshot(router_ingress_request(
                 axum::http::Request::builder()
                     .method(Method::HEAD)
                     .uri(&path)
                     .body(Body::empty())
                     .unwrap(),
-            )
+                "image-head",
+                Some("share-image"),
+            ))
             .await
             .unwrap();
         assert_eq!(head_response.status(), StatusCode::OK);
@@ -1834,17 +1817,131 @@ mod grok_catalog_provider_tests {
         ] {
             let response = app
                 .clone()
-                .oneshot(
+                .oneshot(router_ingress_request(
                     axum::http::Request::builder()
                         .method(Method::GET)
                         .uri(invalid_path)
                         .body(Body::empty())
                         .unwrap(),
-                )
+                    "image-invalid",
+                    Some("share-image"),
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn inference_requires_signed_share_ingress_and_route_key_paths_are_gone() {
+        let state = catalog_test_state("share-ingress-only");
+        configure_test_router(&state).await;
+        let app = app_router(state);
+
+        let unsigned = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+        let client_ingress = app
+            .clone()
+            .oneshot(router_ingress_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+                "client-inference",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(client_ingress.status(), StatusCode::FORBIDDEN);
+
+        for (method, uri, body) in [
+            (Method::GET, "/v1/models", Body::empty()),
+            (Method::POST, "/v1/responses/input_tokens", Body::from("{}")),
+            (Method::GET, "/v1beta/models", Body::empty()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(router_ingress_request(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                    &format!("missing-share-{uri}"),
+                    Some("missing-share"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+
+        let legacy_route = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/r/provider/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_route.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_inference_routes_reject_disabled_share_surfaces() {
+        let state = catalog_test_state("disabled-share-surface");
+        configure_test_router(&state).await;
+        configure_test_share(&state, "share-disabled", AppKind::Codex).await;
+        state
+            .mutate_providers_immediate(|providers| {
+                let provider = providers
+                    .providers
+                    .iter_mut()
+                    .find(|stored| {
+                        stored.app == AppKind::Codex
+                            && stored.provider.id == "share-disabled-provider"
+                    })
+                    .unwrap();
+                provider
+                    .provider
+                    .extra
+                    .insert("surfaceEnabled".to_string(), json!(false));
+            })
+            .await
+            .unwrap();
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(router_ingress_request(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+                "disabled-share-surface",
+                Some("share-disabled"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2352,24 +2449,6 @@ async fn proxy_claude_messages(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_claude_messages(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_for_route_key(
-        state,
-        ProxyRoute::ClaudeMessages,
-        route_key,
-        None,
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
-}
-
 async fn proxy_claude_count_tokens(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2378,24 +2457,6 @@ async fn proxy_claude_count_tokens(
     proxy::forward(state, ProxyRoute::ClaudeCountTokens, None, headers, body)
         .await
         .map_err(ApiError::proxy)
-}
-
-async fn proxy_route_claude_count_tokens(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_for_route_key(
-        state,
-        ProxyRoute::ClaudeCountTokens,
-        route_key,
-        None,
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
 }
 
 async fn proxy_codex_chat_completions(
@@ -2408,24 +2469,6 @@ async fn proxy_codex_chat_completions(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_codex_chat_completions(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_for_route_key(
-        state,
-        ProxyRoute::CodexChatCompletions,
-        route_key,
-        None,
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
-}
-
 async fn proxy_codex_responses(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2434,24 +2477,6 @@ async fn proxy_codex_responses(
     proxy::forward(state, ProxyRoute::CodexResponses, None, headers, body)
         .await
         .map_err(ApiError::proxy)
-}
-
-async fn proxy_route_codex_responses(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_for_route_key(
-        state,
-        ProxyRoute::CodexResponses,
-        route_key,
-        None,
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
 }
 
 async fn proxy_codex_responses_compact(
@@ -2470,41 +2495,12 @@ async fn proxy_codex_responses_compact(
     .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_codex_responses_compact(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_for_route_key(
-        state,
-        ProxyRoute::CodexResponsesCompact,
-        route_key,
-        None,
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
-}
-
 async fn proxy_codex_responses_ws(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     proxy::forward_codex_responses_ws(state, headers, ws)
-        .await
-        .map_err(ApiError::proxy)
-}
-
-async fn proxy_route_codex_responses_ws(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
-    proxy::forward_codex_responses_ws_for_route_key(state, route_key, headers, ws)
         .await
         .map_err(ApiError::proxy)
 }
@@ -2519,31 +2515,23 @@ async fn proxy_images_generations(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_images_generations(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_images_generations_for_route_key(state, route_key, headers, body)
-        .await
-        .map_err(ApiError::proxy)
-}
-
 async fn ephemeral_image_file(
     State(state): State<ServerState>,
     Path(token): Path<String>,
     method: Method,
-) -> Response {
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (_provider_id, _share_guard) =
+        validate_router_share_surface(&state, &headers, AppKind::Codex).await?;
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return StatusCode::NOT_FOUND.into_response();
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
     let image = match state.image_capability(token).await {
         Ok(Some(image)) => image,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return Ok(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
             tracing::error!(error = %error, "image capability read failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
     let body = if method == Method::HEAD {
@@ -2580,7 +2568,7 @@ async fn ephemeral_image_file(
         header::HeaderName::from_static("cross-origin-resource-policy"),
         HeaderValue::from_static("cross-origin"),
     );
-    response
+    Ok(response)
 }
 
 async fn proxy_images_edits(
@@ -2593,17 +2581,6 @@ async fn proxy_images_edits(
         .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_images_edits(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_images_edits_for_route_key(state, route_key, headers, body)
-        .await
-        .map_err(ApiError::proxy)
-}
-
 async fn proxy_grok_videos_generations(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -2611,24 +2588,6 @@ async fn proxy_grok_videos_generations(
 ) -> Result<Response, ApiError> {
     proxy::forward_grok_media(
         state,
-        Method::POST,
-        "/videos/generations".to_string(),
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
-}
-
-async fn proxy_route_grok_videos_generations(
-    State(state): State<ServerState>,
-    Path(route_key): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy::forward_grok_media_for_route_key(
-        state,
-        route_key,
         Method::POST,
         "/videos/generations".to_string(),
         headers,
@@ -2654,23 +2613,6 @@ async fn proxy_grok_video_status(
     .map_err(ApiError::proxy)
 }
 
-async fn proxy_route_grok_video_status(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path((route_key, request_id)): Path<(String, String)>,
-) -> Result<Response, ApiError> {
-    proxy::forward_grok_media_for_route_key(
-        state,
-        route_key,
-        Method::GET,
-        format!("/videos/{request_id}"),
-        headers,
-        Bytes::new(),
-    )
-    .await
-    .map_err(ApiError::proxy)
-}
-
 async fn proxy_gemini(
     method: Method,
     State(state): State<ServerState>,
@@ -2686,26 +2628,6 @@ async fn proxy_gemini(
     proxy::forward(state, ProxyRoute::Gemini, Some(path), headers, body)
         .await
         .map_err(ApiError::proxy)
-}
-
-async fn proxy_route_gemini(
-    method: Method,
-    State(state): State<ServerState>,
-    Path((route_key, path)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    let _ = method;
-    proxy::forward_for_route_key(
-        state,
-        ProxyRoute::Gemini,
-        route_key,
-        Some(path),
-        headers,
-        body,
-    )
-    .await
-    .map_err(ApiError::proxy)
 }
 
 async fn web_dist_missing() -> impl IntoResponse {

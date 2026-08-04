@@ -25,7 +25,7 @@ test("skipped local contracts block release readiness and evidence", () => {
     EVIDENCE_FILE: evidenceFile,
     CC_SWITCH_SERVER_TOKEN: "",
     SHARE_ID: "",
-    DIRECT_SHARE_URL: "",
+    CC_SWITCH_SHARE_URL: "",
     ROUTER_API_TOKEN: "",
     MARKET_API_URL: "",
     CLAUDE_PROVIDER_TOKEN: "",

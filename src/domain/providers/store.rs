@@ -44,6 +44,8 @@ pub struct ProviderStore {
     pub providers: Vec<StoredProvider>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub order: BTreeMap<AppKind, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundle_order: Vec<String>,
     #[serde(skip)]
     pub(crate) runtime_index: Arc<ProviderRuntimeIndex>,
     #[serde(skip)]
@@ -60,6 +62,12 @@ struct ProviderStoreS1<'a> {
     providers: &'a [StoredProvider],
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     order: &'a BTreeMap<AppKind, Vec<String>>,
+    #[serde(skip_serializing_if = "string_slice_is_empty")]
+    bundle_order: &'a [String],
+}
+
+fn string_slice_is_empty(values: &&[String]) -> bool {
+    values.is_empty()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +245,7 @@ impl ProviderStore {
                 serde_json::to_value(ProviderStoreS1 {
                     providers: &materialized.providers,
                     order: &materialized.order,
+                    bundle_order: &materialized.bundle_order,
                 })
                 .context("encode Provider S1 store")?
             }
@@ -361,6 +370,20 @@ impl ProviderStore {
                 );
             }
         }
+        let bundle_ids = self
+            .providers
+            .iter()
+            .filter(|stored| super::bundle::is_explicit_bundle_surface(&stored.provider))
+            .map(|stored| super::bundle::bundle_id(&stored.provider))
+            .collect::<std::collections::BTreeSet<_>>();
+        let ordered_bundle_ids = self
+            .bundle_order
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if ordered_bundle_ids.len() != self.bundle_order.len() || ordered_bundle_ids != bundle_ids {
+            anyhow::bail!("Provider Bundle order must contain every Bundle exactly once");
+        }
         let mut request_ids = std::collections::BTreeSet::new();
         for stored in &self.providers {
             if let Some(request_id) = stored.resource.create_request_id.as_deref() {
@@ -427,6 +450,13 @@ impl ProviderStore {
             self.providers.push(stored.clone());
             if let Some(order) = self.order.get_mut(&app) {
                 order.push(stored.provider.id.clone());
+            }
+        }
+
+        if super::bundle::is_explicit_bundle_surface(&stored.provider) {
+            let bundle_id = super::bundle::bundle_id(&stored.provider);
+            if !self.bundle_order.iter().any(|id| id == bundle_id) {
+                self.bundle_order.push(bundle_id.to_string());
             }
         }
 
@@ -505,6 +535,47 @@ impl ProviderStore {
         Ok(true)
     }
 
+    pub fn update_bundle_sort_order(
+        &mut self,
+        updates: Vec<ProviderSortUpdate>,
+    ) -> anyhow::Result<bool> {
+        let bundle_ids = self
+            .providers
+            .iter()
+            .filter(|stored| super::bundle::is_explicit_bundle_surface(&stored.provider))
+            .map(|stored| super::bundle::bundle_id(&stored.provider))
+            .collect::<std::collections::BTreeSet<_>>();
+        if updates.len() != bundle_ids.len() {
+            anyhow::bail!("Provider Bundle sort order must include every Bundle");
+        }
+        let mut indexed = Vec::with_capacity(updates.len());
+        let mut ids = std::collections::BTreeSet::new();
+        let mut indexes = std::collections::BTreeSet::new();
+        for update in updates {
+            if !bundle_ids.contains(update.id.as_str()) {
+                anyhow::bail!("Provider Bundle sort order contains an unknown Bundle");
+            }
+            if !ids.insert(update.id.clone()) || !indexes.insert(update.sort_index) {
+                anyhow::bail!("Provider Bundle sort order contains duplicate ids or indexes");
+            }
+            indexed.push((update.sort_index, update.id));
+        }
+        indexed.sort_by_key(|(index, _)| *index);
+        if indexed
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+        {
+            anyhow::bail!("Provider Bundle sort indexes must be contiguous from zero");
+        }
+        let next = indexed.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+        if self.bundle_order == next {
+            return Ok(false);
+        }
+        self.bundle_order = next;
+        Ok(true)
+    }
+
     pub fn remove(&mut self, app: AppKind, provider_id: &str) -> Option<StoredProvider> {
         let index = self
             .providers
@@ -515,6 +586,16 @@ impl ProviderStore {
             order.retain(|id| id != provider_id);
             if order.is_empty() {
                 self.order.remove(&app);
+            }
+        }
+        if super::bundle::is_explicit_bundle_surface(&removed.provider) {
+            let bundle_id = super::bundle::bundle_id(&removed.provider).to_string();
+            let bundle_remains = self.providers.iter().any(|stored| {
+                super::bundle::is_explicit_bundle_surface(&stored.provider)
+                    && super::bundle::bundle_id(&stored.provider) == bundle_id.as_str()
+            });
+            if !bundle_remains {
+                self.bundle_order.retain(|id| id != &bundle_id);
             }
         }
         Some(removed)
@@ -1159,6 +1240,55 @@ mod tests {
     }
 
     #[test]
+    fn bundle_order_is_global_persisted_and_cleaned_after_last_surface_removal() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-bundle-order-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = ProviderStore::default();
+        store.upsert(
+            AppKind::Claude,
+            provider_bundle_surface("bundle-first", "Bundle first"),
+        );
+        store.upsert(
+            AppKind::Codex,
+            provider_bundle_surface("bundle-first", "Bundle first"),
+        );
+        store.upsert(
+            AppKind::Gemini,
+            provider_bundle_surface("bundle-second", "Bundle second"),
+        );
+        assert_eq!(store.bundle_order, vec!["bundle-first", "bundle-second"]);
+
+        assert!(store
+            .update_bundle_sort_order(vec![
+                ProviderSortUpdate {
+                    id: "bundle-second".to_string(),
+                    sort_index: 0,
+                },
+                ProviderSortUpdate {
+                    id: "bundle-first".to_string(),
+                    sort_index: 1,
+                },
+            ])
+            .unwrap());
+        store.validate_for_commit().unwrap();
+        store.save(&config_dir).unwrap();
+
+        let mut loaded = ProviderStore::load_or_default(&config_dir).unwrap();
+        assert_eq!(loaded.bundle_order, vec!["bundle-second", "bundle-first"]);
+        loaded.remove(AppKind::Claude, "bundle-first").unwrap();
+        assert!(loaded.bundle_order.iter().any(|id| id == "bundle-first"));
+        loaded.remove(AppKind::Codex, "bundle-first").unwrap();
+        assert_eq!(loaded.bundle_order, vec!["bundle-second"]);
+
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
     fn sort_order_preserves_revision_and_survives_restart() {
         let config_dir = std::env::temp_dir().join(format!(
             "cc-switch-server-provider-order-test-{}",
@@ -1241,5 +1371,17 @@ mod tests {
             meta: None,
             extra,
         }
+    }
+
+    fn provider_bundle_surface(id: &str, name: &str) -> Provider {
+        let mut provider = provider_with_sort_index(id, name, 0);
+        provider.extra.insert("bundleId".to_string(), json!(id));
+        provider
+            .extra
+            .insert("familyId".to_string(), json!("family.test"));
+        provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(true));
+        provider
     }
 }

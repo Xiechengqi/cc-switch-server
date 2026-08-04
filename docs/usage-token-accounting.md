@@ -29,7 +29,7 @@ Codex OAuth Images 在同一 usage log 额外记录独立的输出元数据，�
 
 会话关联：
 
-- `sessionId` 会写入本地 usage log，并在 direct share request log sync 时传给 router。
+- `sessionId` 会写入本地 usage log，并在 Router Share request log sync 时传给 router。
 - Claude 从 session header、`metadata.user_id` 的 `_session_` 后缀和 `metadata.session_id/sessionId` 提取。
 - Codex 从 `session_id`、`x-session-id`、`x-codex-session-id`、`x-client-request-id`、`x-codex-window-id` 和 metadata 提取。
 

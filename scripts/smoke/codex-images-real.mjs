@@ -178,9 +178,9 @@ function boundedText(value, max = 500) {
 
 function parseArgs(argv, env) {
   const options = {
-    baseUrl: env.CC_SWITCH_BASE_URL || env.SERVER_URL || "http://127.0.0.1:15721",
-    routeKey: env.CC_SWITCH_CODEX_ROUTE_KEY || "",
-    token: env.CC_SWITCH_INFERENCE_TOKEN || "",
+    shareUrl: env.CC_SWITCH_SHARE_URL || "",
+    routerToken: env.ROUTER_API_TOKEN || "",
+    routerTokenHeader: env.ROUTER_API_TOKEN_HEADER || "Authorization",
     mode: env.CC_SWITCH_IMAGE_SMOKE_MODE || "all",
     prompt:
       env.CC_SWITCH_IMAGE_SMOKE_PROMPT ||
@@ -203,9 +203,9 @@ function parseArgs(argv, env) {
       if (index >= argv.length) throw new Error(`${arg} requires a value`);
       return argv[index];
     };
-    if (arg === "--base-url") options.baseUrl = next();
-    else if (arg === "--route-key") options.routeKey = next();
-    else if (arg === "--token") options.token = next();
+    if (arg === "--share-url") options.shareUrl = next();
+    else if (arg === "--router-token") options.routerToken = next();
+    else if (arg === "--router-token-header") options.routerTokenHeader = next();
     else if (arg === "--mode") options.mode = next();
     else if (arg === "--prompt") options.prompt = next();
     else if (arg === "--image-model") options.imageModel = next();
@@ -231,7 +231,7 @@ function numberOption(raw, fallback) {
 
 function printHelp() {
   process.stdout.write(`Usage: node scripts/smoke/codex-images-real.mjs [options]\n\n`);
-  process.stdout.write(`  --base-url URL\n  --route-key KEY\n  --token TOKEN\n`);
+  process.stdout.write(`  --share-url URL\n  --router-token TOKEN\n  --router-token-header HEADER\n`);
   process.stdout.write(`  --mode stream|json|url|responses|all\n`);
   process.stdout.write(`  --size WIDTHxHEIGHT\n  --timeout-ms N\n  --max-silence-ms N\n`);
   process.stdout.write(`  --output-dir DIR\n\n`);
@@ -239,17 +239,26 @@ function printHelp() {
 }
 
 function endpointUrl(options, endpoint) {
-  const base = options.baseUrl.trim().replace(/\/+$/, "");
-  const route = options.routeKey ? `/r/${encodeURIComponent(options.routeKey.trim())}` : "";
-  return `${base}${route}/v1/${endpoint}`;
+  const base = options.shareUrl.trim().replace(/\/+$/, "");
+  return `${base}/v1/${endpoint}`;
+}
+
+function routerAuthHeaders(options, headers = {}) {
+  if (/^authorization$/i.test(options.routerTokenHeader)) {
+    headers.Authorization = `Bearer ${options.routerToken}`;
+  } else if (/^(x-api-key|x-goog-api-key)$/i.test(options.routerTokenHeader)) {
+    headers[options.routerTokenHeader] = options.routerToken;
+  } else {
+    throw new Error(`unsupported ROUTER_API_TOKEN_HEADER: ${options.routerTokenHeader}`);
+  }
+  return headers;
 }
 
 function requestHeaders(options, accept) {
-  return {
-    Authorization: `Bearer ${options.token}`,
+  return routerAuthHeaders(options, {
     "Content-Type": "application/json",
     Accept: accept,
-  };
+  });
 }
 
 async function timedPost(options, endpoint, payload, label) {
@@ -391,6 +400,7 @@ async function downloadCapability(options, rawUrl) {
   try {
     head = await fetch(url, {
       method: "HEAD",
+      headers: routerAuthHeaders(options),
       signal: headController.signal,
       redirect: "error",
     });
@@ -417,7 +427,11 @@ async function downloadCapability(options, rawUrl) {
   };
   armGetTimer();
   try {
-    const response = await fetch(url, { signal: getController.signal, redirect: "error" });
+    const response = await fetch(url, {
+      headers: routerAuthHeaders(options),
+      signal: getController.signal,
+      redirect: "error",
+    });
     if (!response.ok) throw new Error(`capability GET returned HTTP ${response.status}`);
     const metadata = validateCapabilityHeaders(response.headers, "capability GET");
     if (metadata.byteLength !== expected) {
@@ -472,7 +486,10 @@ async function run(options) {
       "set CC_SWITCH_CODEX_IMAGES_SMOKE=1 to confirm the billable 4K image smoke",
     );
   }
-  if (!options.token.trim()) throw new Error("CC_SWITCH_INFERENCE_TOKEN or --token is required");
+  if (!options.shareUrl.trim()) throw new Error("CC_SWITCH_SHARE_URL or --share-url is required");
+  if (!options.routerToken.trim()) {
+    throw new Error("ROUTER_API_TOKEN or --router-token is required");
+  }
   if (!options.prompt.trim()) throw new Error("image prompt must not be empty");
   const modes = options.mode === "all" ? ["stream", "json", "url", "responses"] : [options.mode];
   for (const mode of modes) {
@@ -549,8 +566,7 @@ const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).hr
 if (invokedPath === import.meta.url) {
   main().catch((error) => {
     const secrets = [
-      process.env.CC_SWITCH_INFERENCE_TOKEN || "",
-      process.env.CC_SWITCH_CODEX_ROUTE_KEY || "",
+      process.env.ROUTER_API_TOKEN || "",
     ];
     process.stderr.write(`[FAIL] ${redact(error instanceof Error ? error.message : error, secrets)}\n`);
     process.exitCode = 1;

@@ -2,19 +2,13 @@
   "common": {
     "copied": "Copied"
   },
-  "server": {
-    "auth": {
-      "inferenceTokenTitle": "Claude inference token",
-      "inferenceTokenOneTime": "This token is shown only once. Store it securely before continuing to the console.",
-      "continueToConsole": "I saved it, continue to console"
-    }
-  },
   "providers": {
     "addProvider": "Add provider"
   },
   "providerBundle": {
     "account": "OAuth account",
     "advancedSettings": "Advanced settings JSON",
+    "basic": "Basic information",
     "count": "{{count}} provider nodes",
     "create": "New provider",
     "credential": "Credential",
@@ -25,8 +19,8 @@
     "driverOptions": "Driver options",
     "edit": "Edit provider",
     "family": "Provider type",
-    "identity": "Provider",
-    "routeKey": "Route Key",
+    "modelPassthrough": "Pass through",
+    "modelSingle": "Fixed model",
     "saved": "Provider saved",
     "selectAccount": "Select an OAuth account",
     "surfaceCredential": "Authentication credential",
@@ -110,6 +104,7 @@
     }
   },
   "proxy": {
+    "alwaysOn": "Router Share ingress",
     "routing": {
       "ready": "Routed",
       "needsProvider": "Needs provider"
@@ -118,6 +113,9 @@
       "stopped": "Proxy server stopped",
       "stopFailed": "Failed to stop proxy server"
     }
+  },
+  "proxyConfig": {
+    "proxyEnabled": "Router Share data plane"
   },
   "settings": {
     "loadFailed": "Unable to load settings. Refresh the page and try again.",
@@ -132,17 +130,20 @@
       "antigravityOauthDescription": "Manage Antigravity subscription accounts",
       "deepseekAccountDescription": "Manage DeepSeek accounts"
     },
+    "advanced": {
+      "proxy": {
+        "title": "Router Share routing",
+        "description": "View Router Share ingress status and routable Bundle Surfaces",
+        "running": "Running",
+        "stopped": "Stopped"
+      }
+    },
     "serverConfigDir": {
       "title": "Server configuration directory",
       "description": "Directory containing providers, shares, UI settings, and other persistent files. The listen address and port come from process arguments."
     },
     "serverSecurity": {
-      "currentPasswordRequired": "Enter the current password",
-      "inferenceTokenRotated": "Inference token rotated",
-      "inferenceTokenTitle": "Claude inference token",
-      "inferenceTokenDescription": "Used for local Claude API requests and isolated from administrator access",
-      "rotateInferenceToken": "Rotate token",
-      "rotateInferenceTokenConfirm": "Rotate the inference token? Existing clients will stop authenticating immediately."
+      "currentPasswordRequired": "Enter the current password"
     },
     "share": {
       "health": {

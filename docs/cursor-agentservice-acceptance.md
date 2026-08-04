@@ -21,12 +21,15 @@ Expected invariants: 401 recovery retains the original principal; 429 and satura
 Use the `composer-api` official `@cursor/sdk` bridge as a test oracle, not a production dependency:
 
 ```bash
-CURSOR_SERVER_URL=http://127.0.0.1:15721 \
+CC_SWITCH_SHARE_URL=https://share.example.com \
+ROUTER_API_TOKEN=... \
+ROUTER_API_TOKEN_HEADER=Authorization \
 CURSOR_SDK_ORACLE_URL=http://127.0.0.1:8787 \
-CURSOR_SERVER_TOKEN=... \
 CURSOR_SDK_ORACLE_TOKEN=... \
 CURSOR_TEST_MODEL=composer-2.5 \
 node scripts/smoke/cursor-sdk-differential.mjs
 ```
+
+`CC_SWITCH_SHARE_URL` 必须是 Router 暴露的 Share URL；该验收不会调用 Server 的 `15721` 推理路径。
 
 The script records only semantic summaries: HTTP status class, content presence, terminal event presence, finish reasons, and declared tool names. It does not print credentials or full response bodies.

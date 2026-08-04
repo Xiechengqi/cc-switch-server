@@ -3,10 +3,7 @@ set -euo pipefail
 
 SERVER_URL="${SERVER_URL:-http://127.0.0.1:15721}"
 API_TOKEN="${CC_SWITCH_SERVER_TOKEN:-}"
-DIRECT_SHARE_URL="${DIRECT_SHARE_URL:-}"
-DIRECT_CLAUDE_SHARE_URL="${DIRECT_CLAUDE_SHARE_URL:-}"
-DIRECT_CODEX_SHARE_URL="${DIRECT_CODEX_SHARE_URL:-${DIRECT_SHARE_URL}}"
-DIRECT_GEMINI_SHARE_URL="${DIRECT_GEMINI_SHARE_URL:-}"
+SHARE_URL="${CC_SWITCH_SHARE_URL:-}"
 MARKET_API_URL="${MARKET_API_URL:-}"
 MARKET_CLAUDE_API_URL="${MARKET_CLAUDE_API_URL:-}"
 MARKET_CODEX_API_URL="${MARKET_CODEX_API_URL:-${MARKET_API_URL}}"
@@ -32,15 +29,15 @@ ROUTER_TUNNELS_STATUS=""
 SHARES_STATUS=""
 USAGE_LOGS_STATUS=""
 PROVIDER_HEALTH_STATUS=""
-DIRECT_NOAUTH_STATUS=""
-DIRECT_PUBLIC_STATUS=""
-DIRECT_PUBLIC_STREAM_STATUS=""
-DIRECT_CLAUDE_STATUS=""
-DIRECT_CODEX_STATUS=""
-DIRECT_GEMINI_STATUS=""
-DIRECT_CLAUDE_STREAM_STATUS=""
-DIRECT_CODEX_STREAM_STATUS=""
-DIRECT_GEMINI_STREAM_STATUS=""
+SHARE_NOAUTH_STATUS=""
+SHARE_PUBLIC_STATUS=""
+SHARE_PUBLIC_STREAM_STATUS=""
+SHARE_CLAUDE_STATUS=""
+SHARE_CODEX_STATUS=""
+SHARE_GEMINI_STATUS=""
+SHARE_CLAUDE_STREAM_STATUS=""
+SHARE_CODEX_STREAM_STATUS=""
+SHARE_GEMINI_STREAM_STATUS=""
 MARKET_API_STATUS=""
 MARKET_API_STREAM_STATUS=""
 MARKET_CLAUDE_STATUS=""
@@ -341,12 +338,9 @@ try {
   STREAM_STATUS="$status"
 }
 
-echo "== direct/market diagnostics =="
+echo "== Router Share/market diagnostics =="
 echo "serverUrl=${SERVER_URL}"
-echo "directShareUrl=${DIRECT_SHARE_URL:-<not-set>}"
-echo "directClaudeShareUrl=${DIRECT_CLAUDE_SHARE_URL:-<not-set>}"
-echo "directCodexShareUrl=${DIRECT_CODEX_SHARE_URL:-<not-set>}"
-echo "directGeminiShareUrl=${DIRECT_GEMINI_SHARE_URL:-<not-set>}"
+echo "routerShareUrl=${SHARE_URL:-<not-set>}"
 echo "marketApiUrl=${MARKET_API_URL:-<not-set>}"
 echo "marketClaudeApiUrl=${MARKET_CLAUDE_API_URL:-<not-set>}"
 echo "marketCodexApiUrl=${MARKET_CODEX_API_URL:-<not-set>}"
@@ -376,53 +370,45 @@ else
 fi
 
 if [[ "$RUN_PROBES" == "1" ]]; then
-  if [[ -n "$DIRECT_CODEX_SHARE_URL" ]]; then
-    post_probe_summary "direct codex unauthenticated probe" codex "$DIRECT_CODEX_SHARE_URL"
-    DIRECT_NOAUTH_STATUS="$PROBE_STATUS"
+  if [[ -n "$SHARE_URL" ]]; then
+    post_probe_summary "Router Share Codex unauthenticated probe" codex "$SHARE_URL"
+    SHARE_NOAUTH_STATUS="$PROBE_STATUS"
     if [[ "${#router_auth_header[@]}" -gt 0 ]]; then
-      post_probe_summary "direct codex authenticated probe" codex "$DIRECT_CODEX_SHARE_URL" "${router_auth_header[@]}"
-      DIRECT_CODEX_STATUS="$PROBE_STATUS"
-      DIRECT_PUBLIC_STATUS="$PROBE_STATUS"
+      post_probe_summary "Router Share Codex authenticated probe" codex "$SHARE_URL" "${router_auth_header[@]}"
+      SHARE_CODEX_STATUS="$PROBE_STATUS"
+      SHARE_PUBLIC_STATUS="$PROBE_STATUS"
       if [[ "$STREAM_PROBE" == "1" ]]; then
-        stream_probe_summary "direct codex stream probe" codex "$DIRECT_CODEX_SHARE_URL" "${router_auth_header[@]}"
-        DIRECT_CODEX_STREAM_STATUS="$STREAM_STATUS"
-        DIRECT_PUBLIC_STREAM_STATUS="$STREAM_STATUS"
+        stream_probe_summary "Router Share Codex stream probe" codex "$SHARE_URL" "${router_auth_header[@]}"
+        SHARE_CODEX_STREAM_STATUS="$STREAM_STATUS"
+        SHARE_PUBLIC_STREAM_STATUS="$STREAM_STATUS"
       fi
     else
-      block "ROUTER_API_TOKEN is required for authenticated direct Codex probe"
+      block "ROUTER_API_TOKEN is required for authenticated Router Share probes"
     fi
   else
-    warn "DIRECT_CODEX_SHARE_URL/DIRECT_SHARE_URL not set; skipped direct Codex probes"
+    warn "CC_SWITCH_SHARE_URL not set; skipped Router Share probes"
   fi
 
-  if [[ -n "$DIRECT_CLAUDE_SHARE_URL" ]]; then
+  if [[ -n "$SHARE_URL" ]]; then
     if [[ "${#router_auth_header[@]}" -gt 0 ]]; then
-      post_probe_summary "direct claude authenticated probe" claude "$DIRECT_CLAUDE_SHARE_URL" "${router_auth_header[@]}"
-      DIRECT_CLAUDE_STATUS="$PROBE_STATUS"
+      post_probe_summary "Router Share Claude authenticated probe" claude "$SHARE_URL" "${router_auth_header[@]}"
+      SHARE_CLAUDE_STATUS="$PROBE_STATUS"
       if [[ "$STREAM_PROBE" == "1" ]]; then
-        stream_probe_summary "direct claude stream probe" claude "$DIRECT_CLAUDE_SHARE_URL" "${router_auth_header[@]}"
-        DIRECT_CLAUDE_STREAM_STATUS="$STREAM_STATUS"
+        stream_probe_summary "Router Share Claude stream probe" claude "$SHARE_URL" "${router_auth_header[@]}"
+        SHARE_CLAUDE_STREAM_STATUS="$STREAM_STATUS"
       fi
-    else
-      block "ROUTER_API_TOKEN is required for direct Claude probe"
     fi
-  else
-    warn "DIRECT_CLAUDE_SHARE_URL not set; skipped direct Claude probe"
   fi
 
-  if [[ -n "$DIRECT_GEMINI_SHARE_URL" ]]; then
+  if [[ -n "$SHARE_URL" ]]; then
     if [[ "${#router_auth_header[@]}" -gt 0 ]]; then
-      post_probe_summary "direct gemini authenticated probe" gemini "$DIRECT_GEMINI_SHARE_URL" "${router_auth_header[@]}"
-      DIRECT_GEMINI_STATUS="$PROBE_STATUS"
+      post_probe_summary "Router Share Gemini authenticated probe" gemini "$SHARE_URL" "${router_auth_header[@]}"
+      SHARE_GEMINI_STATUS="$PROBE_STATUS"
       if [[ "$STREAM_PROBE" == "1" ]]; then
-        stream_probe_summary "direct gemini stream probe" gemini "$DIRECT_GEMINI_SHARE_URL" "${router_auth_header[@]}"
-        DIRECT_GEMINI_STREAM_STATUS="$STREAM_STATUS"
+        stream_probe_summary "Router Share Gemini stream probe" gemini "$SHARE_URL" "${router_auth_header[@]}"
+        SHARE_GEMINI_STREAM_STATUS="$STREAM_STATUS"
       fi
-    else
-      block "ROUTER_API_TOKEN is required for direct Gemini probe"
     fi
-  else
-    warn "DIRECT_GEMINI_SHARE_URL not set; skipped direct Gemini probe"
   fi
 
   if [[ -n "$MARKET_CODEX_API_URL" ]]; then
@@ -472,7 +458,7 @@ if [[ "$RUN_PROBES" == "1" ]]; then
     warn "MARKET_GEMINI_API_URL not set; skipped market Gemini probe"
   fi
 else
-  warn "RUN_PROBES=0; direct/market provider probes skipped"
+  warn "RUN_PROBES=0; Router Share/market provider probes skipped"
 fi
 
 if [[ "$BLOCKED" -gt 0 ]]; then
@@ -509,15 +495,15 @@ if [[ -n "$EVIDENCE_FILE" ]]; then
   SHARES_STATUS="$SHARES_STATUS" \
   USAGE_LOGS_STATUS="$USAGE_LOGS_STATUS" \
   PROVIDER_HEALTH_STATUS="$PROVIDER_HEALTH_STATUS" \
-  DIRECT_NOAUTH_STATUS="$DIRECT_NOAUTH_STATUS" \
-  DIRECT_PUBLIC_STATUS="$DIRECT_PUBLIC_STATUS" \
-  DIRECT_PUBLIC_STREAM_STATUS="$DIRECT_PUBLIC_STREAM_STATUS" \
-  DIRECT_CLAUDE_STATUS="$DIRECT_CLAUDE_STATUS" \
-  DIRECT_CODEX_STATUS="$DIRECT_CODEX_STATUS" \
-  DIRECT_GEMINI_STATUS="$DIRECT_GEMINI_STATUS" \
-  DIRECT_CLAUDE_STREAM_STATUS="$DIRECT_CLAUDE_STREAM_STATUS" \
-  DIRECT_CODEX_STREAM_STATUS="$DIRECT_CODEX_STREAM_STATUS" \
-  DIRECT_GEMINI_STREAM_STATUS="$DIRECT_GEMINI_STREAM_STATUS" \
+  SHARE_NOAUTH_STATUS="$SHARE_NOAUTH_STATUS" \
+  SHARE_PUBLIC_STATUS="$SHARE_PUBLIC_STATUS" \
+  SHARE_PUBLIC_STREAM_STATUS="$SHARE_PUBLIC_STREAM_STATUS" \
+  SHARE_CLAUDE_STATUS="$SHARE_CLAUDE_STATUS" \
+  SHARE_CODEX_STATUS="$SHARE_CODEX_STATUS" \
+  SHARE_GEMINI_STATUS="$SHARE_GEMINI_STATUS" \
+  SHARE_CLAUDE_STREAM_STATUS="$SHARE_CLAUDE_STREAM_STATUS" \
+  SHARE_CODEX_STREAM_STATUS="$SHARE_CODEX_STREAM_STATUS" \
+  SHARE_GEMINI_STREAM_STATUS="$SHARE_GEMINI_STREAM_STATUS" \
   MARKET_API_STATUS="$MARKET_API_STATUS" \
   MARKET_API_STREAM_STATUS="$MARKET_API_STREAM_STATUS" \
   MARKET_CLAUDE_STATUS="$MARKET_CLAUDE_STATUS" \

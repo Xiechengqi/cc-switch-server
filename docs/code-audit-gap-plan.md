@@ -149,7 +149,7 @@
 
 ## 明确不在本计划内（边界）
 
-1. **真实环境验收**：router 隧道实连、direct share 端到端、market 调度、OAuth 订阅账号真实转发、Cursor（planned，静态 driver 已接线）与 Bedrock（planned，SigV4 合同已生成）的真实验收——全部依赖外部凭据/环境，沿既有 runbook 推进；X5/X6 的 capability 从 fallback/planned 升级 native 均以真实验收为 gate。
+1. **真实环境验收**：router 隧道实连、Router Share 端到端、market 调度、OAuth 订阅账号真实转发、Cursor（planned，静态 driver 已接线）与 Bedrock（planned，SigV4 合同已生成）的真实验收——全部依赖外部凭据/环境，沿既有 runbook 推进；X5/X6 的 capability 从 fallback/planned 升级 native 均以真实验收为 gate。
 2. **`set_window_theme`**：契约中唯一 `implemented=false` 命令，浏览器由 ThemeProvider 覆盖，维持现状。
 3. **`v1/shares/sync`（单条同步）**：server 用 batch-sync 覆盖同一语义，不补。
 4. **DeepSeek 账密登录 / 请求时 PoW**：账密登录维持排除（import-only 不变）；请求时 PoW（`DeepSeekHashV1`）已在 Server 独立实现并用于 `DeepSeekAccount` 转发。Claude + `DeepSeekAccount` 协议桥已静态接线（Phase Y3，`planned`）；Codex/Gemini 路径仍为 skeleton，按 X6.2 Claude IR 复用路线推进。

@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::domain::accounts::store::{active_account_usage_block, AccountStore, AccountUsageBlock};
-use crate::domain::providers::bundle::{route_key as provider_route_key, surface_enabled};
+#[cfg(test)]
+use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::runtime::{authoritative_managed_account, managed_account_binding};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
@@ -59,26 +60,26 @@ pub(super) struct AccountConcurrencySelection {
 
 const DEFAULT_ACCOUNT_MAX_CONCURRENT: u32 = 8;
 
-pub(super) fn select_provider_for_route_key(
+#[cfg(test)]
+pub(super) fn select_test_provider(
     store: &ProviderStore,
     accounts: &AccountStore,
     app: AppKind,
-    route_key: &str,
+    provider_id: &str,
     account_in_flight: Option<&AccountInFlightSnapshot>,
 ) -> Result<ProviderRouteSelection, ProxyError> {
-    let route_key = route_key.trim();
     let provider = store
         .providers
         .iter()
         .find(|item| {
             item.app == app
                 && surface_enabled(&item.provider)
-                && provider_route_key(&item.provider) == route_key
+                && item.provider.id == provider_id.trim()
         })
         .cloned()
         .ok_or_else(|| {
             ProxyError::not_found(format!(
-                "no enabled {} Surface is configured for route key {route_key}",
+                "no enabled {} Surface is configured for Provider {provider_id}",
                 app.as_str()
             ))
         })?;
@@ -706,34 +707,29 @@ mod tests {
     }
 
     #[test]
-    fn route_key_selects_the_exact_enabled_surface() {
+    fn bound_surface_selects_the_exact_enabled_surface() {
         let store = provider_store();
-        let selected = select_provider_for_route_key(
-            &store,
-            &AccountStore::default(),
-            AppKind::Codex,
-            "p2",
-            None,
-        )
-        .unwrap();
+        let selected =
+            select_test_provider(&store, &AccountStore::default(), AppKind::Codex, "p2", None)
+                .unwrap();
 
         assert_eq!(selected.execution.stored.provider.id, "p2");
     }
 
     #[test]
-    fn missing_or_disabled_route_key_is_rejected() {
+    fn missing_or_disabled_bound_surface_is_rejected() {
         let mut store = provider_store();
         store.providers[1]
             .provider
             .extra
             .insert("surfaceEnabled".to_string(), json!(false));
 
-        for route_key in ["missing", "p2"] {
-            let error = select_provider_for_route_key(
+        for bound_surface in ["missing", "p2"] {
+            let error = select_test_provider(
                 &store,
                 &AccountStore::default(),
                 AppKind::Codex,
-                route_key,
+                bound_surface,
                 None,
             )
             .unwrap_err();
@@ -743,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_route_key_uses_its_binding_independent_of_active_account() {
+    fn codex_bound_surface_uses_its_binding_independent_of_active_account() {
         let store = runtime_store(vec![codex_oauth_provider("p2", "acct-2")]);
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", None));
@@ -752,8 +748,7 @@ mod tests {
             .select_active_codex_oauth_account("acct-1")
             .unwrap();
 
-        let selected =
-            select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p2", None).unwrap();
+        let selected = select_test_provider(&store, &accounts, AppKind::Codex, "p2", None).unwrap();
 
         assert_eq!(
             selected.execution.managed_account_target(),
@@ -762,20 +757,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_route_key_rejects_a_missing_explicit_binding() {
+    fn codex_bound_surface_rejects_a_missing_explicit_binding() {
         let store = runtime_store(vec![codex_oauth_provider("p1", "acct-1")]);
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-2", None));
 
-        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
-            .unwrap_err();
+        let error =
+            select_test_provider(&store, &accounts, AppKind::Codex, "p1", None).unwrap_err();
 
         assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.message.contains("missing or stale"));
     }
 
     #[test]
-    fn route_key_rate_limited_provider_returns_429_without_fallback() {
+    fn bound_surface_rate_limited_provider_returns_429_without_fallback() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![
             codex_oauth_provider("p1", "acct-1"),
@@ -784,26 +779,26 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(codex_oauth_account("acct-1", Some(now + 60_000)));
         accounts.upsert(codex_oauth_account("acct-2", None));
-        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
-            .unwrap_err();
+        let error =
+            select_test_provider(&store, &accounts, AppKind::Codex, "p1", None).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
-    fn route_key_quota_exhausted_provider_returns_429_without_fallback() {
+    fn bound_surface_quota_exhausted_provider_returns_429_without_fallback() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![codex_oauth_provider("p1", "acct-1")]);
         let mut accounts = AccountStore::default();
         accounts.upsert(exhausted_codex_oauth_account("acct-1", now));
 
-        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
-            .unwrap_err();
+        let error =
+            select_test_provider(&store, &accounts, AppKind::Codex, "p1", None).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
         assert!(error.message.contains("quota_exhausted"));
     }
 
     #[test]
-    fn route_key_cursor_provider_respects_account_cooldown() {
+    fn bound_surface_cursor_provider_respects_account_cooldown() {
         let now = now_ms() as i64;
         let store = runtime_store(vec![
             cursor_oauth_provider("p1", "cursor-acct-1"),
@@ -812,8 +807,8 @@ mod tests {
         let mut accounts = AccountStore::default();
         accounts.upsert(cursor_oauth_account("cursor-acct-1", Some(now + 60_000)));
         accounts.upsert(cursor_oauth_account("cursor-acct-2", None));
-        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
-            .unwrap_err();
+        let error =
+            select_test_provider(&store, &accounts, AppKind::Codex, "p1", None).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -835,7 +830,7 @@ mod tests {
             .try_acquire(ProviderType::CursorApiKey, "legacy-cursor-account", 1)
             .unwrap();
 
-        let selected = select_provider_for_route_key(
+        let selected = select_test_provider(
             &store,
             &accounts,
             AppKind::Codex,
@@ -871,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn route_key_provider_that_requires_relogin_returns_401_without_fallback() {
+    fn bound_surface_provider_that_requires_relogin_returns_401_without_fallback() {
         let store = runtime_store(vec![
             codex_oauth_provider("p1", "acct-1"),
             codex_oauth_provider("p2", "acct-2"),
@@ -880,8 +875,8 @@ mod tests {
         accounts.upsert(codex_oauth_account("acct-1", None));
         accounts.upsert(codex_oauth_account("acct-2", None));
         accounts.accounts[0].needs_relogin = true;
-        let error = select_provider_for_route_key(&store, &accounts, AppKind::Codex, "p1", None)
-            .unwrap_err();
+        let error =
+            select_test_provider(&store, &accounts, AppKind::Codex, "p1", None).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::UNAUTHORIZED);
         assert!(error.message.contains("requires login"));
     }
@@ -900,20 +895,14 @@ mod tests {
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .unwrap();
         let snapshot = tracker.snapshot();
-        let error = select_provider_for_route_key(
-            &store,
-            &accounts,
-            AppKind::Claude,
-            "p1",
-            Some(&snapshot),
-        )
-        .unwrap_err();
+        let error = select_test_provider(&store, &accounts, AppKind::Claude, "p1", Some(&snapshot))
+            .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
         assert!(error.message.contains("p1"));
     }
 
     #[test]
-    fn grok_route_key_at_concurrency_limit_never_selects_another_account() {
+    fn grok_bound_surface_at_concurrency_limit_never_selects_another_account() {
         let store = runtime_store(vec![
             grok_oauth_provider("grok-current", "grok-acct-current", 1),
             grok_oauth_provider("grok-other", "grok-acct-other", 1),
@@ -926,7 +915,7 @@ mod tests {
             .try_acquire(ProviderType::GrokOAuth, "grok-acct-current", 1)
             .unwrap();
 
-        let error = select_provider_for_route_key(
+        let error = select_test_provider(
             &store,
             &accounts,
             AppKind::Codex,
@@ -940,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_route_key_remains_selected_when_another_account_is_less_busy() {
+    fn grok_bound_surface_remains_selected_when_another_account_is_less_busy() {
         let store = runtime_store(vec![
             grok_oauth_provider("grok-current", "grok-acct-current", 8),
             grok_oauth_provider("grok-other", "grok-acct-other", 8),
@@ -953,7 +942,7 @@ mod tests {
             .try_acquire(ProviderType::GrokOAuth, "grok-acct-current", 8)
             .unwrap();
 
-        let selected = select_provider_for_route_key(
+        let selected = select_test_provider(
             &store,
             &accounts,
             AppKind::Codex,
@@ -966,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_route_key_never_switches_accounts() {
+    fn claude_bound_surface_never_switches_accounts() {
         let store = runtime_store(vec![
             claude_oauth_provider("p1", "acct-1", Some(1)),
             claude_oauth_provider("p2", "acct-2", Some(1)),
@@ -979,7 +968,7 @@ mod tests {
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .unwrap();
 
-        let error = select_provider_for_route_key(
+        let error = select_test_provider(
             &store,
             &accounts,
             AppKind::Claude,
@@ -991,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_images_honor_route_key_binding_independent_of_active_account() {
+    fn codex_images_honor_bound_surface_binding_independent_of_active_account() {
         let mut requested = codex_oauth_provider("p2", "acct-2");
         requested
             .provider
@@ -1007,7 +996,7 @@ mod tests {
             .select_active_codex_oauth_account("acct-1")
             .unwrap();
 
-        let selected = select_provider_for_route_key(
+        let selected = select_test_provider(
             &store,
             &accounts,
             AppKind::Codex,
@@ -1021,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_route_key_does_not_switch_for_load() {
+    fn codex_bound_surface_does_not_switch_for_load() {
         let mut first = codex_oauth_provider("p1", "acct-1");
         first.provider.settings_config["ACCOUNT_MAX_CONCURRENT"] = json!(8);
         let mut second = codex_oauth_provider("p2", "acct-2");
@@ -1047,7 +1036,7 @@ mod tests {
             .try_acquire(ProviderType::CodexOAuth, "acct-2", 2)
             .unwrap();
 
-        let selected = select_provider_for_route_key(
+        let selected = select_test_provider(
             &store,
             &accounts,
             AppKind::Codex,
@@ -1070,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_route_key_selection_remains_stable() {
+    fn repeated_bound_surface_selection_remains_stable() {
         let store = runtime_store(vec![
             claude_oauth_provider("p1", "acct-1", Some(8)),
             claude_oauth_provider("p2", "acct-2", Some(8)),
@@ -1080,22 +1069,11 @@ mod tests {
         accounts.upsert(claude_oauth_account("acct-2"));
         let snapshot = AccountInFlightTracker::default().snapshot();
 
-        let first = select_provider_for_route_key(
-            &store,
-            &accounts,
-            AppKind::Claude,
-            "p1",
-            Some(&snapshot),
-        )
-        .unwrap();
-        let second = select_provider_for_route_key(
-            &store,
-            &accounts,
-            AppKind::Claude,
-            "p1",
-            Some(&snapshot),
-        )
-        .unwrap();
+        let first = select_test_provider(&store, &accounts, AppKind::Claude, "p1", Some(&snapshot))
+            .unwrap();
+        let second =
+            select_test_provider(&store, &accounts, AppKind::Claude, "p1", Some(&snapshot))
+                .unwrap();
 
         assert_eq!(first.execution.stored.provider.id, "p1");
         assert_eq!(second.execution.stored.provider.id, "p1");
@@ -1228,7 +1206,7 @@ mod tests {
         accounts.upsert(claude_oauth_account("acct-1"));
         let tracker = AccountInFlightTracker::default();
 
-        let selected = select_provider_for_route_key(
+        let selected = select_test_provider(
             &store,
             &accounts,
             AppKind::Claude,
@@ -1241,7 +1219,7 @@ mod tests {
             &selected.execution.stored
         ));
 
-        let selected = select_provider_for_route_key(
+        let selected = select_test_provider(
             &store,
             &accounts,
             AppKind::Claude,

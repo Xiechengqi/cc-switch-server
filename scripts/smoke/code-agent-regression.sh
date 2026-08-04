@@ -3,15 +3,7 @@ set -euo pipefail
 
 SERVER_URL="${SERVER_URL:-http://127.0.0.1:15721}"
 API_TOKEN="${CC_SWITCH_SERVER_TOKEN:-}"
-INFERENCE_TOKEN="${CC_SWITCH_INFERENCE_TOKEN:-}"
-SHARE_ID="${SHARE_ID:-}"
-CLAUDE_SHARE_ID="${CLAUDE_SHARE_ID:-}"
-CODEX_SHARE_ID="${CODEX_SHARE_ID:-${SHARE_ID}}"
-GEMINI_SHARE_ID="${GEMINI_SHARE_ID:-}"
-DIRECT_SHARE_URL="${DIRECT_SHARE_URL:-}"
-DIRECT_CLAUDE_SHARE_URL="${DIRECT_CLAUDE_SHARE_URL:-}"
-DIRECT_CODEX_SHARE_URL="${DIRECT_CODEX_SHARE_URL:-${DIRECT_SHARE_URL}}"
-DIRECT_GEMINI_SHARE_URL="${DIRECT_GEMINI_SHARE_URL:-}"
+SHARE_URL="${CC_SWITCH_SHARE_URL:-}"
 MARKET_API_URL="${MARKET_API_URL:-}"
 MARKET_CLAUDE_API_URL="${MARKET_CLAUDE_API_URL:-}"
 MARKET_CODEX_API_URL="${MARKET_CODEX_API_URL:-${MARKET_API_URL}}"
@@ -47,11 +39,6 @@ fail() { FAILURES=$((FAILURES + 1)); echo "[FAIL] $*"; }
 auth_header=()
 if [[ -n "$API_TOKEN" ]]; then
   auth_header=(-H "Authorization: Bearer $API_TOKEN")
-fi
-
-inference_auth_header=()
-if [[ -n "$INFERENCE_TOKEN" ]]; then
-  inference_auth_header=(-H "x-api-key: $INFERENCE_TOKEN")
 fi
 
 router_auth_header=()
@@ -249,96 +236,40 @@ else
   done
 fi
 
-echo "== local source probes =="
-if [[ -n "$INFERENCE_TOKEN" ]]; then
-  if [[ -n "$CLAUDE_SHARE_ID" ]]; then
-    probe "claude local messages non-stream" "$SERVER_URL/v1/messages" \
-      '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":false}' \
-      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CLAUDE_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-    if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "claude local messages stream" "$SERVER_URL/v1/messages" \
-        '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"stream ping"}],"stream":true}' \
-        "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CLAUDE_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-    fi
-  else
-    skip "CLAUDE_SHARE_ID missing; skipped Claude local probes"
-  fi
-
-  if [[ -n "$CODEX_SHARE_ID" ]]; then
-  probe "codex local responses non-stream" "$SERVER_URL/v1/responses" \
-    '{"model":"probe","input":"ping","stream":false,"max_output_tokens":1}' \
-    "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-  probe "codex local chat non-stream" "$SERVER_URL/v1/chat/completions" \
-    '{"model":"probe","messages":[{"role":"user","content":"ping"}],"stream":false,"max_tokens":1}' \
-    "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-  if [[ "$STREAM_PROBE" == "1" ]]; then
-    stream_probe "codex local responses stream" "$SERVER_URL/v1/responses" \
-      '{"model":"probe","input":"stream ping","stream":true,"max_output_tokens":1}' \
-      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-    stream_probe "codex local chat stream" "$SERVER_URL/v1/chat/completions" \
-      '{"model":"probe","messages":[{"role":"user","content":"stream ping"}],"stream":true,"max_tokens":1}' \
-      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $CODEX_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-  fi
-  else
-    skip "CODEX_SHARE_ID/SHARE_ID missing; skipped Codex local probes"
-  fi
-
-  if [[ -n "$GEMINI_SHARE_ID" ]]; then
-    probe "gemini local generateContent non-stream" "$SERVER_URL/v1beta/models/probe:generateContent" \
-      '{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-      "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $GEMINI_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-    if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "gemini local generateContent stream" "$SERVER_URL/v1beta/models/probe:streamGenerateContent" \
-        '{"contents":[{"role":"user","parts":[{"text":"stream ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-        "${inference_auth_header[@]}" -H "X-CC-Switch-Share-Id: $GEMINI_SHARE_ID" -H "X-CC-Switch-Data-Source: local"
-    fi
-  else
-    skip "GEMINI_SHARE_ID missing; skipped Gemini local probes"
-  fi
-else
-  skip "CC_SWITCH_INFERENCE_TOKEN missing; skipped local source probes"
-fi
-
-echo "== direct source probes =="
-if [[ -n "$ROUTER_API_TOKEN" ]]; then
-  if [[ -n "$DIRECT_CLAUDE_SHARE_URL" ]]; then
-    probe "direct claude messages non-stream" "$DIRECT_CLAUDE_SHARE_URL/v1/messages" \
+echo "== router share probes =="
+if [[ -n "$SHARE_URL" && -n "$ROUTER_API_TOKEN" ]]; then
+    probe "share claude messages non-stream" "$SHARE_URL/v1/messages" \
       '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":false}' \
       "${router_auth_header[@]}"
     if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "direct claude messages stream" "$DIRECT_CLAUDE_SHARE_URL/v1/messages" \
+      stream_probe "share claude messages stream" "$SHARE_URL/v1/messages" \
         '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"stream ping"}],"stream":true}' \
         "${router_auth_header[@]}"
     fi
-  else
-    skip "DIRECT_CLAUDE_SHARE_URL missing; skipped direct Claude probes"
-  fi
-  if [[ -n "$DIRECT_CODEX_SHARE_URL" ]]; then
-    probe "direct codex responses non-stream" "$DIRECT_CODEX_SHARE_URL/v1/responses" \
+    probe "share codex responses non-stream" "$SHARE_URL/v1/responses" \
     '{"model":"probe","input":"ping","stream":false,"max_output_tokens":1}' \
     "${router_auth_header[@]}"
+    probe "share codex chat non-stream" "$SHARE_URL/v1/chat/completions" \
+      '{"model":"probe","messages":[{"role":"user","content":"ping"}],"stream":false,"max_tokens":1}' \
+      "${router_auth_header[@]}"
     if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "direct codex responses stream" "$DIRECT_CODEX_SHARE_URL/v1/responses" \
+      stream_probe "share codex responses stream" "$SHARE_URL/v1/responses" \
         '{"model":"probe","input":"stream ping","stream":true,"max_output_tokens":1}' \
         "${router_auth_header[@]}"
+      stream_probe "share codex chat stream" "$SHARE_URL/v1/chat/completions" \
+        '{"model":"probe","messages":[{"role":"user","content":"stream ping"}],"stream":true,"max_tokens":1}' \
+        "${router_auth_header[@]}"
     fi
-  else
-    skip "DIRECT_CODEX_SHARE_URL/DIRECT_SHARE_URL missing; skipped direct Codex probes"
-  fi
-  if [[ -n "$DIRECT_GEMINI_SHARE_URL" ]]; then
-    probe "direct gemini generateContent non-stream" "$DIRECT_GEMINI_SHARE_URL/v1beta/models/probe:generateContent" \
+    probe "share gemini generateContent non-stream" "$SHARE_URL/v1beta/models/probe:generateContent" \
       '{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
       "${router_auth_header[@]}"
     if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "direct gemini generateContent stream" "$DIRECT_GEMINI_SHARE_URL/v1beta/models/probe:streamGenerateContent" \
+      stream_probe "share gemini generateContent stream" "$SHARE_URL/v1beta/models/probe:streamGenerateContent" \
         '{"contents":[{"role":"user","parts":[{"text":"stream ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
         "${router_auth_header[@]}"
     fi
-  else
-    skip "DIRECT_GEMINI_SHARE_URL missing; skipped direct Gemini probes"
-  fi
 else
-  skip "ROUTER_API_TOKEN missing; skipped direct source probes"
+  skip "CC_SWITCH_SHARE_URL or ROUTER_API_TOKEN missing; skipped Router Share probes"
 fi
 
 echo "== market source probes =="

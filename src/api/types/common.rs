@@ -74,8 +74,6 @@ pub(in crate::api) struct SetupResponse {
     pub(in crate::api) session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api) api_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(in crate::api) inference_token: Option<String>,
 }
 
 impl SetupResponse {
@@ -93,7 +91,6 @@ impl SetupResponse {
             message: outcome.message,
             session_token: outcome.session_token,
             api_token: outcome.api_token,
-            inference_token: outcome.inference_token,
         }
     }
 }

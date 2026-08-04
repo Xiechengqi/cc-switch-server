@@ -38,18 +38,12 @@ use serde_json::Value;
 
 pub use forwarder::forward;
 pub use forwarder::forward_codex_alpha_search;
-pub use forwarder::forward_codex_alpha_search_for_route_key;
 pub use forwarder::forward_codex_models_manifest;
-pub use forwarder::forward_codex_models_manifest_for_route_key;
 pub use forwarder::forward_codex_responses_ws;
-pub use forwarder::forward_codex_responses_ws_for_route_key;
-pub use forwarder::forward_for_route_key;
 pub use forwarder::forward_grok_media;
-pub use forwarder::forward_grok_media_for_route_key;
 pub use forwarder::forward_images_edits;
-pub use forwarder::forward_images_edits_for_route_key;
 pub use forwarder::forward_images_generations;
-pub use forwarder::forward_images_generations_for_route_key;
+pub(crate) use forwarder::validate_and_acquire_share_invocation;
 pub(crate) use request_governance::decode_request_body_for_proxy_with_limit;
 pub use router::ProxyRoute;
 

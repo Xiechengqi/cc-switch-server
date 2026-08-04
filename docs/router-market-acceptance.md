@@ -16,7 +16,7 @@
 export SERVER_URL=http://127.0.0.1:15721
 export CC_SWITCH_SERVER_TOKEN=...
 export SHARE_ID=...
-export DIRECT_SHARE_URL=https://share-subdomain.example.com
+export CC_SWITCH_SHARE_URL=https://share-subdomain.example.com
 export MARKET_API_URL=https://market-api.example.com
 export MARKET_URL=https://market.example.com
 export ROUTER_API_TOKEN=...
@@ -25,7 +25,7 @@ export STREAM_PROBE=0
 ```
 
 `ROUTER_API_TOKEN_HEADER` 可选 `Authorization`、`x-api-key`、`x-goog-api-key`。默认使用 `Authorization: Bearer ...`。
-`STREAM_PROBE=1` 时会额外执行 direct/market stream 请求；没有真实 provider/token 时保持默认 `0`。
+`STREAM_PROBE=1` 时会额外执行 Router Share/market stream 请求；没有真实 provider/token 时保持默认 `0`。
 
 ## 执行顺序
 
@@ -36,7 +36,7 @@ export STREAM_PROBE=0
 5. 等待启动/注册后的自动 share reconcile，并通过 `GET /api/router/diagnostics` 验证同步状态。
 6. `POST /api/router/share-edits/pull`，拉取并应用 pending share edits。
 7. `POST /api/shares/runtime-snapshot`。
-8. direct share URL 调 `/v1/responses`。
+8. Router Share URL 调 `/v1/responses`。
 9. market api URL 调 `/v1/responses`。
 10. `POST /api/usage/router-sync/retry`。
 11. 导出 shares、provider health、usage logs。
@@ -87,7 +87,7 @@ Ollama Cloud 等无百分比 quota 的 provider 不应显示伪造 `0%`，也不
 - `cacheCreationTokens`
 - `totalTokens`
 
-server 只自动同步 `dataSource=direct` 的 share request log 到 router；market source 日志应由 market 侧负责，避免重复。
+server 只自动同步 Router Share 来源的 request log 到 router；market source 日志应由 market 侧负责，避免重复。
 
 ### Share edit / managed grant
 
@@ -112,8 +112,8 @@ Router 内建 Share Market 会将单个 entitlement 的增删转换成 pending s
 - router 强制每个 Share Owner 等于 Installation Owner；不匹配的单条/批量同步被拒绝，已验证的 Installation Owner 变更会原子重绑全部 Share 并保留旧 owner 的共享访问。
 - Client Tunnel claim/update 只能携带当前 Installation Owner，不能借由 tunnel payload 创建或修改 Installation Owner。
 - market admin Shares 页能看到 app runtime、provider、model、quota、health。
-- direct share URL 和 market api URL 都能命中正确 binding。
-- request log 国家/IP/source 不丢，direct/market 不重复。
+- Router Share URL 和 market API URL 都能命中正确 binding。
+- request log 国家/IP/source 不丢，`dataSource=direct` 与 market 计费日志不重复。
 - 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 server share，并回写 ack。
 
 ## 阻断记录

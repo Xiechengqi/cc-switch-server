@@ -4,11 +4,11 @@
 
 ## 能力边界
 
-- 文本入口包括 Route Key 下的 `POST /r/:routeKey/v1/responses`、`POST /r/:routeKey/v1/chat/completions` 及兼容别名。
-- 原生 compact 入口包括 `POST /r/:routeKey/v1/responses/compact` 及兼容别名。
-- Responses WebSocket 使用 `GET /r/:routeKey/v1/responses` 及兼容别名。
+- 文本入口包括 Router Share URL 下的 `POST /v1/responses`、`POST /v1/chat/completions` 及兼容别名。
+- 原生 compact 入口包括同一 Share URL 下的 `POST /v1/responses/compact` 及兼容别名。
+- Responses WebSocket 使用同一 Share URL 下的 `GET /v1/responses` 及兼容别名。
 - Codex 专用 surface 包括 models manifest、alpha search、图片生成和图片编辑。
-- 本地直连推理入口使用独立 inference token；经过 Router 签名验证的请求沿用 Router 身份。
+- 所有推理入口都要求 Router 签名验证且必须携带 Share 身份；Server 不接受本地推理 token。
 - 每个 `codex_oauth` Provider Bundle 必须绑定一个明确的 `codex_oauth` Account。
 - 一次请求从开始到结束只使用解析出的 Provider、账号和 workspace；任何错误都不能触发通用 Provider failover 或账号轮换。
 
@@ -42,9 +42,9 @@ Content-Type: application/json
 1. 验证目标账号存在且类型为 `codex_oauth`。
 2. 只更新并持久化 `accounts.json` 中的 `activeCodexOauthAccountId`。
 3. 不修改 `providers.json`、Provider revision、RuntimePlan 或 Share binding。
-4. 不改变任何 Route Key 的执行身份。
+4. 不改变任何 Share binding 的执行身份。
 
-数据面执行身份只能在 Provider Bundle 编辑器中通过账号绑定变更。Route Key 和 Share 请求始终使用各自 Bundle 已提交的账号，即使账号中心选择了另一个 Codex 账号也不会漂移。
+数据面执行身份只能在 Provider Bundle 编辑器中通过账号绑定变更。Share 请求始终使用其 Bundle 已提交的账号，即使账号中心选择了另一个 Codex 账号也不会漂移。
 
 ## OpenAI 信任边界
 
@@ -61,15 +61,15 @@ Content-Type: application/json
 
 ## Provider 与账号固定
 
-一次直连请求按以下顺序解析执行身份：
+一次 Share 请求按以下顺序解析执行身份：
 
-1. 从 `/r/:routeKey` 解析唯一的 Codex Surface；Share 请求使用 Share 自身的不可变 binding。
+1. 校验 Router ingress 签名，从 Share 身份解析唯一的 Codex Surface。
 2. 编译后的 RuntimePlan 必须与已提交的 Provider revision、类型和账号身份代际一致。
 3. 对 `codex_oauth` Driver，解析 Provider Bundle 明确绑定的账号。
 4. 检查账号登录、cooldown、quota 和并发状态，并获取该账号的 in-flight lease。
 5. 对即将过期的 token 执行同账号 refresh，再物化 Authorization、workspace 和 Codex CLI identity headers。
 
-Route Key 不存在、Surface 已禁用、绑定过期、账号需要重登、处于 cooldown、quota 耗尽或并发饱和时，请求直接失败。系统不会查询另一个 Codex Provider 或账号。账号中心是否选择 active account 不影响该判定。
+Share 不存在、没有 Codex binding、Surface 已禁用、绑定过期、账号需要重登、处于 cooldown、quota 耗尽或并发饱和时，请求直接失败。系统不会查询另一个 Codex Provider 或账号。账号中心是否选择 active account 不影响该判定。
 
 models manifest、alpha search、Provider 网络测试、模型发现、Images、HTTP、SSE、WebSocket 和 WS 到 HTTP fallback 使用同一 Bundle 绑定账号规则。账号中心 quota refresh 可独立使用 active account；credential persistence degraded 时，需要 OAuth 凭据的出站操作在网络前返回 `503`。
 
@@ -89,7 +89,7 @@ models manifest、alpha search、Provider 网络测试、模型发现、Images�
 
 ### Images 兼容与资源边界
 
-Codex OAuth 图片桥覆盖 Route Key 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游始终使用增量 SSE，generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
+Codex OAuth 图片桥覆盖 Share URL 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游始终使用增量 SSE，generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
 
 - 输入模型只接受 `gpt-image-*`；`gpt-image-2-2k` 和 `gpt-image-2-4k` 会规范化为 `gpt-image-2` 及对应方向尺寸。
 - `response_format` 支持 `b64_json` 和 `url`；同时校验 `size`、`quality`、`background`、`output_format`、`moderation`、`input_fidelity`、`output_compression`、`partial_images` 和 `stream` 的类型、范围及组合关系。
@@ -107,26 +107,20 @@ Codex OAuth 图片桥覆盖 Route Key 下的 `POST /v1/images/generations`、`PO
 
 URL 模式不会返回伪造或上游私有 URL。Server 将解码后的图片放入持久化 capability store，并返回同源 `/v1/images/files/<256-bit-token>`：
 
-- token 具有 256-bit 随机熵，GET/HEAD 不再要求 inference token；token 本身就是短期访问能力。
+- token 具有 256-bit 随机熵并只标识短期文件能力；GET/HEAD 仍必须经同一 Router Share ingress，token 不能绕过 Router 鉴权。
 - TTL 为 1 小时，最多 128 项、合计 256 MiB；达到上限会淘汰最旧项。默认目录是 `<config-dir>/image-capabilities`，也可用 `CC_SWITCH_IMAGE_STORE_DIR` 指定绝对路径或相对 config dir 的路径。过期、孤立、元数据损坏、长度或 SHA-256 不匹配的条目会在启动、读写或命中校验时清理。
 - payload 先以 `0600` 数据文件原子落盘，随后才提交带长度、MIME、SHA-256 和过期时间的元数据；所有读写通过同一锁文件串行化。因此同一目录中的 URL 可跨进程重启继续使用，也可由挂载该目录的其他副本读取。
 - 多副本共享目录必须支持跨进程 advisory file lock、同一文件系统内的 atomic rename 和目录同步，并让所有副本以兼容的文件权限访问。无法满足这些条件时，每个副本使用独立 store，并对生成请求及后续 GET/HEAD 配置粘性回源。
 - 下载响应带 `private, no-store`、`nosniff`、准确 Content-Type/Length，不应被 Cloudflare Cache、浏览器或下游代理持久化。
-- public origin 优先使用 `CC_SWITCH_IMAGE_PUBLIC_BASE_URL`，其次使用 Router 已验证的 Client tunnel host，再按 Host/forwarded headers 推导。环境变量必须是无 path/query/fragment 的 HTTP(S) origin。
+- public origin 固定使用 Router 签名 ingress context 中的 Share host，并生成 HTTPS URL；普通 Host、forwarded header 和环境变量都不能改写它。
 
 ### Cloudflare Proxy
 
-Cloudflare DNS 橙云或 Tunnel 直接保留公开 Host 时可自动推导 URL。Cloudflare Worker 把请求转发到不同源站 host 时，应显式配置：
-
-```bash
-CC_SWITCH_IMAGE_PUBLIC_BASE_URL=https://api.example.com
-```
-
-Worker 必须把上游 Body 当作 `ReadableStream` 原样返回，例如 `new Response(upstream.body, { status, headers })`；不能调用 `.text()`、`.json()`、`.arrayBuffer()`，也不能先聚合完整响应。还必须：
+Capability URL 的 host 来自 Router 签名 context，不依赖 Worker 转发时的源站 Host。Worker 必须把上游 Body 当作 `ReadableStream` 原样返回，例如 `new Response(upstream.body, { status, headers })`；不能调用 `.text()`、`.json()`、`.arrayBuffer()`，也不能先聚合完整响应。还必须：
 
 - 透传或正确生成公开 Host、`CF-Visitor`/`X-Forwarded-Proto`，不要覆盖 Server 的 `Cache-Control: no-store` 和 `X-Accel-Buffering: no`。
 - 对 Images SSE/JSON 关闭 Worker 自定义缓冲、响应重写和 cache；允许至少每 15 秒一个很小的 chunk 立即流向客户端。
-- 允许 `/v1/images/files/<token>` 的匿名 GET/HEAD 到达共享同一 `CC_SWITCH_IMAGE_STORE_DIR` 的任一 Server 副本；副本没有共享目录时才要求回到生成实例。不要把 inference bearer 追加到生成 URL，也不要缓存 capability 响应。
+- `/v1/images/files/<token>` 的 GET/HEAD 必须继续经过同一个 Router Share URL 并携带 Router 用户令牌；Router 为其生成签名 Share ingress 后才可到达共享同一 `CC_SWITCH_IMAGE_STORE_DIR` 的任一 Server 副本。副本没有共享目录时才要求回到生成实例，不要缓存 capability 响应。
 - 确认 WAF、请求体和上传规则允许 Codex Images 的 48 MiB HTTP envelope（解码图片聚合仍为 32 MiB）；真实验证首块、15 秒以上生成、URL 下载和客户端取消。
 
 Cloudflare 524 是否消失、Worker 是否实际 flush 小 chunk、订阅账号是否拥有 image entitlement，仍是外部部署/真实 OAuth gate，离线测试不能替代。
@@ -174,9 +168,9 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 ## 验收清单
 
 - 0/1/2 个 Codex OAuth 账号分别得到 `unconfigured`、自动 `ready`、`needs_selection`，这些状态只约束账号中心操作。
-- `needs_selection` 不阻断具有完整账号绑定的 Route Key 或 Share 数据面。
+- `needs_selection` 不阻断具有完整账号绑定的 Share 数据面。
 - 选择账号中心目标后，Provider、Share、revision 和 RuntimePlan 均保持不变；进程重启后账号中心选择保持。
-- Route Key 和 Share 都只使用各自 Bundle 的绑定账号；并发饱和、cooldown、quota 耗尽及第二次 401 时其他 Provider/账号上游请求数为零。
+- Share 只使用其 Bundle 的绑定账号；并发饱和、cooldown、quota 耗尽及第二次 401 时其他 Provider/账号上游请求数为零。
 - HTTP、SSE、Images、WS 握手和 WS 到 HTTP fallback 的首次 401 都只刷新同一账号一次。
 - Claude/Codex/Gemini 经 OpenAI OAuth 转出的普通 Responses 最终出站均为 `store=false`、`stream=true`；客户端非流请求得到单个 JSON，成功终止 SSE usage 记录为 `observed` 而不是零值占位，失败聚合则按 `missing`、`parse_error` 或 `interrupted` 记录并保留已明确观测到的 usage。
 - Router 收到 pending 后可由更高 `usageRevision` 的终态覆盖；低 revision 重放不能回退状态，显式 observed zero 与 missing/parse error/interrupted 在 API 和 UI 中保持可区分。

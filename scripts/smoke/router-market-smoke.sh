@@ -6,12 +6,11 @@ set -euo pipefail
 #
 # Optional:
 #   SERVER_URL              cc-switch-server base URL. Default: http://127.0.0.1:15721
-#   CC_SWITCH_INFERENCE_TOKEN Dedicated token for the optional local share inference probe.
-#   SHARE_ID                Local server share id for direct binding probe.
-#   DIRECT_SHARE_URL        Public direct share tunnel URL, without trailing /v1/responses.
+#   SHARE_ID                Server share id used by control-plane diagnostics.
+#   CC_SWITCH_SHARE_URL     Public Router Share URL, without trailing /v1/responses.
 #   MARKET_API_URL          Market API URL, without trailing /v1/responses.
 #   MARKET_URL              Market admin/base URL for health probe.
-#   ROUTER_API_TOKEN        Router user API token for public direct/market URL probes.
+#   ROUTER_API_TOKEN        Router user API token for Router Share/market URL probes.
 #   ROUTER_API_TOKEN_HEADER Header name for ROUTER_API_TOKEN. Default: Authorization.
 #                           Router accepts Authorization: Bearer, x-api-key, x-goog-api-key.
 #   MARKET_API_TOKEN        Optional market-specific token. Defaults to ROUTER_API_TOKEN when unset.
@@ -24,9 +23,8 @@ set -euo pipefail
 SERVER_URL="${SERVER_URL:-http://127.0.0.1:15721}"
 MARKET_URL="${MARKET_URL:-}"
 API_TOKEN="${CC_SWITCH_SERVER_TOKEN:-}"
-INFERENCE_TOKEN="${CC_SWITCH_INFERENCE_TOKEN:-}"
 SHARE_ID="${SHARE_ID:-}"
-DIRECT_SHARE_URL="${DIRECT_SHARE_URL:-}"
+SHARE_URL="${CC_SWITCH_SHARE_URL:-}"
 MARKET_API_URL="${MARKET_API_URL:-}"
 ROUTER_API_TOKEN="${ROUTER_API_TOKEN:-}"
 ROUTER_API_TOKEN_HEADER="${ROUTER_API_TOKEN_HEADER:-Authorization}"
@@ -38,10 +36,9 @@ REQUIRE_STREAM_USAGE="${REQUIRE_STREAM_USAGE:-0}"
 EVIDENCE_FILE="${EVIDENCE_FILE:-}"
 FAILURES=0
 WARNINGS=0
-LOCAL_SHARE_STATUS=""
-DIRECT_NOAUTH_STATUS=""
-DIRECT_PUBLIC_STATUS=""
-DIRECT_PUBLIC_STREAM_STATUS=""
+SHARE_NOAUTH_STATUS=""
+SHARE_PUBLIC_STATUS=""
+SHARE_PUBLIC_STREAM_STATUS=""
 MARKET_API_STATUS=""
 MARKET_API_STREAM_STATUS=""
 MARKET_HEALTH_STATUS=""
@@ -52,10 +49,6 @@ if [[ -z "$API_TOKEN" ]]; then
 fi
 
 auth_header=(-H "Authorization: Bearer $API_TOKEN")
-inference_auth_header=()
-if [[ -n "$INFERENCE_TOKEN" ]]; then
-  inference_auth_header=(-H "x-api-key: $INFERENCE_TOKEN")
-fi
 router_auth_header=()
 if [[ -n "$ROUTER_API_TOKEN" ]]; then
   case "$ROUTER_API_TOKEN_HEADER" in
@@ -276,91 +269,68 @@ fetch_required "shares before probes" "$SERVER_URL/api/shares" "${auth_header[@]
 echo "== share runtime snapshot refresh =="
 post_optional "share runtime snapshot refresh" "$SERVER_URL/api/shares/runtime-snapshot" "${auth_header[@]}"
 
-if [[ -n "$SHARE_ID" && -n "$INFERENCE_TOKEN" ]]; then
-  echo "== direct share codex probe =="
-  direct_local_payload="$(probe_payload "ping" 0)"
-  direct_status="$(curl -sS -o /tmp/cc-switch-server-direct-share.out -w "%{http_code}" \
-    -H "Content-Type: application/json" \
-    "${inference_auth_header[@]}" \
-    -H "X-CC-Switch-Share-Id: $SHARE_ID" \
-    -H "X-CC-Switch-Data-Source: direct" \
-    -d "$direct_local_payload" \
-    "$SERVER_URL/v1/responses" || true)"
-  LOCAL_SHARE_STATUS="$direct_status"
-  echo "status=${direct_status}"
-  cat /tmp/cc-switch-server-direct-share.out
-  echo
-  if [[ "$direct_status" =~ ^[0-9]{3}$ ]]; then
-    pass "direct share local probe reached server"
-  else
-    warn "direct share local probe did not return an HTTP status"
-  fi
-else
-  warn "SHARE_ID or CC_SWITCH_INFERENCE_TOKEN not set; skipped local direct share binding probe"
-fi
-
-if [[ -n "$DIRECT_SHARE_URL" ]]; then
-  echo "== direct share unsigned internal router health probe =="
-  fetch_status_optional "unsigned internal router health is hidden" "404" "$DIRECT_SHARE_URL/_share-router/health" \
+if [[ -n "$SHARE_URL" ]]; then
+  echo "== Router Share unsigned internal health probe =="
+  fetch_status_optional "unsigned internal router health is hidden" "404" "$SHARE_URL/_share-router/health" \
     -H "X-Share-Router-Probe: 1"
 
-  echo "== direct share unsigned internal request logs probe =="
-  fetch_status_optional "unsigned internal request logs are hidden" "404" "$DIRECT_SHARE_URL/_share-router/request-logs?limit=5"
+  echo "== Router Share unsigned internal request logs probe =="
+  fetch_status_optional "unsigned internal request logs are hidden" "404" "$SHARE_URL/_share-router/request-logs?limit=5"
 
   if [[ -n "$SHARE_ID" ]]; then
-    echo "== direct share unsigned internal runtime probe =="
-    fetch_status_optional "unsigned internal runtime is hidden" "404" "$DIRECT_SHARE_URL/_share-router/share-runtime?shareId=$SHARE_ID" \
+    echo "== Router Share unsigned internal runtime probe =="
+    fetch_status_optional "unsigned internal runtime is hidden" "404" "$SHARE_URL/_share-router/share-runtime?shareId=$SHARE_ID" \
       -H "X-Share-Router-Probe: 1"
   else
-    warn "SHARE_ID not set; skipped direct share internal runtime probe"
+    warn "SHARE_ID not set; skipped Router Share internal runtime probe"
   fi
 
-  echo "== direct share public url missing token probe =="
+  echo "== Router Share URL missing token probe =="
   direct_noauth_payload="$(probe_payload "ping" 0)"
   direct_noauth_status="$(curl -LsS -o /tmp/cc-switch-server-direct-public-noauth.out -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -d "$direct_noauth_payload" \
-    "$DIRECT_SHARE_URL/v1/responses" || true)"
-  DIRECT_NOAUTH_STATUS="$direct_noauth_status"
+    "$SHARE_URL/v1/responses" || true)"
+  SHARE_NOAUTH_STATUS="$direct_noauth_status"
   echo "status=${direct_noauth_status}"
   cat /tmp/cc-switch-server-direct-public-noauth.out
   echo
   if [[ "$direct_noauth_status" == "401" ]] && grep -qi "missing-router-api-token" /tmp/cc-switch-server-direct-public-noauth.out; then
-    pass "direct share public url rejects missing router api token"
+    pass "Router Share URL rejects missing router api token"
   else
-    warn "direct share public url missing-token response was not 401 missing-router-api-token"
+    warn "Router Share URL missing-token response was not 401 missing-router-api-token"
   fi
 
-  echo "== direct share public url codex probe =="
+  echo "== Router Share URL Codex probe =="
   if [[ -z "$ROUTER_API_TOKEN" ]]; then
-    warn "ROUTER_API_TOKEN not set; skipped authenticated public direct share probe"
+    warn "ROUTER_API_TOKEN not set; skipped authenticated Router Share probe"
   else
     direct_public_payload="$(probe_payload "ping" 0)"
     direct_public_status="$(curl -LsS -o /tmp/cc-switch-server-direct-public.out -w "%{http_code}" \
       -H "Content-Type: application/json" \
       "${router_auth_header[@]}" \
       -d "$direct_public_payload" \
-      "$DIRECT_SHARE_URL/v1/responses" || true)"
-    DIRECT_PUBLIC_STATUS="$direct_public_status"
+      "$SHARE_URL/v1/responses" || true)"
+    SHARE_PUBLIC_STATUS="$direct_public_status"
     echo "status=${direct_public_status}"
     cat /tmp/cc-switch-server-direct-public.out
     echo
     if [[ "$direct_public_status" =~ ^2 ]]; then
-      pass "direct share public url succeeded"
+      pass "Router Share URL succeeded"
     else
-      warn "direct share public url did not succeed"
+      warn "Router Share URL did not succeed"
     fi
     if [[ "$STREAM_PROBE" == "1" ]]; then
-      echo "== direct share public url codex stream probe =="
+      echo "== Router Share URL Codex stream probe =="
       direct_stream_payload="$(probe_payload "stream ping" 1)"
       STREAM_OPTIONAL_STATUS=""
-      stream_optional "direct share public stream url succeeded" "$DIRECT_SHARE_URL/v1/responses" \
+      stream_optional "Router Share public stream URL succeeded" "$SHARE_URL/v1/responses" \
         "$direct_stream_payload" "${router_auth_header[@]}"
-      DIRECT_PUBLIC_STREAM_STATUS="$STREAM_OPTIONAL_STATUS"
+      SHARE_PUBLIC_STREAM_STATUS="$STREAM_OPTIONAL_STATUS"
     fi
   fi
 else
-  warn "DIRECT_SHARE_URL not set; skipped public direct share probe"
+  warn "CC_SWITCH_SHARE_URL not set; skipped Router Share probe"
 fi
 
 if [[ -n "$MARKET_API_URL" ]]; then
@@ -447,10 +417,9 @@ if [[ -n "$EVIDENCE_FILE" ]]; then
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-router-market-smoke}" \
   EVIDENCE_STATUS="$([[ "$FAILURES" -eq 0 ]] && echo pass || echo fail)" \
   FAILURES="$FAILURES" WARNINGS="$WARNINGS" \
-  LOCAL_SHARE_STATUS="$LOCAL_SHARE_STATUS" \
-  DIRECT_NOAUTH_STATUS="$DIRECT_NOAUTH_STATUS" \
-  DIRECT_PUBLIC_STATUS="$DIRECT_PUBLIC_STATUS" \
-  DIRECT_PUBLIC_STREAM_STATUS="$DIRECT_PUBLIC_STREAM_STATUS" \
+  SHARE_NOAUTH_STATUS="$SHARE_NOAUTH_STATUS" \
+  SHARE_PUBLIC_STATUS="$SHARE_PUBLIC_STATUS" \
+  SHARE_PUBLIC_STREAM_STATUS="$SHARE_PUBLIC_STREAM_STATUS" \
   MARKET_API_STATUS="$MARKET_API_STATUS" \
   MARKET_API_STREAM_STATUS="$MARKET_API_STREAM_STATUS" \
   MARKET_HEALTH_STATUS="$MARKET_HEALTH_STATUS" \

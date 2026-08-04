@@ -3,9 +3,9 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const baseUrl = (process.env.CC_SWITCH_BASE_URL || "").trim().replace(/\/+$/, "");
-const inferenceToken = (process.env.CC_SWITCH_INFERENCE_TOKEN || "").trim();
-const routeKey = (process.env.CC_SWITCH_GROK_ROUTE_KEY || "").trim();
+const shareUrl = (process.env.CC_SWITCH_SHARE_URL || "").trim().replace(/\/+$/, "");
+const routerToken = (process.env.ROUTER_API_TOKEN || "").trim();
+const routerTokenHeader = (process.env.ROUTER_API_TOKEN_HEADER || "Authorization").trim();
 const model = (process.env.CC_SWITCH_GROK_MODEL || "grok-4.5").trim();
 const mediaSmoke = (process.env.CC_SWITCH_GROK_MEDIA_SMOKE || "0").trim() === "1";
 const evidenceFile = (process.env.EVIDENCE_FILE || "").trim();
@@ -35,7 +35,7 @@ function fail(message) {
 function redact(value) {
   let text = String(value);
   const secrets = [
-    inferenceToken,
+    routerToken,
     process.env.GROK_OAUTH_REFRESH_TOKEN_FIXTURE,
     process.env.GROK_OAUTH_AUTH_JSON_FIXTURE,
   ].filter(isUsable);
@@ -62,13 +62,12 @@ function writeEvidence(status, notes = "") {
     stdio: "inherit",
     env: {
       ...process.env,
-      SERVER_URL: isUsable(baseUrl) ? baseUrl : "",
       EVIDENCE_STAGE: "grok-oauth-real",
       EVIDENCE_STATUS: status,
-      EVIDENCE_TARGET: isUsable(baseUrl) ? baseUrl : "",
+      EVIDENCE_TARGET: isUsable(shareUrl) ? shareUrl : "",
       EVIDENCE_SOURCE: "scripts/smoke/grok-oauth-real.mjs",
       EVIDENCE_APP: "codex",
-      EVIDENCE_PROVIDER: isUsable(routeKey) ? routeKey : "",
+      EVIDENCE_PROVIDER: "router-share-binding",
       EVIDENCE_PROVIDER_TYPE: "grok_oauth",
       EVIDENCE_NOTES: notes,
       PROBE_MODEL: model,
@@ -83,9 +82,8 @@ function writeEvidence(status, notes = "") {
 }
 
 const missingInputs = [
-  ["CC_SWITCH_BASE_URL", baseUrl],
-  ["CC_SWITCH_INFERENCE_TOKEN", inferenceToken],
-  ["CC_SWITCH_GROK_ROUTE_KEY", routeKey],
+  ["CC_SWITCH_SHARE_URL", shareUrl],
+  ["ROUTER_API_TOKEN", routerToken],
 ]
   .filter(([, value]) => !isUsable(value))
   .map(([name]) => name);
@@ -107,8 +105,14 @@ if (!isUsable(model)) {
 function commonHeaders({ inference = false } = {}) {
   const headers = new Headers({
     accept: "application/json",
-    "x-api-key": inferenceToken,
   });
+  if (/^authorization$/i.test(routerTokenHeader)) {
+    headers.set("authorization", `Bearer ${routerToken}`);
+  } else if (/^(x-api-key|x-goog-api-key)$/i.test(routerTokenHeader)) {
+    headers.set(routerTokenHeader, routerToken);
+  } else {
+    fail(`unsupported ROUTER_API_TOKEN_HEADER: ${routerTokenHeader}`);
+  }
   if (inference) {
     headers.set("x-session-id", sessionId);
     headers.set("x-grok-turn-idx", turnIndex);
@@ -126,12 +130,8 @@ async function request(path, init = {}, options = {}) {
   if (init.body !== undefined) {
     headers.set("content-type", "application/json");
   }
-  const routedPath =
-    path === "/ready"
-      ? path
-      : `/r/${encodeURIComponent(routeKey)}${path}`;
   try {
-    const response = await fetch(`${baseUrl}${routedPath}`, {
+    const response = await fetch(`${shareUrl}${path}`, {
       ...init,
       headers,
       signal: controller.signal,
@@ -354,24 +354,15 @@ async function validateMedia() {
 }
 
 async function main() {
-  const { response: ready, stopTimeout } = await request("/ready");
-  try {
-    if (!ready.ok) {
-      fail(`/ready returned HTTP ${ready.status}: ${safePreview(await ready.text())}`);
-    }
-  } finally {
-    stopTimeout();
-  }
-  checks.ready = "pass";
-  console.log("[PASS] server readiness");
-
   const models = await requireJson(
     "/v1/models",
     { method: "GET" },
     "models",
   );
   validateModels(models);
+  checks.ready = "pass";
   checks.models = "pass";
+  console.log("[PASS] Router Share ingress");
   console.log(`[PASS] model catalog metadata (source=${models.source}, stale=${models.stale})`);
 
   const result = await requireJson(

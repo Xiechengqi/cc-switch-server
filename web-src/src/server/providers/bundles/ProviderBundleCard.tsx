@@ -1,0 +1,415 @@
+import {
+  Activity,
+  Copy,
+  GripVertical,
+  Link,
+  LoaderCircle,
+  Pencil,
+  Share2,
+  Trash2,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import type {
+  DraggableAttributes,
+  DraggableSyntheticListeners,
+} from "@dnd-kit/core";
+
+import AntigravityOauthQuotaFooter from "@/components/AntigravityOauthQuotaFooter";
+import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
+import ClaudeOauthQuotaFooter from "@/components/ClaudeOauthQuotaFooter";
+import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
+import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
+import CursorOauthQuotaFooter from "@/components/CursorOauthQuotaFooter";
+import GeminiOauthQuotaFooter from "@/components/GeminiOauthQuotaFooter";
+import GrokOauthQuotaFooter from "@/components/GrokOauthQuotaFooter";
+import KiroOauthQuotaFooter from "@/components/KiroOauthQuotaFooter";
+import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
+import { ProviderIcon } from "@/components/ProviderIcon";
+import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
+import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
+import { Button } from "@/components/ui/button";
+import { PROVIDER_TYPES } from "@/config/constants";
+import type { ManagedAuthAccount } from "@/lib/api/auth";
+import type { ProviderBundleView, ProviderResource } from "@/lib/api/providers";
+import type { ShareRecord } from "@/lib/api/share";
+import { useModelTest } from "@/hooks/useModelTest";
+import { useStreamCheck } from "@/hooks/useStreamCheck";
+import { useProviderHealth } from "@/lib/query/providerHealth";
+import { cn } from "@/lib/utils";
+import type { CoreProviderApp } from "@/server/providerRegistry";
+import { providerResourceSupportsOperation } from "@/server/providerOperations";
+import {
+  canTestLinkProvider,
+  canTestModelProvider,
+  getProviderQuotaSource,
+} from "@/utils/providerMetaUtils";
+import { getProviderCardShareDisplayStatus } from "@/utils/shareUtils";
+import {
+  providerBundleDisplayTarget,
+  providerBundlePrimaryResource,
+} from "./bundleCard";
+
+const APP_LABELS: Record<CoreProviderApp, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  gemini: "Gemini",
+};
+
+function AppLogo({ app }: { app: CoreProviderApp }) {
+  if (app === "claude") return <ClaudeIcon size={17} />;
+  if (app === "codex") return <CodexIcon size={17} />;
+  return <GeminiIcon size={17} />;
+}
+
+function BundleQuotaSummary({ resource }: { resource?: ProviderResource }) {
+  if (!resource) return null;
+  const provider = resource.provider;
+  const app = resource.app;
+  const quotaSource = getProviderQuotaSource(provider, app);
+
+  if (quotaSource === "copilot") {
+    return <CopilotQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "codex_oauth") {
+    return <CodexOauthQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "grok_oauth") {
+    return <GrokOauthQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "claude_oauth") {
+    return <ClaudeOauthQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "google_gemini_oauth") {
+    return <GeminiOauthQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "antigravity_oauth" || quotaSource === "agy_oauth") {
+    return (
+      <AntigravityOauthQuotaFooter
+        meta={provider.meta}
+        authProvider={
+          quotaSource === "agy_oauth"
+            ? PROVIDER_TYPES.AGY_OAUTH
+            : PROVIDER_TYPES.ANTIGRAVITY_OAUTH
+        }
+        inline
+      />
+    );
+  }
+  if (quotaSource === "cursor_oauth" || quotaSource === "cursor_apikey") {
+    return (
+      <CursorOauthQuotaFooter
+        meta={provider.meta}
+        appId={app}
+        providerId={provider.id}
+        inline
+      />
+    );
+  }
+  if (quotaSource === "kiro_oauth") {
+    return <KiroOauthQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "ollama_cloud") {
+    return <OllamaQuotaFooter providerId={provider.id} appId={app} inline />;
+  }
+  return null;
+}
+
+function supportsConnectivity(resource: ProviderResource): boolean {
+  return (
+    providerResourceSupportsOperation(resource, "connectivity") ??
+    canTestLinkProvider(resource.provider, resource.app)
+  );
+}
+
+function supportsModelTest(resource: ProviderResource): boolean {
+  return (
+    providerResourceSupportsOperation(resource, "test") ??
+    canTestModelProvider(resource.provider, resource.app)
+  );
+}
+
+function operationResource(
+  bundle: ProviderBundleView,
+  supports: (resource: ProviderResource) => boolean,
+): ProviderResource | undefined {
+  return bundle.enabledApps
+    .map((app) => bundle.surfaces[app])
+    .find((resource): resource is ProviderResource =>
+      Boolean(resource && supports(resource)),
+    );
+}
+
+interface ProviderBundleCardProps {
+  bundle: ProviderBundleView;
+  share?: ShareRecord;
+  accounts: ManagedAuthAccount[];
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onOpenShare: () => void;
+  onDelete: () => void;
+  dragHandleProps?: {
+    attributes: DraggableAttributes;
+    listeners: DraggableSyntheticListeners;
+    isDragging: boolean;
+  };
+}
+
+export function ProviderBundleCard({
+  bundle,
+  share,
+  accounts,
+  onEdit,
+  onDuplicate,
+  onOpenShare,
+  onDelete,
+  dragHandleProps,
+}: ProviderBundleCardProps) {
+  const { t } = useTranslation();
+  const primaryResource = providerBundlePrimaryResource(bundle);
+  const connectivityResource = operationResource(bundle, supportsConnectivity);
+  const modelResource = operationResource(bundle, supportsModelTest);
+  const connectivityApp =
+    connectivityResource?.app ?? primaryResource?.app ?? "claude";
+  const modelApp = modelResource?.app ?? primaryResource?.app ?? "claude";
+  const { checkProvider, isChecking } = useStreamCheck(connectivityApp);
+  const { testProvider, isTesting } = useModelTest(modelApp);
+  const { data: health } = useProviderHealth(
+    primaryResource?.provider.id ?? bundle.id,
+    primaryResource?.app ?? "claude",
+  );
+  const target = providerBundleDisplayTarget(bundle, accounts);
+  const targetText =
+    target.kind === "oauth_account"
+      ? target.value
+        ? t("provider.oauthAccountDisplay", {
+            account: target.value,
+            defaultValue: `OAuth account: ${target.value}`,
+          })
+        : t("provider.oauthAccountResolving", {
+            defaultValue: "OAuth account",
+          })
+      : (target.value ??
+        t("providerBundle.apiUrlUnavailable", {
+          defaultValue: "API 地址未配置",
+        }));
+  const shareDisplayStatus = share
+    ? getProviderCardShareDisplayStatus(share)
+    : "not_created";
+  const isSharing = shareDisplayStatus === "sharing";
+  const shareButtonLabel =
+    shareDisplayStatus === "sharing"
+      ? t("provider.share.sharing", { defaultValue: "分享中" })
+      : shareDisplayStatus === "closed"
+        ? t("provider.share.resumeShort", { defaultValue: "开启分享" })
+        : t("provider.share.enable", { defaultValue: "分享" });
+  const connectivityId = connectivityResource?.provider.id ?? bundle.id;
+  const modelId = modelResource?.provider.id ?? bundle.id;
+  const iconButtonClass = "h-8 w-8 p-1";
+
+  return (
+    <article
+      className={cn(
+        "group relative overflow-hidden rounded-xl border bg-card p-4 text-card-foreground transition-all duration-300",
+        isSharing
+          ? "border-violet-500/60 shadow-sm shadow-violet-500/10"
+          : "border-border hover:border-border-active hover:shadow-sm",
+        dragHandleProps?.isDragging &&
+          "z-10 scale-[1.01] cursor-grabbing border-primary shadow-lg",
+      )}
+    >
+      <div
+        className={cn(
+          "pointer-events-none absolute inset-0 bg-gradient-to-r from-violet-500/10 to-transparent transition-opacity duration-500",
+          isSharing ? "opacity-100" : "opacity-0",
+        )}
+      />
+      <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          {dragHandleProps ? (
+            <button
+              type="button"
+              className={cn(
+                "-ml-1.5 flex shrink-0 cursor-grab items-center justify-center p-1.5 text-muted-foreground/50 transition-colors hover:text-muted-foreground active:cursor-grabbing",
+                dragHandleProps.isDragging && "cursor-grabbing",
+              )}
+              aria-label={t("provider.dragHandle", {
+                defaultValue: "拖拽排序",
+              })}
+              {...dragHandleProps.attributes}
+              {...dragHandleProps.listeners}
+            >
+              <GripVertical className="h-4 w-4" />
+            </button>
+          ) : null}
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105">
+            <ProviderIcon
+              icon={bundle.icon}
+              name={bundle.name}
+              color={bundle.iconColor}
+              size={20}
+              showFallback
+            />
+          </div>
+
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex min-h-7 min-w-0 flex-wrap items-center gap-2">
+              <h2 className="truncate text-base font-semibold leading-none">
+                {bundle.name}
+              </h2>
+              <div className="flex shrink-0 items-center gap-1">
+                {bundle.supportedApps.map((app) => (
+                  <span
+                    key={app}
+                    className={cn(
+                      "flex h-5 w-5 items-center justify-center",
+                      bundle.enabledApps.includes(app)
+                        ? "opacity-100"
+                        : "opacity-30 grayscale",
+                    )}
+                    title={`${APP_LABELS[app]}${bundle.enabledApps.includes(app) ? "" : " (disabled)"}`}
+                  >
+                    <AppLogo app={app} />
+                  </span>
+                ))}
+              </div>
+              {share ? <ProviderShareStatusTag share={share} /> : null}
+              {health ? <ProviderHealthBadge health={health} /> : null}
+            </div>
+
+            <button
+              type="button"
+              disabled={target.kind !== "api_url" || !target.value}
+              className={cn(
+                "inline-flex max-w-full items-center overflow-hidden text-left text-sm",
+                target.kind === "api_url" && target.value
+                  ? "cursor-pointer text-blue-500 transition-colors hover:underline dark:text-blue-400"
+                  : "cursor-default text-muted-foreground",
+              )}
+              title={targetText}
+              onClick={() => {
+                if (target.kind === "api_url" && target.value) {
+                  window.open(target.value, "_blank", "noopener,noreferrer");
+                }
+              }}
+            >
+              <span className="min-w-0 truncate">{targetText}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="flex w-full min-w-0 flex-col gap-2 sm:ml-auto sm:w-auto sm:max-w-[58%]">
+          <div className="flex min-h-5 min-w-0 max-w-full flex-wrap items-center justify-end gap-x-1 gap-y-1">
+            <BundleQuotaSummary resource={primaryResource} />
+          </div>
+
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+            <Button
+              type="button"
+              size="sm"
+              variant={share ? "secondary" : "default"}
+              className={cn(
+                "w-[4.5rem] px-2.5",
+                share
+                  ? "bg-violet-100 text-violet-600 hover:bg-violet-200 dark:bg-violet-900/50 dark:text-violet-400 dark:hover:bg-violet-900/70"
+                  : "bg-violet-500 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700",
+              )}
+              title={t("provider.share.sectionTitle", {
+                defaultValue: "远程分享",
+              })}
+              onClick={onOpenShare}
+            >
+              <Share2 className="h-4 w-4" />
+              {shareButtonLabel}
+            </Button>
+
+            <div className="flex items-center gap-1">
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={iconButtonClass}
+                title={t("common.edit")}
+                onClick={onEdit}
+              >
+                <Pencil className="h-4 w-4" />
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={iconButtonClass}
+                title={t("provider.duplicate", { defaultValue: "复制" })}
+                onClick={onDuplicate}
+              >
+                <Copy className="h-4 w-4" />
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={cn(
+                  iconButtonClass,
+                  !connectivityResource &&
+                    "cursor-not-allowed text-muted-foreground opacity-40",
+                )}
+                disabled={!connectivityResource || isChecking(connectivityId)}
+                title={
+                  connectivityResource
+                    ? t("provider.testLink", { defaultValue: "测试链接" })
+                    : t("provider.testLinkUnavailable", {
+                        defaultValue: "当前供应商不支持连通性测试",
+                      })
+                }
+                onClick={() => {
+                  if (connectivityResource) {
+                    void checkProvider(connectivityId, bundle.name);
+                  }
+                }}
+              >
+                {isChecking(connectivityId) ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Link className="h-4 w-4" />
+                )}
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={cn(
+                  iconButtonClass,
+                  !modelResource &&
+                    "cursor-not-allowed text-muted-foreground opacity-40",
+                )}
+                disabled={!modelResource || isTesting(modelId)}
+                title={t("provider.testModel", { defaultValue: "测试模型" })}
+                onClick={() => {
+                  if (modelResource) void testProvider(modelId, bundle.name);
+                }}
+              >
+                {isTesting(modelId) ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Activity className="h-4 w-4" />
+                )}
+              </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className={cn(
+                  iconButtonClass,
+                  "hover:text-red-500 dark:hover:text-red-400",
+                )}
+                title={t("common.delete")}
+                onClick={onDelete}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}

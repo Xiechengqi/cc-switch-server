@@ -49,6 +49,24 @@ pub(in crate::api) async fn get_provider_bundle(
     Ok(Json(ProviderBundleResponse { ok: true, bundle }))
 }
 
+pub(in crate::api) async fn update_provider_bundle_order(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateProviderBundleOrderRequest>,
+) -> Result<Json<UpdateProviderBundleOrderResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    require_provider_write_contract(&state, &headers)?;
+    let changed = state
+        .update_provider_bundle_order_command(input.updates)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    Ok(Json(UpdateProviderBundleOrderResponse {
+        ok: true,
+        changed,
+    }))
+}
+
 pub(in crate::api) async fn update_provider_bundle(
     State(state): State<ServerState>,
     headers: HeaderMap,

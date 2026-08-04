@@ -203,8 +203,8 @@ if should_run "AB2" || should_run "AB3" || should_run "AB4" || should_run "AB8";
 fi
 
 if should_run "AB2"; then
-  echo "== AB2 direct public share URL =="
-  check_group "AB2 authenticated direct public probe" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID DIRECT_SHARE_URL ROUTER_API_TOKEN
+  echo "== AB2 Router Share URL =="
+  check_group "AB2 authenticated Router Share probe" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID CC_SWITCH_SHARE_URL ROUTER_API_TOKEN
 fi
 
 if should_run "AB3"; then
@@ -215,7 +215,7 @@ fi
 
 if should_run "AB4"; then
   echo "== AB4 code agent regression =="
-  check_group "AB4 local regression" SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_INFERENCE_TOKEN SHARE_ID
+  check_group "AB4 Router Share regression" SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN
   check_group "AB4 real provider tokens" CLAUDE_PROVIDER_TOKEN CODEX_PROVIDER_TOKEN GEMINI_PROVIDER_TOKEN
   check_group "AB4 complete fixture evidence" MATRIX_LIVE_EVIDENCE_FILE
 fi
@@ -227,7 +227,7 @@ if should_run "AB5"; then
   check_optional CODEX_OAUTH_REFRESH_TOKEN
   check_binary_flag CC_SWITCH_CODEX_IMAGES_SMOKE
   if [[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]]; then
-    check_external_group "AB5 Codex Images Cloudflare smoke" CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_CODEX_ROUTE_KEY
+    check_external_group "AB5 Codex Images Router Share smoke" CC_SWITCH_SHARE_URL ROUTER_API_TOKEN
     echo "[INFO] Run node scripts/smoke/codex-images-real.mjs; input readiness is not live acceptance."
   else
     echo "[OPTIONAL] Codex Images Cloudflare smoke is disabled"
@@ -250,7 +250,7 @@ if should_run "AB6"; then
   check_group "AB6 Antigravity/Agy OAuth real account" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
   check_optional ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE
   echo "== AB6 Grok OAuth external gate =="
-  check_external_group "AB6 Grok OAuth single-account smoke" GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_ROUTE_KEY
+  check_external_group "AB6 Grok OAuth single-account smoke" GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_SHARE_URL ROUTER_API_TOKEN
   check_optional GROK_OAUTH_CALLBACK_URL
   check_optional GROK_OAUTH_REFRESH_TOKEN_FIXTURE
   check_optional GROK_OAUTH_AUTH_JSON_FIXTURE
@@ -275,7 +275,7 @@ fi
 
 if should_run "AB8"; then
   echo "== AB8 release readiness =="
-  check_group "AB8 direct share acceptance" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID DIRECT_SHARE_URL
+  check_group "AB8 Router Share acceptance" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID CC_SWITCH_SHARE_URL
   check_group "AB8 router/market acceptance" ROUTER_API_TOKEN MARKET_API_URL
   check_group "AB8 real provider tokens" CLAUDE_PROVIDER_TOKEN CODEX_PROVIDER_TOKEN GEMINI_PROVIDER_TOKEN
 fi
@@ -287,8 +287,8 @@ echo "external_blocked_groups=${EXTERNAL_BLOCKED_GROUPS}"
 if [[ -n "$EVIDENCE_FILE" ]]; then
   BLOCKED_GROUPS="$FAILED_GROUPS" \
   EXTERNAL_BLOCKED_GROUPS="$EXTERNAL_BLOCKED_GROUPS" \
-  GROK_GATE_STATUS="$(gate_status GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_GROK_ROUTE_KEY)" \
-  CODEX_IMAGES_GATE_STATUS="$([[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]] && gate_status CC_SWITCH_BASE_URL CC_SWITCH_INFERENCE_TOKEN CC_SWITCH_CODEX_ROUTE_KEY || printf '%s' disabled)" \
+  GROK_GATE_STATUS="$(gate_status GROK_OAUTH_TEST_ACCOUNT CC_SWITCH_SHARE_URL ROUTER_API_TOKEN)" \
+  CODEX_IMAGES_GATE_STATUS="$([[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]] && gate_status CC_SWITCH_SHARE_URL ROUTER_API_TOKEN || printf '%s' disabled)" \
   CLAUDE_MAX_5X_GATE_STATUS="$(gate_status CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT)" \
   CLAUDE_MAX_20X_GATE_STATUS="$(gate_status CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT)" \
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-${STAGE}-env-check}" \

@@ -1330,6 +1330,19 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     let was_running = previous
         .as_ref()
         .is_some_and(crate::state::should_restore_share_tunnel);
+    let _binding_mutation = if previous
+        .as_ref()
+        .is_some_and(|share| share.bindings != staged_share.bindings)
+    {
+        Some(
+            state
+                .lock_share_binding_mutation(&staged_share.id)
+                .await
+                .ok_or_else(share_in_flight_error)?,
+        )
+    } else {
+        None
+    };
 
     let mut remote_subdomain_claimed = false;
     if subdomain_changed && previous.is_some() && config.has_registered_router_identity() {
@@ -2213,7 +2226,6 @@ pub(in crate::api) async fn web_proxy_status_json(state: &ServerState) -> Value 
             "app_type": stored.app.as_str(),
             "provider_id": stored.provider.id,
             "provider_name": stored.provider.name,
-            "route_key": crate::domain::providers::bundle::route_key(&stored.provider),
         }));
     }
 

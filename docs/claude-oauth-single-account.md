@@ -4,9 +4,9 @@
 
 ## 能力边界
 
-- 直连入口为 `POST /r/:routeKey/v1/messages` 及对应的 `count_tokens` 路径。
-- Route Key 精确绑定一个已启用的 Claude Surface；OAuth Provider Bundle 必须绑定一个明确账号。
-- Share 请求继续使用 Share 自身不可变的 Provider/账号绑定。
+- 对外入口为 Router 暴露的 Share URL 下 `POST /v1/messages` 及对应的 `count_tokens` 路径。
+- Share 精确绑定一个已启用的 Claude Surface；OAuth Provider Bundle 必须绑定一个明确账号。
+- 同一个 Share URL 也可承载该 Bundle 已启用的 Codex/Gemini Surface。
 - 不按并发、配额、健康度或错误类型切换到其他 Claude Provider 或账号。
 - 可在同一 Provider、同一账号上执行文档中列出的有限重放。
 
@@ -14,28 +14,24 @@
 
 ## 入口鉴权
 
-推理入口使用独立的 `inference_token_hash`，不复用管理员 API token。
+客户端只连接 Router Share URL，并使用 Router 用户令牌。Router 转发到 Server 时附加签名 ingress context；Server 必须同时验证 Router 身份和非空 Share 身份。
 
-- 首次 setup 会签发一次明文 `inferenceToken`，服务端只保存 Keccak-256 摘要。
-- 本地 owner 可调用 `POST /api/auth/inference-token` 轮换 token；旧 token 立即失效。
-- 客户端可使用 `Authorization: Bearer <token>` 或 `x-api-key: <token>`。
-- 带 `Origin` 的直连推理请求被拒绝，避免浏览器页面借用本机凭据发起请求。
-- 经过 Router 签名验证的入口继续信任 Router 上下文，不要求推理 token。
-- setup 已完成但没有推理 token 的旧安装返回 `503`，直到 owner 主动轮换。
-
-管理 token 和推理 token 权限分离：泄露推理 token 不会获得 Provider、账号、备份或升级管理能力。
+- 未签名请求返回 `401`。
+- 签名有效但没有 Share 身份的 client-lane 请求返回 `403`。
+- 客户端提供的 `Authorization`、`x-api-key`、Share header 或 Provider header 都不能替代签名 context，也不能改写 binding。
+- `15721` 不签发或接受本地推理 token，不提供 `/r/:key` Provider 入口；该端口只承载管理 UI、控制面、健康检查和 Router 内部 ingress。
 
 ## Provider 与账号固定
 
-直连请求的选择过程如下：
+Share 请求的选择过程如下：
 
-1. 从 `/r/:routeKey` 解析唯一的 Claude Surface。
+1. 从已验证 ingress context 解析唯一 Share，并读取其 Claude binding。
 2. 编译后的 RuntimePlan 必须与该 Surface 的已提交 revision 一致。
 3. 解析 Provider Bundle 的不可变账号绑定。
 4. 检查账号登录状态、配额/冷却状态和并发上限。
 5. 获取该账号的 in-flight lease 后开始转发。
 
-Route Key 不存在、Surface 已禁用、账号需要重新登录、账号处于冷却或并发已满时，请求直接失败。系统不会查找第二个 Claude Provider。
+Share 不存在、没有 Claude binding、Surface 已禁用、账号需要重新登录、账号处于冷却或并发已满时，请求直接失败。系统不会查找第二个 Claude Provider。
 
 ## OAuth 刷新一致性
 
@@ -85,7 +81,7 @@ Messages 的建连重放只发生在请求尚未到达可产生计费副作用�
 ## 可观测性
 
 - `GET /health` 始终反映进程存活；降级时 `status=degraded`。
-- `GET /ready` 在 OAuth credential persistence degraded 或已 setup 但缺推理 token 时返回 `503`。
+- `GET /ready` 在 OAuth credential persistence degraded 时返回 `503`。
 - `cc_switch_credential_persistence_degraded`：落盘降级 gauge。
 - `cc_switch_stream_client_cancelled_total{app="claude"}`：客户端取消计数。
 - `cc_switch_claude_retry_total`：按 stage/source 分类的 Claude 重放。
@@ -95,12 +91,11 @@ Messages 的建连重放只发生在请求尚未到达可产生计费副作用�
 
 ## 真实账号验收
 
-先确保待测 Route Key 的 Claude Surface 已绑定真实 OAuth 账号，然后运行：
+先确保待测 Share 的 Claude Surface 已绑定真实 OAuth 账号，然后运行：
 
 ```bash
-CC_SWITCH_BASE_URL=http://127.0.0.1:15721 \
-CC_SWITCH_INFERENCE_TOKEN='<one-time-issued-token>' \
-CC_SWITCH_CLAUDE_ROUTE_KEY='<provider-route-key>' \
+CC_SWITCH_SHARE_URL='https://share.example.com' \
+ROUTER_API_TOKEN='<router-user-token>' \
 node scripts/smoke/claude-oauth-real.mjs
 ```
 
@@ -109,7 +104,7 @@ node scripts/smoke/claude-oauth-real.mjs
 - `CC_SWITCH_CLAUDE_MODEL`：覆盖默认模型 `claude-sonnet-4-6`。
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 
-验收依次检查 readiness、Route Key 下的 count_tokens、非流式 Messages 和完整 SSE lifecycle。缺少 `CC_SWITCH_BASE_URL`、`CC_SWITCH_INFERENCE_TOKEN` 或 `CC_SWITCH_CLAUDE_ROUTE_KEY` 时脚本明确输出 `SKIP` 并退出，不把缺少真实凭据记为通过。
+验收依次通过同一个 Share URL 检查 count_tokens、非流式 Messages 和完整 SSE lifecycle。缺少 `CC_SWITCH_SHARE_URL` 或 `ROUTER_API_TOKEN` 时脚本明确输出 `SKIP` 并退出，不把缺少真实凭据记为通过。
 
 ## 非目标与剩余外部风险
 

@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
   ArrowLeft,
+  ArrowRightLeft,
   Check,
   Copy,
   KeyRound,
@@ -10,6 +11,7 @@ import {
   Plus,
   Save,
   Share2,
+  Target,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -71,10 +73,12 @@ import {
 } from "./bundleShare";
 import {
   createProviderBundleDraft,
+  duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
   parseSettings,
+  providerBundleIdentityEditable,
   surfaceEndpoint,
   toProviderBundleWriteDraft,
   updateBundleModel,
@@ -86,6 +90,8 @@ import {
 
 interface ProviderBundleEditorProps {
   bundle?: ProviderBundleView;
+  duplicate?: boolean;
+  initialSection?: "share";
   onCancel: () => void;
   onSaved: (bundle: ProviderBundleView) => void;
   onOpenShareSettings?: () => void;
@@ -151,12 +157,6 @@ function fieldLabel(logical: string): string {
   }
 }
 
-function enabledApps(draft: ProviderBundleEditorDraft): CoreProviderApp[] {
-  return draft.surfaces
-    .filter((surface) => surface.enabled)
-    .map((surface) => surface.app);
-}
-
 function surfaceSettingsValid(surface: BundleSurfaceEditorDraft): boolean {
   try {
     parseSettings(surface.settingsText);
@@ -164,23 +164,6 @@ function surfaceSettingsValid(surface: BundleSurfaceEditorDraft): boolean {
   } catch {
     return false;
   }
-}
-
-function routeEndpoints(
-  routeKey: string,
-  apps: CoreProviderApp[],
-): Array<{ app: CoreProviderApp; label: string; url: string }> {
-  const base = `${window.location.origin}/r/${routeKey}`;
-  return apps.map((app) => ({
-    app,
-    label: APP_LABELS[app],
-    url:
-      app === "claude"
-        ? `${base}/v1/messages`
-        : app === "codex"
-          ? `${base}/v1/responses`
-          : `${base}/v1beta`,
-  }));
 }
 
 function SurfaceEditor({
@@ -713,6 +696,8 @@ function BundleShareEditor({
 
 export function ProviderBundleEditor({
   bundle,
+  duplicate = false,
+  initialSection,
   onCancel,
   onSaved,
   onOpenShareSettings,
@@ -722,15 +707,20 @@ export function ProviderBundleEditor({
   const initialFamily = providerRegistry.families[0]!;
   const [draft, setDraft] = useState<ProviderBundleEditorDraft>(() =>
     bundle
-      ? editProviderBundleDraft(bundle)
+      ? duplicate
+        ? duplicateProviderBundleDraft(bundle)
+        : editProviderBundleDraft(bundle)
       : createProviderBundleDraft(initialFamily),
   );
-  const persisted = Boolean(bundle) || draft.expectedRevision !== undefined;
+  const persisted =
+    (Boolean(bundle) && !duplicate) || draft.expectedRevision !== undefined;
   const family = familyById(draft.familyId) ?? initialFamily;
+  const identityEditable = providerBundleIdentityEditable(family);
   const [activeApp, setActiveApp] = useState<CoreProviderApp>(
     draft.surfaces[0]?.app ?? "claude",
   );
   const [saving, setSaving] = useState(false);
+  const shareSectionRef = useRef<HTMLDivElement>(null);
   const sharesQuery = useSharesQuery();
   const existingShare = shareForBundle(sharesQuery.data, draft.id);
   const [shareDraft, setShareDraft] = useState<ProviderBundleShareDraft>(() =>
@@ -775,6 +765,17 @@ export function ProviderBundleEditor({
   useEffect(() => {
     setShareDraft(createBundleShareDraft(existingShare));
   }, [existingShare?.id, existingShare?.configRevision]);
+
+  useEffect(() => {
+    if (initialSection !== "share") return;
+    const frame = requestAnimationFrame(() => {
+      shareSectionRef.current?.scrollIntoView?.({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [initialSection]);
 
   useEffect(() => {
     if (!shareDraft.enabled || shareDraft.subdomain.trim() || existingShare)
@@ -870,8 +871,6 @@ export function ProviderBundleEditor({
     }
   };
 
-  const apps = enabledApps(draft);
-  const endpoints = routeEndpoints(draft.routeKey, apps);
   const shareUrl = existingShare?.tunnelUrl ?? existingShare?.subdomain;
 
   return (
@@ -896,24 +895,18 @@ export function ProviderBundleEditor({
             {family.surfaces.map((surface) => (
               <AppLogo key={surface.app} app={surface.app} />
             ))}
-            <span className="text-xs text-muted-foreground">
-              {family.label}
-            </span>
           </div>
         </div>
       </div>
 
       <div className="space-y-6">
         <Section
-          title={t("providerBundle.identity", { defaultValue: "供应商" })}
+          title={t("providerBundle.basic", { defaultValue: "基本信息" })}
         >
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2 md:col-span-2">
-              <Label className={persisted ? "block text-center" : undefined}>
-                {t("providerBundle.family", { defaultValue: "供应商类型" })}
-              </Label>
               {persisted ? (
-                <div className="space-y-4">
+                <div className="flex justify-center">
                   <ProviderIconControl
                     icon={draft.icon}
                     iconColor={draft.iconColor}
@@ -926,42 +919,43 @@ export function ProviderBundleEditor({
                       }))
                     }
                   />
-                  <div className="flex justify-center">
-                    <Badge variant="outline" className="gap-2">
-                      <FamilyLogo family={family} />
-                      {family.label}
-                    </Badge>
-                  </div>
                 </div>
               ) : (
-                <div
-                  role="radiogroup"
-                  aria-label={t("providerBundle.family", {
-                    defaultValue: "供应商类型",
-                  })}
-                  className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"
-                >
-                  {providerRegistry.families.map((item) => {
-                    const selected = item.familyId === draft.familyId;
-                    return (
-                      <button
-                        key={item.familyId}
-                        type="button"
-                        role="radio"
-                        aria-checked={selected}
-                        onClick={() => changeFamily(item.familyId)}
-                        className={cn(
-                          "inline-flex min-h-10 w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors",
-                          selected
-                            ? "bg-primary text-primary-foreground"
-                            : "bg-accent text-muted-foreground hover:bg-accent/80 hover:text-foreground",
-                        )}
-                      >
-                        <FamilyLogo family={item} />
-                        <span className="truncate">{item.label}</span>
-                      </button>
-                    );
-                  })}
+                <div className="space-y-2">
+                  <Label>
+                    {t("providerBundle.family", {
+                      defaultValue: "供应商类型",
+                    })}
+                  </Label>
+                  <div
+                    role="radiogroup"
+                    aria-label={t("providerBundle.family", {
+                      defaultValue: "供应商类型",
+                    })}
+                    className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"
+                  >
+                    {providerRegistry.families.map((item) => {
+                      const selected = item.familyId === draft.familyId;
+                      return (
+                        <button
+                          key={item.familyId}
+                          type="button"
+                          role="radio"
+                          aria-checked={selected}
+                          onClick={() => changeFamily(item.familyId)}
+                          className={cn(
+                            "inline-flex min-h-10 w-full items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm font-medium transition-colors",
+                            selected
+                              ? "bg-primary text-primary-foreground"
+                              : "bg-accent text-muted-foreground hover:bg-accent/80 hover:text-foreground",
+                          )}
+                        >
+                          <FamilyLogo family={item} />
+                          <span className="truncate">{item.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>
@@ -969,7 +963,13 @@ export function ProviderBundleEditor({
               <Label>{t("serverProviderForm.basic.name")}</Label>
               <Input
                 value={draft.name}
+                readOnly={!identityEditable}
+                className={cn(
+                  !identityEditable &&
+                    "cursor-default bg-muted/40 text-muted-foreground",
+                )}
                 onChange={(event) =>
+                  identityEditable &&
                   setDraft({ ...draft, name: event.target.value })
                 }
               />
@@ -979,22 +979,14 @@ export function ProviderBundleEditor({
               <Input
                 type="url"
                 value={draft.websiteUrl}
+                readOnly={!identityEditable}
+                className={cn(
+                  !identityEditable &&
+                    "cursor-default bg-muted/40 text-muted-foreground",
+                )}
                 onChange={(event) =>
+                  identityEditable &&
                   setDraft({ ...draft, websiteUrl: event.target.value })
-                }
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>
-                {t("providerBundle.routeKey", { defaultValue: "Route Key" })}
-              </Label>
-              <Input
-                value={draft.routeKey}
-                onChange={(event) =>
-                  setDraft({
-                    ...draft,
-                    routeKey: event.target.value.toLowerCase(),
-                  })
                 }
               />
             </div>
@@ -1009,30 +1001,6 @@ export function ProviderBundleEditor({
               />
             </div>
           </div>
-          {endpoints.length ? (
-            <div className="grid gap-2">
-              {endpoints.map((endpoint) => (
-                <div
-                  key={endpoint.app}
-                  className="flex min-w-0 items-center gap-2 rounded-md border px-3 py-2"
-                >
-                  <AppLogo app={endpoint.app} />
-                  <code className="min-w-0 flex-1 truncate text-xs">
-                    {endpoint.url}
-                  </code>
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="ghost"
-                    title={t("common.copy")}
-                    onClick={() => void copyText(endpoint.url)}
-                  >
-                    <Copy className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-          ) : null}
         </Section>
 
         {credentialProfile?.credentialPolicy.mode === "managed_account" ? (
@@ -1130,45 +1098,70 @@ export function ProviderBundleEditor({
         ) : null}
 
         <Section title={t("serverProviderForm.model.title")}>
-          <div className="space-y-3">
-            {allowedModelPolicies.length > 1 ? (
-              <Tabs
-                value={draft.modelPolicy}
-                onValueChange={(value) => {
-                  if (value !== "single" && value !== "passthrough") return;
-                  if (!allowedModelPolicies.includes(value)) return;
-                  setDraft((current) =>
-                    updateBundleModel(
-                      current,
-                      value,
-                      value === "single" && !current.upstreamModel.trim()
-                        ? defaultSharedModel
-                        : current.upstreamModel,
-                    ),
-                  );
-                }}
-              >
-                <TabsList className="w-full justify-start sm:w-auto">
-                  {allowedModelPolicies.map((policy) => (
-                    <TabsTrigger
-                      key={policy}
-                      value={policy}
-                      className="min-w-0 flex-1 sm:min-w-[10rem]"
-                    >
-                      {policy === "single"
-                        ? t("serverProviderForm.model.single")
-                        : t("serverProviderForm.model.passthrough")}
-                    </TabsTrigger>
-                  ))}
-                </TabsList>
-              </Tabs>
-            ) : (
-              <Badge variant="secondary">
+          <div className="grid gap-4 md:grid-cols-[minmax(0,22rem)_minmax(0,1fr)] md:items-start">
+            <div className="space-y-2">
+              {allowedModelPolicies.length > 1 ? (
+                <Tabs
+                  value={draft.modelPolicy}
+                  onValueChange={(value) => {
+                    if (value !== "single" && value !== "passthrough") return;
+                    if (!allowedModelPolicies.includes(value)) return;
+                    setDraft((current) =>
+                      updateBundleModel(
+                        current,
+                        value,
+                        value === "single" && !current.upstreamModel.trim()
+                          ? defaultSharedModel
+                          : current.upstreamModel,
+                      ),
+                    );
+                  }}
+                >
+                  <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
+                    {allowedModelPolicies.map((policy) => (
+                      <TabsTrigger
+                        key={policy}
+                        value={policy}
+                        className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground dark:data-[state=active]:bg-background"
+                      >
+                        {policy === "single" ? (
+                          <Target className="hidden h-4 w-4 shrink-0 sm:block" />
+                        ) : (
+                          <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
+                        )}
+                        {policy === "single"
+                          ? t("providerBundle.modelSingle", {
+                              defaultValue: "固定上游模型",
+                            })
+                          : t("providerBundle.modelPassthrough", {
+                              defaultValue: "模型透传",
+                            })}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                </Tabs>
+              ) : (
+                <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
+                  {draft.modelPolicy === "single" ? (
+                    <Target className="h-4 w-4" />
+                  ) : (
+                    <ArrowRightLeft className="h-4 w-4" />
+                  )}
+                  {draft.modelPolicy === "single"
+                    ? t("providerBundle.modelSingle", {
+                        defaultValue: "固定上游模型",
+                      })
+                    : t("providerBundle.modelPassthrough", {
+                        defaultValue: "模型透传",
+                      })}
+                </div>
+              )}
+              <p className="text-xs leading-relaxed text-muted-foreground">
                 {draft.modelPolicy === "single"
-                  ? t("serverProviderForm.model.single")
-                  : t("serverProviderForm.model.passthrough")}
-              </Badge>
-            )}
+                  ? t("serverProviderForm.model.singleHint")
+                  : t("serverProviderForm.model.passthroughHint")}
+              </p>
+            </div>
 
             {draft.modelPolicy === "single" ? (
               <div className="space-y-2">
@@ -1188,15 +1181,8 @@ export function ProviderBundleEditor({
                     )
                   }
                 />
-                <p className="text-xs text-muted-foreground">
-                  {t("serverProviderForm.model.singleHint")}
-                </p>
               </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                {t("serverProviderForm.model.passthroughHint")}
-              </p>
-            )}
+            ) : null}
           </div>
         </Section>
 
@@ -1280,12 +1266,14 @@ export function ProviderBundleEditor({
           </Tabs>
         </Section>
 
-        <BundleShareEditor
-          draft={shareDraft}
-          onChange={setShareDraft}
-          shareUrl={shareUrl}
-          onOpenShareSettings={onOpenShareSettings}
-        />
+        <div ref={shareSectionRef}>
+          <BundleShareEditor
+            draft={shareDraft}
+            onChange={setShareDraft}
+            shareUrl={shareUrl}
+            onOpenShareSettings={onOpenShareSettings}
+          />
+        </div>
       </div>
 
       <div className="sticky bottom-0 z-20 flex items-center justify-end gap-2 border-t bg-background/95 py-4 backdrop-blur">

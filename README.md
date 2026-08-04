@@ -13,29 +13,30 @@
 
 当前仓库只维护 server 运行路径：HTTP API、静态 Web UI、本地 JSON store、反代转发、router/share tunnel 和真实验收脚本。不迁移 Tauri window/tray/updater/deeplink、Claude Desktop profile 写入、MCP、skills、session manager 和桌面安装资产。
 
-典型链路：
+管理面链路：
+
+```text
+browser / operator
+  -> cc-switch-server :15721
+  -> Web UI / control plane / health
+```
+
+数据面链路：
 
 ```text
 Claude / Codex / Gemini client
-  -> cc-switch-server local or public endpoint
-  -> provider adapter / account manager / usage recorder
-  -> upstream provider or OAuth backend
-```
-
-注册到 router 后的 share 链路：
-
-```text
-market or direct share URL
+  -> Router Share URL or market API URL
   -> cc-switch-router
-  -> SSH reverse tunnel
-  -> cc-switch-server share binding
-  -> selected provider / account
+  -> signed ingress over SSH reverse tunnel
+  -> cc-switch-server Share binding
+  -> provider adapter / bound account
+  -> upstream provider or OAuth backend
 ```
 
 ## 特性
 
 - 提供 setup、password/API token 登录和 router 邮箱验证码登录；Web UI 覆盖 provider、account、share、usage、router、backup 和 diagnostics 常用操作。
-- 支持 Claude、Codex、Gemini 三类入口：`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、Gemini `/v1beta/*` 和 OpenAI-compatible `/v1/models`/`/models`。
+- 在 Router Share URL 下支持 Claude、Codex、Gemini 三类入口：`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、Gemini `/v1beta/*` 和 OpenAI-compatible `/v1/models`/`/models`；这些路径不是 `15721` 的客户端直连 API。
 - 通过显式 legacy reader 保留旧 cc-switch Provider metadata、AuthBinding 和未知扩展字段；Universal 派生项只作为迁移输入，不再是 Server runtime 真值。
 - Provider API 导出仅返回脱敏视图；受控导入按 server 当前分类和凭据补丁契约执行，不提供跨 store 的通用配置导入导出。
 - 已实现 Codex Chat Completions 与 Responses 的直接互转，保留 max/reasoning/response_format/tool/usage 等 Codex bridge 关键字段。
@@ -43,10 +44,10 @@ market or direct share URL
 - Cursor AgentService 已默认接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；Provider maturity 保持 Experimental，直到 OAuth/API key 真实验收矩阵通过。
 - GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
 - Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
-- Managed OAuth Provider Bundle 必须显式绑定账号。Codex OAuth 的 active account 仅是账号中心独立操作的目标，不重绑 Provider 或 Share，也不参与数据面路由。直连请求由 `/r/:routeKey` 精确选择 Claude/Codex/Gemini Surface 及其绑定账号；请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
+- Managed OAuth Provider Bundle 必须显式绑定账号。Codex OAuth 的 active account 仅是账号中心独立操作的目标，不重绑 Provider 或 Share，也不参与数据面路由。所有外部推理请求只能通过 Router 暴露的同一个 Share URL 进入；Server 校验 Router ingress 签名和 Share 身份后，由 Share binding 精确选择 Claude/Codex/Gemini Surface 及其绑定账号。请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
 - Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
 - Codex context overflow 自动压缩可通过 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 显式启用；它只在业务输出提交前使用同一账号做一次有界摘要和重试，默认关闭且摘要 usage 独立记录。
-- 支持 router installation register、client tunnel、share tunnel、share batch sync、direct share request log sync、pending share edit pull/ack/event 监听。
+- 支持 router installation register、client tunnel、share tunnel、share batch sync、Router Share request log sync、pending share edit pull/ack/event 监听。
 - 支持 Router 内建 Share Market entitlement add/revoke 通过 pending edit 幂等应用到 Server Share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
 - usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。
@@ -59,6 +60,8 @@ market or direct share URL
 `cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。Provider 桥接能力按 Server 自身的协议契约实现，能力分级以静态 adapter contract 覆盖度与真实验收结果为准。
 
 ### 支持的客户端入口
+
+下表路径全部相对于同一个 Router Share URL。`15721` 只承载管理 UI、控制面、健康检查和 Router 签名后的内部 ingress。
 
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -132,7 +135,7 @@ curl -fsS -X POST http://127.0.0.1:15721/api/setup/bootstrap \
 2. 浏览器授权后会跳转到本机 `localhost:1455`；页面不可达是远程部署下的预期现象。
 3. 从地址栏提交完整的 `http://localhost:1455/auth/callback?code=...&state=...` URL，Server 校验固定 scheme/host/port/path、state、当前管理员主体和会话期限后交换 token。
 
-只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。存在一条 Codex 凭据时该账号自动成为账号中心操作目标；存在多条凭据时可在 Web 管理面显式选择，`needs_selection` 只阻断依赖该偏好的账号中心操作，不影响已明确绑定账号的 Route Key 或 Share 数据面。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
+只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。存在一条 Codex 凭据时该账号自动成为账号中心操作目标；存在多条凭据时可在 Web 管理面显式选择，`needs_selection` 只阻断依赖该偏好的账号中心操作，不影响已明确绑定账号的 Share 数据面。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
 
 或使用 CLI 在启动 HTTP 前写本地配置：
 
@@ -248,14 +251,14 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 7. Router 内建 Share Market entitlement 会通过 pending share edit 下发；Server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
 8. router 可经 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime`、`/_share-router/model-health` 拉取 runtime。
 9. `/_ctl/apply_share_settings` 和 `/_ctl/refresh_share_usage` 使用 router `control_secret` HMAC、timestamp、nonce 防重放。
-10. direct share URL 请求会按 `X-CC-Switch-Share-Id` 选择 share binding，并将 `dataSource=direct` 的 request log 同步到 router；market source 日志不由 server 回传，避免与 market 侧计费日志重复。
+10. Router Share URL 请求由已验签 ingress context 中的 Share 身份选择 binding。Router 将非 market 的 Share 流量标记为 `dataSource=direct`；对应 request log 由 server 同步到 router，market source 日志不由 server 回传，避免与 market 侧计费日志重复。
 
 联调验收重点：
 
 - router client 表中 0 share client 也应显示在线/健康。
 - router share 表能看到 server share 的 owner、subdomain、app runtime、provider 和 quota 展示字段。
 - market API URL 能调度 server share。
-- direct share API URL 能直接调用 server share，router request log 不重复且保留 country/IP/source。
+- Router Share URL 能经 Router 调用 server Share，request log 不重复且保留 country/IP/source。
 - Router 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 Server Share。
 
 ## 关键配置
@@ -276,10 +279,10 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
-| Codex Images | `CC_SWITCH_IMAGE_PUBLIC_BASE_URL` 固定公开 origin；`CC_SWITCH_IMAGE_STORE_DIR` 指定可跨重启的 capability 目录，多副本共享时底层文件系统必须支持跨进程锁和 atomic rename |
+| Codex Images | capability URL 固定使用 Router 签名 context 中的 Share host；`CC_SWITCH_IMAGE_STORE_DIR` 指定可跨重启的 capability 目录，多副本共享时底层文件系统必须支持跨进程锁和 atomic rename |
 | OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
 | Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
-| 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`DIRECT_SHARE_URL` 及各真实 Provider token |
+| 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`CC_SWITCH_SHARE_URL` 及各真实 Provider token |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
 
@@ -338,7 +341,7 @@ cc-switch-server config migrate-provider-store --cleanup-snapshot
 - `GET /api/router/tunnels`
 - `GET /api/usage/summary`
 
-反代入口：
+Router Share URL 下的反代入口：
 
 - `POST /v1/messages`
 - `POST /v1/chat/completions`

@@ -1,32 +1,42 @@
-import { useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useMemo,
+  useState,
+  type ComponentProps,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import {
+  closestCenter,
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  sortableKeyboardCoordinates,
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import {
-  Copy,
-  KeyRound,
-  LoaderCircle,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Route,
-  Trash2,
-} from "lucide-react";
+import { LoaderCircle, Plus, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { ProviderIcon } from "@/components/ProviderIcon";
-import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
 import { Button } from "@/components/ui/button";
 import type { ProviderBundleView } from "@/lib/api/providers";
-import type { ShareRecord } from "@/lib/api/share";
 import { providersApi } from "@/lib/api/providers";
-import { copyText } from "@/lib/clipboard";
-import { useSharesQuery } from "@/lib/query";
-import type { CoreProviderApp } from "@/server/providerRegistry";
-import { familyById } from "@/server/providerRegistry";
+import { useManagedAccountsQuery, useSharesQuery } from "@/lib/query";
 import { cn } from "@/lib/utils";
 import { shareForBundle } from "./bundleShare";
+import { ProviderBundleCard } from "./ProviderBundleCard";
 import { ProviderBundleEditor } from "./ProviderBundleEditor";
 
 export const providerBundleKeys = {
@@ -38,116 +48,34 @@ interface ProviderBundlesPageProps {
   toolbarActions?: ReactNode;
 }
 
-function AppLogo({ app }: { app: CoreProviderApp }) {
-  if (app === "claude") return <ClaudeIcon size={17} />;
-  if (app === "codex") return <CodexIcon size={17} />;
-  return <GeminiIcon size={17} />;
-}
+type BundleEditorRequest =
+  | { mode: "create" }
+  | { mode: "edit"; bundle: ProviderBundleView; initialSection?: "share" }
+  | { mode: "duplicate"; bundle: ProviderBundleView };
 
-function BundleCard({
-  bundle,
-  share,
-  onEdit,
-  onDelete,
-}: {
-  bundle: ProviderBundleView;
-  share?: ShareRecord;
-  onEdit: () => void;
-  onDelete: () => void;
-}) {
-  const { t } = useTranslation();
-  const family = familyById(bundle.familyId);
-  const routeBase = `${window.location.origin}/r/${bundle.routeKey}`;
+function SortableProviderBundleCard(
+  props: ComponentProps<typeof ProviderBundleCard>,
+) {
+  const {
+    setNodeRef,
+    attributes,
+    listeners,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: props.bundle.id });
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
   return (
-    <article className="group relative overflow-hidden rounded-xl border border-border bg-card p-4 text-card-foreground transition-all duration-300 hover:border-border-active hover:shadow-sm">
-      <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105">
-            <ProviderIcon
-              icon={bundle.icon}
-              name={bundle.name}
-              color={bundle.iconColor}
-              size={20}
-              showFallback
-            />
-          </div>
-          <div className="min-w-0 flex-1 space-y-1">
-            <div className="flex min-h-7 min-w-0 flex-wrap items-center gap-2">
-              <h2 className="truncate text-base font-semibold leading-none">
-                {bundle.name}
-              </h2>
-              <div className="flex shrink-0 items-center gap-1">
-                {bundle.supportedApps.map((app) => (
-                  <span
-                    key={app}
-                    className={cn(
-                      "flex h-5 w-5 items-center justify-center",
-                      bundle.enabledApps.includes(app)
-                        ? "opacity-100"
-                        : "opacity-30 grayscale",
-                    )}
-                    title={`${app}${bundle.enabledApps.includes(app) ? "" : " (disabled)"}`}
-                  >
-                    <AppLogo app={app} />
-                  </span>
-                ))}
-              </div>
-              <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
-                {family?.label ?? bundle.familyId}
-              </span>
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold",
-                  bundle.credentialConfigured
-                    ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-                    : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
-                )}
-              >
-                <KeyRound className="h-3 w-3" />
-                {bundle.credentialConfigured
-                  ? t("providerBundle.credentialReady", {
-                      defaultValue: "凭据已配置",
-                    })
-                  : t("providerBundle.credentialMissing", {
-                      defaultValue: "缺少凭据",
-                    })}
-              </span>
-              {share ? <ProviderShareStatusTag share={share} /> : null}
-            </div>
-            <button
-              type="button"
-              className="inline-flex max-w-full items-center gap-1.5 overflow-hidden text-left text-sm text-blue-500 transition-colors hover:underline dark:text-blue-400"
-              title={`${routeBase} - ${t("common.copy")}`}
-              onClick={() => void copyText(routeBase)}
-            >
-              <Route className="h-3.5 w-3.5 shrink-0" />
-              <code className="min-w-0 truncate">{routeBase}</code>
-              <Copy className="h-3.5 w-3.5 shrink-0" />
-            </button>
-          </div>
-        </div>
-        <div className="flex shrink-0 justify-end gap-1 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100 max-sm:opacity-100">
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            title={t("common.edit")}
-            onClick={onEdit}
-          >
-            <Pencil className="h-4 w-4" />
-          </Button>
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            title={t("common.delete")}
-            onClick={onDelete}
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-    </article>
+    <div ref={setNodeRef} style={style}>
+      <ProviderBundleCard
+        {...props}
+        dragHandleProps={{ attributes, listeners, isDragging }}
+      />
+    </div>
   );
 }
 
@@ -162,12 +90,20 @@ export function ProviderBundlesPage({
     queryFn: providersApi.getBundles,
   });
   const sharesQuery = useSharesQuery();
-  const [editing, setEditing] = useState<ProviderBundleView | "new" | null>(
-    null,
-  );
+  const accountsQuery = useManagedAccountsQuery();
+  const [editing, setEditing] = useState<BundleEditorRequest | null>(null);
   const [deleting, setDeleting] = useState<ProviderBundleView | null>(null);
   const [deletePending, setDeletePending] = useState(false);
+  const [sortPending, setSortPending] = useState(false);
   const bundles = bundlesQuery.data ?? [];
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
   const sharesByBundle = useMemo(
     () =>
       new Map(
@@ -178,11 +114,62 @@ export function ProviderBundlesPage({
       ),
     [bundles, sharesQuery.data],
   );
+  const handleDragEnd = useCallback(
+    async ({ active, over }: DragEndEvent) => {
+      if (sortPending || !over || active.id === over.id) return;
+      const oldIndex = bundles.findIndex((bundle) => bundle.id === active.id);
+      const newIndex = bundles.findIndex((bundle) => bundle.id === over.id);
+      if (oldIndex < 0 || newIndex < 0) return;
+
+      const reordered = arrayMove(bundles, oldIndex, newIndex);
+      queryClient.setQueryData<ProviderBundleView[]>(
+        providerBundleKeys.all,
+        reordered,
+      );
+      setSortPending(true);
+      try {
+        await providersApi.updateBundleSortOrder(
+          reordered.map((bundle, sortIndex) => ({
+            id: bundle.id,
+            sortIndex,
+          })),
+        );
+        await queryClient.invalidateQueries({
+          queryKey: providerBundleKeys.all,
+        });
+        toast.success(
+          t("provider.sortUpdated", { defaultValue: "排序已更新" }),
+        );
+      } catch (error) {
+        queryClient.setQueryData<ProviderBundleView[]>(
+          providerBundleKeys.all,
+          bundles,
+        );
+        await queryClient.invalidateQueries({
+          queryKey: providerBundleKeys.all,
+        });
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : t("provider.sortUpdateFailed", {
+                defaultValue: "排序更新失败",
+              }),
+        );
+      } finally {
+        setSortPending(false);
+      }
+    },
+    [bundles, queryClient, sortPending, t],
+  );
 
   if (editing) {
     return (
       <ProviderBundleEditor
-        bundle={editing === "new" ? undefined : editing}
+        bundle={editing.mode === "create" ? undefined : editing.bundle}
+        duplicate={editing.mode === "duplicate"}
+        initialSection={
+          editing.mode === "edit" ? editing.initialSection : undefined
+        }
         onCancel={() => setEditing(null)}
         onSaved={() => setEditing(null)}
         onOpenShareSettings={onOpenShareSettings}
@@ -266,7 +253,7 @@ export function ProviderBundlesPage({
             type="button"
             className="shrink-0"
             title={t("providers.addProvider", { defaultValue: "添加供应商" })}
-            onClick={() => setEditing("new")}
+            onClick={() => setEditing({ mode: "create" })}
           >
             <Plus className="h-4 w-4 sm:mr-2" />
             <span className="hidden sm:inline">
@@ -295,23 +282,43 @@ export function ProviderBundlesPage({
             <CodexIcon size={28} />
             <GeminiIcon size={28} />
           </div>
-          <Button onClick={() => setEditing("new")}>
+          <Button onClick={() => setEditing({ mode: "create" })}>
             <Plus className="mr-2 h-4 w-4" />
             {t("providers.addProvider", { defaultValue: "添加供应商" })}
           </Button>
         </div>
       ) : (
-        <div className="space-y-3">
-          {bundles.map((bundle) => (
-            <BundleCard
-              key={bundle.id}
-              bundle={bundle}
-              share={sharesByBundle.get(bundle.id)}
-              onEdit={() => setEditing(bundle)}
-              onDelete={() => setDeleting(bundle)}
-            />
-          ))}
-        </div>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={(event) => void handleDragEnd(event)}
+        >
+          <SortableContext
+            items={bundles.map((bundle) => bundle.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className="space-y-3">
+              {bundles.map((bundle) => (
+                <SortableProviderBundleCard
+                  key={bundle.id}
+                  bundle={bundle}
+                  share={sharesByBundle.get(bundle.id)}
+                  accounts={accountsQuery.data ?? []}
+                  onEdit={() => setEditing({ mode: "edit", bundle })}
+                  onDuplicate={() => setEditing({ mode: "duplicate", bundle })}
+                  onOpenShare={() =>
+                    setEditing({
+                      mode: "edit",
+                      bundle,
+                      initialSection: "share",
+                    })
+                  }
+                  onDelete={() => setDeleting(bundle)}
+                />
+              ))}
+            </div>
+          </SortableContext>
+        </DndContext>
       )}
 
       <ConfirmDialog

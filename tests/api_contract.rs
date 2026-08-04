@@ -50,8 +50,6 @@ use cc_switch_server::domain::usage::store::{
 };
 use cc_switch_server::state::{ServerState, ServerStateInner};
 
-const TEST_INFERENCE_TOKEN: &str = "test-inference-token-0123456789";
-
 #[derive(Debug)]
 struct AcceptCursorApiKeyVerifier;
 
@@ -87,18 +85,73 @@ async fn upsert_test_provider(state: &ServerState, app: AppKind, provider: Provi
         .unwrap();
 }
 
+async fn upsert_shared_test_provider(state: &ServerState, app: AppKind, provider: Provider) {
+    let provider_id = provider.id.clone();
+    upsert_test_provider(state, app, provider).await;
+    configure_share_router_identity(state).await;
+    let stored = state
+        .providers_snapshot()
+        .await
+        .providers
+        .into_iter()
+        .find(|stored| stored.app == app && stored.provider.id == provider_id)
+        .unwrap();
+    let share_id = test_provider_share_id(app, &provider_id);
+    state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input_for_app(
+                    &share_id,
+                    app,
+                    &provider_id,
+                    stored.provider_type,
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+}
+
+fn test_provider_share_id(app: AppKind, provider_id: &str) -> String {
+    format!("test-{}-{provider_id}", app.as_str())
+}
+
+fn provider_share_request(
+    request: Request<Body>,
+    app: AppKind,
+    provider_id: &str,
+    nonce: &str,
+) -> Request<Body> {
+    router_ingress_request(
+        request,
+        Some(&test_provider_share_id(app, provider_id)),
+        nonce,
+    )
+}
+
+fn provider_share_json_request(
+    method: Method,
+    uri: &str,
+    app: AppKind,
+    provider_id: &str,
+    nonce: &str,
+    value: Value,
+) -> Request<Body> {
+    provider_share_request(
+        json_request(method, uri, value, None),
+        app,
+        provider_id,
+        nonce,
+    )
+}
+
 async fn providers_snapshot(
     state: &ServerState,
 ) -> cc_switch_server::domain::providers::store::ProviderStore {
     state.providers_snapshot().await
 }
 
-fn grok_provider_bundle_draft(
-    bundle_id: &str,
-    route_key: &str,
-    account_id: &str,
-    client_request_id: &str,
-) -> Value {
+fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_id: &str) -> Value {
     let surface = |app: &str, profile_id: &str, api_format: &str| {
         json!({
             "app": app,
@@ -125,7 +178,6 @@ fn grok_provider_bundle_draft(
     json!({
         "id": bundle_id,
         "familyId": "family.grok_oauth",
-        "routeKey": route_key,
         "name": "Grok OAuth Bundle",
         "websiteUrl": "https://x.ai",
         "icon": "grok",
@@ -988,264 +1040,135 @@ async fn auth_routes_cover_password_api_token_and_email_paths() {
 }
 
 #[tokio::test]
-async fn direct_inference_routes_require_dedicated_auth_and_reject_browser_origins() {
+async fn inference_routes_only_accept_signed_router_share_ingress() {
     let state = test_state();
+    configure_share_router_identity(&state).await;
     let app = app_router(state);
-    for path in [
-        "/v1/messages",
-        "/claude/v1/messages",
-        "/v1/messages/count_tokens",
-        "/claude/v1/messages/count_tokens",
-    ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        br#"{"model":"claude-sonnet-4","max_tokens":16,"messages":[]}"#.as_slice(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
-    }
-
     for (method, path) in [
+        (Method::POST, "/v1/messages"),
+        (Method::POST, "/claude/v1/messages"),
+        (Method::POST, "/v1/messages/count_tokens"),
+        (Method::POST, "/claude/v1/messages/count_tokens"),
         (Method::GET, "/v1/models"),
+        (Method::GET, "/models"),
+        (Method::GET, "/backend-api/codex/models"),
         (Method::POST, "/v1/chat/completions"),
+        (Method::POST, "/v1/v1/chat/completions"),
+        (Method::POST, "/chat/completions"),
+        (Method::POST, "/codex/v1/chat/completions"),
         (Method::POST, "/v1/responses"),
         (Method::GET, "/v1/responses"),
+        (Method::POST, "/v1/responses/compact"),
+        (Method::GET, "/v1/responses/compact"),
+        (Method::POST, "/v1/v1/responses"),
+        (Method::GET, "/v1/v1/responses"),
+        (Method::POST, "/v1/v1/responses/compact"),
+        (Method::GET, "/v1/v1/responses/compact"),
+        (Method::POST, "/responses"),
+        (Method::GET, "/responses"),
+        (Method::POST, "/responses/compact"),
+        (Method::GET, "/responses/compact"),
+        (Method::POST, "/codex/v1/responses"),
+        (Method::GET, "/codex/v1/responses"),
+        (Method::POST, "/codex/v1/responses/compact"),
+        (Method::POST, "/backend-api/codex/responses"),
+        (Method::POST, "/backend-api/codex/responses/compact"),
+        (Method::POST, "/v1/responses/input_tokens"),
+        (Method::POST, "/responses/input_tokens"),
+        (Method::POST, "/alpha/search"),
+        (Method::POST, "/v1/alpha/search"),
+        (Method::POST, "/backend-api/codex/alpha/search"),
+        (Method::GET, "/v1/images/files/not-a-capability"),
+        (Method::HEAD, "/v1/images/files/not-a-capability"),
         (Method::POST, "/v1/images/generations"),
+        (Method::POST, "/images/generations"),
         (Method::POST, "/v1/images/edits"),
+        (Method::POST, "/images/edits"),
         (Method::POST, "/v1/videos/generations"),
+        (Method::POST, "/videos/generations"),
         (Method::GET, "/v1/videos/request-1"),
+        (Method::GET, "/videos/request-1"),
         (Method::POST, "/v1beta/models/gemini-pro:generateContent"),
+        (Method::POST, "/gemini/v1/models/gemini-pro:generateContent"),
+        (
+            Method::POST,
+            "/gemini/v1beta/models/gemini-pro:generateContent",
+        ),
     ] {
-        let missing = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method.clone())
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED, "{path}");
-
-        let invalid = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method.clone())
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .header("x-api-key", "wrong-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED, "{path}");
-
-        let browser = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .header("x-api-key", TEST_INFERENCE_TOKEN)
-                    .header("origin", "https://malicious.example")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(browser.status(), StatusCode::FORBIDDEN, "{path}");
+        for credential in [None, Some("wrong-token"), Some("admin-token")] {
+            let mut builder = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(credential) = credential {
+                builder = builder.header("x-api-key", credential).header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {credential}"),
+                );
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
     }
 
-    let response = app
+    let client_ingress = app
         .clone()
-        .oneshot(
+        .oneshot(router_ingress_request(
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
-                .header("x-api-key", "wrong-token")
-                .body(Body::empty())
+                .body(Body::from("{}"))
                 .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("origin", "https://malicious.example")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {TEST_INFERENCE_TOKEN}"),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1beta/models/gemini-pro:generateContent")
-                .header("content-type", "application/json")
-                .header("x-goog-api-key", TEST_INFERENCE_TOKEN)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn inference_token_rotation_invalidates_the_previous_token() {
-    let state = test_state();
-    let app = app_router(state);
-    let admin_token = setup_and_login(&app).await;
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/auth/inference-token",
-            Value::Null,
-            Some(&admin_token),
+            None,
+            "router-client-inference",
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let inference_token = json_body(response).await["inferenceToken"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert_eq!(client_ingress.status(), StatusCode::FORBIDDEN);
 
-    let old = app
+    let signed = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::POST,
+            "/v1/messages",
+            &["share-router-only"],
+            "router-only-inference",
+            br#"{"model":"claude-sonnet-4","max_tokens":16,"messages":[]}"#.to_vec(),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(signed.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(signed.status(), StatusCode::FORBIDDEN);
+
+    let removed_token_endpoint = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/api/auth/inference-token")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(removed_token_endpoint.status(), StatusCode::NOT_FOUND);
 
-    let current = app
+    let removed_route_key = app
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
-                .header("x-api-key", inference_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_ne!(current.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn legacy_setup_without_inference_token_is_not_ready_and_fails_closed() {
-    let state = test_state_without_inference_token();
-    let app = app_router(state.clone());
-
-    let ready = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/ready")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(ready.status(), StatusCode::OK);
-
-    let mut config = cc_switch_server::domain::settings::config::ServerConfig::from_setup(
-        cc_switch_server::domain::settings::config::SetupInput {
-            password: "password123".to_string(),
-            owner_email: "owner@example.com".to_string(),
-            router_url: "http://127.0.0.1:9".to_string(),
-            client_tunnel_subdomain: Some("legacyowner".to_string()),
-            options: None,
-        },
-    )
-    .unwrap();
-    config.client.tunnel_status = Some("claim_skipped".to_string());
-    state.replace_config(config).await.unwrap();
-
-    let ready = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/ready")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let ready = json_body(ready).await;
-    assert_eq!(ready["ok"], false);
-    assert!(ready["reasons"].as_array().is_some_and(|reasons| reasons
-        .iter()
-        .any(|reason| reason == "inference_token_not_configured")));
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("content-type", "application/json")
+                .uri("/r/provider/v1/messages")
                 .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(removed_route_key.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1605,6 +1528,7 @@ async fn managed_auth_logout_preflights_all_accounts_before_deleting_any() {
         .unwrap();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
+    configure_share_router_identity(&state).await;
     let created = app
         .clone()
         .oneshot(json_request(
@@ -2368,7 +2292,7 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Codex,
         Provider {
@@ -2388,11 +2312,13 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
     .await;
 
     let response = app
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/codex-proxy-error/v1/responses",
+            "/v1/responses",
+            AppKind::Codex,
+            "codex-proxy-error",
+            "codex-proxy-error",
             json!({"model":"gpt-5.5","input":"ping","stream":false}),
-            None,
         ))
         .await
         .unwrap();
@@ -2451,7 +2377,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Codex,
         Provider {
@@ -2511,11 +2437,10 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
         .unwrap();
 
     let response = app
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/copilot-managed/v1/chat/completions")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2525,7 +2450,10 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
                     .unwrap(),
                 ))
                 .unwrap(),
-        )
+            AppKind::Codex,
+            "copilot-managed",
+            "copilot-managed-chat",
+        ))
         .await
         .unwrap();
 
@@ -2613,7 +2541,7 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         Provider {
@@ -2682,11 +2610,10 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
 
     let response = app
         .clone()
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/kiro-managed/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2698,7 +2625,10 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                     .unwrap(),
                 ))
                 .unwrap(),
-        )
+            AppKind::Claude,
+            "kiro-managed",
+            "kiro-managed-complete",
+        ))
         .await
         .unwrap();
 
@@ -2711,11 +2641,10 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 
     let response = app
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/kiro-managed/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2727,7 +2656,10 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
                     .unwrap(),
                 ))
                 .unwrap(),
-        )
+            AppKind::Claude,
+            "kiro-managed",
+            "kiro-managed-incomplete-tool",
+        ))
         .await
         .unwrap();
     let status = response.status();
@@ -2786,7 +2718,7 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         Provider {
@@ -2854,11 +2786,10 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
         .unwrap();
 
     let response = app
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/kiro-managed-stream/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2870,7 +2801,10 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
                     .unwrap(),
                 ))
                 .unwrap(),
-        )
+            AppKind::Claude,
+            "kiro-managed-stream",
+            "kiro-managed-stream",
+        ))
         .await
         .unwrap();
 
@@ -2912,7 +2846,7 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
 
     let state = test_state();
     let app = app_router(state.clone());
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Codex,
         Provider {
@@ -2933,11 +2867,13 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
     .await;
 
     let response = app
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/codex-proxy-timeout/v1/responses",
+            "/v1/responses",
+            AppKind::Codex,
+            "codex-proxy-timeout",
+            "codex-proxy-timeout",
             json!({"model":"gpt-5.5","input":"ping","stream":false}),
-            None,
         ))
         .await
         .unwrap();
@@ -3043,17 +2979,6 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
         })
         .await
         .unwrap();
-    upsert_test_provider(
-        &state,
-        AppKind::Claude,
-        legacy_claude_oauth_relay_test_provider(
-            "legacy-claude-forward",
-            &format!("http://{upstream_addr}"),
-            "legacy-forward-access-token",
-        ),
-    )
-    .await;
-
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
     let created = app
@@ -3108,27 +3033,30 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
         assert!(network_header_names.iter().any(|name| name == expected));
     }
 
+    upsert_shared_test_provider(
+        &state,
+        AppKind::Claude,
+        legacy_claude_oauth_relay_test_provider(
+            "legacy-claude-forward",
+            &format!("http://{upstream_addr}"),
+            "legacy-forward-access-token",
+        ),
+    )
+    .await;
+
     for provider_id in ["legacy-claude-forward"] {
         for stream in [false, true] {
             let request = Request::builder()
                 .method(Method::POST)
-                .uri(format!("/r/{provider_id}/v1/messages"))
+                .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .header("anthropic-beta", "prompt-caching-2024-07-31")
                 .header("anthropic-beta", "unknown-client-beta")
                 .header("anthropic-dangerous-direct-browser-access", "true")
                 .header("sec-fetch-mode", "cors");
-            let request = if stream {
-                request.header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {TEST_INFERENCE_TOKEN}"),
-                )
-            } else {
-                request.header("x-api-key", TEST_INFERENCE_TOKEN)
-            };
             let response = app
                 .clone()
-                .oneshot(
+                .oneshot(provider_share_request(
                     request
                         .body(Body::from(
                             serde_json::to_vec(&json!({
@@ -3140,7 +3068,14 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
                             .unwrap(),
                         ))
                         .unwrap(),
-                )
+                    AppKind::Claude,
+                    provider_id,
+                    if stream {
+                        "legacy-claude-stream"
+                    } else {
+                        "legacy-claude-json"
+                    },
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -3153,11 +3088,10 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
 
         let response = app
             .clone()
-            .oneshot(
+            .oneshot(provider_share_request(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/r/{provider_id}/v1/messages/count_tokens"))
-                    .header("x-api-key", TEST_INFERENCE_TOKEN)
+                    .uri("/v1/messages/count_tokens")
                     .header("content-type", "application/json")
                     .header("anthropic-beta", "prompt-caching-2024-07-31")
                     .body(Body::from(
@@ -3170,7 +3104,10 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
                         .unwrap(),
                     ))
                     .unwrap(),
-            )
+                AppKind::Claude,
+                provider_id,
+                "legacy-claude-count",
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3237,7 +3174,7 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         legacy_claude_managed_oauth_test_provider(
@@ -3248,11 +3185,10 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
     )
     .await;
     let response = app_router(state)
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/legacy-claude-missing-auth/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -3263,14 +3199,19 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
                     .unwrap(),
                 ))
                 .unwrap(),
-        )
+            AppKind::Claude,
+            "legacy-claude-missing-auth",
+            "legacy-claude-missing-auth",
+        ))
         .await
         .unwrap();
 
-    assert!(response.status().is_client_error());
-    let body = body_text(response).await;
-    assert!(body.contains("explicitly bind"), "{body}");
-    assert!(body.contains("managed claude_oauth account"), "{body}");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    assert_eq!(body["code"], "cc_switch_no_available_provider");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("explicit account binding")));
     assert_eq!(upstream_requests.load(Ordering::SeqCst), 0);
 }
 
@@ -3310,7 +3251,7 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         Provider {
@@ -3333,11 +3274,10 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
     .await;
 
     let response = app_router(state.clone())
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/claude-count-oauth/v1/messages/count_tokens")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/messages/count_tokens")
                 .header("anthropic-beta", "prompt-caching-2024-07-31,unknown-beta")
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -3354,7 +3294,10 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
                     .unwrap(),
                 ))
                 .unwrap(),
-        )
+            AppKind::Claude,
+            "claude-count-oauth",
+            "claude-count-success",
+        ))
         .await
         .unwrap();
 
@@ -3390,17 +3333,19 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
         .all(|log| log.provider_id != "claude-count-oauth"));
 
     let response = app_router(state.clone())
-        .oneshot(
+        .oneshot(provider_share_request(
             Request::builder()
                 .method(Method::POST)
-                .uri("/r/claude-count-oauth/v1/messages/count_tokens")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
+                .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"model":"rate-limit-model","messages":[{"role":"user","content":"count me"}]}"#,
                 ))
                 .unwrap(),
-        )
+            AppKind::Claude,
+            "claude-count-oauth",
+            "claude-count-rate-limit",
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -3484,7 +3429,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         claude_api_key_test_provider(
@@ -3498,16 +3443,18 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
     for model in ["invalid-json", "empty-stream"] {
         let response = app
             .clone()
-            .oneshot(json_request(
+            .oneshot(provider_share_json_request(
                 Method::POST,
-                "/r/anthropic-semantic-guard/v1/messages",
+                "/v1/messages",
+                AppKind::Claude,
+                "anthropic-semantic-guard",
+                model,
                 json!({
                     "model": model,
                     "max_tokens": 16,
                     "messages": [{"role": "user", "content": "ping"}],
                     "stream": model == "empty-stream"
                 }),
-                None,
             ))
             .await
             .unwrap();
@@ -3516,16 +3463,18 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
 
     let response = app
         .clone()
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/anthropic-semantic-guard/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "anthropic-semantic-guard",
+            "anthropic-semantic-error",
             json!({
                 "model": "semantic-error",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -3534,30 +3483,34 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
 
     let response = app
         .clone()
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/anthropic-semantic-guard/v1/messages/count_tokens",
+            "/v1/messages/count_tokens",
+            AppKind::Claude,
+            "anthropic-semantic-guard",
+            "anthropic-invalid-count",
             json!({
                 "model": "invalid-count",
                 "messages": [{"role": "user", "content": "ping"}]
             }),
-            None,
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
     let response = app
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/anthropic-semantic-guard/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "anthropic-semantic-guard",
+            "anthropic-truncated-stream",
             json!({
                 "model": "truncated-stream",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": true
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -3601,23 +3554,25 @@ async fn claude_client_disconnect_cancels_upstream_without_provider_failure() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         claude_api_key_test_provider("claude-client-cancel", &format!("http://{upstream_addr}")),
     )
     .await;
     let response = app_router(state.clone())
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-client-cancel/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-client-cancel",
+            "claude-client-cancel",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": true
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -3696,7 +3651,7 @@ async fn claude_connect_failure_retries_only_the_pinned_provider() {
         ("claude-dead", format!("http://{closed_addr}")),
         ("claude-live", format!("http://{upstream_addr}")),
     ] {
-        upsert_test_provider(
+        upsert_shared_test_provider(
             &state,
             AppKind::Claude,
             Provider {
@@ -3716,16 +3671,18 @@ async fn claude_connect_failure_retries_only_the_pinned_provider() {
         .await;
     }
     let response = app_router(state.clone())
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-dead/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-dead",
+            "claude-connect-failure",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -3776,7 +3733,7 @@ async fn claude_rate_limit_body_read_failure_is_not_replayed() {
         ("claude-broken-429", format!("http://{broken_addr}")),
         ("claude-live-after-429", format!("http://{live_addr}")),
     ] {
-        upsert_test_provider(
+        upsert_shared_test_provider(
             &state,
             AppKind::Claude,
             Provider {
@@ -3796,16 +3753,18 @@ async fn claude_rate_limit_body_read_failure_is_not_replayed() {
         .await;
     }
     let response = app_router(state.clone())
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-broken-429/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-broken-429",
+            "claude-broken-429",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -3873,7 +3832,7 @@ async fn claude_http_429_is_returned_without_same_account_replay() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         claude_api_key_test_provider("claude-limited", &format!("http://{limited_addr}")),
@@ -3886,16 +3845,18 @@ async fn claude_http_429_is_returned_without_same_account_replay() {
     )
     .await;
     let response = app_router(state)
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-limited/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-limited",
+            "claude-http-429",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -3968,7 +3929,7 @@ async fn claude_http_529_is_returned_without_same_account_replay() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         claude_api_key_test_provider("claude-overloaded", &format!("http://{overloaded_addr}")),
@@ -3981,16 +3942,18 @@ async fn claude_http_529_is_returned_without_same_account_replay() {
     )
     .await;
     let response = app_router(state)
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-overloaded/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-overloaded",
+            "claude-http-529",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -4029,7 +3992,7 @@ async fn explicit_claude_provider_never_fails_over() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         claude_api_key_test_provider("claude-explicit-dead", &format!("http://{closed_addr}")),
@@ -4043,23 +4006,19 @@ async fn explicit_claude_provider_never_fails_over() {
     .await;
 
     let response = app_router(state)
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/r/claude-explicit-dead/v1/messages")
-                .header("x-api-key", TEST_INFERENCE_TOKEN)
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "model": "claude-sonnet-4",
-                        "max_tokens": 16,
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "stream": false
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(provider_share_json_request(
+            Method::POST,
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-explicit-dead",
+            "claude-explicit-dead-request",
+            json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false
+            }),
+        ))
         .await
         .unwrap();
 
@@ -4219,7 +4178,7 @@ async fn claude_oauth_body_retry_stays_on_original_provider() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         legacy_claude_oauth_relay_test_provider(
@@ -4239,16 +4198,18 @@ async fn claude_oauth_body_retry_stays_on_original_provider() {
     )
     .await;
     let response = app_router(state)
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-body-retry/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-body-retry",
+            "claude-body-retry",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": false
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -4299,7 +4260,7 @@ async fn claude_split_first_error_event_is_not_replayed() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         Provider {
@@ -4324,16 +4285,18 @@ async fn claude_split_first_error_event_is_not_replayed() {
     )
     .await;
     let response = app_router(state.clone())
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-sse-retry/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-sse-retry",
+            "claude-sse-error",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": true
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -4400,7 +4363,7 @@ async fn claude_stream_failure_after_first_event_does_not_replay_on_next_provide
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         claude_api_key_test_provider("claude-stream-break", &format!("http://{broken_addr}")),
@@ -4416,16 +4379,18 @@ async fn claude_stream_failure_after_first_event_does_not_replay_on_next_provide
     )
     .await;
     let response = app_router(state)
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/claude-stream-break/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "claude-stream-break",
+            "claude-stream-break",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": true
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -4467,7 +4432,7 @@ async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
     });
 
     let state = test_state();
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Claude,
         Provider {
@@ -4487,16 +4452,18 @@ async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
     .await;
 
     let response = app_router(state)
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/native-claude-signature-error/v1/messages",
+            "/v1/messages",
+            AppKind::Claude,
+            "native-claude-signature-error",
+            "native-claude-signature-error",
             json!({
                 "model": "claude-sonnet-4",
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": true
             }),
-            None,
         ))
         .await
         .unwrap();
@@ -4512,7 +4479,7 @@ async fn stream_proxy_marks_upstream_chunk_error() {
     let upstream_addr = spawn_broken_chunked_upstream().await;
     let state = test_state();
     let app = app_router(state.clone());
-    upsert_test_provider(
+    upsert_shared_test_provider(
         &state,
         AppKind::Codex,
         Provider {
@@ -4532,11 +4499,13 @@ async fn stream_proxy_marks_upstream_chunk_error() {
     .await;
 
     let response = app
-        .oneshot(json_request(
+        .oneshot(provider_share_json_request(
             Method::POST,
-            "/r/codex-stream-error/v1/responses",
+            "/v1/responses",
+            AppKind::Codex,
+            "codex-stream-error",
+            "codex-stream-error",
             json!({"model":"gpt-5.5","input":"ping","stream":true}),
-            None,
         ))
         .await
         .unwrap();
@@ -6330,7 +6299,6 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     let token = setup_and_login(&app).await;
     let draft = grok_provider_bundle_draft(
         "bundle-grok",
-        "bundle-grok-route",
         "bundle-grok-account",
         "bundle-grok-create-request",
     );
@@ -6358,14 +6326,14 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         created["surfaces"].as_object().map(|value| value.len()),
         Some(3)
     );
-    for provider_app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+    for provider_app in ["claude", "codex", "gemini"] {
         assert_eq!(
-            state
-                .provider_id_for_route_key(provider_app, "bundle-grok-route")
-                .await
-                .as_deref(),
-            Some("bundle-grok")
+            created["surfaces"][provider_app]["provider"]["id"],
+            "bundle-grok"
         );
+        assert!(created["surfaces"][provider_app]["provider"]["extra"]
+            .get("routeKey")
+            .is_none());
     }
 
     let replay = app
@@ -6543,7 +6511,7 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     );
 
     let mut detached_surface = claude_surface["provider"].clone();
-    for field in ["bundleId", "familyId", "routeKey", "surfaceEnabled"] {
+    for field in ["bundleId", "familyId", "surfaceEnabled"] {
         detached_surface.as_object_mut().unwrap().remove(field);
     }
     for provider in [
@@ -6641,26 +6609,77 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         .iter()
         .all(|provider| provider.resource.revision == 3));
 
-    let route_conflict = grok_provider_bundle_draft(
+    let second_bundle = grok_provider_bundle_draft(
         "bundle-grok-other",
-        "bundle-grok-route",
         "bundle-grok-account",
         "bundle-grok-other-request",
     );
-    let conflict = app
+    let second = app
         .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/provider-bundles",
-            route_conflict,
+            second_bundle,
             Some(&token),
         ))
         .await
         .unwrap();
-    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(second.status(), StatusCode::OK);
     assert_eq!(
-        json_body(conflict).await["code"],
-        "cc_switch_provider_route_key_conflict"
+        providers_snapshot(&state).await.bundle_order,
+        vec!["bundle-grok", "bundle-grok-other"]
+    );
+    let reordered = app
+        .clone()
+        .oneshot(json_request(
+            Method::PUT,
+            "/api/provider-bundles/order",
+            json!({
+                "updates": [
+                    {"id": "bundle-grok-other", "sortIndex": 0},
+                    {"id": "bundle-grok", "sortIndex": 1}
+                ]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reordered.status(), StatusCode::OK);
+    assert_eq!(json_body(reordered).await["changed"], true);
+    let listed = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/provider-bundles",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(listed).await["bundles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bundle| bundle["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["bundle-grok-other", "bundle-grok"]
+    );
+    let removed_second = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/provider-bundles/bundle-grok-other?expectedRevision=1",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(removed_second.status(), StatusCode::OK);
+    assert_eq!(
+        providers_snapshot(&state).await.bundle_order,
+        vec!["bundle-grok"]
     );
 
     let mut share_input =
@@ -6733,7 +6752,6 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
     let draft = json!({
         "id": "bundle-custom-claude-only",
         "familyId": "family.custom_http",
-        "routeKey": "bundle-custom-claude-only-route",
         "name": "Claude-only Custom HTTP",
         "surfaces": [
             {
@@ -6832,10 +6850,7 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
         status["active_targets"][0]["provider_id"],
         "bundle-custom-claude-only"
     );
-    assert_eq!(
-        status["active_targets"][0]["route_key"],
-        "bundle-custom-claude-only-route"
-    );
+    assert!(status["active_targets"][0].get("route_key").is_none());
 
     let routing = app
         .oneshot(json_request(
@@ -6872,7 +6887,6 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     let token = setup_and_login(&app).await;
     let draft = grok_provider_bundle_draft(
         "bundle-share-grok",
-        "bundle-share-grok-route",
         "bundle-share-grok-account",
         "bundle-share-grok-create-request",
     );
@@ -6943,26 +6957,48 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
         .unwrap();
     assert_eq!(bundle_update.status(), StatusCode::OK);
 
+    let reconcile_payload = json!({
+        "params": {
+            "bundleId": "bundle-share-grok",
+            "shareId": share_id,
+            "expectedConfigRevision": 1,
+            "enabled": false,
+            "subdomain": "bundle-share-grok-url",
+            "description": "Saved while paused",
+            "forSale": "Free",
+            "tokenLimit": 250,
+            "parallelLimit": 3,
+            "expiresAt": "2036-01-01T00:00:00Z",
+            "sharedWithEmails": ["friend@example.com", "FRIEND@example.com"]
+        }
+    });
+    let in_flight = state
+        .share_in_flight
+        .try_acquire(&share_id, None)
+        .expect("test request should acquire the Share slot");
+    let blocked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_bundle_share",
+            reconcile_payload.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(blocked).await["code"],
+        "cc_switch_share_in_flight"
+    );
+    drop(in_flight);
+
     let reconciled = app
         .clone()
         .oneshot(json_request(
             Method::POST,
             "/web-api/invoke/save_provider_bundle_share",
-            json!({
-                "params": {
-                    "bundleId": "bundle-share-grok",
-                    "shareId": share_id,
-                    "expectedConfigRevision": 1,
-                    "enabled": false,
-                    "subdomain": "bundle-share-grok-url",
-                    "description": "Saved while paused",
-                    "forSale": "Free",
-                    "tokenLimit": 250,
-                    "parallelLimit": 3,
-                    "expiresAt": "2036-01-01T00:00:00Z",
-                    "sharedWithEmails": ["friend@example.com", "FRIEND@example.com"]
-                }
-            }),
+            reconcile_payload,
             Some(&token),
         ))
         .await
@@ -8110,26 +8146,56 @@ async fn codex_banked_reset_and_manual_refresh_reject_non_active_accounts_withou
 
 #[tokio::test]
 async fn models_routes_dispatch_codex_manifest_only_for_codex_client_requests() {
-    let app = app_router(test_state());
+    let state = test_state();
+    upsert_shared_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "models-dispatch-codex".to_string(),
+            name: "Models Dispatch Codex".to_string(),
+            settings_config: json!({
+                "env": {"OPENAI_API_KEY": "sk-test"},
+                "models": ["gpt-5.5"]
+            }),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+    )
+    .await;
+    let app = app_router(state);
 
-    for path in ["/v1/models", "/models"] {
+    for (index, path) in ["/v1/models", "/models"].into_iter().enumerate() {
         let response = app
             .clone()
-            .oneshot(json_request(Method::GET, path, Value::Null, None))
+            .oneshot(provider_share_request(
+                json_request(Method::GET, path, Value::Null, None),
+                AppKind::Codex,
+                "models-dispatch-codex",
+                &format!("models-list-{index}"),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert_eq!(json_body(response).await["object"], "list", "{path}");
     }
 
-    for path in [
+    for (index, path) in [
         "/v1/models?client_version=0.144.1",
         "/models?client_version=0.144.1",
         "/backend-api/codex/models?client_version=0.144.1",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let response = app
             .clone()
-            .oneshot(json_request(Method::GET, path, Value::Null, None))
+            .oneshot(provider_share_request(
+                json_request(Method::GET, path, Value::Null, None),
+                AppKind::Codex,
+                "models-dispatch-codex",
+                &format!("models-manifest-{index}"),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
@@ -8597,8 +8663,7 @@ fn test_state_with_cursor_api_key_verifier() -> ServerState {
         .as_nanos();
     let config_dir =
         std::env::temp_dir().join(format!("cc-switch-server-http-cursor-test-{nanos}"));
-    let mut config = cc_switch_server::domain::settings::config::ServerConfig::empty();
-    config.set_inference_token(TEST_INFERENCE_TOKEN).unwrap();
+    let config = cc_switch_server::domain::settings::config::ServerConfig::empty();
     config.save(&config_dir).unwrap();
     let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
         cc_switch_server::logging::RING_BUFFER_CAPACITY,
@@ -8624,8 +8689,7 @@ fn test_state_with_host(host: IpAddr) -> ServerState {
         .unwrap()
         .as_nanos();
     let config_dir = std::env::temp_dir().join(format!("cc-switch-server-http-test-{nanos}"));
-    let mut config = cc_switch_server::domain::settings::config::ServerConfig::empty();
-    config.set_inference_token(TEST_INFERENCE_TOKEN).unwrap();
+    let config = cc_switch_server::domain::settings::config::ServerConfig::empty();
     config.save(&config_dir).unwrap();
     let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
         cc_switch_server::logging::RING_BUFFER_CAPACITY,
@@ -8633,30 +8697,6 @@ fn test_state_with_host(host: IpAddr) -> ServerState {
     ServerStateInner::load(
         Cli {
             host,
-            port: 0,
-            config_dir: Some(config_dir),
-            web_dist_dir: None,
-            log_level: "warn".to_string(),
-            command: None,
-        },
-        log_capture,
-    )
-    .unwrap()
-}
-
-fn test_state_without_inference_token() -> ServerState {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let config_dir =
-        std::env::temp_dir().join(format!("cc-switch-server-http-no-inference-test-{nanos}"));
-    let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
-        cc_switch_server::logging::RING_BUFFER_CAPACITY,
-    ));
-    ServerStateInner::load(
-        Cli {
-            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             config_dir: Some(config_dir),
             web_dist_dir: None,
@@ -10485,6 +10525,11 @@ async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
     assert_eq!(connect_info.status(), StatusCode::OK);
     let connect_info = json_body(connect_info).await;
     assert_eq!(
+        connect_info["tunnelUrl"],
+        "https://sharereusemulti--client-alpha.router.test"
+    );
+    assert!(connect_info.get("directUrl").is_none());
+    assert_eq!(
         connect_info["snippets"]
             .as_array()
             .unwrap()
@@ -11179,56 +11224,10 @@ fn json_request(
         .method(method)
         .uri(uri)
         .header(axum::http::header::CONTENT_TYPE, "application/json");
-    if is_direct_inference_test_uri(uri) {
-        builder = builder.header("x-api-key", TEST_INFERENCE_TOKEN);
-    }
     if let Some(token) = bearer {
         builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
     }
     builder.body(body).unwrap()
-}
-
-fn is_direct_inference_test_uri(uri: &str) -> bool {
-    let path = uri.split('?').next().unwrap_or(uri);
-    matches!(
-        path,
-        "/v1/models"
-            | "/models"
-            | "/backend-api/codex/models"
-            | "/v1/messages"
-            | "/claude/v1/messages"
-            | "/v1/messages/count_tokens"
-            | "/claude/v1/messages/count_tokens"
-            | "/v1/chat/completions"
-            | "/v1/v1/chat/completions"
-            | "/chat/completions"
-            | "/codex/v1/chat/completions"
-            | "/v1/responses"
-            | "/v1/responses/compact"
-            | "/v1/v1/responses"
-            | "/v1/v1/responses/compact"
-            | "/responses"
-            | "/responses/compact"
-            | "/codex/v1/responses"
-            | "/codex/v1/responses/compact"
-            | "/backend-api/codex/responses"
-            | "/backend-api/codex/responses/compact"
-            | "/v1/responses/input_tokens"
-            | "/responses/input_tokens"
-            | "/alpha/search"
-            | "/v1/alpha/search"
-            | "/backend-api/codex/alpha/search"
-            | "/v1/images/generations"
-            | "/images/generations"
-            | "/v1/images/edits"
-            | "/images/edits"
-            | "/v1/videos/generations"
-            | "/videos/generations"
-    ) || path.starts_with("/v1/videos/")
-        || path.starts_with("/videos/")
-        || path.starts_with("/v1beta/")
-        || path.starts_with("/gemini/v1/")
-        || path.starts_with("/gemini/v1beta/")
 }
 
 fn control_request(
@@ -11261,6 +11260,46 @@ async fn configure_share_router_identity(state: &ServerState) {
     });
     config.client.tunnel_subdomain = Some("client-alpha".to_string());
     state.replace_config(config).await.unwrap();
+}
+
+fn router_ingress_request(
+    mut request: Request<Body>,
+    share_id: Option<&str>,
+    nonce: &str,
+) -> Request<Body> {
+    let timestamp_ms = now_ms() as i64;
+    let context = cc_switch_server::clients::router::ingress::IngressContext {
+        protocol_epoch: cc_switch_server::clients::router::ingress::PROTOCOL_EPOCH.to_string(),
+        router_id: "router.test".to_string(),
+        route_id: share_id
+            .map(|share_id| format!("share:{share_id}"))
+            .unwrap_or_else(|| "client:inst-share-router".to_string()),
+        installation_id: "inst-share-router".to_string(),
+        target_lane_id: "inst-share-router".to_string(),
+        public_host: "test--client-alpha.router.test".to_string(),
+        share_id: share_id.map(str::to_string),
+        request_id: format!("request-{nonce}"),
+        user_email: Some("owner@example.com".to_string()),
+        user_role: share_id.is_none().then(|| "owner".to_string()),
+        user_country: Some("JP".to_string()),
+        issued_at_ms: timestamp_ms,
+    };
+    let encoded_context = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).unwrap());
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"share-router-control-secret").unwrap();
+    mac.update(b"cc-switch-router-ingress-v1\n");
+    mac.update(cc_switch_server::clients::router::ingress::PROTOCOL_EPOCH.as_bytes());
+    mac.update(b"\n");
+    mac.update(encoded_context.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    request.headers_mut().insert(
+        cc_switch_server::clients::router::ingress::INGRESS_CONTEXT_HEADER,
+        encoded_context.parse().unwrap(),
+    );
+    request.headers_mut().insert(
+        cc_switch_server::clients::router::ingress::INGRESS_SIGNATURE_HEADER,
+        signature.parse().unwrap(),
+    );
+    request
 }
 
 fn client_router_ingress_request(mut request: Request<Body>, request_id: &str) -> Request<Body> {
@@ -11361,11 +11400,16 @@ fn share_router_request(
     builder.body(Body::from(body)).unwrap()
 }
 
-fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) -> UpsertShareInput {
+fn test_share_input_for_app(
+    id: &str,
+    app: AppKind,
+    provider_id: &str,
+    provider_type: ProviderType,
+) -> UpsertShareInput {
     UpsertShareInput {
         id: Some(id.to_string()),
         owner_email: Some("owner@example.com".to_string()),
-        app: AppKind::Codex,
+        app,
         provider_id: provider_id.to_string(),
         provider_type,
         display_name: Some(id.to_string()),
@@ -11391,6 +11435,10 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
         runtime_snapshot: None,
         user_grants: BTreeMap::new(),
     }
+}
+
+fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) -> UpsertShareInput {
+    test_share_input_for_app(id, AppKind::Codex, provider_id, provider_type)
 }
 
 fn event_stream_bytes(events: Vec<(&str, Value)>) -> Vec<u8> {

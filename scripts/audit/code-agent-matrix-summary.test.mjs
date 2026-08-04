@@ -33,32 +33,30 @@ function writeJson(directory, name, value) {
   return file;
 }
 
-test("local matrix cases require the inference token used by their probes", () => {
+test("share matrix cases require the Router Share URL", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cc-switch-matrix-"));
   const matrixPath = writeJson(directory, "matrix.json", {
     schemaVersion: 2,
     requiredFixtureFields: ["non_stream", "stream"],
     cases: [
       {
-        id: "claude-local",
+        id: "claude-share",
         app: "claude",
-        source: "local",
+        source: "router_share",
         entryPath: "/v1/messages",
-        shareEnv: "CLAUDE_SHARE_ID",
-        requiresServerToken: true,
-        requiresInferenceToken: true,
+        urlEnv: "CC_SWITCH_SHARE_URL",
+        requiresRouterToken: true,
       },
     ],
   });
 
   const summary = runSummary(matrixPath, "", {
-    CC_SWITCH_SERVER_TOKEN: "server-token",
-    CC_SWITCH_INFERENCE_TOKEN: undefined,
-    CLAUDE_SHARE_ID: "share-id",
+    ROUTER_API_TOKEN: "router-token",
+    CC_SWITCH_SHARE_URL: undefined,
   });
 
   assert.equal(summary.runnable, 0);
-  assert.deepEqual(summary.cases[0].missing, ["CC_SWITCH_INFERENCE_TOKEN"]);
+  assert.deepEqual(summary.cases[0].missing, ["CC_SWITCH_SHARE_URL"]);
   assert.equal(summary.matrixInputComplete, false);
   assert.equal(summary.cases[0].blockerGroup, "missing-matrix-input");
   assert.equal(summary.cases[0].liveBlockerGroup, "missing-matrix-input");
@@ -75,7 +73,7 @@ test("live fixture evidence is complete only when every required field passed", 
         app: "codex",
         source: "direct",
         entryPath: "/v1/responses",
-        urlEnv: "DIRECT_SHARE_URL",
+        urlEnv: "CC_SWITCH_SHARE_URL",
         requiresRouterToken: true,
       },
     ],
@@ -91,7 +89,7 @@ test("live fixture evidence is complete only when every required field passed", 
   });
   const environment = {
     ROUTER_API_TOKEN: "router-token",
-    DIRECT_SHARE_URL: "https://direct.example",
+    CC_SWITCH_SHARE_URL: "https://share.example",
   };
 
   const incomplete = runSummary(matrixPath, incompleteEvidence, environment);

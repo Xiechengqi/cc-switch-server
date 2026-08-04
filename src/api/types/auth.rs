@@ -76,13 +76,6 @@ pub(in crate::api) struct ApiTokenResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct InferenceTokenResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) inference_token: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct AuthMeResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) owner_email: Option<String>,

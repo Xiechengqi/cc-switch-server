@@ -17,7 +17,6 @@ use super::store::StoredProvider;
 
 const BUNDLE_ID_FIELD: &str = "bundleId";
 const FAMILY_ID_FIELD: &str = "familyId";
-const ROUTE_KEY_FIELD: &str = "routeKey";
 const SURFACE_ENABLED_FIELD: &str = "surfaceEnabled";
 
 #[derive(Debug, Clone, Serialize)]
@@ -25,7 +24,6 @@ const SURFACE_ENABLED_FIELD: &str = "surfaceEnabled";
 pub struct ProviderBundleView {
     pub id: String,
     pub family_id: String,
-    pub route_key: String,
     pub revision: u64,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,7 +55,6 @@ pub struct ProviderBundleReferencePreview {
 pub struct ProviderBundleWriteDraft {
     pub id: String,
     pub family_id: String,
-    pub route_key: String,
     pub name: String,
     #[serde(default)]
     pub website_url: Option<String>,
@@ -97,7 +94,6 @@ pub struct ProviderBundleSurfaceWriteDraft {
 impl ProviderBundleWriteDraft {
     pub fn validate(&self) -> anyhow::Result<&'static ProviderFamilySpec> {
         validate_bundle_id(&self.id)?;
-        validate_route_key(&self.route_key)?;
         if self.name.trim().is_empty() || self.name != self.name.trim() {
             bail!("Provider Bundle name must be non-empty and trimmed");
         }
@@ -176,10 +172,6 @@ impl ProviderBundleWriteDraft {
             Value::String(self.family_id.clone()),
         );
         extra.insert(
-            ROUTE_KEY_FIELD.to_string(),
-            Value::String(self.route_key.clone()),
-        );
-        extra.insert(
             SURFACE_ENABLED_FIELD.to_string(),
             Value::Bool(surface.enabled),
         );
@@ -201,7 +193,6 @@ impl ProviderBundleView {
             .context("Provider Bundle has no Surfaces")?;
         let id = bundle_id(&first.provider).to_string();
         let family_id = family_id_for_view(first)?;
-        let bundle_route_key = route_key(&first.provider).to_string();
         let name = first.provider.name.clone();
         let mut revision = 0u64;
         let mut surfaces = BTreeMap::new();
@@ -211,7 +202,6 @@ impl ProviderBundleView {
         for view in surface_views {
             if bundle_id(&view.provider) != id
                 || family_id_for_view(&view)? != family_id
-                || route_key(&view.provider) != bundle_route_key
                 || view.provider.name != name
             {
                 bail!("Provider Bundle Surface metadata is inconsistent");
@@ -272,7 +262,6 @@ impl ProviderBundleView {
         Ok(Self {
             id,
             family_id,
-            route_key: bundle_route_key,
             revision,
             name,
             website_url: extra_string(provider, "websiteUrl"),
@@ -293,25 +282,15 @@ pub fn bundle_id(provider: &Provider) -> &str {
 }
 
 pub fn has_bundle_managed_metadata(provider: &Provider) -> bool {
-    [
-        BUNDLE_ID_FIELD,
-        FAMILY_ID_FIELD,
-        ROUTE_KEY_FIELD,
-        SURFACE_ENABLED_FIELD,
-    ]
-    .iter()
-    .any(|field| provider.extra.contains_key(*field))
+    [BUNDLE_ID_FIELD, FAMILY_ID_FIELD, SURFACE_ENABLED_FIELD]
+        .iter()
+        .any(|field| provider.extra.contains_key(*field))
 }
 
 pub fn is_explicit_bundle_surface(provider: &Provider) -> bool {
     extra_string_ref(provider, BUNDLE_ID_FIELD).is_some()
         && extra_string_ref(provider, FAMILY_ID_FIELD).is_some()
-        && extra_string_ref(provider, ROUTE_KEY_FIELD).is_some()
         && provider.extra.contains_key(SURFACE_ENABLED_FIELD)
-}
-
-pub fn route_key(provider: &Provider) -> &str {
-    extra_string_ref(provider, ROUTE_KEY_FIELD).unwrap_or(&provider.id)
 }
 
 pub fn surface_enabled(provider: &Provider) -> bool {
@@ -378,19 +357,6 @@ pub fn family_id_for_view(view: &ProviderView) -> anyhow::Result<String> {
         .with_context(|| format!("profile {profile_id} has no Provider family"))
 }
 
-pub fn validate_route_key(value: &str) -> anyhow::Result<()> {
-    let valid = (3..=64).contains(&value.len())
-        && value == value.trim()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-        })
-        && value.bytes().any(|byte| byte.is_ascii_lowercase());
-    if !valid {
-        bail!("routeKey must be 3-64 lowercase letters, digits, hyphens, or underscores");
-    }
-    Ok(())
-}
-
 fn validate_bundle_id(value: &str) -> anyhow::Result<()> {
     if value.trim().is_empty() || value != value.trim() || value.len() > 128 {
         bail!("Provider Bundle id must be non-empty, trimmed, and at most 128 characters");
@@ -449,7 +415,6 @@ mod tests {
         ProviderBundleWriteDraft {
             id: "grok-bundle".to_string(),
             family_id: "family.grok_oauth".to_string(),
-            route_key: "grok-bundle".to_string(),
             name: "Grok Bundle".to_string(),
             website_url: None,
             notes: None,

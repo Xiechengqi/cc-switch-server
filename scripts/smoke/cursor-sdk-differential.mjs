@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-const serverBase = requiredEnv("CURSOR_SERVER_URL");
+const shareBase = requiredEnv("CC_SWITCH_SHARE_URL");
 const oracleBase = requiredEnv("CURSOR_SDK_ORACLE_URL");
-const serverToken = requiredEnv("CURSOR_SERVER_TOKEN");
+const routerToken = requiredEnv("ROUTER_API_TOKEN");
+const routerTokenHeader = process.env.ROUTER_API_TOKEN_HEADER || "Authorization";
 const oracleToken = requiredEnv("CURSOR_SDK_ORACLE_TOKEN");
 const model = process.env.CURSOR_TEST_MODEL || "composer-2.5";
 const timeoutMs = numberEnv("CURSOR_DIFFERENTIAL_TIMEOUT_MS", 120_000);
@@ -52,8 +53,8 @@ const fixtures = [
 const results = [];
 for (const fixture of fixtures) {
   const [server, oracle] = await Promise.all([
-    invoke(serverBase, serverToken, fixture.body),
-    invoke(oracleBase, oracleToken, fixture.body),
+    invoke(shareBase, routerAuthHeaders(routerTokenHeader, routerToken), fixture.body),
+    invoke(oracleBase, { authorization: `Bearer ${oracleToken}` }, fixture.body),
   ]);
   const comparison = compareSemantics(server, oracle, fixture.id);
   results.push({ id: fixture.id, server, oracle, comparison });
@@ -63,14 +64,14 @@ const ok = results.every((result) => result.comparison.ok);
 process.stdout.write(`${JSON.stringify({ ok, model, results }, null, 2)}\n`);
 process.exit(ok ? 0 : 1);
 
-async function invoke(base, token, body) {
+async function invoke(base, authHeaders, body) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${base.replace(/\/$/, "")}/v1/chat/completions`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${token}`,
+        ...authHeaders,
         "content-type": "application/json",
         accept: body.stream ? "text/event-stream" : "application/json",
       },
@@ -92,6 +93,16 @@ async function invoke(base, token, body) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function routerAuthHeaders(header, token) {
+  if (/^authorization$/i.test(header)) {
+    return { authorization: `Bearer ${token}` };
+  }
+  if (/^(x-api-key|x-goog-api-key)$/i.test(header)) {
+    return { [header]: token };
+  }
+  throw new Error(`unsupported ROUTER_API_TOKEN_HEADER: ${header}`);
 }
 
 function summarize(status, text, streaming) {

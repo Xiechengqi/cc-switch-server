@@ -1,7 +1,5 @@
-import { Activity, Clock, Copy, Power, Server, TrendingUp } from "lucide-react";
+import { Activity, Clock, Power, Server, TrendingUp } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
-import { Button } from "@/components/ui/button";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useProxyTakeoverStatus } from "@/lib/query/proxy";
 
@@ -9,10 +7,6 @@ export function ProxyPanel() {
   const { t } = useTranslation();
   const { status, isRunning } = useProxyStatus();
   const { data: routingStatus } = useProxyTakeoverStatus();
-
-  const serviceAddress = status
-    ? formatAddressForUrl(status.address, status.port)
-    : null;
 
   return (
     <section className="space-y-4">
@@ -68,35 +62,7 @@ export function ProxyPanel() {
 
       {isRunning && status ? (
         <>
-          <div className="space-y-4 rounded-lg border border-border bg-muted/40 p-4">
-            <div>
-              <p className="mb-2 text-xs text-muted-foreground">
-                {t("proxy.panel.serviceAddress", { defaultValue: "服务地址" })}
-              </p>
-              <div className="flex items-center gap-2">
-                <code className="min-w-0 flex-1 truncate rounded border border-border/60 bg-background px-3 py-2 text-sm">
-                  {serviceAddress}
-                </code>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="outline"
-                  title={t("common.copy")}
-                  aria-label={t("common.copy")}
-                  onClick={() => {
-                    if (!serviceAddress) return;
-                    void navigator.clipboard.writeText(serviceAddress);
-                    toast.success(t("common.copied", { defaultValue: "已复制" }), {
-                      closeButton: true,
-                    });
-                  }}
-                >
-                  <Copy className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-
-            <div className="space-y-2 border-t border-border pt-3">
+          <div className="space-y-2 rounded-lg border border-border bg-muted/40 p-4">
               <p className="text-xs text-muted-foreground">
                 {t("proxy.panel.routableSurfaces", {
                   defaultValue: "可路由 Surface",
@@ -128,7 +94,6 @@ export function ProxyPanel() {
                   })}
                 </p>
               )}
-            </div>
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -170,11 +135,6 @@ export function ProxyPanel() {
       )}
     </section>
   );
-}
-
-function formatAddressForUrl(address: string, port: number): string {
-  const host = address.includes(":") ? `[${address}]` : address;
-  return `http://${host}:${port}`;
 }
 
 function formatUptime(seconds: number): string {
