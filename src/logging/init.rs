@@ -94,6 +94,7 @@ pub fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
                     capture: capture.clone(),
                 }),
         )
+        .with(crate::logging::remote_log_layer())
         .init();
 }
 

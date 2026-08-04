@@ -1,10 +1,14 @@
 mod capture;
 mod init;
+mod remote;
 
 pub use capture::{
     LogCapture, LogTailAccessError, LogTailResponse, LogTailSource, SharedLogCapture,
 };
 pub use init::{init_tracing, reload_log_level};
+pub use remote::{
+    apply_remote_log_config, remote_log_layer, spawn_remote_log_upload, RemoteLogLayer,
+};
 
 use std::path::{Path, PathBuf};
 

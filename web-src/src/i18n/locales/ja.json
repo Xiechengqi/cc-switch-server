@@ -533,6 +533,8 @@
         "enabledDescription": "マスタースイッチ、オフにするとすべてのログが無効になります",
         "level": "ログレベル",
         "levelDescription": "出力する最小ログレベルを設定",
+        "collectionEnabled": "ログ収集",
+        "collectionEnabledDescription": "機密情報をマスクした INFO、WARN、ERROR ログを現在の Router に送信します。info レベルでのみ有効化できます。",
         "levels": {
           "error": "エラー",
           "warn": "警告",

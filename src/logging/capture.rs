@@ -130,6 +130,7 @@ mod tests {
             &ParsedLogConfig {
                 enabled: true,
                 level: "info".into(),
+                collection_enabled: true,
                 api_enabled: true,
                 api_tail_lines: 100,
             },

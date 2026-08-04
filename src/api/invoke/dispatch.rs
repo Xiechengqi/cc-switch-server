@@ -204,6 +204,7 @@ async fn web_invoke_dispatch(
         }
         "set_log_config" => {
             let config: Value = web_arg_value(&args, "config")?;
+            ui_settings::validate_log_config(&config).map_err(ApiError::bad_request)?;
             state
                 .apply_ui_settings_patch_immediate(json!({ "logConfig": config }))
                 .await
@@ -236,10 +237,14 @@ async fn web_invoke_dispatch(
         "save_settings" => {
             let patch =
                 ui_settings::settings_patch_from_args(&args).map_err(ApiError::bad_request)?;
+            let updates_log_config = patch.get("logConfig").is_some();
             state
                 .apply_ui_settings_patch_immediate(patch)
                 .await
                 .map_err(ApiError::internal)?;
+            if updates_log_config {
+                state.sync_log_config_from_ui_settings().await;
+            }
             Ok(json!(true))
         }
         "is_portable_mode" => Ok(json!(false)),

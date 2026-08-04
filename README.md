@@ -272,6 +272,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | 配置目录 | `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR`，默认 `~/.cc-switch-server` |
 | 静态 Web | 默认使用构建时内嵌到 binary 的 Web UI；`--web-dist-dir` / `CC_SWITCH_SERVER_WEB_DIST_DIR` 仅用于开发或调试时覆盖静态目录 |
 | 日志级别 | `--log-level` / `CC_SWITCH_SERVER_LOG`，默认 `info` |
+| 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时可上传脱敏后的 `INFO/WARN/ERROR`，`DEBUG/TRACE` 永不上传 |
 | Router 心跳 | `CC_SWITCH_SERVER_ROUTER_HEARTBEAT_INTERVAL_SECS`，默认 `60` 秒，实际发送间隔带 ±10% jitter（允许范围 `15`-`60` 秒） |
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
 | Managed OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
@@ -294,6 +295,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
 - `shares.json` / `tunnels.json`：Share、binding、ACL、Router 管理的 Share Market entitlement 和 tunnel runtime。
 - `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
+- `remote-log-spool/events.jsonl`：等待上传到当前 Router 的进程日志，最多 16 MiB、最长保留 6 小时；Router 未配置或暂时不可达时保留并退避重试。
 - `image-capabilities/`：默认的短期图片 capability payload/metadata；URL 默认跨重启有效 1 小时，内容仍属于敏感生成结果。
 - `email-auth.json` 及运行时生成的日志/备份目录。
 

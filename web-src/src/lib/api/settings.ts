@@ -367,6 +367,7 @@ export interface OptimizerConfig {
 export interface LogConfig {
   enabled: boolean;
   level: "error" | "warn" | "info" | "debug" | "trace";
+  collectionEnabled: boolean;
 }
 
 export interface ApiManagementConfig {

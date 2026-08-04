@@ -11,6 +11,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
+use crate::domain::router::{
+    InstallationLogBatchPayload, InstallationLogBatchResponse, INSTALLATION_LOG_BATCH_ACTION,
+};
 use crate::domain::settings::config::{RouterIdentity, ServerConfig, UpgradePolicyConfig};
 use crate::domain::sharing::router_contract::*;
 use crate::self_update::version::LatestReleaseMeta;
@@ -19,6 +22,7 @@ const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const ROUTER_TUNNEL_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_INSTALLATION_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_SETUP_COMPLETED_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
@@ -105,6 +109,54 @@ pub enum InstallationHeartbeatError {
         status: reqwest::StatusCode,
         body: String,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InstallationLogUploadError {
+    #[error("router installation log request failed: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("router installation log upload timed out")]
+    Timeout,
+    #[error("router installation log endpoint is unavailable: {status}: {body}")]
+    EndpointUnavailable {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("router installation log upload requires registration: {status}: {body}")]
+    RegistrationRequired {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("router installation log sequence gap; expected {expected_sequence}")]
+    SequenceGap { expected_sequence: u64 },
+    #[error("router installation log upload transient failure: {status}: {body}")]
+    Transient {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("router installation log upload rejected: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("parse router installation log response: {0}")]
+    InvalidResponse(String),
+    #[error("router installation log upload is not configured")]
+    NotConfigured,
+}
+
+impl InstallationLogUploadError {
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Request(_)
+                | Self::Timeout
+                | Self::EndpointUnavailable { .. }
+                | Self::RegistrationRequired { .. }
+                | Self::Transient { .. }
+                | Self::NotConfigured
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -857,6 +909,74 @@ pub async fn send_installation_heartbeat(
         .await
         .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
     Err(classify_installation_heartbeat_failure(status, &body))
+}
+
+pub async fn send_installation_log_batch(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    payload: InstallationLogBatchPayload,
+) -> Result<InstallationLogBatchResponse, InstallationLogUploadError> {
+    let api_base = config
+        .router_api_base()
+        .ok_or(InstallationLogUploadError::NotConfigured)?
+        .trim_end_matches('/');
+    let identity = config
+        .registered_router_identity()
+        .ok_or(InstallationLogUploadError::NotConfigured)?;
+    let request = signed_request(identity, INSTALLATION_LOG_BATCH_ACTION, payload)
+        .map_err(|error| InstallationLogUploadError::InvalidResponse(error.to_string()))?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/logs/batch"))
+        .json(&request)
+        .timeout(ROUTER_INSTALLATION_LOG_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                InstallationLogUploadError::Timeout
+            } else {
+                InstallationLogUploadError::Request(error)
+            }
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<InstallationLogBatchResponse>()
+            .await
+            .map_err(|error| InstallationLogUploadError::InvalidResponse(error.to_string()));
+    }
+    let body = read_bounded_router_error_body(response)
+        .await
+        .map_err(InstallationLogUploadError::Request)?;
+    if status == reqwest::StatusCode::CONFLICT {
+        let expected_sequence = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("details")
+                    .and_then(|details| details.get("expectedSequence"))
+                    .and_then(serde_json::Value::as_u64)
+            });
+        if let Some(expected_sequence) = expected_sequence {
+            return Err(InstallationLogUploadError::SequenceGap { expected_sequence });
+        }
+    }
+    let error = match status {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            InstallationLogUploadError::RegistrationRequired { status, body }
+        }
+        reqwest::StatusCode::NOT_FOUND => {
+            InstallationLogUploadError::EndpointUnavailable { status, body }
+        }
+        reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            InstallationLogUploadError::Transient { status, body }
+        }
+        status if status.is_server_error() => {
+            InstallationLogUploadError::Transient { status, body }
+        }
+        _ => InstallationLogUploadError::Rejected { status, body },
+    };
+    Err(error)
 }
 
 pub async fn send_installation_setup_completed(
@@ -4107,5 +4227,33 @@ mod tests {
         verifying_key
             .verify(canonical.as_bytes(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn installation_log_not_configured_error_is_retryable() {
+        assert!(InstallationLogUploadError::NotConfigured.is_transient());
+    }
+
+    #[test]
+    fn installation_log_request_keeps_signed_payload_flattened() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-logs".into();
+        let request = signed_request(
+            &identity,
+            INSTALLATION_LOG_BATCH_ACTION,
+            InstallationLogBatchPayload {
+                protocol_version: 1,
+                stream_id: "stream-1".into(),
+                server_version: "0.1.0".into(),
+                commit_id: "abc".into(),
+                events: Vec::new(),
+            },
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["installationId"], "inst-logs");
+        assert_eq!(value["protocolVersion"], 1);
+        assert_eq!(value["streamId"], "stream-1");
+        assert!(value.get("payload").is_none());
     }
 }

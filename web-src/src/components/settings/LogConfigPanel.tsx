@@ -14,9 +14,13 @@ import { settingsApi, type LogConfig } from "@/lib/api/settings";
 
 const LOG_LEVELS = ["error", "warn", "info", "debug", "trace"] as const;
 function normalizeLogConfig(config: LogConfig): LogConfig {
+  const enabled = config.enabled;
+  const level = config.level;
   return {
-    enabled: config.enabled,
-    level: config.level,
+    enabled,
+    level,
+    collectionEnabled:
+      (config.collectionEnabled ?? true) && enabled && level === "info",
   };
 }
 
@@ -25,6 +29,7 @@ export function LogConfigPanel() {
   const [config, setConfig] = useState<LogConfig>({
     enabled: true,
     level: "info",
+    collectionEnabled: true,
   });
   const [isLoading, setIsLoading] = useState(true);
 
@@ -77,7 +82,10 @@ export function LogConfigPanel() {
           value={config.level}
           disabled={!config.enabled}
           onValueChange={(value) =>
-            handleChange({ level: value as LogConfig["level"] })
+            handleChange({
+              level: value as LogConfig["level"],
+              ...(value === "info" ? {} : { collectionEnabled: false }),
+            })
           }
         >
           <SelectTrigger className="w-[120px]">
@@ -91,6 +99,22 @@ export function LogConfigPanel() {
             ))}
           </SelectContent>
         </Select>
+      </div>
+
+      <div className="flex items-center justify-between gap-4">
+        <div className="space-y-0.5">
+          <Label>{t("settings.advanced.logConfig.collectionEnabled")}</Label>
+          <p className="text-xs text-muted-foreground">
+            {t("settings.advanced.logConfig.collectionEnabledDescription")}
+          </p>
+        </div>
+        <Switch
+          checked={config.collectionEnabled}
+          disabled={!config.enabled || config.level !== "info"}
+          onCheckedChange={(checked) =>
+            handleChange({ collectionEnabled: checked })
+          }
+        />
       </div>
 
       <div className="rounded-lg bg-muted/50 p-4 text-xs space-y-1.5">

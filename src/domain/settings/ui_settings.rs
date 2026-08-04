@@ -222,6 +222,7 @@ pub fn default_log_config() -> Value {
     json!({
         "enabled": true,
         "level": "info",
+        "collectionEnabled": true,
         "apiEnabled": false,
         "apiTailLines": LOG_API_DEFAULT_TAIL_LINES,
     })
@@ -301,6 +302,7 @@ pub fn parse_api_management_config(value: &Value) -> ParsedApiManagementConfig {
 pub struct ParsedLogConfig {
     pub enabled: bool,
     pub level: String,
+    pub collection_enabled: bool,
     pub api_enabled: bool,
     pub api_tail_lines: usize,
 }
@@ -319,6 +321,10 @@ pub fn parse_log_config(value: &Value) -> ParsedLogConfig {
         .get("apiEnabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let collection_enabled = value
+        .get("collectionEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let api_tail_lines = value
         .get("apiTailLines")
         .and_then(Value::as_u64)
@@ -328,9 +334,21 @@ pub fn parse_log_config(value: &Value) -> ParsedLogConfig {
     ParsedLogConfig {
         enabled,
         level,
+        collection_enabled,
         api_enabled,
         api_tail_lines,
     }
+}
+
+pub fn validate_log_config(value: &Value) -> Result<(), String> {
+    let parsed = parse_log_config(value);
+    if parsed.collection_enabled && (!parsed.enabled || !parsed.level.eq_ignore_ascii_case("info"))
+    {
+        return Err(
+            "log collection can only be enabled while local logging uses info level".into(),
+        );
+    }
+    Ok(())
 }
 
 pub fn default_stream_check_config() -> Value {
@@ -408,9 +426,14 @@ fn merge_json_values(base: Value, patch: Value) -> Value {
 }
 
 pub fn settings_patch_from_args(args: &Value) -> Result<Value, String> {
-    args.get("settings")
+    let patch = args
+        .get("settings")
         .cloned()
-        .ok_or_else(|| "settings payload is required".to_string())
+        .ok_or_else(|| "settings payload is required".to_string())?;
+    if let Some(log_config) = patch.get("logConfig") {
+        validate_log_config(log_config)?;
+    }
+    Ok(patch)
 }
 
 #[cfg(test)]
@@ -570,6 +593,7 @@ mod tests {
         let log = log_config_for_frontend(&store);
         assert_eq!(log["enabled"], json!(true));
         assert_eq!(log["level"], json!("debug"));
+        assert_eq!(log["collectionEnabled"], json!(true));
         assert_eq!(log["apiEnabled"], json!(false));
         assert_eq!(log["apiTailLines"], json!(LOG_API_DEFAULT_TAIL_LINES));
     }
@@ -584,14 +608,58 @@ mod tests {
         }));
         assert!(!parsed.enabled);
         assert_eq!(parsed.level, "warn");
+        assert!(parsed.collection_enabled);
         assert!(parsed.api_enabled);
         assert_eq!(parsed.api_tail_lines, LOG_API_MAX_TAIL_LINES);
 
         let parsed = parse_log_config(&json!({}));
         assert!(parsed.enabled);
         assert_eq!(parsed.level, "info");
+        assert!(parsed.collection_enabled);
         assert!(!parsed.api_enabled);
         assert_eq!(parsed.api_tail_lines, LOG_API_DEFAULT_TAIL_LINES);
+    }
+
+    #[test]
+    fn log_collection_requires_enabled_info_logging() {
+        assert!(validate_log_config(&json!({
+            "enabled": true,
+            "level": "info",
+            "collectionEnabled": true
+        }))
+        .is_ok());
+        assert!(validate_log_config(&json!({
+            "enabled": true,
+            "level": "debug",
+            "collectionEnabled": false
+        }))
+        .is_ok());
+        assert!(validate_log_config(&json!({
+            "enabled": true,
+            "level": "debug",
+            "collectionEnabled": true
+        }))
+        .is_err());
+        assert!(validate_log_config(&json!({
+            "enabled": false,
+            "level": "info",
+            "collectionEnabled": true
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn generic_settings_patch_enforces_log_collection_invariants() {
+        assert!(settings_patch_from_args(&json!({
+            "settings": {
+                "logConfig": {
+                    "enabled": true,
+                    "level": "debug",
+                    "collectionEnabled": true
+                }
+            }
+        }))
+        .is_err());
     }
 
     #[test]

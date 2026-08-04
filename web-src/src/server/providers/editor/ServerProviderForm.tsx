@@ -21,15 +21,7 @@ import {
 } from "@/components/providers/ProviderShareSection";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
-import { AntigravityOAuthSection } from "@/components/providers/forms/AntigravityOAuthSection";
-import { ClaudeOAuthSection } from "@/components/providers/forms/ClaudeOAuthSection";
-import { CodexOAuthSection } from "@/components/providers/forms/CodexOAuthSection";
-import { CopilotAuthSection } from "@/components/providers/forms/CopilotAuthSection";
-import { CursorOAuthSection } from "@/components/providers/forms/CursorOAuthSection";
-import { DeepSeekAccountSection } from "@/components/providers/forms/DeepSeekAccountSection";
-import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSection";
-import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
-import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
+import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
 import {
   ProviderPresetSelector,
   type PresetEntry,
@@ -59,12 +51,7 @@ import { vscodeApi } from "@/lib/api/vscode";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
 import { isValidUserAgentHeader } from "@/lib/userAgent";
-import {
-  findAccountCapability,
-  resolveManagedAccountCapabilityState,
-  useAccountCapabilitiesQuery,
-  useManagedAccountsQuery,
-} from "@/lib/query/accounts";
+import { useManagedAccountsQuery } from "@/lib/query/accounts";
 import {
   customPolicyForProfile,
   driverForProfile,
@@ -989,111 +976,6 @@ function CredentialControl({
   );
 }
 
-function ManagedAccountSection({
-  providerType,
-  accountId,
-  onAccountSelect,
-}: {
-  providerType: string;
-  accountId: string;
-  onAccountSelect: (accountId: string | null) => void;
-}) {
-  const { t } = useTranslation();
-  const capabilityQuery = useAccountCapabilitiesQuery();
-  const capability = findAccountCapability(capabilityQuery.data, providerType);
-  const capabilityState = resolveManagedAccountCapabilityState(
-    capabilityQuery.status,
-    capability,
-  );
-  if (capabilityState === "loading") {
-    return (
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        <LoaderCircle className="h-4 w-4 animate-spin" />
-        {t("common.loading")}
-      </div>
-    );
-  }
-  if (capabilityState === "load_error") {
-    return (
-      <div
-        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive/40 p-3 text-sm text-destructive"
-        role="alert"
-      >
-        <span className="flex min-w-0 items-center gap-2">
-          <AlertTriangle className="h-4 w-4 shrink-0" />
-          {t("settings.authCenter.capabilityLoadFailed", {
-            defaultValue: "无法加载账号能力，供应商账号绑定已暂停。",
-          })}
-        </span>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={capabilityQuery.isFetching}
-          onClick={() => void capabilityQuery.refetch()}
-        >
-          {capabilityQuery.isFetching ? (
-            <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <RotateCcw className="mr-2 h-4 w-4" />
-          )}
-          {t("common.retry")}
-        </Button>
-      </div>
-    );
-  }
-  if (capabilityState === "unsupported") {
-    return (
-      <div className="flex items-center gap-2 text-sm text-destructive">
-        <AlertTriangle className="h-4 w-4" />
-        {t("serverProviderForm.unsupportedAccountType", {
-          type: providerType,
-        })}
-      </div>
-    );
-  }
-  const common = {
-    selectedAccountId: accountId || null,
-    onAccountSelect,
-    showLoggedInAccounts: false,
-  };
-  switch (providerType) {
-    case "claude_oauth":
-      return <ClaudeOAuthSection {...common} />;
-    case "codex_oauth":
-      return <CodexOAuthSection {...common} accountSelectionMode="provider" />;
-    case "grok_oauth":
-      return <GrokOAuthSection {...common} allowDefaultAccountOption={false} />;
-    case "github_copilot":
-      return <CopilotAuthSection {...common} />;
-    case "gemini_cli":
-      return (
-        <GeminiOAuthSection {...common} allowDefaultAccountOption={false} />
-      );
-    case "antigravity_oauth":
-      return (
-        <AntigravityOAuthSection {...common} authProvider="antigravity_oauth" />
-      );
-    case "agy_oauth":
-      return <AntigravityOAuthSection {...common} authProvider="agy_oauth" />;
-    case "cursor_oauth":
-      return <CursorOAuthSection {...common} />;
-    case "kiro_oauth":
-      return <KiroOAuthSection {...common} />;
-    case "deepseek_account":
-      return <DeepSeekAccountSection {...common} />;
-    default:
-      return (
-        <div className="flex items-center gap-2 text-sm text-destructive">
-          <AlertTriangle className="h-4 w-4" />
-          {t("serverProviderForm.unsupportedAccountType", {
-            type: providerType,
-          })}
-        </div>
-      );
-  }
-}
-
 export function ServerProviderForm({
   appId,
   providerId,
@@ -1747,7 +1629,7 @@ export function ServerProviderForm({
               providerType={
                 suggestedProfile.credentialPolicy.accountProviderType
               }
-              accountId={adoptAccountId}
+              selectedAccountId={adoptAccountId || null}
               onAccountSelect={(accountId) =>
                 setAdoptAccountId(accountId ?? "")
               }
@@ -1917,7 +1799,7 @@ export function ServerProviderForm({
         <Section title={t("serverProviderForm.account.title")}>
           <ManagedAccountSection
             providerType={profile.credentialPolicy.accountProviderType}
-            accountId={state.accountId}
+            selectedAccountId={state.accountId || null}
             onAccountSelect={(accountId) =>
               setState((current) => {
                 if (profile.credentialPolicy.mode !== "managed_account") {

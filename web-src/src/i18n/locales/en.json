@@ -608,6 +608,8 @@
         "enabledDescription": "Master switch, all logging will be disabled when turned off",
         "level": "Log Level",
         "levelDescription": "Set the minimum log level to output",
+        "collectionEnabled": "Log Collection",
+        "collectionEnabledDescription": "Upload redacted INFO, WARN, and ERROR logs to the configured Router. Collection is available only at info level.",
         "levels": {
           "error": "Error",
           "warn": "Warning",

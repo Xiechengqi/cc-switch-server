@@ -19,6 +19,7 @@ import { toast } from "sonner";
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
+import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -763,6 +764,24 @@ export function ProviderBundleEditor({
   });
 
   useEffect(() => {
+    if (!draft.accountId || draft.accountGeneration != null) return;
+    const account = accounts.find((item) => item.id === draft.accountId);
+    if (account?.authIdentityGeneration == null) return;
+    setDraft((current) => {
+      if (
+        current.accountId !== account.id ||
+        current.accountGeneration != null
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        accountGeneration: account.authIdentityGeneration,
+      };
+    });
+  }, [accounts, draft.accountGeneration, draft.accountId]);
+
+  useEffect(() => {
     setShareDraft(createBundleShareDraft(existingShare));
   }, [existingShare?.id, existingShare?.configRevision]);
 
@@ -1008,36 +1027,20 @@ export function ProviderBundleEditor({
             title={t("providerBundle.account", { defaultValue: "OAuth 账号" })}
             icon={<KeyRound className="h-4 w-4" />}
           >
-            <Select
-              value={draft.accountId}
-              onValueChange={(accountId) => {
+            <ManagedAccountSection
+              providerType={
+                credentialProfile.credentialPolicy.accountProviderType
+              }
+              selectedAccountId={draft.accountId || null}
+              onAccountSelect={(accountId) => {
                 const account = accounts.find((item) => item.id === accountId);
-                setDraft({
-                  ...draft,
-                  accountId,
+                setDraft((current) => ({
+                  ...current,
+                  accountId: accountId ?? "",
                   accountGeneration: account?.authIdentityGeneration,
-                });
+                }));
               }}
-            >
-              <SelectTrigger>
-                <SelectValue
-                  placeholder={
-                    accountsQuery.isLoading
-                      ? t("common.loading")
-                      : t("providerBundle.selectAccount", {
-                          defaultValue: "选择账号",
-                        })
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {accounts.map((account) => (
-                  <SelectItem key={account.id} value={account.id}>
-                    {account.email || account.login || account.id}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            />
           </Section>
         ) : null}
 

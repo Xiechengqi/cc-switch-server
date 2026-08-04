@@ -518,6 +518,8 @@
         "enabledDescription": "總開關，關閉後所有日誌將被停用",
         "level": "日誌層級",
         "levelDescription": "設定輸出的最低日誌層級",
+        "collectionEnabled": "日誌採集",
+        "collectionEnabledDescription": "將遮蔽敏感資訊後的 INFO、WARN、ERROR 日誌上傳至目前 Router。僅可在 info 層級啟用。",
         "levels": {
           "error": "錯誤",
           "warn": "警告",

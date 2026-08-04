@@ -32,6 +32,7 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     let state =
         ServerStateInner::load(cli.clone(), log_capture).context("initialize server state")?;
     state.sync_log_config_from_ui_settings().await;
+    cc_switch_server::logging::spawn_remote_log_upload(state.clone());
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_public_ip_discovery(state.clone());
     cc_switch_server::state::spawn_installation_heartbeat(state.clone());

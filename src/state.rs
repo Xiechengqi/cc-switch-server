@@ -3562,12 +3562,26 @@ impl ServerStateInner {
         let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
         drop(store);
         self.log_capture.apply_config(&config, &self.config_dir);
+        crate::logging::apply_remote_log_config(&config);
         let level = if config.enabled {
             config.level.as_str()
         } else {
             "off"
         };
         crate::logging::reload_log_level(level);
+    }
+
+    pub(crate) async fn upload_installation_log_batch(
+        &self,
+        payload: crate::domain::router::InstallationLogBatchPayload,
+    ) -> Result<
+        crate::domain::router::InstallationLogBatchResponse,
+        crate::clients::router::client::InstallationLogUploadError,
+    > {
+        let config = self.config.read().await.clone();
+        let http_client = self.http_client.read().await.clone();
+        crate::clients::router::client::send_installation_log_batch(&http_client, &config, payload)
+            .await
     }
 
     pub(crate) async fn store_image_capability(

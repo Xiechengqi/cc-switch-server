@@ -205,7 +205,7 @@ export function ProviderBundlesPage({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col pb-12">
-      <div className="sticky top-0 z-30 mb-4 flex min-h-14 shrink-0 items-center gap-3 border-b border-border/60 bg-background/95 backdrop-blur-md">
+      <div className="sticky top-0 z-30 mb-4 flex min-h-14 shrink-0 items-center gap-3 bg-background/95 backdrop-blur-md">
         <a
           href="https://tokenswitch.org"
           target="_blank"
@@ -214,26 +214,8 @@ export function ProviderBundlesPage({
         >
           CC Switch Server
         </a>
-        <span
-          className="hidden h-5 w-px shrink-0 bg-border sm:block"
-          aria-hidden
-        />
-        <div className="flex min-w-0 items-baseline gap-2">
-          <h1 className="shrink-0 text-base font-semibold">
-            {t("providerBundle.title", { defaultValue: "供应商" })}
-          </h1>
-          <p className="hidden truncate text-xs text-muted-foreground md:block">
-            {t("providerBundle.count", {
-              defaultValue: "{{count}} 个供应商节点",
-              count: bundles.length,
-            })}
-          </p>
-        </div>
+        {toolbarActions}
         <div className="ml-auto flex shrink-0 items-center gap-1">
-          {toolbarActions}
-          {toolbarActions ? (
-            <span className="mx-1 h-5 w-px shrink-0 bg-border" aria-hidden />
-          ) : null}
           <Button
             type="button"
             size="icon"
@@ -251,14 +233,12 @@ export function ProviderBundlesPage({
           </Button>
           <Button
             type="button"
-            className="shrink-0"
+            size="icon"
+            className="h-8 w-8 shrink-0 rounded-full bg-orange-500 text-white shadow-lg shadow-orange-500/30 hover:bg-orange-600 dark:bg-orange-500 dark:shadow-orange-500/40 dark:hover:bg-orange-600"
             title={t("providers.addProvider", { defaultValue: "添加供应商" })}
             onClick={() => setEditing({ mode: "create" })}
           >
-            <Plus className="h-4 w-4 sm:mr-2" />
-            <span className="hidden sm:inline">
-              {t("providers.addProvider", { defaultValue: "添加供应商" })}
-            </span>
+            <Plus className="h-5 w-5" />
           </Button>
         </div>
       </div>
