@@ -205,6 +205,28 @@ pub struct ClientConfig {
     pub last_heartbeat_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_pending: Option<ClientTunnelClaimIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdomain_adoption: Option<ClientSubdomainAdoption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSubdomainAdoptionStatus {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientSubdomainAdoption {
+    pub takeover_id: String,
+    pub from_subdomain: String,
+    pub to_subdomain: String,
+    pub status: ClientSubdomainAdoptionStatus,
+    pub activate_at_ms: i64,
+    pub prepared_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +521,7 @@ impl ServerConfig {
                 tunnel_status: Some("claimed".to_string()),
                 last_heartbeat_ms: None,
                 claim_pending: None,
+                subdomain_adoption: None,
             },
             setup_completion_notification: None,
             upgrade_policy: UpgradePolicyConfig::default(),

@@ -27,8 +27,10 @@ pub(in crate::api) mod usage;
 pub(in crate::api) use accounts::*;
 pub(in crate::api) use backup::*;
 pub(crate) use control::{
-    control_apply_share_settings, control_refresh_share_usage, share_router_health,
-    share_router_model_health, share_router_request_logs, share_router_runtime,
+    control_abort_client_subdomain_adoption, control_apply_share_settings,
+    control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
+    control_refresh_share_usage, share_router_health, share_router_model_health,
+    share_router_request_logs, share_router_runtime,
 };
 pub use control::{
     control_signature, control_signature_for_method, refresh_share_usage_items,
@@ -131,6 +133,9 @@ use crate::state::{ServerEvent, ServerState, Session, ShareInFlightGuard};
 
 pub const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 pub const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
+pub const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
+pub const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
+pub const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
 pub async fn serve(state: ServerState) -> anyhow::Result<()> {
     if !state.config.read().await.is_setup_complete() {
         crate::setup::log_setup_required_hints(&state);
@@ -168,6 +173,18 @@ pub fn app_router(state: ServerState) -> Router {
             post(control_apply_share_settings),
         )
         .route(REFRESH_SHARE_USAGE_PATH, post(control_refresh_share_usage))
+        .route(
+            PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+            post(control_prepare_client_subdomain_adoption),
+        )
+        .route(
+            COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+            post(control_commit_client_subdomain_adoption),
+        )
+        .route(
+            ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+            post(control_abort_client_subdomain_adoption),
+        )
         .route("/api/setup/status", get(setup_status))
         .route("/api/setup/check-router", post(setup_check_router))
         .route(

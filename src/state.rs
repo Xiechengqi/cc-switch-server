@@ -79,9 +79,10 @@ use crate::domain::providers::runtime::{
     compile_runtime_plan, managed_account_binding, managed_account_provider_type,
 };
 use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
-use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
+use crate::domain::router::{ClientSubdomain, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
-    ClientTunnelClaimIntent, RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
+    ClientSubdomainAdoption, ClientSubdomainAdoptionStatus, ClientTunnelClaimIntent,
+    RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::router_contract::{
@@ -101,6 +102,9 @@ const ROUTER_SHARE_SYNC_BATCH_SIZE: usize = 100;
 const SHARE_EDIT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SETUP_COMPLETION_RETRY_BASE_MS: i64 = 30_000;
 const SETUP_COMPLETION_RETRY_MAX_MS: i64 = 30 * 60_000;
+const CLIENT_SUBDOMAIN_ADOPTION_MAX_FUTURE_MS: i64 = 60_000;
+const CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_BASE: Duration = Duration::from_secs(2);
+const CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_MAX: Duration = Duration::from_secs(30);
 const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA: u32 = 1;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_FILE: &str = ".codex-workspace-rebind-transaction.json";
@@ -320,6 +324,7 @@ pub struct ServerStateInner {
     pub control_nonces: Arc<ControlNonceCache>,
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
     client_tunnel_claim: AsyncMutex<()>,
+    client_subdomain_adoption_schedulers: Mutex<BTreeSet<String>>,
     setup_flight: AsyncMutex<()>,
     router_share_sync: AsyncMutex<()>,
     share_edit_sync: AsyncMutex<()>,
@@ -1255,6 +1260,7 @@ fn validate_server_backup_restore_stage(
     manifest: &crate::infra::backup::BackupManifest,
 ) -> anyhow::Result<()> {
     let includes = |name: &str| manifest.files.iter().any(|file| file.file_name == name);
+    validate_client_subdomain_adoption_restore_stage(config_dir, stage_dir, &includes)?;
     let validates_subscription_references = [
         "accounts.json",
         "accounts.key",
@@ -1377,6 +1383,76 @@ fn validate_server_backup_restore_stage(
             .context("validate staged tunnels.json")?;
     }
     Ok(())
+}
+
+fn validate_client_subdomain_adoption_restore_stage(
+    config_dir: &Path,
+    stage_dir: &Path,
+    includes: &impl Fn(&str) -> bool,
+) -> anyhow::Result<()> {
+    let current = ServerConfig::load_or_default(config_dir)?;
+    if includes("server.json") {
+        let staged = ServerConfig::load_or_default(stage_dir)?;
+        if staged.client.tunnel_subdomain != current.client.tunnel_subdomain
+            || staged.client.subdomain_adoption != current.client.subdomain_adoption
+        {
+            anyhow::bail!(
+                "backup restore cannot replace the Router-authoritative Client subdomain adoption state"
+            );
+        }
+    }
+
+    if includes("shares.json") {
+        if let Some(client_subdomain) = current.client.tunnel_subdomain.as_deref() {
+            let client_subdomain = ClientSubdomain::parse(client_subdomain)?;
+            let staged_shares = ShareStore::load_or_default(stage_dir)?;
+            if let Some(share) = staged_shares.shares.iter().find(|share| {
+                share
+                    .tunnel_subdomain
+                    .as_deref()
+                    .and_then(|value| value.split_once("--"))
+                    .is_some_and(|(_, suffix)| suffix != client_subdomain.as_str())
+            }) {
+                anyhow::bail!(
+                    "backup Share {} does not use the Router-authoritative Client subdomain",
+                    share.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_client_subdomain_adoption_on_reload(
+    current: &ServerConfig,
+    incoming: &mut ServerConfig,
+    incoming_shares: &mut ShareStore,
+) -> anyhow::Result<(bool, usize)> {
+    let loaded_client_state = (
+        incoming.client.subdomain_adoption.clone(),
+        incoming.client.tunnel_subdomain.clone(),
+        incoming.client.tunnel_status.clone(),
+    );
+    preserve_client_subdomain_adoption_from_stale_snapshot(current, incoming);
+    let preserved_client_state = loaded_client_state
+        != (
+            incoming.client.subdomain_adoption.clone(),
+            incoming.client.tunnel_subdomain.clone(),
+            incoming.client.tunnel_status.clone(),
+        );
+    let rebased_share_subdomains = if incoming.client.subdomain_adoption.is_some() {
+        incoming
+            .client
+            .tunnel_subdomain
+            .as_deref()
+            .map(ClientSubdomain::parse)
+            .transpose()?
+            .map(|client| incoming_shares.normalize_full_tunnel_subdomains_to_client(&client))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok((preserved_client_state, rebased_share_subdomains))
 }
 
 #[derive(Debug, Clone)]
@@ -3530,6 +3606,7 @@ impl ServerStateInner {
             control_nonces: Arc::new(ControlNonceCache::default()),
             router_registration_flight: AsyncMutex::new(None),
             client_tunnel_claim: AsyncMutex::new(()),
+            client_subdomain_adoption_schedulers: Mutex::new(BTreeSet::new()),
             setup_flight: AsyncMutex::new(()),
             router_share_sync: AsyncMutex::new(()),
             share_edit_sync: AsyncMutex::new(()),
@@ -3629,6 +3706,7 @@ impl ServerStateInner {
         preserve_router_identity_from_stale_snapshot(&current, &mut config);
         preserve_setup_completion_from_stale_snapshot(&current, &mut config);
         preserve_client_tunnel_claim_from_stale_snapshot(&current, &mut config);
+        preserve_client_subdomain_adoption_from_stale_snapshot(&current, &mut config);
         let http_client = build_http_client()?;
         config.save(&self.config_dir)?;
         *self.http_client.write().await = http_client;
@@ -3648,6 +3726,163 @@ impl ServerStateInner {
 
     pub async fn config_snapshot(&self) -> ServerConfig {
         self.config.read().await.clone()
+    }
+
+    pub(crate) async fn prepare_client_subdomain_adoption(
+        &self,
+        takeover_id: &str,
+        from_subdomain: &str,
+        to_subdomain: &str,
+        activate_at_ms: i64,
+    ) -> anyhow::Result<ClientSubdomainAdoption> {
+        let takeover_id = takeover_id.trim();
+        if takeover_id.is_empty() || takeover_id.len() > 128 {
+            anyhow::bail!("takeoverId must be a non-empty identifier of at most 128 bytes");
+        }
+        let from_subdomain = ClientSubdomain::parse(from_subdomain)?.to_string();
+        let to_subdomain = ClientSubdomain::parse(to_subdomain)?.to_string();
+        if from_subdomain == to_subdomain {
+            anyhow::bail!("source and destination Client subdomains must differ");
+        }
+        let now = now_ms_i64();
+
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction(
+            "Client subdomain adoption prepare",
+        )?;
+        let mut current = self.config.write().await;
+        if let Some(existing) = current.client.subdomain_adoption.as_ref() {
+            if existing.takeover_id == takeover_id {
+                if existing.from_subdomain != from_subdomain
+                    || existing.to_subdomain != to_subdomain
+                {
+                    anyhow::bail!("takeoverId is already bound to a different adoption");
+                }
+                return Ok(existing.clone());
+            }
+            if existing.status == ClientSubdomainAdoptionStatus::Prepared {
+                anyhow::bail!("another Client subdomain adoption is already prepared");
+            }
+        }
+        if activate_at_ms > now.saturating_add(CLIENT_SUBDOMAIN_ADOPTION_MAX_FUTURE_MS) {
+            anyhow::bail!("activateAtMs is outside the allowed activation window");
+        }
+        let configured_subdomain = current
+            .client
+            .tunnel_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))?;
+        if configured_subdomain != from_subdomain {
+            anyhow::bail!(
+                "client subdomain changed before adoption prepare: expected {from_subdomain}, found {configured_subdomain}"
+            );
+        }
+
+        let adoption = ClientSubdomainAdoption {
+            takeover_id: takeover_id.to_string(),
+            from_subdomain,
+            to_subdomain,
+            status: ClientSubdomainAdoptionStatus::Prepared,
+            activate_at_ms,
+            prepared_at_ms: now,
+            committed_at_ms: None,
+        };
+        let mut next = current.clone();
+        next.client.subdomain_adoption = Some(adoption.clone());
+        next.save(&self.config_dir)?;
+        *current = next;
+        Ok(adoption)
+    }
+
+    pub(crate) async fn commit_client_subdomain_adoption(
+        &self,
+        takeover_id: &str,
+    ) -> anyhow::Result<(ClientSubdomainAdoption, bool)> {
+        // Keep the persistent-store lock order aligned with backup restore/reload:
+        // workspace transaction -> config -> Shares. The previous config -> workspace
+        // order could deadlock against a concurrent persistent-store reload.
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Client subdomain adoption")?;
+        let mut current = self.config.write().await;
+        let adoption = current
+            .client
+            .subdomain_adoption
+            .as_ref()
+            .filter(|adoption| adoption.takeover_id == takeover_id.trim())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("prepared Client subdomain adoption was not found"))?;
+        if adoption.status == ClientSubdomainAdoptionStatus::Committed {
+            return Ok((adoption, false));
+        }
+        if current.client.tunnel_subdomain.as_deref() != Some(adoption.from_subdomain.as_str()) {
+            anyhow::bail!("client subdomain changed after adoption prepare");
+        }
+
+        let from_client = ClientSubdomain::parse(&adoption.from_subdomain)?;
+        let to_client = ClientSubdomain::parse(&adoption.to_subdomain)?;
+        let mut shares = self.shares.write().await;
+        let mut candidate_shares = shares.clone();
+        let rebased_shares =
+            candidate_shares.rebase_full_tunnel_subdomains(&from_client, &to_client);
+        if let Err(error) = candidate_shares.save(&self.config_dir) {
+            let disk_matches = ShareStore::load_or_default(&self.config_dir)
+                .ok()
+                .and_then(|store| serde_json::to_value(store).ok())
+                .zip(serde_json::to_value(&candidate_shares).ok())
+                .is_some_and(|(disk, expected)| disk == expected);
+            if !disk_matches {
+                return Err(error);
+            }
+            tracing::warn!(
+                %error,
+                "Shares reached the Client subdomain adoption commit point despite a persistence error"
+            );
+        }
+        *shares = candidate_shares;
+
+        let mut committed = adoption;
+        committed.status = ClientSubdomainAdoptionStatus::Committed;
+        committed.committed_at_ms = Some(now_ms_i64());
+        let mut next = current.clone();
+        next.client.tunnel_subdomain = Some(committed.to_subdomain.clone());
+        next.client.tunnel_status = Some("claimed_remote".to_string());
+        next.client.claim_pending = None;
+        next.client.subdomain_adoption = Some(committed.clone());
+        next.save(&self.config_dir)?;
+        *current = next;
+        if rebased_shares > 0 {
+            tracing::info!(
+                takeover_id = %committed.takeover_id,
+                rebased_shares,
+                "rebased persisted Share subdomains for Client adoption"
+            );
+        }
+        Ok((committed, true))
+    }
+
+    pub(crate) async fn abort_client_subdomain_adoption(
+        &self,
+        takeover_id: &str,
+    ) -> anyhow::Result<bool> {
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Client subdomain adoption abort")?;
+        let mut current = self.config.write().await;
+        let Some(adoption) = current.client.subdomain_adoption.as_ref() else {
+            return Ok(false);
+        };
+        if adoption.takeover_id != takeover_id.trim() {
+            anyhow::bail!("prepared Client subdomain adoption was not found");
+        }
+        if adoption.status == ClientSubdomainAdoptionStatus::Committed {
+            anyhow::bail!("committed Client subdomain adoption cannot be aborted");
+        }
+        let mut next = current.clone();
+        next.client.subdomain_adoption = None;
+        next.save(&self.config_dir)?;
+        *current = next;
+        Ok(true)
     }
 
     pub(crate) async fn lock_client_tunnel_claim(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -4236,7 +4471,8 @@ impl ServerStateInner {
         {
             tracing::warn!("completed a pending Codex workspace rebind transaction before reload");
         }
-        let config = ServerConfig::load_or_default(&self.config_dir)?;
+        let mut config = ServerConfig::load_or_default(&self.config_dir)?;
+        let current_config = self.config.read().await.clone();
         let http_client = build_http_client()?;
         let reasoning_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
             .context("resolve proxy reasoning bridge root key")?;
@@ -4248,11 +4484,17 @@ impl ServerStateInner {
         let usage = UsageStore::load_or_default(&self.config_dir)?;
         remove_obsolete_model_pricing_file(&self.config_dir)?;
         let mut shares = ShareStore::load_or_default(&self.config_dir)?;
+        let (preserved_client_state, rebased_client_share_subdomains) =
+            reconcile_client_subdomain_adoption_on_reload(
+                &current_config,
+                &mut config,
+                &mut shares,
+            )?;
         let refreshed_capacity_pools = shares
             .refresh_capacity_pool_ids(&providers, &accounts, &reasoning_root_key.key)
             .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
             .context("derive Share capacity pools during reload")?;
-        if !refreshed_capacity_pools.is_empty() {
+        if !refreshed_capacity_pools.is_empty() || rebased_client_share_subdomains > 0 {
             shares.save(&self.config_dir)?;
         }
         let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
@@ -4261,6 +4503,10 @@ impl ServerStateInner {
         )
         .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
         .context("validate subscription reference graph before reload")?;
+
+        if preserved_client_state {
+            config.save(&self.config_dir)?;
+        }
 
         *self.http_client.write().await = http_client;
         *self.config.write().await = config;
@@ -9472,6 +9718,19 @@ fn preserve_client_tunnel_claim_from_stale_snapshot(
     incoming.router.last_register_error = current.router.last_register_error.clone();
 }
 
+fn preserve_client_subdomain_adoption_from_stale_snapshot(
+    current: &ServerConfig,
+    incoming: &mut ServerConfig,
+) {
+    let adoption_changed = incoming.client.subdomain_adoption != current.client.subdomain_adoption;
+    if !adoption_changed && current.client.subdomain_adoption.is_none() {
+        return;
+    }
+    incoming.client.subdomain_adoption = current.client.subdomain_adoption.clone();
+    incoming.client.tunnel_subdomain = current.client.tunnel_subdomain.clone();
+    incoming.client.tunnel_status = current.client.tunnel_status.clone();
+}
+
 fn preserve_setup_completion_from_stale_snapshot(
     current: &ServerConfig,
     incoming: &mut ServerConfig,
@@ -9613,6 +9872,9 @@ pub async fn refresh_router_installation_registration(state: &ServerState) -> bo
 }
 
 pub async fn restore_tunnels(state: ServerState) {
+    if let Err(error) = resume_client_subdomain_adoption(state.clone()).await {
+        tracing::error!(error = %error, "resume Client subdomain adoption failed");
+    }
     let registration_completed = refresh_router_installation_registration(&state).await;
 
     if state.config.read().await.client.claim_pending.is_some() {
@@ -9650,6 +9912,160 @@ pub async fn restore_tunnels(state: ServerState) {
         }
     }
     retry_pending_router_share_deletes(state).await;
+}
+
+async fn resume_client_subdomain_adoption(state: ServerState) -> anyhow::Result<()> {
+    let adoption = state
+        .config_snapshot()
+        .await
+        .client
+        .subdomain_adoption
+        .filter(|adoption| adoption.status == ClientSubdomainAdoptionStatus::Prepared);
+    let Some(adoption) = adoption else {
+        return Ok(());
+    };
+    schedule_client_subdomain_adoption(state, adoption);
+    Ok(())
+}
+
+struct ClientSubdomainAdoptionScheduleGuard {
+    state: ServerState,
+    takeover_id: String,
+}
+
+impl Drop for ClientSubdomainAdoptionScheduleGuard {
+    fn drop(&mut self) {
+        self.state
+            .client_subdomain_adoption_schedulers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.takeover_id);
+    }
+}
+
+pub(crate) fn schedule_client_subdomain_adoption(
+    state: ServerState,
+    adoption: ClientSubdomainAdoption,
+) {
+    if adoption.status != ClientSubdomainAdoptionStatus::Prepared {
+        return;
+    }
+    let scheduled = state
+        .client_subdomain_adoption_schedulers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(adoption.takeover_id.clone());
+    if !scheduled {
+        return;
+    }
+    tokio::spawn(async move {
+        let _guard = ClientSubdomainAdoptionScheduleGuard {
+            state: state.clone(),
+            takeover_id: adoption.takeover_id.clone(),
+        };
+        let delay_ms = adoption.activate_at_ms.saturating_sub(now_ms_i64()).max(0) as u64;
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+        let mut error_retry = CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_BASE;
+        loop {
+            let config = state.config_snapshot().await;
+            let still_prepared = config
+                .client
+                .subdomain_adoption
+                .as_ref()
+                .is_some_and(|current| {
+                    current.takeover_id == adoption.takeover_id
+                        && current.status == ClientSubdomainAdoptionStatus::Prepared
+                });
+            if !still_prepared {
+                return;
+            }
+
+            let authorization =
+                crate::clients::router::client::authorize_client_subdomain_takeover(
+                    &state.http_client().await,
+                    &config,
+                    &adoption.takeover_id,
+                )
+                .await;
+            let retry_after = match authorization {
+                Ok(response) if response.authorized => {
+                    match state
+                        .commit_client_subdomain_adoption(&adoption.takeover_id)
+                        .await
+                    {
+                        Ok((_, true)) => {
+                            reconnect_after_client_subdomain_adoption(
+                                state.clone(),
+                                "subdomain_adoption_authorized",
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok((_, false)) => return,
+                        Err(error) => {
+                            tracing::error!(
+                                takeover_id = %adoption.takeover_id,
+                                error = %error,
+                                "authorized Client subdomain adoption failed"
+                            );
+                            let retry_after = error_retry;
+                            error_retry = error_retry
+                                .saturating_mul(2)
+                                .min(CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_MAX);
+                            retry_after
+                        }
+                    }
+                }
+                Ok(response) if response.status == "failed" => {
+                    if let Err(error) = state
+                        .abort_client_subdomain_adoption(&adoption.takeover_id)
+                        .await
+                    {
+                        tracing::error!(
+                            takeover_id = %adoption.takeover_id,
+                            error = %error,
+                            "failed Client subdomain adoption could not be cleared"
+                        );
+                    }
+                    return;
+                }
+                Ok(_) => {
+                    error_retry = CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_BASE;
+                    CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_BASE
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        takeover_id = %adoption.takeover_id,
+                        error = %error,
+                        "Client subdomain adoption authorization remains pending"
+                    );
+                    let retry_after = error_retry;
+                    error_retry = error_retry
+                        .saturating_mul(2)
+                        .min(CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_MAX);
+                    retry_after
+                }
+            };
+            sleep(retry_after).await;
+        }
+    });
+}
+
+pub(crate) fn spawn_client_subdomain_adoption_reconnect(state: ServerState, reason: &'static str) {
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(250)).await;
+        reconnect_after_client_subdomain_adoption(state, reason).await;
+    });
+}
+
+async fn reconnect_after_client_subdomain_adoption(state: ServerState, reason: &str) {
+    force_reconnect_client_tunnel(state.clone(), reason).await;
+    let share_ids = share_tunnel_restore_ids(&state.shares.read().await.shares);
+    for share_id in share_ids {
+        force_reconnect_share_tunnel(state.clone(), share_id, reason).await;
+    }
 }
 
 pub fn spawn_periodic_backups(state: ServerState) {
@@ -12531,13 +12947,7 @@ async fn issue_share_tunnel_lease(
         Some(&usage),
     );
     let mut descriptor = descriptor;
-    let client_subdomain = config
-        .client
-        .tunnel_subdomain
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
-        .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
-    descriptor.subdomain = resolve_share_label(&descriptor.subdomain, &client_subdomain)?;
+    descriptor.subdomain = client::canonicalize_share_subdomain(&config, &descriptor.subdomain)?;
     let requested_subdomain = descriptor.subdomain.clone();
     let http_client = state.http_client().await;
     client::claim_share_subdomain(&http_client, &config, descriptor.clone()).await?;
@@ -12557,22 +12967,6 @@ async fn issue_share_tunnel_lease(
         },
     )
     .await
-}
-
-fn resolve_share_label(
-    configured: &str,
-    client_subdomain: &ClientSubdomain,
-) -> anyhow::Result<String> {
-    if let Some((slug, suffix)) = configured.split_once("--") {
-        let slug = ShareSlug::parse(slug)?;
-        let suffix = ClientSubdomain::parse(suffix)?;
-        if &suffix != client_subdomain {
-            anyhow::bail!("share host belongs to another client subdomain");
-        }
-        return Ok(format!("{}--{}", slug.as_str(), suffix.as_str()));
-    }
-    let slug = ShareSlug::parse(configured)?;
-    Ok(format!("{}--{}", slug.as_str(), client_subdomain.as_str()))
 }
 
 #[cfg(test)]
@@ -20247,6 +20641,265 @@ mod tests {
         ];
 
         assert_eq!(auto_start_share_ids(&shares), vec!["s1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn client_subdomain_adoption_is_durable_idempotent_and_stale_snapshot_safe() {
+        let state = test_state();
+        let mut initial = state.config_snapshot().await;
+        initial.client.tunnel_subdomain = Some("targeta".to_string());
+        state.replace_config(initial).await.unwrap();
+        state
+            .mutate_shares_immediate(|shares| {
+                let mut raw = router_sync_share_input("adoption-raw", "provider-adoption-raw");
+                raw.tunnel_subdomain = Some("rawslug".to_string());
+                shares.upsert(raw).unwrap();
+
+                let mut full = router_sync_share_input("adoption-full", "provider-adoption-full");
+                full.tunnel_subdomain = Some("fullslug--targeta".to_string());
+                full.runtime_snapshot = Some(json!({"subdomain": "fullslug--targeta"}));
+                shares.upsert(full).unwrap();
+            })
+            .await
+            .unwrap();
+        let raw_revision = state
+            .shares
+            .read()
+            .await
+            .get("adoption-raw")
+            .unwrap()
+            .config_revision;
+        let full_revision = state
+            .shares
+            .read()
+            .await
+            .get("adoption-full")
+            .unwrap()
+            .config_revision;
+        let stale = state.config_snapshot().await;
+        let activate_at_ms = now_ms_i64() + 30_000;
+
+        let prepared = state
+            .prepare_client_subdomain_adoption("takeover-1", "targeta", "sourceb", activate_at_ms)
+            .await
+            .unwrap();
+        assert_eq!(prepared.status, ClientSubdomainAdoptionStatus::Prepared);
+        let repeated = state
+            .prepare_client_subdomain_adoption(
+                "takeover-1",
+                "targeta",
+                "sourceb",
+                activate_at_ms + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.activate_at_ms, activate_at_ms);
+
+        let (committed, changed) = state
+            .commit_client_subdomain_adoption("takeover-1")
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(committed.status, ClientSubdomainAdoptionStatus::Committed);
+        assert_eq!(
+            state
+                .config_snapshot()
+                .await
+                .client
+                .tunnel_subdomain
+                .as_deref(),
+            Some("sourceb")
+        );
+        {
+            let shares = state.shares.read().await;
+            let raw = shares.get("adoption-raw").unwrap();
+            assert_eq!(raw.tunnel_subdomain.as_deref(), Some("rawslug"));
+            assert_eq!(raw.config_revision, raw_revision);
+
+            let full = shares.get("adoption-full").unwrap();
+            assert_eq!(full.tunnel_subdomain.as_deref(), Some("fullslug--sourceb"));
+            assert_eq!(
+                full.runtime_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot["subdomain"].as_str()),
+                Some("fullslug--sourceb")
+            );
+            assert_eq!(full.config_revision, full_revision + 1);
+        }
+        let persisted_shares = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            persisted_shares
+                .get("adoption-full")
+                .unwrap()
+                .tunnel_subdomain
+                .as_deref(),
+            Some("fullslug--sourceb")
+        );
+        assert!(
+            !state
+                .commit_client_subdomain_adoption("takeover-1")
+                .await
+                .unwrap()
+                .1
+        );
+
+        state.replace_config(stale.clone()).await.unwrap();
+        let restored = state.config_snapshot().await;
+        assert_eq!(restored.client.tunnel_subdomain.as_deref(), Some("sourceb"));
+        assert_eq!(
+            restored.client.subdomain_adoption.as_ref().unwrap().status,
+            ClientSubdomainAdoptionStatus::Committed
+        );
+
+        let mut stale_config = stale;
+        let mut stale_shares = state.shares.read().await.clone();
+        let stale_full = stale_shares
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "adoption-full")
+            .unwrap();
+        stale_full.tunnel_subdomain = Some("fullslug--targeta".to_string());
+        stale_full.runtime_snapshot = Some(json!({"subdomain": "fullslug--targeta"}));
+        let incompatible_backup_config = stale_config.clone();
+        let incompatible_backup_shares = stale_shares.clone();
+
+        let (preserved_config, rebased_shares) = reconcile_client_subdomain_adoption_on_reload(
+            &restored,
+            &mut stale_config,
+            &mut stale_shares,
+        )
+        .unwrap();
+        assert!(preserved_config);
+        assert_eq!(rebased_shares, 1);
+        assert_eq!(
+            stale_config.client.tunnel_subdomain.as_deref(),
+            Some("sourceb")
+        );
+        assert_eq!(
+            stale_config.client.subdomain_adoption.unwrap().status,
+            ClientSubdomainAdoptionStatus::Committed
+        );
+        let reloaded_full = stale_shares.get("adoption-full").unwrap();
+        assert_eq!(
+            reloaded_full.tunnel_subdomain.as_deref(),
+            Some("fullslug--sourceb")
+        );
+        assert_eq!(
+            reloaded_full
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot["subdomain"].as_str()),
+            Some("fullslug--sourceb")
+        );
+
+        let restore_stage = state.config_dir.join("adoption-restore-stage");
+        std::fs::create_dir_all(&restore_stage).unwrap();
+        let includes = |name: &str| matches!(name, "server.json" | "shares.json");
+        incompatible_backup_config.save(&restore_stage).unwrap();
+        incompatible_backup_shares.save(&restore_stage).unwrap();
+        let identity_error = validate_client_subdomain_adoption_restore_stage(
+            &state.config_dir,
+            &restore_stage,
+            &includes,
+        )
+        .unwrap_err();
+        assert!(identity_error.to_string().contains("Router-authoritative"));
+
+        restored.save(&restore_stage).unwrap();
+        let share_error = validate_client_subdomain_adoption_restore_stage(
+            &state.config_dir,
+            &restore_stage,
+            &includes,
+        )
+        .unwrap_err();
+        assert!(share_error
+            .to_string()
+            .contains("backup Share adoption-full"));
+
+        stale_shares.save(&restore_stage).unwrap();
+        validate_client_subdomain_adoption_restore_stage(
+            &state.config_dir,
+            &restore_stage,
+            &includes,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(restore_stage).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_client_subdomain_adoption_can_be_aborted_before_commit() {
+        let state = test_state();
+        let mut initial = state.config_snapshot().await;
+        initial.client.tunnel_subdomain = Some("targeta".to_string());
+        state.replace_config(initial).await.unwrap();
+        state
+            .prepare_client_subdomain_adoption(
+                "takeover-abort",
+                "targeta",
+                "sourceb",
+                now_ms_i64() + 30_000,
+            )
+            .await
+            .unwrap();
+        let stale_prepared = state.config_snapshot().await;
+        assert!(state
+            .abort_client_subdomain_adoption("takeover-abort")
+            .await
+            .unwrap());
+        let config = state.config_snapshot().await;
+        assert_eq!(config.client.tunnel_subdomain.as_deref(), Some("targeta"));
+        assert!(config.client.subdomain_adoption.is_none());
+
+        state.replace_config(stale_prepared).await.unwrap();
+        assert!(
+            state
+                .config_snapshot()
+                .await
+                .client
+                .subdomain_adoption
+                .is_none(),
+            "a stale config snapshot must not resurrect an aborted adoption"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_adoption_deadline_waits_for_router_authorization() {
+        let state = test_state();
+        let mut initial = state.config_snapshot().await;
+        initial.client.tunnel_subdomain = Some("targeta".to_string());
+        state.replace_config(initial).await.unwrap();
+        let adoption = state
+            .prepare_client_subdomain_adoption(
+                "takeover-auth-gate",
+                "targeta",
+                "sourceb",
+                now_ms_i64() - 1,
+            )
+            .await
+            .unwrap();
+
+        schedule_client_subdomain_adoption(state.clone(), adoption.clone());
+        schedule_client_subdomain_adoption(state.clone(), adoption);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let config = state.config_snapshot().await;
+        assert_eq!(config.client.tunnel_subdomain.as_deref(), Some("targeta"));
+        assert_eq!(
+            config.client.subdomain_adoption.unwrap().status,
+            ClientSubdomainAdoptionStatus::Prepared
+        );
+        assert_eq!(
+            state
+                .client_subdomain_adoption_schedulers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+        state
+            .abort_client_subdomain_adoption("takeover-auth-gate")
+            .await
+            .unwrap();
     }
 
     fn share(id: &str, auto_start: bool, enabled: bool, status: &str) -> Share {

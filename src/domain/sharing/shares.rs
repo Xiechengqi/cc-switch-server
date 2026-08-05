@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
+use crate::domain::router::{ClientSubdomain, ShareSlug};
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339,
     ShareAnchoredUsageBucket, ShareAppAccess, ShareAppSettings, ShareGrantManager,
@@ -1550,6 +1551,53 @@ impl ShareStore {
         }
         mark_share_config_pending(share);
         Ok(share.clone())
+    }
+
+    pub fn rebase_full_tunnel_subdomains(
+        &mut self,
+        from_client: &ClientSubdomain,
+        to_client: &ClientSubdomain,
+    ) -> usize {
+        self.rebase_full_tunnel_subdomains_matching(to_client, |suffix| {
+            suffix == from_client.as_str()
+        })
+    }
+
+    pub fn normalize_full_tunnel_subdomains_to_client(
+        &mut self,
+        client: &ClientSubdomain,
+    ) -> usize {
+        self.rebase_full_tunnel_subdomains_matching(client, |suffix| suffix != client.as_str())
+    }
+
+    fn rebase_full_tunnel_subdomains_matching(
+        &mut self,
+        to_client: &ClientSubdomain,
+        matches_suffix: impl Fn(&str) -> bool,
+    ) -> usize {
+        let mut updated = 0;
+        for share in &mut self.shares {
+            let Some(configured) = share.tunnel_subdomain.as_deref() else {
+                continue;
+            };
+            let Some((slug, suffix)) = configured.split_once("--") else {
+                continue;
+            };
+            if !matches_suffix(suffix) || ShareSlug::parse(slug).is_err() {
+                continue;
+            }
+
+            let subdomain = format!("{}--{}", slug, to_client.as_str());
+            share.tunnel_subdomain = Some(subdomain.clone());
+            if let Some(snapshot) = share.runtime_snapshot.as_mut() {
+                if let Some(object) = snapshot.as_object_mut() {
+                    object.insert("subdomain".to_string(), json!(subdomain));
+                }
+            }
+            mark_share_config_pending(share);
+            updated += 1;
+        }
+        updated
     }
 
     pub fn bind_all_to_client_owner(

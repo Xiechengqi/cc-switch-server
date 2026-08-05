@@ -32,6 +32,8 @@ const REGISTRATION_PROOF_VERSION: u8 = 2;
 const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_ACTION: &str = "installation_setup_completed_v1";
+const CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION: &str =
+    "client_subdomain_takeover_authorization";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +256,23 @@ pub struct SignedRequest<T> {
     pub signature: String,
     #[serde(flatten)]
     pub payload: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientSubdomainTakeoverAuthorizationPayload<'a> {
+    takeover_id: &'a str,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSubdomainTakeoverAuthorizationResponse {
+    #[serde(default)]
+    pub ok: bool,
+    pub takeover_id: String,
+    #[serde(default)]
+    pub authorized: bool,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1285,6 +1304,48 @@ pub async fn check_client_tunnel_subdomain_available(
     .await
 }
 
+pub async fn authorize_client_subdomain_takeover(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    takeover_id: &str,
+) -> anyhow::Result<ClientSubdomainTakeoverAuthorizationResponse> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/');
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let payload = ClientSubdomainTakeoverAuthorizationPayload { takeover_id };
+    let request = signed_request(
+        identity,
+        CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION,
+        payload,
+    )?;
+    let response = http
+        .post(format!(
+            "{api_base}/v1/installations/client-subdomain-takeover/authorization"
+        ))
+        .timeout(ROUTER_CONTROL_PLANE_SYNC_TIMEOUT)
+        .json(&request)
+        .send()
+        .await
+        .context("send Router Client subdomain takeover authorization request")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("Router Client subdomain takeover authorization failed: {status}: {body}");
+    }
+    let response = response
+        .json::<ClientSubdomainTakeoverAuthorizationResponse>()
+        .await
+        .context("decode Router Client subdomain takeover authorization response")?;
+    if !response.ok || response.takeover_id != takeover_id {
+        bail!("Router returned an invalid Client subdomain takeover authorization");
+    }
+    Ok(response)
+}
+
 async fn check_client_tunnel_subdomain_available_with_timeout(
     http: &reqwest::Client,
     router_api_base: &str,
@@ -1903,23 +1964,38 @@ pub fn canonicalize_share_descriptor(
     config: &ServerConfig,
     mut share: ShareDescriptor,
 ) -> anyhow::Result<ShareDescriptor> {
+    share.subdomain = canonicalize_share_subdomain(config, &share.subdomain)?;
+    Ok(share)
+}
+
+pub fn canonicalize_share_subdomain(
+    config: &ServerConfig,
+    configured: &str,
+) -> anyhow::Result<String> {
     let client_subdomain = config
         .client
         .tunnel_subdomain
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
         .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
-    let slug = if let Some((slug, suffix)) = share.subdomain.split_once("--") {
+    let slug = if let Some((slug, suffix)) = configured.split_once("--") {
         let suffix = ClientSubdomain::parse(suffix)?;
-        if suffix != client_subdomain {
+        let adoption_suffix = config
+            .client
+            .subdomain_adoption
+            .as_ref()
+            .is_some_and(|adoption| {
+                suffix.as_str() == adoption.from_subdomain
+                    || suffix.as_str() == adoption.to_subdomain
+            });
+        if suffix != client_subdomain && !adoption_suffix {
             bail!("share host belongs to another client subdomain");
         }
         ShareSlug::parse(slug)?
     } else {
-        ShareSlug::parse(&share.subdomain)?
+        ShareSlug::parse(configured)?
     };
-    share.subdomain = format!("{}--{}", slug.as_str(), client_subdomain.as_str());
-    Ok(share)
+    Ok(format!("{}--{}", slug.as_str(), client_subdomain.as_str()))
 }
 
 pub async fn prune_shares(
@@ -2211,20 +2287,7 @@ pub async fn notify_runtime_refresh(
     share_id: String,
     subdomain: String,
 ) -> anyhow::Result<()> {
-    let client_subdomain = config
-        .client
-        .tunnel_subdomain
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
-        .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
-    let subdomain = if let Some((slug, suffix)) = subdomain.split_once("--") {
-        if ClientSubdomain::parse(suffix)? != client_subdomain {
-            bail!("share host belongs to another client subdomain");
-        }
-        format!("{}--{}", ShareSlug::parse(slug)?, client_subdomain)
-    } else {
-        format!("{}--{}", ShareSlug::parse(&subdomain)?, client_subdomain)
-    };
+    let subdomain = canonicalize_share_subdomain(config, &subdomain)?;
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
@@ -2860,6 +2923,50 @@ mod tests {
         )
         .expect_err("another Client suffix must be rejected");
         assert!(error.to_string().contains("another client subdomain"));
+    }
+
+    #[test]
+    fn share_subdomains_accept_adoption_endpoints_and_follow_the_current_client() {
+        let mut config = ServerConfig::empty();
+        config.client.tunnel_subdomain = Some("client-alpha".to_string());
+        config.client.subdomain_adoption =
+            Some(crate::domain::settings::config::ClientSubdomainAdoption {
+                takeover_id: "takeover-canonicalization".to_string(),
+                from_subdomain: "client-alpha".to_string(),
+                to_subdomain: "client-beta".to_string(),
+                status: crate::domain::settings::config::ClientSubdomainAdoptionStatus::Prepared,
+                activate_at_ms: 1,
+                prepared_at_ms: 1,
+                committed_at_ms: None,
+            });
+
+        assert_eq!(
+            canonicalize_share_subdomain(&config, "codex-pro--client-alpha").unwrap(),
+            "codex-pro--client-alpha"
+        );
+        assert_eq!(
+            canonicalize_share_subdomain(&config, "codex-pro--client-beta").unwrap(),
+            "codex-pro--client-alpha"
+        );
+
+        config.client.tunnel_subdomain = Some("client-beta".to_string());
+        let adoption = config.client.subdomain_adoption.as_mut().unwrap();
+        adoption.status = crate::domain::settings::config::ClientSubdomainAdoptionStatus::Committed;
+        adoption.committed_at_ms = Some(2);
+
+        assert_eq!(
+            canonicalize_share_subdomain(&config, "codex-pro").unwrap(),
+            "codex-pro--client-beta"
+        );
+        assert_eq!(
+            canonicalize_share_subdomain(&config, "codex-pro--client-alpha").unwrap(),
+            "codex-pro--client-beta"
+        );
+        assert_eq!(
+            canonicalize_share_subdomain(&config, "codex-pro--client-beta").unwrap(),
+            "codex-pro--client-beta"
+        );
+        assert!(canonicalize_share_subdomain(&config, "codex-pro--client-gamma").is_err());
     }
 
     #[test]

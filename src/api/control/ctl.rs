@@ -9,6 +9,83 @@ use crate::domain::providers::runtime::{
 type HmacSha256 = Hmac<Sha256>;
 
 const CONTROL_SIGNATURE_WINDOW_MS: i64 = 5 * 60 * 1000;
+
+pub(crate) async fn control_prepare_client_subdomain_adoption(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ControlClientSubdomainAdoptionResponse>, ApiError> {
+    verify_control_request(
+        &state,
+        PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+        &headers,
+        &body,
+    )
+    .await?;
+    let input: ControlPrepareClientSubdomainAdoptionInput =
+        serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    let adoption = state
+        .prepare_client_subdomain_adoption(
+            &input.takeover_id,
+            &input.from_subdomain,
+            &input.to_subdomain,
+            input.activate_at_ms,
+        )
+        .await
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    crate::state::schedule_client_subdomain_adoption(state, adoption.clone());
+    Ok(Json(adoption.into()))
+}
+
+pub(crate) async fn control_commit_client_subdomain_adoption(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ControlClientSubdomainAdoptionResponse>, ApiError> {
+    verify_control_request(
+        &state,
+        COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+        &headers,
+        &body,
+    )
+    .await?;
+    let input: ControlClientSubdomainAdoptionIdInput =
+        serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    let (adoption, activated) = state
+        .commit_client_subdomain_adoption(&input.takeover_id)
+        .await
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    if activated {
+        crate::state::spawn_client_subdomain_adoption_reconnect(state, "subdomain_adoption_commit");
+    }
+    Ok(Json(adoption.into()))
+}
+
+pub(crate) async fn control_abort_client_subdomain_adoption(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ControlAbortClientSubdomainAdoptionResponse>, ApiError> {
+    verify_control_request(
+        &state,
+        ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+        &headers,
+        &body,
+    )
+    .await?;
+    let input: ControlClientSubdomainAdoptionIdInput =
+        serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    let aborted = state
+        .abort_client_subdomain_adoption(&input.takeover_id)
+        .await
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    Ok(Json(ControlAbortClientSubdomainAdoptionResponse {
+        ok: true,
+        takeover_id: input.takeover_id,
+        aborted,
+    }))
+}
+
 pub(crate) async fn control_apply_share_settings(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -748,6 +825,60 @@ async fn commit_control_quota_update(
 pub(crate) struct ControlApplyShareSettingsInput {
     share_id: String,
     patch: ShareSettingsPatch,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ControlPrepareClientSubdomainAdoptionInput {
+    takeover_id: String,
+    from_subdomain: String,
+    to_subdomain: String,
+    activate_at_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ControlClientSubdomainAdoptionIdInput {
+    takeover_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlClientSubdomainAdoptionResponse {
+    ok: bool,
+    takeover_id: String,
+    from_subdomain: String,
+    to_subdomain: String,
+    status: crate::domain::settings::config::ClientSubdomainAdoptionStatus,
+    activate_at_ms: i64,
+    prepared_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_at_ms: Option<i64>,
+}
+
+impl From<crate::domain::settings::config::ClientSubdomainAdoption>
+    for ControlClientSubdomainAdoptionResponse
+{
+    fn from(value: crate::domain::settings::config::ClientSubdomainAdoption) -> Self {
+        Self {
+            ok: true,
+            takeover_id: value.takeover_id,
+            from_subdomain: value.from_subdomain,
+            to_subdomain: value.to_subdomain,
+            status: value.status,
+            activate_at_ms: value.activate_at_ms,
+            prepared_at_ms: value.prepared_at_ms,
+            committed_at_ms: value.committed_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlAbortClientSubdomainAdoptionResponse {
+    ok: bool,
+    takeover_id: String,
+    aborted: bool,
 }
 
 #[derive(Debug, Serialize)]
