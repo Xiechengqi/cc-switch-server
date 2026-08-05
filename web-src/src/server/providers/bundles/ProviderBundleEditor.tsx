@@ -20,7 +20,10 @@ import { toast } from "sonner";
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
+import { MarketSelectorField } from "@/components/providers/ProviderShareSection";
+import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
+import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,20 +42,23 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { EmailTagsInput } from "@/components/ui/tags-input";
 import { Textarea } from "@/components/ui/textarea";
 import type {
   ProviderBundleView,
   ProviderCustomBinding,
 } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
-import { shareApi } from "@/lib/api/share";
+import { shareApi, type ShareUserPolicy } from "@/lib/api/share";
 import { normalizeManagedAuthProvider } from "@/lib/authBinding";
 import { copyText } from "@/lib/clipboard";
 import {
   managedAccountKeys,
   shareKeys,
+  useClientTunnelQuery,
   useManagedAccountsQuery,
   useSharesQuery,
+  useTokenMarketsQuery,
 } from "@/lib/query";
 import {
   customPolicyForProfile,
@@ -69,11 +75,17 @@ import {
 } from "@/server/providers/editor/providerDraft";
 import { SecretInput } from "@/server/ui/SecretInput";
 import { cn } from "@/lib/utils";
-import { SHARE_TOKEN_PRESETS } from "@/utils/shareFormUtils";
+import {
+  buildShareUserGrantsForAcl,
+  isValidShareEmail,
+  SHARE_TOKEN_PRESETS,
+  uniqueSortedEmails,
+} from "@/utils/shareFormUtils";
 import { DEFAULT_PARALLEL_LIMIT } from "@/utils/shareUtils";
 import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
+  isValidShareSlug,
   saveBundleShare,
   shareForBundle,
   type ProviderBundleShareDraft,
@@ -139,7 +151,7 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="space-y-4 border-b border-border/60 pb-6 last:border-0">
+    <section className="space-y-4 pb-6">
       <h2 className="flex items-center gap-2 text-sm font-semibold">
         {icon}
         {title}
@@ -489,7 +501,7 @@ function SurfaceEditor({
       </div>
 
       {surface.runtime ? (
-        <Collapsible className="border-t border-border/60 pt-4">
+        <Collapsible className="pt-4">
           <div className="flex items-center justify-between gap-2">
             <CollapsibleTrigger asChild>
               <Button type="button" variant="ghost" size="sm">
@@ -522,18 +534,166 @@ function SurfaceEditor({
   );
 }
 
+function positiveShareLimit(value: string): number | undefined {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function defaultBundleUserPolicy(
+  draft: ProviderBundleShareDraft,
+): ShareUserPolicy {
+  const expiryPreset = BUNDLE_SHARE_EXPIRY_PRESETS.find(
+    (preset) => preset.value === draft.expiry,
+  );
+  return {
+    parallelLimit: positiveShareLimit(draft.parallelLimit),
+    tokenLimit: positiveShareLimit(draft.tokenLimit),
+    tokenPeriod: "lifetime",
+    expiresAt: expiryPreset
+      ? Date.now() + expiryPreset.seconds * 1000
+      : undefined,
+  };
+}
+
 function BundleShareEditor({
   draft,
   onChange,
+  ownerEmail,
   shareUrl,
   onOpenShareSettings,
 }: {
   draft: ProviderBundleShareDraft;
   onChange: (draft: ProviderBundleShareDraft) => void;
+  ownerEmail: string;
   shareUrl?: string | null;
   onOpenShareSettings?: () => void;
 }) {
   const { t } = useTranslation();
+  const [marketSelectKey, setMarketSelectKey] = useState(0);
+  const marketsQuery = useTokenMarketsQuery(
+    draft.enabled && draft.forSale === "Yes",
+  );
+  const markets = marketsQuery.data ?? [];
+  const marketEmails = useMemo(
+    () => new Set(markets.map((market) => market.email.trim().toLowerCase())),
+    [markets],
+  );
+  const routerManagedEmails = useMemo(
+    () =>
+      new Set(
+        Object.values(draft.userGrants)
+          .filter(
+            (grant) =>
+              grant.active !== false && grant.manager === "routerShareMarket",
+          )
+          .map((grant) => grant.email.trim().toLowerCase()),
+      ),
+    [draft.userGrants],
+  );
+  const selectedMarketEmails = useMemo(
+    () =>
+      draft.marketAccessMode === "selected"
+        ? draft.sharedWithEmails.filter(
+            (email) =>
+              marketEmails.has(email.toLowerCase()) &&
+              !routerManagedEmails.has(email.toLowerCase()),
+          )
+        : [],
+    [
+      draft.marketAccessMode,
+      draft.sharedWithEmails,
+      marketEmails,
+      routerManagedEmails,
+    ],
+  );
+  const directEmails = useMemo(
+    () =>
+      draft.sharedWithEmails.filter(
+        (email) =>
+          !marketEmails.has(email.toLowerCase()) &&
+          !routerManagedEmails.has(email.toLowerCase()),
+      ),
+    [draft.sharedWithEmails, marketEmails, routerManagedEmails],
+  );
+  const normalizedOwnerEmail = ownerEmail.trim().toLowerCase();
+  const defaultUserPolicy = useMemo(
+    () => defaultBundleUserPolicy(draft),
+    [draft.expiry, draft.parallelLimit, draft.tokenLimit],
+  );
+  const displayedUserGrants = useMemo(
+    () =>
+      buildShareUserGrantsForAcl({
+        source: draft.userGrants,
+        ownerEmail: normalizedOwnerEmail,
+        aclEmails: draft.sharedWithEmails,
+        defaultPolicy: defaultUserPolicy,
+      }),
+    [
+      defaultUserPolicy,
+      draft.sharedWithEmails,
+      draft.userGrants,
+      normalizedOwnerEmail,
+    ],
+  );
+  const slugInvalid = Boolean(
+    draft.subdomain.trim() && !isValidShareSlug(draft.subdomain),
+  );
+  const directEmailInvalid = directEmails.some(
+    (email) => !isValidShareEmail(email),
+  );
+  const marketsError =
+    marketsQuery.error instanceof Error
+      ? marketsQuery.error.message
+      : marketsQuery.error
+        ? String(marketsQuery.error)
+        : undefined;
+
+  const updateAccessEmails = (
+    emails: string[],
+    patch: Partial<ProviderBundleShareDraft> = {},
+  ) => {
+    const normalizedEmails = uniqueSortedEmails(
+      emails.map((email) => email.trim().toLowerCase()).filter(Boolean),
+    );
+    const sourceGrants = patch.userGrants ?? draft.userGrants;
+    onChange({
+      ...draft,
+      ...patch,
+      sharedWithEmails: normalizedEmails,
+      userGrants: buildShareUserGrantsForAcl({
+        source: sourceGrants,
+        ownerEmail: normalizedOwnerEmail,
+        aclEmails: normalizedEmails,
+        defaultPolicy: defaultUserPolicy,
+      }),
+    });
+  };
+
+  const updateDirectEmails = (emails: string[]) =>
+    updateAccessEmails([...emails, ...selectedMarketEmails]);
+
+  const updateMarketEmails = (emails: string[]) =>
+    updateAccessEmails([...directEmails, ...emails], {
+      marketAccessMode: "selected",
+    });
+
+  const updateUserGrants = (
+    userGrants: ProviderBundleShareDraft["userGrants"],
+  ) => {
+    const sharedWithEmails = uniqueSortedEmails(
+      Object.values(userGrants)
+        .filter(
+          (grant) =>
+            grant.active !== false &&
+            grant.role === "shareto" &&
+            grant.manager !== "routerShareMarket",
+        )
+        .map((grant) => grant.email.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    onChange({ ...draft, sharedWithEmails, userGrants });
+  };
+
   return (
     <Section
       title={t("provider.share.sectionTitle", { defaultValue: "远程分享" })}
@@ -586,15 +746,34 @@ function BundleShareEditor({
       {draft.enabled ? (
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
-            <Label>
+            <Label htmlFor="bundle-share-subdomain">
               {t("provider.share.subdomain", { defaultValue: "分享子域名" })}
             </Label>
-            <Input
-              value={draft.subdomain}
-              onChange={(event) =>
-                onChange({ ...draft, subdomain: event.target.value })
-              }
-            />
+            <div className="flex items-center gap-2">
+              <Input
+                id="bundle-share-subdomain"
+                value={draft.subdomain}
+                aria-invalid={slugInvalid}
+                className={cn(slugInvalid && "border-destructive")}
+                onChange={(event) =>
+                  onChange({ ...draft, subdomain: event.target.value })
+                }
+              />
+              <SubdomainGeneratorButton
+                embedded={false}
+                onGenerated={(subdomain) => onChange({ ...draft, subdomain })}
+                onError={(message) => toast.error(message)}
+                suggest={() => shareApi.suggestShareSlug()}
+              />
+            </div>
+            {slugInvalid ? (
+              <p className="text-xs text-destructive">
+                {t("share.validation.invalidShareSlug", {
+                  defaultValue:
+                    "Share slug must be 6-30 lowercase DNS characters without '--'",
+                })}
+              </p>
+            ) : null}
           </div>
           <div className="space-y-2">
             <Label>
@@ -602,12 +781,14 @@ function BundleShareEditor({
             </Label>
             <Select
               value={draft.forSale}
-              onValueChange={(forSale) =>
-                onChange({
-                  ...draft,
-                  forSale: forSale as ProviderBundleShareDraft["forSale"],
-                })
-              }
+              onValueChange={(forSale) => {
+                const next = forSale as ProviderBundleShareDraft["forSale"];
+                if (next === "Yes") {
+                  onChange({ ...draft, forSale: next });
+                  return;
+                }
+                updateAccessEmails(directEmails, { forSale: next });
+              }}
             >
               <SelectTrigger>
                 <SelectValue />
@@ -637,16 +818,56 @@ function BundleShareEditor({
             />
           </div>
           <div className="space-y-2 md:col-span-2">
-            <Label>
+            <Label htmlFor="bundle-share-authorized-emails">
               {t("provider.share.sharedWith", { defaultValue: "授权邮箱" })}
             </Label>
-            <Input
-              value={draft.sharedWithEmails}
-              onChange={(event) =>
-                onChange({ ...draft, sharedWithEmails: event.target.value })
-              }
+            <EmailTagsInput
+              inputId="bundle-share-authorized-emails"
+              value={directEmails}
+              invalid={directEmailInvalid}
+              placeholder={t("share.sharedWithEmails", {
+                defaultValue: "输入邮箱后按 Enter 添加",
+              })}
+              onChange={updateDirectEmails}
             />
+            {directEmailInvalid ? (
+              <p className="text-xs text-destructive">
+                {t("share.validation.invalidEmail", {
+                  defaultValue: "邮箱格式无效",
+                })}
+              </p>
+            ) : null}
           </div>
+          {draft.forSale === "Yes" ? (
+            <MarketSelectorField
+              markets={markets}
+              marketAccessMode={draft.marketAccessMode}
+              selectedMarketEmails={selectedMarketEmails}
+              marketSelectKey={marketSelectKey}
+              disabled={marketsQuery.isLoading || marketsQuery.isError}
+              marketsLoading={marketsQuery.isLoading}
+              marketsError={marketsError}
+              onRetryMarkets={() => void marketsQuery.refetch()}
+              onMarketAccessModeChange={(marketAccessMode) => {
+                if (marketAccessMode === "all") {
+                  updateAccessEmails(directEmails, { marketAccessMode });
+                  return;
+                }
+                updateAccessEmails([...directEmails, ...selectedMarketEmails], {
+                  marketAccessMode,
+                });
+              }}
+              onSelectedMarketEmailsChange={updateMarketEmails}
+              onMarketSelectKeyChange={setMarketSelectKey}
+            />
+          ) : null}
+          <ShareUserGrantsEditor
+            value={displayedUserGrants}
+            ownerEmail={normalizedOwnerEmail}
+            defaultPolicy={defaultUserPolicy}
+            protectedEmails={routerManagedEmails}
+            onChange={updateUserGrants}
+          />
           <div className="space-y-2">
             <Label>
               {t("provider.share.tokenLimit", { defaultValue: "Token 限额" })}
@@ -820,6 +1041,7 @@ export function ProviderBundleEditor({
   const [saving, setSaving] = useState(false);
   const shareSectionRef = useRef<HTMLDivElement>(null);
   const sharesQuery = useSharesQuery();
+  const clientTunnelQuery = useClientTunnelQuery();
   const existingShare = shareForBundle(sharesQuery.data, draft.id);
   const [shareDraft, setShareDraft] = useState<ProviderBundleShareDraft>(() =>
     createBundleShareDraft(existingShare),
@@ -859,6 +1081,10 @@ export function ProviderBundleEditor({
       ? driverForProfile(profile)?.driverId === "oauth.openai_codex"
       : false;
   });
+  const ownerEmail =
+    existingShare?.ownerEmail ??
+    clientTunnelQuery.data?.config.ownerEmail ??
+    "";
 
   useEffect(() => {
     if (!draft.accountId || draft.accountGeneration != null) return;
@@ -945,6 +1171,29 @@ export function ProviderBundleEditor({
     const validation = validateProviderBundleDraft(draft);
     if (validation) {
       toast.error(validation);
+      return;
+    }
+    if (
+      shareDraft.enabled &&
+      shareDraft.subdomain.trim() &&
+      !isValidShareSlug(shareDraft.subdomain)
+    ) {
+      toast.error(
+        t("share.validation.invalidShareSlug", {
+          defaultValue:
+            "Share slug must be 6-30 lowercase DNS characters without '--'",
+        }),
+      );
+      return;
+    }
+    if (
+      shareDraft.sharedWithEmails.some((email) => !isValidShareEmail(email))
+    ) {
+      toast.error(
+        t("share.validation.invalidEmail", {
+          defaultValue: "邮箱格式无效",
+        }),
+      );
       return;
     }
     setSaving(true);
@@ -1186,7 +1435,7 @@ export function ProviderBundleEditor({
         ) : null}
 
         <Section title={t("serverProviderForm.model.title")}>
-          <div className="grid gap-4 md:grid-cols-[minmax(0,22rem)_minmax(0,1fr)] md:items-start">
+          <div className="max-w-xl space-y-4">
             <div className="space-y-2">
               {allowedModelPolicies.length > 1 ? (
                 <Tabs
@@ -1326,7 +1575,7 @@ export function ProviderBundleEditor({
         ) : null}
 
         <Section
-          title={t("providerBundle.surfaces", { defaultValue: "API Surface" })}
+          title={t("providerBundle.surfaces", { defaultValue: "应用接口" })}
         >
           <Tabs
             value={activeApp}
@@ -1362,13 +1611,14 @@ export function ProviderBundleEditor({
           <BundleShareEditor
             draft={shareDraft}
             onChange={setShareDraft}
+            ownerEmail={ownerEmail}
             shareUrl={shareUrl}
             onOpenShareSettings={onOpenShareSettings}
           />
         </div>
       </div>
 
-      <div className="sticky bottom-0 z-20 flex items-center justify-end gap-2 border-t bg-background/95 py-4 backdrop-blur">
+      <div className="sticky bottom-0 z-20 flex items-center justify-end gap-2 bg-background/95 py-4 backdrop-blur">
         <Button
           type="button"
           variant="outline"

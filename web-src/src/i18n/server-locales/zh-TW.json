@@ -25,7 +25,7 @@
     "selectAccount": "選擇 OAuth 帳號",
     "surfaceCredential": "驗證憑證",
     "surfaceEnabled": "啟用 API",
-    "surfaces": "API Surface",
+    "surfaces": "應用介面",
     "title": "供應商"
   },
   "provider": {
@@ -57,7 +57,8 @@
   "share": {
     "unsupportedApp": "{{app}} 暫不支援分享；請切換至 Claude、Codex 或 Gemini 分頁後再建立 Share。",
     "validation": {
-      "invalidEmail": "電子郵件格式無效"
+      "invalidEmail": "電子郵件格式無效",
+      "invalidShareSlug": "Share slug 必須為 6-30 位小寫 DNS 字元，以字母開頭，不得以連字號結尾，且不得包含「--」或保留名稱"
     },
     "market": {
       "allSelected": "已選取所有 Market"
@@ -121,7 +122,7 @@
     "loadFailed": "無法載入設定，請重新整理頁面後再試。",
     "selectFileFailed": "選擇目錄失敗",
     "authCenter": {
-      "serverDescription": "管理供應商節點及其 API Surface 使用的官方 OAuth 帳號。",
+      "serverDescription": "管理供應商節點及其應用介面使用的官方 OAuth 帳號。",
       "claudeOauthDescription": "管理 Claude 官方訂閱帳號",
       "grokOauthDescription": "管理 Grok/xAI 訂閱帳號",
       "kiroOauthDescription": "管理 Kiro AWS Builder ID 帳號",

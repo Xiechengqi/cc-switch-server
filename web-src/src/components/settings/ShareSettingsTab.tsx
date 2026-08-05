@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import { Activity, Laptop, Network } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
@@ -61,13 +67,13 @@ function ShareSettingsAccordionItem({
       className="rounded-xl glass-card overflow-hidden"
     >
       <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
             {icon}
           </div>
-          <div className="text-left">
-            <h3 className="text-base font-semibold">{title}</h3>
-            <p className="text-sm font-normal text-muted-foreground">
+          <div className="min-w-0 space-y-1 text-left">
+            <h3 className="text-sm font-medium leading-none">{title}</h3>
+            <p className="text-xs font-normal text-muted-foreground">
               {description}
             </p>
           </div>
@@ -135,9 +141,7 @@ export function ShareSettingsTab({ onSaveStateChange }: ShareSettingsTabProps) {
             error instanceof Error
               ? error.message
               : "share.validation.invalidRouterDomain";
-          setRouterDomainError(
-            t(key, { defaultValue: "Router 域名无效" }),
-          );
+          setRouterDomainError(t(key, { defaultValue: "Router 域名无效" }));
           throw error;
         }),
       );
@@ -146,20 +150,13 @@ export function ShareSettingsTab({ onSaveStateChange }: ShareSettingsTabProps) {
       tasks.push(clientFormState.save());
     }
     await Promise.all(tasks);
-  }, [
-    clientFormState,
-    handleSaveRouter,
-    routerDirty,
-    t,
-  ]);
+  }, [clientFormState, handleSaveRouter, routerDirty, t]);
 
   const canSave =
-    routerDirty ||
-    (clientFormState?.dirty === true && clientFormState.canSave);
+    routerDirty || (clientFormState?.dirty === true && clientFormState.canSave);
 
   const isSaving =
-    configureTunnelMutation.isPending ||
-    clientFormState?.isSaving === true;
+    configureTunnelMutation.isPending || clientFormState?.isSaving === true;
 
   useEffect(() => {
     if (!onSaveStateChange) return;

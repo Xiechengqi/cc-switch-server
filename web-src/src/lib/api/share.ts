@@ -238,6 +238,7 @@ export interface SaveProviderBundleShareParams {
   parallelLimit: number;
   expiresAt: string;
   sharedWithEmails: string[];
+  userGrants?: ShareUserGrantMap;
 }
 
 export interface UpdateShareTokenLimitParams {

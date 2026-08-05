@@ -33,9 +33,13 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Button } from "@/components/ui/button";
 import type { ProviderBundleView } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
-import { useManagedAccountsQuery, useSharesQuery } from "@/lib/query";
+import {
+  shareKeys,
+  useManagedAccountsQuery,
+  useSharesQuery,
+} from "@/lib/query";
 import { cn } from "@/lib/utils";
-import { shareForBundle } from "./bundleShare";
+import { enableBundleShare, shareForBundle } from "./bundleShare";
 import { ProviderBundleCard } from "./ProviderBundleCard";
 import { ProviderBundleEditor } from "./ProviderBundleEditor";
 
@@ -95,6 +99,9 @@ export function ProviderBundlesPage({
   const [deleting, setDeleting] = useState<ProviderBundleView | null>(null);
   const [deletePending, setDeletePending] = useState(false);
   const [sortPending, setSortPending] = useState(false);
+  const [sharePendingBundleId, setSharePendingBundleId] = useState<
+    string | null
+  >(null);
   const bundles = bundlesQuery.data ?? [];
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -162,6 +169,28 @@ export function ProviderBundlesPage({
     [bundles, queryClient, sortPending, t],
   );
 
+  const handleEnableShare = async (bundle: ProviderBundleView) => {
+    if (sharePendingBundleId) return;
+    setSharePendingBundleId(bundle.id);
+    try {
+      await enableBundleShare(bundle.id, sharesByBundle.get(bundle.id));
+      await queryClient.invalidateQueries({ queryKey: shareKeys.list() });
+      toast.success(
+        t("share.toast.enableSuccess", { defaultValue: "分享已开启" }),
+      );
+    } catch (error) {
+      void queryClient.invalidateQueries({ queryKey: shareKeys.list() });
+      toast.error(
+        t("share.toast.enableError", {
+          defaultValue: "开启分享失败：{{error}}",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setSharePendingBundleId(null);
+    }
+  };
+
   if (editing) {
     return (
       <ProviderBundleEditor
@@ -222,7 +251,13 @@ export function ProviderBundlesPage({
             variant="outline"
             title={t("common.refresh")}
             disabled={bundlesQuery.isFetching}
-            onClick={() => void bundlesQuery.refetch()}
+            onClick={() =>
+              void Promise.all([
+                bundlesQuery.refetch(),
+                sharesQuery.refetch(),
+                accountsQuery.refetch(),
+              ])
+            }
           >
             <RefreshCw
               className={cn(
@@ -296,13 +331,13 @@ export function ProviderBundlesPage({
                   accounts={accountsQuery.data ?? []}
                   onEdit={() => setEditing({ mode: "edit", bundle })}
                   onDuplicate={() => setEditing({ mode: "duplicate", bundle })}
-                  onOpenShare={() =>
-                    setEditing({
-                      mode: "edit",
-                      bundle,
-                      initialSection: "share",
-                    })
+                  sharePending={sharePendingBundleId === bundle.id}
+                  shareActionDisabled={
+                    sharesQuery.isLoading ||
+                    sharesQuery.isError ||
+                    sharePendingBundleId !== null
                   }
+                  onEnableShare={() => void handleEnableShare(bundle)}
                   onDelete={() => setDeleting(bundle)}
                 />
               ))}

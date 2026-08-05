@@ -48,13 +48,15 @@ export function ServerUpgradePolicySettings() {
         className="rounded-xl glass-card overflow-hidden"
       >
         <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-          <div className="flex items-center gap-3">
-            <Shield className="h-5 w-5 text-violet-500" />
-            <div className="text-left">
-              <h3 className="text-base font-semibold">
-                {t("settings.upgradePolicy.title", { defaultValue: "升级策略" })}
+          <div className="flex min-w-0 flex-1 items-center gap-3">
+            <Shield className="h-5 w-5 shrink-0 text-violet-500" />
+            <div className="min-w-0 space-y-1 text-left">
+              <h3 className="text-sm font-medium leading-none">
+                {t("settings.upgradePolicy.title", {
+                  defaultValue: "升级策略",
+                })}
               </h3>
-              <p className="text-sm text-muted-foreground font-normal">
+              <p className="text-xs font-normal text-muted-foreground">
                 {t("settings.upgradePolicy.description", {
                   defaultValue: "控制 Router 代升级与后台自动检查更新行为。",
                 })}

@@ -57,7 +57,8 @@
   "share": {
     "unsupportedApp": "{{app}} does not support sharing. Switch to the Claude, Codex, or Gemini tab to create a Share.",
     "validation": {
-      "invalidEmail": "Invalid email address"
+      "invalidEmail": "Invalid email address",
+      "invalidShareSlug": "Share slug must be 6-30 lowercase DNS characters, start with a letter, not end with a hyphen, and contain neither '--' nor a reserved name"
     },
     "market": {
       "allSelected": "All Markets selected"

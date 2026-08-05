@@ -1,4 +1,14 @@
-import { shareApi, type ShareRecord } from "@/lib/api/share";
+import {
+  shareApi,
+  type ShareRecord,
+  type ShareUserGrantMap,
+  type ShareUserPolicy,
+} from "@/lib/api/share";
+import {
+  buildShareUserGrantsForAcl,
+  isValidShareEmail,
+  normalizeShareEmails,
+} from "@/utils/shareFormUtils";
 import {
   PERMANENT_EXPIRES_AT,
   UNLIMITED_PARALLEL_LIMIT,
@@ -14,7 +24,8 @@ export interface ProviderBundleShareDraft {
   tokenLimit: string;
   parallelLimit: string;
   expiry: ProviderBundleShareExpiry;
-  sharedWithEmails: string;
+  sharedWithEmails: string[];
+  userGrants: ShareUserGrantMap;
 }
 
 export const BUNDLE_SHARE_EXPIRY_PRESETS = [
@@ -35,6 +46,25 @@ export const BUNDLE_SHARE_EXPIRY_PRESETS = [
 
 export type ProviderBundleShareExpiry =
   "permanent" | (typeof BUNDLE_SHARE_EXPIRY_PRESETS)[number]["value"];
+
+const RESERVED_SHARE_SLUGS = new Set([
+  "admin",
+  "api",
+  "cdn-cgi",
+  "router",
+  "www",
+]);
+
+export function isValidShareSlug(value: string): boolean {
+  const slug = value.trim();
+  return (
+    slug.length >= 6 &&
+    slug.length <= 30 &&
+    !slug.includes("--") &&
+    !RESERVED_SHARE_SLUGS.has(slug) &&
+    /^[a-z][a-z0-9-]*[a-z0-9]$/.test(slug)
+  );
+}
 
 export function shareForBundle(
   shares: ShareRecord[] | undefined,
@@ -59,6 +89,17 @@ export function createBundleShareDraft(
             ? preset
             : closest,
         ).value;
+  const sharedWithEmails = normalizeShareEmails(share?.sharedWithEmails ?? []);
+  const defaultPolicy: ShareUserPolicy = {
+    parallelLimit:
+      share && share.parallelLimit > 0 ? share.parallelLimit : undefined,
+    tokenLimit: share && share.tokenLimit > 0 ? share.tokenLimit : undefined,
+    tokenPeriod: "lifetime",
+    expiresAt:
+      Number.isFinite(expiresAt) && expiresAt < Date.parse(PERMANENT_EXPIRES_AT)
+        ? expiresAt
+        : undefined,
+  };
   return {
     enabled: Boolean(
       share && share.status !== "paused" && share.status !== "deleted",
@@ -71,7 +112,15 @@ export function createBundleShareDraft(
     parallelLimit:
       share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "",
     expiry,
-    sharedWithEmails: share?.sharedWithEmails.join(", ") ?? "",
+    sharedWithEmails,
+    userGrants: share
+      ? buildShareUserGrantsForAcl({
+          source: share.userGrants,
+          ownerEmail: share.ownerEmail,
+          aclEmails: sharedWithEmails,
+          defaultPolicy,
+        })
+      : {},
   };
 }
 
@@ -93,32 +142,34 @@ function expiresAt(draft: ProviderBundleShareDraft): string {
   return new Date(Date.now() + preset.seconds * 1000).toISOString();
 }
 
-function normalizedEmails(value: string): string[] {
-  const emails = value
-    .split(/[\s,;]+/)
-    .map((email) => email.trim().toLowerCase())
-    .filter(Boolean);
-  return [...new Set(emails)].sort();
-}
-
 export async function saveBundleShare(
   bundleId: string,
   draft: ProviderBundleShareDraft,
   existing?: ShareRecord,
 ): Promise<ShareRecord | undefined> {
+  const subdomain = draft.subdomain.trim();
+  if (draft.enabled && subdomain && !isValidShareSlug(subdomain)) {
+    throw new Error("Share slug is invalid");
+  }
+  if (draft.sharedWithEmails.some((email) => !isValidShareEmail(email))) {
+    throw new Error("Share email is invalid");
+  }
   const tokenLimit = limitValue(draft.tokenLimit, UNLIMITED_TOKEN_LIMIT);
   const parallelLimit = limitValue(
     draft.parallelLimit,
     UNLIMITED_PARALLEL_LIMIT,
   );
   const expiry = expiresAt(draft);
-  const sharedWithEmails = normalizedEmails(draft.sharedWithEmails);
+  const sharedWithEmails = normalizeShareEmails(draft.sharedWithEmails);
+  const userGrants = Object.keys(draft.userGrants).length
+    ? draft.userGrants
+    : undefined;
   return shareApi.saveProviderBundleShare({
     bundleId,
     shareId: existing?.id,
     expectedConfigRevision: existing?.configRevision,
     enabled: draft.enabled,
-    subdomain: draft.subdomain.trim() || existing?.shareSlug || "",
+    subdomain: subdomain || existing?.shareSlug || "",
     description: draft.description.trim() || undefined,
     forSale: draft.forSale,
     marketAccessMode: draft.marketAccessMode,
@@ -126,5 +177,19 @@ export async function saveBundleShare(
     parallelLimit,
     expiresAt: expiry,
     sharedWithEmails,
+    userGrants,
   });
+}
+
+export async function enableBundleShare(
+  bundleId: string,
+  existing?: ShareRecord,
+): Promise<ShareRecord | undefined> {
+  const draft = createBundleShareDraft(existing);
+  draft.enabled = true;
+  if (!draft.subdomain.trim()) {
+    const suggestion = await shareApi.suggestShareSlug();
+    draft.subdomain = suggestion.subdomain;
+  }
+  return saveBundleShare(bundleId, draft, existing);
 }

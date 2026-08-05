@@ -5,6 +5,7 @@ import { PERMANENT_EXPIRES_AT } from "@/utils/shareUtils";
 
 const shareApiMock = vi.hoisted(() => ({
   saveProviderBundleShare: vi.fn(),
+  suggestShareSlug: vi.fn(),
 }));
 
 vi.mock("@/lib/api/share", async (importOriginal) => {
@@ -15,6 +16,8 @@ vi.mock("@/lib/api/share", async (importOriginal) => {
 import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
+  enableBundleShare,
+  isValidShareSlug,
   saveBundleShare,
   shareForBundle,
 } from "./bundleShare";
@@ -69,7 +72,19 @@ describe("Provider Bundle sharing", () => {
       tokenLimit: "",
       parallelLimit: "",
       expiry: "permanent",
+      sharedWithEmails: [],
+      userGrants: {},
     });
+  });
+
+  it("matches the Router share slug contract before saving", () => {
+    expect(isValidShareSlug("share-1")).toBe(true);
+    expect(isValidShareSlug("a12345")).toBe(true);
+    expect(isValidShareSlug("short")).toBe(false);
+    expect(isValidShareSlug("Uppercase")).toBe(false);
+    expect(isValidShareSlug("share--one")).toBe(false);
+    expect(isValidShareSlug("share-")).toBe(false);
+    expect(isValidShareSlug("router")).toBe(false);
   });
 
   it("maps every quick expiry preset to and from an absolute timestamp", async () => {
@@ -134,6 +149,76 @@ describe("Provider Bundle sharing", () => {
     expect(
       shareApiMock.saveProviderBundleShare.mock.calls[0]?.[0],
     ).not.toHaveProperty("bindings");
+  });
+
+  it("quick-enables a Bundle Share with a suggested slug", async () => {
+    const created = share({ claude: "bundle-1" });
+    shareApiMock.suggestShareSlug.mockResolvedValue({
+      subdomain: "quick-share",
+    });
+    shareApiMock.saveProviderBundleShare.mockResolvedValue(created);
+
+    const result = await enableBundleShare("bundle-1");
+
+    expect(result).toBe(created);
+    expect(shareApiMock.suggestShareSlug).toHaveBeenCalledTimes(1);
+    expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bundleId: "bundle-1",
+        enabled: true,
+        subdomain: "quick-share",
+      }),
+    );
+  });
+
+  it("quick-resumes an existing Bundle Share without replacing its slug", async () => {
+    const existing = {
+      ...share({ claude: "bundle-1" }, 7),
+      status: "paused",
+    };
+    const resumed = { ...existing, status: "active", configRevision: 8 };
+    shareApiMock.saveProviderBundleShare.mockResolvedValue(resumed);
+
+    await enableBundleShare("bundle-1", existing);
+
+    expect(shareApiMock.suggestShareSlug).not.toHaveBeenCalled();
+    expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        shareId: "share-1",
+        expectedConfigRevision: 7,
+        enabled: true,
+        subdomain: "bundle-share",
+      }),
+    );
+  });
+
+  it("persists per-email user limits through the Bundle command", async () => {
+    shareApiMock.saveProviderBundleShare.mockResolvedValue(undefined);
+    const draft = createBundleShareDraft();
+    draft.enabled = true;
+    draft.subdomain = "bundle-share";
+    draft.sharedWithEmails = ["friend@example.com"];
+    draft.userGrants = {
+      "friend@example.com": {
+        email: "friend@example.com",
+        role: "shareto",
+        active: true,
+        policy: {
+          parallelLimit: 2,
+          tokenLimit: 10_000,
+          tokenPeriod: "day",
+        },
+      },
+    };
+
+    await saveBundleShare("bundle-1", draft);
+
+    expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sharedWithEmails: ["friend@example.com"],
+        userGrants: draft.userGrants,
+      }),
+    );
   });
 
   it("saves binding reconciliation and settings through one atomic command", async () => {

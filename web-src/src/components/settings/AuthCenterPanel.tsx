@@ -80,13 +80,13 @@ function AuthProviderAccordionItem({
       className="rounded-xl glass-card overflow-hidden"
     >
       <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
             {icon}
           </div>
-          <div className="text-left">
-            <h3 className="text-base font-semibold">{title}</h3>
-            <p className="text-sm font-normal text-muted-foreground">
+          <div className="min-w-0 space-y-1 text-left">
+            <h3 className="text-sm font-medium leading-none">{title}</h3>
+            <p className="text-xs font-normal text-muted-foreground">
               {description}
             </p>
           </div>

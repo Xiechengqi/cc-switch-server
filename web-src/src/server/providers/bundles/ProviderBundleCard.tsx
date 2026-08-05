@@ -145,7 +145,9 @@ interface ProviderBundleCardProps {
   accounts: ManagedAuthAccount[];
   onEdit: () => void;
   onDuplicate: () => void;
-  onOpenShare: () => void;
+  sharePending?: boolean;
+  shareActionDisabled?: boolean;
+  onEnableShare: () => void;
   onDelete: () => void;
   dragHandleProps?: {
     attributes: DraggableAttributes;
@@ -160,7 +162,9 @@ export function ProviderBundleCard({
   accounts,
   onEdit,
   onDuplicate,
-  onOpenShare,
+  sharePending = false,
+  shareActionDisabled = false,
+  onEnableShare,
   onDelete,
   dragHandleProps,
 }: ProviderBundleCardProps) {
@@ -316,9 +320,14 @@ export function ProviderBundleCard({
               title={t("provider.share.sectionTitle", {
                 defaultValue: "远程分享",
               })}
-              onClick={onOpenShare}
+              disabled={isSharing || sharePending || shareActionDisabled}
+              onClick={onEnableShare}
             >
-              <Share2 className="h-4 w-4" />
+              {sharePending ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <Share2 className="h-4 w-4" />
+              )}
               {shareButtonLabel}
             </Button>
 

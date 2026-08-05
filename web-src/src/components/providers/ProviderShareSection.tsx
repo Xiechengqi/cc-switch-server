@@ -10,11 +10,7 @@ import {
   Share2,
   X,
 } from "lucide-react";
-import type {
-  AppId,
-  PublicTokenMarket,
-  ShareReuseCandidate,
-} from "@/lib/api";
+import type { AppId, PublicTokenMarket, ShareReuseCandidate } from "@/lib/api";
 import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -234,9 +230,9 @@ export function ProviderShareSection({
   const shareRunning = share ? isShareRunning(share) : false;
   const routerSyncPending = Boolean(
     share &&
-      (share.descriptorGeneration === 0 ||
-        share.routerSyncedDescriptorGeneration !== share.descriptorGeneration ||
-        share.routerSyncedDescriptorFingerprint !== share.descriptorFingerprint),
+    (share.descriptorGeneration === 0 ||
+      share.routerSyncedDescriptorGeneration !== share.descriptorGeneration ||
+      share.routerSyncedDescriptorFingerprint !== share.descriptorFingerprint),
   );
   const marketsQueryEnabled = shareExists && isShareOpen;
   const {
@@ -1102,6 +1098,7 @@ export function ProviderShareSection({
                   onRetryMarkets={() => void refetchMarkets()}
                   onMarketAccessModeChange={(value) => {
                     setMarketAccessMode(value);
+                    if (value === "all") setSelectedMarketEmails([]);
                     syncUserGrantsForMarketEmails(
                       value === "selected"
                         ? normalizedSelectedMarketEmails
@@ -1377,7 +1374,7 @@ export function ProviderShareSection({
   );
 }
 
-function MarketSelectorField({
+export function MarketSelectorField({
   markets,
   marketAccessMode,
   selectedMarketEmails,
@@ -1415,7 +1412,6 @@ function MarketSelectorField({
           onValueChange={(value) => {
             if (value === "__all__") {
               onMarketAccessModeChange("all");
-              onSelectedMarketEmailsChange([]);
               onMarketSelectKeyChange((current) => current + 1);
               return;
             }

@@ -983,6 +983,8 @@ struct SaveProviderBundleShareCommand {
     expires_at: String,
     #[serde(default)]
     shared_with_emails: Vec<String>,
+    #[serde(default)]
+    user_grants: Option<BTreeMap<String, ShareUserGrant>>,
 }
 
 fn default_provider_bundle_market_access_mode() -> String {
@@ -1154,6 +1156,7 @@ fn stage_provider_bundle_share(
                     token_limit: Some(command.token_limit),
                     parallel_limit: Some(command.parallel_limit),
                     expires_at: Some(command.expires_at.clone()),
+                    user_grants: command.user_grants.clone(),
                     ..ShareSettingsPatch::default()
                 },
                 command.enabled,
@@ -1200,7 +1203,7 @@ fn stage_provider_bundle_share(
                 description,
                 bindings: bindings.to_vec(),
                 runtime_snapshot: None,
-                user_grants: BTreeMap::new(),
+                user_grants: command.user_grants.clone().unwrap_or_default(),
             },
             Some(capacity_pool_id.to_string()),
         )

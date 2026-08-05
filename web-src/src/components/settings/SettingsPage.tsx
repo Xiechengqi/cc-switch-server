@@ -386,17 +386,17 @@ export function SettingsPage({
                         className="rounded-xl glass-card overflow-hidden"
                       >
                         <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <FolderSearch className="h-5 w-5 text-primary" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
+                          <div className="flex min-w-0 flex-1 items-center gap-3">
+                            <FolderSearch className="h-5 w-5 shrink-0 text-primary" />
+                            <div className="min-w-0 space-y-1 text-left">
+                              <h3 className="text-sm font-medium leading-none">
                                 {serverMode
                                   ? t("settings.serverConfigDir.title", {
                                       defaultValue: "Server 配置目录",
                                     })
                                   : t("settings.advanced.configDir.title")}
                               </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
+                              <p className="text-xs font-normal text-muted-foreground">
                                 {serverMode
                                   ? t("settings.serverConfigDir.description", {
                                       defaultValue:
@@ -442,15 +442,15 @@ export function SettingsPage({
                         className="rounded-xl glass-card overflow-hidden"
                       >
                         <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <HardDriveDownload className="h-5 w-5 text-amber-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
+                          <div className="flex min-w-0 flex-1 items-center gap-3">
+                            <HardDriveDownload className="h-5 w-5 shrink-0 text-amber-500" />
+                            <div className="min-w-0 space-y-1 text-left">
+                              <h3 className="text-sm font-medium leading-none">
                                 {t("settings.advanced.backup.title", {
                                   defaultValue: "Backup & Restore",
                                 })}
                               </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
+                              <p className="text-xs font-normal text-muted-foreground">
                                 {t("settings.advanced.backup.description", {
                                   defaultValue:
                                     "Manage state snapshots for this installation; migrate hosts by copying the complete stopped data directory",
@@ -476,13 +476,13 @@ export function SettingsPage({
                           className="rounded-xl glass-card overflow-hidden"
                         >
                           <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                            <div className="flex items-center gap-3">
-                              <Cloud className="h-5 w-5 text-blue-500" />
-                              <div className="text-left">
-                                <h3 className="text-base font-semibold">
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                              <Cloud className="h-5 w-5 shrink-0 text-blue-500" />
+                              <div className="min-w-0 space-y-1 text-left">
+                                <h3 className="text-sm font-medium leading-none">
                                   {t("settings.advanced.cloudSync.title")}
                                 </h3>
-                                <p className="text-sm text-muted-foreground font-normal">
+                                <p className="text-xs font-normal text-muted-foreground">
                                   {t("settings.advanced.cloudSync.description")}
                                 </p>
                               </div>
@@ -504,13 +504,13 @@ export function SettingsPage({
                         className="rounded-xl glass-card overflow-hidden"
                       >
                         <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <FlaskConical className="h-5 w-5 text-emerald-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
+                          <div className="flex min-w-0 flex-1 items-center gap-3">
+                            <FlaskConical className="h-5 w-5 shrink-0 text-emerald-500" />
+                            <div className="min-w-0 space-y-1 text-left">
+                              <h3 className="text-sm font-medium leading-none">
                                 {t("settings.advanced.modelTest.title")}
                               </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
+                              <p className="text-xs font-normal text-muted-foreground">
                                 {t("settings.advanced.modelTest.description")}
                               </p>
                             </div>
@@ -526,13 +526,13 @@ export function SettingsPage({
                         className="rounded-xl glass-card overflow-hidden"
                       >
                         <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <ScrollText className="h-5 w-5 text-cyan-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
+                          <div className="flex min-w-0 flex-1 items-center gap-3">
+                            <ScrollText className="h-5 w-5 shrink-0 text-cyan-500" />
+                            <div className="min-w-0 space-y-1 text-left">
+                              <h3 className="text-sm font-medium leading-none">
                                 {t("settings.advanced.logConfig.title")}
                               </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
+                              <p className="text-xs font-normal text-muted-foreground">
                                 {t("settings.advanced.logConfig.description")}
                               </p>
                             </div>
@@ -548,13 +548,13 @@ export function SettingsPage({
                         className="rounded-xl glass-card overflow-hidden"
                       >
                         <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                          <div className="flex items-center gap-3">
-                            <ShieldCheck className="h-5 w-5 text-amber-500" />
-                            <div className="text-left">
-                              <h3 className="text-base font-semibold">
+                          <div className="flex min-w-0 flex-1 items-center gap-3">
+                            <ShieldCheck className="h-5 w-5 shrink-0 text-amber-500" />
+                            <div className="min-w-0 space-y-1 text-left">
+                              <h3 className="text-sm font-medium leading-none">
                                 {t("settings.advanced.apiManagement.title")}
                               </h3>
-                              <p className="text-sm text-muted-foreground font-normal">
+                              <p className="text-xs font-normal text-muted-foreground">
                                 {t(
                                   "settings.advanced.apiManagement.description",
                                 )}

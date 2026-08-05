@@ -57,7 +57,8 @@
   "share": {
     "unsupportedApp": "{{app}} は Share に対応していません。Claude、Codex、Gemini のいずれかのタブに切り替えて作成してください。",
     "validation": {
-      "invalidEmail": "メールアドレスが無効です"
+      "invalidEmail": "メールアドレスが無効です",
+      "invalidShareSlug": "Share slug は 6～30 文字の小文字 DNS 文字列で、英字から始まり、ハイフンで終わらず、「--」または予約名を含まない必要があります"
     },
     "market": {
       "allSelected": "すべての Market を選択済み"

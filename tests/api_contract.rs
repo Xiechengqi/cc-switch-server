@@ -6928,7 +6928,19 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
                     "tokenLimit": 500,
                     "parallelLimit": 5,
                     "expiresAt": "2035-01-01T00:00:00Z",
-                    "sharedWithEmails": ["friend@example.com"]
+                    "sharedWithEmails": ["friend@example.com"],
+                    "userGrants": {
+                        "friend@example.com": {
+                            "email": "friend@example.com",
+                            "role": "shareto",
+                            "active": true,
+                            "policy": {
+                                "parallelLimit": 2,
+                                "tokenLimit": 120,
+                                "tokenPeriod": "day"
+                            }
+                        }
+                    }
                 }
             }),
             Some(&token),
@@ -6946,6 +6958,14 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
         .unwrap()
         .iter()
         .all(|binding| binding["providerId"] == "bundle-share-grok"));
+    assert_eq!(
+        created_share["userGrants"]["friend@example.com"]["policy"]["parallelLimit"],
+        2
+    );
+    assert_eq!(
+        created_share["userGrants"]["friend@example.com"]["policy"]["tokenPeriod"],
+        "day"
+    );
     let share_id = created_share["id"].as_str().unwrap().to_string();
 
     let mut disable_gemini = draft.clone();
@@ -6979,7 +6999,19 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
             "tokenLimit": 250,
             "parallelLimit": 3,
             "expiresAt": "2036-01-01T00:00:00Z",
-            "sharedWithEmails": ["friend@example.com", "FRIEND@example.com"]
+            "sharedWithEmails": ["friend@example.com", "FRIEND@example.com"],
+            "userGrants": {
+                "friend@example.com": {
+                    "email": "friend@example.com",
+                    "role": "shareto",
+                    "active": true,
+                    "policy": {
+                        "parallelLimit": 1,
+                        "tokenLimit": 75,
+                        "tokenPeriod": "calendarMonth"
+                    }
+                }
+            }
         }
     });
     let in_flight = state
@@ -7026,6 +7058,14 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     assert_eq!(
         reconciled["acl"]["sharedWithEmails"],
         json!(["friend@example.com"])
+    );
+    assert_eq!(
+        reconciled["userGrants"]["friend@example.com"]["policy"]["tokenLimit"],
+        75
+    );
+    assert_eq!(
+        reconciled["userGrants"]["friend@example.com"]["policy"]["tokenPeriod"],
+        "calendarMonth"
     );
 
     let mut enable_gemini = draft;
