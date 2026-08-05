@@ -256,13 +256,23 @@ export function ProviderBundlesPage({
           </Button>
         </div>
       ) : bundles.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-4 py-20 text-center">
-          <div className="flex items-center gap-3 opacity-70">
+        <div className="flex flex-1 flex-col items-center justify-center rounded-lg border border-dashed border-border p-10 text-center">
+          <div className="mb-4 flex items-center gap-3 opacity-70">
             <ClaudeIcon size={28} />
             <CodexIcon size={28} />
             <GeminiIcon size={28} />
           </div>
-          <Button onClick={() => setEditing({ mode: "create" })}>
+          <h3 className="text-lg font-semibold">{t("provider.noProviders")}</h3>
+          <p className="mt-2 max-w-lg text-sm text-muted-foreground">
+            {t("provider.noProvidersDescription")}
+          </p>
+          <p className="mt-1 max-w-lg text-sm text-muted-foreground">
+            {t("provider.noProvidersDescriptionSnippet")}
+          </p>
+          <Button
+            className="mt-6"
+            onClick={() => setEditing({ mode: "create" })}
+          >
             <Plus className="mr-2 h-4 w-4" />
             {t("providers.addProvider", { defaultValue: "添加供应商" })}
           </Button>

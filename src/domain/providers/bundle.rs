@@ -2,16 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 use super::credentials::{CredentialPatch, ProviderView};
 use super::model::{AppKind, Provider, ProviderMeta};
-use super::model_routing::{
-    normalize_and_validate_provider_model_routing, policy_from_settings, ModelRoutingPolicy,
-};
+use super::model_routing::normalize_and_validate_provider_model_routing;
 use super::registry::{
-    family_by_id, family_for_profile, profile_by_id, CredentialPolicy, CustomBindingInput,
-    ProfileId, ProviderFamilySpec,
+    family_by_id, family_for_profile, profile_by_id, provider_registry, resolve_custom_binding,
+    AuthScheme, CredentialPolicy, CustomBindingInput, DriverBinding, EndpointPolicy,
+    FormComposition, ModelPolicyKind, ProfileId, ProviderFamilySpec, UpstreamProtocol,
 };
 use super::store::StoredProvider;
 
@@ -64,6 +63,13 @@ pub struct ProviderBundleWriteDraft {
     pub icon: Option<String>,
     #[serde(default)]
     pub icon_color: Option<String>,
+    pub model_policy: ModelPolicyKind,
+    #[serde(default)]
+    pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub managed_account: Option<ProviderBundleManagedAccountWriteDraft>,
+    #[serde(default)]
+    pub aws_region: Option<String>,
     pub surfaces: Vec<ProviderBundleSurfaceWriteDraft>,
     #[serde(default)]
     pub credential_patches: BTreeMap<String, CredentialPatch>,
@@ -75,16 +81,53 @@ pub struct ProviderBundleWriteDraft {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderBundleManagedAccountWriteDraft {
+    pub account_id: String,
+    pub auth_identity_generation: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderTransportWriteDraft {
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub stream_first_byte_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub stream_idle_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDriverOptionsWriteDraft {
+    #[serde(default)]
+    pub api_key_field: Option<String>,
+    #[serde(default)]
+    pub custom_user_agent: Option<String>,
+    #[serde(default)]
+    pub codex_fast_mode: Option<bool>,
+    #[serde(default)]
+    pub codex_image_generation_enabled: Option<bool>,
+    #[serde(default)]
+    pub codex_websocket_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderBundleSurfaceWriteDraft {
     pub app: AppKind,
     pub enabled: bool,
     pub profile_id: ProfileId,
     #[serde(default)]
-    pub settings_config: Value,
+    pub endpoint: Option<String>,
     #[serde(default)]
-    pub category: Option<String>,
+    pub test_model: Option<String>,
     #[serde(default)]
-    pub meta: Option<ProviderMeta>,
+    pub transport: ProviderTransportWriteDraft,
+    #[serde(default)]
+    pub driver_options: ProviderDriverOptionsWriteDraft,
+    #[serde(default)]
+    pub extra_headers: Vec<String>,
     #[serde(default)]
     pub custom_binding: Option<CustomBindingInput>,
     #[serde(default)]
@@ -108,7 +151,7 @@ impl ProviderBundleWriteDraft {
         }
         let mut apps = BTreeSet::new();
         let mut enabled = 0usize;
-        let mut bundle_model_policy: Option<ModelRoutingPolicy> = None;
+        self.validate_shared_configuration(family)?;
         for surface in &self.surfaces {
             if !apps.insert(surface.app) {
                 bail!(
@@ -137,21 +180,13 @@ impl ProviderBundleWriteDraft {
             }
             let profile = profile_by_id(surface.profile_id.as_str())
                 .with_context(|| format!("unknown Provider profile {}", surface.profile_id))?;
-            let mut provider = self.provider_for_surface(surface);
+            self.validate_surface_configuration(surface, profile)?;
+            let mut provider = self.provider_for_surface(surface)?;
             normalize_and_validate_provider_model_routing(
                 surface.app,
                 &mut provider,
                 Some(profile),
             )?;
-            let surface_model_policy = policy_from_settings(&provider.settings_config)
-                .context("Provider Bundle Surface has no resolved model policy")?;
-            if bundle_model_policy
-                .as_ref()
-                .is_some_and(|policy| policy != &surface_model_policy)
-            {
-                bail!("Provider Bundle Surfaces must share one model policy and upstream model");
-            }
-            bundle_model_policy.get_or_insert(surface_model_policy);
             enabled += usize::from(surface.enabled);
         }
         if enabled == 0 {
@@ -160,7 +195,12 @@ impl ProviderBundleWriteDraft {
         Ok(family)
     }
 
-    pub fn provider_for_surface(&self, surface: &ProviderBundleSurfaceWriteDraft) -> Provider {
+    pub fn provider_for_surface(
+        &self,
+        surface: &ProviderBundleSurfaceWriteDraft,
+    ) -> anyhow::Result<Provider> {
+        let profile = profile_by_id(surface.profile_id.as_str())
+            .with_context(|| format!("unknown Provider profile {}", surface.profile_id))?;
         let mut extra = BTreeMap::new();
         insert_optional_string(&mut extra, "websiteUrl", self.website_url.as_deref());
         insert_optional_string(&mut extra, "notes", self.notes.as_deref());
@@ -175,14 +215,369 @@ impl ProviderBundleWriteDraft {
             SURFACE_ENABLED_FIELD.to_string(),
             Value::Bool(surface.enabled),
         );
-        Provider {
+        let mut settings = Map::new();
+        settings.insert("modelMapping".to_string(), self.model_mapping_value());
+
+        let mut env = Map::new();
+        if let Some(endpoint) = normalized_optional_string(surface.endpoint.as_deref()) {
+            env.insert(
+                endpoint_environment_key(surface.app).to_string(),
+                Value::String(endpoint.trim_end_matches('/').to_string()),
+            );
+        }
+        if let Some(region) = normalized_optional_string(self.aws_region.as_deref()) {
+            env.insert("AWS_REGION".to_string(), Value::String(region));
+        }
+        if !env.is_empty() {
+            settings.insert("env".to_string(), Value::Object(env));
+        }
+        if let Some(test_model) = normalized_optional_string(surface.test_model.as_deref()) {
+            settings.insert("testModel".to_string(), Value::String(test_model));
+        }
+        let transport = transport_value(&surface.transport);
+        if !transport.is_empty() {
+            settings.insert("transport".to_string(), Value::Object(transport));
+        }
+        if !surface.extra_headers.is_empty() {
+            settings.insert(
+                "extraHeaders".to_string(),
+                Value::Object(
+                    surface
+                        .extra_headers
+                        .iter()
+                        .map(|name| (name.trim().to_string(), Value::String(String::new())))
+                        .collect(),
+                ),
+            );
+        }
+
+        let mut meta = ProviderMeta {
+            provider_type: profile
+                .compatibility_provider_type
+                .map(|provider_type| provider_type.as_str().to_string()),
+            api_format: resolved_protocol(profile, surface.custom_binding.as_ref())
+                .and_then(api_format_for_protocol)
+                .map(str::to_string),
+            api_key_field: normalized_optional_string(
+                surface.driver_options.api_key_field.as_deref(),
+            ),
+            custom_user_agent: normalized_optional_string(
+                surface.driver_options.custom_user_agent.as_deref(),
+            ),
+            codex_fast_mode: surface.driver_options.codex_fast_mode,
+            codex_image_generation_enabled: surface.driver_options.codex_image_generation_enabled,
+            codex_websocket_enabled: surface.driver_options.codex_websocket_enabled,
+            ..ProviderMeta::default()
+        };
+        if let Some(account) = self.managed_account.as_ref() {
+            meta.auth_binding = Some(super::model::AuthBinding {
+                source: Some(super::model::MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
+                auth_provider: profile
+                    .compatibility_provider_type
+                    .map(|provider_type| provider_type.as_str().to_string()),
+                account_id: Some(account.account_id.clone()),
+                auth_identity_generation: Some(account.auth_identity_generation),
+            });
+        }
+
+        Ok(Provider {
             id: self.id.clone(),
             name: self.name.clone(),
-            settings_config: surface.settings_config.clone(),
-            category: surface.category.clone(),
-            meta: surface.meta.clone(),
+            settings_config: Value::Object(settings),
+            category: (profile.form_composition == FormComposition::Custom)
+                .then(|| "custom".to_string()),
+            meta: Some(meta),
             extra,
+        })
+    }
+
+    fn validate_shared_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
+        match self.model_policy {
+            ModelPolicyKind::Single => {
+                if normalized_optional_string(self.upstream_model.as_deref()).is_none() {
+                    bail!("single-model Provider Bundle requires an upstream model");
+                }
+            }
+            ModelPolicyKind::Passthrough => {
+                if normalized_optional_string(self.upstream_model.as_deref()).is_some() {
+                    bail!("passthrough Provider Bundle cannot define an upstream model");
+                }
+            }
         }
+        for surface in &family.surfaces {
+            let profile = profile_by_id(surface.profile_id.as_str())
+                .expect("Provider family profile is registry-validated");
+            if !profile.allows_model_policy(self.model_policy) {
+                bail!(
+                    "Provider profile {} does not allow the selected model policy",
+                    profile.profile_id
+                );
+            }
+        }
+
+        let credential_profile = profile_by_id(family.credential_profile_id.as_str())
+            .expect("Provider family credential profile is registry-validated");
+        let managed = matches!(
+            credential_profile.credential_policy,
+            CredentialPolicy::ManagedAccount { .. }
+        );
+        match (managed, self.managed_account.as_ref()) {
+            (true, Some(account)) => {
+                if account.account_id.trim().is_empty()
+                    || account.account_id != account.account_id.trim()
+                {
+                    bail!("managed Provider Bundle accountId must be non-empty and trimmed");
+                }
+            }
+            (true, None) => bail!("managed Provider Bundle requires one account binding"),
+            (false, Some(_)) => bail!("static Provider Bundle cannot bind a managed account"),
+            (false, None) => {}
+        }
+
+        let aws = matches!(
+            credential_profile.credential_policy,
+            CredentialPolicy::Aws { .. }
+        );
+        match (aws, normalized_optional_string(self.aws_region.as_deref())) {
+            (true, Some(region)) => validate_aws_region(&region)?,
+            (true, None) => bail!("AWS Provider Bundle requires a region"),
+            (false, Some(_)) => bail!("awsRegion is only valid for AWS Provider Bundles"),
+            (false, None) => {}
+        }
+        Ok(())
+    }
+
+    fn validate_surface_configuration(
+        &self,
+        surface: &ProviderBundleSurfaceWriteDraft,
+        profile: &super::registry::ProfileSpec,
+    ) -> anyhow::Result<()> {
+        let endpoint = normalized_optional_string(surface.endpoint.as_deref());
+        match profile.endpoint_policy {
+            EndpointPolicy::Custom if surface.enabled && endpoint.is_none() => {
+                bail!("custom Provider Surface requires an endpoint")
+            }
+            EndpointPolicy::Fixed | EndpointPolicy::Template if endpoint.is_some() => bail!(
+                "Provider profile {} does not allow an endpoint override",
+                profile.profile_id
+            ),
+            EndpointPolicy::FrozenLegacy => {
+                bail!("legacy Provider profiles cannot be written through the Bundle API")
+            }
+            _ => {}
+        }
+        if let Some(endpoint) = endpoint.as_deref() {
+            validate_endpoint(endpoint)?;
+        }
+        validate_transport(&surface.transport)?;
+        if let Some(test_model) = normalized_optional_string(surface.test_model.as_deref()) {
+            if test_model.len() > 256 {
+                bail!("Provider test model must be at most 256 characters");
+            }
+        }
+        if surface.extra_headers.len() > 32 {
+            bail!("custom Provider cannot define more than 32 extra headers");
+        }
+        let mut header_names = BTreeSet::new();
+        for name in &surface.extra_headers {
+            let canonical = super::runtime::validate_custom_header_name(name)?;
+            if !header_names.insert(canonical) {
+                bail!("custom Provider extra headers contain a duplicate name");
+            }
+        }
+        if !surface.extra_headers.is_empty() && profile.form_composition != FormComposition::Custom
+        {
+            bail!("extra headers are only valid for Custom HTTP Providers");
+        }
+
+        let resolved_driver_id = match &profile.driver_binding {
+            DriverBinding::Fixed { driver_id } => {
+                if surface.custom_binding.is_some() {
+                    bail!("fixed Provider profile cannot define a custom binding");
+                }
+                driver_id.clone()
+            }
+            DriverBinding::Custom { .. } => {
+                let binding = surface
+                    .custom_binding
+                    .as_ref()
+                    .context("custom Provider Surface requires a protocol/auth binding")?;
+                resolve_custom_binding(profile, binding)?.driver_id
+            }
+        };
+        let driver = provider_registry()
+            .drivers
+            .iter()
+            .find(|driver| driver.driver_id == resolved_driver_id)
+            .context("resolved Provider driver is not registered")?;
+        super::registry::validate_driver_option_input(
+            driver,
+            &surface.driver_options.configured_fields(),
+        )?;
+
+        let api_key_field =
+            normalized_optional_string(surface.driver_options.api_key_field.as_deref());
+        if let Some(binding) = surface.custom_binding.as_ref() {
+            if matches!(
+                binding.auth_scheme,
+                AuthScheme::CustomHeader | AuthScheme::Query
+            ) && api_key_field.is_none()
+            {
+                bail!("custom_header and query authentication require apiKeyField");
+            }
+            if binding.auth_scheme == AuthScheme::CustomHeader {
+                super::runtime::validate_custom_auth_header_name(
+                    api_key_field.as_deref().expect("apiKeyField was checked"),
+                )?;
+            }
+        } else if api_key_field.is_some() {
+            bail!("apiKeyField is only valid for Custom HTTP Providers");
+        }
+        if surface.driver_options.custom_user_agent.is_some()
+            && profile.form_composition != FormComposition::Custom
+        {
+            bail!("customUserAgent is only valid for Custom HTTP Providers");
+        }
+        Ok(())
+    }
+
+    fn model_mapping_value(&self) -> Value {
+        match self.model_policy {
+            ModelPolicyKind::Passthrough => json!({"mode": "passthrough"}),
+            ModelPolicyKind::Single => json!({
+                "mode": "single",
+                "upstreamModel": self
+                    .upstream_model
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default(),
+            }),
+        }
+    }
+}
+
+impl ProviderDriverOptionsWriteDraft {
+    fn configured_fields(&self) -> BTreeSet<&'static str> {
+        let mut fields = BTreeSet::new();
+        if self.api_key_field.is_some() {
+            fields.insert("apiKeyField");
+        }
+        if self.custom_user_agent.is_some() {
+            fields.insert("customUserAgent");
+        }
+        if self.codex_fast_mode.is_some() {
+            fields.insert("codexFastMode");
+        }
+        if self.codex_image_generation_enabled.is_some() {
+            fields.insert("codexImageGenerationEnabled");
+        }
+        if self.codex_websocket_enabled.is_some() {
+            fields.insert("codexWebsocketEnabled");
+        }
+        fields
+    }
+}
+
+fn normalized_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn endpoint_environment_key(app: AppKind) -> &'static str {
+    match app {
+        AppKind::Claude => "ANTHROPIC_BASE_URL",
+        AppKind::Codex => "OPENAI_BASE_URL",
+        AppKind::Gemini => "GOOGLE_GEMINI_BASE_URL",
+    }
+}
+
+fn validate_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(endpoint).context("Provider endpoint is not a valid URL")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host_str().is_none()
+    {
+        bail!("Provider endpoint must be an HTTP(S) URL without userinfo");
+    }
+    Ok(())
+}
+
+fn validate_aws_region(region: &str) -> anyhow::Result<()> {
+    if region.len() > 64
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("AWS region is invalid");
+    }
+    Ok(())
+}
+
+fn validate_transport(transport: &ProviderTransportWriteDraft) -> anyhow::Result<()> {
+    validate_duration("timeoutMs", transport.timeout_ms, 1_000, 3_600_000)?;
+    validate_duration(
+        "streamFirstByteTimeoutMs",
+        transport.stream_first_byte_timeout_ms,
+        1_000,
+        600_000,
+    )?;
+    validate_duration(
+        "streamIdleTimeoutMs",
+        transport.stream_idle_timeout_ms,
+        1_000,
+        3_600_000,
+    )?;
+    Ok(())
+}
+
+fn validate_duration(name: &str, value: Option<u64>, min: u64, max: u64) -> anyhow::Result<()> {
+    if value.is_some_and(|value| !(min..=max).contains(&value)) {
+        bail!("{name} must be between {min} and {max}");
+    }
+    Ok(())
+}
+
+fn transport_value(transport: &ProviderTransportWriteDraft) -> Map<String, Value> {
+    let mut value = Map::new();
+    for (name, duration) in [
+        ("timeoutMs", transport.timeout_ms),
+        (
+            "streamFirstByteTimeoutMs",
+            transport.stream_first_byte_timeout_ms,
+        ),
+        ("streamIdleTimeoutMs", transport.stream_idle_timeout_ms),
+    ] {
+        if let Some(duration) = duration {
+            value.insert(name.to_string(), Value::from(duration));
+        }
+    }
+    value
+}
+
+fn resolved_protocol(
+    profile: &super::registry::ProfileSpec,
+    custom_binding: Option<&CustomBindingInput>,
+) -> Option<UpstreamProtocol> {
+    match &profile.driver_binding {
+        DriverBinding::Fixed { driver_id } => provider_registry()
+            .drivers
+            .iter()
+            .find(|driver| driver.driver_id == *driver_id)
+            .map(|driver| driver.upstream_protocol),
+        DriverBinding::Custom { .. } => custom_binding.map(|binding| binding.upstream_protocol),
+    }
+}
+
+fn api_format_for_protocol(protocol: UpstreamProtocol) -> Option<&'static str> {
+    match protocol {
+        UpstreamProtocol::AnthropicMessages => Some("anthropic"),
+        UpstreamProtocol::OpenAiChat => Some("openai_chat"),
+        UpstreamProtocol::OpenAiResponses => Some("openai_responses"),
+        UpstreamProtocol::GeminiNative => Some("gemini_native"),
+        _ => None,
     }
 }
 
@@ -389,29 +784,22 @@ mod tests {
 
     use super::*;
 
-    fn grok_surface(
-        app: AppKind,
-        profile_id: &str,
-        upstream_model: &str,
-    ) -> ProviderBundleSurfaceWriteDraft {
+    fn grok_surface(app: AppKind, profile_id: &str) -> ProviderBundleSurfaceWriteDraft {
         ProviderBundleSurfaceWriteDraft {
             app,
             enabled: true,
             profile_id: ProfileId::parse(profile_id).unwrap(),
-            settings_config: json!({
-                "modelMapping": {
-                    "mode": "single",
-                    "upstreamModel": upstream_model,
-                }
-            }),
-            category: None,
-            meta: None,
+            endpoint: None,
+            test_model: None,
+            transport: ProviderTransportWriteDraft::default(),
+            driver_options: ProviderDriverOptionsWriteDraft::default(),
+            extra_headers: Vec::new(),
             custom_binding: None,
             credential_patches: BTreeMap::new(),
         }
     }
 
-    fn grok_bundle(upstream_models: [&str; 3]) -> ProviderBundleWriteDraft {
+    fn grok_bundle() -> ProviderBundleWriteDraft {
         ProviderBundleWriteDraft {
             id: "grok-bundle".to_string(),
             family_id: "family.grok_oauth".to_string(),
@@ -420,10 +808,17 @@ mod tests {
             notes: None,
             icon: None,
             icon_color: None,
+            model_policy: ModelPolicyKind::Single,
+            upstream_model: Some("grok-4.5".to_string()),
+            managed_account: Some(ProviderBundleManagedAccountWriteDraft {
+                account_id: "grok-account".to_string(),
+                auth_identity_generation: 1,
+            }),
+            aws_region: None,
             surfaces: vec![
-                grok_surface(AppKind::Claude, "claude.grok_oauth", upstream_models[0]),
-                grok_surface(AppKind::Codex, "codex.grok_oauth", upstream_models[1]),
-                grok_surface(AppKind::Gemini, "gemini.grok_oauth", upstream_models[2]),
+                grok_surface(AppKind::Claude, "claude.grok_oauth"),
+                grok_surface(AppKind::Codex, "codex.grok_oauth"),
+                grok_surface(AppKind::Gemini, "gemini.grok_oauth"),
             ],
             credential_patches: BTreeMap::new(),
             expected_revision: None,
@@ -432,14 +827,24 @@ mod tests {
     }
 
     #[test]
-    fn bundle_surfaces_require_one_model_policy_and_upstream_model() {
-        assert!(grok_bundle(["grok-4.5"; 3]).validate().is_ok());
+    fn bundle_generates_one_canonical_model_mapping_for_every_surface() {
+        let draft = grok_bundle();
+        assert!(draft.validate().is_ok());
+        for surface in &draft.surfaces {
+            assert_eq!(
+                draft.provider_for_surface(surface).unwrap().settings_config["modelMapping"],
+                json!({"mode": "single", "upstreamModel": "grok-4.5"})
+            );
+        }
+    }
 
-        let error = grok_bundle(["grok-4.5", "grok-4.5", "grok-other"])
-            .validate()
-            .unwrap_err();
+    #[test]
+    fn passthrough_bundle_rejects_an_upstream_model() {
+        let mut draft = grok_bundle();
+        draft.model_policy = ModelPolicyKind::Passthrough;
+        let error = draft.validate().unwrap_err();
         assert!(error
             .to_string()
-            .contains("must share one model policy and upstream model"));
+            .contains("passthrough Provider Bundle cannot define an upstream model"));
     }
 }

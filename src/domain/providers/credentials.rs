@@ -191,6 +191,8 @@ pub struct ProviderView {
     pub order_index: Option<usize>,
     pub credential_configured: bool,
     pub credential_slots: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<super::runtime::ProviderRuntimePlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -221,6 +223,14 @@ impl ProviderView {
     }
 
     pub fn from_stored_with_order(stored: &StoredProvider, order_index: Option<usize>) -> Self {
+        Self::from_stored_with_order_and_runtime(stored, order_index, None)
+    }
+
+    pub fn from_stored_with_order_and_runtime(
+        stored: &StoredProvider,
+        order_index: Option<usize>,
+        runtime: Option<super::runtime::ProviderRuntimePlan>,
+    ) -> Self {
         let (provider, credentials) = redact_provider(&stored.provider);
         Self {
             app: stored.app,
@@ -235,6 +245,7 @@ impl ProviderView {
             order_index,
             credential_configured: credentials.configured,
             credential_slots: credentials.slots,
+            runtime,
         }
     }
 }

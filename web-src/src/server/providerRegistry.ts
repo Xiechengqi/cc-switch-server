@@ -116,6 +116,18 @@ export interface ProviderRegistryDriver {
   optionSchemaId: string;
 }
 
+export type ProviderDriverOptionField =
+  | "apiKeyField"
+  | "customUserAgent"
+  | "codexFastMode"
+  | "codexImageGenerationEnabled"
+  | "codexWebsocketEnabled";
+
+export interface ProviderDriverOptionSchema {
+  optionSchemaId: string;
+  fields: ProviderDriverOptionField[];
+}
+
 export interface ProviderCustomPolicy {
   customPolicyId: string;
   app: CoreProviderApp;
@@ -131,6 +143,7 @@ export interface ProviderRegistrySnapshot {
   families: ProviderFamilySpec[];
   profiles: ProviderRegistryProfile[];
   drivers: ProviderRegistryDriver[];
+  optionSchemas: ProviderDriverOptionSchema[];
   customPolicies: ProviderCustomPolicy[];
   legacyPresetMappings: Array<{
     app: CoreProviderApp;
@@ -206,6 +219,14 @@ export function driverForProfile(
   if (binding.kind !== "fixed") return undefined;
   return providerRegistry.drivers.find(
     (driver) => driver.driverId === binding.driverId,
+  );
+}
+
+export function optionSchemaForDriver(
+  driver: ProviderRegistryDriver,
+): ProviderDriverOptionSchema | undefined {
+  return providerRegistry.optionSchemas.find(
+    (schema) => schema.optionSchemaId === driver.optionSchemaId,
   );
 }
 

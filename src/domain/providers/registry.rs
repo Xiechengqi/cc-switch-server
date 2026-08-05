@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 3;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 4;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -78,6 +78,7 @@ pub struct ProviderRegistry {
     pub families: Vec<ProviderFamilySpec>,
     pub profiles: Vec<ProfileSpec>,
     pub drivers: Vec<DriverSpec>,
+    pub option_schemas: Vec<DriverOptionSchemaSpec>,
     #[serde(default)]
     pub custom_policies: Vec<CustomPolicySpec>,
     #[serde(default)]
@@ -86,6 +87,36 @@ pub struct ProviderRegistry {
     pub published_id_tombstones: Vec<PublishedIdTombstone>,
     #[serde(default)]
     pub conformance: Vec<DriverConformance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DriverOptionSchemaSpec {
+    pub option_schema_id: String,
+    #[serde(default)]
+    pub fields: Vec<DriverOptionField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DriverOptionField {
+    ApiKeyField,
+    CustomUserAgent,
+    CodexFastMode,
+    CodexImageGenerationEnabled,
+    CodexWebsocketEnabled,
+}
+
+impl DriverOptionField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKeyField => "apiKeyField",
+            Self::CustomUserAgent => "customUserAgent",
+            Self::CodexFastMode => "codexFastMode",
+            Self::CodexImageGenerationEnabled => "codexImageGenerationEnabled",
+            Self::CodexWebsocketEnabled => "codexWebsocketEnabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +463,38 @@ pub fn family_for_profile(profile_id: &str) -> Option<&'static ProviderFamilySpe
     })
 }
 
+pub fn option_schema_by_id(option_schema_id: &str) -> Option<&'static DriverOptionSchemaSpec> {
+    provider_registry()
+        .option_schemas
+        .iter()
+        .find(|schema| schema.option_schema_id == option_schema_id)
+}
+
+pub fn validate_driver_option_input(
+    driver: &DriverSpec,
+    configured_fields: &BTreeSet<&'static str>,
+) -> anyhow::Result<()> {
+    let schema = option_schema_by_id(&driver.option_schema_id).with_context(|| {
+        format!(
+            "Driver {} references unknown option schema {}",
+            driver.driver_id, driver.option_schema_id
+        )
+    })?;
+    let allowed = schema
+        .fields
+        .iter()
+        .map(|field| field.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(field) = configured_fields.difference(&allowed).next() {
+        bail!(
+            "Driver {} does not allow option {}",
+            driver.driver_id,
+            field
+        );
+    }
+    Ok(())
+}
+
 pub fn profile_for_legacy_preset(app: AppKind, legacy_name: &str) -> Option<&'static ProfileSpec> {
     let mapping = provider_registry()
         .legacy_preset_mappings
@@ -510,6 +573,22 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     let mut profile_ids = BTreeSet::new();
     let mut driver_ids = BTreeSet::new();
     let mut custom_policy_ids = BTreeSet::new();
+    let mut option_schema_ids = BTreeSet::new();
+    for schema in &registry.option_schemas {
+        validate_registry_id(&schema.option_schema_id, "Driver option schema")?;
+        if !option_schema_ids.insert(schema.option_schema_id.as_str()) {
+            bail!(
+                "duplicate Driver option schema id {}",
+                schema.option_schema_id
+            );
+        }
+        if schema.fields.iter().collect::<BTreeSet<_>>().len() != schema.fields.len() {
+            bail!(
+                "Driver option schema {} repeats a field",
+                schema.option_schema_id
+            );
+        }
+    }
     for driver in &registry.drivers {
         validate_registry_id(driver.driver_id.as_str(), "driver")?;
         if driver.driver_contract_revision == 0 {
@@ -518,6 +597,13 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         if !driver_ids.insert(driver.driver_id.as_str()) {
             bail!("duplicate driver id {}", driver.driver_id);
         }
+        if !option_schema_ids.contains(driver.option_schema_id.as_str()) {
+            bail!(
+                "driver {} references unknown option schema {}",
+                driver.driver_id,
+                driver.option_schema_id
+            );
+        }
         if driver.outbound_identity_policy == OutboundIdentityPolicy::CustomOverride {
             bail!(
                 "driver {} cannot delegate outbound identity to a Provider override",
@@ -525,6 +611,14 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
         validate_operation_contract(driver)?;
+    }
+    let referenced_option_schema_ids = registry
+        .drivers
+        .iter()
+        .map(|driver| driver.option_schema_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if referenced_option_schema_ids != option_schema_ids {
+        bail!("every Driver option schema must be referenced by at least one Driver");
     }
     for policy in &registry.custom_policies {
         validate_registry_id(&policy.custom_policy_id, "custom policy")?;

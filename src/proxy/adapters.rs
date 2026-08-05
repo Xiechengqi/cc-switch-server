@@ -3003,6 +3003,9 @@ struct ModelMappingDecision {
 }
 
 fn cache_injection_config(stored: &StoredProvider) -> CacheInjectionConfig {
+    if stored.resource.profile_id.is_some() {
+        return CacheInjectionConfig::disabled();
+    }
     let settings = &stored.provider.settings_config;
     let cache_settings = settings
         .get("cacheInjection")
@@ -3065,6 +3068,9 @@ fn cache_injection_config(stored: &StoredProvider) -> CacheInjectionConfig {
 }
 
 fn thinking_pipeline_config(stored: &StoredProvider) -> ThinkingPipelineConfig {
+    if stored.resource.profile_id.is_some() {
+        return ThinkingPipelineConfig::disabled();
+    }
     let settings = &stored.provider.settings_config;
     let thinking_settings = settings
         .get("thinkingPipeline")
@@ -3208,6 +3214,9 @@ fn thinking_pipeline_config(stored: &StoredProvider) -> ThinkingPipelineConfig {
 }
 
 fn request_governance_config(stored: &StoredProvider) -> RequestGovernanceConfig {
+    if stored.resource.profile_id.is_some() {
+        return RequestGovernanceConfig::disabled();
+    }
     let settings = &stored.provider.settings_config;
     let governance_settings = settings
         .get("requestGovernance")
@@ -4583,6 +4592,8 @@ mod tests {
                 auth_identity_generation: 1,
             },
             model_policy: crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough,
+            test_model: None,
+            aws_region: None,
             media_policy: None,
             transport_policy: Default::default(),
             extra_headers: Vec::new(),

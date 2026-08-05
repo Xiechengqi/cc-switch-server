@@ -152,27 +152,11 @@ async fn providers_snapshot(
 }
 
 fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_id: &str) -> Value {
-    let surface = |app: &str, profile_id: &str, api_format: &str| {
+    let surface = |app: &str, profile_id: &str| {
         json!({
             "app": app,
             "enabled": true,
-            "profileId": profile_id,
-            "settingsConfig": {
-                "modelMapping": {
-                    "mode": "single",
-                    "upstreamModel": "grok-4.5"
-                }
-            },
-            "category": "official",
-            "meta": {
-                "providerType": "grok_oauth",
-                "apiFormat": api_format,
-                "authBinding": {
-                    "source": "managed_account",
-                    "authProvider": "grok_oauth",
-                    "accountId": account_id
-                }
-            }
+            "profileId": profile_id
         })
     };
     json!({
@@ -181,10 +165,16 @@ fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_
         "name": "Grok OAuth Bundle",
         "websiteUrl": "https://x.ai",
         "icon": "grok",
+        "modelPolicy": "single",
+        "upstreamModel": "grok-4.5",
+        "managedAccount": {
+            "accountId": account_id,
+            "authIdentityGeneration": 1
+        },
         "surfaces": [
-            surface("claude", "claude.grok_oauth", "openai_responses"),
-            surface("codex", "codex.grok_oauth", "openai_responses"),
-            surface("gemini", "gemini.grok_oauth", "openai_responses")
+            surface("claude", "claude.grok_oauth"),
+            surface("codex", "codex.grok_oauth"),
+            surface("gemini", "gemini.grok_oauth")
         ],
         "clientRequestId": client_request_id
     })
@@ -6194,6 +6184,13 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
+    assert_eq!(registry["registry"]["schemaVersion"], 4);
+    assert_eq!(
+        registry["registry"]["optionSchemas"]
+            .as_array()
+            .map(Vec::len),
+        Some(18)
+    );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
         40
@@ -6281,6 +6278,14 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     let resources = json_body(resources).await;
     assert_eq!(resources[0]["profileId"], "codex.openai_api_key");
     assert_eq!(resources[0]["revision"], 1);
+    assert_eq!(resources[0]["runtime"]["driverId"], "http.openai_responses");
+    assert_eq!(
+        resources[0]["runtime"]["transportPolicy"]["timeoutMs"],
+        300_000
+    );
+    assert!(!serde_json::to_string(&resources[0]["runtime"])
+        .unwrap()
+        .contains("api-contract-openai-key"));
 }
 
 #[tokio::test]
@@ -6334,6 +6339,15 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         assert!(created["surfaces"][provider_app]["provider"]["extra"]
             .get("routeKey")
             .is_none());
+        assert_eq!(
+            created["surfaces"][provider_app]["runtime"]["modelPolicy"],
+            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+        );
+        assert!(
+            !serde_json::to_string(&created["surfaces"][provider_app]["runtime"])
+                .unwrap()
+                .contains("access-token")
+        );
     }
 
     let replay = app
@@ -6371,7 +6385,7 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     let mut update = draft.clone();
     update.as_object_mut().unwrap().remove("clientRequestId");
     update["expectedRevision"] = json!(1);
-    update["surfaces"][0]["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.3");
+    update["surfaces"][0]["settingsConfig"] = json!({"unexpected": true});
     let divergent = app
         .clone()
         .oneshot(json_request(
@@ -6382,10 +6396,12 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         ))
         .await
         .unwrap();
-    assert_eq!(divergent.status(), StatusCode::BAD_REQUEST);
-    for surface in update["surfaces"].as_array_mut().unwrap() {
-        surface["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.3");
-    }
+    assert_eq!(divergent.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    update["surfaces"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("settingsConfig");
+    update["upstreamModel"] = json!("grok-4.3");
     let updated = app
         .clone()
         .oneshot(json_request(
@@ -6421,9 +6437,7 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     );
 
     update["expectedRevision"] = json!(2);
-    for surface in update["surfaces"].as_array_mut().unwrap() {
-        surface["settingsConfig"]["modelMapping"]["upstreamModel"] = json!("grok-4.20-multi-agent");
-    }
+    update["upstreamModel"] = json!("grok-4.20-multi-agent");
     let updated = app
         .clone()
         .oneshot(json_request(
@@ -6753,18 +6767,20 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
         "id": "bundle-custom-claude-only",
         "familyId": "family.custom_http",
         "name": "Claude-only Custom HTTP",
+        "modelPolicy": "single",
+        "upstreamModel": "claude-test",
         "surfaces": [
             {
                 "app": "claude",
                 "enabled": true,
                 "profileId": "claude.custom_http",
-                "settingsConfig": {
-                    "env": {"ANTHROPIC_BASE_URL": "https://claude.example/v1"},
-                    "modelMapping": {"mode": "single", "upstreamModel": "claude-test"}
-                },
+                "endpoint": "https://claude.example/v1",
                 "customBinding": {
                     "upstreamProtocol": "anthropic_messages",
-                    "authScheme": "api_key"
+                    "authScheme": "custom_header"
+                },
+                "driverOptions": {
+                    "apiKeyField": "x-api-key"
                 },
                 "credentialPatches": {
                     "/settingsConfig/apiKey": {
@@ -6777,9 +6793,6 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
                 "app": "codex",
                 "enabled": false,
                 "profileId": "codex.custom_http",
-                "settingsConfig": {
-                    "modelMapping": {"mode": "single", "upstreamModel": "claude-test"}
-                },
                 "customBinding": {
                     "upstreamProtocol": "open_ai_responses",
                     "authScheme": "bearer"
@@ -6789,9 +6802,6 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
                 "app": "gemini",
                 "enabled": false,
                 "profileId": "gemini.custom_http",
-                "settingsConfig": {
-                    "modelMapping": {"mode": "single", "upstreamModel": "claude-test"}
-                },
                 "customBinding": {
                     "upstreamProtocol": "gemini_native",
                     "authScheme": "api_key"

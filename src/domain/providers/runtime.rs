@@ -119,6 +119,10 @@ pub struct ProviderRuntimePlan {
     pub auth_ref: RuntimeAuthRef,
     pub model_policy: RuntimeModelPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_policy: Option<Value>,
     pub transport_policy: RuntimeTransportPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -289,8 +293,10 @@ pub fn compile_runtime_plan(
             BTreeMap::new()
         }
     };
-    let media_policy = runtime_media_policy(&stored.provider);
-    let transport_policy = runtime_transport_policy(&stored.provider);
+    let test_model = runtime_test_model(&stored.provider, profile_policy.is_some());
+    let aws_region = configured_setting(&stored.provider, "AWS_REGION");
+    let media_policy = runtime_media_policy(&stored.provider, profile_policy.is_none());
+    let transport_policy = runtime_transport_policy(&stored.provider, profile_policy.is_some());
     let extra_headers = match runtime_extra_headers(stored, profile_policy) {
         Ok(headers) => headers,
         Err(error) => {
@@ -311,6 +317,8 @@ pub fn compile_runtime_plan(
         "outboundIdentityPolicy": outbound_identity_policy,
         "authRef": &auth_ref,
         "modelPolicy": &model_policy,
+        "testModel": &test_model,
+        "awsRegion": &aws_region,
         "mediaPolicy": &media_policy,
         "transportPolicy": &transport_policy,
         "extraHeaders": &extra_headers,
@@ -329,6 +337,8 @@ pub fn compile_runtime_plan(
         outbound_identity_policy,
         auth_ref,
         model_policy,
+        test_model,
+        aws_region,
         media_policy,
         transport_policy,
         extra_headers,
@@ -395,17 +405,21 @@ fn runtime_extra_headers(
 }
 
 pub fn validate_custom_header_name(name: &str) -> anyhow::Result<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        bail!("custom header name cannot be empty");
-    }
-    let parsed = HeaderName::from_bytes(name.as_bytes())
-        .with_context(|| format!("custom header name is invalid: {name}"))?;
-    let canonical = parsed.as_str().to_string();
+    let canonical = parse_custom_header_name(name)?;
     if matches!(
         canonical.as_str(),
-        "authorization"
-            | "proxy-authorization"
+        "authorization" | "x-api-key" | "api-key" | "x-goog-api-key"
+    ) {
+        bail!("custom header {canonical} is controlled by the Provider driver");
+    }
+    validate_custom_auth_header_name(&canonical)
+}
+
+pub fn validate_custom_auth_header_name(name: &str) -> anyhow::Result<String> {
+    let canonical = parse_custom_header_name(name)?;
+    if matches!(
+        canonical.as_str(),
+        "proxy-authorization"
             | "proxy-authenticate"
             | "host"
             | "content-length"
@@ -416,13 +430,21 @@ pub fn validate_custom_header_name(name: &str) -> anyhow::Result<String> {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-            | "x-api-key"
-            | "api-key"
-            | "x-goog-api-key"
             | "user-agent"
     ) {
-        bail!("custom header {canonical} is controlled by the Provider driver");
+        bail!("custom authentication header {canonical} is controlled by the Provider driver");
     }
+    Ok(canonical)
+}
+
+fn parse_custom_header_name(name: &str) -> anyhow::Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("custom header name cannot be empty");
+    }
+    let parsed = HeaderName::from_bytes(name.as_bytes())
+        .with_context(|| format!("custom header name is invalid: {name}"))?;
+    let canonical = parsed.as_str().to_string();
     Ok(canonical)
 }
 
@@ -744,7 +766,34 @@ pub fn validate_custom_user_agent(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-fn runtime_media_policy(provider: &Provider) -> Option<Value> {
+fn runtime_test_model(provider: &Provider, profiled: bool) -> Option<String> {
+    non_empty_value(provider.settings_config.get("testModel")).or_else(|| {
+        (!profiled)
+            .then(|| {
+                non_empty_value(provider.settings_config.pointer("/testConfig/testModel"))
+                    .or_else(|| {
+                        non_empty_value(provider.settings_config.pointer("/testConfig/model"))
+                    })
+                    .or_else(|| {
+                        provider
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.test_config.as_ref())
+                            .and_then(|value| {
+                                non_empty_value(
+                                    value.get("testModel").or_else(|| value.get("model")),
+                                )
+                            })
+                    })
+            })
+            .flatten()
+    })
+}
+
+fn runtime_media_policy(provider: &Provider, legacy: bool) -> Option<Value> {
+    if !legacy {
+        return None;
+    }
     let image_model = non_empty_value(provider.settings_config.get("imageModel"));
     let video_model = non_empty_value(provider.settings_config.get("videoModel"));
     (image_model.is_some() || video_model.is_some()).then(|| {
@@ -755,7 +804,20 @@ fn runtime_media_policy(provider: &Provider) -> Option<Value> {
     })
 }
 
-fn runtime_transport_policy(provider: &Provider) -> RuntimeTransportPolicy {
+fn runtime_transport_policy(provider: &Provider, profiled: bool) -> RuntimeTransportPolicy {
+    if profiled {
+        return RuntimeTransportPolicy {
+            timeout_ms: typed_timeout_ms(provider, "/transport/timeoutMs").unwrap_or(300_000),
+            stream_first_byte_timeout_ms: Some(
+                typed_timeout_ms(provider, "/transport/streamFirstByteTimeoutMs")
+                    .unwrap_or(120_000),
+            ),
+            stream_idle_timeout_ms: Some(
+                typed_timeout_ms(provider, "/transport/streamIdleTimeoutMs").unwrap_or(300_000),
+            ),
+            ..RuntimeTransportPolicy::default()
+        };
+    }
     RuntimeTransportPolicy {
         timeout_ms: configured_timeout_ms(
             provider,
@@ -787,6 +849,13 @@ fn runtime_transport_policy(provider: &Provider) -> RuntimeTransportPolicy {
         ),
         ..RuntimeTransportPolicy::default()
     }
+}
+
+fn typed_timeout_ms(provider: &Provider, pointer: &str) -> Option<u64> {
+    provider
+        .settings_config
+        .pointer(pointer)
+        .and_then(Value::as_u64)
 }
 
 fn configured_timeout_ms(provider: &Provider, keys: &[&str], default_ms: u64) -> Option<u64> {
@@ -1279,6 +1348,58 @@ mod tests {
     }
 
     #[test]
+    fn profiled_runtime_uses_typed_transport_and_ignores_hidden_media_settings() {
+        let accounts = AccountStore::default();
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        stored.provider.settings_config["env"]["UPSTREAM_TIMEOUT_MS"] = json!("999999");
+        stored.provider.settings_config["transport"] = json!({
+            "timeoutMs": 45_000,
+            "streamFirstByteTimeoutMs": 15_000,
+            "streamIdleTimeoutMs": 30_000,
+        });
+        stored.provider.settings_config["testModel"] = json!("health-model");
+        stored.provider.settings_config["imageModel"] = json!("hidden-image-model");
+
+        let first = compile_runtime_plan(&stored, &accounts).unwrap();
+
+        assert_eq!(first.test_model.as_deref(), Some("health-model"));
+        assert_eq!(first.transport_policy.timeout_ms, 45_000);
+        assert_eq!(
+            first.transport_policy.stream_first_byte_timeout_ms,
+            Some(15_000)
+        );
+        assert_eq!(first.transport_policy.stream_idle_timeout_ms, Some(30_000));
+        assert_eq!(first.media_policy, None);
+
+        stored.provider.settings_config["testModel"] = json!("next-health-model");
+        let changed = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert_ne!(first.runtime_fingerprint, changed.runtime_fingerprint);
+    }
+
+    #[test]
+    fn legacy_runtime_keeps_frozen_transport_and_media_compatibility() {
+        let accounts = AccountStore::default();
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.resource.profile_id = None;
+        stored.resource.profile_schema_revision = None;
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        stored.provider.settings_config["env"]["UPSTREAM_TIMEOUT_MS"] = json!("42000");
+        stored.provider.settings_config["imageModel"] = json!("legacy-image-model");
+
+        let plan = compile_runtime_plan(&stored, &accounts).unwrap();
+
+        assert_eq!(plan.transport_policy.timeout_ms, 42_000);
+        assert_eq!(
+            plan.media_policy,
+            Some(json!({
+                "imageModel": "legacy-image-model",
+                "videoModel": null,
+            }))
+        );
+    }
+
+    #[test]
     fn every_registered_profile_compiles_into_the_runtime_index() {
         let mut accounts = AccountStore::default();
         let providers = provider_registry()
@@ -1658,6 +1779,25 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("controlled by the Provider driver")));
+    }
+
+    #[test]
+    fn custom_auth_headers_allow_auth_fields_but_reject_transport_fields() {
+        for name in ["Authorization", "x-api-key", "api-key", "x-goog-api-key"] {
+            assert_eq!(
+                validate_custom_auth_header_name(name).unwrap(),
+                name.to_ascii_lowercase()
+            );
+            assert!(validate_custom_header_name(name).is_err());
+        }
+        for name in [
+            "Host",
+            "Content-Length",
+            "Proxy-Authorization",
+            "User-Agent",
+        ] {
+            assert!(validate_custom_auth_header_name(name).is_err());
+        }
     }
 
     #[test]

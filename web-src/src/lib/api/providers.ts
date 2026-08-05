@@ -1,6 +1,5 @@
 import { invokeCommand } from "@/lib/runtime";
 import type { Provider } from "@/types";
-import type { ProviderMeta } from "@/types";
 import type { CoreProviderApp } from "@/server/providerRegistry";
 import type { AppId } from "./types";
 
@@ -38,6 +37,36 @@ export interface ProviderIdentityView {
   warning?: string;
 }
 
+export interface ProviderRuntimePlan {
+  providerKey: { app: CoreProviderApp; providerId: string };
+  providerRevision: number;
+  profileId: string;
+  profileSchemaRevision: number;
+  driverId: string;
+  driverContractRevision: number;
+  endpoint: string;
+  upstreamProtocol: string;
+  outboundIdentityPolicy: unknown;
+  authRef: unknown;
+  modelPolicy:
+    { mode: "passthrough" } | { mode: "single"; upstreamModel: string };
+  testModel?: string;
+  awsRegion?: string;
+  mediaPolicy?: unknown;
+  transportPolicy: {
+    timeoutMs: number;
+    streamFirstByteTimeoutMs?: number;
+    streamIdleTimeoutMs?: number;
+    redirectPolicy: string;
+    directConnection: boolean;
+  };
+  extraHeaders?: Array<{ name: string; credentialSlot: string }>;
+  driverOptions: Record<string, unknown>;
+  configurationState: "ready" | "legacy_compat" | "needs_attention";
+  warnings?: string[];
+  runtimeFingerprint: string;
+}
+
 export interface ProviderResource {
   app: "claude" | "codex" | "gemini";
   provider: Provider;
@@ -51,6 +80,7 @@ export interface ProviderResource {
   orderIndex?: number;
   credentialConfigured: boolean;
   credentialSlots: string[];
+  runtime?: ProviderRuntimePlan;
 }
 
 export interface ProviderBundleView {
@@ -73,9 +103,21 @@ export interface ProviderBundleSurfaceWriteDraft {
   app: CoreProviderApp;
   enabled: boolean;
   profileId: string;
-  settingsConfig: Record<string, unknown>;
-  category?: string;
-  meta?: ProviderMeta;
+  endpoint?: string;
+  testModel?: string;
+  transport?: {
+    timeoutMs?: number;
+    streamFirstByteTimeoutMs?: number;
+    streamIdleTimeoutMs?: number;
+  };
+  driverOptions?: {
+    apiKeyField?: string;
+    customUserAgent?: string;
+    codexFastMode?: boolean;
+    codexImageGenerationEnabled?: boolean;
+    codexWebsocketEnabled?: boolean;
+  };
+  extraHeaders?: string[];
   customBinding?: ProviderCustomBinding;
   credentialPatches?: ProviderCredentialPatches;
 }
@@ -88,6 +130,13 @@ export interface ProviderBundleWriteDraft {
   notes?: string;
   icon?: string;
   iconColor?: string;
+  modelPolicy: "passthrough" | "single";
+  upstreamModel?: string;
+  managedAccount?: {
+    accountId: string;
+    authIdentityGeneration: number;
+  };
+  awsRegion?: string;
   surfaces: ProviderBundleSurfaceWriteDraft[];
   credentialPatches?: ProviderCredentialPatches;
   expectedRevision?: number;

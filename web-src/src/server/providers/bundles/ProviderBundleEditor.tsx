@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   ArrowRightLeft,
   Check,
+  ChevronDown,
   Copy,
   KeyRound,
   LoaderCircle,
@@ -22,6 +23,11 @@ import { ProviderIconControl } from "@/components/providers/ProviderIconControl"
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -78,9 +84,7 @@ import {
   editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
-  parseSettings,
   providerBundleIdentityEditable,
-  surfaceEndpoint,
   toProviderBundleWriteDraft,
   updateBundleModel,
   updateSurfaceEndpoint,
@@ -158,15 +162,6 @@ function fieldLabel(logical: string): string {
   }
 }
 
-function surfaceSettingsValid(surface: BundleSurfaceEditorDraft): boolean {
-  try {
-    parseSettings(surface.settingsText);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function SurfaceEditor({
   surface,
   onChange,
@@ -177,14 +172,13 @@ function SurfaceEditor({
   const { t } = useTranslation();
   const profile = profileById(surface.profileId);
   if (!profile) return null;
-  const settingsValid = surfaceSettingsValid(surface);
   const customPolicy = customPolicyForProfile(profile);
-  const endpoint = settingsValid ? surfaceEndpoint(surface) : "";
-
-  const updateMeta = (patch: Record<string, unknown>) =>
+  const updateDriverOptions = (
+    patch: Partial<BundleSurfaceEditorDraft["driverOptions"]>,
+  ) =>
     onChange({
       ...surface,
-      meta: { ...surface.meta, ...patch },
+      driverOptions: { ...surface.driverOptions, ...patch },
     });
 
   return (
@@ -215,8 +209,7 @@ function SurfaceEditor({
               <Label>{t("serverProviderForm.endpoint.url")}</Label>
               <Input
                 type="url"
-                value={endpoint}
-                disabled={!settingsValid}
+                value={surface.endpoint}
                 onChange={(event) =>
                   onChange(updateSurfaceEndpoint(surface, event.target.value))
                 }
@@ -256,7 +249,12 @@ function SurfaceEditor({
               <Label>{t("serverProviderForm.binding.authScheme")}</Label>
               <Select
                 value={surface.customBinding?.authScheme}
-                onValueChange={(authScheme) =>
+                onValueChange={(authScheme) => {
+                  const typedAuthScheme =
+                    authScheme as ProviderCustomBinding["authScheme"];
+                  const requiresField =
+                    typedAuthScheme === "custom_header" ||
+                    typedAuthScheme === "query";
                   onChange({
                     ...surface,
                     customBinding: {
@@ -264,11 +262,17 @@ function SurfaceEditor({
                         upstreamProtocol: customPolicy
                           .protocols[0]! as ProviderCustomBinding["upstreamProtocol"],
                       }),
-                      authScheme:
-                        authScheme as ProviderCustomBinding["authScheme"],
+                      authScheme: typedAuthScheme,
                     },
-                  })
-                }
+                    driverOptions: {
+                      ...surface.driverOptions,
+                      apiKeyField: requiresField
+                        ? surface.driverOptions.apiKeyField ||
+                          (typedAuthScheme === "query" ? "key" : "x-api-key")
+                        : undefined,
+                    },
+                  });
+                }}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -282,6 +286,31 @@ function SurfaceEditor({
                 </SelectContent>
               </Select>
             </div>
+            {surface.customBinding?.authScheme === "custom_header" ||
+            surface.customBinding?.authScheme === "query" ? (
+              <div className="space-y-2 md:col-span-2">
+                <Label>
+                  {surface.customBinding.authScheme === "query"
+                    ? t("providerBundle.queryParameter", {
+                        defaultValue: "API Key 查询参数名",
+                      })
+                    : t("providerBundle.authHeader", {
+                        defaultValue: "API Key Header 名称",
+                      })}
+                </Label>
+                <Input
+                  value={surface.driverOptions.apiKeyField ?? ""}
+                  placeholder={
+                    surface.customBinding.authScheme === "query"
+                      ? "key"
+                      : "x-api-key"
+                  }
+                  onChange={(event) =>
+                    updateDriverOptions({ apiKeyField: event.target.value })
+                  }
+                />
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-2">
@@ -393,34 +422,102 @@ function SurfaceEditor({
           <div className="space-y-2">
             <Label>{t("serverProviderForm.usage.customUserAgent")}</Label>
             <Input
-              value={surface.meta.customUserAgent ?? ""}
+              value={surface.driverOptions.customUserAgent ?? ""}
               onChange={(event) =>
-                updateMeta({ customUserAgent: event.target.value })
+                updateDriverOptions({ customUserAgent: event.target.value })
               }
             />
           </div>
         </div>
       ) : null}
 
-      <div className="space-y-2">
-        <Label>
-          {t("providerBundle.advancedSettings", {
-            defaultValue: "高级设置 JSON",
-          })}
-        </Label>
-        <Textarea
-          className={cn(
-            "min-h-44 font-mono text-xs",
-            !settingsValid &&
-              "border-destructive focus-visible:ring-destructive",
-          )}
-          spellCheck={false}
-          value={surface.settingsText}
-          onChange={(event) =>
-            onChange({ ...surface, settingsText: event.target.value })
-          }
-        />
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="space-y-2 md:col-span-2">
+          <Label>
+            {t("providerBundle.testModel", { defaultValue: "测试模型" })}
+          </Label>
+          <Input
+            value={surface.testModel}
+            onChange={(event) =>
+              onChange({ ...surface, testModel: event.target.value })
+            }
+          />
+        </div>
+        {[
+          {
+            key: "timeoutMs" as const,
+            label: t("providerBundle.requestTimeout", {
+              defaultValue: "请求超时（毫秒）",
+            }),
+            max: 3_600_000,
+          },
+          {
+            key: "streamFirstByteTimeoutMs" as const,
+            label: t("providerBundle.firstByteTimeout", {
+              defaultValue: "首字节超时（毫秒）",
+            }),
+            max: 600_000,
+          },
+          {
+            key: "streamIdleTimeoutMs" as const,
+            label: t("providerBundle.streamIdleTimeout", {
+              defaultValue: "流空闲超时（毫秒）",
+            }),
+            max: 3_600_000,
+          },
+        ].map(({ key, label, max }) => (
+          <div key={key} className="space-y-2">
+            <Label>{label}</Label>
+            <Input
+              type="number"
+              min={1_000}
+              max={max}
+              step={1_000}
+              value={surface.transport[key]}
+              onChange={(event) =>
+                onChange({
+                  ...surface,
+                  transport: {
+                    ...surface.transport,
+                    [key]: event.target.value,
+                  },
+                })
+              }
+            />
+          </div>
+        ))}
       </div>
+
+      {surface.runtime ? (
+        <Collapsible className="border-t border-border/60 pt-4">
+          <div className="flex items-center justify-between gap-2">
+            <CollapsibleTrigger asChild>
+              <Button type="button" variant="ghost" size="sm">
+                <ChevronDown className="mr-2 h-4 w-4" />
+                {t("providerBundle.effectiveConfig", {
+                  defaultValue: "有效运行配置",
+                })}
+              </Button>
+            </CollapsibleTrigger>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              title={t("common.copy")}
+              onClick={() =>
+                void copyText(JSON.stringify(surface.runtime, null, 2))
+              }
+            >
+              <Copy className="h-4 w-4" />
+            </Button>
+          </div>
+          <CollapsibleContent className="pt-2">
+            <pre className="max-h-80 overflow-auto rounded-md border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
+              {JSON.stringify(surface.runtime, null, 2)}
+            </pre>
+          </CollapsibleContent>
+        </Collapsible>
+      ) : null}
     </div>
   );
 }
@@ -837,7 +934,10 @@ export function ProviderBundleEditor({
         const profile = profileById(surface.profileId);
         if (driverForProfile(profile!)?.driverId !== "oauth.openai_codex")
           return surface;
-        return { ...surface, meta: { ...surface.meta, [key]: checked } };
+        return {
+          ...surface,
+          driverOptions: { ...surface.driverOptions, [key]: checked },
+        };
       }),
     }));
 
@@ -852,22 +952,7 @@ export function ProviderBundleEditor({
       const saved = await providersApi.upsertBundle(
         toProviderBundleWriteDraft(draft),
       );
-      setDraft((current) => ({
-        ...current,
-        expectedRevision: saved.revision,
-        clientRequestId: undefined,
-        secrets: Object.fromEntries(
-          Object.entries(current.secrets).map(([slot, secret]) => [
-            slot,
-            {
-              ...secret,
-              configured: secret.configured || Boolean(secret.value.trim()),
-              value: "",
-              clear: false,
-            },
-          ]),
-        ),
-      }));
+      setDraft(editProviderBundleDraft(saved));
       await saveBundleShare(saved.id, shareDraft, existingShare);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["provider-bundles"] }),
@@ -1217,7 +1302,11 @@ export function ProviderBundleEditor({
                 ["WebSocket", "codexWebsocketEnabled"],
               ].map(([label, key]) => {
                 const checked = draft.surfaces.some((surface) =>
-                  Boolean((surface.meta as Record<string, unknown>)[key]),
+                  Boolean(
+                    surface.driverOptions[
+                      key as keyof BundleSurfaceEditorDraft["driverOptions"]
+                    ],
+                  ),
                 );
                 return (
                   <div

@@ -1728,6 +1728,14 @@ pub(in crate::api) fn provider_test_model(
             stored
                 .provider
                 .settings_config
+                .get("testModel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            stored
+                .provider
+                .settings_config
                 .pointer("/testConfig/testModel")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)

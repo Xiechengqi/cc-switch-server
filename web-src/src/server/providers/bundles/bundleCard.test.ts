@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { ManagedAuthAccount } from "@/lib/api/auth";
-import type { ProviderBundleView, ProviderResource } from "@/lib/api/providers";
+import type {
+  ProviderBundleView,
+  ProviderResource,
+  ProviderRuntimePlan,
+} from "@/lib/api/providers";
 import type { CoreProviderApp } from "@/server/providerRegistry";
 import type { ProviderMeta } from "@/types";
 import {
@@ -9,11 +13,44 @@ import {
   providerBundlePrimaryResource,
 } from "./bundleCard";
 
+function runtime(
+  app: CoreProviderApp,
+  profileId: string,
+  endpoint: string,
+): ProviderRuntimePlan {
+  return {
+    providerKey: { app, providerId: "bundle-1" },
+    providerRevision: 1,
+    profileId,
+    profileSchemaRevision: 1,
+    driverId: "http.openai_chat",
+    driverContractRevision: 1,
+    endpoint,
+    upstreamProtocol: "open_ai_chat",
+    outboundIdentityPolicy: { kind: "server_identity" },
+    authRef: { kind: "static_credential" },
+    modelPolicy: { mode: "single", upstreamModel: "model" },
+    transportPolicy: {
+      timeoutMs: 300_000,
+      streamFirstByteTimeoutMs: 120_000,
+      streamIdleTimeoutMs: 300_000,
+      redirectPolicy: "same_origin",
+      directConnection: true,
+    },
+    extraHeaders: [],
+    driverOptions: {},
+    configurationState: "ready",
+    warnings: [],
+    runtimeFingerprint: "fixture",
+  };
+}
+
 function resource(
   app: CoreProviderApp,
   profileId: string,
   settingsConfig: Record<string, unknown>,
   meta?: ProviderMeta,
+  runtimeEndpoint?: string,
 ): ProviderResource {
   return {
     app,
@@ -30,6 +67,9 @@ function resource(
     identity: { status: "bound" },
     credentialConfigured: true,
     credentialSlots: [],
+    runtime: runtimeEndpoint
+      ? runtime(app, profileId, runtimeEndpoint)
+      : undefined,
   };
 }
 
@@ -77,20 +117,48 @@ function account(): ManagedAuthAccount {
 }
 
 describe("Provider Bundle card data", () => {
-  it("uses the family credential Surface and shows its upstream API URL", () => {
+  it("uses the family credential Surface and shows its runtime API URL", () => {
     const view = bundle("family.nvidia", {
-      claude: resource("claude", "claude.nvidia", {
-        env: { ANTHROPIC_BASE_URL: "https://claude.nvidia.example" },
-      }),
-      codex: resource("codex", "codex.nvidia", {
-        env: { OPENAI_BASE_URL: "https://integrate.api.nvidia.com/v1" },
-      }),
+      claude: resource(
+        "claude",
+        "claude.nvidia",
+        {},
+        undefined,
+        "https://claude.nvidia.example",
+      ),
+      codex: resource(
+        "codex",
+        "codex.nvidia",
+        {},
+        undefined,
+        "https://integrate.api.nvidia.com/v1",
+      ),
     });
 
     expect(providerBundlePrimaryResource(view)?.app).toBe("codex");
     expect(providerBundleDisplayTarget(view, [])).toEqual({
       kind: "api_url",
       value: "https://integrate.api.nvidia.com/v1",
+    });
+  });
+
+  it("falls back to an enabled Surface when the credential Surface has no runtime", () => {
+    const view = bundle("family.custom_http", {
+      claude: resource("claude", "claude.custom_http", {}),
+      codex: resource(
+        "codex",
+        "codex.custom_http",
+        {},
+        undefined,
+        "https://codex.gateway.example/v1",
+      ),
+      gemini: resource("gemini", "gemini.custom_http", {}),
+    });
+    view.enabledApps = ["codex"];
+
+    expect(providerBundleDisplayTarget(view, [])).toEqual({
+      kind: "api_url",
+      value: "https://codex.gateway.example/v1",
     });
   });
 

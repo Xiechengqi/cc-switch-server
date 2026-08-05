@@ -1,6 +1,26 @@
 {
   "format": "cc-switch-provider-registry",
-  "schemaVersion": 3,
+  "schemaVersion": 4,
+  "optionSchemas": [
+    {"optionSchemaId":"oauth.claude.v1","fields":[]},
+    {"optionSchemaId":"http.anthropic.v1","fields":["apiKeyField","customUserAgent"]},
+    {"optionSchemaId":"oauth.openai_codex.v1","fields":["codexFastMode","codexImageGenerationEnabled","codexWebsocketEnabled"]},
+    {"optionSchemaId":"oauth.grok.v1","fields":[]},
+    {"optionSchemaId":"special.kiro.v1","fields":[]},
+    {"optionSchemaId":"http.openai_chat.v1","fields":["apiKeyField","customUserAgent"]},
+    {"optionSchemaId":"special.cursor.v1","fields":[]},
+    {"optionSchemaId":"special.antigravity.v1","fields":[]},
+    {"optionSchemaId":"special.agy.v1","fields":[]},
+    {"optionSchemaId":"special.copilot.v1","fields":[]},
+    {"optionSchemaId":"special.deepseek_account.v1","fields":[]},
+    {"optionSchemaId":"aws.bedrock_sigv4.v1","fields":[]},
+    {"optionSchemaId":"http.bedrock_bearer.v1","fields":[]},
+    {"optionSchemaId":"http.openai_responses.v1","fields":["apiKeyField","customUserAgent"]},
+    {"optionSchemaId":"oauth.gemini_native.v1","fields":[]},
+    {"optionSchemaId":"oauth.gemini_code_assist.v1","fields":[]},
+    {"optionSchemaId":"http.gemini_native.v1","fields":["apiKeyField","customUserAgent"]},
+    {"optionSchemaId":"legacy.frozen.v1","fields":[]}
+  ],
   "families": [
     {"familyId":"family.claude_oauth","label":"Claude OAuth","credentialProfileId":"claude.official_oauth","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.official_oauth","defaultEnabled":true}]},
     {"familyId":"family.anthropic_api_key","label":"Anthropic API Key","credentialProfileId":"claude.anthropic_api_key","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.anthropic_api_key","defaultEnabled":true}]},

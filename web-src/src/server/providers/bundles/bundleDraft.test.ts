@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import type { ProviderBundleView, ProviderResource } from "@/lib/api/providers";
+import type {
+  ProviderBundleView,
+  ProviderResource,
+  ProviderRuntimePlan,
+} from "@/lib/api/providers";
 import { familyById, providerRegistry } from "@/server/providerRegistry";
-import { readEndpoint } from "@/server/providers/editor/providerDraft";
 import {
   createProviderBundleDraft,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
-  parseSettings,
   providerBundleIdentityEditable,
   toProviderBundleWriteDraft,
   updateBundleModel,
@@ -17,54 +19,103 @@ import {
   validateProviderBundleDraft,
 } from "./bundleDraft";
 
+function runtime(
+  resource: Pick<ProviderResource, "app" | "profileId" | "revision">,
+  endpoint: string,
+): ProviderRuntimePlan {
+  return {
+    providerKey: { app: resource.app, providerId: "provider" },
+    providerRevision: resource.revision,
+    profileId: resource.profileId!,
+    profileSchemaRevision: 1,
+    driverId: "http.openai_chat",
+    driverContractRevision: 1,
+    endpoint,
+    upstreamProtocol: "open_ai_chat",
+    outboundIdentityPolicy: { kind: "server_identity" },
+    authRef: { kind: "static_credential" },
+    modelPolicy: { mode: "single", upstreamModel: "shared-model" },
+    testModel: "health-model",
+    transportPolicy: {
+      timeoutMs: 45_000,
+      streamFirstByteTimeoutMs: 15_000,
+      streamIdleTimeoutMs: 30_000,
+      redirectPolicy: "same_origin",
+      directConnection: true,
+    },
+    extraHeaders: [],
+    driverOptions: {},
+    configurationState: "ready",
+    warnings: [],
+    runtimeFingerprint: "fixture",
+  };
+}
+
 describe("Provider Bundle drafts", () => {
-  it("materializes every registry family with its complete Surface set", () => {
+  it("materializes every family and every Driver option schema", () => {
     for (const family of providerRegistry.families) {
       const draft = createProviderBundleDraft(family);
       expect(
-        draft.surfaces.map((surface) => ({
-          app: surface.app,
-          profileId: surface.profileId,
-          enabled: surface.enabled,
+        draft.surfaces.map(({ app, profileId, enabled }) => ({
+          app,
+          profileId,
+          enabled,
         })),
         family.familyId,
       ).toEqual(
-        family.surfaces.map((surface) => ({
-          app: surface.app,
-          profileId: surface.profileId,
-          enabled: surface.defaultEnabled,
+        family.surfaces.map(({ app, profileId, defaultEnabled }) => ({
+          app,
+          profileId,
+          enabled: defaultEnabled,
         })),
       );
       expect(modelPoliciesForFamily(family), family.familyId).toContain(
         draft.modelPolicy,
       );
+      expect(
+        draft.surfaces.every((surface) => !("settingsText" in surface)),
+      ).toBe(true);
+      for (const surface of toProviderBundleWriteDraft(draft).surfaces) {
+        expect("settingsConfig" in surface, family.familyId).toBe(false);
+        expect("meta" in surface, family.familyId).toBe(false);
+      }
+    }
+    for (const driver of providerRegistry.drivers) {
+      expect(
+        providerRegistry.optionSchemas.some(
+          (schema) => schema.optionSchemaId === driver.optionSchemaId,
+        ),
+        driver.driverId,
+      ).toBe(true);
     }
   });
 
-  it("writes one shared model policy and upstream model to every Surface", () => {
+  it("writes one shared model policy without Surface settings JSON", () => {
     const family = familyById("family.grok_oauth")!;
     const draft = updateBundleModel(
       createProviderBundleDraft(family),
       "single",
       "grok-shared-model",
     );
-    const write = toProviderBundleWriteDraft(draft);
+    draft.accountId = "grok-account";
+    draft.accountGeneration = 7;
 
-    for (const surface of write.surfaces) {
-      expect(surface.settingsConfig.modelMapping).toEqual({
-        mode: "single",
-        upstreamModel: "grok-shared-model",
-      });
-    }
+    const write = toProviderBundleWriteDraft(draft);
+    expect(write.modelPolicy).toBe("single");
+    expect(write.upstreamModel).toBe("grok-shared-model");
+    expect(write.managedAccount).toEqual({
+      accountId: "grok-account",
+      authIdentityGeneration: 7,
+    });
+    expect(
+      write.surfaces.every((surface) => !("settingsConfig" in surface)),
+    ).toBe(true);
 
     const passthrough = toProviderBundleWriteDraft(
-      updateBundleModel(draft, "passthrough", "grok-shared-model"),
+      updateBundleModel(draft, "passthrough", "ignored-model"),
     );
-    for (const surface of passthrough.surfaces) {
-      expect(surface.settingsConfig.modelMapping).toEqual({
-        mode: "passthrough",
-      });
-    }
+    expect(passthrough.modelPolicy).toBe("passthrough");
+    expect(passthrough.upstreamModel).toBeUndefined();
   });
 
   it("keeps preset identity canonical while Custom HTTP remains editable", () => {
@@ -83,7 +134,6 @@ describe("Provider Bundle drafts", () => {
     const custom = createProviderBundleDraft(customFamily);
     custom.name = "Private gateway";
     custom.websiteUrl = "https://gateway.example";
-
     expect(providerBundleIdentityEditable(customFamily)).toBe(true);
     expect(toProviderBundleWriteDraft(custom)).toMatchObject({
       name: "Private gateway",
@@ -96,9 +146,8 @@ describe("Provider Bundle drafts", () => {
       const family = familyById(familyId)!;
       const draft = createProviderBundleDraft(family);
       expect(modelPoliciesForFamily(family), familyId).toEqual(["passthrough"]);
-      expect(draft.modelPolicy, familyId).toBe("passthrough");
-
       draft.accountId = "official-account";
+      draft.accountGeneration = 1;
       draft.modelPolicy = "single";
       draft.upstreamModel = "forced-model";
       expect(validateProviderBundleDraft(draft), familyId).toBe(
@@ -107,30 +156,7 @@ describe("Provider Bundle drafts", () => {
     }
   });
 
-  it("binds one Grok OAuth account to Claude, Codex, and Gemini", () => {
-    const family = familyById("family.grok_oauth")!;
-    const draft = createProviderBundleDraft(family);
-    draft.accountId = "grok-account";
-    draft.accountGeneration = 7;
-
-    expect(validateProviderBundleDraft(draft)).toBeNull();
-    const write = toProviderBundleWriteDraft(draft);
-    expect(write.surfaces.map((surface) => surface.app)).toEqual([
-      "claude",
-      "codex",
-      "gemini",
-    ]);
-    for (const surface of write.surfaces) {
-      expect(surface.meta?.authBinding).toMatchObject({
-        source: "managed_account",
-        authProvider: "grok_oauth",
-        accountId: "grok-account",
-        authIdentityGeneration: 7,
-      });
-    }
-  });
-
-  it("writes shared credentials at Bundle scope for fixed endpoint families", () => {
+  it("writes shared credentials at Bundle scope and omits fixed endpoints", () => {
     const family = familyById("family.openrouter")!;
     const draft = createProviderBundleDraft(family);
     const [{ pointer }] = familyCredentialSlots(family);
@@ -146,13 +172,11 @@ describe("Provider Bundle drafts", () => {
     });
     for (const surface of write.surfaces) {
       expect(surface.credentialPatches).toBeUndefined();
-      expect(readEndpoint(surface.settingsConfig, surface.app)).toMatch(
-        /^https:\/\/openrouter\.ai\/api/,
-      );
+      expect(surface.endpoint).toBeUndefined();
     }
   });
 
-  it("keeps Custom HTTP endpoint and credentials isolated by Surface", () => {
+  it("keeps Custom HTTP endpoint, credentials, auth field, and transport typed", () => {
     const family = familyById("family.custom_http")!;
     const draft = createProviderBundleDraft(family);
     draft.surfaces = draft.surfaces.map((surface, index) => ({
@@ -160,80 +184,263 @@ describe("Provider Bundle drafts", () => {
         surface,
         `https://${surface.app}.example/v${index + 1}`,
       ),
+      testModel: `${surface.app}-health-model`,
+      transport: {
+        timeoutMs: "60000",
+        streamFirstByteTimeoutMs: "15000",
+        streamIdleTimeoutMs: "45000",
+      },
       secret: {
         configured: false,
         value: `${surface.app}-secret`,
         clear: false,
       },
     }));
+    draft.surfaces[0]!.customBinding = {
+      upstreamProtocol: "anthropic_messages",
+      authScheme: "custom_header",
+    };
+    draft.surfaces[0]!.driverOptions.apiKeyField = "x-api-key";
 
     expect(validateProviderBundleDraft(draft)).toBeNull();
     const write = toProviderBundleWriteDraft(draft);
     expect(write.credentialPatches).toEqual({});
-    for (const surface of write.surfaces) {
-      expect(surface.credentialPatches).toEqual({
+    expect(write.surfaces[0]).toMatchObject({
+      endpoint: "https://claude.example/v1",
+      testModel: "claude-health-model",
+      transport: {
+        timeoutMs: 60000,
+        streamFirstByteTimeoutMs: 15000,
+        streamIdleTimeoutMs: 45000,
+      },
+      driverOptions: { apiKeyField: "x-api-key" },
+      credentialPatches: {
         "/settingsConfig/apiKey": {
           action: "replace",
-          value: `${surface.app}-secret`,
+          value: "claude-secret",
         },
-      });
-      expect(
-        readEndpoint(
-          parseSettings(JSON.stringify(surface.settingsConfig)),
-          surface.app,
-        ),
-      ).toContain(`${surface.app}.example`);
-    }
+      },
+    });
   });
 
-  it("does not require Surface-scoped credentials for disabled APIs", () => {
+  it("validates Custom Header names and timeout bounds", () => {
     const family = familyById("family.custom_http")!;
     const draft = createProviderBundleDraft(family);
-    draft.surfaces = draft.surfaces.map((surface, index) => {
-      const next =
-        index === 0
-          ? updateSurfaceEndpoint(surface, "https://claude.example/v1")
-          : surface;
-      return {
-        ...next,
-        enabled: index === 0,
-        secret:
-          index === 0
-            ? { configured: false, value: "claude-secret", clear: false }
-            : surface.secret,
-      };
-    });
+    draft.surfaces = draft.surfaces.map((item) =>
+      updateSurfaceEndpoint(item, `https://${item.app}.example/v1`),
+    );
+    const surface = draft.surfaces[0]!;
+    surface.customBinding = {
+      upstreamProtocol: "anthropic_messages",
+      authScheme: "custom_header",
+    };
+    surface.driverOptions.apiKeyField = "bad header";
+    surface.secret.value = "secret";
+    expect(validateProviderBundleDraft(draft)).toBe(
+      "claude authentication header name is invalid",
+    );
 
-    expect(validateProviderBundleDraft(draft)).toBeNull();
+    surface.driverOptions.apiKeyField = "x-api-key";
+    surface.transport.timeoutMs = "999";
+    expect(validateProviderBundleDraft(draft)).toBe(
+      "claude request timeout is invalid",
+    );
+
+    surface.transport.timeoutMs = "60000";
+    surface.driverOptions.apiKeyField = "Host";
+    expect(validateProviderBundleDraft(draft)).toBe(
+      "claude authentication header name is invalid",
+    );
+
+    surface.driverOptions.apiKeyField = "x-api-key";
+    surface.headers = [
+      {
+        id: "managed-header",
+        name: "Authorization",
+        configured: false,
+        value: "shadow-secret",
+        removed: false,
+      },
+    ];
+    expect(validateProviderBundleDraft(draft)).toBe(
+      "claude custom header name is invalid or repeated",
+    );
   });
 
-  it("duplicates Bundle configuration without reusing stored secrets", () => {
-    const family = familyById("family.openrouter")!;
+  it("requires a new Custom Header secret when its credential slot changes", () => {
+    const family = familyById("family.custom_http")!;
+    const draft = createProviderBundleDraft(family);
+    draft.surfaces = draft.surfaces.map((surface) => ({
+      ...updateSurfaceEndpoint(surface, `https://${surface.app}.example/v1`),
+      secret: {
+        configured: false,
+        value: `${surface.app}-secret`,
+        clear: false,
+      },
+    }));
+    draft.surfaces[0]!.headers = [
+      {
+        id: "configured-header",
+        name: "x-new-route~id",
+        originalName: "x-old-route~id",
+        configured: true,
+        value: "",
+        removed: false,
+      },
+      {
+        id: "removed-destination-header",
+        name: "x-new-route~id",
+        originalName: "x-new-route~id",
+        configured: true,
+        value: "",
+        removed: true,
+      },
+    ];
+
+    expect(validateProviderBundleDraft(draft)).toBe(
+      "claude custom header value must be re-entered after renaming",
+    );
+    expect(
+      toProviderBundleWriteDraft(draft).surfaces[0]?.credentialPatches,
+    ).toEqual({
+      "/settingsConfig/apiKey": {
+        action: "replace",
+        value: "claude-secret",
+      },
+      "/settingsConfig/extraHeaders/x-old-route~0id": { action: "clear" },
+      "/settingsConfig/extraHeaders/x-new-route~0id": { action: "clear" },
+    });
+
+    draft.surfaces[0]!.headers[0]!.value = "new-route-secret";
+    expect(validateProviderBundleDraft(draft)).toBeNull();
+    expect(
+      toProviderBundleWriteDraft(draft).surfaces[0]?.credentialPatches,
+    ).toMatchObject({
+      "/settingsConfig/extraHeaders/x-old-route~0id": { action: "clear" },
+      "/settingsConfig/extraHeaders/x-new-route~0id": {
+        action: "replace",
+        value: "new-route-secret",
+      },
+    });
+  });
+
+  it("decodes escaped Custom Header credential slots for editing", () => {
+    const family = familyById("family.custom_http")!;
     const source = createProviderBundleDraft(family);
-    const [{ pointer }] = familyCredentialSlots(family);
-    const write = toProviderBundleWriteDraft(source);
     const surfaces = Object.fromEntries(
-      write.surfaces.map((surface) => [
-        surface.app,
-        {
+      family.surfaces.map((surface) => {
+        const resource: ProviderResource = {
           app: surface.app,
           provider: {
             id: source.id,
             name: source.name,
-            settingsConfig: surface.settingsConfig,
-            category: surface.category,
-            meta: surface.meta,
+            settingsConfig:
+              surface.app === "claude"
+                ? {
+                    modelMapping: {
+                      mode: "single",
+                      upstreamModel: "persisted-disabled-model",
+                    },
+                    testModel: "persisted-health-model",
+                    transport: {
+                      timeoutMs: 61_000,
+                      streamFirstByteTimeoutMs: 16_000,
+                      streamIdleTimeoutMs: 46_000,
+                    },
+                  }
+                : {},
+            meta:
+              surface.app === "claude"
+                ? { customUserAgent: "persisted-agent/1" }
+                : undefined,
           },
-          providerType: surface.meta?.providerType ?? "openrouter",
-          providerTypeId: surface.meta?.providerType ?? "openrouter",
+          providerType: "custom",
+          providerTypeId: "custom",
+          revision: 2,
+          profileId: surface.profileId,
+          customBinding: source.surfaces.find(
+            (candidate) => candidate.app === surface.app,
+          )!.customBinding,
+          identity: { status: "bound" },
+          credentialConfigured: true,
+          credentialSlots:
+            surface.app === "claude"
+              ? [
+                  "/settingsConfig/apiKey",
+                  "/settingsConfig/extraHeaders/x-route~0id",
+                ]
+              : ["/settingsConfig/apiKey"],
+        };
+        if (surface.app !== "claude") {
+          resource.runtime = runtime(
+            resource,
+            `https://${surface.app}.example/v1`,
+          );
+        }
+        return [surface.app, resource];
+      }),
+    ) as ProviderBundleView["surfaces"];
+    const view: ProviderBundleView = {
+      id: source.id,
+      familyId: family.familyId,
+      revision: 2,
+      name: source.name,
+      supportedApps: family.surfaces.map((surface) => surface.app),
+      enabledApps: ["codex", "gemini"],
+      credentialConfigured: true,
+      credentialSlots: [
+        "/settingsConfig/apiKey",
+        "/settingsConfig/extraHeaders/x-route~0id",
+      ],
+      surfaces,
+    };
+
+    const edited = editProviderBundleDraft(view);
+    expect(edited.modelPolicy).toBe("single");
+    expect(edited.upstreamModel).toBe("persisted-disabled-model");
+    expect(edited.surfaces[0]?.runtime).toBeUndefined();
+    expect(edited.surfaces[0]?.testModel).toBe("persisted-health-model");
+    expect(edited.surfaces[0]?.transport).toEqual({
+      timeoutMs: "61000",
+      streamFirstByteTimeoutMs: "16000",
+      streamIdleTimeoutMs: "46000",
+    });
+    expect(edited.surfaces[0]?.driverOptions.customUserAgent).toBe(
+      "persisted-agent/1",
+    );
+    expect(edited.surfaces[0]?.headers).toMatchObject([
+      {
+        name: "x-route~id",
+        originalName: "x-route~id",
+        configured: true,
+      },
+    ]);
+  });
+
+  it("duplicates effective configuration without reusing stored secrets", () => {
+    const family = familyById("family.openrouter")!;
+    const source = createProviderBundleDraft(family);
+    const [{ pointer }] = familyCredentialSlots(family);
+    const surfaces = Object.fromEntries(
+      family.surfaces.map((surface) => {
+        const resource: ProviderResource = {
+          app: surface.app,
+          provider: {
+            id: source.id,
+            name: source.name,
+            settingsConfig: {},
+          },
+          providerType: "openrouter",
+          providerTypeId: "openrouter",
           revision: 4,
           profileId: surface.profileId,
-          customBinding: surface.customBinding,
-          identity: { status: "bound" as const },
+          identity: { status: "bound" },
           credentialConfigured: true,
           credentialSlots: [pointer],
-        } satisfies ProviderResource,
-      ]),
+        };
+        resource.runtime = runtime(resource, "https://openrouter.ai/api");
+        return [surface.app, resource];
+      }),
     ) as ProviderBundleView["surfaces"];
     const view: ProviderBundleView = {
       id: source.id,
@@ -241,9 +448,6 @@ describe("Provider Bundle drafts", () => {
       revision: 4,
       name: source.name,
       websiteUrl: source.websiteUrl,
-      notes: source.notes,
-      icon: source.icon,
-      iconColor: source.iconColor,
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: family.surfaces.map((surface) => surface.app),
       credentialConfigured: true,
@@ -251,22 +455,17 @@ describe("Provider Bundle drafts", () => {
       surfaces,
     };
 
-    view.name = "Legacy custom name";
-    view.websiteUrl = "https://legacy.example";
-    expect(editProviderBundleDraft(view)).toMatchObject({
-      name: source.name,
-      websiteUrl: source.websiteUrl,
-    });
+    const edited = editProviderBundleDraft(view);
+    expect(edited.surfaces[0]?.runtime?.runtimeFingerprint).toBe("fixture");
+    expect(edited.surfaces[0]?.testModel).toBe("health-model");
+    expect(edited.surfaces[0]?.transport.timeoutMs).toBe("45000");
 
     const duplicate = duplicateProviderBundleDraft(view);
-
     expect(duplicate.id).not.toBe(source.id);
-    expect(duplicate.name).toBe(source.name);
     expect(duplicate.expectedRevision).toBeUndefined();
-    expect(duplicate.clientRequestId).toBeTruthy();
-    expect(Object.values(duplicate.secrets)).toEqual([
-      { configured: false, value: "", clear: false },
-    ]);
+    expect(duplicate.surfaces.every((surface) => surface.runtime == null)).toBe(
+      true,
+    );
     expect(toProviderBundleWriteDraft(duplicate).credentialPatches).toEqual({});
     expect(validateProviderBundleDraft(duplicate)).toBe(
       "Configure the required credential",

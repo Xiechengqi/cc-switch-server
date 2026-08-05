@@ -5,13 +5,16 @@ import type {
   ProviderCredentialPatches,
   ProviderCustomBinding,
   ProviderResource,
+  ProviderRuntimePlan,
 } from "@/lib/api/providers";
 import {
   customPolicyForProfile,
   driverForProfile,
   familyById,
   modelPoliciesForProfile,
+  optionSchemaForDriver,
   profileById,
+  providerRegistry,
   type CoreProviderApp,
   type ProviderFamilySpec,
   type ProviderModelPolicy,
@@ -22,15 +25,45 @@ import {
   readEndpoint,
   readModelPolicy,
   readUpstreamModel,
-  setEndpoint,
-  setPassthroughModel,
-  setSingleModel,
 } from "@/server/providers/editor/providerDraft";
-import type { ProviderMeta } from "@/types";
 
-export const KEEP_SECRET = "__CC_SWITCH_SECRET_KEEP__";
 export const PRIMARY_SECRET_SLOT = "/settingsConfig/apiKey";
 export const EXTRA_HEADER_PREFIX = "/settingsConfig/extraHeaders/";
+
+const CUSTOM_AUTH_HEADER_DENYLIST = new Set([
+  "proxy-authorization",
+  "proxy-authenticate",
+  "host",
+  "content-length",
+  "content-type",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "user-agent",
+]);
+
+const EXTRA_HEADER_DENYLIST = new Set([
+  ...CUSTOM_AUTH_HEADER_DENYLIST,
+  "authorization",
+  "x-api-key",
+  "api-key",
+  "x-goog-api-key",
+]);
+
+function escapePointerSegment(value: string): string {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+function unescapePointerSegment(value: string): string {
+  return value.replace(/~1/g, "/").replace(/~0/g, "~");
+}
+
+function extraHeaderSlot(name: string): string {
+  return `${EXTRA_HEADER_PREFIX}${escapePointerSegment(name)}`;
+}
 
 export const AWS_CREDENTIAL_SLOTS = {
   access_key_id: "/settingsConfig/env/AWS_ACCESS_KEY_ID",
@@ -57,12 +90,24 @@ export interface BundleSurfaceEditorDraft {
   app: CoreProviderApp;
   enabled: boolean;
   profileId: string;
-  category?: string;
-  meta: ProviderMeta;
-  settingsText: string;
+  endpoint: string;
+  testModel: string;
+  transport: {
+    timeoutMs: string;
+    streamFirstByteTimeoutMs: string;
+    streamIdleTimeoutMs: string;
+  };
+  driverOptions: {
+    apiKeyField?: string;
+    customUserAgent?: string;
+    codexFastMode?: boolean;
+    codexImageGenerationEnabled?: boolean;
+    codexWebsocketEnabled?: boolean;
+  };
   customBinding?: ProviderCustomBinding;
   secret: BundleSecretDraft;
   headers: BundleHeaderDraft[];
+  runtime?: ProviderRuntimePlan;
 }
 
 export interface ProviderBundleEditorDraft {
@@ -94,10 +139,6 @@ const DEFAULT_CUSTOM_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function prettySettings(value: Record<string, unknown>): string {
-  return JSON.stringify(value, null, 2);
 }
 
 function sourceSurface(
@@ -147,9 +188,13 @@ export function modelPoliciesForFamily(
 function initialBundleModel(
   family: ProviderFamilySpec,
   surfaces: BundleSurfaceEditorDraft[],
+  sourceResource?: ProviderResource,
 ): { policy: ProviderModelPolicy; upstreamModel: string } {
   const source = sourceSurface(family, surfaces);
-  const sourceModel = surfaceModelState(source);
+  const sourceSettings = sourceResource
+    ? clone(sourceResource.provider.settingsConfig as Record<string, unknown>)
+    : undefined;
+  const sourceModel = surfaceModelState(source, sourceSettings);
   const allowedPolicies = modelPoliciesForFamily(family);
   return {
     policy: allowedPolicies.includes(sourceModel.policy)
@@ -201,40 +246,74 @@ function surfaceFromResource(
   const profile = profileById(profileId);
   if (!profile) throw new Error(`Unknown profile ${profileId}`);
   const preset = createDraftForProfile(profile);
-  const provider = resource?.provider;
+  const runtime = resource?.runtime;
   const settings = clone(
-    (provider?.settingsConfig ?? preset.settingsConfig) as Record<
+    (resource?.provider.settingsConfig ?? preset.settingsConfig) as Record<
       string,
       unknown
     >,
   );
-  const meta = clone((provider?.meta ?? preset.meta) as ProviderMeta);
-  const headersValue = settings.extraHeaders;
-  const configuredHeaders = new Set(
-    (resource?.credentialSlots ?? []).filter((slot) =>
-      slot.startsWith(EXTRA_HEADER_PREFIX),
-    ),
+  const configuredHeaderSlots = (resource?.credentialSlots ?? []).filter(
+    (slot) => slot.startsWith(EXTRA_HEADER_PREFIX),
   );
-  const headers =
-    headersValue &&
-    typeof headersValue === "object" &&
-    !Array.isArray(headersValue)
-      ? Object.keys(headersValue as Record<string, unknown>).map((name) => ({
-          id: crypto.randomUUID(),
-          name,
-          originalName: name,
-          configured: configuredHeaders.has(`${EXTRA_HEADER_PREFIX}${name}`),
-          value: "",
-          removed: false,
-        }))
-      : [];
+  const runtimeHeaders = new Map(
+    (runtime?.extraHeaders ?? []).map((header) => [
+      header.credentialSlot,
+      header.name,
+    ]),
+  );
+  const headers = configuredHeaderSlots.map((slot) => {
+    const originalName = unescapePointerSegment(
+      slot.slice(EXTRA_HEADER_PREFIX.length),
+    );
+    return {
+      id: crypto.randomUUID(),
+      name: originalName || runtimeHeaders.get(slot) || "",
+      originalName,
+      configured: true,
+      value: "",
+      removed: false,
+    };
+  });
+  const runtimeOptions = runtime?.driverOptions ?? {};
+  const configuredMeta = resource?.provider.meta ?? preset.meta ?? {};
+  const configuredTransport = objectOption(settings.transport);
+  const endpoint = runtime?.endpoint ?? readEndpoint(settings, app);
   return {
     app,
     enabled,
     profileId,
-    category: provider?.category ?? preset.category,
-    meta,
-    settingsText: prettySettings(settings),
+    endpoint,
+    testModel: runtime?.testModel ?? stringOption(settings.testModel) ?? "",
+    transport: {
+      timeoutMs: runtime
+        ? String(runtime.transportPolicy.timeoutMs)
+        : numberOption(configuredTransport?.timeoutMs),
+      streamFirstByteTimeoutMs:
+        runtime?.transportPolicy.streamFirstByteTimeoutMs == null
+          ? numberOption(configuredTransport?.streamFirstByteTimeoutMs)
+          : String(runtime.transportPolicy.streamFirstByteTimeoutMs),
+      streamIdleTimeoutMs:
+        runtime?.transportPolicy.streamIdleTimeoutMs == null
+          ? numberOption(configuredTransport?.streamIdleTimeoutMs)
+          : String(runtime.transportPolicy.streamIdleTimeoutMs),
+    },
+    driverOptions: {
+      apiKeyField:
+        stringOption(runtimeOptions.apiKeyField) ?? configuredMeta.apiKeyField,
+      customUserAgent:
+        stringOption(runtimeOptions.customUserAgent) ??
+        configuredMeta.customUserAgent,
+      codexFastMode:
+        booleanOption(runtimeOptions.codexFastMode) ??
+        configuredMeta.codexFastMode,
+      codexImageGenerationEnabled:
+        booleanOption(runtimeOptions.codexImageGenerationEnabled) ??
+        configuredMeta.codexImageGenerationEnabled,
+      codexWebsocketEnabled:
+        booleanOption(runtimeOptions.codexWebsocketEnabled) ??
+        configuredMeta.codexWebsocketEnabled,
+    },
     customBinding:
       resource?.customBinding ??
       (profile.formComposition === "custom"
@@ -250,7 +329,28 @@ function surfaceFromResource(
       clear: false,
     },
     headers,
+    runtime,
   };
+}
+
+function stringOption(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function booleanOption(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function numberOption(value: unknown): string {
+  return typeof value === "number" && Number.isSafeInteger(value)
+    ? String(value)
+    : "";
+}
+
+function objectOption(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 export function createProviderBundleDraft(
@@ -267,7 +367,6 @@ export function createProviderBundleDraft(
   );
   const source = sourceSurface(family, surfaces);
   const sourceProfile = profileById(source.profileId)!;
-  const sourceSettings = parseSettings(source.settingsText);
   const sourcePreset = createDraftForProfile(sourceProfile);
   const model = initialBundleModel(family, surfaces);
   const secrets = Object.fromEntries(
@@ -286,14 +385,14 @@ export function createProviderBundleDraft(
     iconColor: sourcePreset.iconColor,
     clientRequestId: crypto.randomUUID(),
     accountId: "",
-    endpoint: readEndpoint(sourceSettings, source.app),
-    awsRegion: readAwsRegion(sourceSettings),
+    endpoint: source.endpoint,
+    awsRegion: readAwsRegion(
+      sourcePreset.settingsConfig as Record<string, unknown>,
+    ),
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     secrets,
-    surfaces: surfaces.map((surface) =>
-      updateSurfaceModel(surface, model.policy, model.upstreamModel),
-    ),
+    surfaces,
   };
 }
 
@@ -313,9 +412,8 @@ export function editProviderBundleDraft(
   );
   const source = sourceSurface(family, surfaces);
   const sourceResource = bundle.surfaces[source.app];
-  const sourceSettings = parseSettings(source.settingsText);
   const binding = sourceResource?.provider.meta?.authBinding;
-  const model = initialBundleModel(family, surfaces);
+  const model = initialBundleModel(family, surfaces, sourceResource);
   const identity = providerBundleIdentityEditable(family)
     ? { name: bundle.name, websiteUrl: bundle.websiteUrl ?? "" }
     : canonicalBundleIdentity(family);
@@ -343,14 +441,21 @@ export function editProviderBundleDraft(
     expectedRevision: bundle.revision,
     accountId: binding?.accountId ?? "",
     accountGeneration: binding?.authIdentityGeneration,
-    endpoint: readEndpoint(sourceSettings, source.app),
-    awsRegion: readAwsRegion(sourceSettings),
+    endpoint: source.endpoint,
+    awsRegion:
+      sourceResource?.runtime?.awsRegion ??
+      readAwsRegion(
+        clone(
+          (sourceResource?.provider.settingsConfig ?? {}) as Record<
+            string,
+            unknown
+          >,
+        ),
+      ),
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     secrets,
-    surfaces: surfaces.map((surface) =>
-      updateSurfaceModel(surface, model.policy, model.upstreamModel),
-    ),
+    surfaces,
   };
 }
 
@@ -377,6 +482,7 @@ export function duplicateProviderBundleDraft(
     ),
     surfaces: source.surfaces.map((surface) => ({
       ...surface,
+      runtime: undefined,
       secret: {
         ...surface.secret,
         configured: false,
@@ -392,37 +498,27 @@ export function duplicateProviderBundleDraft(
   };
 }
 
-export function parseSettings(value: string): Record<string, unknown> {
-  const parsed = JSON.parse(value) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Surface settings must be a JSON object");
-  }
-  return parsed as Record<string, unknown>;
-}
-
-export function surfaceModelState(surface: BundleSurfaceEditorDraft): {
+export function surfaceModelState(
+  surface: BundleSurfaceEditorDraft,
+  settings?: Record<string, unknown>,
+): {
   policy: ProviderModelPolicy;
   upstreamModel: string;
 } {
   const profile = profileById(surface.profileId);
   if (!profile) throw new Error(`Unknown profile ${surface.profileId}`);
-  const settings = parseSettings(surface.settingsText);
+  const runtimeModel = surface.runtime?.modelPolicy;
   return {
-    policy: readModelPolicy(settings, profile),
+    policy:
+      runtimeModel?.mode ??
+      (settings ? readModelPolicy(settings, profile) : profile.modelPolicy),
     upstreamModel:
-      readUpstreamModel(settings) ?? profile.defaultUpstreamModel ?? "",
+      runtimeModel?.mode === "single"
+        ? runtimeModel.upstreamModel
+        : ((settings ? readUpstreamModel(settings) : undefined) ??
+          profile.defaultUpstreamModel ??
+          ""),
   };
-}
-
-export function updateSurfaceModel(
-  surface: BundleSurfaceEditorDraft,
-  policy: ProviderModelPolicy,
-  upstreamModel: string,
-): BundleSurfaceEditorDraft {
-  const settings = parseSettings(surface.settingsText);
-  if (policy === "single") setSingleModel(settings, surface.app, upstreamModel);
-  else setPassthroughModel(settings);
-  return { ...surface, settingsText: prettySettings(settings) };
 }
 
 export function updateBundleModel(
@@ -434,27 +530,18 @@ export function updateBundleModel(
     ...draft,
     modelPolicy: policy,
     upstreamModel,
-    surfaces: draft.surfaces.map((surface) => {
-      try {
-        return updateSurfaceModel(surface, policy, upstreamModel);
-      } catch {
-        return surface;
-      }
-    }),
   };
 }
 
 export function surfaceEndpoint(surface: BundleSurfaceEditorDraft): string {
-  return readEndpoint(parseSettings(surface.settingsText), surface.app);
+  return surface.endpoint;
 }
 
 export function updateSurfaceEndpoint(
   surface: BundleSurfaceEditorDraft,
   endpoint: string,
 ): BundleSurfaceEditorDraft {
-  const settings = parseSettings(surface.settingsText);
-  setEndpoint(settings, surface.app, endpoint);
-  return { ...surface, settingsText: prettySettings(settings) };
+  return { ...surface, endpoint };
 }
 
 function readAwsRegion(settings: Record<string, unknown>): string {
@@ -462,16 +549,6 @@ function readAwsRegion(settings: Record<string, unknown>): string {
   if (!env || typeof env !== "object" || Array.isArray(env)) return "us-east-1";
   const value = (env as Record<string, unknown>).AWS_REGION;
   return typeof value === "string" && value.trim() ? value.trim() : "us-east-1";
-}
-
-function setAwsRegion(settings: Record<string, unknown>, region: string): void {
-  const current = settings.env;
-  const env =
-    current && typeof current === "object" && !Array.isArray(current)
-      ? (current as Record<string, unknown>)
-      : {};
-  env.AWS_REGION = region.trim();
-  settings.env = env;
 }
 
 function secretPatches(
@@ -493,33 +570,79 @@ function customCredentialPatches(
   const patches = secretPatches({ [PRIMARY_SECRET_SLOT]: surface.secret });
   for (const header of surface.headers) {
     const originalSlot = header.originalName
-      ? `${EXTRA_HEADER_PREFIX}${header.originalName}`
+      ? extraHeaderSlot(header.originalName)
       : undefined;
-    if (header.removed) {
-      if (originalSlot) patches[originalSlot] = { action: "clear" };
-      continue;
-    }
-    const slot = `${EXTRA_HEADER_PREFIX}${header.name.trim()}`;
-    if (originalSlot && originalSlot !== slot) {
+    const slot = extraHeaderSlot(header.name.trim());
+    if (originalSlot && (header.removed || originalSlot !== slot)) {
       patches[originalSlot] = { action: "clear" };
     }
+  }
+  for (const header of surface.headers) {
+    if (header.removed) continue;
+    const originalSlot = header.originalName
+      ? extraHeaderSlot(header.originalName)
+      : undefined;
+    const slot = extraHeaderSlot(header.name.trim());
+    const renamed = Boolean(originalSlot && originalSlot !== slot);
     if (header.value.trim()) {
       patches[slot] = { action: "replace", value: header.value.trim() };
-    } else if (header.configured) {
+    } else if (header.configured && !renamed) {
       patches[slot] = { action: "keep" };
     }
   }
   return patches;
 }
 
-function protocolFormat(
-  protocol: string | undefined,
-): ProviderMeta["apiFormat"] | undefined {
-  if (protocol === "anthropic_messages") return "anthropic";
-  if (protocol === "open_ai_chat") return "openai_chat";
-  if (protocol === "open_ai_responses") return "openai_responses";
-  if (protocol === "gemini_native") return "gemini_native";
-  return undefined;
+function driverForSurface(profileId: string, binding?: ProviderCustomBinding) {
+  const profile = profileById(profileId);
+  if (!profile) return undefined;
+  const fixed = driverForProfile(profile);
+  if (fixed) return fixed;
+  if (!binding) return undefined;
+  const policy = customPolicyForProfile(profile);
+  return providerRegistry.drivers.find(
+    (driver) =>
+      policy?.allowedDriverIds.includes(driver.driverId) &&
+      driver.upstreamProtocol === binding.upstreamProtocol &&
+      driver.acceptedAuthSchemes.includes(binding.authScheme),
+  );
+}
+
+function optionalDuration(value: string): number | undefined {
+  const trimmed = value.trim();
+  return trimmed ? Number(trimmed) : undefined;
+}
+
+function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
+  const profile = profileById(surface.profileId);
+  const driver = driverForSurface(surface.profileId, surface.customBinding);
+  const schema = driver ? optionSchemaForDriver(driver) : undefined;
+  const fields = new Set(schema?.fields ?? []);
+  const apiKeyField = surface.driverOptions.apiKeyField?.trim();
+  const customUserAgent = surface.driverOptions.customUserAgent?.trim();
+  return {
+    apiKeyField:
+      profile?.formComposition === "custom" &&
+      fields.has("apiKeyField") &&
+      apiKeyField
+        ? apiKeyField
+        : undefined,
+    customUserAgent:
+      profile?.formComposition === "custom" &&
+      fields.has("customUserAgent") &&
+      customUserAgent
+        ? customUserAgent
+        : undefined,
+    codexFastMode: fields.has("codexFastMode")
+      ? surface.driverOptions.codexFastMode
+      : undefined,
+    codexImageGenerationEnabled: fields.has("codexImageGenerationEnabled")
+      ? surface.driverOptions.codexImageGenerationEnabled
+      : undefined,
+    codexWebsocketEnabled: fields.has("codexWebsocketEnabled")
+      ? surface.driverOptions.codexWebsocketEnabled
+      : undefined,
+  } satisfies NonNullable<ProviderBundleSurfaceWriteDraft["driverOptions"]>;
 }
 
 function surfaceWriteDraft(
@@ -529,57 +652,33 @@ function surfaceWriteDraft(
 ): ProviderBundleSurfaceWriteDraft {
   const profile = profileById(surface.profileId);
   if (!profile) throw new Error(`Unknown profile ${surface.profileId}`);
-  const settings = parseSettings(surface.settingsText);
-  if (
-    family.endpointScope === "bundle" &&
-    profileAllowsEndpointEditing(profile)
-  ) {
-    setEndpoint(settings, surface.app, draft.endpoint);
-  }
-  if (profile.formComposition === "aws")
-    setAwsRegion(settings, draft.awsRegion);
-  if (draft.modelPolicy === "single") {
-    setSingleModel(settings, surface.app, draft.upstreamModel);
-  } else {
-    setPassthroughModel(settings);
-  }
-  const meta = clone(surface.meta);
-  meta.providerType = profile.compatibilityProviderType;
-  if (profile.credentialPolicy.mode === "managed_account") {
-    meta.authBinding = {
-      source: "managed_account",
-      authProvider: profile.credentialPolicy.accountProviderType,
-      accountId: draft.accountId,
-      ...(draft.accountGeneration == null
-        ? {}
-        : { authIdentityGeneration: draft.accountGeneration }),
-    };
-  } else {
-    delete meta.authBinding;
-  }
-  const protocol =
-    profile.formComposition === "custom"
-      ? surface.customBinding?.upstreamProtocol
-      : driverForProfile(profile)?.upstreamProtocol;
-  meta.apiFormat = protocolFormat(protocol);
-  if (profile.formComposition === "custom") {
-    const headers = Object.fromEntries(
-      surface.headers
-        .filter((header) => !header.removed && header.name.trim())
-        .map((header) => [
-          header.name.trim(),
-          header.configured && !header.value.trim() ? KEEP_SECRET : "",
-        ]),
-    );
-    settings.extraHeaders = headers;
-  }
+  const endpoint = profileAllowsEndpointEditing(profile)
+    ? family.endpointScope === "bundle"
+      ? draft.endpoint.trim()
+      : surface.endpoint.trim()
+    : "";
   return {
     app: surface.app,
     enabled: surface.enabled,
     profileId: surface.profileId,
-    settingsConfig: settings,
-    category: surface.category,
-    meta,
+    endpoint: endpoint || undefined,
+    testModel: surface.testModel.trim() || undefined,
+    transport: {
+      timeoutMs: optionalDuration(surface.transport.timeoutMs),
+      streamFirstByteTimeoutMs: optionalDuration(
+        surface.transport.streamFirstByteTimeoutMs,
+      ),
+      streamIdleTimeoutMs: optionalDuration(
+        surface.transport.streamIdleTimeoutMs,
+      ),
+    },
+    driverOptions: typedDriverOptions(surface),
+    extraHeaders:
+      profile.formComposition === "custom"
+        ? surface.headers
+            .filter((header) => !header.removed && header.name.trim())
+            .map((header) => header.name.trim())
+        : undefined,
     customBinding:
       profile.formComposition === "custom" ? surface.customBinding : undefined,
     credentialPatches:
@@ -587,6 +686,27 @@ function surfaceWriteDraft(
         ? customCredentialPatches(surface)
         : undefined,
   };
+}
+
+function validateEndpoint(endpoint: string, required: boolean): boolean {
+  if (!endpoint.trim()) return !required;
+  try {
+    const parsed = new URL(endpoint);
+    return (
+      /^https?:$/.test(parsed.protocol) &&
+      !parsed.username &&
+      !parsed.password &&
+      Boolean(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function validateDuration(value: string, min: number, max: number): boolean {
+  if (!value.trim()) return true;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max;
 }
 
 export function validateProviderBundleDraft(
@@ -606,6 +726,12 @@ export function validateProviderBundleDraft(
   ) {
     return "Select an OAuth account";
   }
+  if (
+    credentialProfile.credentialPolicy.mode === "managed_account" &&
+    draft.accountGeneration == null
+  ) {
+    return "OAuth account identity is unavailable";
+  }
   for (const [slot, secret] of Object.entries(draft.secrets)) {
     const optional = slot.endsWith("/AWS_SESSION_TOKEN");
     if (!optional && !secret.configured && !secret.value.trim()) {
@@ -617,6 +743,12 @@ export function validateProviderBundleDraft(
   if (credentialProfile.formComposition === "aws" && !draft.awsRegion.trim()) {
     return "AWS region is required";
   }
+  if (
+    credentialProfile.formComposition === "aws" &&
+    !/^[A-Za-z0-9-]{1,64}$/.test(draft.awsRegion.trim())
+  ) {
+    return "AWS region is invalid";
+  }
   const allowedModelPolicies = modelPoliciesForFamily(family);
   if (!allowedModelPolicies.includes(draft.modelPolicy)) {
     return "Provider model policy is invalid";
@@ -627,27 +759,39 @@ export function validateProviderBundleDraft(
   for (const surface of draft.surfaces) {
     const profile = profileById(surface.profileId);
     if (!profile) return `Profile ${surface.profileId} is unavailable`;
-    let settings: Record<string, unknown>;
-    try {
-      settings = parseSettings(surface.settingsText);
-    } catch (error) {
-      return error instanceof Error ? error.message : String(error);
+    if (surface.testModel.trim().length > 256) {
+      return `${surface.app} test model is too long`;
     }
-    if (!surface.enabled) continue;
-    if (profile.formComposition === "custom") {
-      const endpoint = readEndpoint(settings, surface.app);
-      try {
-        const parsed = new URL(endpoint);
-        if (
-          !/^https?:$/.test(parsed.protocol) ||
-          parsed.username ||
-          parsed.password
-        ) {
-          return `${surface.app} endpoint is invalid`;
-        }
-      } catch {
+    if (!validateDuration(surface.transport.timeoutMs, 1_000, 3_600_000)) {
+      return `${surface.app} request timeout is invalid`;
+    }
+    if (
+      !validateDuration(
+        surface.transport.streamFirstByteTimeoutMs,
+        1_000,
+        600_000,
+      )
+    ) {
+      return `${surface.app} first-byte timeout is invalid`;
+    }
+    if (
+      !validateDuration(surface.transport.streamIdleTimeoutMs, 1_000, 3_600_000)
+    ) {
+      return `${surface.app} stream idle timeout is invalid`;
+    }
+    if (profileAllowsEndpointEditing(profile)) {
+      const endpoint =
+        family.endpointScope === "bundle" ? draft.endpoint : surface.endpoint;
+      if (
+        !validateEndpoint(
+          endpoint,
+          profile.endpointPolicy === "custom" && surface.enabled,
+        )
+      ) {
         return `${surface.app} endpoint is invalid`;
       }
+    }
+    if (profile.formComposition === "custom") {
       const policy = customPolicyForProfile(profile);
       if (
         !surface.customBinding ||
@@ -656,16 +800,47 @@ export function validateProviderBundleDraft(
       ) {
         return `${surface.app} custom protocol binding is invalid`;
       }
-      if (!surface.secret.configured && !surface.secret.value.trim()) {
+      const authScheme = surface.customBinding.authScheme;
+      const apiKeyField = surface.driverOptions.apiKeyField?.trim();
+      if (
+        (authScheme === "custom_header" || authScheme === "query") &&
+        !apiKeyField
+      ) {
+        return `${surface.app} authentication field is required`;
+      }
+      if (
+        authScheme === "custom_header" &&
+        (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(apiKeyField ?? "") ||
+          CUSTOM_AUTH_HEADER_DENYLIST.has(apiKeyField?.toLowerCase() ?? ""))
+      ) {
+        return `${surface.app} authentication header name is invalid`;
+      }
+      if (
+        surface.enabled &&
+        !surface.secret.configured &&
+        !surface.secret.value.trim()
+      ) {
         return `${surface.app} authentication credential is required`;
       }
       const names = new Set<string>();
       for (const header of surface.headers.filter((item) => !item.removed)) {
-        const name = header.name.trim().toLowerCase();
-        if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name) || names.has(name)) {
+        const trimmedName = header.name.trim();
+        const name = trimmedName.toLowerCase();
+        if (
+          !/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name) ||
+          EXTRA_HEADER_DENYLIST.has(name) ||
+          names.has(name)
+        ) {
           return `${surface.app} custom header name is invalid or repeated`;
         }
         names.add(name);
+        if (
+          header.originalName != null &&
+          header.originalName !== trimmedName &&
+          !header.value.trim()
+        ) {
+          return `${surface.app} custom header value must be re-entered after renaming`;
+        }
         if (!header.configured && !header.value.trim()) {
           return `${surface.app} custom header value is required`;
         }
@@ -691,6 +866,21 @@ export function toProviderBundleWriteDraft(
     notes: draft.notes.trim() || undefined,
     icon: draft.icon,
     iconColor: draft.iconColor,
+    modelPolicy: draft.modelPolicy,
+    upstreamModel:
+      draft.modelPolicy === "single" ? draft.upstreamModel.trim() : undefined,
+    managedAccount:
+      credentialProfileForFamily(family)?.credentialPolicy.mode ===
+        "managed_account" && draft.accountGeneration != null
+        ? {
+            accountId: draft.accountId,
+            authIdentityGeneration: draft.accountGeneration,
+          }
+        : undefined,
+    awsRegion:
+      credentialProfileForFamily(family)?.formComposition === "aws"
+        ? draft.awsRegion.trim()
+        : undefined,
     surfaces: draft.surfaces.map((surface) =>
       surfaceWriteDraft(draft, family, surface),
     ),
@@ -698,6 +888,10 @@ export function toProviderBundleWriteDraft(
     expectedRevision: draft.expectedRevision,
     clientRequestId: draft.clientRequestId,
   };
+}
+
+function credentialProfileForFamily(family: ProviderFamilySpec) {
+  return profileById(family.credentialProfileId);
 }
 
 export function familyCredentialSlots(

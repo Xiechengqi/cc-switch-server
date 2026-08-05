@@ -117,6 +117,8 @@ mod tests {
             outbound_identity_policy: policy,
             auth_ref: RuntimeAuthRef::Missing,
             model_policy: RuntimeModelPolicy::Passthrough,
+            test_model: None,
+            aws_region: None,
             media_policy: None,
             transport_policy: RuntimeTransportPolicy::default(),
             extra_headers: Vec::new(),

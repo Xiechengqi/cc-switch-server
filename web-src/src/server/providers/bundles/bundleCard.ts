@@ -2,8 +2,6 @@ import type { ManagedAuthAccount } from "@/lib/api/auth";
 import type { ProviderBundleView, ProviderResource } from "@/lib/api/providers";
 import { managedAuthProvidersMatch } from "@/lib/authBinding";
 import { familyById, profileById } from "@/server/providerRegistry";
-import { endpointEnvironmentKey } from "@/server/providers/editor/providerDraft";
-import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 
 const DEFAULT_API_URLS: Partial<Record<string, string>> = {
   "codex.openai_api_key": "https://api.openai.com",
@@ -32,20 +30,8 @@ export function providerBundlePrimaryResource(
 }
 
 function endpointFromResource(resource: ProviderResource): string | null {
-  const settings = resource.provider.settingsConfig;
-  const endpointKey = endpointEnvironmentKey(resource.app);
-  const env = settings.env;
-  if (env && typeof env === "object" && !Array.isArray(env)) {
-    const value = (env as Record<string, unknown>)[endpointKey];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-
-  const direct = settings[endpointKey];
-  if (typeof direct === "string" && direct.trim()) return direct.trim();
-  if (resource.app === "codex" && typeof settings.config === "string") {
-    const value = extractCodexBaseUrl(settings.config)?.trim();
-    if (value) return value;
-  }
+  const endpoint = resource.runtime?.endpoint.trim();
+  if (endpoint) return endpoint;
   return resource.profileId
     ? (DEFAULT_API_URLS[resource.profileId] ?? null)
     : null;
@@ -91,5 +77,18 @@ export function providerBundleDisplayTarget(
     };
   }
 
-  return { kind: "api_url", value: endpointFromResource(resource) };
+  const candidates = [
+    resource,
+    ...bundle.enabledApps
+      .map((app) => bundle.surfaces[app])
+      .filter((candidate): candidate is ProviderResource => Boolean(candidate)),
+  ];
+  const endpoint = candidates
+    .filter(
+      (candidate, index) =>
+        candidates.findIndex((item) => item.app === candidate.app) === index,
+    )
+    .map(endpointFromResource)
+    .find((value): value is string => Boolean(value));
+  return { kind: "api_url", value: endpoint ?? null };
 }

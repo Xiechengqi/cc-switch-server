@@ -1894,6 +1894,7 @@ fn schedule_debounced_save(state: ServerState, kind: DebouncedStoreKind) {
 
 fn provider_bundle_views_from_store(
     store: &ProviderStore,
+    accounts: &AccountStore,
 ) -> anyhow::Result<Vec<ProviderBundleView>> {
     let mut grouped = BTreeMap::<String, Vec<ProviderView>>::new();
     for stored in store.list(None) {
@@ -1903,9 +1904,10 @@ fn provider_bundle_views_from_store(
         grouped
             .entry(provider_bundle_id(&stored.provider).to_string())
             .or_default()
-            .push(ProviderView::from_stored_with_order(
+            .push(ProviderView::from_stored_with_order_and_runtime(
                 &stored,
                 store.provider_order_index(&stored),
+                compile_runtime_plan(&stored, accounts).ok(),
             ));
     }
     let mut bundles = grouped
@@ -4364,18 +4366,24 @@ impl ServerStateInner {
 
     pub async fn provider_views(&self, app: Option<AppKind>) -> Vec<ProviderView> {
         let store = self.providers.read().await;
+        let accounts = self.accounts.read().await;
         store
             .list(app)
             .iter()
             .map(|stored| {
-                ProviderView::from_stored_with_order(stored, store.provider_order_index(stored))
+                ProviderView::from_stored_with_order_and_runtime(
+                    stored,
+                    store.provider_order_index(stored),
+                    compile_runtime_plan(stored, &accounts).ok(),
+                )
             })
             .collect()
     }
 
     pub async fn provider_bundle_views(&self) -> anyhow::Result<Vec<ProviderBundleView>> {
         let store = self.providers.read().await;
-        provider_bundle_views_from_store(&store)
+        let accounts = self.accounts.read().await;
+        provider_bundle_views_from_store(&store, &accounts)
     }
 
     pub async fn provider_bundle_view(
@@ -4717,34 +4725,6 @@ impl ServerStateInner {
                 "shared Provider credentials must be submitted at Bundle scope".to_string(),
             )));
         }
-        if matches!(
-            credential_profile.credential_policy,
-            CredentialPolicy::ManagedAccount { .. }
-        ) {
-            let account_ids = draft
-                .surfaces
-                .iter()
-                .map(|surface| {
-                    surface
-                        .meta
-                        .as_ref()
-                        .and_then(|meta| meta.auth_binding.as_ref())
-                        .and_then(|binding| binding.account_id.as_deref())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                })
-                .collect::<Vec<_>>();
-            let unique = account_ids
-                .iter()
-                .filter_map(|account_id| *account_id)
-                .collect::<BTreeSet<_>>();
-            if account_ids.iter().any(|account_id| account_id.is_none()) || unique.len() != 1 {
-                return Ok(Err(ProviderCommandError::Invalid(
-                    "all Provider Bundle Surfaces must use the same managed account".to_string(),
-                )));
-            }
-        }
-
         let credential_source = match credential_source_app(family) {
             Ok(app) => app,
             Err(error) => return Ok(Err(ProviderCommandError::Invalid(error.to_string()))),
@@ -4774,9 +4754,15 @@ impl ServerStateInner {
                     }
                 }
             }
+            let provider = match draft.provider_for_surface(surface) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    return Ok(Err(ProviderCommandError::Invalid(error.to_string())));
+                }
+            };
             provider_drafts.push(ProviderWriteDraft {
                 app: surface.app,
-                provider: draft.provider_for_surface(surface),
+                provider,
                 profile_id: Some(surface.profile_id.clone()),
                 custom_binding: surface.custom_binding.clone(),
                 expected_revision: None,
@@ -4900,7 +4886,13 @@ impl ServerStateInner {
             let views = result
                 .0
                 .iter()
-                .map(ProviderView::from_stored)
+                .map(|stored| {
+                    ProviderView::from_stored_with_order_and_runtime(
+                        stored,
+                        store.provider_order_index(stored),
+                        compile_runtime_plan(stored, &accounts).ok(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let bundle = ProviderBundleView::from_surface_views(views)
                 .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;

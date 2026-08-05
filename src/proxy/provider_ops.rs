@@ -1052,7 +1052,7 @@ fn credential_slot_priority(slot: &str) -> (u8, &str) {
 }
 
 fn validate_custom_auth_header(name: &str) -> Result<(), ProxyError> {
-    crate::domain::providers::runtime::validate_custom_header_name(name)
+    crate::domain::providers::runtime::validate_custom_auth_header_name(name)
         .map(|_| ())
         .map_err(|error| ProxyError::bad_request(error.to_string()))
 }
@@ -1273,6 +1273,8 @@ mod tests {
                     crate::domain::providers::registry::OutboundIdentityPolicy::CustomOverride,
                 auth_ref,
                 model_policy: RuntimeModelPolicy::Passthrough,
+                test_model: None,
+                aws_region: None,
                 media_policy: None,
                 transport_policy: Default::default(),
                 extra_headers: Vec::new(),
@@ -1387,6 +1389,8 @@ mod tests {
                 model_policy: RuntimeModelPolicy::Single {
                     upstream_model: "actual-model".to_string(),
                 },
+                test_model: None,
+                aws_region: None,
                 media_policy: None,
                 transport_policy: Default::default(),
                 extra_headers: Vec::new(),
