@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -25,6 +26,7 @@ const REMOTE_LOG_INTERNAL_TARGET: &str = "cc_switch_server::logging::remote";
 const REMOTE_LOG_CHANNEL_CAPACITY: usize = 4_096;
 const REMOTE_LOG_BATCH_MAX_EVENTS: usize = 200;
 const REMOTE_LOG_BATCH_MAX_BYTES: usize = 220 * 1024;
+const REMOTE_LOG_RAW_LINE_MAX_BYTES: usize = 32 * 1024;
 const REMOTE_LOG_SPOOL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_LOG_SPOOL_TARGET_BYTES: usize = 14 * 1024 * 1024;
 const REMOTE_LOG_SPOOL_MAX_AGE_MS: i64 = 6 * 60 * 60 * 1_000;
@@ -104,8 +106,22 @@ impl RemoteLogCollector {
 
 static REMOTE_LOG_COLLECTOR: OnceLock<Arc<RemoteLogCollector>> = OnceLock::new();
 
+thread_local! {
+    static REMOTE_LOG_RAW_LINE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 fn collector() -> &'static Arc<RemoteLogCollector> {
     REMOTE_LOG_COLLECTOR.get_or_init(|| Arc::new(RemoteLogCollector::new()))
+}
+
+pub(super) fn remember_remote_log_line(line: &str) {
+    REMOTE_LOG_RAW_LINE.with(|raw_line| {
+        *raw_line.borrow_mut() = Some(line.to_string());
+    });
+}
+
+pub(super) fn take_remote_log_line() -> Option<String> {
+    REMOTE_LOG_RAW_LINE.with(|raw_line| raw_line.borrow_mut().take())
 }
 
 #[derive(Clone)]
@@ -131,6 +147,7 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
         let metadata = event.metadata();
+        let raw_line = take_remote_log_line();
         if !self.collector.enabled.load(Ordering::Acquire)
             || metadata.target() == REMOTE_LOG_INTERNAL_TARGET
         {
@@ -155,11 +172,29 @@ where
             .chars()
             .take(16 * 1024)
             .collect(),
+            raw_line: raw_line.map(|line| sanitize_raw_line(&line)),
             fields: visitor.fields,
             file: metadata.file().map(str::to_string),
             line: metadata.line(),
         });
     }
+}
+
+fn sanitize_raw_line(line: &str) -> String {
+    let single_line = line.replace('\r', "\\r").replace('\n', "\\n");
+    let redacted = crate::logging::redact_sensitive_text(&single_line);
+    bounded_text(&redacted, REMOTE_LOG_RAW_LINE_MAX_BYTES)
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 #[derive(Default)]
@@ -585,6 +620,7 @@ mod tests {
                 level: "info".into(),
                 target: "test".into(),
                 message: "message".into(),
+                raw_line: Some("2026-08-05T23:21:25Z  INFO message".into()),
                 fields: BTreeMap::new(),
                 file: None,
                 line: None,
@@ -603,9 +639,24 @@ mod tests {
 
         let mut restored = RemoteSpool::load(&directory).expect("restore spool");
         assert_eq!(restored.records.len(), 2);
+        assert_eq!(
+            restored.records[0].event.raw_line.as_deref(),
+            Some("2026-08-05T23:21:25Z  INFO message")
+        );
         restored.acknowledge("stream", 1).unwrap();
         assert_eq!(restored.records.front().unwrap().event.sequence, 2);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn raw_lines_are_single_line_redacted_and_utf8_bounded() {
+        let sanitized = sanitize_raw_line("INFO connected\napi_key=secret");
+        assert_eq!(sanitized, "INFO connected\\napi_key= [REDACTED]");
+
+        let oversized = "中".repeat(REMOTE_LOG_RAW_LINE_MAX_BYTES);
+        let bounded = sanitize_raw_line(&oversized);
+        assert!(bounded.len() <= REMOTE_LOG_RAW_LINE_MAX_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
     }
 
     #[test]

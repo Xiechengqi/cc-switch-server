@@ -4305,7 +4305,7 @@ impl ServerStateInner {
     }
 
     async fn run_router_registration_stages(&self) -> anyhow::Result<client::RouterRegisterResult> {
-        let mut identity = self.ensure_pending_router_identity().await?;
+        let identity = self.ensure_pending_router_identity().await?;
         let config = self.config_snapshot().await;
         let api_base = config
             .router_api_base()
@@ -4315,27 +4315,8 @@ impl ServerStateInner {
             .trim_end_matches('/')
             .to_string();
         let http = self.http_client().await;
-        let mut response = match client::register_installation_v2(&http, &api_base, &identity).await
-        {
-            Ok(response) if response.control_secret.is_some() => response,
-            Ok(response) => {
-                identity = identity_for_registration_recovery(&identity, &response)?;
-                client::recover_legacy_installation(&http, &api_base, &identity).await?
-            }
-            Err(error) if error.allows_legacy_fallback() => {
-                let discovered =
-                    client::discover_legacy_installation(&http, &api_base, &identity).await?;
-                identity = identity_for_registration_recovery(&identity, &discovered)?;
-                client::recover_legacy_installation(&http, &api_base, &identity).await?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if response.control_secret.is_none()
-            && response.installation_id.trim() == identity.installation_id.trim()
-        {
-            response.control_secret = identity.control_secret.clone();
-        }
-        ensure_complete_router_registration_response(&identity, &response)?;
+        let response = client::register_installation(&http, &api_base, &identity).await?;
+        ensure_complete_router_registration_response(&response)?;
         let registered_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         let identity = self
             .merge_router_registration_response(
@@ -4408,9 +4389,7 @@ impl ServerStateInner {
                 .as_mut()
                 .expect("router identity checked above");
             identity.installation_id = installation_id.to_string();
-            if response.control_secret.is_some() {
-                identity.control_secret = response.control_secret;
-            }
+            identity.control_secret = Some(response.control_secret);
             identity.clone()
         };
         if let Some(registered_at_ms) = registered_at_ms {
@@ -9602,36 +9581,14 @@ fn new_process_instance_id() -> String {
     hex::encode(bytes)
 }
 
-fn identity_for_registration_recovery(
-    current: &RouterIdentity,
-    response: &client::RegisterInstallationResponse,
-) -> anyhow::Result<RouterIdentity> {
-    let installation_id = response.installation_id.trim();
-    if installation_id.is_empty() {
-        anyhow::bail!("router installation discovery returned an empty installation id");
-    }
-    let mut identity = current.clone();
-    if identity.installation_id.trim() != installation_id {
-        identity.control_secret = None;
-    }
-    identity.installation_id = installation_id.to_string();
-    if let Some(control_secret) = response.control_secret.as_ref() {
-        identity.control_secret = Some(control_secret.clone());
-    }
-    Ok(identity)
-}
-
 fn ensure_complete_router_registration_response(
-    recovery_identity: &RouterIdentity,
     response: &client::RegisterInstallationResponse,
 ) -> anyhow::Result<()> {
     let installation_id = response.installation_id.trim();
     if installation_id.is_empty() {
         anyhow::bail!("router installation register returned an empty installation id");
     }
-    let retained_secret_is_valid = recovery_identity.installation_id.trim() == installation_id
-        && recovery_identity.control_secret.is_some();
-    if response.control_secret.is_none() && !retained_secret_is_valid {
+    if response.control_secret.trim().is_empty() {
         anyhow::bail!("router installation registration did not return a control secret");
     }
     Ok(())
@@ -10175,7 +10132,6 @@ const MAX_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS: u64 = 5;
 const ROUTER_HEARTBEAT_UNREGISTERED_MAX_RETRY_SECS: u64 = 5 * 60;
 const ROUTER_HEARTBEAT_WARNING_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const ROUTER_HEARTBEAT_ENDPOINT_WARNING_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const PUBLIC_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const PUBLIC_IP_RETRY_INITIAL: Duration = Duration::from_secs(30);
 const PUBLIC_IP_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
@@ -10186,14 +10142,12 @@ pub fn spawn_installation_heartbeat(state: ServerState) {
     tokio::spawn(async move {
         let mut consecutive_failures = 0_u32;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
         let mut unregistered_retry_secs = ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS;
         loop {
             if run_installation_heartbeat_once(
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
-                &mut last_endpoint_warning,
             )
             .await
             {
@@ -10249,7 +10203,6 @@ async fn run_installation_heartbeat_once(
     state: &ServerState,
     consecutive_failures: &mut u32,
     last_failure_warning: &mut Option<tokio::time::Instant>,
-    last_endpoint_warning: &mut Option<tokio::time::Instant>,
 ) -> bool {
     let config = state.config_snapshot().await;
     if !config.has_registered_router_identity() {
@@ -10263,7 +10216,6 @@ async fn run_installation_heartbeat_once(
                         Ok(()) => {
                             *consecutive_failures = 0;
                             *last_failure_warning = None;
-                            *last_endpoint_warning = None;
                         }
                         Err(error) => {
                             tracing::warn!(%error, "complete heartbeat registration retry failed");
@@ -10297,61 +10249,8 @@ async fn run_installation_heartbeat_once(
         Ok(()) => {
             *consecutive_failures = 0;
             *last_failure_warning = None;
-            *last_endpoint_warning = None;
             record_installation_heartbeat_success(state).await;
             state.retry_pending_setup_completion_notification().await;
-        }
-        Err(client::InstallationHeartbeatError::EndpointUnavailable { status, body }) => {
-            let recovery_error = if config
-                .registered_router_identity()
-                .is_some_and(|identity| identity.control_secret.is_none())
-            {
-                match state.register_router_installation().await {
-                    Ok(_) => state
-                        .complete_router_registration_control_plane(
-                            "heartbeat_legacy_secret_recovery",
-                        )
-                        .await
-                        .err()
-                        .map(|error| {
-                            format!(
-                                "complete legacy heartbeat registration recovery failed: {error}"
-                            )
-                        }),
-                    Err(error) => Some(format!(
-                        "router heartbeat compatibility registration recovery failed: {error}"
-                    )),
-                }
-            } else {
-                None
-            };
-            if let Some(error) = recovery_error {
-                *consecutive_failures = consecutive_failures.saturating_add(1);
-                warn_on_sustained_heartbeat_failure(
-                    last_failure_warning,
-                    *consecutive_failures,
-                    &error,
-                );
-                if *consecutive_failures >= ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
-                    record_installation_heartbeat_failure(state, error).await;
-                }
-            } else {
-                *consecutive_failures = 0;
-                *last_failure_warning = None;
-                record_installation_heartbeat_compatible(state).await;
-            }
-            let now = tokio::time::Instant::now();
-            if rate_limited_warning_due(
-                last_endpoint_warning,
-                now,
-                ROUTER_HEARTBEAT_ENDPOINT_WARNING_INTERVAL,
-            ) {
-                tracing::warn!(
-                    %status,
-                    response = %body,
-                    "router does not support installation heartbeat; upgrade Router to enable offline notifications"
-                );
-            }
         }
         Err(client::InstallationHeartbeatError::RegistrationRequired { status, body }) => {
             *consecutive_failures = consecutive_failures.saturating_add(1);
@@ -10374,10 +10273,7 @@ async fn run_installation_heartbeat_once(
                         )
                         .await
                         {
-                            Ok(()) => Ok(true),
-                            Err(client::InstallationHeartbeatError::EndpointUnavailable {
-                                ..
-                            }) => Ok(false),
+                            Ok(()) => Ok(()),
                             Err(error) => Err(error.to_string()),
                         }
                     }
@@ -10390,16 +10286,10 @@ async fn run_installation_heartbeat_once(
                 )),
             };
             match recovery_result {
-                Ok(true) => {
+                Ok(()) => {
                     *consecutive_failures = 0;
                     *last_failure_warning = None;
-                    *last_endpoint_warning = None;
                     record_installation_heartbeat_success(state).await;
-                }
-                Ok(false) => {
-                    *consecutive_failures = 0;
-                    *last_failure_warning = None;
-                    record_installation_heartbeat_compatible(state).await;
                 }
                 Err(recovery_error) => {
                     let error = format!("{heartbeat_error}; {recovery_error}");
@@ -10434,15 +10324,6 @@ async fn record_installation_heartbeat_success(state: &ServerState) {
     state
         .mutate_shares_debounced(|shares| {
             shares.last_router_heartbeat_ms = Some(crate::infra::time::now_ms());
-            shares.router_registered = true;
-            shares.last_router_error = None;
-        })
-        .await;
-}
-
-async fn record_installation_heartbeat_compatible(state: &ServerState) {
-    state
-        .mutate_shares_debounced(|shares| {
             shares.router_registered = true;
             shares.last_router_error = None;
         })
@@ -13997,7 +13878,6 @@ mod tests {
         configure_registered_test_router(&state, &format!("http://{addr}"), "inst-health").await;
         let mut consecutive_failures = 0;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
         let before = crate::infra::time::now_ms();
 
         assert!(
@@ -14005,7 +13885,6 @@ mod tests {
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
-                &mut last_endpoint_warning,
             )
             .await
         );
@@ -14021,7 +13900,6 @@ mod tests {
                     &state,
                     &mut consecutive_failures,
                     &mut last_failure_warning,
-                    &mut last_endpoint_warning,
                 )
                 .await
             );
@@ -14046,7 +13924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_heartbeat_endpoint_keeps_registered_router_healthy() {
+    async fn missing_heartbeat_endpoint_counts_as_a_sustained_failure() {
         async fn handler() -> (StatusCode, Json<Value>) {
             (
                 StatusCode::NOT_FOUND,
@@ -14062,7 +13940,7 @@ mod tests {
         let mut config = state.config_snapshot().await;
         config.router.url = Some(format!("http://{addr}"));
         let mut identity = client::generate_identity_without_installation();
-        identity.installation_id = "inst-legacy".to_string();
+        identity.installation_id = "inst-missing-heartbeat-endpoint".to_string();
         identity.control_secret = Some("secret".to_string());
         config.router.identity = Some(identity);
         state.replace_config(config).await.unwrap();
@@ -14075,23 +13953,26 @@ mod tests {
             .await;
         let mut consecutive_failures = 0;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
 
-        assert!(
-            run_installation_heartbeat_once(
-                &state,
-                &mut consecutive_failures,
-                &mut last_failure_warning,
-                &mut last_endpoint_warning,
-            )
-            .await
-        );
+        for _ in 0..ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
+            assert!(
+                run_installation_heartbeat_once(
+                    &state,
+                    &mut consecutive_failures,
+                    &mut last_failure_warning,
+                )
+                .await
+            );
+        }
 
         let shares = state.shares.read().await;
-        assert!(shares.router_registered);
-        assert!(shares.last_router_error.is_none());
+        assert!(!shares.router_registered);
+        assert!(shares
+            .last_router_error
+            .as_deref()
+            .is_some_and(|error| error.contains("404 Not Found")));
         assert_eq!(shares.last_router_heartbeat_ms, Some(123));
-        assert_eq!(consecutive_failures, 0);
+        assert_eq!(consecutive_failures, ROUTER_HEARTBEAT_SUSTAINED_FAILURES);
         server.abort();
     }
 
@@ -14147,14 +14028,12 @@ mod tests {
         state.replace_config(config).await.unwrap();
         let mut consecutive_failures = 0;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
 
         assert!(
             run_installation_heartbeat_once(
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
-                &mut last_endpoint_warning,
             )
             .await
         );
@@ -14262,7 +14141,6 @@ mod tests {
             .unwrap();
         let mut consecutive_failures = 0;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
 
         for _ in 0..ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
             assert!(
@@ -14270,7 +14148,6 @@ mod tests {
                     &state,
                     &mut consecutive_failures,
                     &mut last_failure_warning,
-                    &mut last_endpoint_warning,
                 )
                 .await
             );
@@ -14343,14 +14220,12 @@ mod tests {
         state.replace_config(config).await.unwrap();
         let mut consecutive_failures = 0;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
 
         assert!(
             run_installation_heartbeat_once(
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
-                &mut last_endpoint_warning,
             )
             .await
         );
@@ -14426,7 +14301,6 @@ mod tests {
         state.replace_config(config).await.unwrap();
         let mut consecutive_failures = 0;
         let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
 
         for expected_failures in 1..=2 {
             assert!(
@@ -14434,7 +14308,6 @@ mod tests {
                     &state,
                     &mut consecutive_failures,
                     &mut last_failure_warning,
-                    &mut last_endpoint_warning,
                 )
                 .await
             );
@@ -14448,19 +14321,16 @@ mod tests {
         }
 
         last_failure_warning = Some(tokio::time::Instant::now());
-        last_endpoint_warning = Some(tokio::time::Instant::now());
         assert!(
             run_installation_heartbeat_once(
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
-                &mut last_endpoint_warning,
             )
             .await
         );
         assert_eq!(consecutive_failures, 0);
         assert!(last_failure_warning.is_none());
-        assert!(last_endpoint_warning.is_none());
         {
             let shares = state.shares.read().await;
             assert!(shares.router_registered);
@@ -14473,7 +14343,6 @@ mod tests {
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
-                &mut last_endpoint_warning,
             )
             .await
         );
@@ -14484,81 +14353,6 @@ mod tests {
         assert!(shares.last_router_heartbeat_ms.is_none());
         assert_eq!(counts.registrations.load(AtomicOrdering::SeqCst), 3);
         assert_eq!(counts.heartbeats.load(AtomicOrdering::SeqCst), 1);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn missing_control_secret_recovery_failures_accumulate_across_endpoint_404s() {
-        #[derive(Clone)]
-        struct Counts {
-            heartbeats: Arc<AtomicUsize>,
-            registrations: Arc<AtomicUsize>,
-        }
-
-        async fn heartbeat_handler(
-            AxumState(counts): AxumState<Counts>,
-        ) -> (StatusCode, Json<Value>) {
-            counts.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": "route /v1/installations/heartbeat not found"})),
-            )
-        }
-
-        async fn registration_handler(
-            AxumState(counts): AxumState<Counts>,
-        ) -> (StatusCode, Json<Value>) {
-            counts.registrations.fetch_add(1, AtomicOrdering::SeqCst);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"message": "router unavailable"})),
-            )
-        }
-
-        let counts = Counts {
-            heartbeats: Arc::new(AtomicUsize::new(0)),
-            registrations: Arc::new(AtomicUsize::new(0)),
-        };
-        let app = Router::new()
-            .route("/v1/installations/heartbeat", post(heartbeat_handler))
-            .route("/v1/installations/register", post(registration_handler))
-            .with_state(counts.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let state = test_state();
-        let mut config = state.config_snapshot().await;
-        config.router.url = Some(format!("http://{addr}"));
-        let mut identity = client::generate_identity_without_installation();
-        identity.installation_id = "inst-endpoint-404".to_string();
-        config.router.identity = Some(identity);
-        state.replace_config(config).await.unwrap();
-        let mut consecutive_failures = 0;
-        let mut last_failure_warning = None;
-        let mut last_endpoint_warning = None;
-
-        for _ in 0..ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
-            assert!(
-                run_installation_heartbeat_once(
-                    &state,
-                    &mut consecutive_failures,
-                    &mut last_failure_warning,
-                    &mut last_endpoint_warning,
-                )
-                .await
-            );
-        }
-
-        assert_eq!(consecutive_failures, ROUTER_HEARTBEAT_SUSTAINED_FAILURES);
-        assert!(last_failure_warning.is_some());
-        assert_eq!(
-            counts.heartbeats.load(AtomicOrdering::SeqCst),
-            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
-        );
-        assert_eq!(
-            counts.registrations.load(AtomicOrdering::SeqCst),
-            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
-        );
         server.abort();
     }
 
@@ -15115,7 +14909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_router_owner_response_remains_verified_compatible() {
+    async fn router_owner_response_requires_explicit_verified_state() {
         async fn owner_status() -> Json<Value> {
             Json(json!({
                 "ok": true,
@@ -15128,15 +14922,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = test_state();
-        configure_registered_test_router(&state, &format!("http://{addr}"), "inst-legacy-owner")
+        configure_registered_test_router(&state, &format!("http://{addr}"), "inst-owner-status")
             .await;
         let mut config = state.config_snapshot().await;
         config.owner.email = Some("owner@example.com".to_string());
         state.replace_config(config.clone()).await.unwrap();
 
-        ensure_router_installation_owner_bound(&state, &config)
+        let error = ensure_router_installation_owner_bound(&state, &config)
             .await
-            .unwrap();
+            .expect_err("missing ownerVerified must be rejected");
+        assert!(error.to_string().contains("parse"));
 
         server.abort();
     }
@@ -15402,30 +15197,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_router_rejection_does_not_trigger_legacy_registration() {
+    async fn registration_rejection_makes_exactly_one_signed_attempt() {
         async fn handler(
             AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
             Json(request): Json<Value>,
         ) -> (StatusCode, Json<Value>) {
             let mut requests = requests.lock().await;
             requests.push(request);
-            match requests.len() {
-                1 => (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"message": "old protocol only"})),
-                ),
-                2 => (
-                    StatusCode::OK,
-                    Json(json!({"installationId": "inst-discovered"})),
-                ),
-                _ => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "installationId": "inst-discovered",
-                        "controlSecret": "legacy-control-secret"
-                    })),
-                ),
-            }
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "registration rejected"})),
+            )
         }
 
         let requests = Arc::new(TokioMutex::new(Vec::new()));
@@ -15449,12 +15231,13 @@ mod tests {
         assert!(error.to_string().contains("401 Unauthorized"));
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["proofVersion"], 2);
+        assert!(requests[0]["timestampMs"].is_number());
+        assert!(requests[0]["signature"].is_string());
         server.abort();
     }
 
     #[tokio::test]
-    async fn registration_rejection_returns_without_legacy_fallback() {
+    async fn registration_rejection_returns_without_another_attempt() {
         async fn handler(
             AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
             Json(request): Json<Value>,
@@ -15469,7 +15252,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     (
                         StatusCode::UNAUTHORIZED,
-                        Json(json!({"message": "legacy only"})),
+                        Json(json!({"message": "registration rejected"})),
                     )
                 }
                 2 => (
@@ -15521,27 +15304,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_identity_without_control_secret_recovers_via_legacy_signature() {
+    async fn registration_response_without_control_secret_is_rejected() {
         async fn handler(
             AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
             Json(request): Json<Value>,
         ) -> (StatusCode, Json<Value>) {
             let mut requests = requests.lock().await;
             requests.push(request);
-            if requests.len() == 1 {
-                (
-                    StatusCode::OK,
-                    Json(json!({"installationId": "inst-known"})),
-                )
-            } else {
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "installationId": "inst-known",
-                        "controlSecret": "recovered-control-secret"
-                    })),
-                )
-            }
+            (
+                StatusCode::OK,
+                Json(json!({"installationId": "inst-known"})),
+            )
         }
 
         let requests = Arc::new(TokioMutex::new(Vec::new()));
@@ -15559,21 +15332,16 @@ mod tests {
         config.router.identity = Some(identity);
         state.replace_config(config).await.unwrap();
 
-        let result = state.register_router_installation().await.unwrap();
+        let error = state.register_router_installation().await.unwrap_err();
 
-        assert!(result.control_secret_present);
+        assert!(error.to_string().contains("missing field"));
         let requests = requests.lock().await;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["proofVersion"], 2);
-        assert!(requests[1].get("proofVersion").is_none());
-        assert!(requests[1]["timestampMs"].is_number());
-        assert!(requests[1]["signature"].is_string());
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]["timestampMs"].is_number());
+        assert!(requests[0]["signature"].is_string());
         drop(requests);
         let identity = state.config_snapshot().await.router.identity.unwrap();
-        assert_eq!(
-            identity.control_secret.as_deref(),
-            Some("recovered-control-secret")
-        );
+        assert!(identity.control_secret.is_none());
         server.abort();
     }
 

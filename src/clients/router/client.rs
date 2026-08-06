@@ -28,7 +28,6 @@ const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
 const ROUTER_ERROR_BODY_LIMIT: usize = 512;
 const ROUTER_SHARE_PRUNE_MAX_IDS: usize = 10_000;
-const REGISTRATION_PROOF_VERSION: u8 = 2;
 const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_ACTION: &str = "installation_setup_completed_v1";
@@ -43,20 +42,15 @@ pub struct RegisterInstallationRequest {
     pub platform: String,
     pub app_version: String,
     pub instance_nonce: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proof_version: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
+    pub timestamp_ms: i64,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterInstallationResponse {
     pub installation_id: String,
-    #[serde(default)]
-    pub control_secret: Option<String>,
+    pub control_secret: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,10 +69,6 @@ pub enum RegisterInstallationAttemptError {
 }
 
 impl RegisterInstallationAttemptError {
-    pub fn allows_legacy_fallback(&self) -> bool {
-        false
-    }
-
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Request(error) => error.is_connect() || error.is_timeout(),
@@ -94,11 +84,6 @@ impl RegisterInstallationAttemptError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallationHeartbeatError {
-    #[error("router installation heartbeat endpoint is unavailable: {status}: {body}")]
-    EndpointUnavailable {
-        status: reqwest::StatusCode,
-        body: String,
-    },
     #[error("router installation heartbeat requires registration: {status}: {body}")]
     RegistrationRequired {
         status: reqwest::StatusCode,
@@ -369,7 +354,6 @@ struct InstallationOwnerEmailResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default = "legacy_owner_email_is_verified")]
     pub owner_verified: bool,
 }
 
@@ -386,11 +370,6 @@ impl From<InstallationOwnerEmailResponse> for InstallationOwnerEmailStatus {
             owner_verified: response.owner_verified,
         }
     }
-}
-
-const fn legacy_owner_email_is_verified() -> bool {
-    // Older Routers exposed ownerEmail only after treating the binding as verified.
-    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -801,42 +780,12 @@ pub struct RouterRegisterResult {
     pub registered_at_ms: i64,
 }
 
-pub async fn register_installation_v2(
+pub async fn register_installation(
     http: &reqwest::Client,
     api_base: &str,
     identity: &RouterIdentity,
 ) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
     let request = build_register_installation_request(
-        identity,
-        std::env::consts::OS,
-        crate::build_info::router_registration_version(),
-        nonce(),
-        now_ms(),
-    )
-    .map_err(|error| RegisterInstallationAttemptError::InvalidRequest(error.to_string()))?;
-    send_register_installation_request(http, api_base, &request).await
-}
-
-pub async fn discover_legacy_installation(
-    http: &reqwest::Client,
-    api_base: &str,
-    identity: &RouterIdentity,
-) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
-    let request = build_unsigned_legacy_register_installation_request(
-        identity,
-        std::env::consts::OS,
-        crate::build_info::router_registration_version(),
-        nonce(),
-    );
-    send_register_installation_request(http, api_base, &request).await
-}
-
-pub async fn recover_legacy_installation(
-    http: &reqwest::Client,
-    api_base: &str,
-    identity: &RouterIdentity,
-) -> Result<RegisterInstallationResponse, RegisterInstallationAttemptError> {
-    let request = build_legacy_register_installation_request(
         identity,
         std::env::consts::OS,
         crate::build_info::router_registration_version(),
@@ -1175,9 +1124,6 @@ fn classify_installation_heartbeat_failure(
     let body = bounded_router_error_body(body);
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return InstallationHeartbeatError::RegistrationRequired { status, body };
-    }
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return InstallationHeartbeatError::EndpointUnavailable { status, body };
     }
     if status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -2622,7 +2568,7 @@ fn build_register_installation_request(
     instance_nonce: String,
     timestamp_ms: i64,
 ) -> anyhow::Result<RegisterInstallationRequest> {
-    let signature = sign_registration_v2(
+    let signature = sign_registration(
         identity,
         platform,
         app_version,
@@ -2635,57 +2581,12 @@ fn build_register_installation_request(
         platform: platform.to_string(),
         app_version: app_version.to_string(),
         instance_nonce,
-        proof_version: Some(REGISTRATION_PROOF_VERSION),
-        timestamp_ms: Some(timestamp_ms),
-        signature: Some(signature),
-    })
-}
-
-fn build_legacy_register_installation_request(
-    identity: &RouterIdentity,
-    platform: &str,
-    app_version: &str,
-    instance_nonce: String,
-    timestamp_ms: i64,
-) -> anyhow::Result<RegisterInstallationRequest> {
-    let signature = sign_registration_recovery(
-        identity,
-        platform,
-        app_version,
-        &instance_nonce,
         timestamp_ms,
-    )?;
-    Ok(RegisterInstallationRequest {
-        protocol_epoch: PROTOCOL_EPOCH.to_string(),
-        public_key: identity.public_key.clone(),
-        platform: platform.to_string(),
-        app_version: app_version.to_string(),
-        instance_nonce,
-        proof_version: None,
-        timestamp_ms: Some(timestamp_ms),
-        signature: Some(signature),
+        signature,
     })
 }
 
-fn build_unsigned_legacy_register_installation_request(
-    identity: &RouterIdentity,
-    platform: &str,
-    app_version: &str,
-    instance_nonce: String,
-) -> RegisterInstallationRequest {
-    RegisterInstallationRequest {
-        protocol_epoch: PROTOCOL_EPOCH.to_string(),
-        public_key: identity.public_key.clone(),
-        platform: platform.to_string(),
-        app_version: app_version.to_string(),
-        instance_nonce,
-        proof_version: None,
-        timestamp_ms: None,
-        signature: None,
-    }
-}
-
-fn sign_registration_v2(
+fn sign_registration(
     identity: &RouterIdentity,
     platform: &str,
     app_version: &str,
@@ -2700,38 +2601,8 @@ fn sign_registration_v2(
         .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
     let signing_key = SigningKey::from_bytes(&secret);
     let canonical = format!(
-        "{}\nregister_installation_v2\n{}\n{}\n{}\n{}\n{}",
+        "{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
         PROTOCOL_EPOCH,
-        identity.public_key.trim(),
-        platform.trim(),
-        app_version,
-        instance_nonce,
-        timestamp_ms
-    );
-    Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
-}
-
-fn sign_registration_recovery(
-    identity: &RouterIdentity,
-    platform: &str,
-    app_version: &str,
-    instance_nonce: &str,
-    timestamp_ms: i64,
-) -> anyhow::Result<String> {
-    if identity.installation_id.trim().is_empty() {
-        bail!("router installation id is missing");
-    }
-    let secret = STANDARD
-        .decode(&identity.private_key)
-        .context("decode router private key")?;
-    let secret: [u8; 32] = secret
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
-    let signing_key = SigningKey::from_bytes(&secret);
-    let canonical = format!(
-        "{}\n{}\nregister_installation\n{}\n{}\n{}\n{}\n{}",
-        PROTOCOL_EPOCH,
-        identity.installation_id,
         identity.public_key.trim(),
         platform.trim(),
         app_version,
@@ -2863,16 +2734,12 @@ mod tests {
     }
 
     #[test]
-    fn installation_owner_status_treats_legacy_visible_owner_as_verified() {
-        let response: InstallationOwnerEmailResponse = serde_json::from_value(json!({
+    fn installation_owner_status_requires_explicit_verification_state() {
+        let response = serde_json::from_value::<InstallationOwnerEmailResponse>(json!({
             "ok": true,
             "ownerEmail": "owner@example.com"
-        }))
-        .unwrap();
-        let status = InstallationOwnerEmailStatus::from(response);
-
-        assert_eq!(status.owner_email.as_deref(), Some("owner@example.com"));
-        assert!(status.owner_verified);
+        }));
+        assert!(response.is_err());
     }
 
     #[test]
@@ -3289,7 +3156,7 @@ mod tests {
     }
 
     #[test]
-    fn first_registration_request_carries_v2_proof_of_possession() {
+    fn registration_request_carries_epoch_scoped_proof_of_possession() {
         let identity = generate_identity_without_installation();
 
         let request = build_register_installation_request(
@@ -3301,16 +3168,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(request.proof_version, Some(2));
-        assert_eq!(request.timestamp_ms, Some(123));
+        assert_eq!(request.timestamp_ms, 123);
         let public_key = STANDARD.decode(&identity.public_key).unwrap();
         let public_key: [u8; 32] = public_key.try_into().unwrap();
         let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
-        let signature = STANDARD.decode(request.signature.unwrap()).unwrap();
+        let signature = STANDARD.decode(request.signature).unwrap();
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
         let canonical = format!(
-            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
+            "{PROTOCOL_EPOCH}\nregister_installation\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
             identity.public_key
         );
 
@@ -3320,7 +3186,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_registration_request_still_uses_id_independent_v2_proof() {
+    fn existing_registration_request_uses_the_same_id_independent_proof() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-existing".into();
 
@@ -3333,46 +3199,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(request.proof_version, Some(2));
         let public_key = STANDARD.decode(&identity.public_key).unwrap();
         let public_key: [u8; 32] = public_key.try_into().unwrap();
         let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
-        let signature = STANDARD.decode(request.signature.unwrap()).unwrap();
+        let signature = STANDARD.decode(request.signature).unwrap();
         let signature: [u8; 64] = signature.try_into().unwrap();
         let signature = Signature::from_bytes(&signature);
         let canonical = format!(
-            "{PROTOCOL_EPOCH}\nregister_installation_v2\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
-            identity.public_key
-        );
-
-        verifying_key
-            .verify(canonical.as_bytes(), &signature)
-            .unwrap();
-    }
-
-    #[test]
-    fn registration_recovery_signature_is_epoch_scoped() {
-        let mut identity = generate_identity_without_installation();
-        identity.installation_id = "inst-existing".into();
-
-        let request = build_legacy_register_installation_request(
-            &identity,
-            "linux",
-            "1.2.3",
-            "legacy-nonce".into(),
-            456,
-        )
-        .unwrap();
-
-        assert_eq!(request.proof_version, None);
-        let public_key = STANDARD.decode(&identity.public_key).unwrap();
-        let public_key: [u8; 32] = public_key.try_into().unwrap();
-        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
-        let signature = STANDARD.decode(request.signature.unwrap()).unwrap();
-        let signature: [u8; 64] = signature.try_into().unwrap();
-        let signature = Signature::from_bytes(&signature);
-        let canonical = format!(
-            "{PROTOCOL_EPOCH}\ninst-existing\nregister_installation\n{}\nlinux\n1.2.3\nlegacy-nonce\n456",
+            "{PROTOCOL_EPOCH}\nregister_installation\n{}\nlinux\n1.2.3\nregistration-nonce\n123",
             identity.public_key
         );
 
@@ -3430,28 +3264,21 @@ mod tests {
             1_700_000_000_123,
         )
         .unwrap();
-        assert_eq!(registration.proof_version, Some(2));
-        assert_eq!(
-            registration.signature.as_deref(),
-            Some(
-                "nlRT3f2KJ0oZaI84N/naU1WYGv/bS7Pz0X7I0hDKxQg2U0RZ/eZhmpZ4yaCcTARWq7TRvaGbUe7vejXPnmkcBA=="
+        let public_key = STANDARD.decode(&identity.public_key).unwrap();
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key).unwrap();
+        let signature = STANDARD.decode(&registration.signature).unwrap();
+        let signature: [u8; 64] = signature.try_into().unwrap();
+        verifying_key
+            .verify(
+                format!(
+                    "{PROTOCOL_EPOCH}\nregister_installation\n{}\nlinux\n1.2.3\nfixture-nonce-123\n1700000000123",
+                    identity.public_key
+                )
+                .as_bytes(),
+                &Signature::from_bytes(&signature),
             )
-        );
-
-        let legacy = build_legacy_register_installation_request(
-            &identity,
-            "linux",
-            "1.2.3",
-            "fixture-legacy-123".into(),
-            1_700_000_000_234,
-        )
-        .unwrap();
-        assert_eq!(
-            legacy.signature.as_deref(),
-            Some(
-                "+SCyz8ys5tyXjoTXYkzIyb9n/LBovygmFHz4wHoDF7uJF7jNKh7egVmaUGK9E34nyWytM1fPTyoMrl+TRh4tCg=="
-            )
-        );
+            .unwrap();
 
         let payload = InstallationHeartbeatPayload {
             protocol_version: 1,
@@ -3487,27 +3314,27 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_failure_classification_distinguishes_old_endpoint_and_missing_identity() {
+    fn heartbeat_failure_classification_distinguishes_identity_and_transport_failures() {
         assert!(matches!(
             classify_installation_heartbeat_failure(
                 reqwest::StatusCode::NOT_FOUND,
                 "route not found"
             ),
-            InstallationHeartbeatError::EndpointUnavailable { .. }
+            InstallationHeartbeatError::Rejected { .. }
         ));
         assert!(matches!(
             classify_installation_heartbeat_failure(
                 reqwest::StatusCode::NOT_FOUND,
                 "installation not found"
             ),
-            InstallationHeartbeatError::EndpointUnavailable { .. }
+            InstallationHeartbeatError::Rejected { .. }
         ));
         assert!(matches!(
             classify_installation_heartbeat_failure(
                 reqwest::StatusCode::NOT_FOUND,
                 "route /v1/installations/heartbeat not found"
             ),
-            InstallationHeartbeatError::EndpointUnavailable { .. }
+            InstallationHeartbeatError::Rejected { .. }
         ));
         assert!(matches!(
             classify_installation_heartbeat_failure(
@@ -3526,7 +3353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_v2_rejection_does_not_enable_legacy_fallback() {
+    async fn registration_rejection_returns_after_one_request() {
         async fn handler(
             State(requests): State<Arc<Mutex<Vec<Value>>>>,
             Json(request): Json<Value>,
@@ -3535,7 +3362,7 @@ mod tests {
             requests.push(request);
             (
                 StatusCode::UNAUTHORIZED,
-                Json(json!({"message": "arbitrary old router rejection"})),
+                Json(json!({"message": "registration rejected"})),
             )
         }
 
@@ -3549,18 +3376,25 @@ mod tests {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-existing".into();
 
-        let error = register_installation_v2(
+        let error = register_installation(
             &reqwest::Client::new(),
             &format!("http://{addr}"),
             &identity,
         )
         .await
         .unwrap_err();
+        assert!(matches!(
+            error,
+            RegisterInstallationAttemptError::Rejected {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        ));
 
-        assert!(!error.allows_legacy_fallback());
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["proofVersion"], 2);
+        assert!(requests[0]["timestampMs"].is_number());
+        assert!(requests[0]["signature"].is_string());
         server.abort();
     }
 
@@ -3655,7 +3489,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let identity = generate_identity_without_installation();
 
-        let error = register_installation_v2(
+        let error = register_installation(
             &reqwest::Client::new(),
             &format!("http://{addr}"),
             &identity,
@@ -3670,23 +3504,6 @@ mod tests {
         assert!(body.starts_with("registration denied: "));
         assert_eq!(body.chars().count(), ROUTER_ERROR_BODY_LIMIT);
         server.abort();
-    }
-
-    #[test]
-    fn unsigned_legacy_discovery_omits_all_proof_fields() {
-        let identity = generate_identity_without_installation();
-        let request = build_unsigned_legacy_register_installation_request(
-            &identity,
-            "linux",
-            "1.2.3",
-            "discovery-nonce".into(),
-        );
-        let value = serde_json::to_value(request).unwrap();
-
-        assert!(value.get("proofVersion").is_none());
-        assert!(value.get("timestampMs").is_none());
-        assert!(value.get("signature").is_none());
-        assert_eq!(value["instanceNonce"], "discovery-nonce");
     }
 
     #[tokio::test]
@@ -3754,7 +3571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_classifies_401_and_404_without_waiting_for_a_stalled_chunked_tail() {
+    async fn heartbeat_bounds_401_and_404_error_bodies_without_waiting_for_the_tail() {
         use tokio::io::AsyncWriteExt;
 
         for (status, status_line) in [
@@ -3801,7 +3618,7 @@ mod tests {
                 ) => body,
                 (
                     reqwest::StatusCode::NOT_FOUND,
-                    InstallationHeartbeatError::EndpointUnavailable { body, .. },
+                    InstallationHeartbeatError::Rejected { body, .. },
                 ) => body,
                 (_, error) => panic!("stalled error tail changed classification: {error}"),
             };

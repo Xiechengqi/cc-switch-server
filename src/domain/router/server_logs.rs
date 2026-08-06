@@ -14,6 +14,8 @@ pub struct InstallationLogEvent {
     pub level: String,
     pub target: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_line: Option<String>,
     #[serde(default)]
     pub fields: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

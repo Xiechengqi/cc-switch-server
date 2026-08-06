@@ -79,13 +79,8 @@ pub struct RouterVerifyEmailCodeResponse {
 pub struct BindOwnerEmailResponse {
     pub ok: bool,
     pub owner_email: String,
-    #[serde(default = "legacy_owner_binding_is_verified")]
     pub owner_verified: bool,
     pub already_bound: bool,
-}
-
-const fn legacy_owner_binding_is_verified() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,7 +275,7 @@ pub async fn request_code(
     .map_err(|error| EmailAuthError::internal(error.to_string()))?;
     let api_base = router_api_base(config)?;
     let response = http
-        .post(format!("{api_base}/v1/auth/email/request-code"))
+        .post(format!("{api_base}/v1/client-web/auth/email/request-code"))
         .json(&json!({
             "email": email,
             "installationId": identity.installation_id.as_str(),
@@ -333,13 +328,11 @@ pub async fn refresh_session(
     if refresh_token.is_empty() {
         return Err(EmailAuthError::bad_request("refreshToken is required"));
     }
-    let identity = router_identity(config)?;
     let api_base = router_api_base(config)?;
     let response = http
         .post(format!("{api_base}/v1/auth/session/refresh"))
         .json(&json!({
             "refreshToken": refresh_token,
-            "installationId": identity.installation_id.as_str(),
         }))
         .send()
         .await
@@ -696,14 +689,13 @@ mod tests {
     }
 
     #[test]
-    fn owner_binding_verification_is_additive_and_explicit() {
-        let legacy: BindOwnerEmailResponse = serde_json::from_value(serde_json::json!({
+    fn owner_binding_verification_is_required_and_explicit() {
+        let missing = serde_json::from_value::<BindOwnerEmailResponse>(serde_json::json!({
             "ok": true,
             "ownerEmail": "owner@example.com",
             "alreadyBound": true
-        }))
-        .unwrap();
-        assert!(legacy.owner_verified);
+        }));
+        assert!(missing.is_err());
 
         let tentative: BindOwnerEmailResponse = serde_json::from_value(serde_json::json!({
             "ok": true,

@@ -1,14 +1,18 @@
-const AUTH_KEY = "cc_switch_router_auth_v1";
+const AUTH_KEY = "cc_switch_router_auth_v2";
+const PROTOCOL_EPOCH = "namespace-flat-1";
+const AUTH_DEVICE_IDENTITY_LOCK_NAME =
+  "cc-switch-server-auth-device-identity-v1";
 const SERVER_PASSWORD_KEY = "cc_switch_server_password";
 export const SERVER_AUTH_EXPIRED_EVENT = "cc-switch-server-auth-expired";
 
 let refreshInFlight: { promise: Promise<boolean> | null } = { promise: null };
 let reloginInFlight: { promise: Promise<boolean> | null } = { promise: null };
+let authDeviceIdentityInitialization: Promise<AuthDeviceIdentity> | null = null;
 let authExpiryNotified = false;
 
 export interface RouterAuthState {
   authProvider?: "router" | "apiToken" | "password" | null;
-  installationId?: string | null;
+  authDeviceId?: string | null;
   publicKey?: string | null;
   privateKey?: string | null;
   email?: string | null;
@@ -19,6 +23,12 @@ export interface RouterAuthState {
   refreshExpiresAt?: string | null;
 }
 
+interface AuthDeviceIdentity {
+  authDeviceId: string;
+  publicKey: string;
+  privateKey: string;
+}
+
 export interface RouterSessionStatus {
   authenticated: boolean;
   user?: {
@@ -26,7 +36,6 @@ export interface RouterSessionStatus {
     email: string;
   } | null;
   expiresAt?: string | null;
-  installationOwnerEmail?: string | null;
   isAdmin?: boolean;
 }
 
@@ -54,7 +63,7 @@ function mergeAuthState(patch: RouterAuthState): RouterAuthState {
 export function clearRouterSessionTokens(): void {
   const state = readAuthState();
   mergeAuthState({
-    installationId: state.installationId || null,
+    authDeviceId: state.authDeviceId || null,
     publicKey: state.publicKey || null,
     privateKey: state.privateKey || null,
     email: null,
@@ -163,7 +172,7 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
   return data as T;
 }
 
-async function generateInstallationKeys(): Promise<{
+async function generateAuthDeviceKeys(): Promise<{
   publicKey: string;
   privateKey: string;
 }> {
@@ -191,78 +200,169 @@ async function importPrivateKey(privateKeyBase64: string): Promise<CryptoKey> {
   );
 }
 
-async function registerInstallationIdentity(
+async function registerAuthDeviceIdentity(
   publicKey: string,
+  privateKey: string,
 ): Promise<string> {
-  const response = await fetch("/v1/installations/register", {
+  const kind = "browser";
+  const platform = platformLabel();
+  const appVersion = "cc-switch-share-web";
+  const instanceNonce = randomId();
+  const timestampMs = Date.now();
+  const canonical = `${PROTOCOL_EPOCH}\nregister_auth_device\n${publicKey}\n${kind}\n${platform}\n${appVersion}\n${instanceNonce}\n${timestampMs}`;
+  const privateCryptoKey = await importPrivateKey(privateKey);
+  const signature = bytesToBase64(
+    new Uint8Array(
+      await crypto.subtle.sign(
+        { name: "Ed25519" } as AlgorithmIdentifier,
+        privateCryptoKey,
+        bytesToArrayBuffer(new TextEncoder().encode(canonical)),
+      ),
+    ),
+  );
+  const response = await fetch("/v1/auth/devices/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
+      protocolEpoch: PROTOCOL_EPOCH,
       publicKey,
-      platform: platformLabel(),
-      appVersion: "cc-switch-share-web",
-      instanceNonce: randomId(),
+      kind,
+      platform,
+      appVersion,
+      instanceNonce,
+      timestampMs,
+      signature,
     }),
   });
-  const data = await parseJsonResponse<{ installationId: string }>(response);
-  return data.installationId;
+  const data = await parseJsonResponse<{ authDeviceId: string }>(response);
+  return data.authDeviceId;
 }
 
-async function ensureInstallationIdentity(): Promise<{
-  installationId: string;
-  publicKey: string;
-  privateKey: string;
-}> {
-  const state = readAuthState();
-  if (state.installationId && state.publicKey && state.privateKey) {
+function authDeviceIdentityFromState(
+  state: RouterAuthState,
+): AuthDeviceIdentity | null {
+  if (state.authDeviceId && state.publicKey && state.privateKey) {
     return {
-      installationId: state.installationId,
+      authDeviceId: state.authDeviceId,
       publicKey: state.publicKey,
       privateKey: state.privateKey,
     };
   }
-  const keys = await generateInstallationKeys();
-  const installationId = await registerInstallationIdentity(keys.publicKey);
+  return null;
+}
+
+async function createAuthDeviceIdentityIfMissing(): Promise<AuthDeviceIdentity> {
+  const existing = authDeviceIdentityFromState(readAuthState());
+  if (existing) return existing;
+  const keys = await generateAuthDeviceKeys();
+  const authDeviceId = await registerAuthDeviceIdentity(
+    keys.publicKey,
+    keys.privateKey,
+  );
+  const identityCreatedElsewhere = authDeviceIdentityFromState(readAuthState());
+  if (identityCreatedElsewhere) return identityCreatedElsewhere;
   const next = mergeAuthState({
-    installationId,
+    authDeviceId,
     publicKey: keys.publicKey,
     privateKey: keys.privateKey,
   });
   return {
-    installationId,
+    authDeviceId,
     publicKey: next.publicKey!,
     privateKey: next.privateKey!,
   };
 }
 
-function shouldResetInstallationIdentity(message: string): boolean {
-  return /installation|public key|signature/i.test(message || "");
+async function initializeAuthDeviceIdentity(): Promise<AuthDeviceIdentity> {
+  const lockManager = navigator.locks;
+  if (!lockManager) return createAuthDeviceIdentityIfMissing();
+  let lockCallbackStarted = false;
+  try {
+    return await lockManager.request(AUTH_DEVICE_IDENTITY_LOCK_NAME, async () => {
+      lockCallbackStarted = true;
+      return createAuthDeviceIdentityIfMissing();
+    });
+  } catch (error) {
+    if (lockCallbackStarted) throw error;
+    return createAuthDeviceIdentityIfMissing();
+  }
 }
 
-function resetInstallationIdentity(): void {
-  const state = readAuthState();
-  mergeAuthState({
-    ...state,
-    installationId: null,
-    publicKey: null,
-    privateKey: null,
-  });
+async function ensureAuthDeviceIdentity(): Promise<AuthDeviceIdentity> {
+  const existing = authDeviceIdentityFromState(readAuthState());
+  if (existing) return existing;
+  if (authDeviceIdentityInitialization) return authDeviceIdentityInitialization;
+  const pending = initializeAuthDeviceIdentity();
+  authDeviceIdentityInitialization = pending;
+  try {
+    return await pending;
+  } finally {
+    if (authDeviceIdentityInitialization === pending) {
+      authDeviceIdentityInitialization = null;
+    }
+  }
+}
+
+function shouldResetAuthDeviceIdentity(message: string): boolean {
+  return /auth device|public key|signature/i.test(message || "");
+}
+
+async function replaceAuthDeviceIdentity(
+  expectedAuthDeviceId: string,
+): Promise<AuthDeviceIdentity> {
+  const replaceIfCurrent = async () => {
+    const current = authDeviceIdentityFromState(readAuthState());
+    if (current && current.authDeviceId !== expectedAuthDeviceId) return current;
+    mergeAuthState({
+      authDeviceId: null,
+      publicKey: null,
+      privateKey: null,
+    });
+    return createAuthDeviceIdentityIfMissing();
+  };
+
+  const lockManager = navigator.locks;
+  if (!lockManager) return replaceIfCurrent();
+
+  let lockCallbackStarted = false;
+  try {
+    return await lockManager.request(AUTH_DEVICE_IDENTITY_LOCK_NAME, async () => {
+      lockCallbackStarted = true;
+      return replaceIfCurrent();
+    });
+  } catch (error) {
+    if (lockCallbackStarted) throw error;
+    return replaceIfCurrent();
+  }
 }
 
 async function signAuthPayload(
   action: string,
   payload: Record<string, unknown>,
 ): Promise<{
-  installationId: string;
+  authDeviceId: string;
   timestampMs: number;
   nonce: string;
   signature: string;
 }> {
-  const identity = await ensureInstallationIdentity();
+  const identity = await ensureAuthDeviceIdentity();
+  return signAuthPayloadWithIdentity(identity, action, payload);
+}
+
+async function signAuthPayloadWithIdentity(
+  identity: AuthDeviceIdentity,
+  action: string,
+  payload: Record<string, unknown>,
+): Promise<{
+  authDeviceId: string;
+  timestampMs: number;
+  nonce: string;
+  signature: string;
+}> {
   const timestampMs = Date.now();
   const nonce = randomId();
   const payloadJson = JSON.stringify(payload);
-  const body = `${identity.installationId}\n${action}\n${payloadJson}\n${timestampMs}\n${nonce}`;
+  const body = `${PROTOCOL_EPOCH}\n${identity.authDeviceId}\n${action}\n${payloadJson}\n${timestampMs}\n${nonce}`;
   const privateKey = await importPrivateKey(identity.privateKey);
   const encodedBody = new TextEncoder().encode(body);
   const signature = bytesToBase64(
@@ -275,7 +375,7 @@ async function signAuthPayload(
     ),
   );
   return {
-    installationId: identity.installationId,
+    authDeviceId: identity.authDeviceId,
     timestampMs,
     nonce,
     signature,
@@ -354,18 +454,7 @@ async function refreshAccessToken(): Promise<boolean> {
         if (await applyPasswordAuthResponse(response)) return true;
         return reloginWithCachedWebPassword();
       }
-      if (state.installationId) {
-        const response = await fetch("/v1/auth/session/refresh", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            refreshToken: state.refreshToken,
-            installationId: state.installationId,
-          }),
-        });
-        if (await applyRefreshResponse(response)) return true;
-      }
-      const response = await fetch("/web-api/auth/session/refresh", {
+      const response = await fetch("/v1/auth/session/refresh", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -373,6 +462,14 @@ async function refreshAccessToken(): Promise<boolean> {
         }),
       });
       if (await applyRefreshResponse(response)) return true;
+      const clientWebResponse = await fetch("/web-api/auth/session/refresh", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          refreshToken: state.refreshToken,
+        }),
+      });
+      if (await applyRefreshResponse(clientWebResponse)) return true;
       return reloginWithCachedWebPassword();
     } finally {
       refreshInFlight.promise = null;
@@ -492,13 +589,9 @@ function notifyServerAuthExpired(): void {
 }
 
 export async function getRouterSessionStatus(): Promise<RouterSessionStatus> {
-  const state = readAuthState();
-  const params = new URLSearchParams();
-  if (state.installationId) params.set("installationId", state.installationId);
-  const response = await routerAuthFetch(
-    `/v1/auth/session/me${params.toString() ? `?${params}` : ""}`,
-    { cache: "no-store" },
-  );
+  const response = await routerAuthFetch("/v1/auth/session/me", {
+    cache: "no-store",
+  });
   if (!response.ok) return { authenticated: false };
   return response.json() as Promise<RouterSessionStatus>;
 }
@@ -516,7 +609,15 @@ export async function requestRouterEmailCode(
     });
     return parseJsonResponse(response);
   }
-  const signed = await signAuthPayload("auth_request_code", {
+  const identity = await ensureAuthDeviceIdentity();
+  return requestRouterEmailCodeWithIdentity(normalizedEmail, identity);
+}
+
+async function requestRouterEmailCodeWithIdentity(
+  normalizedEmail: string,
+  identity: AuthDeviceIdentity,
+): Promise<{ maskedDestination: string; cooldownSecs?: number }> {
+  const signed = await signAuthPayloadWithIdentity(identity, "auth_request_code", {
     email: normalizedEmail,
     purpose: "login",
   });
@@ -532,14 +633,16 @@ export async function requestRouterEmailCodeWithIdentityRetry(
   email: string,
   options?: { clientWeb?: boolean },
 ): Promise<{ maskedDestination: string; cooldownSecs?: number }> {
+  if (options?.clientWeb) return requestRouterEmailCode(email, options);
+  const normalizedEmail = email.trim().toLowerCase();
+  let identity = await ensureAuthDeviceIdentity();
   try {
-    return await requestRouterEmailCode(email, options);
+    return await requestRouterEmailCodeWithIdentity(normalizedEmail, identity);
   } catch (error) {
-    if (options?.clientWeb) throw error;
     const message = error instanceof Error ? error.message : String(error);
-    if (!shouldResetInstallationIdentity(message)) throw error;
-    resetInstallationIdentity();
-    return requestRouterEmailCode(email);
+    if (!shouldResetAuthDeviceIdentity(message)) throw error;
+    identity = await replaceAuthDeviceIdentity(identity.authDeviceId);
+    return requestRouterEmailCodeWithIdentity(normalizedEmail, identity);
   }
 }
 
@@ -553,14 +656,14 @@ export async function verifyRouterEmailCode(
     : "/v1/auth/email/verify-code";
   const identity = options?.clientWeb
     ? null
-    : await ensureInstallationIdentity();
+    : await ensureAuthDeviceIdentity();
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       email: email.trim().toLowerCase(),
       code: code.trim(),
-      ...(identity ? { installationId: identity.installationId } : {}),
+      ...(identity ? { authDeviceId: identity.authDeviceId } : {}),
     }),
   });
   const data = await parseJsonResponse<{

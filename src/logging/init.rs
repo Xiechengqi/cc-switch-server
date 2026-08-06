@@ -12,6 +12,7 @@ use crate::logging::capture::LogCapture;
 struct CaptureWriter {
     capture: Arc<LogCapture>,
     buffer: Vec<u8>,
+    formatted_lines: Vec<String>,
 }
 
 impl CaptureWriter {
@@ -19,6 +20,7 @@ impl CaptureWriter {
         Self {
             capture,
             buffer: Vec::new(),
+            formatted_lines: Vec::new(),
         }
     }
 
@@ -29,8 +31,16 @@ impl CaptureWriter {
         let line = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
         self.buffer.clear();
         if !line.is_empty() {
+            self.formatted_lines.push(line.clone());
+            crate::logging::remote::remember_remote_log_line(&self.formatted_lines.join("\\n"));
             self.capture.push_line(line);
         }
+    }
+}
+
+impl Drop for CaptureWriter {
+    fn drop(&mut self) {
+        self.flush_line();
     }
 }
 
@@ -78,6 +88,7 @@ pub fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let _ = FILTER_HANDLE.set(filter_handle);
 
+    // The capture formatter must run before the remote layer consumes its raw line.
     Registry::default()
         .with(filter_layer)
         .with(
@@ -108,4 +119,43 @@ pub fn reload_filter(handle: &reload::Handle<EnvFilter, Registry>, level: &str) 
     let _ = handle.modify(|filter| {
         *filter = build_filter(level);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_writer_remembers_the_formatter_output_for_remote_upload() {
+        let capture = Arc::new(LogCapture::new(2));
+        let mut writer = CaptureWriter::new(capture);
+        writer.write_all(b"first line\nsecond line\n").unwrap();
+
+        assert_eq!(
+            crate::logging::remote::take_remote_log_line().as_deref(),
+            Some("first line\\nsecond line")
+        );
+    }
+
+    #[test]
+    fn capture_layer_preserves_the_process_log_format_without_ansi() {
+        let capture = Arc::new(LogCapture::new(2));
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_span_events(FmtSpan::NONE)
+                .with_writer(CaptureMakeWriter { capture }),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(answer = 42, "formatter output");
+        });
+
+        let raw_line = crate::logging::remote::take_remote_log_line().unwrap();
+        assert!(raw_line.contains(" INFO "));
+        assert!(raw_line.contains("formatter output"));
+        assert!(raw_line.contains("answer=42"));
+        assert!(!raw_line.contains('\u{1b}'));
+    }
 }
