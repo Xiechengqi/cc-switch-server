@@ -57,7 +57,6 @@ struct UpdateHelperSpec {
     install_path: PathBuf,
     staging_path: PathBuf,
     rollback_path: PathBuf,
-    log_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +182,6 @@ pub fn schedule_upgrade_restart(
         install_path: BINARY_INSTALL_PATH.into(),
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
-        log_path: config_dir.join("server.log"),
     })
 }
 
@@ -227,7 +225,6 @@ pub fn restart_from_detected_service(
         install_path,
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
-        log_path: config_dir.join("server.log"),
     })?;
     Ok(RestartSchedule {
         operation_id,
@@ -307,11 +304,16 @@ pub fn rollback_from_backup_and_restart(
         install_path: BINARY_INSTALL_PATH.into(),
         staging_path: BINARY_STAGING_PATH.into(),
         rollback_path: BINARY_ROLLBACK_PATH.into(),
-        log_path: config_dir.join("server.log"),
     })
 }
 
 fn launch_helper(spec: UpdateHelperSpec) -> Result<String, SelfUpdateError> {
+    crate::logging::ensure_log_dir(&spec.config_dir).map_err(|error| {
+        SelfUpdateError::Internal(format!(
+            "initialize restart log directory under {} failed: {error}",
+            spec.config_dir.display()
+        ))
+    })?;
     let now = chrono::Utc::now().to_rfc3339();
     write_json_atomic(
         &spec.config_dir.join(RESTART_OPERATION_FILENAME),
@@ -386,17 +388,13 @@ fn spawn_detached_helper(
         RestartStrategy::Standalone => {
             use std::os::unix::process::CommandExt;
 
-            let helper_log_path = spec.config_dir.join("restart-helper.log");
-            let helper_log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&helper_log_path)
-                .map_err(|err| {
-                    SelfUpdateError::Internal(format!(
-                        "open restart helper log {} failed: {err}",
-                        helper_log_path.display()
-                    ))
-                })?;
+            let helper_log_path = crate::logging::restart_helper_log_path(&spec.config_dir);
+            let helper_log = crate::logging::open_log_append(&helper_log_path).map_err(|err| {
+                SelfUpdateError::Internal(format!(
+                    "open restart helper log {} failed: {err}",
+                    helper_log_path.display()
+                ))
+            })?;
             let helper_error_log = helper_log.try_clone().map_err(|err| {
                 SelfUpdateError::Internal(format!("clone restart helper log failed: {err}"))
             })?;
@@ -629,10 +627,9 @@ fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::proces
                 !process_is_active(&parent_proc),
                 "current server process did not exit after SIGTERM"
             );
-            let log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&spec.log_path)?;
+            crate::logging::ensure_log_dir(&spec.config_dir)?;
+            let log_path = crate::logging::process_log_path(&spec.config_dir);
+            let log = crate::logging::open_log_append(&log_path)?;
             let err_log = log.try_clone()?;
             let child = Command::new(&spec.install_path)
                 .args(&spec.server_args)
@@ -1130,7 +1127,6 @@ mod tests {
             install_path: install_path.clone(),
             staging_path,
             rollback_path,
-            log_path: dir.join("server.log"),
         };
 
         let error =

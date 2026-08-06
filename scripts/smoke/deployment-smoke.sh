@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 MODE="${MODE:-binary}"
 HOST="${HOST:-127.0.0.1}"
@@ -7,6 +8,7 @@ PORT="${PORT:-18083}"
 SERVER_URL="http://${HOST}:${PORT}"
 CONFIG_DIR="${CONFIG_DIR:-$(mktemp -d /tmp/cc-switch-server-deploy.XXXXXX)}"
 KEEP_CONFIG_DIR="${KEEP_CONFIG_DIR:-0}"
+LOG_DIR="${CONFIG_DIR}/log"
 
 cleanup() {
   case "${MODE}" in
@@ -64,7 +66,8 @@ backup_restore_smoke() {
 case "$MODE" in
   binary)
     cargo build
-    target/debug/cc-switch-server --host "$HOST" --port "$PORT" --config-dir "$CONFIG_DIR" >"$CONFIG_DIR/server.log" 2>&1 &
+    mkdir -p "$LOG_DIR"
+    target/debug/cc-switch-server --host "$HOST" --port "$PORT" --config-dir "$CONFIG_DIR" >"$LOG_DIR/server.log" 2>&1 &
     PID=$!
     wait_health
     curl -fsS "$SERVER_URL/version"
@@ -74,7 +77,7 @@ case "$MODE" in
     kill "$PID"
     wait "$PID" 2>/dev/null || true
     unset PID
-    target/debug/cc-switch-server --host "$HOST" --port "$PORT" --config-dir "$CONFIG_DIR" >"$CONFIG_DIR/server-restart.log" 2>&1 &
+    target/debug/cc-switch-server --host "$HOST" --port "$PORT" --config-dir "$CONFIG_DIR" >"$LOG_DIR/server-restart.log" 2>&1 &
     PID=$!
     wait_health
     echo "binary restart preserved config"

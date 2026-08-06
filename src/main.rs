@@ -32,6 +32,17 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     let state =
         ServerStateInner::load(cli.clone(), log_capture).context("initialize server state")?;
     state.sync_log_config_from_ui_settings().await;
+    let config = state.config_snapshot().await;
+    let installation_id = config
+        .registered_router_identity()
+        .map(|identity| identity.installation_id.as_str())
+        .unwrap_or("unregistered");
+    tracing::info!(
+        process_id = std::process::id(),
+        process_instance_id = %state.process_instance_id,
+        installation_id,
+        "server process log started"
+    );
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_public_ip_discovery(state.clone());
     cc_switch_server::state::spawn_installation_heartbeat(state.clone());

@@ -6,27 +6,55 @@ pub use capture::{
 };
 pub use init::{init_tracing, reload_log_level};
 
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::domain::settings::ui_settings::{self, LOG_API_MAX_TAIL_LINES};
-use crate::self_update::version::SERVICE_LOG_PATH;
 
 pub const RING_BUFFER_CAPACITY: usize = 5_000;
 const LOG_TAIL_FILE_SCAN_MAX_BYTES: u64 = 512 * 1024;
+const LOG_DIRECTORY: &str = "log";
+const PERSISTENT_LOG_FILENAME: &str = "cc-switch-server.log";
+const PROCESS_LOG_FILENAME: &str = "server.log";
+const RESTART_HELPER_LOG_FILENAME: &str = "restart-helper.log";
 
-pub fn resolve_log_file_path(config_dir: &Path) -> PathBuf {
-    let service_log = Path::new(SERVICE_LOG_PATH);
-    if service_log.is_file() {
-        return service_log.to_path_buf();
+pub(crate) fn log_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join(LOG_DIRECTORY)
+}
+
+pub(crate) fn persistent_log_path(config_dir: &Path) -> PathBuf {
+    log_dir(config_dir).join(PERSISTENT_LOG_FILENAME)
+}
+
+pub(crate) fn process_log_path(config_dir: &Path) -> PathBuf {
+    log_dir(config_dir).join(PROCESS_LOG_FILENAME)
+}
+
+pub(crate) fn restart_helper_log_path(config_dir: &Path) -> PathBuf {
+    log_dir(config_dir).join(RESTART_HELPER_LOG_FILENAME)
+}
+
+pub(crate) fn ensure_log_dir(config_dir: &Path) -> std::io::Result<PathBuf> {
+    let path = log_dir(config_dir);
+    fs::create_dir_all(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     }
-    if let Some(parent) = service_log.parent() {
-        if parent.exists() || std::fs::create_dir_all(parent).is_ok() {
-            return service_log.to_path_buf();
-        }
+    Ok(path)
+}
+
+pub(crate) fn open_log_append(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    config_dir.join("cc-switch-server.log")
+    options.open(path)
 }
 
 pub fn clamp_tail_lines(requested: Option<usize>, configured_default: usize) -> usize {
@@ -184,6 +212,59 @@ fn redact_sensitive_line(line: &str, keys: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cc-switch-server-log-path-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn application_logs_resolve_under_config_log_directory() {
+        let config_dir = Path::new("/srv/cc-switch-server-data");
+        assert_eq!(log_dir(config_dir), config_dir.join("log"));
+        assert_eq!(
+            persistent_log_path(config_dir),
+            config_dir.join("log/cc-switch-server.log")
+        );
+        assert_eq!(
+            process_log_path(config_dir),
+            config_dir.join("log/server.log")
+        );
+        assert_eq!(
+            restart_helper_log_path(config_dir),
+            config_dir.join("log/restart-helper.log")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_directory_and_new_log_files_are_private() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let config_dir = test_config_dir("permissions");
+        let directory = ensure_log_dir(&config_dir).unwrap();
+        let path = persistent_log_path(&config_dir);
+        let mut file = open_log_append(&path).unwrap();
+        writeln!(file, "private log").unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
 
     #[test]
     fn clamp_tail_lines_respects_bounds() {

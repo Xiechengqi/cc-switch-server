@@ -272,7 +272,8 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | 配置目录 | `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR`，默认 `~/.cc-switch-server` |
 | 静态 Web | 默认使用构建时内嵌到 binary 的 Web UI；`--web-dist-dir` / `CC_SWITCH_SERVER_WEB_DIST_DIR` 仅用于开发或调试时覆盖静态目录 |
 | 日志级别 | `--log-level` / `CC_SWITCH_SERVER_LOG`，默认 `info` |
-| 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时，允许当前 Router 通过受签名保护的 Client 控制接口按需读取最近最多 100 行脱敏日志；Server 不主动上传日志 |
+| 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时，允许当前 Router 通过受签名保护的 Client 控制接口按需读取当前进程最近最多 100 行脱敏日志；Server 不主动上传日志 |
+| 持久日志 | `<config-dir>/log/cc-switch-server.log` 跨进程保留供本机诊断；单文件达到 8 MiB 后轮转，并在同目录保留最近 2 个备份，不按日志时间清理 |
 | Router 心跳 | `CC_SWITCH_SERVER_ROUTER_HEARTBEAT_INTERVAL_SECS`，默认 `60` 秒，实际发送间隔带 ±10% jitter（允许范围 `15`-`60` 秒） |
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
 | Managed OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
@@ -280,7 +281,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
-| Codex Images | capability URL 固定使用 Router 签名 context 中的 Share host；`CC_SWITCH_IMAGE_STORE_DIR` 指定可跨重启的 capability 目录，多副本共享时底层文件系统必须支持跨进程锁和 atomic rename |
+| Codex Images | capability URL 固定使用 Router 签名 context 中的 Share host；短期图片默认保存到 `<config-dir>/image-capabilities`，仅多副本共享时用 `CC_SWITCH_IMAGE_STORE_DIR` 覆盖，底层文件系统必须支持跨进程锁和 atomic rename |
 | OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
 | Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
 | 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`CC_SWITCH_SHARE_URL` 及各真实 Provider token |

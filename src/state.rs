@@ -3468,6 +3468,8 @@ impl ServerStateInner {
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
         let data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
+        crate::logging::ensure_log_dir(&config_dir)
+            .with_context(|| format!("initialize log dir under {}", config_dir.display()))?;
         if apply_codex_workspace_rebind_transaction(&config_dir)
             .context("recover pending Codex workspace rebind transaction during startup")?
         {
@@ -3548,6 +3550,7 @@ impl ServerStateInner {
             &ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&ui_settings)),
             &config_dir,
         );
+        let process_instance_id = new_process_instance_id();
         let bind_addr = SocketAddr::new(cli.host, cli.port);
         let http_client = build_http_client()?;
         let (events, _) = broadcast::channel(256);
@@ -3629,7 +3632,7 @@ impl ServerStateInner {
             web_auth,
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
             started_at: std::time::Instant::now(),
-            process_instance_id: new_process_instance_id(),
+            process_instance_id,
             upgrade,
             log_capture,
             terminal: crate::api::terminal::OpsTerminalManager::new(),
@@ -3673,7 +3676,7 @@ impl ServerStateInner {
         }
         Ok(self
             .log_capture
-            .read_tail(&config, &self.config_dir, requested_lines.clamp(1, 100)))
+            .read_current_process_tail(requested_lines.clamp(1, 100)))
     }
 
     pub(crate) async fn store_image_capability(

@@ -20,7 +20,6 @@ pub const SERVICE_NAME: &str = "cc-switch-server";
 pub const BINARY_INSTALL_PATH: &str = "/usr/local/bin/cc-switch-server";
 pub const BINARY_STAGING_PATH: &str = "/usr/local/bin/.cc-switch-server.new";
 pub const BINARY_ROLLBACK_PATH: &str = "/usr/local/bin/cc-switch-server.bak";
-pub const SERVICE_LOG_PATH: &str = "/var/log/cc-switch-server.log";
 const GITHUB_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/Xiechengqi/cc-switch-server/releases/tags/latest";
 const GITHUB_REPO_API: &str = "https://api.github.com/repos/Xiechengqi/cc-switch-server";

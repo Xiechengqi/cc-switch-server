@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 PORT="${PORT:-18082}"
 HOST="${HOST:-127.0.0.1}"
 CONFIG_DIR="${CONFIG_DIR:-$(mktemp -d /tmp/cc-switch-server-smoke.XXXXXX)}"
 SERVER_URL="http://${HOST}:${PORT}"
-LOG_FILE="${CONFIG_DIR}/server.log"
+LOG_DIR="${CONFIG_DIR}/log"
+LOG_FILE="${LOG_DIR}/server.log"
 
 cleanup() {
   if [[ -n "${PID:-}" ]]; then
@@ -20,6 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$LOG_DIR"
 cargo run -- --host "$HOST" --port "$PORT" --config-dir "$CONFIG_DIR" >"$LOG_FILE" 2>&1 &
 PID=$!
 

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,17 +56,8 @@ struct StoreSnapshot {
 
 impl ImageCapabilityStore {
     pub(crate) fn from_config_dir(config_dir: &Path) -> anyhow::Result<Self> {
-        let root = std::env::var_os("CC_SWITCH_IMAGE_STORE_DIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    config_dir.join(path)
-                }
-            })
-            .unwrap_or_else(|| config_dir.join(IMAGE_STORE_DIRECTORY));
+        let root =
+            resolve_image_store_dir(config_dir, std::env::var_os("CC_SWITCH_IMAGE_STORE_DIR"));
         Self::at(root)
     }
 
@@ -318,6 +310,20 @@ impl ImageCapabilityStore {
     }
 }
 
+fn resolve_image_store_dir(config_dir: &Path, configured: Option<OsString>) -> PathBuf {
+    configured
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                config_dir.join(path)
+            }
+        })
+        .unwrap_or_else(|| config_dir.join(IMAGE_STORE_DIRECTORY))
+}
+
 struct ImageStoreLock {
     file: Option<fs::File>,
 }
@@ -396,6 +402,30 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn image_store_defaults_to_the_config_directory() {
+        let config_dir = Path::new("/srv/cc-switch-server-data");
+        assert_eq!(
+            resolve_image_store_dir(config_dir, None),
+            config_dir.join("image-capabilities")
+        );
+        assert_eq!(
+            resolve_image_store_dir(config_dir, Some(OsString::new())),
+            config_dir.join("image-capabilities")
+        );
+        assert_eq!(
+            resolve_image_store_dir(config_dir, Some(OsString::from("shared-images"))),
+            config_dir.join("shared-images")
+        );
+        assert_eq!(
+            resolve_image_store_dir(
+                config_dir,
+                Some(OsString::from("/mnt/cc-switch-image-capabilities")),
+            ),
+            PathBuf::from("/mnt/cc-switch-image-capabilities")
+        );
+    }
 
     fn test_store(name: &str) -> (PathBuf, ImageCapabilityStore) {
         let root = std::env::temp_dir().join(format!(

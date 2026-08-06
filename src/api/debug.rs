@@ -169,10 +169,12 @@ pub(crate) async fn debug_diagnostics(
 ) -> Result<Json<Value>, ApiError> {
     require_debug_capability(&state, &headers, DebugCapability::Diagnostics).await?;
     let upgrade = state.upgrade.status_snapshot().await;
-    let helper_log =
-        crate::logging::tail_file_lines(&state.config_dir.join("restart-helper.log"), 50)
-            .unwrap_or_default()
-            .join("\n");
+    let helper_log = crate::logging::tail_file_lines(
+        &crate::logging::restart_helper_log_path(&state.config_dir),
+        50,
+    )
+    .unwrap_or_default()
+    .join("\n");
     Ok(Json(json!({
         "runtime": runtime_snapshot(&state),
         "restartOperation": read_restart_operation(&state.config_dir),
