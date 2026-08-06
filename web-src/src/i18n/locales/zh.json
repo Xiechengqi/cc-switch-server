@@ -613,7 +613,7 @@
         "level": "日志级别",
         "levelDescription": "设置输出的最低日志级别",
         "collectionEnabled": "日志采集",
-        "collectionEnabledDescription": "将脱敏后的 INFO、WARN、ERROR 日志上传到当前 Router。仅在日志级别为 info 时可开启。",
+        "collectionEnabledDescription": "允许当前 Router 按需读取最近最多 100 行脱敏日志。仅在日志级别为 info 时可开启。",
         "levels": {
           "error": "错误",
           "warn": "警告",

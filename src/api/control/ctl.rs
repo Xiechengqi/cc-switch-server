@@ -184,6 +184,105 @@ pub(crate) async fn control_refresh_share_usage(
     }))
 }
 
+const CONTROL_LOG_MAX_LINES: usize = 100;
+const CONTROL_LOG_MAX_LINE_BYTES: usize = 16 * 1024;
+const CONTROL_LOG_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+pub(crate) async fn control_client_log_tail(
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Query(query): Query<ControlClientLogTailQuery>,
+) -> Result<Response, ApiError> {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(CLIENT_LOG_TAIL_PATH);
+    verify_control_request_for_method(&state, "GET", path_and_query, &headers, &[]).await?;
+    if !(1..=CONTROL_LOG_MAX_LINES).contains(&query.lines) {
+        return Err(ApiError::bad_request(format!(
+            "lines must be between 1 and {CONTROL_LOG_MAX_LINES}"
+        )));
+    }
+    let tail = state
+        .read_router_log_tail(query.lines)
+        .await
+        .map_err(|error| match error {
+            crate::logging::LogTailAccessError::Disabled => {
+                ApiError::forbidden("router log collection is disabled")
+            }
+        })?;
+    let (content, lines, response_truncated) = bounded_control_log_content(&tail.content);
+    let payload = fit_control_log_response(ControlClientLogTailResponse {
+        ok: true,
+        lines,
+        truncated: tail.truncated || response_truncated,
+        content,
+    });
+    let mut response = Json(payload).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+fn fit_control_log_response(
+    mut response: ControlClientLogTailResponse,
+) -> ControlClientLogTailResponse {
+    while serde_json::to_vec(&response)
+        .expect("serialize Client log response")
+        .len()
+        > CONTROL_LOG_MAX_RESPONSE_BYTES
+    {
+        response.truncated = true;
+        response.content = response
+            .content
+            .split_once('\n')
+            .map(|(_, remaining)| remaining.to_string())
+            .unwrap_or_default();
+        response.lines = response.content.lines().count();
+    }
+    response
+}
+
+fn bounded_control_log_content(content: &str) -> (String, usize, bool) {
+    let mut truncated = false;
+    let mut used_bytes = 0_usize;
+    let mut lines = Vec::new();
+    for raw_line in content.lines().rev().take(CONTROL_LOG_MAX_LINES) {
+        let redacted = crate::logging::redact_sensitive_text(&raw_line.replace('\r', "\\r"));
+        if redacted.len() > CONTROL_LOG_MAX_LINE_BYTES {
+            truncated = true;
+        }
+        let line = bounded_utf8(&redacted, CONTROL_LOG_MAX_LINE_BYTES);
+        let additional = line.len() + usize::from(!lines.is_empty());
+        if used_bytes.saturating_add(additional) > CONTROL_LOG_MAX_RESPONSE_BYTES {
+            truncated = true;
+            break;
+        }
+        used_bytes += additional;
+        lines.push(line);
+    }
+    if content.lines().count() > lines.len() {
+        truncated = true;
+    }
+    lines.reverse();
+    let line_count = lines.len();
+    (lines.join("\n"), line_count, truncated)
+}
+
+fn bounded_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 pub(crate) async fn verify_control_request(
     state: &ServerState,
     path: &str,
@@ -915,4 +1014,59 @@ pub struct ControlRefreshShareUsageItem {
 pub(crate) struct ControlRefreshShareUsageResponse {
     ok: bool,
     refreshed: Vec<ControlRefreshShareUsageItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ControlClientLogTailQuery {
+    lines: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlClientLogTailResponse {
+    ok: bool,
+    lines: usize,
+    truncated: bool,
+    content: String,
+}
+
+#[cfg(test)]
+mod control_log_tests {
+    use super::*;
+
+    #[test]
+    fn control_log_tail_redacts_secrets_and_keeps_latest_lines() {
+        let oversized = "x".repeat(CONTROL_LOG_MAX_LINE_BYTES + 20);
+        let content = format!("first\nauthorization: Bearer secret\n{oversized}\nlast");
+        let (content, lines, truncated) = bounded_control_log_content(&content);
+        assert_eq!(lines, 4);
+        assert!(truncated);
+        assert!(!content.contains("secret"));
+        assert!(content.contains("Bearer [REDACTED]"));
+        assert!(content.ends_with("last"));
+        assert!(content.len() <= CONTROL_LOG_MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn control_log_response_limit_includes_json_escaping() {
+        let quoted = "\"".repeat(CONTROL_LOG_MAX_LINE_BYTES);
+        let content = (0..20)
+            .map(|index| format!("{index}:{quoted}"))
+            .chain(std::iter::once("latest".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (content, lines, truncated) = bounded_control_log_content(&content);
+        let response = fit_control_log_response(ControlClientLogTailResponse {
+            ok: true,
+            lines,
+            truncated,
+            content,
+        });
+
+        assert!(serde_json::to_vec(&response).unwrap().len() <= CONTROL_LOG_MAX_RESPONSE_BYTES);
+        assert!(response.truncated);
+        assert!(response.content.ends_with("latest"));
+        assert_eq!(response.lines, response.content.lines().count());
+    }
 }

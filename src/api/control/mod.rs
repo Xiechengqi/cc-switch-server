@@ -1,6 +1,7 @@
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -25,7 +26,7 @@ use crate::state::ServerState;
 
 use super::{
     now_ms, parse_app_kind, web_stream_check_config, ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
-    APPLY_SHARE_SETTINGS_PATH, COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+    APPLY_SHARE_SETTINGS_PATH, CLIENT_LOG_TAIL_PATH, COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
     PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH, REFRESH_SHARE_USAGE_PATH,
 };
 
@@ -33,7 +34,7 @@ mod ctl;
 mod share_router;
 
 pub(crate) use ctl::{
-    control_abort_client_subdomain_adoption, control_apply_share_settings,
+    control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
     control_refresh_share_usage,
 };

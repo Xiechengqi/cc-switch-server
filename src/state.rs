@@ -11,7 +11,7 @@ use rand::RngCore;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify, RwLock};
 use tokio::time::{sleep, timeout_at, Duration, Instant};
 
 use crate::api::web::coverage::ProviderCoverage;
@@ -353,6 +353,7 @@ pub struct ServerStateInner {
     pub(crate) terminal: crate::api::terminal::OpsTerminalManager,
     /// Startup-discovered public IPv4 reported to router via heartbeat.
     reported_public_ip: RwLock<Option<String>>,
+    installation_heartbeat_wakeup: Notify,
 }
 
 #[derive(Debug)]
@@ -3633,6 +3634,7 @@ impl ServerStateInner {
             log_capture,
             terminal: crate::api::terminal::OpsTerminalManager::new(),
             reported_public_ip: RwLock::new(None),
+            installation_heartbeat_wakeup: Notify::new(),
         }))
     }
 
@@ -3641,26 +3643,37 @@ impl ServerStateInner {
         let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
         drop(store);
         self.log_capture.apply_config(&config, &self.config_dir);
-        crate::logging::apply_remote_log_config(&config);
         let level = if config.enabled {
             config.level.as_str()
         } else {
             "off"
         };
         crate::logging::reload_log_level(level);
+        self.installation_heartbeat_wakeup.notify_one();
     }
 
-    pub(crate) async fn upload_installation_log_batch(
+    pub async fn router_log_collection_enabled(&self) -> bool {
+        let store = self.ui_settings.read().await;
+        let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
+        config.enabled && config.collection_enabled && config.level.eq_ignore_ascii_case("info")
+    }
+
+    pub async fn read_router_log_tail(
         &self,
-        payload: crate::domain::router::InstallationLogBatchPayload,
-    ) -> Result<
-        crate::domain::router::InstallationLogBatchResponse,
-        crate::clients::router::client::InstallationLogUploadError,
-    > {
-        let config = self.config.read().await.clone();
-        let http_client = self.http_client.read().await.clone();
-        crate::clients::router::client::send_installation_log_batch(&http_client, &config, payload)
-            .await
+        requested_lines: usize,
+    ) -> Result<LogTailResponse, LogTailAccessError> {
+        let store = self.ui_settings.read().await;
+        let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
+        drop(store);
+        if !config.enabled
+            || !config.collection_enabled
+            || !config.level.eq_ignore_ascii_case("info")
+        {
+            return Err(LogTailAccessError::Disabled);
+        }
+        Ok(self
+            .log_capture
+            .read_tail(&config, &self.config_dir, requested_lines.clamp(1, 100)))
     }
 
     pub(crate) async fn store_image_capability(
@@ -10144,7 +10157,7 @@ pub fn spawn_installation_heartbeat(state: ServerState) {
         let mut last_failure_warning = None;
         let mut unregistered_retry_secs = ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS;
         loop {
-            if run_installation_heartbeat_once(
+            let delay = if run_installation_heartbeat_once(
                 &state,
                 &mut consecutive_failures,
                 &mut last_failure_warning,
@@ -10152,12 +10165,17 @@ pub fn spawn_installation_heartbeat(state: ServerState) {
             .await
             {
                 unregistered_retry_secs = ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS;
-                sleep(next_router_heartbeat_delay(router_heartbeat_interval_secs())).await;
+                next_router_heartbeat_delay(router_heartbeat_interval_secs())
             } else {
-                sleep(Duration::from_secs(unregistered_retry_secs)).await;
+                let delay = Duration::from_secs(unregistered_retry_secs);
                 unregistered_retry_secs =
                     next_router_registration_retry_secs(unregistered_retry_secs);
-            }
+                delay
+            };
+            tokio::select! {
+                _ = sleep(delay) => {}
+                _ = state.installation_heartbeat_wakeup.notified() => {}
+            };
         }
     });
 }
@@ -10238,11 +10256,13 @@ async fn run_installation_heartbeat_once(
     }
     let http_client = state.http_client().await;
     let public_ip = state.reported_public_ip().await;
+    let log_collection_enabled = state.router_log_collection_enabled().await;
     match client::send_installation_heartbeat(
         &http_client,
         &config,
         &state.process_instance_id,
         public_ip.as_deref(),
+        log_collection_enabled,
     )
     .await
     {
@@ -10270,6 +10290,7 @@ async fn run_installation_heartbeat_once(
                             &recovered_config,
                             &state.process_instance_id,
                             state.reported_public_ip().await.as_deref(),
+                            state.router_log_collection_enabled().await,
                         )
                         .await
                         {

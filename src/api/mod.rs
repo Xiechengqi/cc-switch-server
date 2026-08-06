@@ -27,7 +27,7 @@ pub(in crate::api) mod usage;
 pub(in crate::api) use accounts::*;
 pub(in crate::api) use backup::*;
 pub(crate) use control::{
-    control_abort_client_subdomain_adoption, control_apply_share_settings,
+    control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
     control_refresh_share_usage, share_router_health, share_router_model_health,
     share_router_request_logs, share_router_runtime,
@@ -136,6 +136,7 @@ pub const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
 pub const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
 pub const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
 pub const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
+pub const CLIENT_LOG_TAIL_PATH: &str = "/_ctl/logs/tail";
 pub async fn serve(state: ServerState) -> anyhow::Result<()> {
     if !state.config.read().await.is_setup_complete() {
         crate::setup::log_setup_required_hints(&state);
@@ -185,6 +186,7 @@ pub fn app_router(state: ServerState) -> Router {
             ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
             post(control_abort_client_subdomain_adoption),
         )
+        .route(CLIENT_LOG_TAIL_PATH, get(control_client_log_tail))
         .route("/api/setup/status", get(setup_status))
         .route("/api/setup/check-router", post(setup_check_router))
         .route(

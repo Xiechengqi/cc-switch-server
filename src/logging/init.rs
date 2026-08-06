@@ -12,7 +12,6 @@ use crate::logging::capture::LogCapture;
 struct CaptureWriter {
     capture: Arc<LogCapture>,
     buffer: Vec<u8>,
-    formatted_lines: Vec<String>,
 }
 
 impl CaptureWriter {
@@ -20,7 +19,6 @@ impl CaptureWriter {
         Self {
             capture,
             buffer: Vec::new(),
-            formatted_lines: Vec::new(),
         }
     }
 
@@ -31,8 +29,6 @@ impl CaptureWriter {
         let line = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
         self.buffer.clear();
         if !line.is_empty() {
-            self.formatted_lines.push(line.clone());
-            crate::logging::remote::remember_remote_log_line(&self.formatted_lines.join("\\n"));
             self.capture.push_line(line);
         }
     }
@@ -88,7 +84,6 @@ pub fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let _ = FILTER_HANDLE.set(filter_handle);
 
-    // The capture formatter must run before the remote layer consumes its raw line.
     Registry::default()
         .with(filter_layer)
         .with(
@@ -105,7 +100,6 @@ pub fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
                     capture: capture.clone(),
                 }),
         )
-        .with(crate::logging::remote_log_layer())
         .init();
 }
 
@@ -126,15 +120,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_writer_remembers_the_formatter_output_for_remote_upload() {
+    fn capture_writer_records_each_formatted_line() {
         let capture = Arc::new(LogCapture::new(2));
-        let mut writer = CaptureWriter::new(capture);
+        let mut writer = CaptureWriter::new(capture.clone());
         writer.write_all(b"first line\nsecond line\n").unwrap();
-
-        assert_eq!(
-            crate::logging::remote::take_remote_log_line().as_deref(),
-            Some("first line\\nsecond line")
-        );
+        assert_eq!(capture.tail_lines(2), vec!["first line", "second line"]);
     }
 
     #[test]
@@ -145,14 +135,16 @@ mod tests {
                 .with_target(false)
                 .with_ansi(false)
                 .with_span_events(FmtSpan::NONE)
-                .with_writer(CaptureMakeWriter { capture }),
+                .with_writer(CaptureMakeWriter {
+                    capture: capture.clone(),
+                }),
         );
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(answer = 42, "formatter output");
         });
 
-        let raw_line = crate::logging::remote::take_remote_log_line().unwrap();
+        let raw_line = capture.tail_lines(1).pop().unwrap();
         assert!(raw_line.contains(" INFO "));
         assert!(raw_line.contains("formatter output"));
         assert!(raw_line.contains("answer=42"));

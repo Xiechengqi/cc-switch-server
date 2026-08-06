@@ -643,6 +643,76 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
 }
 
 #[tokio::test]
+async fn control_client_log_tail_requires_router_signature_and_collection_permission() {
+    let state = test_state();
+    let mut config = state.config_snapshot().await;
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-ctl".to_string(),
+        public_key: "public-key".to_string(),
+        private_key: "private-key".to_string(),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+    let app = app_router(state.clone());
+    let path = format!("{CLIENT_LOG_TAIL_PATH}?lines=10");
+
+    let unsigned = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+    let enabled = app
+        .clone()
+        .oneshot(signed_control_get_request(
+            &path,
+            "inst-ctl",
+            "control-secret",
+            "nonce-log-enabled",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), StatusCode::OK);
+    assert_eq!(
+        enabled.headers()[axum::http::header::CACHE_CONTROL],
+        "no-store"
+    );
+    let enabled = json_body(enabled).await;
+    assert_eq!(enabled["ok"], true);
+    assert!(enabled["lines"].as_u64().is_some_and(|lines| lines <= 10));
+    assert!(enabled["content"].is_string());
+
+    state
+        .apply_ui_settings_patch_immediate(json!({
+            "logConfig": {
+                "enabled": true,
+                "level": "info",
+                "collectionEnabled": false
+            }
+        }))
+        .await
+        .unwrap();
+    state.sync_log_config_from_ui_settings().await;
+    let disabled = app
+        .oneshot(signed_control_get_request(
+            &path,
+            "inst-ctl",
+            "control-secret",
+            "nonce-log-disabled",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn control_apply_share_settings_accepts_router_share_market_managed_grant() {
     let state = test_state();
     let mut config = state.config_snapshot().await;
@@ -11296,6 +11366,35 @@ fn control_request(
         .header("x-ctl-nonce", nonce)
         .header("x-ctl-signature", signature)
         .body(Body::from(body))
+        .unwrap()
+}
+
+fn signed_control_get_request(
+    path: &str,
+    installation_id: &str,
+    control_secret: &str,
+    nonce: &str,
+) -> Request<Body> {
+    let timestamp_ms = now_ms() as i64;
+    let signature = BASE64_STANDARD.encode(
+        control_signature_for_method(
+            Method::GET.as_str(),
+            path,
+            control_secret,
+            &[],
+            timestamp_ms,
+            nonce,
+        )
+        .unwrap(),
+    );
+    Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header("x-ctl-installation-id", installation_id)
+        .header("x-ctl-timestamp-ms", timestamp_ms.to_string())
+        .header("x-ctl-nonce", nonce)
+        .header("x-ctl-signature", signature)
+        .body(Body::empty())
         .unwrap()
 }
 

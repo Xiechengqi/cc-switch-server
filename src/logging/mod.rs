@@ -1,21 +1,20 @@
 mod capture;
 mod init;
-mod remote;
 
 pub use capture::{
     LogCapture, LogTailAccessError, LogTailResponse, LogTailSource, SharedLogCapture,
 };
 pub use init::{init_tracing, reload_log_level};
-pub use remote::{
-    apply_remote_log_config, remote_log_layer, spawn_remote_log_upload, RemoteLogLayer,
-};
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::domain::settings::ui_settings::{self, LOG_API_MAX_TAIL_LINES};
 use crate::self_update::version::SERVICE_LOG_PATH;
 
 pub const RING_BUFFER_CAPACITY: usize = 5_000;
+const LOG_TAIL_FILE_SCAN_MAX_BYTES: u64 = 512 * 1024;
 
 pub fn resolve_log_file_path(config_dir: &Path) -> PathBuf {
     let service_log = Path::new(SERVICE_LOG_PATH);
@@ -37,7 +36,20 @@ pub fn clamp_tail_lines(requested: Option<usize>, configured_default: usize) -> 
 }
 
 pub fn tail_file_lines(path: &Path, lines: usize) -> std::io::Result<Vec<String>> {
-    let content = std::fs::read_to_string(path)?;
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let start = file_len.saturating_sub(LOG_TAIL_FILE_SCAN_MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((file_len - start) as usize);
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        if let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=first_newline);
+        } else {
+            bytes.clear();
+        }
+    }
+    let content = String::from_utf8_lossy(&bytes);
     let mut collected: Vec<String> = content
         .lines()
         .map(str::trim_end)
@@ -52,7 +64,7 @@ pub fn tail_file_lines(path: &Path, lines: usize) -> std::io::Result<Vec<String>
 
 pub fn merge_tail_lines(
     buffer: Vec<String>,
-    file: Vec<String>,
+    mut file: Vec<String>,
     lines: usize,
 ) -> (Vec<String>, LogTailSource) {
     if buffer.is_empty() {
@@ -64,8 +76,12 @@ pub fn merge_tail_lines(
         return (buffer[start..].to_vec(), LogTailSource::Buffer);
     }
 
-    let mut merged = file;
-    merged.extend(buffer);
+    let overlap = (1..=file.len().min(buffer.len()))
+        .rev()
+        .find(|overlap| file[file.len() - overlap..] == buffer[..*overlap])
+        .unwrap_or(0);
+    file.extend(buffer.into_iter().skip(overlap));
+    let merged = file;
     let start = merged.len().saturating_sub(lines);
     (merged[start..].to_vec(), LogTailSource::BufferAndFile)
 }
@@ -183,6 +199,15 @@ mod tests {
         let file = vec!["f1".into()];
         let (merged, source) = merge_tail_lines(buffer, file, 3);
         assert_eq!(merged, vec!["f1", "b1", "b2"]);
+        assert_eq!(source, LogTailSource::BufferAndFile);
+    }
+
+    #[test]
+    fn merge_tail_lines_deduplicates_file_buffer_overlap() {
+        let buffer = vec!["two".into(), "three".into()];
+        let file = vec!["one".into(), "two".into(), "three".into()];
+        let (merged, source) = merge_tail_lines(buffer, file, 10);
+        assert_eq!(merged, vec!["one", "two", "three"]);
         assert_eq!(source, LogTailSource::BufferAndFile);
     }
 
