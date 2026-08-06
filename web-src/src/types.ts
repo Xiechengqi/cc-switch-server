@@ -372,9 +372,9 @@ export interface Settings {
   s3Sync?: S3SyncSettings;
 
   // ===== 备份策略设置 =====
-  // Auto-backup interval in hours (0=disabled, default 24)
+  // Auto-backup interval in hours (0=disabled, default 12)
   backupIntervalHours?: number;
-  // Maximum backup files to retain (default 10)
+  // Maximum backup files to retain (default 3)
   backupRetainCount?: number;
 
   // ===== 终端设置 =====

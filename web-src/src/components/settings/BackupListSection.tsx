@@ -162,8 +162,8 @@ export function BackupListSection({
     }
   };
 
-  const intervalValue = String(backupIntervalHours ?? 24);
-  const retainValue = String(backupRetainCount ?? 10);
+  const intervalValue = String(backupIntervalHours ?? 12);
+  const retainValue = String(backupRetainCount ?? 3);
 
   return (
     <div className="space-y-4">

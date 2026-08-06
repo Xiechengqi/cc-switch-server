@@ -166,8 +166,8 @@ pub fn default_ui_settings() -> Value {
             "openclaw": false,
             "hermes": false
         },
-        "backupIntervalHours": 24,
-        "backupRetainCount": 10,
+        "backupIntervalHours": 12,
+        "backupRetainCount": 3,
         "rectifierConfig": default_rectifier_config(),
         "optimizerConfig": default_optimizer_config(),
         "logConfig": default_log_config(),

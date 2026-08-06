@@ -32,7 +32,7 @@ export const SERVER_DEFAULT_SETTINGS: Settings = {
     openclaw: false,
     hermes: false,
   },
-  backupIntervalHours: 24,
-  backupRetainCount: 10,
+  backupIntervalHours: 12,
+  backupRetainCount: 3,
   upgradePolicy: DEFAULT_UPGRADE_POLICY,
 };
