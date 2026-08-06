@@ -10034,10 +10034,21 @@ pub(crate) fn spawn_client_subdomain_adoption_reconnect(state: ServerState, reas
 }
 
 async fn reconnect_after_client_subdomain_adoption(state: ServerState, reason: &str) {
-    force_reconnect_client_tunnel(state.clone(), reason).await;
+    replace_client_tunnel(
+        state.clone(),
+        reason,
+        tunnel::TunnelReplacementMode::NamespaceRebind,
+    )
+    .await;
     let share_ids = share_tunnel_restore_ids(&state.shares.read().await.shares);
     for share_id in share_ids {
-        force_reconnect_share_tunnel(state.clone(), share_id, reason).await;
+        replace_share_tunnel(
+            state.clone(),
+            share_id,
+            reason,
+            tunnel::TunnelReplacementMode::NamespaceRebind,
+        )
+        .await;
     }
 }
 
@@ -11314,6 +11325,14 @@ pub async fn ensure_client_tunnel_running(state: ServerState, reason: &str) {
 }
 
 pub async fn force_reconnect_client_tunnel(state: ServerState, reason: &str) {
+    replace_client_tunnel(state, reason, tunnel::TunnelReplacementMode::Graceful).await;
+}
+
+async fn replace_client_tunnel(
+    state: ServerState,
+    reason: &str,
+    mode: tunnel::TunnelReplacementMode,
+) {
     let local_addr = tunnel::local_forward_addr(state.bind_addr);
     let spec_id = client_tunnel_spec_id(&state, &local_addr).await;
     let (lease_fn, activate_tunnel_fn, tunnel_state_fn, renew_lease_fn) =
@@ -11330,6 +11349,7 @@ pub async fn force_reconnect_client_tunnel(state: ServerState, reason: &str) {
             renew_lease_fn,
             reason,
             spec_id,
+            mode,
         )
         .await;
 }
@@ -11368,6 +11388,21 @@ async fn ensure_share_tunnel_actor(state: ServerState, share_id: String, reason:
 }
 
 pub async fn force_reconnect_share_tunnel(state: ServerState, share_id: String, reason: &str) {
+    replace_share_tunnel(
+        state,
+        share_id,
+        reason,
+        tunnel::TunnelReplacementMode::Graceful,
+    )
+    .await;
+}
+
+async fn replace_share_tunnel(
+    state: ServerState,
+    share_id: String,
+    reason: &str,
+    mode: tunnel::TunnelReplacementMode,
+) {
     let share = {
         let shares = state.shares.read().await;
         shares.get(&share_id).cloned()
@@ -11392,6 +11427,7 @@ pub async fn force_reconnect_share_tunnel(state: ServerState, share_id: String, 
             renew_lease_fn,
             reason,
             spec_id,
+            mode,
         )
         .await;
 }

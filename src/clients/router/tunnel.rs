@@ -98,6 +98,21 @@ pub enum TunnelStartOutcome {
     AlreadyRunning { generation: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelReplacementMode {
+    Graceful,
+    NamespaceRebind,
+}
+
+impl TunnelReplacementMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::NamespaceRebind => "namespace_rebind",
+        }
+    }
+}
+
 impl TunnelStartOutcome {
     pub fn started(self) -> bool {
         matches!(self, Self::Started { .. })
@@ -330,6 +345,7 @@ impl TunnelSupervisor {
         renew_lease_fn: RenewLeaseFn,
         reason: impl Into<String>,
         spec_id: impl Into<String>,
+        mode: TunnelReplacementMode,
     ) -> TunnelStartOutcome {
         let key = key.into();
         let kind = kind.into();
@@ -338,6 +354,12 @@ impl TunnelSupervisor {
         let slot = self.slot_for(&key).await;
         let mut slot = slot.lock().await;
         slot.retiring_handles.retain(|handle| !handle.is_finished());
+        if mode == TunnelReplacementMode::NamespaceRebind {
+            for handle in slot.retiring_handles.drain(..) {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
         let generation = slot
             .generation
             .max(slot.desired_generation)
@@ -355,6 +377,9 @@ impl TunnelSupervisor {
             )
             .await;
             if handle.is_finished() {
+                let _ = handle.await;
+            } else if mode == TunnelReplacementMode::NamespaceRebind {
+                handle.abort();
                 let _ = handle.await;
             } else {
                 slot.retiring_handles.push(handle);
@@ -385,6 +410,7 @@ impl TunnelSupervisor {
             generation,
             reason = %reason,
             operation = "force_reconnect",
+            replacement_mode = mode.as_str(),
             "tunnel actor replaced"
         );
         TunnelStartOutcome::Started { generation }
@@ -788,6 +814,16 @@ async fn run_tunnel_actor(
                 .await;
             }
             Ok(TunnelConnectionEnd::ReplaceRequired(error)) => {
+                if actor_generation_is_stale(&statuses, &key, generation).await {
+                    tracing::debug!(
+                        tunnel_key = %key,
+                        tunnel_kind = %kind,
+                        generation,
+                        error = %error,
+                        "retiring tunnel actor ignored replacement lease rejection"
+                    );
+                    break;
+                }
                 router_active_generation = lease.generation;
                 router_generation = lease.generation.saturating_add(1);
                 rotation_id = new_rotation_id();
@@ -1081,7 +1117,27 @@ async fn connect_and_forward(
         );
         connected.remote_port = Some(remote_port);
         connected.connected_at_ms = Some(now_ms());
-        set_status_for_generation(statuses, store_path, connected).await;
+        if !set_status_for_generation(statuses, store_path, connected).await {
+            tracing::debug!(
+                tunnel_key = %key,
+                tunnel_kind = %kind,
+                actor_generation = generation,
+                lease_generation = lease.generation,
+                "retiring tunnel actor disconnected after stale activation"
+            );
+            return Ok(TunnelConnectionEnd::Ended);
+        }
+        tracing::info!(
+            tunnel_key = %key,
+            tunnel_kind = %kind,
+            actor_generation = generation,
+            lease_generation = lease.generation,
+            expected_generation = lease.expected_generation,
+            route_id = %lease.route_id,
+            subdomain = %lease.subdomain,
+            reason = %start_reason,
+            "tunnel lease activated"
+        );
 
         maintain_forward_with_pump(
             forward.as_mut(),
@@ -1899,11 +1955,14 @@ mod tests {
                 renew,
                 "configuration_changed",
                 "share-spec-v2",
+                TunnelReplacementMode::Graceful,
             )
             .await;
         tokio::task::yield_now().await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let slot = supervisor.slot_for("share:fenced").await;
+        assert_eq!(slot.lock().await.retiring_handles.len(), 1);
         let current = supervisor.status("share:fenced").await.unwrap();
         assert_eq!(current.generation, 2);
         let accepted = set_status_for_generation(
@@ -1926,6 +1985,78 @@ mod tests {
             2
         );
         supervisor.stop("share:fenced", "stopped").await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn namespace_rebind_aborts_old_actors_and_preserves_router_head() {
+        let dir = temp_config_dir("tunnel-namespace-rebind");
+        let supervisor = TunnelSupervisor::load_or_default(&dir).unwrap();
+        supervisor
+            .set_status(TunnelRuntimeStatus {
+                key: "client-web".into(),
+                kind: "client-web".into(),
+                status: "connected".into(),
+                router_generation: 7,
+                router_active_generation: 7,
+                updated_at_ms: now_ms(),
+                ..TunnelRuntimeStatus::default()
+            })
+            .await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_for_lease = requests.clone();
+        let lease: LeaseFn = Arc::new(move |request| {
+            requests_for_lease.lock().unwrap().push(request);
+            Box::pin(std::future::pending())
+        });
+        let renew = pending_renew_fn();
+        let activate = pending_tunnel_control_fn();
+        let state = pending_tunnel_control_fn();
+
+        supervisor
+            .ensure_running(
+                "client-web",
+                "client-web",
+                "127.0.0.1:9".to_string(),
+                lease.clone(),
+                activate.clone(),
+                state.clone(),
+                renew.clone(),
+                "initial",
+                "client-spec-v1",
+            )
+            .await;
+        while requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        supervisor
+            .force_reconnect(
+                "client-web",
+                "client-web",
+                "127.0.0.1:9".to_string(),
+                lease,
+                activate,
+                state,
+                renew,
+                "subdomain_adoption_commit",
+                "client-spec-v2",
+                TunnelReplacementMode::NamespaceRebind,
+            )
+            .await;
+        while requests.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].generation, 8);
+        assert_eq!(requests[0].expected_generation, 7);
+        assert_eq!(requests[1].generation, 9);
+        assert_eq!(requests[1].expected_generation, 7);
+        drop(requests);
+        let slot = supervisor.slot_for("client-web").await;
+        assert!(slot.lock().await.retiring_handles.is_empty());
+        supervisor.stop("client-web", "stopped").await;
         fs::remove_dir_all(dir).unwrap();
     }
 
