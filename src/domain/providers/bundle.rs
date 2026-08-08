@@ -10,7 +10,7 @@ use super::model_routing::normalize_and_validate_provider_model_routing;
 use super::registry::{
     family_by_id, family_for_profile, profile_by_id, provider_registry, resolve_custom_binding,
     AuthScheme, CredentialPolicy, CredentialSourceScope, CustomBindingInput, DriverBinding,
-    EndpointPolicy, FormComposition, ModelPolicyKind, ProfileId, ProviderFamilySpec,
+    EndpointPolicy, FormComposition, ModelPolicyKind, ProfileId, ProfileSpec, ProviderFamilySpec,
     UpstreamProtocol,
 };
 use super::store::StoredProvider;
@@ -217,7 +217,10 @@ impl ProviderBundleWriteDraft {
             Value::Bool(surface.enabled),
         );
         let mut settings = Map::new();
-        settings.insert("modelMapping".to_string(), self.model_mapping_value());
+        settings.insert(
+            "modelMapping".to_string(),
+            self.model_mapping_value_for_profile(profile)?,
+        );
 
         let mut env = Map::new();
         if let Some(endpoint) = normalized_optional_string(surface.endpoint.as_deref()) {
@@ -305,9 +308,13 @@ impl ProviderBundleWriteDraft {
                 }
             }
         }
+        let has_configurable_profile = family_has_configurable_model_profile(family);
         for surface in &family.surfaces {
             let profile = profile_by_id(surface.profile_id.as_str())
                 .expect("Provider family profile is registry-validated");
+            if has_configurable_profile && !profile_has_configurable_model_policy(profile) {
+                continue;
+            }
             if !profile.allows_model_policy(self.model_policy) {
                 bail!(
                     "Provider profile {} does not allow the selected model policy",
@@ -442,19 +449,45 @@ impl ProviderBundleWriteDraft {
         Ok(())
     }
 
-    fn model_mapping_value(&self) -> Value {
-        match self.model_policy {
+    fn model_mapping_value_for_profile(&self, profile: &ProfileSpec) -> anyhow::Result<Value> {
+        let family = family_by_id(&self.family_id)
+            .with_context(|| format!("unknown Provider family {}", self.family_id))?;
+        let use_bundle_policy = profile_has_configurable_model_policy(profile)
+            || !family_has_configurable_model_profile(family);
+        let (policy, upstream_model) = if use_bundle_policy {
+            if !profile.allows_model_policy(self.model_policy) {
+                bail!(
+                    "Provider profile {} does not allow the selected model policy",
+                    profile.profile_id
+                );
+            }
+            (self.model_policy, self.upstream_model.as_deref())
+        } else {
+            (
+                profile.model_policy,
+                profile.default_upstream_model.as_deref(),
+            )
+        };
+        Ok(match policy {
             ModelPolicyKind::Passthrough => json!({"mode": "passthrough"}),
             ModelPolicyKind::Single => json!({
                 "mode": "single",
-                "upstreamModel": self
-                    .upstream_model
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default(),
+                "upstreamModel": upstream_model.map(str::trim).unwrap_or_default(),
             }),
-        }
+        })
     }
+}
+
+fn profile_has_configurable_model_policy(profile: &ProfileSpec) -> bool {
+    profile.allowed_model_policies.len() > 1
+}
+
+fn family_has_configurable_model_profile(family: &ProviderFamilySpec) -> bool {
+    family.surfaces.iter().any(|surface| {
+        let profile = profile_by_id(surface.profile_id.as_str())
+            .expect("Provider family profile is registry-validated");
+        profile_has_configurable_model_policy(profile)
+    })
 }
 
 impl ProviderDriverOptionsWriteDraft {
@@ -830,6 +863,32 @@ mod tests {
         }
     }
 
+    fn openai_oauth_bundle() -> ProviderBundleWriteDraft {
+        ProviderBundleWriteDraft {
+            id: "openai-oauth-bundle".to_string(),
+            family_id: "family.openai_oauth".to_string(),
+            name: "OpenAI OAuth".to_string(),
+            website_url: None,
+            notes: None,
+            icon: None,
+            icon_color: None,
+            model_policy: ModelPolicyKind::Single,
+            upstream_model: Some("gpt-5.6-sol".to_string()),
+            managed_account: Some(ProviderBundleManagedAccountWriteDraft {
+                account_id: "openai-account".to_string(),
+                auth_identity_generation: 1,
+            }),
+            aws_region: None,
+            surfaces: vec![
+                grok_surface(AppKind::Claude, "claude.openai_oauth"),
+                grok_surface(AppKind::Codex, "codex.openai_oauth"),
+            ],
+            credential_patches: BTreeMap::new(),
+            expected_revision: None,
+            client_request_id: None,
+        }
+    }
+
     #[test]
     fn bundle_generates_one_canonical_model_mapping_for_every_surface() {
         let draft = grok_bundle();
@@ -850,5 +909,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains("passthrough Provider Bundle cannot define an upstream model"));
+    }
+
+    #[test]
+    fn openai_oauth_keeps_codex_passthrough_while_claude_is_configurable() {
+        let mut draft = openai_oauth_bundle();
+        assert!(draft.validate().is_ok());
+        assert_eq!(
+            draft
+                .provider_for_surface(&draft.surfaces[0])
+                .unwrap()
+                .settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "gpt-5.6-sol"})
+        );
+        assert_eq!(
+            draft
+                .provider_for_surface(&draft.surfaces[1])
+                .unwrap()
+                .settings_config["modelMapping"],
+            json!({"mode": "passthrough"})
+        );
+
+        draft.model_policy = ModelPolicyKind::Passthrough;
+        draft.upstream_model = None;
+        assert!(draft.validate().is_ok());
+        for surface in &draft.surfaces {
+            assert_eq!(
+                draft.provider_for_surface(surface).unwrap().settings_config["modelMapping"],
+                json!({"mode": "passthrough"})
+            );
+        }
     }
 }

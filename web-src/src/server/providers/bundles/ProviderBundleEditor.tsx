@@ -95,6 +95,7 @@ import {
 } from "./bundleShare";
 import {
   createProviderBundleDraft,
+  defaultUpstreamModelForFamily,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
@@ -1062,12 +1063,7 @@ export function ProviderBundleEditor({
   const accountsQuery = useManagedAccountsQuery();
   const credentialProfile = profileById(family.credentialProfileId);
   const allowedModelPolicies = modelPoliciesForFamily(family);
-  const defaultSharedModel =
-    credentialProfile?.defaultUpstreamModel ??
-    family.surfaces
-      .map((surface) => profileById(surface.profileId)?.defaultUpstreamModel)
-      .find(Boolean) ??
-    "";
+  const defaultSharedModel = defaultUpstreamModelForFamily(family);
   const managedProviderType =
     credentialProfile?.credentialPolicy.mode === "managed_account"
       ? credentialProfile.credentialPolicy.accountProviderType
@@ -1226,7 +1222,11 @@ export function ProviderBundleEditor({
       const savedDraft = editProviderBundleDraft(saved);
       setDraft(savedDraft);
       draftBaselineRef.current = stableStringify(savedDraft);
-      const savedShare = await saveBundleShare(saved.id, shareDraft, existingShare);
+      const savedShare = await saveBundleShare(
+        saved.id,
+        shareDraft,
+        existingShare,
+      );
       const savedShareDraft = savedShare
         ? createBundleShareDraft(savedShare)
         : shareDraft;

@@ -141,19 +141,79 @@ describe("Provider Bundle drafts", () => {
     });
   });
 
-  it("locks official Claude and Codex families to passthrough", () => {
-    for (const familyId of ["family.claude_oauth", "family.openai_oauth"]) {
-      const family = familyById(familyId)!;
-      const draft = createProviderBundleDraft(family);
-      expect(modelPoliciesForFamily(family), familyId).toEqual(["passthrough"]);
-      draft.accountId = "official-account";
-      draft.accountGeneration = 1;
-      draft.modelPolicy = "single";
-      draft.upstreamModel = "forced-model";
-      expect(validateProviderBundleDraft(draft), familyId).toBe(
-        "Provider model policy is invalid",
-      );
-    }
+  it("locks Claude OAuth while OpenAI OAuth uses Claude model policies", () => {
+    const claudeFamily = familyById("family.claude_oauth")!;
+    const claudeDraft = createProviderBundleDraft(claudeFamily);
+    expect(modelPoliciesForFamily(claudeFamily)).toEqual(["passthrough"]);
+    claudeDraft.accountId = "official-account";
+    claudeDraft.accountGeneration = 1;
+    claudeDraft.modelPolicy = "single";
+    claudeDraft.upstreamModel = "forced-model";
+    expect(validateProviderBundleDraft(claudeDraft)).toBe(
+      "Provider model policy is invalid",
+    );
+
+    const openaiFamily = familyById("family.openai_oauth")!;
+    const openaiDraft = createProviderBundleDraft(openaiFamily);
+    expect(modelPoliciesForFamily(openaiFamily)).toEqual([
+      "single",
+      "passthrough",
+    ]);
+    expect(openaiDraft.modelPolicy).toBe("single");
+    expect(openaiDraft.upstreamModel).toBe("gpt-5.6-sol");
+    openaiDraft.accountId = "official-account";
+    openaiDraft.accountGeneration = 1;
+    expect(validateProviderBundleDraft(openaiDraft)).toBeNull();
+
+    openaiDraft.modelPolicy = "passthrough";
+    openaiDraft.upstreamModel = "";
+    expect(validateProviderBundleDraft(openaiDraft)).toBeNull();
+  });
+
+  it("restores the OpenAI OAuth Bundle model policy from Claude", () => {
+    const family = familyById("family.openai_oauth")!;
+    const resource = (
+      app: "claude" | "codex",
+      profileId: string,
+      modelMapping: Record<string, string>,
+    ): ProviderResource => ({
+      app,
+      provider: {
+        id: "openai-bundle",
+        name: "OpenAI OAuth",
+        settingsConfig: { modelMapping },
+      },
+      providerType: "codex_oauth",
+      providerTypeId: "codex_oauth",
+      revision: 3,
+      profileId,
+      identity: { status: "bound" },
+      credentialConfigured: true,
+      credentialSlots: [],
+    });
+    const bundle: ProviderBundleView = {
+      id: "openai-bundle",
+      familyId: family.familyId,
+      revision: 3,
+      name: "OpenAI OAuth",
+      supportedApps: ["claude", "codex"],
+      enabledApps: ["claude", "codex"],
+      credentialConfigured: true,
+      credentialSlots: [],
+      surfaces: {
+        claude: resource("claude", "claude.openai_oauth", {
+          mode: "single",
+          upstreamModel: "persisted-claude-model",
+        }),
+        codex: resource("codex", "codex.openai_oauth", {
+          mode: "passthrough",
+        }),
+      },
+    };
+
+    const edited = editProviderBundleDraft(bundle);
+    expect(edited.modelPolicy).toBe("single");
+    expect(edited.upstreamModel).toBe("persisted-claude-model");
   });
 
   it("writes shared credentials at Bundle scope and omits fixed endpoints", () => {

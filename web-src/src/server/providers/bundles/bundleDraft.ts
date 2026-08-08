@@ -18,6 +18,7 @@ import {
   type CoreProviderApp,
   type ProviderFamilySpec,
   type ProviderModelPolicy,
+  type ProviderRegistryProfile,
 } from "@/server/providerRegistry";
 import {
   createDraftForProfile,
@@ -169,28 +170,63 @@ function canonicalBundleIdentity(family: ProviderFamilySpec): {
   return { name: family.label, websiteUrl: preset.websiteUrl };
 }
 
-export function modelPoliciesForFamily(
+function modelControlProfilesForFamily(
   family: ProviderFamilySpec,
-): ProviderModelPolicy[] {
+): ProviderRegistryProfile[] {
   const profiles = family.surfaces.map((surface) =>
     profileById(surface.profileId),
   );
   if (profiles.some((profile) => !profile)) return [];
-  const credentialProfile = profileById(family.credentialProfileId);
-  if (!credentialProfile) return [];
-  return modelPoliciesForProfile(credentialProfile).filter((policy) =>
+  const resolved = profiles as ProviderRegistryProfile[];
+  const configurable = resolved.filter(
+    (profile) => modelPoliciesForProfile(profile).length > 1,
+  );
+  return configurable.length > 0 ? configurable : resolved;
+}
+
+function modelControlSurface(
+  family: ProviderFamilySpec,
+  surfaces: BundleSurfaceEditorDraft[],
+): BundleSurfaceEditorDraft {
+  const profile = modelControlProfilesForFamily(family)[0];
+  const surface = surfaces.find(
+    (candidate) => candidate.profileId === profile?.profileId,
+  );
+  if (!surface)
+    throw new Error(`Family ${family.familyId} has no model control Surface`);
+  return surface;
+}
+
+export function modelPoliciesForFamily(
+  family: ProviderFamilySpec,
+): ProviderModelPolicy[] {
+  const profiles = modelControlProfilesForFamily(family);
+  const first = profiles[0];
+  if (!first) return [];
+  return modelPoliciesForProfile(first).filter((policy) =>
     profiles.every((profile) =>
-      modelPoliciesForProfile(profile!).includes(policy),
+      modelPoliciesForProfile(profile).includes(policy),
     ),
+  );
+}
+
+export function defaultUpstreamModelForFamily(
+  family: ProviderFamilySpec,
+): string {
+  return (
+    modelControlProfilesForFamily(family)
+      .map((profile) => profile.defaultUpstreamModel)
+      .find(Boolean) ?? ""
   );
 }
 
 function initialBundleModel(
   family: ProviderFamilySpec,
   surfaces: BundleSurfaceEditorDraft[],
-  sourceResource?: ProviderResource,
+  resources?: ProviderBundleView["surfaces"],
 ): { policy: ProviderModelPolicy; upstreamModel: string } {
-  const source = sourceSurface(family, surfaces);
+  const source = modelControlSurface(family, surfaces);
+  const sourceResource = resources?.[source.app];
   const sourceSettings = sourceResource
     ? clone(sourceResource.provider.settingsConfig as Record<string, unknown>)
     : undefined;
@@ -413,7 +449,7 @@ export function editProviderBundleDraft(
   const source = sourceSurface(family, surfaces);
   const sourceResource = bundle.surfaces[source.app];
   const binding = sourceResource?.provider.meta?.authBinding;
-  const model = initialBundleModel(family, surfaces, sourceResource);
+  const model = initialBundleModel(family, surfaces, bundle.surfaces);
   const identity = providerBundleIdentityEditable(family)
     ? { name: bundle.name, websiteUrl: bundle.websiteUrl ?? "" }
     : canonicalBundleIdentity(family);
