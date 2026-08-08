@@ -170,6 +170,33 @@ impl ClientTunnelClaimError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum InstallationOwnerEmailStatusError {
+    #[error("send router installation owner email status: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("router installation owner email status failed: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("parse router installation owner email response: {0}")]
+    InvalidResponse(String),
+}
+
+impl InstallationOwnerEmailStatusError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(error) => error.is_connect() || error.is_timeout(),
+            Self::Rejected { status, .. } => {
+                *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            }
+            Self::InvalidResponse(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTunnelConfig {
@@ -1314,17 +1341,19 @@ pub async fn get_installation_owner_email_status(
         ])
         .send()
         .await
-        .context("send router installation owner email status")?;
+        .map_err(InstallationOwnerEmailStatusError::Request)?;
     if response.status().is_success() {
         let body = response
             .json::<InstallationOwnerEmailResponse>()
             .await
-            .context("parse router installation owner email response")?;
+            .map_err(|error| {
+                InstallationOwnerEmailStatusError::InvalidResponse(error.to_string())
+            })?;
         return Ok(body.into());
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    bail!("router installation owner email status failed: {status}: {body}");
+    Err(InstallationOwnerEmailStatusError::Rejected { status, body }.into())
 }
 
 pub async fn update_client_tunnel(

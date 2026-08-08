@@ -88,6 +88,9 @@ pub(crate) fn is_router_unreachable_error(error: &anyhow::Error) -> bool {
                 .downcast_ref::<crate::clients::router::client::ClientTunnelClaimError>()
                 .is_some_and(|error| error.is_transient())
             || cause
+                .downcast_ref::<crate::clients::router::client::InstallationOwnerEmailStatusError>()
+                .is_some_and(|error| error.is_transient())
+            || cause
                 .downcast_ref::<crate::state::RouterRegistrationTimeout>()
                 .is_some()
     })
@@ -394,6 +397,15 @@ pub(crate) async fn claim_client_tunnel_config(
         .await
         .map_err(ApiError::internal)?;
     if let Err(error) = crate::state::ensure_router_installation_owner_bound(state, &config).await {
+        if is_router_unreachable_error(&error) {
+            state
+                .retain_client_tunnel_claim_pending(&intent, error.to_string())
+                .await
+                .map_err(ApiError::internal)?;
+            return Err(ApiError::bad_gateway(format!(
+                "router installation owner verification failed: {error}"
+            )));
+        }
         commit_claim_failure(state, &intent, false, error.to_string()).await?;
         return Err(ApiError::conflict(error.to_string()));
     }
@@ -443,7 +455,7 @@ pub(crate) async fn claim_client_tunnel_config(
 mod transient_classification_tests {
     use super::*;
     use crate::clients::router::client::{
-        ClientTunnelClaimError, RegisterInstallationAttemptError,
+        ClientTunnelClaimError, InstallationOwnerEmailStatusError, RegisterInstallationAttemptError,
     };
 
     #[test]
@@ -478,6 +490,21 @@ mod transient_classification_tests {
         let transient = anyhow::Error::new(ClientTunnelClaimError::Rejected {
             status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
             body: "retry later".to_string(),
+        });
+        assert!(is_router_unreachable_error(&transient));
+    }
+
+    #[test]
+    fn typed_owner_status_errors_distinguish_permanent_and_transient() {
+        let permanent = anyhow::Error::new(InstallationOwnerEmailStatusError::Rejected {
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: "owner mismatch".to_string(),
+        });
+        assert!(!is_router_unreachable_error(&permanent));
+
+        let transient = anyhow::Error::new(InstallationOwnerEmailStatusError::Rejected {
+            status: reqwest::StatusCode::from_u16(521).unwrap(),
+            body: "router is restarting".to_string(),
         });
         assert!(is_router_unreachable_error(&transient));
     }
@@ -714,7 +741,7 @@ pub(crate) fn derive_client_tunnel_connectivity_status(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -971,6 +998,165 @@ mod tests {
             drop(state);
             std::fs::remove_dir_all(config_dir).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn client_tunnel_actor_recovers_after_transient_owner_status_failure() {
+        #[derive(Clone)]
+        struct RecoveryState {
+            owner_checks: Arc<AtomicUsize>,
+            claims: Arc<AtomicUsize>,
+            leases: Arc<AtomicUsize>,
+            claimed: Arc<AtomicBool>,
+        }
+
+        async fn owner_status(
+            AxumState(state): AxumState<RecoveryState>,
+        ) -> (StatusCode, Json<Value>) {
+            if state.owner_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                return (
+                    StatusCode::from_u16(521).unwrap(),
+                    Json(json!({"message": "router is restarting"})),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "ownerEmail": "owner@example.com",
+                    "ownerVerified": true
+                })),
+            )
+        }
+
+        async fn get_tunnel(AxumState(state): AxumState<RecoveryState>) -> Json<Value> {
+            if state.claimed.load(Ordering::SeqCst) {
+                Json(json!({
+                    "tunnel": {
+                        "ownerEmail": "owner@example.com",
+                        "subdomain": "restart-recovery",
+                        "enabled": true
+                    }
+                }))
+            } else {
+                Json(json!({"tunnel": null}))
+            }
+        }
+
+        async fn claim_tunnel(AxumState(state): AxumState<RecoveryState>) -> Json<Value> {
+            state.claims.fetch_add(1, Ordering::SeqCst);
+            state.claimed.store(true, Ordering::SeqCst);
+            Json(json!({"ok": true}))
+        }
+
+        async fn reject_lease(
+            AxumState(state): AxumState<RecoveryState>,
+        ) -> (StatusCode, Json<Value>) {
+            state.leases.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "lease unavailable in test"})),
+            )
+        }
+
+        let recovery = RecoveryState {
+            owner_checks: Arc::new(AtomicUsize::new(0)),
+            claims: Arc::new(AtomicUsize::new(0)),
+            leases: Arc::new(AtomicUsize::new(0)),
+            claimed: Arc::new(AtomicBool::new(false)),
+        };
+        let app = Router::new()
+            .route("/v1/installations/owner-email", get(owner_status))
+            .route("/v1/installations/client-tunnel", get(get_tunnel))
+            .route("/v1/installations/client-tunnel/claim", post(claim_tunnel))
+            .route("/v1/tunnels/lease", post(reject_lease))
+            .with_state(recovery.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state("restart-recovery");
+        let config_dir = state.config_dir.clone();
+        configure_claim_state(
+            &state,
+            format!("http://{addr}"),
+            "inst-restart-recovery",
+            "restart-recovery",
+        )
+        .await;
+        let mut failed = state.config_snapshot().await;
+        failed.auth.password_hash = Some("configured".to_string());
+        failed.client.tunnel_status = Some("claim_failed".to_string());
+        state.replace_config(failed).await.unwrap();
+
+        crate::state::ensure_client_tunnel_running(state.clone(), "restart_recovery_test").await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if recovery.claims.load(Ordering::SeqCst) >= 1
+                    && recovery.leases.load(Ordering::SeqCst) >= 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the original tunnel actor must retry after Router recovery");
+
+        assert!(recovery.owner_checks.load(Ordering::SeqCst) >= 2);
+        assert_eq!(recovery.claims.load(Ordering::SeqCst), 1);
+        let config = state.config_snapshot().await;
+        assert_eq!(
+            config.client.tunnel_status.as_deref(),
+            Some("claimed_remote")
+        );
+        assert!(config.client.claim_pending.is_none());
+
+        state
+            .tunnels
+            .stop(
+                &crate::clients::router::tunnel::client_tunnel_key(),
+                "stopped",
+            )
+            .await;
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_owner_mismatch_commits_claim_failure() {
+        async fn mismatched_owner() -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "ownerEmail": "different@example.com",
+                "ownerVerified": true
+            }))
+        }
+
+        let app = Router::new().route("/v1/installations/owner-email", get(mismatched_owner));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state("owner-mismatch");
+        let config_dir = state.config_dir.clone();
+        configure_claim_state(
+            &state,
+            format!("http://{addr}"),
+            "inst-owner-mismatch",
+            "owner-mismatch",
+        )
+        .await;
+
+        let error = claim_client_tunnel_config(&state).await.unwrap_err();
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        let config = state.config_snapshot().await;
+        assert_eq!(config.client.tunnel_status.as_deref(), Some("claim_failed"));
+        assert!(config.client.claim_pending.is_none());
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]

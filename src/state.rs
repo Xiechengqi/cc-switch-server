@@ -10304,7 +10304,7 @@ fn build_http_client() -> anyhow::Result<reqwest::Client> {
 
 pub async fn refresh_router_installation_registration(state: &ServerState) -> bool {
     let config = state.config.read().await.clone();
-    if !config.is_setup_complete() || config.router_api_base().is_none() {
+    if !config.is_local_setup_complete() || config.router_api_base().is_none() {
         return false;
     }
 
@@ -10349,16 +10349,14 @@ pub async fn restore_tunnels(state: ServerState) {
     }
 
     let restore_config = state.config_snapshot().await;
-    if restore_config.client.claim_pending.is_none()
-        && restore_config.is_setup_complete()
-        && should_restore_client_tunnel(
-            state
-                .tunnels
-                .status(&tunnel::client_tunnel_key())
-                .await
-                .as_ref(),
-        )
-    {
+    if should_restore_client_tunnel(
+        &restore_config,
+        state
+            .tunnels
+            .status(&tunnel::client_tunnel_key())
+            .await
+            .as_ref(),
+    ) {
         ensure_client_tunnel_running(state.clone(), "startup_restore").await;
     }
 
@@ -11729,9 +11727,10 @@ fn account_quota_refresh_due(accounts: &AccountStore, account: &Account, now: i6
 }
 
 fn should_restore_client_tunnel(
+    config: &ServerConfig,
     status: Option<&crate::clients::router::tunnel::TunnelRuntimeStatus>,
 ) -> bool {
-    status.is_none_or(|status| status.status != "stopped")
+    config.is_local_setup_complete() && status.is_none_or(|status| status.status != "stopped")
 }
 
 pub(crate) fn should_restore_share_tunnel(share: &crate::domain::sharing::shares::Share) -> bool {
@@ -13348,7 +13347,7 @@ async fn issue_client_tunnel_lease(
     request: TunnelLeaseRequest,
 ) -> anyhow::Result<NamespaceLeaseResponse> {
     let mut config = state.config.read().await.clone();
-    if !config.is_setup_complete() {
+    if !config.is_local_setup_complete() {
         anyhow::bail!("setup is incomplete");
     }
     config = crate::client_tunnel_provision::claim_client_tunnel_config(&state)
@@ -21170,15 +21169,32 @@ mod tests {
 
     #[test]
     fn restore_tunnel_logic_skips_manually_stopped_client() {
-        assert!(should_restore_client_tunnel(None));
-        assert!(should_restore_client_tunnel(Some(&TunnelRuntimeStatus {
-            status: "connected".to_string(),
-            ..TunnelRuntimeStatus::default()
-        })));
-        assert!(!should_restore_client_tunnel(Some(&TunnelRuntimeStatus {
-            status: "stopped".to_string(),
-            ..TunnelRuntimeStatus::default()
-        })));
+        let mut config = ServerConfig::empty();
+        assert!(!should_restore_client_tunnel(&config, None));
+
+        config.auth.password_hash = Some("configured".to_string());
+        config.owner.email = Some("owner@example.com".to_string());
+        config.router.url = Some("https://router.example.com".to_string());
+        config.client.tunnel_subdomain = Some("restore-client".to_string());
+        config.client.tunnel_status = Some("claim_failed".to_string());
+        assert!(should_restore_client_tunnel(&config, None));
+
+        config.client.tunnel_status = Some("claim_pending".to_string());
+        assert!(should_restore_client_tunnel(&config, None));
+        assert!(should_restore_client_tunnel(
+            &config,
+            Some(&TunnelRuntimeStatus {
+                status: "connected".to_string(),
+                ..TunnelRuntimeStatus::default()
+            })
+        ));
+        assert!(!should_restore_client_tunnel(
+            &config,
+            Some(&TunnelRuntimeStatus {
+                status: "stopped".to_string(),
+                ..TunnelRuntimeStatus::default()
+            })
+        ));
     }
 
     #[test]
