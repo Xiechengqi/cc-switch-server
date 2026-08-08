@@ -5,16 +5,16 @@ use axum::Json;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::api::error::ApiError;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::StoredProvider;
+use crate::proxy::ProxyError;
 use crate::state::ServerState;
 
 pub(in crate::api) async fn gemini_models_response(
     state: &ServerState,
     headers: &HeaderMap,
     path: &str,
-) -> Result<Option<Response>, ApiError> {
+) -> Result<Option<Response>, ProxyError> {
     let path = path.trim_matches('/');
     if path != "models" && !path.starts_with("models/") {
         return Ok(None);
@@ -38,7 +38,7 @@ pub(in crate::api) async fn gemini_models_response(
     let model = models
         .into_iter()
         .find(|model| model.name == requested_name || model.name == requested)
-        .ok_or_else(|| ApiError::not_found("Gemini model not found"))?;
+        .ok_or_else(|| ProxyError::not_found("Gemini model not found"))?;
     Ok(Some(Json(model).into_response()))
 }
 

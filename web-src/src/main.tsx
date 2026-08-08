@@ -5,12 +5,10 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { ThemeProvider } from "./components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
-import { I18nProvider } from "./lib/i18n";
 import { queryClient } from "@/lib/query/queryClient";
 import "./i18n";
 import "./server-theme.css";
 import "./styles.css";
-import "./styles/modals.css";
 import "./styles/auth-accounts.css";
 import "./styles/providers.css";
 import "./styles/usage.css";
@@ -29,10 +27,8 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <ThemeProvider defaultTheme="light" storageKey="cc-switch-theme">
-        <I18nProvider>
-          <App />
-          <Toaster />
-        </I18nProvider>
+        <App />
+        <Toaster />
       </ThemeProvider>
     </QueryClientProvider>
   </React.StrictMode>,

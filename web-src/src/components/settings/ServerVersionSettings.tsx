@@ -1066,7 +1066,7 @@ export function ServerVersionSettings() {
         confirmText={t("settings.serverVersion.upgrade")}
         checkboxLabel={t("settings.serverVersion.restartAfterUpgrade")}
         checkboxDefaultChecked
-        onConfirm={(restartAfter) => void handleUpgrade(restartAfter)}
+        onConfirm={handleUpgrade}
         onCancel={() => setUpgradeConfirmOpen(false)}
       />
 
@@ -1076,7 +1076,7 @@ export function ServerVersionSettings() {
         title={t("settings.serverVersion.restartConfirmTitle")}
         message={t("settings.serverVersion.restartConfirmMessage")}
         confirmText={t("settings.serverVersion.restart")}
-        onConfirm={() => void handleRestart()}
+        onConfirm={() => handleRestart()}
         onCancel={() => setRestartConfirmOpen(false)}
       />
 
@@ -1086,7 +1086,7 @@ export function ServerVersionSettings() {
         title={t("settings.serverVersion.rollbackConfirmTitle")}
         message={t("settings.serverVersion.rollbackConfirmMessage")}
         confirmText={t("settings.serverVersion.rollback")}
-        onConfirm={() => void handleRollback()}
+        onConfirm={() => handleRollback()}
         onCancel={() => setRollbackConfirmOpen(false)}
       />
 

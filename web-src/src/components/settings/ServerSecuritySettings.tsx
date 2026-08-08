@@ -4,21 +4,21 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import { changeServerPassword } from "@/lib/server-legacy-api";
 import {
   clearRouterSessionTokens,
   SERVER_AUTH_EXPIRED_EVENT,
 } from "@/lib/routerAuth";
-import { readCachedPassword, writeCachedPassword, writeToken } from "@/lib/runtime";
+import { writeToken } from "@/lib/runtime";
+import { SecretInput } from "@/server/ui/SecretInput";
 
 export function ServerSecuritySettings() {
   const { t } = useTranslation();
-  const [currentPassword, setCurrentPassword] = useState(
-    () => readCachedPassword() ?? "",
-  );
+  const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function handleChangePassword(event: FormEvent) {
@@ -42,6 +42,14 @@ export function ServerSecuritySettings() {
       );
       return;
     }
+    if (trimmedNew !== confirmPassword.trim()) {
+      toast.error(
+        t("settings.serverSecurity.passwordMismatch", {
+          defaultValue: "两次输入的新密码不一致",
+        }),
+      );
+      return;
+    }
 
     setBusy(true);
     try {
@@ -51,11 +59,11 @@ export function ServerSecuritySettings() {
       });
       setCurrentPassword("");
       setNewPassword("");
+      setConfirmPassword("");
       writeToken(null);
       if (isRemoteWebMode()) {
         clearRouterSessionTokens();
       }
-      writeCachedPassword(trimmedNew);
       toast.success(
         t("settings.serverSecurity.passwordChangedSignOut", {
           defaultValue: "密码已修改，请使用新密码重新登录",
@@ -103,35 +111,61 @@ export function ServerSecuritySettings() {
           </div>
         </div>
 
-        <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
-          <Input
-            id="server-current-password"
-            type="password"
-            autoComplete="current-password"
-            className="h-9 w-full sm:w-44 placeholder:text-muted-foreground/50"
-            placeholder={t("settings.serverSecurity.currentPassword", {
-              defaultValue: "当前密码",
-            })}
-            value={currentPassword}
-            onChange={(event) => setCurrentPassword(event.target.value)}
-          />
-          <Input
-            id="server-new-password"
-            type="password"
-            autoComplete="new-password"
-            className="h-9 w-full sm:w-44 sm:w-52 placeholder:text-muted-foreground/50"
-            placeholder={t("settings.serverSecurity.newPassword", {
-              defaultValue: "新密码",
-            })}
-            value={newPassword}
-            onChange={(event) => setNewPassword(event.target.value)}
-          />
+        <div className="grid w-full shrink-0 gap-3 sm:w-auto sm:grid-cols-3 sm:items-end">
+          <div className="space-y-1.5">
+            <Label htmlFor="server-current-password" className="text-xs">
+              {t("settings.serverSecurity.currentPassword", {
+                defaultValue: "当前密码",
+              })}
+            </Label>
+            <SecretInput
+              id="server-current-password"
+              type="password"
+              autoComplete="current-password"
+              className="h-9 w-full sm:w-44"
+              value={currentPassword}
+              onChange={(event) => setCurrentPassword(event.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="server-new-password" className="text-xs">
+              {t("settings.serverSecurity.newPassword", {
+                defaultValue: "新密码",
+              })}
+            </Label>
+            <SecretInput
+              id="server-new-password"
+              type="password"
+              autoComplete="new-password"
+              className="h-9 w-full sm:w-44"
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="server-confirm-password" className="text-xs">
+              {t("settings.serverSecurity.confirmPassword", {
+                defaultValue: "确认新密码",
+              })}
+            </Label>
+            <SecretInput
+              id="server-confirm-password"
+              type="password"
+              autoComplete="new-password"
+              className="h-9 w-full sm:w-44"
+              value={confirmPassword}
+              onChange={(event) => setConfirmPassword(event.target.value)}
+            />
+          </div>
           <Button
             type="submit"
             size="sm"
-            className="h-9 shrink-0"
+            className="h-9 shrink-0 sm:col-start-3"
             disabled={
-              busy || !currentPassword.trim() || !newPassword.trim()
+              busy ||
+              !currentPassword.trim() ||
+              !newPassword.trim() ||
+              !confirmPassword.trim()
             }
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -139,7 +173,6 @@ export function ServerSecuritySettings() {
           </Button>
         </div>
       </form>
-
     </section>
   );
 }

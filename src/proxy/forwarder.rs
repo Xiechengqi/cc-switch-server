@@ -83,7 +83,7 @@ use super::usage::{
     log_usage, update_image_stream_usage, update_stream_usage, update_stream_usage_result,
     update_websocket_stream_usage,
 };
-use super::{setting, ProxyError};
+use super::{setting, ProxyConcurrencyScope, ProxyError};
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
@@ -11381,7 +11381,7 @@ fn kiro_url_with_base_override(base_url: &str, prepared_url: &str) -> Result<Str
 enum AccountInFlightAcquire {
     Acquired(AccountInFlightGuard),
     NotManaged,
-    Saturated,
+    Saturated { current: u32, limit: u32 },
 }
 
 fn select_and_acquire_account_in_flight(
@@ -11397,9 +11397,13 @@ fn select_and_acquire_account_in_flight(
         match try_acquire_account_in_flight(state, &execution.stored, accounts, &snapshot) {
             AccountInFlightAcquire::Acquired(guard) => return Ok((execution, Some(guard))),
             AccountInFlightAcquire::NotManaged => return Ok((execution, None)),
-            AccountInFlightAcquire::Saturated if attempt + 1 < MAX_SELECTION_ATTEMPTS => {}
-            AccountInFlightAcquire::Saturated => {
-                return Err(account_concurrency_proxy_error(&execution.stored));
+            AccountInFlightAcquire::Saturated { .. } if attempt + 1 < MAX_SELECTION_ATTEMPTS => {}
+            AccountInFlightAcquire::Saturated { current, limit } => {
+                return Err(account_concurrency_proxy_error(
+                    &execution.stored,
+                    current,
+                    limit,
+                ));
             }
         }
     }
@@ -11420,8 +11424,11 @@ fn try_acquire_account_in_flight(
         &selection.account_id,
         selection.max_concurrent,
     ) {
-        Some(guard) => AccountInFlightAcquire::Acquired(guard),
-        None => AccountInFlightAcquire::Saturated,
+        Ok(guard) => AccountInFlightAcquire::Acquired(guard),
+        Err(error) => AccountInFlightAcquire::Saturated {
+            current: error.current,
+            limit: error.limit,
+        },
     }
 }
 
@@ -11434,17 +11441,25 @@ fn acquire_account_in_flight(
     match try_acquire_account_in_flight(state, stored, accounts, snapshot) {
         AccountInFlightAcquire::Acquired(guard) => Ok(Some(guard)),
         AccountInFlightAcquire::NotManaged => Ok(None),
-        AccountInFlightAcquire::Saturated => Err(account_concurrency_proxy_error(stored)),
+        AccountInFlightAcquire::Saturated { current, limit } => {
+            Err(account_concurrency_proxy_error(stored, current, limit))
+        }
     }
 }
 
-fn account_concurrency_proxy_error(stored: &StoredProvider) -> ProxyError {
-    ProxyError::rate_limited(
+fn account_concurrency_proxy_error(
+    stored: &StoredProvider,
+    current: u32,
+    limit: u32,
+) -> ProxyError {
+    ProxyError::concurrency_limited(
+        ProxyConcurrencyScope::ProviderAccount,
+        current,
+        limit,
         format!(
-            "provider {} account concurrency limit has been reached",
-            stored.provider.id
+            "Provider account concurrency limit has been reached ({current}/{limit}) for {}. Wait for an in-flight request to finish.",
+            stored.provider.id,
         ),
-        1,
     )
 }
 
@@ -11494,20 +11509,35 @@ fn ensure_execution_matches_share_binding(
 }
 
 fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyError {
+    if let Some(concurrency) = rejection.concurrency {
+        let scope = match rejection.reason {
+            ShareRejectReason::ParallelLimit => ProxyConcurrencyScope::Share,
+            ShareRejectReason::UserParallelLimit => ProxyConcurrencyScope::User,
+            _ => unreachable!("only concurrency Share rejections include concurrency metadata"),
+        };
+        return ProxyError::concurrency_limited(
+            scope,
+            concurrency.current,
+            concurrency.limit,
+            rejection.message,
+        );
+    }
     let status = match rejection.reason {
         ShareRejectReason::NotFound => StatusCode::NOT_FOUND,
         ShareRejectReason::UnsupportedApp => StatusCode::NOT_FOUND,
+        ShareRejectReason::UserIdentityRequired => StatusCode::UNAUTHORIZED,
         ShareRejectReason::ParallelLimit | ShareRejectReason::UserParallelLimit => {
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::CONFLICT
         }
-        ShareRejectReason::Inactive
+        ShareRejectReason::Unauthorized
+        | ShareRejectReason::Inactive
         | ShareRejectReason::Expired
         | ShareRejectReason::Exhausted
         | ShareRejectReason::UserExpired
         | ShareRejectReason::UserExhausted => StatusCode::FORBIDDEN,
     };
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        ProxyError::rate_limited(rejection.formatted_message(), 1)
+    if rejection.reason == ShareRejectReason::UserIdentityRequired {
+        ProxyError::user_identity_required(rejection.message)
     } else {
         ProxyError {
             status,
@@ -14609,13 +14639,10 @@ fn request_context_from_headers(headers: &HeaderMap) -> UsageLogContext {
     UsageLogContext {
         request_id: optional_header(headers, "x-cc-switch-request-id"),
         share_id,
-        user_email: optional_header(headers, "x-cc-switch-user-email")
-            .or_else(|| optional_header(headers, "x-user-email")),
+        user_email: optional_header(headers, "x-cc-switch-user-email"),
         data_source,
-        user_country: optional_header(headers, "x-cc-switch-user-country")
-            .or_else(|| optional_header(headers, "x-user-country")),
-        user_country_iso3: optional_header(headers, "x-cc-switch-user-country-iso3")
-            .or_else(|| optional_header(headers, "x-user-country-iso3")),
+        user_country: optional_header(headers, "x-cc-switch-user-country"),
+        user_country_iso3: optional_header(headers, "x-cc-switch-user-country-iso3"),
         is_health_check: optional_header(headers, "x-cc-switch-health-check")
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
         ..UsageLogContext::default()
@@ -14880,6 +14907,39 @@ mod tests {
     use crate::domain::providers::model::{
         AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
     };
+
+    #[test]
+    fn request_context_ignores_unsigned_legacy_identity_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-user-email",
+            HeaderValue::from_static("forged@example.com"),
+        );
+        headers.insert("x-user-country", HeaderValue::from_static("ZZ"));
+        headers.insert("x-user-country-iso3", HeaderValue::from_static("ZZZ"));
+
+        let context = request_context_from_headers(&headers);
+
+        assert_eq!(context.user_email, None);
+        assert_eq!(context.user_country, None);
+        assert_eq!(context.user_country_iso3, None);
+
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("signed@example.com"),
+        );
+        headers.insert("x-cc-switch-user-country", HeaderValue::from_static("US"));
+        headers.insert(
+            "x-cc-switch-user-country-iso3",
+            HeaderValue::from_static("USA"),
+        );
+
+        let context = request_context_from_headers(&headers);
+
+        assert_eq!(context.user_email.as_deref(), Some("signed@example.com"));
+        assert_eq!(context.user_country.as_deref(), Some("US"));
+        assert_eq!(context.user_country_iso3.as_deref(), Some("USA"));
+    }
 
     #[test]
     fn grok_http_fallback_uses_one_protocol_accept_header() {
@@ -15203,11 +15263,10 @@ mod tests {
                 }
                 if selection_calls == 1 {
                     assert_eq!(selection.execution.stored.provider.id, "race-provider-1");
-                    competing_guard = state.account_in_flight.try_acquire(
-                        ProviderType::CodexOAuth,
-                        "race-account-1",
-                        1,
-                    );
+                    competing_guard = state
+                        .account_in_flight
+                        .try_acquire(ProviderType::CodexOAuth, "race-account-1", 1)
+                        .ok();
                     assert!(competing_guard.is_some());
                 }
                 Ok(selection.execution)
@@ -15215,7 +15274,11 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(selection_calls, 2, "{selection_kind}");
-            assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(
+                error.error_code(),
+                "cc_switch_provider_account_concurrency_limit_exceeded"
+            );
             let snapshot = state.account_in_flight.snapshot();
             assert_eq!(
                 snapshot.current(ProviderType::CodexOAuth, "race-account-1"),
@@ -16692,6 +16755,7 @@ mod tests {
                         "app": "gemini",
                         "providerId": provider_id_for_share,
                         "providerType": "gemini_cli",
+                        "ownerEmail": "owner@example.com",
                         "enabled": true,
                         "status": "active",
                         "tokenLimit": 7,
@@ -16699,7 +16763,14 @@ mod tests {
                             "app": "gemini",
                             "providerId": provider_id_for_share,
                             "providerType": "gemini_cli"
-                        }]
+                        }],
+                        "userGrants": {
+                            "owner@example.com": {
+                                "email": "owner@example.com",
+                                "role": "owner",
+                                "active": true
+                            }
+                        }
                     }))
                     .unwrap(),
                 );
@@ -16710,6 +16781,10 @@ mod tests {
         headers.insert(
             "x-cc-switch-share-id",
             HeaderValue::from_str(&share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
         );
         let response = forward(
             state.clone(),
@@ -20114,26 +20189,63 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
-    fn share_rejections_use_legacy_reason_suffix_and_status_mapping() {
+    fn share_rejections_preserve_reason_and_expose_concurrency_metadata() {
         let expired = share_rejection_to_proxy_error(ShareInvocationRejection {
             reason: ShareRejectReason::Expired,
             message: "Share has expired.".to_string(),
             status_changed: true,
+            concurrency: None,
         });
         let parallel = share_rejection_to_proxy_error(ShareInvocationRejection {
             reason: ShareRejectReason::ParallelLimit,
-            message: "Share parallel limit has been reached.".to_string(),
+            message: "Share concurrency limit has been reached (4/4).".to_string(),
             status_changed: false,
+            concurrency: Some(crate::domain::sharing::shares::ShareConcurrencyLimit {
+                current: 4,
+                limit: 4,
+            }),
+        });
+        let unauthorized = share_rejection_to_proxy_error(ShareInvocationRejection {
+            reason: ShareRejectReason::Unauthorized,
+            message: "This user is not authorized to invoke the Share.".to_string(),
+            status_changed: false,
+            concurrency: None,
+        });
+        let identity_required = share_rejection_to_proxy_error(ShareInvocationRejection {
+            reason: ShareRejectReason::UserIdentityRequired,
+            message: "An authenticated user identity is required.".to_string(),
+            status_changed: false,
+            concurrency: None,
         });
 
         assert_eq!(expired.status, StatusCode::FORBIDDEN);
         assert_eq!(expired.message, "Share has expired. [Expired]");
-        assert_eq!(parallel.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(unauthorized.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            unauthorized.message,
+            "This user is not authorized to invoke the Share. [Unauthorized]"
+        );
+        assert_eq!(identity_required.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            identity_required.client_message(),
+            "An authenticated user identity is required."
+        );
+        assert_eq!(
+            identity_required.error_code(),
+            "cc_switch_user_identity_required"
+        );
+        assert_eq!(parallel.status, StatusCode::CONFLICT);
         assert_eq!(
             parallel.client_message(),
-            "Share parallel limit has been reached. [ParallelLimit]"
+            "Share concurrency limit has been reached (4/4)."
         );
-        assert_eq!(parallel.retry_after_seconds(), Some(1));
+        assert_eq!(
+            parallel.error_code(),
+            "cc_switch_share_concurrency_limit_exceeded"
+        );
+        assert_eq!(parallel.error_scope(), Some("share"));
+        assert_eq!(parallel.retry_after_seconds(), None);
+        assert!(!parallel.retryable());
     }
 
     #[test]

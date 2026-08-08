@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
@@ -62,6 +62,7 @@ export function SharePage({
   const {
     session: routerSession,
     loading: routerSessionLoading,
+    error: routerSessionError,
     refresh: refreshRouterSession,
   } = useRouterSession(shareScoped);
   const claudeProvidersQuery = useProvidersQuery("claude");
@@ -231,6 +232,7 @@ export function SharePage({
             share={primaryShare}
             session={routerSession}
             loading={routerSessionLoading}
+            sessionError={routerSessionError}
             canManageShare={canManageShareFromRouter}
             onRefresh={refreshRouterSession}
           />
@@ -300,9 +302,9 @@ export function SharePage({
           name: deleteTarget?.name ?? "",
         })}
         onCancel={() => setDeleteTarget(null)}
-        onConfirm={() => {
+        onConfirm={async () => {
           if (!deleteTarget) return;
-          void runShareAction(deleteTarget, async () => {
+          await runShareAction(deleteTarget, async () => {
             await deleteMutation.mutateAsync(deleteTarget.id);
             setDeleteTarget(null);
           });
@@ -315,20 +317,25 @@ export function SharePage({
 function useRouterSession(enabled: boolean): {
   session: RouterSessionStatus | null;
   loading: boolean;
+  error: string | null;
   refresh: () => Promise<void>;
 } {
   const [session, setSession] = useState<RouterSessionStatus | null>(null);
   const [loading, setLoading] = useState(enabled);
+  const [error, setError] = useState<string | null>(null);
+  const hasLoaded = useRef(false);
 
   const refresh = useCallback(async () => {
     if (!enabled) return;
-    setLoading(true);
+    if (!hasLoaded.current) setLoading(true);
     try {
       setSession(await getRouterSessionStatus());
+      setError(null);
     } catch (error) {
       console.error("[SharePage] Failed to refresh router session", error);
-      setSession({ authenticated: false });
+      setError(extractErrorMessage(error));
     } finally {
+      hasLoaded.current = true;
       setLoading(false);
     }
   }, [enabled]);
@@ -345,7 +352,7 @@ function useRouterSession(enabled: boolean): {
     };
   }, [enabled, refresh]);
 
-  return { session, loading, refresh };
+  return { session, loading, error, refresh };
 }
 
 function maskEmail(email: string): string {
@@ -362,12 +369,14 @@ function ShareOwnerAuthBar({
   share,
   session,
   loading,
+  sessionError,
   canManageShare,
   onRefresh,
 }: {
   share: ShareRecord | null;
   session: RouterSessionStatus | null;
   loading: boolean;
+  sessionError: string | null;
   canManageShare: boolean;
   onRefresh: () => Promise<void>;
 }) {
@@ -536,6 +545,11 @@ function ShareOwnerAuthBar({
           </div>
         )}
       </div>
+      {sessionError ? (
+        <p className="mt-2 text-xs text-destructive" role="alert">
+          {sessionError}
+        </p>
+      ) : null}
       {step === "code" && !session?.authenticated ? (
         <div className="mt-2 text-xs text-muted-foreground">
           {t("share.routerOwner.codeSent", {

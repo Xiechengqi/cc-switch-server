@@ -1,5 +1,6 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -63,7 +64,9 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
         removeAccount,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -82,7 +85,9 @@ export const DeepSeekAccountSection: React.FC<DeepSeekAccountSectionProps> = ({
       setIdentifier("");
       setAccessToken("");
       setShowForm(false);
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   return (

@@ -5,8 +5,8 @@
   width: 32px;
   height: 32px;
 }.account-regression-badge.warning{
-  border-color: hsl(38 80% 78%);
-  background: hsl(38 90% 96%);
+  border-color: hsl(var(--warning) / 0.4);
+  background: hsl(var(--warning) / 0.12);
 }.json-preview{
   max-height: 260px;
   overflow: auto;
@@ -92,9 +92,9 @@
   border-color: hsl(var(--border));
   background: hsl(var(--panel));
 }.owner-step.active{
-  border-color: hsl(151 58% 72%);
-  background: hsl(151 70% 95%);
-  color: hsl(var(--success));
+  border-color: hsl(var(--success) / 0.4);
+  background: hsl(var(--success) / 0.12);
+  color: hsl(var(--foreground));
 }.owner-step.active span{
   background: hsl(var(--success));
 }.connect-copy-status.warning{

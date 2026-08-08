@@ -9,6 +9,7 @@ export interface RouterShareSettingsPatch {
   accessByApp?: import("@/lib/api").ShareAccessByApp;
   appSettings?: import("@/lib/api").ShareAppSettingsByApp;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
+  officialPricePercent?: number | null;
   tokenLimit?: number;
   parallelLimit?: number;
   expiresAt?: string;

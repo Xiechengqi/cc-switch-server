@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Eye, EyeOff } from "lucide-react";
-
-import { useI18n } from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 
 export function AuthPasswordInput({
   label,
@@ -20,7 +19,7 @@ export function AuthPasswordInput({
   id?: string;
   placeholder?: string;
 }) {
-  const { t } = useI18n();
+  const { t } = useTranslation();
   const [visible, setVisible] = useState(false);
 
   return (

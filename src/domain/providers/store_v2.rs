@@ -238,6 +238,7 @@ pub(crate) fn materialize_store(store: &ProviderStore) -> anyhow::Result<Provide
     for stored in &mut materialized.providers {
         stored.provider = materialize_provider(store, stored)?;
     }
+    materialized.credential_vault = Arc::new(ProviderCredentialVault::default());
     Ok(materialized)
 }
 
@@ -699,6 +700,8 @@ fn provider_uses_legacy_payload(profile_id: Option<&ProfileId>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::*;
@@ -771,6 +774,18 @@ mod tests {
         assert_eq!(
             provider.settings_config["auth"]["OPENAI_API_KEY"],
             "secret-value"
+        );
+
+        let mut materialized = decoded.materialized_clone().unwrap();
+        materialized.providers[0].provider.settings_config["auth"]["OPENAI_API_KEY"] =
+            json!("rotated-secret");
+        assert_eq!(
+            materialized
+                .materialize_provider_record(&materialized.providers[0])
+                .unwrap()
+                .provider
+                .settings_config["auth"]["OPENAI_API_KEY"],
+            "rotated-secret"
         );
     }
 
@@ -847,5 +862,65 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn managed_account_bundle_does_not_require_provider_credential_aliases() {
+        let providers = [
+            (AppKind::Claude, "claude.grok_oauth"),
+            (AppKind::Codex, "codex.grok_oauth"),
+            (AppKind::Gemini, "gemini.grok_oauth"),
+        ]
+        .into_iter()
+        .map(|(app, profile_id)| StoredProvider {
+            app,
+            provider: Provider {
+                id: "managed-bundle".to_string(),
+                name: "Managed Bundle".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("grok_oauth".to_string()),
+                    auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                        source: Some("account".to_string()),
+                        auth_provider: Some("grok_oauth".to_string()),
+                        account_id: Some("account-1".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..ProviderMeta::default()
+                }),
+                extra: BTreeMap::from([
+                    ("bundleId".to_string(), json!("managed-bundle")),
+                    ("familyId".to_string(), json!("family.grok_oauth")),
+                    ("surfaceEnabled".to_string(), json!(true)),
+                ]),
+            },
+            provider_type: ProviderType::GrokOAuth,
+            provider_type_id: ProviderType::GrokOAuth.as_str().to_string(),
+            resource: ProviderResourceMetadata {
+                profile_id: Some(ProfileId::parse(profile_id).unwrap()),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                ..ProviderResourceMetadata::default()
+            },
+        })
+        .collect();
+        let mut store = ProviderStore {
+            providers,
+            bundle_order: vec!["managed-bundle".to_string()],
+            ..ProviderStore::default()
+        };
+
+        seal_store(
+            &mut store,
+            ResolvedCredentialKey {
+                key: [7u8; 32],
+                source: CredentialKeySource::File,
+            },
+        )
+        .unwrap();
+
+        assert!(store.credential_vault.envelopes.is_empty());
+        assert!(store.credential_vault.aliases.is_empty());
     }
 }

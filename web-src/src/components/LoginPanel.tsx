@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { KeyRound, Loader2, Mail, Shield } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { AuthPasswordInput } from "@/components/AuthPasswordInput";
@@ -17,8 +18,7 @@ import {
   verifyEmailLoginCode,
 } from "@/lib/server-legacy-api";
 import { DEFAULT_SHARE_ROUTER_DOMAIN } from "@/config/shareRegions";
-import { useI18n } from "@/lib/i18n";
-import { loginWithPassword, readCachedPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
+import { loginWithPassword, WebRuntimeContext, writeToken } from "@/lib/runtime";
 import {
   normalizeShareRouterDomain,
   shareRouterUrlFromDomain,
@@ -84,14 +84,14 @@ export function LoginPanel({
   context: WebRuntimeContext;
   onAuthenticated: () => Promise<WebRuntimeContext>;
 }) {
-  const { t } = useI18n();
+  const { t } = useTranslation();
   const setupRequired =
     context.status === "setup-required" || context.auth?.setupRequired;
   const availableMethods = useMemo(() => normalizeMethods(), []);
   const [activeMethod, setActiveMethod] = useState<LoginMethod>(
     availableMethods[0] ?? "password",
   );
-  const [password, setPassword] = useState(() => readCachedPassword() ?? "");
+  const [password, setPassword] = useState("");
   const [ownerEmail, setOwnerEmail] = useState(context.auth?.ownerEmail ?? "");
   const [routerDomain, setRouterDomain] = useState(DEFAULT_SHARE_ROUTER_DOMAIN);
   const [routerDomainError, setRouterDomainError] = useState<string | null>(null);

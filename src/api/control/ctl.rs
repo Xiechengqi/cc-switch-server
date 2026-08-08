@@ -122,6 +122,19 @@ pub(crate) async fn control_apply_share_settings(
             crate::domain::sharing::shares::SharePatchError::BindingImmutable => {
                 ApiError::conflict_code("cc_switch_share_binding_immutable", error.to_string())
             }
+            crate::domain::sharing::shares::SharePatchError::PolicyDivergent(message) => {
+                ApiError::conflict_code("cc_switch_share_policy_divergent", message)
+            }
+            crate::domain::sharing::shares::SharePatchError::RevisionConflict {
+                expected,
+                current,
+            } => ApiError::conflict_code(
+                "cc_switch_share_revision_conflict",
+                format!(
+                    "managed grant expected config revision {expected}, current revision is {current}"
+                ),
+            )
+            .with_retryable(true),
             crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
                 ApiError::bad_request(message)
             }

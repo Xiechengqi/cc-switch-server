@@ -12,7 +12,7 @@ export type SettingsFormState = Omit<Settings, "language"> & {
 };
 
 const normalizeLanguage = (lang?: string | null): Language => {
-  if (!lang) return "zh";
+  if (!lang) return "en";
   const normalized = lang.toLowerCase().replace(/_/g, "-");
 
   if (normalized === "zh") {
@@ -36,7 +36,7 @@ const normalizeLanguage = (lang?: string | null): Language => {
     return "zh";
   }
 
-  return "zh";
+  return "en";
 };
 
 const isSupportedLanguage = (lang?: string | null): boolean => {
@@ -79,7 +79,7 @@ export function useSettingsForm(): UseSettingsFormResult {
     null,
   );
 
-  const initialLanguageRef = useRef<Language>("zh");
+  const initialLanguageRef = useRef<Language>("en");
 
   const readPersistedLanguage = useCallback((): Language => {
     if (typeof window !== "undefined") {
@@ -114,11 +114,14 @@ export function useSettingsForm(): UseSettingsFormResult {
   // 初始化设置数据
   useEffect(() => {
     if (!data) {
-      if (isServerWebRuntime() && !isLoading && !settingsState) {
-        const normalizedLanguage = normalizeLanguage(readPersistedLanguage());
-        setSettingsState({
-          ...SERVER_DEFAULT_SETTINGS,
-          language: normalizedLanguage,
+      if (isServerWebRuntime() && !isLoading) {
+        setSettingsState((current) => {
+          if (current) return current;
+          const normalizedLanguage = normalizeLanguage(readPersistedLanguage());
+          return {
+            ...SERVER_DEFAULT_SETTINGS,
+            language: normalizedLanguage,
+          };
         });
       }
       return;
@@ -151,7 +154,7 @@ export function useSettingsForm(): UseSettingsFormResult {
     setSettingsState(normalized);
     initialLanguageRef.current = normalizedLanguage;
     syncLanguage(normalizedLanguage);
-  }, [data, isLoading, readPersistedLanguage, settingsState, syncLanguage]);
+  }, [data, isLoading, readPersistedLanguage, syncLanguage]);
 
   const updateSettings = useCallback(
     (updates: Partial<SettingsFormState>) => {

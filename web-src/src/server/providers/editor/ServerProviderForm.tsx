@@ -2475,7 +2475,8 @@ export function ServerProviderForm({
         confirmText={t("serverProviderForm.identity.apply")}
         variant="info"
         zIndex="top"
-        onConfirm={() => void applyIdentityAction()}
+        confirmDisabled={identityActionPending}
+        onConfirm={applyIdentityAction}
         onCancel={() => {
           if (!identityActionPending) setPendingIdentityAction(null);
         }}

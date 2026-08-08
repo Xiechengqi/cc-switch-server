@@ -150,6 +150,30 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
 
   const bindings = normalizeShareBindings(record);
   const acl = normalizeAcl(record);
+  const rawPriceByApp =
+    (record.forSaleOfficialPricePercentByApp as ShareRecord["forSaleOfficialPricePercentByApp"]) ??
+    (record.for_sale_official_price_percent_by_app as ShareRecord["forSaleOfficialPricePercentByApp"]) ??
+    {};
+  const projectedPrice = Object.values(rawPriceByApp).find(
+    (value) => Number.isInteger(value) && value >= 1 && value <= 100,
+  );
+  const explicitPrice = readNumber(
+    record,
+    "officialPricePercent",
+    "official_price_percent",
+  );
+  const officialPricePercent =
+    Number.isInteger(explicitPrice) && explicitPrice! >= 1 && explicitPrice! <= 100
+      ? explicitPrice!
+      : (projectedPrice ?? null);
+  const priceByApp =
+    Object.keys(rawPriceByApp).length > 0
+      ? rawPriceByApp
+      : officialPricePercent == null
+        ? {}
+        : Object.fromEntries(
+            Object.keys(bindings).map((app) => [app, officialPricePercent]),
+          );
   const shareSlug =
     readString(record, "shareSlug", "share_slug", "tunnelSubdomain", "tunnel_subdomain") ??
     null;
@@ -181,10 +205,8 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
     appSettings:
       (record.appSettings as ShareRecord["appSettings"]) ??
       (record.app_settings as ShareRecord["appSettings"]),
-    forSaleOfficialPricePercentByApp:
-      (record.forSaleOfficialPricePercentByApp as ShareRecord["forSaleOfficialPricePercentByApp"]) ??
-      (record.for_sale_official_price_percent_by_app as ShareRecord["forSaleOfficialPricePercentByApp"]) ??
-      {},
+    forSaleOfficialPricePercentByApp: priceByApp,
+    officialPricePercent,
     description: readString(record, "description") ?? null,
     forSale: normalizeForSale(record),
     bindings,

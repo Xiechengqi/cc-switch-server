@@ -42,15 +42,31 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   footer,
   contentClassName,
 }) => {
+  const panelRef = React.useRef<HTMLDivElement>(null);
+  const closeButtonRef = React.useRef<HTMLButtonElement>(null);
+  const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
   const contentRef = React.useRef<HTMLDivElement>(null);
+  const titleId = React.useId();
 
   React.useEffect(() => {
-    if (isOpen) {
-      document.body.style.overflow = "hidden";
-    }
+    if (!isOpen) return;
+
+    previousFocusRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    document.body.style.overflow = "hidden";
+    const focusFrame = requestAnimationFrame(() => closeButtonRef.current?.focus());
+
     return () => {
+      cancelAnimationFrame(focusFrame);
       document.body.style.overflow = "";
+      const previousFocus = previousFocusRef.current;
+      if (previousFocus?.isConnected) {
+        previousFocus.focus();
+      }
+      previousFocusRef.current = null;
     };
   }, [isOpen]);
 
@@ -65,6 +81,25 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
     if (!isOpen) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Tab") {
+        const focusable = Array.from(
+          panelRef.current?.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ) ?? [],
+        ).filter((element) => !element.hasAttribute("aria-hidden"));
+        if (focusable.length > 0) {
+          const first = focusable[0]!;
+          const last = focusable[focusable.length - 1]!;
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+      }
+
       if (event.key === "Escape") {
         // 子组件（例如 Radix 的 Select/Dialog/Dropdown）如果已经消费了 ESC，就不要再关闭整个面板
         if (event.defaultPrevented) {
@@ -134,6 +169,10 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
     <AnimatePresence>
       {isOpen && (
         <motion.div
+          ref={panelRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -177,16 +216,21 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
               style={{ ...DRAG_REGION_STYLE } as React.CSSProperties}
             >
               <Button
+                ref={closeButtonRef}
                 type="button"
                 variant="outline"
                 size="icon"
                 onClick={onClose}
+                aria-label={title}
                 className="rounded-lg select-none"
                 style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
               >
                 <ArrowLeft className="h-4 w-4" />
               </Button>
-              <h2 className="text-lg font-semibold text-foreground select-none">
+              <h2
+                id={titleId}
+                className="text-lg font-semibold text-foreground select-none"
+              >
                 {title}
               </h2>
             </div>

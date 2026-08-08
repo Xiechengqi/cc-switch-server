@@ -9,8 +9,9 @@ use super::model::{AppKind, Provider, ProviderMeta};
 use super::model_routing::normalize_and_validate_provider_model_routing;
 use super::registry::{
     family_by_id, family_for_profile, profile_by_id, provider_registry, resolve_custom_binding,
-    AuthScheme, CredentialPolicy, CustomBindingInput, DriverBinding, EndpointPolicy,
-    FormComposition, ModelPolicyKind, ProfileId, ProviderFamilySpec, UpstreamProtocol,
+    AuthScheme, CredentialPolicy, CredentialSourceScope, CustomBindingInput, DriverBinding,
+    EndpointPolicy, FormComposition, ModelPolicyKind, ProfileId, ProviderFamilySpec,
+    UpstreamProtocol,
 };
 use super::store::StoredProvider;
 
@@ -586,7 +587,9 @@ impl ProviderBundleView {
         let first = surface_views
             .first()
             .context("Provider Bundle has no Surfaces")?;
-        let id = bundle_id(&first.provider).to_string();
+        let id = bundle_id(&first.provider)
+            .context("Provider Bundle Surface has no explicit Bundle identity")?
+            .to_string();
         let family_id = family_id_for_view(first)?;
         let name = first.provider.name.clone();
         let mut revision = 0u64;
@@ -595,7 +598,7 @@ impl ProviderBundleView {
         let mut enabled_credential_states = Vec::new();
         let mut credential_slots = BTreeSet::new();
         for view in surface_views {
-            if bundle_id(&view.provider) != id
+            if bundle_id(&view.provider) != Some(id.as_str())
                 || family_id_for_view(&view)? != family_id
                 || view.provider.name != name
             {
@@ -672,8 +675,8 @@ impl ProviderBundleView {
     }
 }
 
-pub fn bundle_id(provider: &Provider) -> &str {
-    extra_string_ref(provider, BUNDLE_ID_FIELD).unwrap_or(&provider.id)
+pub fn bundle_id(provider: &Provider) -> Option<&str> {
+    extra_string_ref(provider, BUNDLE_ID_FIELD)
 }
 
 pub fn has_bundle_managed_metadata(provider: &Provider) -> bool {
@@ -710,32 +713,33 @@ pub fn credential_source_app(family: &ProviderFamilySpec) -> anyhow::Result<AppK
 pub fn shared_credential_source_key(
     stored: &StoredProvider,
 ) -> anyhow::Result<Option<super::registry::ProviderKey>> {
+    if !is_explicit_bundle_surface(&stored.provider) {
+        return Ok(None);
+    }
     let Some(family_id) = extra_string_ref(&stored.provider, FAMILY_ID_FIELD) else {
         return Ok(None);
     };
     let family =
         family_by_id(family_id).with_context(|| format!("unknown Provider family {family_id}"))?;
-    if family.surfaces.len() < 2 {
+    if family.credential_source_scope == CredentialSourceScope::Surface {
         return Ok(None);
     }
     let credential_profile =
         profile_by_id(family.credential_profile_id.as_str()).with_context(|| {
             format!(
-                "unknown credential profile {}",
-                family.credential_profile_id
+                "Provider family {} has an unknown credential profile {}",
+                family.family_id, family.credential_profile_id
             )
         })?;
-    if matches!(
+    if !matches!(
         credential_profile.credential_policy,
-        CredentialPolicy::ManagedAccount { .. }
-            | CredentialPolicy::Custom
-            | CredentialPolicy::Legacy
+        CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Aws { .. }
     ) {
         return Ok(None);
     }
     Ok(Some(super::registry::ProviderKey::new(
         credential_source_app(family)?,
-        bundle_id(&stored.provider),
+        bundle_id(&stored.provider).context("Provider Bundle Surface has no Bundle identity")?,
     )?))
 }
 

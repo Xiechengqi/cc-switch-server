@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 4;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 5;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -128,6 +128,7 @@ pub struct ProviderFamilySpec {
     pub endpoint_scope: ProviderFieldScope,
     pub headers_scope: ProviderFieldScope,
     pub driver_options_scope: ProviderFieldScope,
+    pub credential_source_scope: CredentialSourceScope,
     pub surfaces: Vec<ProviderFamilySurfaceSpec>,
 }
 
@@ -142,6 +143,13 @@ pub struct ProviderFamilySurfaceSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFieldScope {
+    Bundle,
+    Surface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSourceScope {
     Bundle,
     Surface,
 }
@@ -740,6 +748,18 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
                     family.family_id, family.credential_profile_id
                 )
             })?;
+        if family.credential_source_scope == CredentialSourceScope::Bundle
+            && family.surfaces.len() > 1
+            && matches!(
+                credential_profile.credential_policy,
+                CredentialPolicy::Custom | CredentialPolicy::Legacy
+            )
+        {
+            bail!(
+                "Provider family {} cannot share Surface-scoped credentials at Bundle scope",
+                family.family_id
+            );
+        }
         let mut apps = BTreeSet::new();
         for surface in &family.surfaces {
             if !apps.insert(surface.app) {

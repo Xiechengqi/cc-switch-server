@@ -35,6 +35,7 @@ function share(
     sharedWithEmails: [],
     marketAccessMode: "selected",
     forSaleOfficialPricePercentByApp: {},
+    officialPricePercent: null,
     forSale: "No",
     bindings,
     apiKey: "redacted",

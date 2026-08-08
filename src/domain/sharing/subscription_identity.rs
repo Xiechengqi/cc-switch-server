@@ -817,8 +817,6 @@ mod tests {
         let mut share = share(id, provider_id);
         share.app = AppKind::Claude;
         share.provider_type = ProviderType::ClaudeOAuth;
-        share.access_by_app.clear();
-        share.app_settings.clear();
         share.bindings = vec![ShareBinding {
             app: AppKind::Claude,
             provider_id: provider_id.to_string(),

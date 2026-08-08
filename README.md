@@ -48,6 +48,7 @@ Claude / Codex / Gemini client
 - Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
 - Codex context overflow 自动压缩可通过 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 显式启用；它只在业务输出提交前使用同一账号做一次有界摘要和重试，默认关闭且摘要 usage 独立记录。
 - 支持 router installation register、client tunnel、share tunnel、share batch sync、Router Share request log sync、pending share edit pull/ack/event 监听。
+- Router ingress 新鲜度采用非对称边界:最多接受 30 秒前签发、最多接受未来 5 秒签发的上下文,边界值有效。验签失败仍返回空正文 `401`,同时用 `x-cc-switch-internal-ingress-*` 向 Router 提供稳定原因码和时间诊断；这些内部响应头必须由 Router 剥离,不得传给公网调用方。普通业务 `401` 不附该诊断头。
 - 支持 Router 内建 Share Market entitlement add/revoke 通过 pending edit 幂等应用到 Server Share，并同步 per-app 授权展示状态。
 - usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
 - usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。

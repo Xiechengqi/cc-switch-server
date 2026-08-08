@@ -355,7 +355,8 @@ export function ProviderBundlesPage({
         })}
         confirmText={deletePending ? t("common.loading") : t("common.delete")}
         variant="destructive"
-        onConfirm={() => void confirmDelete()}
+        confirmDisabled={deletePending}
+        onConfirm={confirmDelete}
         onCancel={() => {
           if (!deletePending) setDeleting(null);
         }}

@@ -11,8 +11,8 @@ export const queryClient = new QueryClient({
         }
         return failureCount < 1;
       },
-      refetchOnWindowFocus: true,
-      staleTime: 0,
+      refetchOnWindowFocus: false,
+      staleTime: 30_000,
     },
     mutations: {
       retry: false,

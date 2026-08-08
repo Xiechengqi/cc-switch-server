@@ -170,8 +170,8 @@ async fn web_invoke_dispatch(
             Ok(json!(response.0))
         }
         "get_settings" => {
+            let config = state.config.read().await.clone();
             let store = state.ui_settings.read().await;
-            let config = state.config.read().await;
             Ok(store.settings_for_frontend(&config))
         }
         "get_rectifier_config" => {
@@ -764,11 +764,11 @@ async fn web_invoke_dispatch(
             Ok(json!(share))
         }
         "save_provider_share" => {
-            let share = web_save_provider_share(state, &args).await?;
+            let share = Box::pin(web_save_provider_share(state, &args)).await?;
             Ok(json!(share))
         }
         "save_provider_bundle_share" => {
-            let share = web_save_provider_bundle_share(state, &args).await?;
+            let share = Box::pin(web_save_provider_bundle_share(state, &args)).await?;
             match share.as_ref() {
                 Some(share) => web_share_json(&state.config_snapshot().await, share),
                 None => Ok(Value::Null),
@@ -1716,12 +1716,28 @@ async fn web_invoke_dispatch(
         }
         "update_share_for_sale_official_price_percent" => {
             let payload = web_payload(&args, &["params", "input"]);
-            let pricing = web_optional_deserialize::<BTreeMap<String, u16>>(
+            let official_price_percent = match payload
+                .get("officialPricePercent")
+                .or_else(|| payload.get("official_price_percent"))
+            {
+                Some(Value::Null) => Some(None),
+                Some(raw) => Some(Some(
+                    raw.as_u64()
+                        .and_then(|value| u16::try_from(value).ok())
+                        .ok_or_else(|| {
+                            ApiError::bad_request(
+                                "officialPricePercent must be an integer between 1 and 100",
+                            )
+                        })?,
+                )),
+                None => None,
+            };
+            let pricing = web_optional_deserialize::<BTreeMap<AppKind, u16>>(
                 payload,
                 "forSaleOfficialPricePercentByApp",
             )?
             .or_else(|| {
-                web_optional_deserialize::<BTreeMap<String, u16>>(
+                web_optional_deserialize::<BTreeMap<AppKind, u16>>(
                     payload,
                     "for_sale_official_price_percent_by_app",
                 )
@@ -1733,6 +1749,7 @@ async fn web_invoke_dispatch(
                 payload,
                 ShareSettingsPatch {
                     for_sale_official_price_percent_by_app: pricing,
+                    official_price_percent,
                     ..ShareSettingsPatch::default()
                 },
             )

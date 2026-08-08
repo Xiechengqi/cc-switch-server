@@ -2,6 +2,7 @@ use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use serde_json::{json, Map, Value};
 
 use crate::clients::oauth::codex_device::CodexDeviceError;
 use crate::clients::oauth::copilot_device::CopilotDeviceError;
@@ -9,6 +10,226 @@ use crate::clients::oauth::grok_device::GrokDeviceError;
 use crate::clients::oauth::kiro_device::KiroDeviceError;
 use crate::clients::router::email_auth::EmailAuthError;
 use crate::proxy;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceSurface {
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+#[derive(Debug)]
+pub(crate) struct InferenceApiError {
+    surface: InferenceSurface,
+    status: StatusCode,
+    message: String,
+    code: &'static str,
+    error_type: &'static str,
+    retryable: bool,
+    retry_after_seconds: Option<u64>,
+    scope: Option<&'static str>,
+    current: Option<u32>,
+    limit: Option<u32>,
+    request_id: Option<String>,
+}
+
+impl InferenceApiError {
+    pub(crate) fn proxy(
+        surface: InferenceSurface,
+        request_id: Option<String>,
+        error: proxy::ProxyError,
+    ) -> Self {
+        let concurrency = error.concurrency_metadata();
+        Self {
+            surface,
+            status: error.status,
+            message: error.client_message().to_string(),
+            code: error.error_code(),
+            error_type: error.error_type(),
+            retryable: error.retryable(),
+            retry_after_seconds: error.retry_after_seconds(),
+            scope: error.error_scope(),
+            current: concurrency.map(|metadata| metadata.current),
+            limit: concurrency.map(|metadata| metadata.limit),
+            request_id,
+        }
+    }
+
+    pub(crate) fn api(
+        surface: InferenceSurface,
+        request_id: Option<String>,
+        error: ApiError,
+    ) -> Self {
+        Self {
+            surface,
+            status: error.status,
+            message: error.message,
+            code: error.code.unwrap_or_else(|| api_error_code(error.status)),
+            error_type: error
+                .error_type
+                .unwrap_or_else(|| api_error_type(error.status)),
+            retryable: error.retryable.unwrap_or(false),
+            retry_after_seconds: error.retry_after_seconds,
+            scope: None,
+            current: None,
+            limit: None,
+            request_id,
+        }
+    }
+
+    fn details(&self) -> Value {
+        let mut details = Map::new();
+        details.insert("retryable".to_string(), Value::Bool(self.retryable));
+        if let Some(scope) = self.scope {
+            details.insert("scope".to_string(), Value::String(scope.to_string()));
+        }
+        if let Some(current) = self.current {
+            details.insert("current".to_string(), Value::from(current));
+        }
+        if let Some(limit) = self.limit {
+            details.insert("limit".to_string(), Value::from(limit));
+        }
+        Value::Object(details)
+    }
+
+    fn body(&self) -> Value {
+        match self.surface {
+            InferenceSurface::OpenAi => json!({
+                "error": {
+                    "message": self.message,
+                    "type": self.error_type,
+                    "code": self.code,
+                    "param": Value::Null,
+                    "details": self.details(),
+                },
+                "request_id": self.request_id,
+            }),
+            InferenceSurface::Anthropic => json!({
+                "type": "error",
+                "error": {
+                    "type": self.error_type,
+                    "message": self.message,
+                    "code": self.code,
+                    "details": self.details(),
+                },
+                "request_id": self.request_id,
+            }),
+            InferenceSurface::Gemini => {
+                let mut metadata = Map::new();
+                metadata.insert("code".to_string(), Value::String(self.code.to_string()));
+                metadata.insert(
+                    "retryable".to_string(),
+                    Value::String(self.retryable.to_string()),
+                );
+                if let Some(scope) = self.scope {
+                    metadata.insert("scope".to_string(), Value::String(scope.to_string()));
+                }
+                if let Some(current) = self.current {
+                    metadata.insert("current".to_string(), Value::String(current.to_string()));
+                }
+                if let Some(limit) = self.limit {
+                    metadata.insert("limit".to_string(), Value::String(limit.to_string()));
+                }
+                if let Some(request_id) = self.request_id.as_deref() {
+                    metadata.insert(
+                        "requestId".to_string(),
+                        Value::String(request_id.to_string()),
+                    );
+                }
+                json!({
+                    "error": {
+                        "code": self.status.as_u16(),
+                        "message": self.message,
+                        "status": gemini_rpc_status(self.status),
+                        "details": [{
+                            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                            "reason": self.code.to_ascii_uppercase(),
+                            "domain": "cc-switch",
+                            "metadata": metadata,
+                        }],
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl IntoResponse for InferenceApiError {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, Json(self.body())).into_response();
+        response.headers_mut().insert(
+            "x-cc-switch-error-code",
+            HeaderValue::from_static(self.code),
+        );
+        if let Some(scope) = self.scope {
+            response
+                .headers_mut()
+                .insert("x-cc-switch-error-scope", HeaderValue::from_static(scope));
+        }
+        if let Some(request_id) = self.request_id.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(request_id) {
+                response
+                    .headers_mut()
+                    .insert("x-cc-switch-request-id", value.clone());
+                response.headers_mut().insert("x-request-id", value);
+            }
+        }
+        if let Some(seconds) = self.retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        if self.surface == InferenceSurface::Anthropic {
+            response.headers_mut().insert(
+                "x-should-retry",
+                HeaderValue::from_static(if self.retryable { "true" } else { "false" }),
+            );
+        }
+        response
+    }
+}
+
+fn api_error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "cc_switch_invalid_request",
+        StatusCode::UNAUTHORIZED => "cc_switch_auth_error",
+        StatusCode::FORBIDDEN => "cc_switch_forbidden",
+        StatusCode::NOT_FOUND => "cc_switch_not_found",
+        StatusCode::CONFLICT => "cc_switch_conflict",
+        StatusCode::TOO_MANY_REQUESTS => "cc_switch_rate_limited",
+        StatusCode::SERVICE_UNAVAILABLE => "cc_switch_no_available_provider",
+        _ if status.is_server_error() => "cc_switch_proxy_error",
+        _ => "cc_switch_invalid_request",
+    }
+}
+
+fn api_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::CONFLICT => "conflict_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::SERVICE_UNAVAILABLE => "unavailable_error",
+        _ if status.is_server_error() => "proxy_error",
+        _ => "invalid_request_error",
+    }
+}
+
+fn gemini_rpc_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::CONFLICT => "ABORTED",
+        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+        StatusCode::GATEWAY_TIMEOUT => "DEADLINE_EXCEEDED",
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+        _ => "INTERNAL",
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ErrorResponse {
@@ -186,6 +407,11 @@ impl ApiError {
         });
         self
     }
+
+    pub(crate) fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = Some(retryable);
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -248,6 +474,19 @@ pub(crate) fn map_share_patch_error(
                 "share binding is immutable in ordinary upsert/import; pause the Share and use the binding endpoint",
             )
         }
+        crate::domain::sharing::shares::SharePatchError::PolicyDivergent(message) => {
+            ApiError::conflict_code("cc_switch_share_policy_divergent", message)
+        }
+        crate::domain::sharing::shares::SharePatchError::RevisionConflict {
+            expected,
+            current,
+        } => ApiError::conflict_code(
+            "cc_switch_share_revision_conflict",
+            format!(
+                "managed grant expected config revision {expected}, current revision is {current}"
+            ),
+        )
+        .with_retryable(true),
         crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
             ApiError::bad_request(message)
         }
@@ -395,6 +634,76 @@ mod tests {
         assert_eq!(body["code"], "cursor_session_lost");
         assert_eq!(body["error"], "Cursor session is unavailable");
         assert_eq!(body["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn inference_concurrency_errors_use_surface_native_bodies_and_headers() {
+        for (surface, expected_path, expected_value) in [
+            (
+                InferenceSurface::OpenAi,
+                "/error/code",
+                "cc_switch_user_concurrency_limit_exceeded",
+            ),
+            (
+                InferenceSurface::Anthropic,
+                "/error/code",
+                "cc_switch_user_concurrency_limit_exceeded",
+            ),
+            (InferenceSurface::Gemini, "/error/status", "ABORTED"),
+        ] {
+            let response = InferenceApiError::proxy(
+                surface,
+                Some("request-123".to_string()),
+                crate::proxy::ProxyError::concurrency_limited(
+                    crate::proxy::ProxyConcurrencyScope::User,
+                    2,
+                    2,
+                    "Your Share user concurrency limit has been reached (2/2).",
+                ),
+            )
+            .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-cc-switch-error-code")
+                    .and_then(|value| value.to_str().ok()),
+                Some("cc_switch_user_concurrency_limit_exceeded")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-cc-switch-error-scope")
+                    .and_then(|value| value.to_str().ok()),
+                Some("user")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("request-123")
+            );
+            assert!(!response.headers().contains_key(RETRY_AFTER));
+            if surface == InferenceSurface::Anthropic {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-should-retry")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("false")
+                );
+            }
+            let body = json_body(response).await;
+            assert_eq!(
+                body.pointer(expected_path).and_then(Value::as_str),
+                Some(expected_value)
+            );
+            if surface != InferenceSurface::Gemini {
+                assert_eq!(body["error"]["details"]["current"], 2);
+                assert_eq!(body["error"]["details"]["limit"], 2);
+            }
+        }
     }
 
     #[tokio::test]

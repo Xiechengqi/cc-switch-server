@@ -374,7 +374,7 @@ mod tests {
     use crate::domain::accounts::store::AccountQuota;
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
+    use crate::domain::sharing::shares::{ShareAcl, ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLogContext, UsageModelMetadata};
 
     #[test]
@@ -804,19 +804,13 @@ mod tests {
             account_email: None,
             quota_percent,
             tunnel_subdomain: Some(id.to_string()),
-            acl: ShareAcl::default(),
-            token_limit: None,
-            parallel_limit: None,
+            policy: SharePolicy {
+                acl: ShareAcl::default(),
+                ..SharePolicy::default()
+            },
             tokens_used: 0,
             requests_count: 0,
-            expires_at: None,
             created_at_ms: 0,
-            for_sale: false,
-            free_access: false,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
             auto_start: false,
             description: None,
             bindings: vec![ShareBinding {
@@ -827,6 +821,7 @@ mod tests {
             binding_history: Vec::new(),
             runtime_snapshot: None,
             last_error: None,
+            integrity_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,

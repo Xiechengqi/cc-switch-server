@@ -18,6 +18,7 @@ import {
 import { toast } from "sonner";
 
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { MarketSelectorField } from "@/components/providers/ProviderShareSection";
@@ -51,7 +52,9 @@ import type {
 import { providersApi } from "@/lib/api/providers";
 import { shareApi, type ShareUserPolicy } from "@/lib/api/share";
 import { normalizeManagedAuthProvider } from "@/lib/authBinding";
+import { useUnsavedChangesGuard } from "@/hooks/useUnsavedChangesGuard";
 import { copyText } from "@/lib/clipboard";
+import { stableStringify } from "@/lib/stableStringify";
 import {
   managedAccountKeys,
   shareKeys,
@@ -1046,6 +1049,16 @@ export function ProviderBundleEditor({
   const [shareDraft, setShareDraft] = useState<ProviderBundleShareDraft>(() =>
     createBundleShareDraft(existingShare),
   );
+  const draftBaselineRef = useRef(stableStringify(draft));
+  const shareBaselineRef = useRef(stableStringify(shareDraft));
+  const dirty =
+    stableStringify(draft) !== draftBaselineRef.current ||
+    stableStringify(shareDraft) !== shareBaselineRef.current;
+  const closeGuard = useUnsavedChangesGuard({
+    active: true,
+    dirty: dirty && !saving,
+    onClose: onCancel,
+  });
   const accountsQuery = useManagedAccountsQuery();
   const credentialProfile = profileById(family.credentialProfileId);
   const allowedModelPolicies = modelPoliciesForFamily(family);
@@ -1105,7 +1118,9 @@ export function ProviderBundleEditor({
   }, [accounts, draft.accountGeneration, draft.accountId]);
 
   useEffect(() => {
-    setShareDraft(createBundleShareDraft(existingShare));
+    const nextShareDraft = createBundleShareDraft(existingShare);
+    shareBaselineRef.current = stableStringify(nextShareDraft);
+    setShareDraft(nextShareDraft);
   }, [existingShare?.id, existingShare?.configRevision]);
 
   useEffect(() => {
@@ -1123,13 +1138,20 @@ export function ProviderBundleEditor({
     if (!shareDraft.enabled || shareDraft.subdomain.trim() || existingShare)
       return;
     let active = true;
-    void shareApi.suggestShareSlug().then((result) => {
-      if (active)
-        setShareDraft((current) => ({
-          ...current,
-          subdomain: result.subdomain,
-        }));
-    });
+    void shareApi
+      .suggestShareSlug()
+      .then((result) => {
+        if (active)
+          setShareDraft((current) => ({
+            ...current,
+            subdomain: result.subdomain,
+          }));
+      })
+      .catch((error) => {
+        if (active) {
+          toast.error(error instanceof Error ? error.message : String(error));
+        }
+      });
     return () => {
       active = false;
     };
@@ -1201,8 +1223,14 @@ export function ProviderBundleEditor({
       const saved = await providersApi.upsertBundle(
         toProviderBundleWriteDraft(draft),
       );
-      setDraft(editProviderBundleDraft(saved));
-      await saveBundleShare(saved.id, shareDraft, existingShare);
+      const savedDraft = editProviderBundleDraft(saved);
+      setDraft(savedDraft);
+      draftBaselineRef.current = stableStringify(savedDraft);
+      const savedShare = await saveBundleShare(saved.id, shareDraft, existingShare);
+      const savedShareDraft = savedShare
+        ? createBundleShareDraft(savedShare)
+        : shareDraft;
+      shareBaselineRef.current = stableStringify(savedShareDraft);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["provider-bundles"] }),
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
@@ -1233,7 +1261,7 @@ export function ProviderBundleEditor({
           type="button"
           size="icon"
           variant="outline"
-          onClick={onCancel}
+          onClick={closeGuard.requestClose}
           title={t("common.back")}
         >
           <ArrowLeft className="h-4 w-4" />
@@ -1622,7 +1650,7 @@ export function ProviderBundleEditor({
         <Button
           type="button"
           variant="outline"
-          onClick={onCancel}
+          onClick={closeGuard.requestClose}
           disabled={saving}
         >
           {t("common.cancel")}
@@ -1636,6 +1664,17 @@ export function ProviderBundleEditor({
           {t("common.save")}
         </Button>
       </div>
+      <ConfirmDialog
+        isOpen={closeGuard.confirmOpen}
+        title={t("provider.unsavedChanges.title")}
+        message={t("provider.unsavedChanges.editMessage")}
+        confirmText={t("provider.unsavedChanges.discard")}
+        cancelText={t("provider.unsavedChanges.keepEditing")}
+        variant="destructive"
+        zIndex="top"
+        onConfirm={closeGuard.discardAndClose}
+        onCancel={closeGuard.keepEditing}
+      />
     </div>
   );
 }

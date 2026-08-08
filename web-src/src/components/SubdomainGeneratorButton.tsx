@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Loader2, Shuffle } from "lucide-react";
-
-import { useI18n } from "@/lib/i18n";
+import { useTranslation } from "react-i18next";
 
 export interface SubdomainSuggestion {
   subdomain: string;
@@ -27,7 +26,7 @@ export function SubdomainGeneratorButton({
   onError,
   suggest,
 }: SubdomainGeneratorButtonProps) {
-  const { t } = useI18n();
+  const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const label = t("server.auth.generateSubdomain");
 

@@ -577,6 +577,9 @@ pub(in crate::api) async fn web_share_upsert_input(
     let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
     let for_sale_official_price_percent_by_app =
         web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
+    let official_price_percent =
+        web_optional_i64(value, &["officialPricePercent", "official_price_percent"])
+            .and_then(|value| u16::try_from(value).ok());
     let user_grants =
         web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
             .unwrap_or_default();
@@ -613,7 +616,7 @@ pub(in crate::api) async fn web_share_upsert_input(
         access_by_app,
         app_settings,
         for_sale_official_price_percent_by_app,
-        official_price_percent: None,
+        official_price_percent,
         auto_start: web_optional_bool(value, &["autoStart", "auto_start"]),
         description: web_optional_string_any(value, &["description"]),
         bindings,
@@ -774,12 +777,12 @@ pub(in crate::api) async fn web_email_auth_change_owner_email(
         emit_share_event(state, "share.changed", share, "owner_email_changed");
     }
 
-    if let Ok(Some(email_state)) = crate::clients::router::email_auth::load_state(&state.config_dir)
-    {
+    let email_state = crate::clients::router::email_auth::load_state(&state.config_dir)
+        .map_err(ApiError::internal)?;
+    if let Some(email_state) = email_state {
         if email_state.email.eq_ignore_ascii_case(&current_email) {
-            let _ = std::fs::remove_file(crate::clients::router::email_auth::email_auth_path(
-                &state.config_dir,
-            ));
+            crate::clients::router::email_auth::clear_state(&state.config_dir)
+                .map_err(ApiError::internal)?;
         }
     }
 
@@ -1261,7 +1264,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         .filter(|stored| {
             crate::domain::providers::bundle::is_explicit_bundle_surface(&stored.provider)
                 && crate::domain::providers::bundle::bundle_id(&stored.provider)
-                    == command.bundle_id
+                    == Some(command.bundle_id.as_str())
         })
         .collect::<Vec<_>>();
     if surfaces.is_empty() {
@@ -1514,6 +1517,22 @@ pub(in crate::api) async fn web_save_provider_share(
     let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
     let for_sale_official_price_percent_by_app =
         web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
+    let official_price_percent = match value
+        .get("officialPricePercent")
+        .or_else(|| value.get("official_price_percent"))
+    {
+        Some(Value::Null) => Some(None),
+        Some(raw) => Some(Some(
+            raw.as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "officialPricePercent must be an integer between 1 and 100",
+                    )
+                })?,
+        )),
+        None => None,
+    };
     let user_grants =
         web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
             .unwrap_or_default();
@@ -1557,6 +1576,7 @@ pub(in crate::api) async fn web_save_provider_share(
                 for_sale_official_price_percent_by_app: Some(
                     for_sale_official_price_percent_by_app,
                 ),
+                official_price_percent,
                 token_limit: Some(token_limit),
                 parallel_limit: Some(parallel_limit),
                 expires_at: Some(expires_at),

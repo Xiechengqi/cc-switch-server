@@ -4,7 +4,9 @@ use sha2::{Digest, Sha256};
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::credentials::split_provider_credentials;
 use crate::domain::providers::model::AppKind;
-use crate::domain::providers::registry::{profile_by_id, CredentialPolicy};
+use crate::domain::providers::registry::{
+    family_for_profile, profile_by_id, CredentialPolicy, CredentialSourceScope,
+};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
 use super::shares::{Share, ShareBinding};
@@ -206,9 +208,12 @@ pub fn resolve_stored_provider_credential_source(
     let Some(profile_id) = stored.resource.profile_id.as_ref() else {
         return Ok(None);
     };
-    let Some(family) = reusable_profile_family(profile_id.as_str()) else {
+    let Some(family) = family_for_profile(profile_id.as_str()) else {
         return Ok(None);
     };
+    if family.credential_source_scope == CredentialSourceScope::Surface {
+        return Ok(None);
+    }
     let Some(profile) = profile_by_id(profile_id.as_str()) else {
         return Ok(None);
     };
@@ -248,7 +253,7 @@ pub fn resolve_stored_provider_credential_source(
             )
             .into_bytes()
         }
-        CredentialPolicy::StaticSecret { .. } => {
+        CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Aws { .. } => {
             let materialized = providers.materialize_provider_record(stored)?;
             let (_, credentials) = split_provider_credentials(&materialized.provider)?;
             let mut values = credentials
@@ -256,44 +261,30 @@ pub fn resolve_stored_provider_credential_source(
                 .filter_map(|value| value.as_str())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(str::to_string)
                 .collect::<Vec<_>>();
-            values.sort();
-            values.dedup();
-            if values.len() != 1 {
+            values.sort_unstable();
+            let mut material = Vec::new();
+            for value in values {
+                material.extend_from_slice(value.as_bytes());
+                material.push(0);
+            }
+            if material.is_empty() {
                 return Ok(None);
             }
-            format!("static\0{}", values[0]).into_bytes()
+            material
         }
         _ => return Ok(None),
     };
 
     let mut digest = Sha256::new();
     digest.update(b"cc-switch-credential-source-v1\0");
-    digest.update(family.as_bytes());
+    digest.update(family.family_id.as_bytes());
     digest.update(b"\0");
     digest.update(material);
     Ok(Some(CredentialSourceIdentity {
-        family,
+        family: family.family_id.as_str(),
         digest: digest.finalize().into(),
     }))
-}
-
-fn reusable_profile_family(profile_id: &str) -> Option<&'static str> {
-    let suffix = profile_id.split_once('.')?.1;
-    match suffix {
-        "openai_oauth" => Some("openai_oauth"),
-        "grok_oauth" => Some("grok_oauth"),
-        "cursor_oauth" => Some("cursor_oauth"),
-        "antigravity_oauth" => Some("antigravity_oauth"),
-        "antigravity_cli" => Some("agy_oauth"),
-        "cursor_api_key" => Some("cursor_api_key"),
-        "ollama_cloud" => Some("ollama_cloud"),
-        "openrouter" => Some("openrouter"),
-        "nvidia" => Some("nvidia"),
-        "deepseek_api" => Some("deepseek_api"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -305,13 +296,22 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::Account;
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::providers::registry::ProfileId;
+    use crate::domain::providers::registry::{provider_registry, ProfileId};
     use crate::domain::providers::store::ProviderResourceMetadata;
 
     fn account(id: &str) -> Account {
         serde_json::from_value(json!({
             "id": id,
             "providerType": "codex_oauth",
+            "authIdentityGeneration": 7
+        }))
+        .unwrap()
+    }
+
+    fn google_account(id: &str) -> Account {
+        serde_json::from_value(json!({
+            "id": id,
+            "providerType": "gemini_cli",
             "authIdentityGeneration": 7
         }))
         .unwrap()
@@ -373,6 +373,55 @@ mod tests {
             },
             ProviderResourceMetadata {
                 profile_id: Some(ProfileId::parse(profile_id).unwrap()),
+                ..ProviderResourceMetadata::default()
+            },
+        )
+    }
+
+    fn google_oauth_provider(app: AppKind, id: &str, account_id: &str) -> StoredProvider {
+        let profile_id = format!("{}.google_oauth", app.as_str());
+        let mut store = ProviderStore::default();
+        store.upsert_with_resource(
+            app,
+            Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account".to_string()),
+                        auth_provider: Some("gemini_cli".to_string()),
+                        account_id: Some(account_id.to_string()),
+                        auth_identity_generation: Some(7),
+                    }),
+                    ..ProviderMeta::default()
+                }),
+                extra: BTreeMap::new(),
+            },
+            ProviderResourceMetadata {
+                profile_id: Some(ProfileId::parse(profile_id).unwrap()),
+                ..ProviderResourceMetadata::default()
+            },
+        )
+    }
+
+    fn custom_provider(app: AppKind, id: &str, secret: &str) -> StoredProvider {
+        let mut store = ProviderStore::default();
+        store.upsert_with_resource(
+            app,
+            Provider {
+                id: id.to_string(),
+                name: id.to_string(),
+                settings_config: json!({"apiKey": secret}),
+                category: Some("custom".to_string()),
+                meta: None,
+                extra: BTreeMap::new(),
+            },
+            ProviderResourceMetadata {
+                profile_id: Some(
+                    ProfileId::parse(format!("{}.custom_http", app.as_str())).unwrap(),
+                ),
                 ..ProviderResourceMetadata::default()
             },
         )
@@ -496,5 +545,97 @@ mod tests {
             CredentialSourceError::SourceMismatch { .. }
         ));
         assert_eq!(error.code(), "cc_switch_share_credential_source_mismatch");
+    }
+
+    #[test]
+    fn google_oauth_surfaces_share_one_registry_declared_credential_source() {
+        let providers = ProviderStore {
+            providers: vec![
+                google_oauth_provider(AppKind::Claude, "google-bundle", "google-account"),
+                google_oauth_provider(AppKind::Gemini, "google-bundle", "google-account"),
+            ],
+            ..ProviderStore::default()
+        };
+        let accounts = AccountStore {
+            accounts: vec![google_account("google-account")],
+            ..AccountStore::default()
+        };
+        let bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "google-bundle".to_string(),
+                provider_type: ProviderType::GeminiCli,
+            },
+            ShareBinding {
+                app: AppKind::Gemini,
+                provider_id: "google-bundle".to_string(),
+                provider_type: ProviderType::GeminiCli,
+            },
+        ];
+
+        assert!(
+            shared_credential_source_for_bindings(&providers, &accounts, &bindings)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn surface_scoped_custom_http_rejects_multi_surface_reuse() {
+        let providers = ProviderStore {
+            providers: vec![
+                custom_provider(AppKind::Claude, "custom-bundle", "claude-key"),
+                custom_provider(AppKind::Codex, "custom-bundle", "codex-key"),
+            ],
+            ..ProviderStore::default()
+        };
+        let bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "custom-bundle".to_string(),
+                provider_type: ProviderType::Claude,
+            },
+            ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "custom-bundle".to_string(),
+                provider_type: ProviderType::Codex,
+            },
+        ];
+
+        assert!(matches!(
+            shared_credential_source_for_bindings(&providers, &AccountStore::default(), &bindings),
+            Err(CredentialSourceError::ReuseUnsupported { .. })
+        ));
+        assert!(resolve_provider_credential_source(
+            &providers,
+            &AccountStore::default(),
+            AppKind::Claude,
+            "custom-bundle"
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn every_multi_surface_family_declares_a_compatible_credential_scope() {
+        for family in provider_registry()
+            .families
+            .iter()
+            .filter(|family| family.surfaces.len() > 1)
+        {
+            let profile = profile_by_id(family.credential_profile_id.as_str()).unwrap();
+            match family.credential_source_scope {
+                CredentialSourceScope::Bundle => assert!(matches!(
+                    profile.credential_policy,
+                    CredentialPolicy::ManagedAccount { .. }
+                        | CredentialPolicy::StaticSecret { .. }
+                        | CredentialPolicy::Aws { .. }
+                )),
+                CredentialSourceScope::Surface => assert!(matches!(
+                    profile.credential_policy,
+                    CredentialPolicy::Custom | CredentialPolicy::Legacy
+                )),
+            }
+        }
     }
 }

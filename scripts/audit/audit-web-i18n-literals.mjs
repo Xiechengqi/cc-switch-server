@@ -107,9 +107,7 @@ for (const file of files) {
   const lineStarts = lineStartOffsets(source);
   collectVisibleLiterals(file, source, lineStarts, literalFindings);
   if (
-    source.includes("react-i18next") ||
-    source.includes('from "@/lib/i18n"') ||
-    source.includes("from '@/lib/i18n'")
+    source.includes("react-i18next")
   ) {
     collectTranslationCalls(file, source, translationCalls);
   }
@@ -214,7 +212,6 @@ function flattenKeys(tree, prefix = "", output = new Set()) {
 }
 
 function loadLocaleKeys() {
-  const inlineServerKeys = loadInlineServerResourceKeys();
   return Object.fromEntries(
     LANGUAGES.map((language) => {
       const base = JSON.parse(
@@ -230,9 +227,6 @@ function loadLocaleKeys() {
         ),
       );
       const keys = flattenKeys(mergeTrees(base, server));
-      for (const key of inlineServerKeys[language]) {
-        keys.add(key);
-      }
       for (const namespace of ACCOUNT_TRANSLATION_NAMESPACES) {
         for (const key of ACCOUNT_TRANSLATION_KEYS) {
           keys.add(`${namespace}.${key}`);
@@ -241,72 +235,6 @@ function loadLocaleKeys() {
       return [language, keys];
     }),
   );
-}
-
-function loadInlineServerResourceKeys() {
-  const keys = Object.fromEntries(
-    LANGUAGES.map((language) => [language, new Set()]),
-  );
-  const file = path.join(WEB_SRC, "lib", "i18n.tsx");
-  const source = fs.readFileSync(file, "utf8");
-  const sourceFile = ts.createSourceFile(
-    file,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  );
-
-  const visit = (node) => {
-    if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      node.name.text === "serverResources" &&
-      node.initializer &&
-      ts.isObjectLiteralExpression(node.initializer)
-    ) {
-      for (const property of node.initializer.properties) {
-        if (!ts.isPropertyAssignment(property)) continue;
-        const language = propertyName(property.name);
-        if (
-          !language ||
-          !LANGUAGES.includes(language) ||
-          !ts.isObjectLiteralExpression(property.initializer)
-        ) {
-          continue;
-        }
-        collectObjectLiteralKeys(property.initializer, "", keys[language]);
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return keys;
-}
-
-function collectObjectLiteralKeys(node, prefix, output) {
-  for (const property of node.properties) {
-    if (!ts.isPropertyAssignment(property)) continue;
-    const name = propertyName(property.name);
-    if (!name) continue;
-    const qualified = prefix ? `${prefix}.${name}` : name;
-    if (ts.isObjectLiteralExpression(property.initializer)) {
-      collectObjectLiteralKeys(property.initializer, qualified, output);
-    } else {
-      output.add(qualified);
-    }
-  }
-}
-
-function propertyName(node) {
-  if (
-    ts.isIdentifier(node) ||
-    ts.isStringLiteralLike(node) ||
-    ts.isNumericLiteral(node)
-  ) {
-    return node.text;
-  }
-  return null;
 }
 
 function collectVisibleLiterals(file, source, lineStarts, output) {

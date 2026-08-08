@@ -87,6 +87,7 @@ export interface ShareRecord {
   accessByApp?: ShareAccessByApp;
   appSettings?: ShareAppSettingsByApp;
   forSaleOfficialPricePercentByApp: Record<string, number>;
+  officialPricePercent: number | null;
   description?: string | null;
   forSale: "Yes" | "No" | "Free";
   /** One to three entries, with at most one provider per app. */
@@ -129,6 +130,8 @@ export interface CreateShareParams {
   marketAccessMode?: "selected" | "all";
   accessByApp?: ShareAccessByApp;
   appSettings?: ShareAppSettingsByApp;
+  forSaleOfficialPricePercentByApp?: Record<string, number>;
+  officialPricePercent?: number | null;
   userGrants?: ShareUserGrantMap;
 }
 
@@ -218,6 +221,7 @@ export interface SaveProviderShareParams {
   accessByApp: ShareAccessByApp;
   appSettings: ShareAppSettingsByApp;
   forSaleOfficialPricePercentByApp: Record<string, number>;
+  officialPricePercent: number | null;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;

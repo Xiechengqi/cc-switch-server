@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Loader2, Square } from "lucide-react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import "@fontsource/source-code-pro/latin-400.css";
@@ -9,6 +9,7 @@ import "@fontsource/source-code-pro/latin-400.css";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
+import { useDarkMode } from "@/hooks/useDarkMode";
 import { jsonFetch } from "@/lib/runtime";
 import {
   consumeAuthenticatedSse,
@@ -29,6 +30,52 @@ const MAX_FONT = 18;
 const TARGET_COLS = 100;
 const INPUT_BATCH_MS = 12;
 const RESIZE_DEBOUNCE_MS = 100;
+
+const LIGHT_TERMINAL_THEME: ITheme = {
+  background: "#f6f8fa",
+  foreground: "#1f2328",
+  cursor: "#1f2328",
+  selectionBackground: "#0969da55",
+  black: "#24292f",
+  red: "#cf222e",
+  green: "#116329",
+  yellow: "#4d2d00",
+  blue: "#0969da",
+  magenta: "#8250df",
+  cyan: "#1b7c83",
+  white: "#6e7781",
+  brightBlack: "#57606a",
+  brightRed: "#a40e26",
+  brightGreen: "#1a7f37",
+  brightYellow: "#633c01",
+  brightBlue: "#218bff",
+  brightMagenta: "#a475f9",
+  brightCyan: "#3192aa",
+  brightWhite: "#8c959f",
+};
+
+const DARK_TERMINAL_THEME: ITheme = {
+  background: "#0d1117",
+  foreground: "#e6edf3",
+  cursor: "#e6edf3",
+  selectionBackground: "#58a6ff55",
+  black: "#484f58",
+  red: "#ff7b72",
+  green: "#3fb950",
+  yellow: "#d29922",
+  blue: "#58a6ff",
+  magenta: "#bc8cff",
+  cyan: "#39c5cf",
+  white: "#b1bac4",
+  brightBlack: "#6e7681",
+  brightRed: "#ffa198",
+  brightGreen: "#56d364",
+  brightYellow: "#e3b341",
+  brightBlue: "#79c0ff",
+  brightMagenta: "#d2a8ff",
+  brightCyan: "#56d4dd",
+  brightWhite: "#f0f6fc",
+};
 
 const STATUS_CLASS_NAME: Record<ConnState, string> = {
   connecting:
@@ -94,6 +141,7 @@ function readableError(error: unknown, fallback: string): string {
 
 export default function TerminalPage() {
   const { t } = useTranslation();
+  const isDarkMode = useDarkMode();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -123,6 +171,14 @@ export default function TerminalPage() {
   }, []);
 
   useEffect(() => {
+    if (termRef.current) {
+      termRef.current.options.theme = isDarkMode
+        ? DARK_TERMINAL_THEME
+        : LIGHT_TERMINAL_THEME;
+    }
+  }, [isDarkMode]);
+
+  useEffect(() => {
     disposedRef.current = false;
     streamReadyRef.current = false;
     setError(null);
@@ -136,28 +192,9 @@ export default function TerminalPage() {
       fontFamily:
         '"Source Code Pro", ui-monospace, SFMono-Regular, Menlo, monospace',
       fontSize: computeFontSize(host.clientWidth),
-      theme: {
-        background: "#f6f8fa",
-        foreground: "#1f2328",
-        cursor: "#1f2328",
-        selectionBackground: "#0969da55",
-        black: "#24292f",
-        red: "#cf222e",
-        green: "#116329",
-        yellow: "#4d2d00",
-        blue: "#0969da",
-        magenta: "#8250df",
-        cyan: "#1b7c83",
-        white: "#6e7781",
-        brightBlack: "#57606a",
-        brightRed: "#a40e26",
-        brightGreen: "#1a7f37",
-        brightYellow: "#633c01",
-        brightBlue: "#218bff",
-        brightMagenta: "#a475f9",
-        brightCyan: "#3192aa",
-        brightWhite: "#8c959f",
-      },
+      theme: document.documentElement.classList.contains("dark")
+        ? DARK_TERMINAL_THEME
+        : LIGHT_TERMINAL_THEME,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -370,7 +407,7 @@ export default function TerminalPage() {
       </div>
 
       {error && (
-        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300">
           {error}
         </div>
       )}
@@ -378,8 +415,8 @@ export default function TerminalPage() {
       <div
         ref={hostRef}
         className={cn(
-          "min-h-0 flex-1 overflow-hidden rounded-lg border border-black/10",
-          "bg-[#f6f8fa]",
+          "min-h-0 flex-1 overflow-hidden rounded-lg border border-border",
+          "bg-[#f6f8fa] dark:bg-[#0d1117]",
         )}
       />
     </div>

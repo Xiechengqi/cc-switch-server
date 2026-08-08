@@ -20,7 +20,6 @@ export function SecretInput({ className, type, ...props }: InputProps) {
       {isPasswordField ? (
         <button
           type="button"
-          tabIndex={-1}
           aria-label={visible ? t("common.hide") : t("common.show")}
           className="absolute inset-y-0 right-0 inline-flex w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
           onClick={() => setVisible((current) => !current)}

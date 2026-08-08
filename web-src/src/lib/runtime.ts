@@ -1,7 +1,6 @@
 import { isRemoteWebMode } from "@/lib/api/auth";
 import {
   clearRouterSessionTokens,
-  loginWithWebPassword,
   readRouterAccessToken,
   routerAuthFetch,
 } from "@/lib/routerAuth";
@@ -105,7 +104,6 @@ export class HttpResponseError extends Error {
 }
 
 const TOKEN_KEY = "cc_switch_server_token";
-const PASSWORD_KEY = "cc_switch_server_password";
 export const PROVIDER_CONTRACT_VERSION = 2;
 const PROVIDER_CONTRACT_HEADER = "x-cc-switch-provider-contract-version";
 
@@ -123,18 +121,6 @@ export function writeToken(token: string | null): void {
     localStorage.setItem(TOKEN_KEY, token);
   } else {
     localStorage.removeItem(TOKEN_KEY);
-  }
-}
-
-export function readCachedPassword(): string | null {
-  return localStorage.getItem(PASSWORD_KEY);
-}
-
-export function writeCachedPassword(password: string | null): void {
-  if (password) {
-    localStorage.setItem(PASSWORD_KEY, password);
-  } else {
-    localStorage.removeItem(PASSWORD_KEY);
   }
 }
 
@@ -160,7 +146,6 @@ export async function loginWithPassword(password: string): Promise<string> {
   }
   clearRouterSessionTokens();
   writeToken(token);
-  writeCachedPassword(password);
   return token;
 }
 
@@ -180,21 +165,8 @@ async function localApiFetch(
     return response;
   }
 
-  const cachedPassword = readCachedPassword();
-  if (!cachedPassword) {
-    writeToken(null);
-    return response;
-  }
-
-  try {
-    await loginWithPassword(cachedPassword);
-  } catch {
-    writeToken(null);
-    writeCachedPassword(null);
-    return response;
-  }
-
-  return request();
+  writeToken(null);
+  return response;
 }
 
 export async function apiFetch(
@@ -298,20 +270,8 @@ async function tryRemoteAutoLogin(
     status: "auth-required",
   },
 ): Promise<WebRuntimeContext> {
-  if (!allowAutoLogin || fallback.auth?.setupRequired) {
-    return fallback;
-  }
-  const cachedPassword = readCachedPassword();
-  if (!cachedPassword) {
-    return fallback;
-  }
-  try {
-    await loginWithWebPassword(cachedPassword);
-    return getRemoteWebRuntimeContext(false);
-  } catch {
-    writeCachedPassword(null);
-    return fallback;
-  }
+  void allowAutoLogin;
+  return fallback;
 }
 
 async function tryAutoLoginFromCache(
@@ -321,20 +281,8 @@ async function tryAutoLoginFromCache(
     status: "auth-required",
   },
 ): Promise<WebRuntimeContext> {
-  if (!allowAutoLogin || fallback.auth?.setupRequired) {
-    return fallback;
-  }
-  const cachedPassword = readCachedPassword();
-  if (!cachedPassword) {
-    return fallback;
-  }
-  try {
-    await loginWithPassword(cachedPassword);
-    return getWebRuntimeContext(false);
-  } catch {
-    writeCachedPassword(null);
-    return fallback;
-  }
+  void allowAutoLogin;
+  return fallback;
 }
 
 export async function invokeCommand<T>(

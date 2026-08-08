@@ -91,7 +91,9 @@ export function useOpencodeFormState({
         ) as Record<string, any>;
         updater(config);
         onSettingsConfigChange(JSON.stringify(config, null, 2));
-      } catch {}
+      } catch (error) {
+        console.warn("[OpenCode] Ignoring malformed settings while editing", error);
+      }
     },
     [getSettingsConfig, onSettingsConfigChange],
   );

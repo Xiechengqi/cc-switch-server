@@ -109,6 +109,7 @@ export function AuthCenterPanel({
   const { data: settings } = useSettingsQuery();
   const capabilityQuery = useAccountCapabilitiesQuery({ enabled: serverMode });
   const [centerOpen, setCenterOpen] = useState(false);
+  const [savingQuotaSettings, setSavingQuotaSettings] = useState(false);
   const currentRefreshInterval = getOauthQuotaRefreshIntervalMinutes(settings);
   const currentRefreshTimeout = getOauthQuotaRefreshTimeoutSeconds(settings);
   const [refreshIntervalInput, setRefreshIntervalInput] = useState(
@@ -261,18 +262,25 @@ export function AuthCenterPanel({
       return;
     }
 
-    const { webdavSync: _, ...rest } = settings;
-    await settingsApi.save({
-      ...rest,
-      oauthQuotaRefreshIntervalMinutes: parsedRefreshInterval,
-      oauthQuotaRefreshTimeoutSeconds: parsedRefreshTimeout,
-    });
-    await invalidateQuotaQueries();
-    toast.success(
-      t("settings.authCenter.quotaSettingsSaved", {
-        defaultValue: "OAuth 用量刷新设置已保存",
-      }),
-    );
+    setSavingQuotaSettings(true);
+    try {
+      const { webdavSync: _, ...rest } = settings;
+      await settingsApi.save({
+        ...rest,
+        oauthQuotaRefreshIntervalMinutes: parsedRefreshInterval,
+        oauthQuotaRefreshTimeoutSeconds: parsedRefreshTimeout,
+      });
+      await invalidateQuotaQueries();
+      toast.success(
+        t("settings.authCenter.quotaSettingsSaved", {
+          defaultValue: "OAuth 用量刷新设置已保存",
+        }),
+      );
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingQuotaSettings(false);
+    }
   };
 
   return (
@@ -355,7 +363,7 @@ export function AuthCenterPanel({
                           setRefreshIntervalInput(event.currentTarget.value)
                         }
                         className="w-24"
-                        disabled={!settings}
+                        disabled={!settings || savingQuotaSettings}
                       />
                       <span className="text-sm text-muted-foreground">
                         {t("settings.authCenter.quotaRefreshIntervalMinutes", {
@@ -389,7 +397,7 @@ export function AuthCenterPanel({
                           setRefreshTimeoutInput(event.currentTarget.value)
                         }
                         className="w-24"
-                        disabled={!settings}
+                        disabled={!settings || savingQuotaSettings}
                       />
                       <span className="text-sm text-muted-foreground">
                         {t("settings.authCenter.quotaRefreshTimeoutSeconds", {
@@ -404,8 +412,13 @@ export function AuthCenterPanel({
                   <Button
                     type="button"
                     onClick={() => void handleSaveQuotaSettings()}
-                    disabled={!settings || !hasQuotaSettingChanges}
+                    disabled={
+                      !settings || !hasQuotaSettingChanges || savingQuotaSettings
+                    }
                   >
+                    {savingQuotaSettings ? (
+                      <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                    ) : null}
                     {t("common.save", { defaultValue: "保存" })}
                   </Button>
                 </div>

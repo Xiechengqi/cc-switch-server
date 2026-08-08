@@ -180,6 +180,53 @@ fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_
     })
 }
 
+fn nvidia_provider_bundle_draft(bundle_id: &str, client_request_id: &str) -> Value {
+    let surface = |app: &str, profile_id: &str| {
+        json!({
+            "app": app,
+            "enabled": true,
+            "profileId": profile_id
+        })
+    };
+    json!({
+        "id": bundle_id,
+        "familyId": "family.nvidia",
+        "name": "NVIDIA Bundle",
+        "modelPolicy": "single",
+        "upstreamModel": "moonshotai/kimi-k2.5",
+        "surfaces": [
+            surface("claude", "claude.nvidia"),
+            surface("codex", "codex.nvidia")
+        ],
+        "credentialPatches": {
+            "/settingsConfig/apiKey": {
+                "action": "replace",
+                "value": "nvidia-test-key"
+            }
+        },
+        "clientRequestId": client_request_id
+    })
+}
+
+fn ordinary_gemini_provider_request(provider_id: &str, request_id: &str) -> Value {
+    json!({
+        "app": "gemini",
+        "profileId": "gemini.google_api_key",
+        "clientRequestId": request_id,
+        "provider": {
+            "id": provider_id,
+            "name": "Gemini API Key",
+            "settingsConfig": {}
+        },
+        "credentialPatches": {
+            "/settingsConfig/apiKey": {
+                "action": "replace",
+                "value": "gemini-test-key"
+            }
+        }
+    })
+}
+
 #[tokio::test]
 async fn share_router_health_is_hidden_without_probe_header() {
     let state = test_state();
@@ -2725,9 +2772,12 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
     let status = response.status();
     let body = json_body(response).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"].as_str(), Some("TOOL_JSON_INCOMPLETE"));
-    assert_eq!(body["type"].as_str(), Some("upstream_tool_json_error"));
-    assert_eq!(body["retryable"].as_bool(), Some(false));
+    assert_eq!(body["error"]["code"].as_str(), Some("TOOL_JSON_INCOMPLETE"));
+    assert_eq!(
+        body["error"]["type"].as_str(),
+        Some("upstream_tool_json_error")
+    );
+    assert_eq!(body["error"]["details"]["retryable"].as_bool(), Some(false));
     assert_eq!(seen.load(Ordering::SeqCst), 2);
 
     let usage = state.usage_snapshot().await;
@@ -3268,8 +3318,8 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = json_body(response).await;
-    assert_eq!(body["code"], "cc_switch_no_available_provider");
-    assert!(body["error"]
+    assert_eq!(body["error"]["code"], "cc_switch_no_available_provider");
+    assert!(body["error"]["message"]
         .as_str()
         .is_some_and(|error| error.contains("explicit account binding")));
     assert_eq!(upstream_requests.load(Ordering::SeqCst), 0);
@@ -5141,7 +5191,11 @@ async fn provider_share_settings_are_saved_atomically() {
                 }
             }),
         )
-        .route("/v1/shares/batch-sync", post(|| async { StatusCode::OK }));
+        .route("/v1/shares/batch-sync", post(|| async { StatusCode::OK }))
+        .route(
+            "/v1/shares/runtime-refresh",
+            post(|| async { StatusCode::OK }),
+        );
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -5201,6 +5255,7 @@ async fn provider_share_settings_are_saved_atomically() {
                     "forSaleOfficialPricePercentByApp": {
                         "codex": 80
                     },
+                    "officialPricePercent": 80,
                     "tokenLimit": 123,
                     "parallelLimit": 4,
                     "expiresAt": "2030-01-01T00:00:00Z"
@@ -5219,10 +5274,7 @@ async fn provider_share_settings_are_saved_atomically() {
     assert_eq!(saved["forSale"].as_bool(), Some(true));
     assert_eq!(saved["tokenLimit"].as_u64(), Some(123));
     assert_eq!(saved["parallelLimit"].as_u64(), Some(4));
-    assert_eq!(
-        saved["forSaleOfficialPricePercentByApp"]["codex"].as_u64(),
-        Some(80)
-    );
+    assert_eq!(saved["officialPricePercent"].as_u64(), Some(80));
     assert_eq!(saved["expiresAt"].as_i64(), Some(1_893_456_000_000));
     assert_eq!(
         saved["acl"]["sharedWithEmails"][0].as_str(),
@@ -5233,22 +5285,57 @@ async fn provider_share_settings_are_saved_atomically() {
         saved["bindings"][0]["providerId"].as_str(),
         Some("provider-save")
     );
-    assert_eq!(
-        saved["appSettings"]["codex"]["expiresAt"].as_str(),
-        Some("2030-01-01T00:00:00+00:00")
-    );
     let stored = state
         .mutate_shares(|store| store.get("share-provider-save").cloned())
         .await
         .unwrap();
-    assert_eq!(
-        stored.for_sale_official_price_percent_by_app.get("codex"),
-        Some(&80)
-    );
+    assert_eq!(stored.official_price_percent, Some(80));
     assert_eq!(stored.router_synced_revision, stored.config_revision);
     assert!(stored.router_last_sync_error.is_none());
 
     let saved_revision = saved["configRevision"].as_u64().unwrap();
+    let divergent = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/save_provider_share",
+            json!({
+                "params": {
+                    "shareId": "share-provider-save",
+                    "expectedConfigRevision": saved_revision,
+                    "subdomain": "after-save",
+                    "description": "must not persist",
+                    "forSale": "Yes",
+                    "marketAccessMode": "selected",
+                    "sharedWithEmails": ["friend@example.com"],
+                    "accessByApp": {},
+                    "appSettings": {},
+                    "forSaleOfficialPricePercentByApp": {"codex": 80},
+                    "officialPricePercent": 60,
+                    "tokenLimit": 123,
+                    "parallelLimit": 4,
+                    "expiresAt": "2030-01-01T00:00:00Z",
+                    "userGrants": {}
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let divergent_status = divergent.status();
+    let divergent_body = json_body(divergent).await;
+    assert_eq!(divergent_status, StatusCode::CONFLICT);
+    assert_eq!(divergent_body["code"], "cc_switch_share_policy_divergent");
+    let unchanged = state
+        .mutate_shares(|store| store.get("share-provider-save").cloned())
+        .await
+        .unwrap();
+    assert_eq!(unchanged.config_revision, saved_revision);
+    assert_eq!(
+        unchanged.description.as_deref(),
+        Some("Provider-scoped share")
+    );
+
     let pending_app = app.clone();
     let pending_token = token.clone();
     let pending_save = tokio::spawn(async move {
@@ -6254,7 +6341,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
-    assert_eq!(registry["registry"]["schemaVersion"], 4);
+    assert_eq!(registry["registry"]["schemaVersion"], 5);
     assert_eq!(
         registry["registry"]["optionSchemas"]
             .as_array()
@@ -6598,14 +6685,20 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     for field in ["bundleId", "familyId", "surfaceEnabled"] {
         detached_surface.as_object_mut().unwrap().remove(field);
     }
-    for provider in [
-        detached_surface,
-        json!({
-            "id": "partial-bundle-metadata",
-            "name": "Partial Bundle metadata",
-            "settingsConfig": {},
-            "surfaceEnabled": true
-        }),
+    for (provider, expected_code) in [
+        (
+            detached_surface,
+            "cc_switch_provider_management_id_conflict",
+        ),
+        (
+            json!({
+                "id": "partial-bundle-metadata",
+                "name": "Partial Bundle metadata",
+                "settingsConfig": {},
+                "surfaceEnabled": true
+            }),
+            "cc_switch_provider_bundle_surface_managed",
+        ),
     ] {
         let blocked_import = app
             .clone()
@@ -6621,10 +6714,7 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
             .await
             .unwrap();
         assert_eq!(blocked_import.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            json_body(blocked_import).await["code"],
-            "cc_switch_provider_bundle_surface_managed"
-        );
+        assert_eq!(json_body(blocked_import).await["code"], expected_code);
     }
 
     for (path, payload) in [
@@ -6829,6 +6919,124 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
 }
 
 #[tokio::test]
+async fn provider_and_bundle_ids_use_one_global_management_namespace() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+
+    let ordinary_first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers",
+            ordinary_gemini_provider_request(
+                "namespace-ordinary-first",
+                "namespace-ordinary-first-create",
+            ),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ordinary_first.status(), StatusCode::OK);
+
+    let blocked_bundle = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            nvidia_provider_bundle_draft(
+                "namespace-ordinary-first",
+                "namespace-bundle-after-ordinary",
+            ),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked_bundle.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(blocked_bundle).await["code"],
+        "cc_switch_provider_management_id_conflict"
+    );
+
+    let bundle_first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            nvidia_provider_bundle_draft("namespace-bundle-first", "namespace-bundle-first-create"),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bundle_first.status(), StatusCode::OK);
+
+    let blocked_ordinary = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/providers",
+            ordinary_gemini_provider_request(
+                "namespace-bundle-first",
+                "namespace-ordinary-after-bundle",
+            ),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked_ordinary.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(blocked_ordinary).await["code"],
+        "cc_switch_provider_management_id_conflict"
+    );
+
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/provider-bundles/namespace-bundle-first/delete-preview",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(json_body(preview).await["preview"]["revision"], 1);
+
+    let deleted_ordinary = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/providers/namespace-ordinary-first?app=gemini&expectedRevision=1",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted_ordinary.status(), StatusCode::OK);
+    assert_eq!(
+        providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .filter(|stored| stored.provider.id == "namespace-bundle-first")
+            .count(),
+        2
+    );
+
+    let deleted_bundle = app
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/provider-bundles/namespace-bundle-first?expectedRevision=1",
+            Value::Null,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted_bundle.status(), StatusCode::OK);
+    assert!(providers_snapshot(&state).await.providers.is_empty());
+}
+
+#[tokio::test]
 async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_plans() {
     let state = test_state();
     let app = app_router(state.clone());
@@ -6980,7 +7188,13 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
         ))
         .await
         .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
+    let created_status = created.status();
+    let created_body = json_body(created).await;
+    assert_eq!(
+        created_status,
+        StatusCode::OK,
+        "response body: {created_body}"
+    );
 
     let created_share = app
         .clone()
@@ -8407,7 +8621,12 @@ async fn share_delete_returns_conflict_until_in_flight_request_finishes() {
         .await
         .unwrap();
     let (_invocation, guard) = state
-        .validate_and_acquire_share_invocation(&share.id, AppKind::Codex, None, 1)
+        .validate_and_acquire_share_invocation(
+            &share.id,
+            AppKind::Codex,
+            Some("owner@example.com"),
+            1,
+        )
         .await
         .unwrap();
     let app = app_router(state.clone());
@@ -8430,7 +8649,7 @@ async fn share_delete_returns_conflict_until_in_flight_request_finishes() {
     );
 
     state
-        .record_share_invocation_result(&share.id, None, 41, 1)
+        .record_share_invocation_result(&share.id, Some("owner@example.com"), 41, 1)
         .await;
     drop(guard);
     let deleted = app
@@ -10385,7 +10604,12 @@ async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
     let router_server = tokio::spawn(async move {
         axum::serve(
             listener,
-            Router::new().route("/v1/shares/batch-sync", post(|| async { StatusCode::OK })),
+            Router::new()
+                .route("/v1/shares/batch-sync", post(|| async { StatusCode::OK }))
+                .route(
+                    "/v1/shares/runtime-refresh",
+                    post(|| async { StatusCode::OK }),
+                ),
         )
         .await
         .unwrap();
@@ -10623,14 +10847,9 @@ async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
     assert_eq!(saved["description"], "edited from Codex");
     assert_eq!(saved["tokenLimit"], 456);
     assert_eq!(saved["parallelLimit"], 3);
-    assert_eq!(
-        saved["appSettings"]["claude"],
-        saved["appSettings"]["codex"]
-    );
-    assert_eq!(
-        saved["forSaleOfficialPricePercentByApp"],
-        json!({"claude": 75, "codex": 75})
-    );
+    assert_eq!(saved["officialPricePercent"], 75);
+    assert!(saved.get("appSettings").is_none());
+    assert!(saved.get("forSaleOfficialPricePercentByApp").is_none());
 
     let connect_info = app
         .clone()

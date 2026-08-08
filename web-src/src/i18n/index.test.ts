@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import i18n from "./index";
+import i18n, { normalizeLanguage } from "./index";
 import en from "./locales/en.json";
 import ja from "./locales/ja.json";
 import zh from "./locales/zh.json";
@@ -38,6 +38,23 @@ const criticalKeys = [
   "share.confirmDeleteMessage",
   "share.freeConfirm",
 ] as const;
+
+describe("language normalization", () => {
+  it.each([
+    ["zh", "zh"],
+    ["zh-CN", "zh"],
+    ["zh_Hans_CN", "zh"],
+    ["zh-TW", "zh-TW"],
+    ["zh-Hant-HK", "zh-TW"],
+    ["ja-JP", "ja"],
+    ["en-US", "en"],
+    ["zh-XX", "en"],
+    ["fr-FR", "en"],
+    [undefined, "en"],
+  ] as const)("maps %s to %s", (input, expected) => {
+    expect(normalizeLanguage(input)).toBe(expected);
+  });
+});
 
 describe("i18n resources", () => {
   it("provides every critical dialog string in all supported languages", () => {

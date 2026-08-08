@@ -23,6 +23,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { useProviderHealth } from "@/lib/query/providerHealth";
 import { useTokenMarketsQuery } from "@/lib/query";
@@ -82,6 +83,7 @@ export function ShareCard({
   const { t } = useTranslation();
   const [connectionExpanded, setConnectionExpanded] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const { data: markets = [] } = useTokenMarketsQuery(settingsExpanded);
   const ratio = getShareUsageRatio(share);
   // P8：多 app share。胸标里渲染每个已绑定 slot 的 chip + 健康色点。
@@ -279,12 +281,7 @@ export function ShareCard({
                 variant="outline"
                 size="sm"
                 disabled={isBusy}
-                onClick={() => {
-                  if (!window.confirm(t("share.confirmResetUsageMessage"))) {
-                    return;
-                  }
-                  void onResetUsage(share);
-                }}
+                onClick={() => setResetConfirmOpen(true)}
               >
                 <RotateCcw className="h-4 w-4" />
                 {t("share.resetUsage")}
@@ -422,6 +419,18 @@ export function ShareCard({
         </section>
 
         <ShareRequestLogTable shareId={share.id} />
+        <ConfirmDialog
+          isOpen={resetConfirmOpen}
+          title={t("share.resetUsage")}
+          message={t("share.confirmResetUsageMessage")}
+          confirmText={t("share.resetUsage")}
+          confirmDisabled={isBusy}
+          onCancel={() => setResetConfirmOpen(false)}
+          onConfirm={async () => {
+            await onResetUsage(share);
+            setResetConfirmOpen(false);
+          }}
+        />
       </CardContent>
     </Card>
   );

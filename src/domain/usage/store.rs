@@ -2012,6 +2012,8 @@ fn append_usage_journal_record(
         .with_context(|| format!("append usage jsonl {}", path.display()))?;
     file.flush()
         .with_context(|| format!("flush usage jsonl {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("sync usage jsonl {}", path.display()))?;
     Ok(())
 }
 

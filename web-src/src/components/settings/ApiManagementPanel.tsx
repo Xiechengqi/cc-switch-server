@@ -1,11 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   Copy,
+  Eye,
+  EyeOff,
   KeyRound,
+  Loader2,
   RotateCcw,
   ShieldAlert,
   Trash2,
+  X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -14,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { copyText } from "@/lib/clipboard";
 import { settingsApi, type ApiManagementConfig } from "@/lib/api/settings";
 
 const DEFAULT_CONFIG: ApiManagementConfig = {
@@ -31,21 +36,38 @@ type DangerousCapability = "restartEnabled" | "upgradeEnabled";
 export function ApiManagementPanel() {
   const { t } = useTranslation();
   const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const configRef = useRef(config);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [ttlHours, setTtlHours] = useState(1);
   const [visibleToken, setVisibleToken] = useState<string | null>(null);
+  const [tokenRevealed, setTokenRevealed] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
+  const logTailSaveTimer = useRef<number | null>(null);
   const [confirmCapability, setConfirmCapability] =
     useState<DangerousCapability | null>(null);
 
   useEffect(() => {
     settingsApi
       .getApiManagement()
-      .then((value) => setConfig({ ...DEFAULT_CONFIG, ...value }))
+      .then((value) => {
+        const next = { ...DEFAULT_CONFIG, ...value };
+        configRef.current = next;
+        setConfig(next);
+      })
       .catch((error) => toast.error(String(error)))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(
+    () => () => {
+      if (logTailSaveTimer.current != null) {
+        window.clearTimeout(logTailSaveTimer.current);
+      }
+    },
+    [],
+  );
 
   const expiresLabel = config.tokenExpiresAtMs
     ? new Date(config.tokenExpiresAtMs).toLocaleString()
@@ -64,15 +86,21 @@ export function ApiManagementPanel() {
     [config.logTailLines, origin],
   );
 
-  const save = async (next: ApiManagementConfig) => {
-    const previous = config;
+  const save = async (next: ApiManagementConfig): Promise<boolean> => {
+    const previous = configRef.current;
+    configRef.current = next;
     setConfig(next);
     setSaving(true);
     try {
-      setConfig(await settingsApi.setApiManagement(next));
+      const saved = await settingsApi.setApiManagement(next);
+      configRef.current = saved;
+      setConfig(saved);
+      return true;
     } catch (error) {
+      configRef.current = previous;
       setConfig(previous);
       toast.error(String(error));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -91,11 +119,14 @@ export function ApiManagementPanel() {
     try {
       const result = await settingsApi.generateDebugToken(ttlHours);
       setVisibleToken(result.token);
-      setConfig({
-        ...config,
+      setTokenRevealed(false);
+      const next = {
+        ...configRef.current,
         tokenConfigured: true,
         tokenExpiresAtMs: result.expiresAtMs,
-      });
+      };
+      configRef.current = next;
+      setConfig(next);
     } catch (error) {
       toast.error(String(error));
     } finally {
@@ -103,14 +134,23 @@ export function ApiManagementPanel() {
     }
   };
 
-  const revoke = async () => {
+  const revoke = async (): Promise<boolean> => {
     setSaving(true);
     try {
       await settingsApi.revokeDebugToken();
       setVisibleToken(null);
-      setConfig({ ...config, tokenConfigured: false, tokenExpiresAtMs: null });
+      setTokenRevealed(false);
+      const next = {
+        ...configRef.current,
+        tokenConfigured: false,
+        tokenExpiresAtMs: null,
+      };
+      configRef.current = next;
+      setConfig(next);
+      return true;
     } catch (error) {
       toast.error(String(error));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -118,12 +158,36 @@ export function ApiManagementPanel() {
 
   const copyToken = async () => {
     if (!visibleToken) return;
-    await navigator.clipboard.writeText(visibleToken);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
+    try {
+      await copyText(visibleToken);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
-  if (loading) return null;
+  const updateLogTailLines = (value: number) => {
+    const logTailLines = Math.min(1000, Math.max(1, value || 1));
+    const next = { ...configRef.current, logTailLines };
+    configRef.current = next;
+    setConfig(next);
+    if (logTailSaveTimer.current != null) {
+      window.clearTimeout(logTailSaveTimer.current);
+    }
+    logTailSaveTimer.current = window.setTimeout(() => {
+      logTailSaveTimer.current = null;
+      void save(configRef.current);
+    }, 500);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex min-h-32 items-center justify-center text-muted-foreground">
+        <Loader2 className="h-5 w-5 animate-spin" />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -169,7 +233,7 @@ export function ApiManagementPanel() {
           {config.tokenConfigured ? (
             <Button
               variant="outline"
-              onClick={() => void revoke()}
+              onClick={() => setConfirmRevoke(true)}
               disabled={saving}
             >
               <Trash2 className="mr-2 h-4 w-4" />
@@ -183,8 +247,22 @@ export function ApiManagementPanel() {
         {visibleToken ? (
           <div className="flex items-center gap-2">
             <code className="min-w-0 flex-1 break-all border bg-muted/30 p-3 text-xs">
-              {visibleToken}
+              {tokenRevealed
+                ? visibleToken
+                : `${"•".repeat(24)}${visibleToken.slice(-4)}`}
             </code>
+            <Button
+              size="icon"
+              variant="outline"
+              title={t(tokenRevealed ? "common.hide" : "common.show")}
+              onClick={() => setTokenRevealed((current) => !current)}
+            >
+              {tokenRevealed ? (
+                <EyeOff className="h-4 w-4" />
+              ) : (
+                <Eye className="h-4 w-4" />
+              )}
+            </Button>
             <Button
               size="icon"
               variant="outline"
@@ -196,6 +274,17 @@ export function ApiManagementPanel() {
               ) : (
                 <Copy className="h-4 w-4" />
               )}
+            </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              title={t("common.close")}
+              onClick={() => {
+                setVisibleToken(null);
+                setTokenRevealed(false);
+              }}
+            >
+              <X className="h-4 w-4" />
             </Button>
           </div>
         ) : null}
@@ -230,15 +319,7 @@ export function ApiManagementPanel() {
               min={1}
               max={1000}
               value={config.logTailLines}
-              onChange={(event) =>
-                void save({
-                  ...config,
-                  logTailLines: Math.min(
-                    1000,
-                    Math.max(1, Number(event.target.value) || 1),
-                  ),
-                })
-              }
+              onChange={(event) => updateLogTailLines(Number(event.target.value))}
             />
           </div>
         ) : null}
@@ -275,10 +356,22 @@ export function ApiManagementPanel() {
         message={t("settings.advanced.apiManagement.dangerMessage")}
         confirmText={t("common.confirm")}
         onCancel={() => setConfirmCapability(null)}
-        onConfirm={() => {
-          if (confirmCapability)
-            void save({ ...config, [confirmCapability]: true });
-          setConfirmCapability(null);
+        onConfirm={async () => {
+          if (!confirmCapability) return;
+          if (await save({ ...configRef.current, [confirmCapability]: true })) {
+            setConfirmCapability(null);
+          }
+        }}
+      />
+      <ConfirmDialog
+        isOpen={confirmRevoke}
+        title={t("settings.advanced.apiManagement.revokeToken")}
+        message={t("settings.advanced.apiManagement.revokeTokenConfirm", {
+          defaultValue: "撤销后，当前调试令牌将立即失效。",
+        })}
+        onCancel={() => setConfirmRevoke(false)}
+        onConfirm={async () => {
+          if (await revoke()) setConfirmRevoke(false);
         }}
       />
     </div>

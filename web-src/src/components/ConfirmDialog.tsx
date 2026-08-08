@@ -9,7 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { AlertTriangle, Info } from "lucide-react";
+import { AlertTriangle, Info, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 interface ConfirmDialogProps {
@@ -25,7 +25,8 @@ interface ConfirmDialogProps {
   /** 可选勾选项：提供 label 即显示，勾选状态经 onConfirm 参数回传 */
   checkboxLabel?: string;
   checkboxDefaultChecked?: boolean;
-  onConfirm: (checkboxChecked: boolean) => void;
+  confirmDisabled?: boolean;
+  onConfirm: (checkboxChecked: boolean) => void | Promise<void>;
   onCancel: () => void;
 }
 
@@ -40,6 +41,7 @@ export function ConfirmDialog({
   zIndex = "alert",
   checkboxLabel,
   checkboxDefaultChecked = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -47,12 +49,27 @@ export function ConfirmDialog({
   const [checkboxChecked, setCheckboxChecked] = useState(
     checkboxDefaultChecked,
   );
+  const [confirming, setConfirming] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       setCheckboxChecked(checkboxDefaultChecked);
+    } else {
+      setConfirming(false);
     }
   }, [isOpen, checkboxDefaultChecked]);
+
+  const handleConfirm = async () => {
+    if (confirming || confirmDisabled) return;
+    setConfirming(true);
+    try {
+      await onConfirm(checkboxLabel ? checkboxChecked : false);
+    } catch (error) {
+      console.error("[ConfirmDialog] Confirmation failed", error);
+    } finally {
+      setConfirming(false);
+    }
+  };
 
   const IconComponent = variant === "info" ? Info : AlertTriangle;
   const iconClass =
@@ -62,7 +79,7 @@ export function ConfirmDialog({
     <Dialog
       open={isOpen}
       onOpenChange={(open) => {
-        if (!open) {
+        if (!open && !confirming) {
           onCancel();
         }
       }}
@@ -93,16 +110,15 @@ export function ConfirmDialog({
           </label>
         ) : null}
         <DialogFooter className="flex gap-2 border-t-0 bg-transparent pt-2 sm:justify-end">
-          <Button variant="outline" onClick={onCancel}>
+          <Button variant="outline" onClick={onCancel} disabled={confirming}>
             {cancelText || t("common.cancel")}
           </Button>
           <Button
             variant={variant === "info" ? "default" : "destructive"}
-            onClick={() =>
-              // 未渲染勾选框时不得回传 defaultChecked 残留值
-              onConfirm(checkboxLabel ? checkboxChecked : false)
-            }
+            disabled={confirming || confirmDisabled}
+            onClick={() => void handleConfirm()}
           >
+            {confirming ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             {confirmText || t("common.confirm")}
           </Button>
         </DialogFooter>

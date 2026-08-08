@@ -108,7 +108,9 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
         removeAccount: removeAccountAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const handleLogout = async () => {
@@ -117,7 +119,9 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
         logout: logoutAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const copyVerificationUrl = async () => {

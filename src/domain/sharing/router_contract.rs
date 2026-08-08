@@ -32,11 +32,13 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_with_emails: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access_by_app: Option<BTreeMap<String, ShareAppAccess>>,
+    pub access_by_app: Option<BTreeMap<AppKind, ShareAppAccess>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_settings: Option<BTreeMap<String, ShareAppSettings>>,
+    pub app_settings: Option<BTreeMap<AppKind, ShareAppSettings>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale_official_price_percent_by_app: Option<BTreeMap<String, u16>>,
+    pub for_sale_official_price_percent_by_app: Option<BTreeMap<AppKind, u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_price_percent: Option<Option<u16>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,11 +202,11 @@ pub struct ShareDescriptor {
     #[serde(default = "default_market_access_mode")]
     pub market_access_mode: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub access_by_app: BTreeMap<String, ShareAppAccess>,
+    pub access_by_app: BTreeMap<AppKind, ShareAppAccess>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub app_settings: BTreeMap<String, ShareAppSettings>,
+    pub app_settings: BTreeMap<AppKind, ShareAppSettings>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
+    pub for_sale_official_price_percent_by_app: BTreeMap<AppKind, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
@@ -214,7 +216,7 @@ pub struct ShareDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub bindings: BTreeMap<String, String>,
+    pub bindings: BTreeMap<AppKind, String>,
     #[serde(default)]
     pub token_limit: i64,
     #[serde(default = "default_parallel_limit")]
@@ -262,7 +264,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareAppAccess {
     #[serde(default)]
@@ -271,7 +273,7 @@ pub struct ShareAppAccess {
     pub market_access_mode: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareAppSettings {
     #[serde(default)]
@@ -589,23 +591,19 @@ pub fn descriptor_for_share_with_accounts_and_usage(
 ) -> ShareDescriptor {
     let mut bindings = BTreeMap::new();
     if share.bindings.is_empty() {
-        bindings.insert(app_key(share.app).to_string(), share.provider_id.clone());
+        bindings.insert(share.app, share.provider_id.clone());
     } else {
         for binding in &share.bindings {
-            bindings.insert(
-                app_key(binding.app).to_string(),
-                binding.provider_id.clone(),
-            );
+            bindings.insert(binding.app, binding.provider_id.clone());
         }
     }
 
     let mut support = ShareSupport::default();
     for app in bindings.keys() {
-        match app.as_str() {
-            "claude" => support.claude = true,
-            "codex" => support.codex = true,
-            "gemini" => support.gemini = true,
-            _ => {}
+        match app {
+            AppKind::Claude => support.claude = true,
+            AppKind::Codex => support.codex = true,
+            AppKind::Gemini => support.gemini = true,
         }
     }
 
@@ -622,30 +620,24 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     let mut access_by_app = BTreeMap::new();
     let mut app_settings = BTreeMap::new();
     for app in bindings.keys() {
-        let app_access = share
-            .access_by_app
-            .get(app)
-            .cloned()
-            .unwrap_or_else(|| ShareAppAccess {
+        access_by_app.insert(
+            *app,
+            ShareAppAccess {
                 shared_with_emails: shared_with_emails.clone(),
                 market_access_mode: market_access_mode.clone(),
-            });
-        access_by_app.insert(app.clone(), app_access);
-
-        let app_setting =
-            share
-                .app_settings
-                .get(app)
-                .cloned()
-                .unwrap_or_else(|| ShareAppSettings {
-                    for_sale: share_router_for_sale_label(share),
-                    market_access_mode: market_access_mode.clone(),
-                    shared_with_emails: shared_with_emails.clone(),
-                    token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
-                    parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
-                    expires_at: share_expires_at_rfc3339(share.expires_at),
-                });
-        app_settings.insert(app.clone(), app_setting);
+            },
+        );
+        app_settings.insert(
+            *app,
+            ShareAppSettings {
+                for_sale: share_router_for_sale_label(share),
+                market_access_mode: market_access_mode.clone(),
+                shared_with_emails: shared_with_emails.clone(),
+                token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
+                parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
+                expires_at: share_expires_at_rfc3339(share.expires_at),
+            },
+        );
     }
 
     let mut app_runtimes = ShareAppRuntimes::default();
@@ -656,27 +648,32 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         if let Some(provider) = providers
             .providers
             .iter()
-            .find(|item| app_key(item.app) == app && item.provider.id == *provider_id)
+            .find(|item| item.app == *app && item.provider.id == *provider_id)
         {
             let runtime_plan = providers.runtime_plan(provider.app, &provider.provider.id);
             let upstream = upstream_provider(
-                app,
+                app.as_str(),
                 provider,
                 share,
                 accounts,
                 usage,
                 runtime_plan.as_deref(),
             );
-            let availability =
-                provider_availability(app, provider, accounts, usage, runtime_plan.as_deref());
-            if app.as_str() == app_key(share.app) {
+            let availability = provider_availability(
+                app.as_str(),
+                provider,
+                accounts,
+                usage,
+                runtime_plan.as_deref(),
+            );
+            if *app == share.app {
                 primary_upstream = Some(upstream.clone());
             }
-            match app.as_str() {
-                "claude" => {
+            match app {
+                AppKind::Claude => {
                     app_runtimes.claude = Some(upstream.clone());
                     app_providers.claude.push(app_provider(
-                        app,
+                        app.as_str(),
                         provider,
                         share,
                         accounts,
@@ -686,10 +683,10 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                     ));
                     app_availability.claude = Some(availability);
                 }
-                "codex" => {
+                AppKind::Codex => {
                     app_runtimes.codex = Some(upstream.clone());
                     app_providers.codex.push(app_provider(
-                        app,
+                        app.as_str(),
                         provider,
                         share,
                         accounts,
@@ -699,10 +696,10 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                     ));
                     app_availability.codex = Some(availability);
                 }
-                "gemini" => {
+                AppKind::Gemini => {
                     app_runtimes.gemini = Some(upstream.clone());
                     app_providers.gemini.push(app_provider(
-                        app,
+                        app.as_str(),
                         provider,
                         share,
                         accounts,
@@ -712,7 +709,6 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                     ));
                     app_availability.gemini = Some(availability);
                 }
-                _ => {}
             }
         }
     }
@@ -735,9 +731,14 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         market_access_mode,
         access_by_app,
         app_settings,
-        for_sale_official_price_percent_by_app: share
-            .for_sale_official_price_percent_by_app
-            .clone(),
+        for_sale_official_price_percent_by_app: if share.for_sale && !share.free_access {
+            share
+                .official_price_percent
+                .map(|price| bindings.keys().map(|app| (*app, price)).collect())
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        },
         description: share.description.clone(),
         for_sale: share_router_for_sale_label(share),
         subdomain: share
@@ -1446,7 +1447,7 @@ mod tests {
     use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, AccountStore};
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::sharing::shares::{ShareAcl, ShareBinding};
+    use crate::domain::sharing::shares::{ShareAcl, ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
 
     #[test]
@@ -2086,19 +2087,13 @@ mod tests {
             account_email: Some("owner@example.com".to_string()),
             quota_percent,
             tunnel_subdomain: Some("codex-share".to_string()),
-            acl: ShareAcl::default(),
-            token_limit: None,
-            parallel_limit: None,
+            policy: SharePolicy {
+                acl: ShareAcl::default(),
+                ..SharePolicy::default()
+            },
             tokens_used: 0,
             requests_count: 0,
-            expires_at: None,
             created_at_ms: 0,
-            for_sale: false,
-            free_access: false,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
             auto_start: false,
             description: None,
             bindings: vec![ShareBinding {
@@ -2109,6 +2104,7 @@ mod tests {
             binding_history: Vec::new(),
             runtime_snapshot: None,
             last_error: None,
+            integrity_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,

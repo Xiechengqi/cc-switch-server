@@ -306,6 +306,8 @@ impl ProviderStore {
 
     pub fn validate_for_commit(&self) -> anyhow::Result<()> {
         let mut keys = std::collections::BTreeSet::new();
+        let mut ordinary_provider_ids = std::collections::BTreeSet::new();
+        let mut bundle_ids = std::collections::BTreeSet::new();
         for stored in &self.providers {
             let id = stored.provider.id.trim();
             if id.is_empty() {
@@ -316,6 +318,24 @@ impl ProviderStore {
             }
             if !keys.insert((stored.app, id.to_string())) {
                 anyhow::bail!("duplicate provider key {}:{id}", stored.app.as_str());
+            }
+            if super::bundle::is_explicit_bundle_surface(&stored.provider) {
+                let bundle_id = super::bundle::bundle_id(&stored.provider)
+                    .expect("explicit Provider Bundle Surface has a Bundle identity");
+                if bundle_id != id {
+                    anyhow::bail!(
+                        "Provider Bundle Surface id {id} must equal its Bundle id {bundle_id}"
+                    );
+                }
+                bundle_ids.insert(bundle_id.to_string());
+            } else {
+                if super::bundle::has_bundle_managed_metadata(&stored.provider) {
+                    anyhow::bail!(
+                        "Provider {}:{id} has incomplete Provider Bundle metadata",
+                        stored.app.as_str()
+                    );
+                }
+                ordinary_provider_ids.insert(id.to_string());
             }
             let expected = canonical_provider_type(stored.app, &stored.provider, &stored.resource)?;
             if stored.provider_type != expected || stored.provider_type_id != expected.as_str() {
@@ -352,6 +372,9 @@ impl ProviderStore {
                 );
             }
         }
+        if let Some(id) = ordinary_provider_ids.intersection(&bundle_ids).next() {
+            anyhow::bail!("Provider id {id} conflicts with the global Provider Bundle namespace");
+        }
         for (app, order) in &self.order {
             let expected = self
                 .providers
@@ -370,18 +393,23 @@ impl ProviderStore {
                 );
             }
         }
-        let bundle_ids = self
+        let persisted_bundle_ids = self
             .providers
             .iter()
             .filter(|stored| super::bundle::is_explicit_bundle_surface(&stored.provider))
-            .map(|stored| super::bundle::bundle_id(&stored.provider))
+            .map(|stored| {
+                super::bundle::bundle_id(&stored.provider)
+                    .expect("explicit Provider Bundle Surface has a Bundle identity")
+            })
             .collect::<std::collections::BTreeSet<_>>();
         let ordered_bundle_ids = self
             .bundle_order
             .iter()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>();
-        if ordered_bundle_ids.len() != self.bundle_order.len() || ordered_bundle_ids != bundle_ids {
+        if ordered_bundle_ids.len() != self.bundle_order.len()
+            || ordered_bundle_ids != persisted_bundle_ids
+        {
             anyhow::bail!("Provider Bundle order must contain every Bundle exactly once");
         }
         let mut request_ids = std::collections::BTreeSet::new();
@@ -454,7 +482,8 @@ impl ProviderStore {
         }
 
         if super::bundle::is_explicit_bundle_surface(&stored.provider) {
-            let bundle_id = super::bundle::bundle_id(&stored.provider);
+            let bundle_id = super::bundle::bundle_id(&stored.provider)
+                .expect("explicit Provider Bundle Surface has a Bundle identity");
             if !self.bundle_order.iter().any(|id| id == bundle_id) {
                 self.bundle_order.push(bundle_id.to_string());
             }
@@ -543,7 +572,10 @@ impl ProviderStore {
             .providers
             .iter()
             .filter(|stored| super::bundle::is_explicit_bundle_surface(&stored.provider))
-            .map(|stored| super::bundle::bundle_id(&stored.provider))
+            .map(|stored| {
+                super::bundle::bundle_id(&stored.provider)
+                    .expect("explicit Provider Bundle Surface has a Bundle identity")
+            })
             .collect::<std::collections::BTreeSet<_>>();
         if updates.len() != bundle_ids.len() {
             anyhow::bail!("Provider Bundle sort order must include every Bundle");
@@ -589,10 +621,12 @@ impl ProviderStore {
             }
         }
         if super::bundle::is_explicit_bundle_surface(&removed.provider) {
-            let bundle_id = super::bundle::bundle_id(&removed.provider).to_string();
+            let bundle_id = super::bundle::bundle_id(&removed.provider)
+                .expect("explicit Provider Bundle Surface has a Bundle identity")
+                .to_string();
             let bundle_remains = self.providers.iter().any(|stored| {
                 super::bundle::is_explicit_bundle_surface(&stored.provider)
-                    && super::bundle::bundle_id(&stored.provider) == bundle_id.as_str()
+                    && super::bundle::bundle_id(&stored.provider) == Some(bundle_id.as_str())
             });
             if !bundle_remains {
                 self.bundle_order.retain(|id| id != &bundle_id);

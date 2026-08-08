@@ -2,12 +2,70 @@
   "common": {
     "copied": "已复制"
   },
+  "server": {
+    "common": {
+      "server": "Server",
+      "runtime": "运行时",
+      "setup": "初始化",
+      "login": "登录",
+      "password": "密码"
+    },
+    "auth": {
+      "ownerEmail": "Owner 邮箱",
+      "clientSubdomain": "Client 子域名",
+      "loginTitle": "登录管理控制台",
+      "setupTitle": "初始化 Server",
+      "loginSubtitlePasswordOnly": "使用 Web 密码登录。",
+      "setupSubtitle": "设置 Owner 邮箱、Router、Client 子域名与管理员密码。Client 子域名初始化后不可修改。",
+      "methodPassword": "密码",
+      "methodEmail": "邮箱验证码",
+      "methodApiToken": "API Token",
+      "apiToken": "API Token",
+      "apiTokenHint": "使用初始化或设置页签发的 API Token 登录。",
+      "emailLoginHint": "验证码由 Router 发送到已配置的 Owner 邮箱。",
+      "codeSentTo": "验证码已发送至 {{destination}}",
+      "resendIn": "{{seconds}} 秒后可重发",
+      "clientSubdomainAuto": "留空时自动生成",
+      "clientSubdomainAvailable": "子域名可用",
+      "clientSubdomainTaken": "子域名已被占用，请更换或随机生成。",
+      "generateSubdomain": "随机生成子域名",
+      "generateSubdomainFailed": "随机生成子域名失败",
+      "routerUnreachableForSubdomain": "Router 不可达，无法随机生成子域名",
+      "subdomainUnchecked": "未能验证子域名是否可用，提交时可能冲突",
+      "setupClaimPending": "Router client 注册状态：{{status}}。请检查 Router 连接后重试。",
+      "clientWeb": {
+        "loginTitle": "Client Web 登录",
+        "setupTitle": "设置 Web 密码",
+        "setupSubtitle": "首次访问需要设置 Web 管理密码。",
+        "webPassword": "Web 密码",
+        "setupPasswordPlaceholder": "设置 Web 密码",
+        "setupAndLogin": "设置并登录",
+        "login": "登录",
+        "verificationCode": "验证码",
+        "sendCode": "发送验证码",
+        "verifyAndLogin": "验证并登录",
+        "unauthorizedCredential": "登录凭证无权访问当前 client",
+        "codeSent": "验证码已发送",
+        "loggedIn": "已登录 client",
+        "loggedInWithToken": "已使用 API token 登录 client",
+        "loggedInWithPassword": "已使用 Web 密码登录",
+        "passwordSet": "Web 密码已设置"
+      }
+    },
+    "settings": {
+      "verificationCode": "验证码",
+      "requestCode": "请求验证码",
+      "verify": "验证"
+    }
+  },
   "providers": {
     "addProvider": "添加供应商"
   },
   "providerBundle": {
     "account": "OAuth 账号",
     "advancedSettings": "高级设置 JSON",
+    "apiUrlUnavailable": "API 地址未配置",
+    "authHeader": "API Key Header 名称",
     "basic": "基本信息",
     "count": "{{count}} 个供应商节点",
     "create": "新建供应商",
@@ -18,14 +76,20 @@
     "deleted": "供应商已删除",
     "driverOptions": "驱动选项",
     "edit": "编辑供应商",
+    "effectiveConfig": "有效运行配置",
     "family": "供应商类型",
+    "firstByteTimeout": "首字节超时（毫秒）",
     "modelPassthrough": "模型透传",
     "modelSingle": "固定上游模型",
+    "queryParameter": "API Key 查询参数名",
+    "requestTimeout": "请求超时（毫秒）",
     "saved": "供应商已保存",
     "selectAccount": "选择 OAuth 账号",
     "surfaceCredential": "认证凭据",
     "surfaceEnabled": "启用 API",
     "surfaces": "应用接口",
+    "streamIdleTimeout": "流空闲超时（毫秒）",
+    "testModel": "测试模型",
     "title": "供应商"
   },
   "provider": {
@@ -43,8 +107,18 @@
       "sectionHint": "每个 Provider 对应一个 Share。在此配置分享参数；Router Console 可管理运营侧高级选项。",
       "openRouterConsole": "打开 Router Console",
       "disabledHint": "开启后可配置远程分享参数并创建 Share。",
+      "description": "描述",
+      "expiry": "有效期",
+      "forSale": "访问模式",
+      "free": "免费",
+      "market": "市场",
+      "parallelLimit": "并发限额",
+      "private": "私有",
       "routerSyncFailed": "Router 同步失败：{{error}}",
       "routerSyncPending": "正在同步到 Router",
+      "sharedWith": "授权邮箱",
+      "subdomain": "分享子域名",
+      "tokenLimit": "Token 限额",
       "ownerRequired": "请先在分享设置页配置 Client Tunnel Owner 邮箱"
     },
     "form": {
@@ -62,6 +136,9 @@
     },
     "market": {
       "allSelected": "已选中所有 Market"
+    },
+    "tunnel": {
+      "region": "区域"
     },
     "permanent": "永久",
     "expiration": "到期",
@@ -99,6 +176,11 @@
   "codexConfig": {
     "noCommonConfigToApply": "通用配置片段为空或没有可写入的内容"
   },
+  "serverProviderForm": {
+    "endpoint": {
+      "url": "上游 API 地址"
+    }
+  },
   "claudeDesktop": {
     "route": {
       "stopBlockedByTakeover": "其他应用正在使用代理接管。请先在设置中关闭对应应用的接管，再停止本地路由。"
@@ -121,6 +203,12 @@
   "settings": {
     "loadFailed": "无法加载设置，请刷新页面后重试。",
     "selectFileFailed": "选择目录失败",
+    "unsavedChanges": {
+      "title": "放弃未保存的设置？",
+      "message": "高级设置中存在未保存的更改，离开后这些更改将丢失。",
+      "discard": "放弃更改",
+      "keepEditing": "继续编辑"
+    },
     "authCenter": {
       "serverDescription": "管理供应商节点及其应用接口使用的官方 OAuth 账号。",
       "claudeOauthDescription": "管理 Claude 官方订阅账号",
@@ -132,6 +220,9 @@
       "deepseekAccountDescription": "管理 DeepSeek 账号"
     },
     "advanced": {
+      "apiManagement": {
+        "revokeTokenConfirm": "撤销后，当前调试令牌将立即失效。"
+      },
       "proxy": {
         "title": "Router Share 路由",
         "description": "查看 Router Share ingress 状态和可路由的 Bundle Surface",

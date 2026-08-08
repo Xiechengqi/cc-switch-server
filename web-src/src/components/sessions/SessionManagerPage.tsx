@@ -28,6 +28,7 @@ import {
   useSessionsQuery,
 } from "@/lib/query";
 import { sessionsApi } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import type { SessionMeta } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -392,7 +393,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
   const handleCopy = useCallback(
     async (text: string, successMessage: string) => {
       try {
-        await navigator.clipboard.writeText(text);
+        await copyText(text);
         toast.success(successMessage);
       } catch (error) {
         toast.error(
@@ -1730,7 +1731,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
         }
         cancelText={t("common.cancel", { defaultValue: "取消" })}
         variant="destructive"
-        onConfirm={() => void handleDeleteConfirm()}
+        confirmDisabled={isDeleting}
+        onConfirm={() => handleDeleteConfirm()}
         onCancel={() => {
           if (!isDeleting) {
             setDeleteTargets(null);

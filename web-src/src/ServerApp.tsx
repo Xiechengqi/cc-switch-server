@@ -1,4 +1,11 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -12,6 +19,7 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   SettingsPage,
+  type SettingsPageHandle,
   type SettingsTab,
 } from "@/components/settings/SettingsPage";
 import { SharePage } from "@/components/share/SharePage";
@@ -25,7 +33,7 @@ import {
   PAGE_SHELL_PADDING_X,
 } from "@/lib/layout";
 import { clearRouterSessionTokens } from "@/lib/routerAuth";
-import { writeCachedPassword, writeToken } from "@/lib/runtime";
+import { writeToken } from "@/lib/runtime";
 import { cn } from "@/lib/utils";
 import { ProviderBundlesPage } from "@/server/providers/bundles/ProviderBundlesPage";
 
@@ -62,6 +70,7 @@ export default function ServerApp({
   );
   const [settingsDefaultTab, setSettingsDefaultTab] =
     useState<SettingsTab>("general");
+  const settingsPageRef = useRef<SettingsPageHandle>(null);
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, currentView);
@@ -74,10 +83,9 @@ export default function ServerApp({
   }, [enableWebTerminal, currentView]);
 
   const handleSignOut = useCallback(
-    (options?: { clearPasswordCache?: boolean }) => {
+    (_options?: { clearPasswordCache?: boolean }) => {
       writeToken(null);
       if (isRemoteWebMode()) clearRouterSessionTokens();
-      if (options?.clearPasswordCache !== false) writeCachedPassword(null);
       if (onSignOut) onSignOut();
       else window.location.reload();
     },
@@ -89,10 +97,19 @@ export default function ServerApp({
     setCurrentView("settings");
   }, []);
 
+  const handleBack = useCallback(() => {
+    if (currentView === "settings") {
+      settingsPageRef.current?.requestClose();
+      return;
+    }
+    setCurrentView("providers");
+  }, [currentView]);
+
   const content = (() => {
     if (currentView === "settings") {
       return (
         <SettingsPage
+          ref={settingsPageRef}
           open
           onOpenChange={() => setCurrentView("providers")}
           defaultTab={settingsDefaultTab}
@@ -198,7 +215,7 @@ export default function ServerApp({
             <Button
               variant="outline"
               size="icon"
-              onClick={() => setCurrentView("providers")}
+              onClick={handleBack}
               title={t("common.back")}
             >
               <ArrowLeft className="h-4 w-4" />

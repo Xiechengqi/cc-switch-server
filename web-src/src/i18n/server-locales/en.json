@@ -2,12 +2,70 @@
   "common": {
     "copied": "Copied"
   },
+  "server": {
+    "common": {
+      "server": "Server",
+      "runtime": "runtime",
+      "setup": "Setup",
+      "login": "Sign in",
+      "password": "Password"
+    },
+    "auth": {
+      "ownerEmail": "Owner email",
+      "clientSubdomain": "Client subdomain",
+      "loginTitle": "Sign in to admin console",
+      "setupTitle": "Initialize server",
+      "loginSubtitlePasswordOnly": "Sign in with your Web password.",
+      "setupSubtitle": "Configure the owner email, Router, Client subdomain, and admin password. The Client subdomain cannot be changed after setup.",
+      "methodPassword": "Password",
+      "methodEmail": "Email code",
+      "methodApiToken": "API Token",
+      "apiToken": "API Token",
+      "apiTokenHint": "Use the API token issued during setup or from Settings.",
+      "emailLoginHint": "Router sends a code to the configured owner email.",
+      "codeSentTo": "Verification code sent to {{destination}}",
+      "resendIn": "Resend in {{seconds}}s",
+      "clientSubdomainAuto": "Generated automatically when empty",
+      "clientSubdomainAvailable": "Subdomain is available",
+      "clientSubdomainTaken": "Subdomain is already in use. Choose another or generate one.",
+      "generateSubdomain": "Generate subdomain",
+      "generateSubdomainFailed": "Failed to generate a subdomain",
+      "routerUnreachableForSubdomain": "Router is unreachable, so a subdomain cannot be generated",
+      "subdomainUnchecked": "Availability could not be verified; setup may still conflict",
+      "setupClaimPending": "Router client registration status: {{status}}. Check Router connectivity and retry.",
+      "clientWeb": {
+        "loginTitle": "Client Web sign in",
+        "setupTitle": "Set Web password",
+        "setupSubtitle": "Set a Web admin password on your first visit.",
+        "webPassword": "Web password",
+        "setupPasswordPlaceholder": "Set Web password",
+        "setupAndLogin": "Set and sign in",
+        "login": "Sign in",
+        "verificationCode": "Verification code",
+        "sendCode": "Send code",
+        "verifyAndLogin": "Verify and sign in",
+        "unauthorizedCredential": "These credentials cannot access this client",
+        "codeSent": "Verification code sent",
+        "loggedIn": "Signed in to client",
+        "loggedInWithToken": "Signed in to client with API token",
+        "loggedInWithPassword": "Signed in with Web password",
+        "passwordSet": "Web password set"
+      }
+    },
+    "settings": {
+      "verificationCode": "Verification code",
+      "requestCode": "Request code",
+      "verify": "Verify"
+    }
+  },
   "providers": {
     "addProvider": "Add provider"
   },
   "providerBundle": {
     "account": "OAuth account",
     "advancedSettings": "Advanced settings JSON",
+    "apiUrlUnavailable": "API URL not configured",
+    "authHeader": "API key header name",
     "basic": "Basic information",
     "count": "{{count}} provider nodes",
     "create": "New provider",
@@ -18,14 +76,20 @@
     "deleted": "Provider deleted",
     "driverOptions": "Driver options",
     "edit": "Edit provider",
+    "effectiveConfig": "Effective runtime configuration",
     "family": "Provider type",
+    "firstByteTimeout": "First-byte timeout (milliseconds)",
     "modelPassthrough": "Pass through",
     "modelSingle": "Fixed model",
+    "queryParameter": "API key query parameter",
+    "requestTimeout": "Request timeout (milliseconds)",
     "saved": "Provider saved",
     "selectAccount": "Select an OAuth account",
     "surfaceCredential": "Authentication credential",
     "surfaceEnabled": "Enable API",
     "surfaces": "API Surfaces",
+    "streamIdleTimeout": "Stream idle timeout (milliseconds)",
+    "testModel": "Test model",
     "title": "Providers"
   },
   "provider": {
@@ -43,8 +107,18 @@
       "sectionHint": "Each Provider maps to one Share. Configure sharing here; use Router Console for advanced operations.",
       "openRouterConsole": "Open Router Console",
       "disabledHint": "Enable this to configure remote sharing and create a Share.",
+      "description": "Description",
+      "expiry": "Expiration",
+      "forSale": "Access mode",
+      "free": "Free",
+      "market": "Market",
+      "parallelLimit": "Concurrency limit",
+      "private": "Private",
       "routerSyncFailed": "Router sync failed: {{error}}",
       "routerSyncPending": "Syncing to Router",
+      "sharedWith": "Authorized emails",
+      "subdomain": "Share subdomain",
+      "tokenLimit": "Token limit",
       "ownerRequired": "Configure the Client Tunnel Owner email on the Share settings page first"
     },
     "form": {
@@ -62,6 +136,9 @@
     },
     "market": {
       "allSelected": "All Markets selected"
+    },
+    "tunnel": {
+      "region": "Region"
     },
     "permanent": "Permanent",
     "expiration": "Expires",
@@ -99,6 +176,11 @@
   "codexConfig": {
     "noCommonConfigToApply": "The common configuration is empty or has no writable values"
   },
+  "serverProviderForm": {
+    "endpoint": {
+      "url": "Upstream API URL"
+    }
+  },
   "claudeDesktop": {
     "route": {
       "stopBlockedByTakeover": "Another app is using proxy takeover. Disable its takeover in Settings before stopping the local route."
@@ -121,6 +203,12 @@
   "settings": {
     "loadFailed": "Unable to load settings. Refresh the page and try again.",
     "selectFileFailed": "Failed to select directory",
+    "unsavedChanges": {
+      "title": "Discard unsaved settings?",
+      "message": "The Advanced settings contain unsaved changes. Leaving this page will discard them.",
+      "discard": "Discard changes",
+      "keepEditing": "Keep editing"
+    },
     "authCenter": {
       "serverDescription": "Manage official OAuth accounts used by provider nodes and their API Surfaces.",
       "claudeOauthDescription": "Manage Claude official subscription accounts",
@@ -132,6 +220,9 @@
       "deepseekAccountDescription": "Manage DeepSeek accounts"
     },
     "advanced": {
+      "apiManagement": {
+        "revokeTokenConfirm": "Revoking immediately invalidates the current debug token."
+      },
       "proxy": {
         "title": "Router Share routing",
         "description": "View Router Share ingress status and routable Bundle Surfaces",

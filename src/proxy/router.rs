@@ -10,7 +10,7 @@ use crate::infra::time::now_ms;
 use crate::state::AccountInFlightSnapshot;
 
 use super::provider_ops::ProviderExecution;
-use super::ProxyError;
+use super::{ProxyConcurrencyScope, ProxyError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyRoute {
@@ -180,11 +180,15 @@ fn finalize_provider_selection(
     ensure_codex_oauth_binding(&provider, accounts)?;
     ensure_provider_account_does_not_need_relogin(&provider, accounts)?;
     ensure_provider_account_usage_available(&provider, accounts, now)?;
-    if account_in_flight
+    if let Some(selection) = account_in_flight
         .and_then(|snapshot| account_concurrency_for_provider(&provider, accounts, snapshot))
-        .is_some_and(|selection| selection.current >= selection.max_concurrent)
+        .filter(|selection| selection.current >= selection.max_concurrent)
     {
-        return Err(account_concurrency_limit_error(&provider));
+        return Err(account_concurrency_limit_error(
+            &provider,
+            selection.current,
+            selection.max_concurrent,
+        ));
     }
     let execution = ProviderExecution::from_store(store, provider)?;
     execution.ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)?;
@@ -296,13 +300,19 @@ fn json_u32(value: &serde_json::Value) -> Option<u32> {
         .or_else(|| value.as_str()?.trim().parse::<u32>().ok())
 }
 
-fn account_concurrency_limit_error(provider: &StoredProvider) -> ProxyError {
-    ProxyError::rate_limited(
+fn account_concurrency_limit_error(
+    provider: &StoredProvider,
+    current: u32,
+    limit: u32,
+) -> ProxyError {
+    ProxyError::concurrency_limited(
+        ProxyConcurrencyScope::ProviderAccount,
+        current,
+        limit,
         format!(
-            "provider {} account concurrency limit has been reached",
-            provider.provider.id
+            "Provider account concurrency limit has been reached ({current}/{limit}) for {}. Wait for an in-flight request to finish.",
+            provider.provider.id,
         ),
-        1,
     )
 }
 
@@ -882,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_managed_provider_returns_429_without_switching_accounts() {
+    fn saturated_managed_provider_returns_concurrency_error_without_switching_accounts() {
         let store = runtime_store(vec![
             claude_oauth_provider("p1", "acct-1", Some(1)),
             claude_oauth_provider("p2", "acct-2", Some(1)),
@@ -897,8 +907,22 @@ mod tests {
         let snapshot = tracker.snapshot();
         let error = select_test_provider(&store, &accounts, AppKind::Claude, "p1", Some(&snapshot))
             .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
-        assert!(error.message.contains("p1"));
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error.error_code(),
+            "cc_switch_provider_account_concurrency_limit_exceeded"
+        );
+        assert_eq!(error.error_scope(), Some("provider_account"));
+        assert_eq!(
+            error.concurrency_metadata(),
+            Some(crate::proxy::ProxyConcurrencyMetadata {
+                scope: crate::proxy::ProxyConcurrencyScope::ProviderAccount,
+                current: 1,
+                limit: 1,
+            })
+        );
+        assert!(error.retry_after_seconds().is_none());
+        assert!(error.client_message().contains("p1"));
     }
 
     #[test]
@@ -924,8 +948,13 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
-        assert!(error.message.contains("grok-current"));
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error.error_code(),
+            "cc_switch_provider_account_concurrency_limit_exceeded"
+        );
+        assert!(error.retry_after_seconds().is_none());
+        assert!(error.client_message().contains("grok-current"));
     }
 
     #[test]
@@ -976,7 +1005,12 @@ mod tests {
             Some(&tracker.snapshot()),
         )
         .unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error.error_code(),
+            "cc_switch_provider_account_concurrency_limit_exceeded"
+        );
+        assert!(error.retry_after_seconds().is_none());
     }
 
     #[test]

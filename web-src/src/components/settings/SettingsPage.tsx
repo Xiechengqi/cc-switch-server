@@ -1,6 +1,8 @@
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -34,9 +36,11 @@ import {
 } from "@/components/ui/accordion";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
 import { settingsApi } from "@/lib/api";
+import { stableStringify } from "@/lib/stableStringify";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
 import { WindowSettings } from "@/components/settings/WindowSettings";
@@ -78,12 +82,21 @@ interface SettingsDialogProps {
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
 }
 
-export function SettingsPage({
-  open,
-  onOpenChange,
-  defaultTab = "general",
-  onSignOut,
-}: SettingsDialogProps) {
+export interface SettingsPageHandle {
+  requestClose: () => void;
+}
+
+type PendingNavigation =
+  | { kind: "close" }
+  | { kind: "tab"; tab: string };
+
+export const SettingsPage = forwardRef<
+  SettingsPageHandle,
+  SettingsDialogProps
+>(function SettingsPage(
+  { open, onOpenChange, defaultTab = "general", onSignOut },
+  ref,
+) {
   const { t } = useTranslation();
   const {
     settings,
@@ -100,6 +113,7 @@ export function SettingsPage({
     resetAppConfigDir,
     saveSettings,
     autoSaveSettings,
+    resetSettings,
     requiresRestart,
     acknowledgeRestart,
   } = useSettings();
@@ -114,7 +128,18 @@ export function SettingsPage({
 
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
+  const [pendingNavigation, setPendingNavigation] =
+    useState<PendingNavigation | null>(null);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
+  const advancedBaselineRef = useRef<string | null>(null);
+  const advancedFingerprint = useMemo(
+    () => stableStringify({ settings, appConfigDir: appConfigDir ?? null }),
+    [appConfigDir, settings],
+  );
+  const advancedDirty =
+    activeTab === "advanced" &&
+    advancedBaselineRef.current !== null &&
+    advancedFingerprint !== advancedBaselineRef.current;
 
   useEffect(() => {
     if (open) {
@@ -127,8 +152,32 @@ export function SettingsPage({
               ? "advanced"
               : defaultTab;
       setActiveTab(normalizedTab);
+      advancedBaselineRef.current = null;
+      setPendingNavigation(null);
     }
   }, [open, defaultTab, serverMode]);
+
+  useEffect(() => {
+    if (
+      open &&
+      activeTab === "advanced" &&
+      settings &&
+      !isLoading &&
+      advancedBaselineRef.current === null
+    ) {
+      advancedBaselineRef.current = advancedFingerprint;
+    }
+  }, [activeTab, advancedFingerprint, isLoading, open, settings]);
+
+  useEffect(() => {
+    if (!open || !advancedDirty) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [advancedDirty, open]);
 
   useEffect(() => {
     if (requiresRestart) {
@@ -148,10 +197,63 @@ export function SettingsPage({
     onOpenChange(false);
   }, [acknowledgeRestart, onOpenChange]);
 
+  const navigateWithoutGuard = useCallback(
+    (navigation: PendingNavigation) => {
+      advancedBaselineRef.current = null;
+      setPendingNavigation(null);
+      if (navigation.kind === "tab") {
+        setActiveTab(navigation.tab);
+        return;
+      }
+      onOpenChange(false);
+    },
+    [onOpenChange],
+  );
+
+  const requestNavigation = useCallback(
+    (navigation: PendingNavigation) => {
+      if (advancedDirty) {
+        setPendingNavigation(navigation);
+        return;
+      }
+      navigateWithoutGuard(navigation);
+    },
+    [advancedDirty, navigateWithoutGuard],
+  );
+
+  const requestClose = useCallback(
+    () => requestNavigation({ kind: "close" }),
+    [requestNavigation],
+  );
+
+  useImperativeHandle(ref, () => ({ requestClose }), [requestClose]);
+
+  const handleTabChange = useCallback(
+    (nextTab: string) => {
+      if (nextTab === activeTab) return;
+      if (activeTab === "advanced") {
+        requestNavigation({ kind: "tab", tab: nextTab });
+        return;
+      }
+      if (nextTab === "advanced") {
+        advancedBaselineRef.current = advancedFingerprint;
+      }
+      setActiveTab(nextTab);
+    },
+    [activeTab, advancedFingerprint, requestNavigation],
+  );
+
+  const discardPendingChanges = useCallback(() => {
+    if (!pendingNavigation) return;
+    resetSettings();
+    navigateWithoutGuard(pendingNavigation);
+  }, [navigateWithoutGuard, pendingNavigation, resetSettings]);
+
   const handleSave = useCallback(async () => {
     try {
       const result = await saveSettings(undefined, { silent: false });
       if (!result) return;
+      advancedBaselineRef.current = advancedFingerprint;
       if (result.requiresRestart) {
         setShowRestartPrompt(true);
         return;
@@ -160,7 +262,7 @@ export function SettingsPage({
     } catch (error) {
       console.error("[SettingsPage] Failed to save settings", error);
     }
-  }, [closeAfterSave, saveSettings]);
+  }, [advancedFingerprint, closeAfterSave, saveSettings]);
 
   const handleRestartLater = useCallback(() => {
     setShowRestartPrompt(false);
@@ -236,7 +338,7 @@ export function SettingsPage({
       ) : (
         <Tabs
           value={activeTab}
-          onValueChange={setActiveTab}
+          onValueChange={handleTabChange}
           className="flex flex-col h-full"
         >
           <TabsList
@@ -634,7 +736,10 @@ export function SettingsPage({
                 style={{ backgroundColor: "hsl(var(--background))" }}
               >
                 <div className="flex items-center justify-end gap-3">
-                  <Button onClick={handleSave} disabled={isSaving}>
+                  <Button
+                    onClick={handleSave}
+                    disabled={isSaving || !advancedDirty}
+                  >
                     {isSaving ? (
                       <span className="inline-flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -684,6 +789,16 @@ export function SettingsPage({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        isOpen={pendingNavigation !== null}
+        title={t("settings.unsavedChanges.title")}
+        message={t("settings.unsavedChanges.message")}
+        confirmText={t("settings.unsavedChanges.discard")}
+        cancelText={t("settings.unsavedChanges.keepEditing")}
+        onConfirm={discardPendingChanges}
+        onCancel={() => setPendingNavigation(null)}
+      />
     </div>
   );
-}
+});

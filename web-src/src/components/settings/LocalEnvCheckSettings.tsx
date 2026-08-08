@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/select";
 import { APP_ICON_MAP } from "@/config/appConfig";
 import { settingsApi } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import type { ToolInstallation, ToolInstallationReport } from "@/lib/api/settings";
 import { cn } from "@/lib/utils";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -216,7 +217,7 @@ export function LocalEnvCheckSettings() {
 
   const handleCopyInstallCommands = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(ONE_CLICK_INSTALL_COMMANDS);
+      await copyText(ONE_CLICK_INSTALL_COMMANDS);
       toast.success(t("settings.installCommandsCopied"), { closeButton: true });
     } catch (error) {
       console.error(

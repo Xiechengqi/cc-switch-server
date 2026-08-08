@@ -1,5 +1,6 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
@@ -126,7 +127,9 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
         removeAccount: removeAccountAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const handleLogout = async () => {
@@ -135,7 +138,9 @@ export const CopilotAuthSection: React.FC<CopilotAuthSectionProps> = ({
         logout: logoutAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   if (isLoadingStatus || isStatusError) {

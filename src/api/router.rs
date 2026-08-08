@@ -364,8 +364,15 @@ pub(in crate::api) async fn router_pull_share_edits(
 }
 
 pub(in crate::api) fn spawn_share_upsert_sync(state: ServerState, share: Share) {
+    let share_id = share.id.clone();
     tokio::spawn(async move {
-        let _ = sync_share_upsert(state, share).await;
+        if let Err(error) = sync_share_upsert(state, share).await {
+            tracing::error!(
+                %error,
+                %share_id,
+                "background Router Share synchronization failed"
+            );
+        }
     });
 }
 
@@ -373,34 +380,11 @@ pub(in crate::api) async fn sync_share_upsert(
     state: ServerState,
     share: Share,
 ) -> Result<(), String> {
-    crate::state::sync_one_share_to_router(&state, &share.id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let Some(current) = state.shares.read().await.get(&share.id).cloned() else {
-        return Ok(());
-    };
-    let Some(subdomain) = current.tunnel_subdomain.as_deref() else {
-        return Ok(());
-    };
-    let config = state.config_snapshot().await;
-    let http_client = state.http_client().await;
-    if let Err(error) = crate::clients::router::client::notify_runtime_refresh(
-        &http_client,
-        &config,
-        current.id.clone(),
-        subdomain.to_string(),
-    )
+    Box::pin(crate::state::sync_share_to_router_with_runtime_refresh(
+        &state, &share.id,
+    ))
     .await
-    {
-        let message = error.to_string();
-        tracing::warn!(share_id = %current.id, error = %message, "router share runtime refresh failed");
-        state
-            .mutate_shares_debounced(|store| {
-                store.last_router_error = Some(message.clone());
-            })
-            .await;
-    }
-    Ok(())
+    .map_err(|error| error.to_string())
 }
 
 pub(in crate::api) fn spawn_share_delete_sync(state: ServerState, tombstone: ShareDeleteTombstone) {

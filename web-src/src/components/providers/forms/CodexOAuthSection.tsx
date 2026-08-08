@@ -1,5 +1,6 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
@@ -225,8 +226,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
       ) {
         onAccountSelect?.(null);
       }
-    } catch {
-      return;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -236,7 +237,9 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         logout: logoutAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   if (isLoadingStatus || isStatusError) {

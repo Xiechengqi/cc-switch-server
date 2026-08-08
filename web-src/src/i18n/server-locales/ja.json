@@ -2,12 +2,70 @@
   "common": {
     "copied": "コピーしました"
   },
+  "server": {
+    "common": {
+      "server": "Server",
+      "runtime": "ランタイム",
+      "setup": "初期設定",
+      "login": "ログイン",
+      "password": "パスワード"
+    },
+    "auth": {
+      "ownerEmail": "Owner メール",
+      "clientSubdomain": "Client サブドメイン",
+      "loginTitle": "管理コンソールにログイン",
+      "setupTitle": "Server を初期化",
+      "loginSubtitlePasswordOnly": "Web パスワードでログインします。",
+      "setupSubtitle": "Owner メール、Router、Client サブドメイン、管理者パスワードを設定します。Client サブドメインは初期設定後に変更できません。",
+      "methodPassword": "パスワード",
+      "methodEmail": "メールコード",
+      "methodApiToken": "API Token",
+      "apiToken": "API Token",
+      "apiTokenHint": "初期設定または設定ページで発行した API Token を使用します。",
+      "emailLoginHint": "Router が設定済み Owner メールに認証コードを送信します。",
+      "codeSentTo": "認証コードを {{destination}} に送信しました",
+      "resendIn": "{{seconds}} 秒後に再送できます",
+      "clientSubdomainAuto": "空欄で自動生成",
+      "clientSubdomainAvailable": "サブドメインは利用可能です",
+      "clientSubdomainTaken": "サブドメインは使用中です。別の名前にするかランダム生成してください。",
+      "generateSubdomain": "サブドメインを生成",
+      "generateSubdomainFailed": "サブドメインの生成に失敗しました",
+      "routerUnreachableForSubdomain": "Router に到達できないためサブドメインを生成できません",
+      "subdomainUnchecked": "利用可否を確認できませんでした。初期化時に競合する可能性があります",
+      "setupClaimPending": "Router client の登録状態：{{status}}。Router 接続を確認して再試行してください。",
+      "clientWeb": {
+        "loginTitle": "Client Web ログイン",
+        "setupTitle": "Web パスワードを設定",
+        "setupSubtitle": "初回アクセス時に Web 管理パスワードを設定してください。",
+        "webPassword": "Web パスワード",
+        "setupPasswordPlaceholder": "Web パスワードを設定",
+        "setupAndLogin": "設定してログイン",
+        "login": "ログイン",
+        "verificationCode": "認証コード",
+        "sendCode": "コードを送信",
+        "verifyAndLogin": "確認してログイン",
+        "unauthorizedCredential": "この認証情報では現在の client にアクセスできません",
+        "codeSent": "認証コードを送信しました",
+        "loggedIn": "client にログインしました",
+        "loggedInWithToken": "API token で client にログインしました",
+        "loggedInWithPassword": "Web パスワードでログインしました",
+        "passwordSet": "Web パスワードを設定しました"
+      }
+    },
+    "settings": {
+      "verificationCode": "認証コード",
+      "requestCode": "コードを要求",
+      "verify": "検証"
+    }
+  },
   "providers": {
     "addProvider": "プロバイダーを追加"
   },
   "providerBundle": {
     "account": "OAuth アカウント",
     "advancedSettings": "詳細設定 JSON",
+    "apiUrlUnavailable": "API URL が設定されていません",
+    "authHeader": "API Key ヘッダー名",
     "basic": "基本情報",
     "count": "{{count}} 件の Provider ノード",
     "create": "Provider を新規作成",
@@ -18,17 +76,24 @@
     "deleted": "Provider を削除しました",
     "driverOptions": "ドライバーオプション",
     "edit": "Provider を編集",
+    "effectiveConfig": "有効なランタイム設定",
     "family": "Provider タイプ",
+    "firstByteTimeout": "最初のバイトのタイムアウト（ミリ秒）",
     "modelPassthrough": "透過",
     "modelSingle": "固定モデル",
+    "queryParameter": "API Key クエリパラメーター名",
+    "requestTimeout": "リクエストタイムアウト（ミリ秒）",
     "saved": "Provider を保存しました",
     "selectAccount": "OAuth アカウントを選択",
     "surfaceCredential": "認証情報",
     "surfaceEnabled": "API を有効化",
     "surfaces": "API Surface",
+    "streamIdleTimeout": "ストリームアイドルタイムアウト（ミリ秒）",
+    "testModel": "テストモデル",
     "title": "Providers"
   },
   "provider": {
+    "clickToClearCurrent": "クリックして無効化",
     "share": {
       "sectionTitle": "リモート Share",
       "addPageBadge": "保存後に利用可能",
@@ -43,8 +108,18 @@
       "sectionHint": "各 Provider は 1 つの Share に対応します。共有パラメーターはここで設定し、高度な運用設定は Router Console で管理します。",
       "openRouterConsole": "Router Console を開く",
       "disabledHint": "有効にするとリモート共有を設定して Share を作成できます。",
+      "description": "説明",
+      "expiry": "有効期限",
+      "forSale": "アクセスモード",
+      "free": "無料",
+      "market": "マーケット",
+      "parallelLimit": "同時実行上限",
+      "private": "非公開",
       "routerSyncFailed": "Router との同期に失敗しました：{{error}}",
       "routerSyncPending": "Router に同期中",
+      "sharedWith": "許可メール",
+      "subdomain": "Share サブドメイン",
+      "tokenLimit": "Token 上限",
       "ownerRequired": "先に Share 設定ページで Client Tunnel Owner のメールを設定してください"
     },
     "form": {
@@ -62,6 +137,9 @@
     },
     "market": {
       "allSelected": "すべての Market を選択済み"
+    },
+    "tunnel": {
+      "region": "リージョン"
     },
     "permanent": "無期限",
     "expiration": "有効期限",
@@ -99,6 +177,11 @@
   "codexConfig": {
     "noCommonConfigToApply": "共通設定が空か、書き込み可能な値がありません"
   },
+  "serverProviderForm": {
+    "endpoint": {
+      "url": "アップストリーム API URL"
+    }
+  },
   "claudeDesktop": {
     "route": {
       "stopBlockedByTakeover": "別のアプリがプロキシテイクオーバーを使用しています。設定で該当アプリのテイクオーバーを無効にしてからローカルルートを停止してください。"
@@ -121,6 +204,12 @@
   "settings": {
     "loadFailed": "設定を読み込めません。ページを再読み込みしてもう一度お試しください。",
     "selectFileFailed": "ディレクトリの選択に失敗しました",
+    "unsavedChanges": {
+      "title": "未保存の設定を破棄しますか？",
+      "message": "詳細設定に未保存の変更があります。このページを離れると変更は失われます。",
+      "discard": "変更を破棄",
+      "keepEditing": "編集を続ける"
+    },
     "authCenter": {
       "serverDescription": "Provider ノードとその API Surface で使用する公式 OAuth アカウントを管理します。",
       "claudeOauthDescription": "Claude 公式サブスクリプションアカウントを管理",
@@ -132,6 +221,9 @@
       "deepseekAccountDescription": "DeepSeek アカウントを管理"
     },
     "advanced": {
+      "apiManagement": {
+        "revokeTokenConfirm": "取り消すと、現在のデバッグトークンは直ちに無効になります。"
+      },
       "proxy": {
         "title": "Router Share ルーティング",
         "description": "Router Share ingress の状態とルーティング可能な Bundle Surface を表示します",

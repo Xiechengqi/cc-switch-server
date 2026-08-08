@@ -1307,7 +1307,9 @@ function ProviderFormFull({
           }
         }
         form.setValue("settingsConfig", JSON.stringify(config, null, 2));
-      } catch {}
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : String(error));
+      }
     },
     [form],
   );
@@ -3724,7 +3726,7 @@ function ProviderFormFull({
         title={t("confirm.commonConfig.title")}
         message={t("confirm.commonConfig.message")}
         confirmText={t("confirm.commonConfig.confirm")}
-        onConfirm={() => void handleCommonConfigConfirm()}
+        onConfirm={handleCommonConfigConfirm}
         onCancel={() => void handleCommonConfigConfirm()}
       />
 

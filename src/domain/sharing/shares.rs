@@ -13,10 +13,10 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::router::{ClientSubdomain, ShareSlug};
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, share_expires_at_rfc3339,
-    ShareAnchoredUsageBucket, ShareAppAccess, ShareAppSettings, ShareGrantManager,
-    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareTokenPeriod,
-    ShareUserGrant, ShareUserPolicy, ShareUserUsage, ShareUserUsageBucket,
+    descriptor_for_share_with_accounts_and_usage, ShareAnchoredUsageBucket, ShareAppAccess,
+    ShareAppSettings, ShareGrantManager, ShareManagedGrantAction, ShareManagedGrantOperation,
+    ShareSettingsPatch, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy, ShareUserUsage,
+    ShareUserUsageBucket,
 };
 use crate::domain::sharing::token_period::{token_period_window, validate_user_policy};
 use crate::domain::usage::store::UsageStore;
@@ -317,6 +317,39 @@ pub struct RouterSharePruneMarker {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SharePolicy {
+    #[serde(default)]
+    pub acl: ShareAcl,
+    #[serde(default)]
+    pub token_limit: Option<u64>,
+    #[serde(default)]
+    pub parallel_limit: Option<u32>,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub for_sale: bool,
+    #[serde(default)]
+    pub free_access: bool,
+    #[serde(default)]
+    pub official_price_percent: Option<u16>,
+}
+
+impl Default for SharePolicy {
+    fn default() -> Self {
+        Self {
+            acl: ShareAcl::default(),
+            token_limit: None,
+            parallel_limit: None,
+            expires_at: None,
+            for_sale: false,
+            free_access: false,
+            official_price_percent: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Share {
     pub id: String,
     #[serde(default)]
@@ -340,32 +373,14 @@ pub struct Share {
     pub quota_percent: Option<f64>,
     #[serde(default)]
     pub tunnel_subdomain: Option<String>,
-    #[serde(default)]
-    pub acl: ShareAcl,
-    #[serde(default)]
-    pub token_limit: Option<u64>,
-    #[serde(default)]
-    pub parallel_limit: Option<u32>,
+    #[serde(flatten)]
+    pub policy: SharePolicy,
     #[serde(default)]
     pub tokens_used: u64,
     #[serde(default)]
     pub requests_count: u64,
     #[serde(default)]
-    pub expires_at: Option<i64>,
-    #[serde(default)]
     pub created_at_ms: u128,
-    #[serde(default)]
-    pub for_sale: bool,
-    #[serde(default)]
-    pub free_access: bool,
-    #[serde(default)]
-    pub access_by_app: BTreeMap<String, ShareAppAccess>,
-    #[serde(default)]
-    pub app_settings: BTreeMap<String, ShareAppSettings>,
-    #[serde(default)]
-    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
-    #[serde(default)]
-    pub official_price_percent: Option<f64>,
     #[serde(default)]
     pub auto_start: bool,
     #[serde(default)]
@@ -378,6 +393,8 @@ pub struct Share {
     pub runtime_snapshot: Option<Value>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_error: Option<ShareIntegrityError>,
     #[serde(default)]
     pub router_last_synced_at_ms: Option<u128>,
     #[serde(default)]
@@ -398,6 +415,52 @@ pub struct Share {
     pub router_synced_descriptor_fingerprint: Option<String>,
     #[serde(default)]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareIntegrityError {
+    pub code: String,
+    pub message: String,
+    pub checked_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareIntegrityStatus {
+    Healthy,
+    Repaired,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareIntegrityOutcome {
+    pub share_id: String,
+    pub status: ShareIntegrityStatus,
+    pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ShareIntegrityError>,
+}
+
+impl ShareIntegrityOutcome {
+    pub fn changed(&self) -> bool {
+        self.changed
+    }
+}
+
+impl std::ops::Deref for Share {
+    type Target = SharePolicy;
+
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
+impl std::ops::DerefMut for Share {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.policy
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -471,13 +534,13 @@ pub struct UpsertShareInput {
     #[serde(default)]
     pub free_access: Option<bool>,
     #[serde(default)]
-    pub access_by_app: BTreeMap<String, ShareAppAccess>,
+    pub access_by_app: BTreeMap<AppKind, ShareAppAccess>,
     #[serde(default)]
-    pub app_settings: BTreeMap<String, ShareAppSettings>,
+    pub app_settings: BTreeMap<AppKind, ShareAppSettings>,
     #[serde(default)]
-    pub for_sale_official_price_percent_by_app: BTreeMap<String, u16>,
+    pub for_sale_official_price_percent_by_app: BTreeMap<AppKind, u16>,
     #[serde(default)]
-    pub official_price_percent: Option<f64>,
+    pub official_price_percent: Option<u16>,
     #[serde(default)]
     pub auto_start: Option<bool>,
     #[serde(default)]
@@ -666,25 +729,31 @@ impl ShareStore {
             account_email: input.account_email,
             quota_percent: input.quota_percent,
             tunnel_subdomain,
-            acl: input.acl.unwrap_or_default(),
-            token_limit: input.token_limit,
-            parallel_limit: input.parallel_limit,
+            policy: SharePolicy {
+                acl: input.acl.unwrap_or_default(),
+                token_limit: input.token_limit,
+                parallel_limit: input.parallel_limit,
+                expires_at: input.expires_at,
+                for_sale: input.for_sale.unwrap_or(false),
+                free_access: input.free_access.unwrap_or(false),
+                official_price_percent: input.official_price_percent.or_else(|| {
+                    input
+                        .for_sale_official_price_percent_by_app
+                        .values()
+                        .next()
+                        .copied()
+                }),
+            },
             tokens_used,
             requests_count,
-            expires_at: input.expires_at,
             created_at_ms,
-            for_sale: input.for_sale.unwrap_or(false),
-            free_access: input.free_access.unwrap_or(false),
-            access_by_app: input.access_by_app,
-            app_settings: input.app_settings,
-            for_sale_official_price_percent_by_app: input.for_sale_official_price_percent_by_app,
-            official_price_percent: input.official_price_percent,
             auto_start: input.auto_start.unwrap_or(true),
             description: input.description,
             bindings: input.bindings,
             binding_history,
             runtime_snapshot: input.runtime_snapshot,
             last_error,
+            integrity_error: None,
             router_last_synced_at_ms,
             router_last_sync_error,
             router_url,
@@ -698,7 +767,6 @@ impl ShareStore {
         };
 
         let mut share = share;
-        canonicalize_shared_app_settings_for_share(&mut share);
         if let Some(user_grants) = explicit_user_grants.as_ref() {
             share.user_grants = normalize_user_grants(
                 user_grants,
@@ -730,6 +798,9 @@ impl ShareStore {
                 item.bindings
                     .iter()
                     .any(|binding| binding.app == app && binding.provider_id == provider_id)
+                    || (item.bindings.is_empty()
+                        && item.app == app
+                        && item.provider_id == provider_id)
             })
             .map(|item| item.id.clone())
             .collect()
@@ -760,6 +831,114 @@ impl ShareStore {
             updated_ids.push(share.id.clone());
         }
         Ok(updated_ids)
+    }
+
+    pub fn refresh_capacity_pool_ids_for_shares(
+        &mut self,
+        share_ids: &BTreeSet<String>,
+        providers: &ProviderStore,
+        accounts: &AccountStore,
+        root_key: &[u8; 32],
+    ) -> Result<Vec<String>, crate::domain::sharing::credential_source::ShareCredentialSourceError>
+    {
+        let mut updated_ids = Vec::new();
+        for share in self
+            .shares
+            .iter_mut()
+            .filter(|share| share.status != "deleted" && share_ids.contains(&share.id))
+        {
+            let capacity_pool_id =
+                crate::domain::sharing::credential_source::capacity_pool_id_for_share(
+                    providers, accounts, share, root_key,
+                )?;
+            if share.capacity_pool_id == capacity_pool_id {
+                continue;
+            }
+            share.capacity_pool_id = capacity_pool_id;
+            mark_share_config_pending(share);
+            updated_ids.push(share.id.clone());
+        }
+        Ok(updated_ids)
+    }
+
+    pub fn repair_integrity(
+        &mut self,
+        providers: &ProviderStore,
+        accounts: &AccountStore,
+        root_key: &[u8; 32],
+    ) -> Vec<ShareIntegrityOutcome> {
+        let mut outcomes = Vec::new();
+        for share in self
+            .shares
+            .iter_mut()
+            .filter(|share| share.status != "deleted")
+        {
+            let mut repaired = false;
+            if share.bindings.is_empty() {
+                let primary_exists = providers.providers.iter().any(|stored| {
+                    stored.app == share.app
+                        && stored.provider.id == share.provider_id
+                        && stored.provider_type == share.provider_type
+                });
+                if primary_exists {
+                    share.bindings.push(ShareBinding {
+                        app: share.app,
+                        provider_id: share.provider_id.clone(),
+                        provider_type: share.provider_type,
+                    });
+                    repaired = true;
+                } else {
+                    outcomes.push(disable_share_for_integrity(
+                        share,
+                        "cc_switch_share_binding_integrity_failed",
+                        "Share has no bindings and its primary Provider does not exist",
+                    ));
+                    continue;
+                }
+            }
+
+            if let Err(message) = validate_share_provider_bindings(share, providers) {
+                outcomes.push(disable_share_for_integrity(
+                    share,
+                    "cc_switch_share_provider_reference_invalid",
+                    &message,
+                ));
+                continue;
+            }
+
+            match crate::domain::sharing::credential_source::capacity_pool_id_for_share(
+                providers, accounts, share, root_key,
+            ) {
+                Ok(capacity_pool_id) => {
+                    if share.capacity_pool_id != capacity_pool_id {
+                        share.capacity_pool_id = capacity_pool_id;
+                        repaired = true;
+                    }
+                    if share.integrity_error.take().is_some() {
+                        repaired = true;
+                    }
+                    if repaired {
+                        mark_share_config_pending(share);
+                    }
+                    outcomes.push(ShareIntegrityOutcome {
+                        share_id: share.id.clone(),
+                        status: if repaired {
+                            ShareIntegrityStatus::Repaired
+                        } else {
+                            ShareIntegrityStatus::Healthy
+                        },
+                        changed: repaired,
+                        error: None,
+                    });
+                }
+                Err(error) => outcomes.push(disable_share_for_integrity(
+                    share,
+                    error.code(),
+                    &error.to_string(),
+                )),
+            }
+        }
+        outcomes
     }
 
     pub fn apply_capacity_pool_ids(
@@ -976,6 +1155,7 @@ impl ShareStore {
                 reason: ShareRejectReason::NotFound,
                 message: "Share not found on this cc-switch.".to_string(),
                 status_changed: false,
+                concurrency: None,
             });
         };
 
@@ -984,6 +1164,7 @@ impl ShareStore {
                 reason: ShareRejectReason::UnsupportedApp,
                 message: format!("Share does not provide the {} API format.", app.as_str()),
                 status_changed: false,
+                concurrency: None,
             });
         }
 
@@ -995,6 +1176,7 @@ impl ShareStore {
                     share.status
                 ),
                 status_changed: false,
+                concurrency: None,
             });
         }
 
@@ -1009,6 +1191,7 @@ impl ShareStore {
                 message: "Share has expired. Extend the share expiration or create a new share."
                     .to_string(),
                 status_changed: true,
+                concurrency: None,
             });
         }
 
@@ -1024,6 +1207,7 @@ impl ShareStore {
                     "Share token quota has been exhausted. Reset usage or increase the token limit."
                         .to_string(),
                 status_changed: true,
+                concurrency: None,
             });
         }
 
@@ -1035,6 +1219,23 @@ impl ShareStore {
             .as_deref()
             .and_then(|email| share.user_grants.get(email))
             .filter(|grant| grant.active);
+        if !share.free_access && normalized_user_email.is_none() {
+            return Err(ShareInvocationRejection {
+                reason: ShareRejectReason::UserIdentityRequired,
+                message: "An authenticated user identity is required to invoke this Share."
+                    .to_string(),
+                status_changed: false,
+                concurrency: None,
+            });
+        }
+        if !share.free_access && normalized_user_email.is_some() && user_grant.is_none() {
+            return Err(ShareInvocationRejection {
+                reason: ShareRejectReason::Unauthorized,
+                message: "This user is not authorized to invoke the Share.".to_string(),
+                status_changed: false,
+                concurrency: None,
+            });
+        }
         if let Some(grant) = user_grant {
             if grant
                 .policy
@@ -1045,6 +1246,7 @@ impl ShareStore {
                     reason: ShareRejectReason::UserExpired,
                     message: "This user's Share access has expired.".to_string(),
                     status_changed: false,
+                    concurrency: None,
                 });
             }
             if grant
@@ -1056,6 +1258,7 @@ impl ShareStore {
                     reason: ShareRejectReason::UserExhausted,
                     message: "This user's Share token quota has been exhausted.".to_string(),
                     status_changed: false,
+                    concurrency: None,
                 });
             }
         }
@@ -1289,7 +1492,6 @@ impl ShareStore {
             change_kind: Some("binding_added".to_string()),
             changed_at_ms: now_ms(),
         });
-        canonicalize_shared_app_settings_for_share(share);
         mark_share_config_pending(share);
         Ok(share.clone())
     }
@@ -1338,7 +1540,6 @@ impl ShareStore {
             change_kind: Some("binding_removed".to_string()),
             changed_at_ms: now_ms(),
         });
-        canonicalize_shared_app_settings_for_share(share);
         mark_share_config_pending(share);
         Ok(share.clone())
     }
@@ -1477,7 +1678,6 @@ impl ShareStore {
         if enabled {
             share.last_error = None;
         }
-        canonicalize_shared_app_settings_for_share(&mut share);
         crate::domain::sharing::invariants::validate_share_import(&share)?;
         candidate.shares[index] = share;
         candidate.apply_settings_patch_with_usage(share_id, settings, usage, applied_at_ms)?;
@@ -1526,7 +1726,6 @@ impl ShareStore {
     pub fn replace_acl(&mut self, share_id: &str, acl: ShareAcl) -> Option<Share> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         share.acl = acl;
-        canonicalize_shared_app_settings_for_share(share);
         mark_share_config_pending(share);
         Some(share.clone())
     }
@@ -1640,7 +1839,7 @@ impl ShareStore {
     pub fn apply_settings_patch(
         &mut self,
         share_id: &str,
-        patch: ShareSettingsPatch,
+        mut patch: ShareSettingsPatch,
     ) -> Result<Share, SharePatchError> {
         let index = self
             .shares
@@ -1648,7 +1847,17 @@ impl ShareStore {
             .position(|item| item.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
         let mut share = self.shares[index].clone();
-        let pricing_was_explicit = patch.for_sale_official_price_percent_by_app.is_some();
+        let bound_apps = share
+            .bindings
+            .iter()
+            .map(|binding| binding.app)
+            .collect::<BTreeSet<_>>();
+        normalize_projected_share_policy_patch(
+            &mut patch,
+            self.shares[index].owner_email.as_deref(),
+            &bound_apps,
+        )?;
+        let pricing_was_explicit = patch.official_price_percent.is_some();
         let managed_grant = patch.managed_grant.clone();
         let mut managed_grant_fingerprint = None;
 
@@ -1670,10 +1879,10 @@ impl ShareStore {
             }
             managed_grant_fingerprint = Some(fingerprint);
             if operation.expected_config_revision != share.config_revision {
-                return Err(SharePatchError::Invalid(format!(
-                    "managed grant expected config revision {}, current revision is {}",
-                    operation.expected_config_revision, share.config_revision
-                )));
+                return Err(SharePatchError::RevisionConflict {
+                    expected: operation.expected_config_revision,
+                    current: share.config_revision,
+                });
             }
         }
 
@@ -1705,38 +1914,8 @@ impl ShareStore {
             share.acl.shared_with_emails =
                 normalize_email_list(&shared_with_emails, share.owner_email.as_deref());
         }
-        if let Some(access_by_app) = patch.access_by_app {
-            share.access_by_app =
-                normalize_access_by_app(access_by_app, share.owner_email.as_deref());
-            if let Some(access) = share
-                .access_by_app
-                .get(share.app.as_str())
-                .or_else(|| share.access_by_app.values().next())
-            {
-                share.acl.shared_with_emails = access.shared_with_emails.clone();
-                share.acl.market_access_mode = Some(access.market_access_mode.clone());
-            }
-        }
-        if let Some(app_settings) = patch.app_settings {
-            share.app_settings = normalize_app_settings(app_settings, share.owner_email.as_deref());
-            if let Some(settings) = share
-                .app_settings
-                .get(share.app.as_str())
-                .or_else(|| share.app_settings.values().next())
-                .cloned()
-            {
-                apply_router_for_sale_patch(&mut share, &settings.for_sale);
-                share.acl.market_access_mode = Some(settings.market_access_mode);
-                share.acl.shared_with_emails = settings.shared_with_emails;
-                share.token_limit =
-                    (settings.token_limit >= 0).then_some(settings.token_limit as u64);
-                share.parallel_limit =
-                    (settings.parallel_limit >= 0).then_some(settings.parallel_limit as u32);
-                share.expires_at = parse_share_expiration(&settings.expires_at)?;
-            }
-        }
-        if let Some(pricing) = patch.for_sale_official_price_percent_by_app {
-            share.for_sale_official_price_percent_by_app = pricing;
+        if let Some(official_price_percent) = patch.official_price_percent {
+            share.official_price_percent = official_price_percent;
         }
         if let Some(token_limit) = patch.token_limit {
             share.token_limit = (token_limit >= 0).then_some(token_limit as u64);
@@ -1761,15 +1940,14 @@ impl ShareStore {
 
         let pricing_eligible = share.for_sale && !share.free_access;
         if !pricing_eligible {
-            if pricing_was_explicit && !share.for_sale_official_price_percent_by_app.is_empty() {
+            if pricing_was_explicit && share.official_price_percent.is_some() {
                 return Err(SharePatchError::Invalid(
                     "share official price percent requires forSale=Yes".to_string(),
                 ));
             }
-            share.for_sale_official_price_percent_by_app.clear();
+            share.official_price_percent = None;
         }
         crate::domain::sharing::invariants::validate_share_import(&share)?;
-        canonicalize_shared_app_settings_for_share(&mut share);
 
         reconcile_user_grants(&mut share, explicit_user_grants.as_ref());
         if let Some(operation) = managed_grant.as_ref() {
@@ -1868,7 +2046,6 @@ impl ShareStore {
             .iter_mut()
             .find(|item| item.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
-        canonicalize_shared_app_settings_for_share(share);
         Ok(share.clone())
     }
 
@@ -2196,18 +2373,10 @@ fn bind_share_to_client_owner(share: &mut Share, owner_email: &str) -> bool {
         .filter(|email| !email.eq_ignore_ascii_case(owner_email));
     if let Some(previous_owner) = previous_owner {
         insert_email(&mut share.acl.shared_with_emails, previous_owner.clone());
-        for access in share.access_by_app.values_mut() {
-            insert_email(&mut access.shared_with_emails, previous_owner.clone());
-        }
-        for settings in share.app_settings.values_mut() {
-            insert_email(&mut settings.shared_with_emails, previous_owner.clone());
-        }
     }
     share.owner_email = Some(owner_email.to_string());
     share.acl.shared_with_emails =
         normalize_email_list(&share.acl.shared_with_emails, Some(owner_email));
-    share.access_by_app = normalize_access_by_app(share.access_by_app.clone(), Some(owner_email));
-    share.app_settings = normalize_app_settings(share.app_settings.clone(), Some(owner_email));
     ShareStore::sync_owner_email_snapshot(share, owner_email);
     true
 }
@@ -2315,6 +2484,13 @@ pub struct ShareInvocationRejection {
     pub reason: ShareRejectReason,
     pub message: String,
     pub status_changed: bool,
+    pub concurrency: Option<ShareConcurrencyLimit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareConcurrencyLimit {
+    pub current: u32,
+    pub limit: u32,
 }
 
 impl ShareInvocationRejection {
@@ -2327,6 +2503,8 @@ impl ShareInvocationRejection {
 pub enum ShareRejectReason {
     NotFound,
     UnsupportedApp,
+    UserIdentityRequired,
+    Unauthorized,
     Inactive,
     Expired,
     Exhausted,
@@ -2341,6 +2519,8 @@ impl ShareRejectReason {
         match self {
             Self::NotFound => "NotFound",
             Self::UnsupportedApp => "UnsupportedApp",
+            Self::UserIdentityRequired => "UserIdentityRequired",
+            Self::Unauthorized => "Unauthorized",
             Self::Inactive => "Inactive",
             Self::Expired => "Expired",
             Self::Exhausted => "Exhausted",
@@ -2373,7 +2553,25 @@ impl std::error::Error for ShareUpdateError {}
 pub enum SharePatchError {
     NotFound,
     BindingImmutable,
+    PolicyDivergent(String),
+    RevisionConflict { expected: u64, current: u64 },
     Invalid(String),
+}
+
+impl SharePatchError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "cc_switch_share_not_found",
+            Self::BindingImmutable => "cc_switch_share_binding_immutable",
+            Self::PolicyDivergent(_) => "cc_switch_share_policy_divergent",
+            Self::RevisionConflict { .. } => "cc_switch_share_revision_conflict",
+            Self::Invalid(_) => "cc_switch_share_invalid_patch",
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::RevisionConflict { .. })
+    }
 }
 
 impl std::fmt::Display for SharePatchError {
@@ -2382,6 +2580,11 @@ impl std::fmt::Display for SharePatchError {
             Self::NotFound => formatter.write_str("share not found"),
             Self::BindingImmutable => formatter.write_str(
                 "share binding is immutable in ordinary upsert/import; pause the Share and use the binding endpoint",
+            ),
+            Self::PolicyDivergent(message) => formatter.write_str(message),
+            Self::RevisionConflict { expected, current } => write!(
+                formatter,
+                "managed grant expected config revision {expected}, current revision is {current}"
             ),
             Self::Invalid(message) => formatter.write_str(message),
         }
@@ -2429,6 +2632,96 @@ fn default_share_status() -> String {
     "active".to_string()
 }
 
+fn validate_share_provider_bindings(
+    share: &Share,
+    providers: &ProviderStore,
+) -> Result<(), String> {
+    if !(1..=3).contains(&share.bindings.len()) {
+        return Err(format!(
+            "Share must have between one and three bindings (found {})",
+            share.bindings.len()
+        ));
+    }
+    let mut apps = BTreeSet::new();
+    for binding in &share.bindings {
+        if !apps.insert(binding.app) {
+            return Err(format!(
+                "Share repeats the {} binding",
+                binding.app.as_str()
+            ));
+        }
+        let Some(stored) = providers
+            .providers
+            .iter()
+            .find(|stored| stored.app == binding.app && stored.provider.id == binding.provider_id)
+        else {
+            return Err(format!(
+                "Share binding {}/{} references a missing Provider",
+                binding.app.as_str(),
+                binding.provider_id
+            ));
+        };
+        if stored.provider_type != binding.provider_type {
+            return Err(format!(
+                "Share binding {}/{} has providerType {}, expected {}",
+                binding.app.as_str(),
+                binding.provider_id,
+                binding.provider_type.as_str(),
+                stored.provider_type.as_str()
+            ));
+        }
+    }
+    if !share.bindings.iter().any(|binding| {
+        binding.app == share.app
+            && binding.provider_id == share.provider_id
+            && binding.provider_type == share.provider_type
+    }) {
+        return Err("Share primary Provider fields do not match a binding".to_string());
+    }
+    Ok(())
+}
+
+fn disable_share_for_integrity(
+    share: &mut Share,
+    code: &str,
+    message: &str,
+) -> ShareIntegrityOutcome {
+    let unchanged = !share.enabled
+        && share.status == "paused"
+        && share.capacity_pool_id.is_empty()
+        && share.last_error.as_deref() == Some(message)
+        && share
+            .integrity_error
+            .as_ref()
+            .is_some_and(|error| error.code == code && error.message == message);
+    let error = if unchanged {
+        share
+            .integrity_error
+            .clone()
+            .expect("unchanged integrity failure has a structured error")
+    } else {
+        ShareIntegrityError {
+            code: code.to_string(),
+            message: message.to_string(),
+            checked_at_ms: now_ms(),
+        }
+    };
+    if !unchanged {
+        share.enabled = false;
+        share.status = "paused".to_string();
+        share.capacity_pool_id.clear();
+        share.last_error = Some(message.to_string());
+        share.integrity_error = Some(error.clone());
+        mark_share_config_pending(share);
+    }
+    ShareIntegrityOutcome {
+        share_id: share.id.clone(),
+        status: ShareIntegrityStatus::Disabled,
+        changed: !unchanged,
+        error: Some(error),
+    }
+}
+
 fn mark_share_config_pending(share: &mut Share) {
     share.config_revision = share.config_revision.saturating_add(1).max(1);
     share.router_last_sync_error = None;
@@ -2463,52 +2756,6 @@ pub(crate) fn share_router_for_sale_label(share: &Share) -> String {
         "Yes".to_string()
     } else {
         "No".to_string()
-    }
-}
-
-fn canonicalize_shared_app_settings_for_share(share: &mut Share) {
-    let apps = share
-        .bindings
-        .iter()
-        .map(|binding| binding.app.as_str().to_string())
-        .collect::<Vec<_>>();
-    let market_access_mode = share
-        .acl
-        .market_access_mode
-        .clone()
-        .unwrap_or_else(|| "selected".to_string());
-    let shared_with_emails = share.acl.shared_with_emails.clone();
-    let access = ShareAppAccess {
-        shared_with_emails: shared_with_emails.clone(),
-        market_access_mode: market_access_mode.clone(),
-    };
-    let settings = ShareAppSettings {
-        for_sale: share_router_for_sale_label(share),
-        market_access_mode,
-        shared_with_emails,
-        token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
-        parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
-        expires_at: share_expires_at_rfc3339(share.expires_at),
-    };
-    let price = share
-        .for_sale_official_price_percent_by_app
-        .values()
-        .next()
-        .copied();
-
-    share.access_by_app.clear();
-    share.app_settings.clear();
-    share.for_sale_official_price_percent_by_app.clear();
-    for app in apps {
-        share.access_by_app.insert(app.clone(), access.clone());
-        share.app_settings.insert(app.clone(), settings.clone());
-        if share.for_sale && !share.free_access {
-            if let Some(price) = price {
-                share
-                    .for_sale_official_price_percent_by_app
-                    .insert(app, price);
-            }
-        }
     }
 }
 
@@ -2746,12 +2993,6 @@ fn apply_managed_grant_operation(
 
 fn add_grant_email_to_acl(share: &mut Share, email: &str) {
     insert_email(&mut share.acl.shared_with_emails, email.to_string());
-    for access in share.access_by_app.values_mut() {
-        insert_email(&mut access.shared_with_emails, email.to_string());
-    }
-    for settings in share.app_settings.values_mut() {
-        insert_email(&mut settings.shared_with_emails, email.to_string());
-    }
 }
 
 fn remove_grant_email_from_acl(share: &mut Share, email: &str) {
@@ -2759,16 +3000,6 @@ fn remove_grant_email_from_acl(share: &mut Share, email: &str) {
         .acl
         .shared_with_emails
         .retain(|value| !value.eq_ignore_ascii_case(email));
-    for access in share.access_by_app.values_mut() {
-        access
-            .shared_with_emails
-            .retain(|value| !value.eq_ignore_ascii_case(email));
-    }
-    for settings in share.app_settings.values_mut() {
-        settings
-            .shared_with_emails
-            .retain(|value| !value.eq_ignore_ascii_case(email));
-    }
 }
 
 fn normalize_user_grants(
@@ -2969,28 +3200,14 @@ fn reconcile_user_grants(
             .acl
             .shared_with_emails
             .retain(|email| !previous_direct.contains(&email.trim().to_ascii_lowercase()));
-        for access in share.access_by_app.values_mut() {
-            access
-                .shared_with_emails
-                .retain(|email| !previous_direct.contains(&email.trim().to_ascii_lowercase()));
-        }
-        for settings in share.app_settings.values_mut() {
-            settings
-                .shared_with_emails
-                .retain(|email| !previous_direct.contains(&email.trim().to_ascii_lowercase()));
-        }
-        for grant in share
+        let active_grant_emails = share
             .user_grants
             .values()
             .filter(|grant| grant.active && grant.role == "shareto")
-        {
-            insert_email(&mut share.acl.shared_with_emails, grant.email.clone());
-            for access in share.access_by_app.values_mut() {
-                insert_email(&mut access.shared_with_emails, grant.email.clone());
-            }
-            for settings in share.app_settings.values_mut() {
-                insert_email(&mut settings.shared_with_emails, grant.email.clone());
-            }
+            .map(|grant| grant.email.clone())
+            .collect::<Vec<_>>();
+        for email in active_grant_emails {
+            insert_email(&mut share.acl.shared_with_emails, email);
         }
         let desired_emails = share_acl_emails(share);
         for email in desired_emails {
@@ -3032,18 +3249,6 @@ fn share_acl_emails(share: &Share) -> BTreeSet<String> {
         .acl
         .shared_with_emails
         .iter()
-        .chain(
-            share
-                .access_by_app
-                .values()
-                .flat_map(|access| access.shared_with_emails.iter()),
-        )
-        .chain(
-            share
-                .app_settings
-                .values()
-                .flat_map(|settings| settings.shared_with_emails.iter()),
-        )
         .map(|email| email.trim().to_ascii_lowercase())
         .filter(|email| !email.is_empty() && owner.as_deref() != Some(email.as_str()))
         .collect()
@@ -3082,15 +3287,11 @@ fn normalize_email_list(values: &[String], owner_email: Option<&str>) -> Vec<Str
 }
 
 fn normalize_access_by_app(
-    access_by_app: BTreeMap<String, ShareAppAccess>,
+    access_by_app: BTreeMap<AppKind, ShareAppAccess>,
     owner_email: Option<&str>,
-) -> BTreeMap<String, ShareAppAccess> {
+) -> BTreeMap<AppKind, ShareAppAccess> {
     let mut normalized = BTreeMap::new();
     for (app, mut access) in access_by_app {
-        let app = app.trim().to_ascii_lowercase();
-        if app.is_empty() {
-            continue;
-        }
         access.market_access_mode = normalize_non_empty(access.market_access_mode, "selected");
         access.shared_with_emails = normalize_email_list(&access.shared_with_emails, owner_email);
         normalized.insert(app, access);
@@ -3099,15 +3300,11 @@ fn normalize_access_by_app(
 }
 
 fn normalize_app_settings(
-    app_settings: BTreeMap<String, ShareAppSettings>,
+    app_settings: BTreeMap<AppKind, ShareAppSettings>,
     owner_email: Option<&str>,
-) -> BTreeMap<String, ShareAppSettings> {
+) -> BTreeMap<AppKind, ShareAppSettings> {
     let mut normalized = BTreeMap::new();
     for (app, mut setting) in app_settings {
-        let app = app.trim().to_ascii_lowercase();
-        if app.is_empty() {
-            continue;
-        }
         setting.for_sale = normalize_router_for_sale_setting(&setting.for_sale);
         setting.market_access_mode = normalize_non_empty(setting.market_access_mode, "selected");
         setting.shared_with_emails = normalize_email_list(&setting.shared_with_emails, owner_email);
@@ -3116,9 +3313,135 @@ fn normalize_app_settings(
     normalized
 }
 
+fn normalize_projected_share_policy_patch(
+    patch: &mut ShareSettingsPatch,
+    owner_email: Option<&str>,
+    bound_apps: &BTreeSet<AppKind>,
+) -> Result<(), SharePatchError> {
+    if let Some(access_by_app) = patch.access_by_app.take() {
+        ensure_projected_apps_are_bound(&access_by_app, bound_apps, "accessByApp")?;
+        let normalized = normalize_access_by_app(access_by_app, owner_email);
+        let access = one_projected_value(normalized.values(), "accessByApp")?;
+        if let Some(access) = access {
+            let emails = normalize_email_list(&access.shared_with_emails, owner_email);
+            if patch
+                .shared_with_emails
+                .as_ref()
+                .is_some_and(|current| normalize_email_list(current, owner_email) != emails)
+                || patch.market_access_mode.as_ref().is_some_and(|current| {
+                    normalize_non_empty(current.clone(), "selected") != access.market_access_mode
+                })
+            {
+                return Err(SharePatchError::PolicyDivergent(
+                    "accessByApp disagrees with the global Share ACL".to_string(),
+                ));
+            }
+            patch.shared_with_emails.get_or_insert(emails);
+            patch
+                .market_access_mode
+                .get_or_insert(access.market_access_mode.clone());
+        }
+    }
+
+    if let Some(app_settings) = patch.app_settings.take() {
+        ensure_projected_apps_are_bound(&app_settings, bound_apps, "appSettings")?;
+        let normalized = normalize_app_settings(app_settings, owner_email);
+        let settings = one_projected_value(normalized.values(), "appSettings")?;
+        if let Some(settings) = settings {
+            let emails = normalize_email_list(&settings.shared_with_emails, owner_email);
+            let token_limit = settings.token_limit;
+            let parallel_limit = settings.parallel_limit;
+            let expires_at = parse_share_expiration(&settings.expires_at)?;
+            if patch
+                .shared_with_emails
+                .as_ref()
+                .is_some_and(|current| normalize_email_list(current, owner_email) != emails)
+                || patch.market_access_mode.as_ref().is_some_and(|current| {
+                    normalize_non_empty(current.clone(), "selected") != settings.market_access_mode
+                })
+                || patch.for_sale.as_ref().is_some_and(|current| {
+                    normalize_router_for_sale_setting(current) != settings.for_sale
+                })
+                || patch
+                    .token_limit
+                    .is_some_and(|current| current != token_limit)
+                || patch
+                    .parallel_limit
+                    .is_some_and(|current| current != parallel_limit)
+                || patch
+                    .expires_at
+                    .as_ref()
+                    .is_some_and(|current| parse_share_expiration(current).ok() != Some(expires_at))
+            {
+                return Err(SharePatchError::PolicyDivergent(
+                    "appSettings disagrees with the global Share policy".to_string(),
+                ));
+            }
+            patch.shared_with_emails.get_or_insert(emails);
+            patch
+                .market_access_mode
+                .get_or_insert(settings.market_access_mode.clone());
+            patch.for_sale.get_or_insert(settings.for_sale.clone());
+            patch.token_limit.get_or_insert(token_limit);
+            patch.parallel_limit.get_or_insert(parallel_limit);
+            patch.expires_at.get_or_insert(settings.expires_at.clone());
+        }
+    }
+
+    if let Some(pricing) = patch.for_sale_official_price_percent_by_app.take() {
+        ensure_projected_apps_are_bound(&pricing, bound_apps, "forSaleOfficialPricePercentByApp")?;
+        if pricing.values().any(|percent| !(1..=100).contains(percent)) {
+            return Err(SharePatchError::Invalid(
+                "share official price percent must be between 1 and 100".to_string(),
+            ));
+        }
+        let price = one_projected_value(pricing.values(), "per-app pricing")?.copied();
+        if patch
+            .official_price_percent
+            .is_some_and(|current| current != price)
+        {
+            return Err(SharePatchError::PolicyDivergent(
+                "per-app pricing disagrees with the global Share price".to_string(),
+            ));
+        }
+        patch.official_price_percent = Some(price);
+    }
+    Ok(())
+}
+
+fn ensure_projected_apps_are_bound<T>(
+    values: &BTreeMap<AppKind, T>,
+    bound_apps: &BTreeSet<AppKind>,
+    field: &str,
+) -> Result<(), SharePatchError> {
+    if let Some(app) = values.keys().find(|app| !bound_apps.contains(app)) {
+        return Err(SharePatchError::Invalid(format!(
+            "{field} contains unbound app {}",
+            app.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn one_projected_value<'a, T: PartialEq>(
+    mut values: impl Iterator<Item = &'a T>,
+    field: &str,
+) -> Result<Option<&'a T>, SharePatchError> {
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.any(|value| value != first) {
+        return Err(SharePatchError::PolicyDivergent(format!(
+            "Router {field} entries must describe one global Share policy"
+        )));
+    }
+    Ok(Some(first))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::sharing::router_contract::share_expires_at_rfc3339;
 
     fn managed_operation(
         operation_id: &str,
@@ -3597,10 +3920,10 @@ mod tests {
         }
     }
 
-    fn codex_app_settings(emails: Vec<&str>) -> BTreeMap<String, ShareAppSettings> {
+    fn codex_app_settings(emails: Vec<&str>) -> BTreeMap<AppKind, ShareAppSettings> {
         let mut app_settings = BTreeMap::new();
         app_settings.insert(
-            "codex".to_string(),
+            AppKind::Codex,
             ShareAppSettings {
                 for_sale: "Yes".to_string(),
                 market_access_mode: "selected".to_string(),
@@ -3611,6 +3934,149 @@ mod tests {
             },
         );
         app_settings
+    }
+
+    fn codex_provider_store(provider_ids: &[&str]) -> ProviderStore {
+        let mut providers = ProviderStore::default();
+        for provider_id in provider_ids {
+            let stored = providers.upsert(
+                AppKind::Codex,
+                crate::domain::providers::model::Provider {
+                    id: (*provider_id).to_string(),
+                    name: (*provider_id).to_string(),
+                    settings_config: json!({}),
+                    category: None,
+                    meta: None,
+                    extra: BTreeMap::new(),
+                },
+            );
+            assert_eq!(stored.provider_type, ProviderType::Codex);
+        }
+        providers
+    }
+
+    #[test]
+    fn integrity_repair_restores_empty_binding_without_disturbing_healthy_share() {
+        let providers = codex_provider_store(&["p1", "p2"]);
+        let accounts = AccountStore::default();
+        let mut store = ShareStore::default();
+        let mut repaired_input = codex_share_input("needs-repair");
+        repaired_input.provider_id = "p1".to_string();
+        store.upsert(repaired_input).unwrap();
+        let mut healthy_input = codex_share_input("healthy");
+        healthy_input.provider_id = "p2".to_string();
+        store.upsert(healthy_input).unwrap();
+        store
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "needs-repair")
+            .unwrap()
+            .bindings
+            .clear();
+
+        let outcomes = store.repair_integrity(&providers, &accounts, &[7; 32]);
+
+        let repaired = outcomes
+            .iter()
+            .find(|outcome| outcome.share_id == "needs-repair")
+            .unwrap();
+        assert_eq!(repaired.status, ShareIntegrityStatus::Repaired);
+        assert!(repaired.changed);
+        assert_eq!(store.get("needs-repair").unwrap().bindings.len(), 1);
+        let healthy = store.get("healthy").unwrap();
+        assert!(healthy.enabled);
+        assert!(healthy.integrity_error.is_none());
+    }
+
+    #[test]
+    fn integrity_repair_disables_only_invalid_share_and_persists_the_diagnosis() {
+        let providers = codex_provider_store(&["p1"]);
+        let accounts = AccountStore::default();
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("healthy")).unwrap();
+        let mut invalid_input = codex_share_input("invalid");
+        invalid_input.provider_id = "missing".to_string();
+        store.upsert(invalid_input).unwrap();
+
+        let outcomes = store.repair_integrity(&providers, &accounts, &[9; 32]);
+
+        assert!(store.get("healthy").unwrap().enabled);
+        let invalid = store.get("invalid").unwrap();
+        assert!(!invalid.enabled);
+        assert_eq!(invalid.status, "paused");
+        assert!(invalid.capacity_pool_id.is_empty());
+        assert_eq!(
+            invalid
+                .integrity_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("cc_switch_share_provider_reference_invalid")
+        );
+        let disabled = outcomes
+            .iter()
+            .find(|outcome| outcome.share_id == "invalid")
+            .unwrap();
+        assert_eq!(disabled.status, ShareIntegrityStatus::Disabled);
+        assert!(disabled.changed);
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "cc-switch-share-integrity-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        store.save(&config_dir).unwrap();
+        let loaded = ShareStore::load_or_default(&config_dir).unwrap();
+        let persisted = loaded.get("invalid").unwrap();
+        assert!(!persisted.enabled);
+        assert!(persisted.integrity_error.is_some());
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn divergent_router_app_policies_are_rejected_atomically() {
+        let mut store = ShareStore::default();
+        store.upsert(codex_share_input("divergent-policy")).unwrap();
+        let original = store
+            .add_binding(
+                "divergent-policy",
+                ShareBinding {
+                    app: AppKind::Claude,
+                    provider_id: "claude-provider".to_string(),
+                    provider_type: ProviderType::Claude,
+                },
+            )
+            .unwrap();
+        let error = store
+            .apply_settings_patch(
+                &original.id,
+                ShareSettingsPatch {
+                    app_settings: Some(BTreeMap::from([
+                        (
+                            AppKind::Claude,
+                            ShareAppSettings {
+                                token_limit: 10,
+                                ..codex_app_settings(Vec::new())[&AppKind::Codex].clone()
+                            },
+                        ),
+                        (
+                            AppKind::Codex,
+                            ShareAppSettings {
+                                token_limit: 20,
+                                ..codex_app_settings(Vec::new())[&AppKind::Codex].clone()
+                            },
+                        ),
+                    ])),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SharePatchError::PolicyDivergent(_)));
+        let unchanged = store.get(&original.id).unwrap();
+        assert_eq!(unchanged.config_revision, original.config_revision);
+        assert!(unchanged.token_limit.is_none());
     }
 
     #[test]
@@ -3626,7 +4092,11 @@ mod tests {
         input.app_settings = codex_app_settings(Vec::new());
 
         let share = ShareStore::default().upsert(input).unwrap();
-        let settings = &share.app_settings["codex"];
+        let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
+            &share,
+            &ProviderStore::default(),
+        );
+        let settings = &descriptor.app_settings[&AppKind::Codex];
 
         assert_eq!(share.expires_at, Some(expires_at));
         assert_eq!(
@@ -3952,6 +4422,52 @@ mod tests {
     }
 
     #[test]
+    fn invocation_acl_rejects_unknown_or_missing_user_identity() {
+        let now = test_timestamp_ms(2026, 7, 19, 12, 0);
+        let mut private_input = codex_share_input("private-acl");
+        private_input.acl = Some(ShareAcl {
+            shared_with_emails: vec!["allowed@example.com".to_string()],
+            ..ShareAcl::default()
+        });
+        let mut store = ShareStore::default();
+        store.upsert(private_input).unwrap();
+
+        let rejection = store
+            .validate_for_invocation(
+                "private-acl",
+                AppKind::Codex,
+                Some("unknown@example.com"),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(rejection.reason, ShareRejectReason::Unauthorized);
+        assert!(store
+            .validate_for_invocation(
+                "private-acl",
+                AppKind::Codex,
+                Some("ALLOWED@EXAMPLE.COM"),
+                now,
+            )
+            .is_ok());
+        let missing_identity = store
+            .validate_for_invocation("private-acl", AppKind::Codex, None, now)
+            .unwrap_err();
+        assert_eq!(
+            missing_identity.reason,
+            ShareRejectReason::UserIdentityRequired
+        );
+
+        let mut free_input = codex_share_input("free-acl");
+        free_input.provider_id = "p-free-acl".to_string();
+        free_input.for_sale = Some(false);
+        free_input.free_access = Some(true);
+        store.upsert(free_input).unwrap();
+        assert!(store
+            .validate_for_invocation("free-acl", AppKind::Codex, Some("anyone@example.com"), now,)
+            .is_ok());
+    }
+
+    #[test]
     fn supplemental_usage_counts_tokens_without_a_second_request() {
         let now = test_timestamp_ms(2026, 7, 19, 12, 0);
         let mut input = codex_share_input("supplemental-usage");
@@ -4133,7 +4649,7 @@ mod tests {
                 &share.id,
                 ShareSettingsPatch {
                     for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
-                        "codex".to_string(),
+                        AppKind::Codex,
                         80,
                     )])),
                     ..ShareSettingsPatch::default()
@@ -4141,10 +4657,7 @@ mod tests {
             )
             .expect("apply pricing");
 
-        assert_eq!(
-            updated.for_sale_official_price_percent_by_app,
-            BTreeMap::from([("codex".to_string(), 80)])
-        );
+        assert_eq!(updated.official_price_percent, Some(80));
     }
 
     #[test]
@@ -4154,9 +4667,9 @@ mod tests {
         let share = store.upsert(input).expect("upsert");
 
         for pricing in [
-            BTreeMap::from([("codex".to_string(), 0)]),
-            BTreeMap::from([("codex".to_string(), 101)]),
-            BTreeMap::from([("claude".to_string(), 80)]),
+            BTreeMap::from([(AppKind::Codex, 0)]),
+            BTreeMap::from([(AppKind::Codex, 101)]),
+            BTreeMap::from([(AppKind::Claude, 80)]),
         ] {
             let result = store.apply_settings_patch(
                 &share.id,
@@ -4169,7 +4682,7 @@ mod tests {
             assert!(matches!(result, Err(SharePatchError::Invalid(_))));
             let stored = store.get(&share.id).expect("stored share");
             assert_eq!(stored.description, None);
-            assert!(stored.for_sale_official_price_percent_by_app.is_empty());
+            assert!(stored.official_price_percent.is_none());
         }
     }
 
@@ -4177,7 +4690,7 @@ mod tests {
     fn sale_mode_transition_clears_pricing_and_rejects_contradictory_payload() {
         let mut store = ShareStore::default();
         let mut input = codex_share_input("share-price-transition");
-        input.for_sale_official_price_percent_by_app = BTreeMap::from([("codex".to_string(), 75)]);
+        input.for_sale_official_price_percent_by_app = BTreeMap::from([(AppKind::Codex, 75)]);
         let share = store.upsert(input).expect("upsert");
 
         let rejected = store.apply_settings_patch(
@@ -4185,7 +4698,7 @@ mod tests {
             ShareSettingsPatch {
                 for_sale: Some("No".to_string()),
                 for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
-                    "codex".to_string(),
+                    AppKind::Codex,
                     75,
                 )])),
                 ..ShareSettingsPatch::default()
@@ -4196,9 +4709,8 @@ mod tests {
             store
                 .get(&share.id)
                 .expect("stored share")
-                .for_sale_official_price_percent_by_app
-                .get("codex"),
-            Some(&75)
+                .official_price_percent,
+            Some(75)
         );
 
         let updated = store
@@ -4210,7 +4722,7 @@ mod tests {
                 },
             )
             .expect("disable market sale");
-        assert!(updated.for_sale_official_price_percent_by_app.is_empty());
+        assert!(updated.official_price_percent.is_none());
     }
 
     #[test]
@@ -4239,7 +4751,7 @@ mod tests {
                 access_by_app: BTreeMap::new(),
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
-                official_price_percent: Some(80.0),
+                official_price_percent: Some(80),
                 auto_start: Some(true),
                 description: Some("test".to_string()),
                 bindings: Vec::new(),
@@ -4318,17 +4830,17 @@ mod tests {
 
         assert_eq!(shared.capacity_pool_id, "cp_shared");
         assert_eq!(shared.bindings.len(), 2);
-        assert_eq!(
-            shared.app_settings["claude"].token_limit,
-            shared.app_settings["codex"].token_limit
+        let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
+            &shared,
+            &ProviderStore::default(),
         );
         assert_eq!(
-            shared.app_settings["claude"].shared_with_emails,
-            shared.app_settings["codex"].shared_with_emails
+            descriptor.app_settings[&AppKind::Claude],
+            descriptor.app_settings[&AppKind::Codex]
         );
         assert_eq!(
-            shared.access_by_app["claude"].shared_with_emails,
-            shared.access_by_app["codex"].shared_with_emails
+            descriptor.access_by_app[&AppKind::Claude],
+            descriptor.access_by_app[&AppKind::Codex]
         );
 
         let updated = store
@@ -4341,7 +4853,7 @@ mod tests {
                     parallel_limit: Some(3),
                     for_sale: Some("Yes".to_string()),
                     for_sale_official_price_percent_by_app: Some(BTreeMap::from([(
-                        "claude".to_string(),
+                        AppKind::Claude,
                         80,
                     )])),
                     ..ShareSettingsPatch::default()
@@ -4349,22 +4861,18 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            updated.app_settings["claude"].shared_with_emails,
-            updated.app_settings["codex"].shared_with_emails
-        );
-        assert_eq!(
-            updated.app_settings["claude"].market_access_mode,
-            updated.app_settings["codex"].market_access_mode
-        );
-        assert_eq!(updated.app_settings["codex"].token_limit, 42);
-        assert_eq!(updated.app_settings["codex"].parallel_limit, 3);
-        assert_eq!(
-            updated.for_sale_official_price_percent_by_app,
-            BTreeMap::from([("claude".to_string(), 80), ("codex".to_string(), 80)])
-        );
+        assert_eq!(updated.acl.shared_with_emails, vec!["user@example.com"]);
+        assert_eq!(updated.acl.market_access_mode.as_deref(), Some("selected"));
+        assert_eq!(updated.token_limit, Some(42));
+        assert_eq!(updated.parallel_limit, Some(3));
+        assert_eq!(updated.official_price_percent, Some(80));
         assert!(store
-            .validate_for_invocation("multi-app", AppKind::Claude, None, 1_000)
+            .validate_for_invocation(
+                "multi-app",
+                AppKind::Claude,
+                Some("user@example.com"),
+                1_000,
+            )
             .is_ok());
         let rejection = store
             .validate_for_invocation("multi-app", AppKind::Gemini, None, 1_000)
@@ -4378,7 +4886,10 @@ mod tests {
         assert_eq!(retained.provider_id, "claude-provider");
         assert_eq!(retained.bindings.len(), 1);
         assert_eq!(store.shares.len(), 1);
-        assert!(!retained.app_settings.contains_key("codex"));
+        assert!(!retained
+            .bindings
+            .iter()
+            .any(|binding| binding.app == AppKind::Codex));
     }
 
     #[test]
@@ -4665,19 +5176,13 @@ mod tests {
             account_email: None,
             quota_percent: None,
             tunnel_subdomain: None,
-            acl: ShareAcl::default(),
-            token_limit: None,
-            parallel_limit: None,
+            policy: SharePolicy {
+                acl: ShareAcl::default(),
+                ..SharePolicy::default()
+            },
             tokens_used: 0,
             requests_count: 0,
-            expires_at: None,
             created_at_ms: 0,
-            for_sale: false,
-            free_access: false,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
             auto_start: false,
             description: None,
             bindings: vec![ShareBinding {
@@ -4688,6 +5193,7 @@ mod tests {
             binding_history: Vec::new(),
             runtime_snapshot: None,
             last_error: None,
+            integrity_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,
@@ -4755,7 +5261,7 @@ mod tests {
 
         let mut app_settings = BTreeMap::new();
         app_settings.insert(
-            "codex".to_string(),
+            AppKind::Codex,
             ShareAppSettings {
                 for_sale: "Yes".to_string(),
                 market_access_mode: "selected".to_string(),
@@ -4780,8 +5286,7 @@ mod tests {
             )
             .unwrap();
 
-        let setting = share.app_settings.get("codex").unwrap();
-        assert_eq!(setting.shared_with_emails, vec!["buyer@example.com"]);
+        assert_eq!(share.acl.shared_with_emails, vec!["buyer@example.com"]);
 
         let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
             &share,
@@ -4790,7 +5295,7 @@ mod tests {
         assert_eq!(
             descriptor
                 .app_settings
-                .get("codex")
+                .get(&AppKind::Codex)
                 .unwrap()
                 .shared_with_emails,
             vec!["buyer@example.com"]
@@ -4949,13 +5454,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            added
-                .app_settings
-                .get("codex")
-                .map(|settings| settings.shared_with_emails.clone()),
-            Some(vec!["buyer@example.com".to_string()])
-        );
+        assert_eq!(added.acl.shared_with_emails, vec!["buyer@example.com"]);
 
         let revoked = store
             .apply_settings_patch(
@@ -4966,13 +5465,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            revoked
-                .app_settings
-                .get("codex")
-                .map(|settings| settings.shared_with_emails.clone()),
-            Some(Vec::new())
-        );
+        assert!(revoked.acl.shared_with_emails.is_empty());
     }
 
     #[test]
@@ -5004,11 +5497,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            final_share
-                .app_settings
-                .get("codex")
-                .map(|settings| settings.shared_with_emails.clone()),
-            Some(vec!["buyer-b@example.com".to_string()])
+            final_share.acl.shared_with_emails,
+            vec!["buyer-b@example.com".to_string()]
         );
     }
 
@@ -5077,7 +5567,7 @@ mod tests {
         let mut input = codex_share_input("owner-bind");
         input.owner_email = Some("previous@example.com".to_string());
         input.access_by_app.insert(
-            "codex".to_string(),
+            AppKind::Codex,
             ShareAppAccess {
                 shared_with_emails: vec!["buyer@example.com".to_string()],
                 market_access_mode: "selected".to_string(),
@@ -5097,11 +5587,15 @@ mod tests {
             .shared_with_emails
             .iter()
             .any(|email| email == "previous@example.com"));
-        assert!(share.access_by_app["codex"]
+        let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
+            share,
+            &ProviderStore::default(),
+        );
+        assert!(descriptor.access_by_app[&AppKind::Codex]
             .shared_with_emails
             .iter()
             .any(|email| email == "previous@example.com"));
-        assert!(share.app_settings["codex"]
+        assert!(descriptor.app_settings[&AppKind::Codex]
             .shared_with_emails
             .iter()
             .any(|email| email == "previous@example.com"));
@@ -5273,15 +5767,16 @@ mod tests {
                 "owner@example.com".to_string()
             ]
         );
+        let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
+            first,
+            &ProviderStore::default(),
+        );
         assert_eq!(
-            first
-                .app_settings
-                .get("codex")
-                .map(|settings| settings.shared_with_emails.clone()),
-            Some(vec![
+            descriptor.app_settings[&AppKind::Codex].shared_with_emails,
+            vec![
                 "buyer@example.com".to_string(),
                 "owner@example.com".to_string()
-            ])
+            ]
         );
     }
 

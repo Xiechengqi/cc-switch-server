@@ -42,7 +42,8 @@ pub(crate) use error::{
     map_account_write_error, map_codex_active_account_selection_error, map_codex_device_error,
     map_codex_workspace_rebind_error, map_copilot_device_error, map_email_auth_error,
     map_grok_device_error, map_kiro_device_error, map_share_patch_error,
-    map_subscription_binding_error, map_web_auth_error, ErrorResponse,
+    map_subscription_binding_error, map_web_auth_error, ErrorResponse, InferenceApiError,
+    InferenceSurface,
 };
 pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;
@@ -713,14 +714,14 @@ async fn verify_router_ingress(
         (Some(encoded), Some(signature)) => {
             let config = state.config.read().await;
             let Some(identity) = config.registered_router_identity() else {
-                return StatusCode::UNAUTHORIZED.into_response();
+                return router_ingress_rejection("router_identity_unavailable", None);
             };
             let Some(control_secret) = identity.control_secret.as_deref() else {
-                return StatusCode::UNAUTHORIZED.into_response();
+                return router_ingress_rejection("control_secret_unavailable", None);
             };
             let router_id = match crate::clients::router::client::tunnel_router_id(&config) {
                 Ok(router_id) => router_id,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+                Err(_) => return router_ingress_rejection("router_binding_invalid", None),
             };
             match crate::clients::router::ingress::verify(
                 &encoded,
@@ -732,16 +733,24 @@ async fn verify_router_ingress(
             ) {
                 Ok(context) => Some(context),
                 Err(error) => {
-                    tracing::warn!(error = %error, "router ingress context rejected");
-                    return StatusCode::UNAUTHORIZED.into_response();
+                    let timing = error.timing();
+                    tracing::warn!(
+                        error = %error,
+                        ingress_error = error.code(),
+                        ingress_age_ms = timing.map(|(issued_at_ms, now_ms)| now_ms.saturating_sub(issued_at_ms)),
+                        "router ingress context rejected"
+                    );
+                    return router_ingress_rejection(error.code(), timing);
                 }
             }
         }
-        _ => return StatusCode::UNAUTHORIZED.into_response(),
+        _ => return router_ingress_rejection("headers_incomplete", None),
     };
 
     let Some(context) = context else {
-        return next.run(request).await;
+        let mut response = next.run(request).await;
+        strip_internal_ingress_response_headers(&mut response);
+        return response;
     };
     request.extensions_mut().insert(context.clone());
     let headers = request.headers_mut();
@@ -788,7 +797,50 @@ async fn verify_router_ingress(
             }
         }
     }
-    next.run(request).await
+    let mut response = next.run(request).await;
+    strip_internal_ingress_response_headers(&mut response);
+    response
+}
+
+fn router_ingress_rejection(code: &'static str, timing: Option<(i64, i64)>) -> Response {
+    use crate::clients::router::ingress::{
+        INTERNAL_INGRESS_AGE_MS_HEADER, INTERNAL_INGRESS_ERROR_HEADER,
+        INTERNAL_INGRESS_SERVER_TIME_MS_HEADER,
+    };
+
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        INTERNAL_INGRESS_ERROR_HEADER,
+        HeaderValue::from_static(code),
+    );
+    if let Some((issued_at_ms, now_ms)) = timing {
+        if let Ok(value) = HeaderValue::from_str(&now_ms.saturating_sub(issued_at_ms).to_string()) {
+            response
+                .headers_mut()
+                .insert(INTERNAL_INGRESS_AGE_MS_HEADER, value);
+        }
+        if let Ok(value) = HeaderValue::from_str(&now_ms.to_string()) {
+            response
+                .headers_mut()
+                .insert(INTERNAL_INGRESS_SERVER_TIME_MS_HEADER, value);
+        }
+    }
+    response
+}
+
+fn strip_internal_ingress_response_headers(response: &mut Response) {
+    use crate::clients::router::ingress::{
+        INTERNAL_INGRESS_AGE_MS_HEADER, INTERNAL_INGRESS_ERROR_HEADER,
+        INTERNAL_INGRESS_SERVER_TIME_MS_HEADER,
+    };
+
+    for name in [
+        INTERNAL_INGRESS_ERROR_HEADER,
+        INTERNAL_INGRESS_AGE_MS_HEADER,
+        INTERNAL_INGRESS_SERVER_TIME_MS_HEADER,
+    ] {
+        response.headers_mut().remove(name);
+    }
 }
 
 async fn embedded_web_asset(method: Method, uri: Uri) -> Response {
@@ -912,9 +964,13 @@ async fn proxy_models(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<ModelsQuery>,
-) -> Result<Json<OpenAiModelsResponse>, ApiError> {
+) -> Result<Json<OpenAiModelsResponse>, InferenceApiError> {
     let app = query.app.unwrap_or(AppKind::Codex);
-    let (provider_id, _share_guard) = validate_router_share_surface(&state, &headers, app).await?;
+    let surface = inference_surface_for_app(app);
+    let request_id = inference_request_id(&headers);
+    let (provider_id, _share_guard) = validate_router_share_surface(&state, &headers, app)
+        .await
+        .map_err(|error| InferenceApiError::proxy(surface, request_id, error))?;
     Ok(proxy_models_for_selection(&state, Some(app), Some(&provider_id)).await)
 }
 
@@ -922,21 +978,22 @@ pub(super) async fn validate_router_share_surface(
     state: &ServerState,
     headers: &HeaderMap,
     app: AppKind,
-) -> Result<(String, ShareInFlightGuard), ApiError> {
+) -> Result<(String, ShareInFlightGuard), proxy::ProxyError> {
     let share_id = headers
         .get("x-cc-switch-share-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::unauthorized("inference requires signed Router Share ingress"))?;
+        .ok_or_else(|| {
+            proxy::ProxyError::unauthorized("inference requires signed Router Share ingress")
+        })?;
     let user_email = headers
         .get("x-cc-switch-user-email")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (_, guard) = proxy::validate_and_acquire_share_invocation(state, share_id, app, user_email)
-        .await
-        .map_err(ApiError::proxy)?;
+    let (_, guard) =
+        proxy::validate_and_acquire_share_invocation(state, share_id, app, user_email).await?;
     let provider_id = state
         .shares
         .read()
@@ -944,18 +1001,36 @@ pub(super) async fn validate_router_share_surface(
         .get(share_id)
         .and_then(|share| share.bindings.iter().find(|binding| binding.app == app))
         .map(|binding| binding.provider_id.clone())
-        .ok_or_else(|| ApiError::conflict("Share binding changed during validation"))?;
+        .ok_or_else(|| proxy::ProxyError::conflict("Share binding changed during validation"))?;
     let provider_enabled = state.providers.read().await.providers.iter().any(|stored| {
         stored.app == app
             && stored.provider.id == provider_id
             && crate::domain::providers::bundle::surface_enabled(&stored.provider)
     });
     if !provider_enabled {
-        return Err(ApiError::not_found(format!(
+        return Err(proxy::ProxyError::not_found(format!(
             "enabled Share provider not found: {provider_id}"
         )));
     }
     Ok((provider_id, guard))
+}
+
+fn inference_surface_for_app(app: AppKind) -> InferenceSurface {
+    match app {
+        AppKind::Claude => InferenceSurface::Anthropic,
+        AppKind::Codex => InferenceSurface::OpenAi,
+        AppKind::Gemini => InferenceSurface::Gemini,
+    }
+}
+
+fn inference_request_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-cc-switch-request-id")
+        .or_else(|| headers.get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 async fn proxy_models_for_selection(
@@ -1312,7 +1387,8 @@ async fn proxy_models_or_manifest(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<ModelsDispatchQuery>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     if query
         .client_version
         .as_deref()
@@ -1320,7 +1396,9 @@ async fn proxy_models_or_manifest(
     {
         return proxy::forward_codex_models_manifest(state, headers, query.client_version)
             .await
-            .map_err(ApiError::proxy);
+            .map_err(|error| {
+                InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error)
+            });
     }
 
     Ok(
@@ -1339,30 +1417,38 @@ async fn proxy_codex_models_manifest(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Query(query): Query<CodexModelsManifestQuery>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward_codex_models_manifest(state, headers, query.client_version)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_codex_alpha_search(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward_codex_alpha_search(state, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_responses_input_tokens(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     let (_provider_id, _share_guard) =
-        validate_router_share_surface(&state, &headers, AppKind::Codex).await?;
+        validate_router_share_surface(&state, &headers, AppKind::Codex)
+            .await
+            .map_err(|error| {
+                InferenceApiError::proxy(InferenceSurface::OpenAi, request_id.clone(), error)
+            })?;
     responses_input_tokens_response(&headers, body)
+        .map_err(|error| InferenceApiError::api(InferenceSurface::OpenAi, request_id, error))
 }
 
 fn responses_input_tokens_response(headers: &HeaderMap, body: Bytes) -> Result<Response, ApiError> {
@@ -1582,9 +1668,23 @@ mod grok_catalog_provider_tests {
     }
 
     fn router_ingress_request(
+        request: Request,
+        request_id: &str,
+        share_id: Option<&str>,
+    ) -> Request {
+        router_ingress_request_at(
+            request,
+            request_id,
+            share_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+
+    fn router_ingress_request_at(
         mut request: Request,
         request_id: &str,
         share_id: Option<&str>,
+        issued_at_ms: i64,
     ) -> Request {
         let context = crate::clients::router::ingress::IngressContext {
             protocol_epoch: crate::clients::router::ingress::PROTOCOL_EPOCH.to_string(),
@@ -1600,7 +1700,7 @@ mod grok_catalog_provider_tests {
             user_email: Some("owner@example.com".to_string()),
             user_role: share_id.is_none().then(|| "owner".to_string()),
             user_country: Some("JP".to_string()),
-            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            issued_at_ms,
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).unwrap());
         let mut mac = Hmac::<Sha256>::new_from_slice(TEST_CONTROL_SECRET.as_bytes()).unwrap();
@@ -1618,6 +1718,84 @@ mod grok_catalog_provider_tests {
             signature.parse().unwrap(),
         );
         request
+    }
+
+    #[tokio::test]
+    async fn ingress_freshness_rejections_include_internal_diagnostics() {
+        let state = catalog_test_state("ingress-freshness-diagnostics");
+        configure_test_router(&state).await;
+        let app = app_router(state);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        for (issued_at_ms, expected_code) in [
+            (
+                now_ms - crate::clients::router::ingress::DEFAULT_MAX_CONTEXT_AGE_MS - 1_000,
+                "expired",
+            ),
+            (
+                now_ms + crate::clients::router::ingress::DEFAULT_FUTURE_CLOCK_SKEW_MS + 1_000,
+                "future_timestamp",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(router_ingress_request_at(
+                    axum::http::Request::builder()
+                        .uri("/web-api/auth/methods")
+                        .body(Body::empty())
+                        .unwrap(),
+                    "freshness-rejection",
+                    None,
+                    issued_at_ms,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::clients::router::ingress::INTERNAL_INGRESS_ERROR_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_code)
+            );
+            assert!(response
+                .headers()
+                .contains_key(crate::clients::router::ingress::INTERNAL_INGRESS_AGE_MS_HEADER));
+            assert!(response.headers().contains_key(
+                crate::clients::router::ingress::INTERNAL_INGRESS_SERVER_TIME_MS_HEADER
+            ));
+            assert!(axum::body::to_bytes(response.into_body(), 1)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn normal_ingress_responses_cannot_spoof_internal_diagnostics() {
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        response.headers_mut().insert(
+            crate::clients::router::ingress::INTERNAL_INGRESS_ERROR_HEADER,
+            HeaderValue::from_static("expired"),
+        );
+        response.headers_mut().insert(
+            crate::clients::router::ingress::INTERNAL_INGRESS_AGE_MS_HEADER,
+            HeaderValue::from_static("31000"),
+        );
+        response
+            .headers_mut()
+            .insert("x-application-header", HeaderValue::from_static("kept"));
+
+        strip_internal_ingress_response_headers(&mut response);
+
+        assert!(response
+            .headers()
+            .get(crate::clients::router::ingress::INTERNAL_INGRESS_ERROR_HEADER)
+            .is_none());
+        assert_eq!(
+            response.headers().get("x-application-header"),
+            Some(&HeaderValue::from_static("kept"))
+        );
     }
 
     fn grok_provider(id: &str) -> StoredProvider {
@@ -1941,7 +2119,18 @@ mod grok_catalog_provider_tests {
                 provider
                     .provider
                     .extra
+                    .insert("bundleId".to_string(), json!("share-disabled-provider"));
+                provider
+                    .provider
+                    .extra
+                    .insert("familyId".to_string(), json!("family.grok_oauth"));
+                provider
+                    .provider
+                    .extra
                     .insert("surfaceEnabled".to_string(), json!(false));
+                providers
+                    .bundle_order
+                    .push("share-disabled-provider".to_string());
             })
             .await
             .unwrap();
@@ -2462,47 +2651,52 @@ async fn proxy_claude_messages(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward(state, ProxyRoute::ClaudeMessages, None, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::Anthropic, request_id, error))
 }
 
 async fn proxy_claude_count_tokens(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward(state, ProxyRoute::ClaudeCountTokens, None, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::Anthropic, request_id, error))
 }
 
 async fn proxy_codex_chat_completions(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward(state, ProxyRoute::CodexChatCompletions, None, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_codex_responses(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward(state, ProxyRoute::CodexResponses, None, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_codex_responses_compact(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward(
         state,
         ProxyRoute::CodexResponsesCompact,
@@ -2511,27 +2705,29 @@ async fn proxy_codex_responses_compact(
         body,
     )
     .await
-    .map_err(ApiError::proxy)
+    .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_codex_responses_ws(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward_codex_responses_ws(state, headers, ws)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_images_generations(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward_images_generations(state, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn ephemeral_image_file(
@@ -2539,9 +2735,14 @@ async fn ephemeral_image_file(
     Path(token): Path<String>,
     method: Method,
     headers: HeaderMap,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     let (_provider_id, _share_guard) =
-        validate_router_share_surface(&state, &headers, AppKind::Codex).await?;
+        validate_router_share_surface(&state, &headers, AppKind::Codex)
+            .await
+            .map_err(|error| {
+                InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error)
+            })?;
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
@@ -2594,17 +2795,19 @@ async fn proxy_images_edits(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward_images_edits(state, headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_grok_videos_generations(
     State(state): State<ServerState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     proxy::forward_grok_media(
         state,
         Method::POST,
@@ -2613,14 +2816,15 @@ async fn proxy_grok_videos_generations(
         body,
     )
     .await
-    .map_err(ApiError::proxy)
+    .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_grok_video_status(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let ingress_request_id = inference_request_id(&headers);
     proxy::forward_grok_media(
         state,
         Method::GET,
@@ -2629,7 +2833,7 @@ async fn proxy_grok_video_status(
         Bytes::new(),
     )
     .await
-    .map_err(ApiError::proxy)
+    .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, ingress_request_id, error))
 }
 
 async fn proxy_gemini(
@@ -2638,15 +2842,21 @@ async fn proxy_gemini(
     Path(path): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError> {
+) -> Result<Response, InferenceApiError> {
+    let request_id = inference_request_id(&headers);
     if method == Method::GET {
-        if let Some(response) = gemini_models_response(&state, &headers, &path).await? {
+        if let Some(response) = gemini_models_response(&state, &headers, &path)
+            .await
+            .map_err(|error| {
+                InferenceApiError::proxy(InferenceSurface::Gemini, request_id.clone(), error)
+            })?
+        {
             return Ok(response);
         }
     }
     proxy::forward(state, ProxyRoute::Gemini, Some(path), headers, body)
         .await
-        .map_err(ApiError::proxy)
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::Gemini, request_id, error))
 }
 
 async fn web_dist_missing() -> impl IntoResponse {

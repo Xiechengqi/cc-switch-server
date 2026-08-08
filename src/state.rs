@@ -3,6 +3,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -85,12 +86,13 @@ use crate::domain::settings::config::{
     RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
+use crate::domain::sharing::credential_source::resolve_provider_credential_source;
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint,
     ShareRequestLogEntry, ShareSyncOperation,
 };
 use crate::domain::sharing::shares::{
-    RouterDescriptorSyncMode, Share, ShareDeleteTombstone, ShareInvocation,
+    RouterDescriptorSyncMode, Share, ShareConcurrencyLimit, ShareDeleteTombstone, ShareInvocation,
     ShareInvocationRejection, ShareRejectReason, ShareStore,
 };
 use crate::domain::usage::store::{UsageLog, UsageStore};
@@ -123,6 +125,204 @@ struct PreparedProviderIdentityChange {
     candidate: ProviderStore,
     preview: ProviderIdentityChangePreview,
     stored: StoredProvider,
+}
+
+#[derive(Debug, Default)]
+struct StorePersistenceCoordinator {
+    gate: AsyncMutex<()>,
+    revision: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    delay_next_persist_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    persist_delay_started: Notify,
+}
+
+impl StorePersistenceCoordinator {
+    fn mark_published(&self) -> u64 {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    #[cfg(test)]
+    fn delay_next_persist(&self, delay_ms: u64) {
+        self.delay_next_persist_ms
+            .store(delay_ms, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn apply_test_persist_delay(&self) {
+        let delay_ms = self
+            .delay_next_persist_ms
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        if delay_ms == 0 {
+            return;
+        }
+        self.persist_delay_started.notify_one();
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+trait PersistedStateSnapshot: Clone + Send + 'static {
+    const NAME: &'static str;
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()>;
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self>;
+    fn reconciliation_value(&self) -> Option<Value>;
+}
+
+impl PersistedStateSnapshot for ServerConfig {
+    const NAME: &'static str = "config";
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        self.save(config_dir)
+    }
+
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_default(config_dir)
+    }
+
+    fn reconciliation_value(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+}
+
+impl PersistedStateSnapshot for AccountStore {
+    const NAME: &'static str = "accounts";
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        self.save(config_dir)
+    }
+
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_default(config_dir)
+    }
+
+    fn reconciliation_value(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+}
+
+impl PersistedStateSnapshot for UsageStore {
+    const NAME: &'static str = "usage";
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        self.save(config_dir)
+    }
+
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_default(config_dir)
+    }
+
+    fn reconciliation_value(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+}
+
+impl PersistedStateSnapshot for ShareStore {
+    const NAME: &'static str = "shares";
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        self.save(config_dir)
+    }
+
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_default(config_dir)
+    }
+
+    fn reconciliation_value(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+}
+
+impl PersistedStateSnapshot for UiSettingsStore {
+    const NAME: &'static str = "ui settings";
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        self.save(config_dir)
+    }
+
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_default(config_dir)
+    }
+
+    fn reconciliation_value(&self) -> Option<Value> {
+        Some(self.value.clone())
+    }
+}
+
+async fn persist_state_snapshot<T: PersistedStateSnapshot>(
+    config_dir: &Path,
+    snapshot: T,
+) -> anyhow::Result<()> {
+    let expected = snapshot.reconciliation_value();
+    let save_dir = config_dir.to_path_buf();
+    let persisted = snapshot.clone();
+    let result = tokio::task::spawn_blocking(move || persisted.save_snapshot(&save_dir))
+        .await
+        .with_context(|| format!("{} persistence task panicked", T::NAME))?;
+    if let Err(error) = result {
+        let load_dir = config_dir.to_path_buf();
+        let disk_matches = tokio::task::spawn_blocking(move || T::load_snapshot(&load_dir))
+            .await
+            .with_context(|| format!("{} reconciliation task panicked", T::NAME))?
+            .ok()
+            .and_then(|store| store.reconciliation_value())
+            .zip(expected)
+            .is_some_and(|(disk, expected)| disk == expected);
+        if !disk_matches {
+            return Err(error);
+        }
+        tracing::warn!(
+            %error,
+            store = T::NAME,
+            "store reached the persistence commit point despite a post-commit error"
+        );
+    }
+    Ok(())
+}
+
+async fn reconcile_usage_store_after_persistence_error(
+    config_dir: &Path,
+    expected_log: UsageLog,
+    error: anyhow::Error,
+) -> anyhow::Result<UsageStore> {
+    let load_dir = config_dir.to_path_buf();
+    let reconciled =
+        match tokio::task::spawn_blocking(move || UsageStore::load_or_default(&load_dir)).await {
+            Ok(Ok(store)) => store,
+            Ok(Err(reconcile_error)) => {
+                tracing::error!(
+                    %reconcile_error,
+                    "failed to reload usage state after a persistence error"
+                );
+                return Err(error);
+            }
+            Err(join_error) => {
+                tracing::error!(
+                    %join_error,
+                    "usage reconciliation task panicked after a persistence error"
+                );
+                return Err(error);
+            }
+        };
+    let expected_value = serde_json::to_value(&expected_log).ok();
+    let disk_matches = reconciled
+        .logs
+        .iter()
+        .find(|log| log.request_id == expected_log.request_id)
+        .and_then(|log| serde_json::to_value(log).ok())
+        .zip(expected_value)
+        .is_some_and(|(disk, expected)| disk == expected);
+    if !disk_matches {
+        return Err(error);
+    }
+    tracing::warn!(
+        %error,
+        request_id = %expected_log.request_id,
+        "usage journal reached the durable commit point despite a post-commit error"
+    );
+    Ok(reconciled)
 }
 
 pub(crate) struct CodexWorkspaceRebindResult {
@@ -289,6 +489,9 @@ pub struct ServerStateInner {
     _data_directory_lock: crate::infra::storage::DataDirectoryLock,
     pub web_dist_dir: Option<PathBuf>,
     pub provider_coverage: ProviderCoverage,
+    // Persistent store locks and commit gates follow:
+    // config -> providers -> accounts -> usage -> shares -> ui_settings.
+    config_persistence: StorePersistenceCoordinator,
     pub(crate) config: RwLock<ServerConfig>,
     pub(crate) providers: RwLock<ProviderStore>,
     provider_commits: AsyncMutex<()>,
@@ -297,12 +500,16 @@ pub struct ServerStateInner {
     provider_import_preview_key: [u8; 32],
     #[cfg(test)]
     provider_commit_delay_ms: std::sync::atomic::AtomicU64,
+    accounts_persistence: StorePersistenceCoordinator,
     pub(crate) accounts: RwLock<AccountStore>,
     managed_auth_operations: AsyncMutex<()>,
+    usage_persistence: StorePersistenceCoordinator,
     pub(crate) usage: RwLock<UsageStore>,
+    shares_persistence: StorePersistenceCoordinator,
     pub(crate) shares: RwLock<ShareStore>,
     share_quota_mutations: AsyncMutex<()>,
     share_lifecycle: AsyncMutex<()>,
+    ui_settings_persistence: StorePersistenceCoordinator,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
@@ -608,6 +815,8 @@ const NATIVE_REFRESH_PENDING_DIR: &str = "oauth-refresh-pending";
 const NATIVE_REFRESH_QUARANTINE_DIR: &str = "oauth-refresh-quarantine";
 const NATIVE_REFRESH_PENDING_FIELD: &str = "nativeRefreshPendingReceipt";
 const NATIVE_REFRESH_RECEIPT_RETRY_BACKOFF_MS: i64 = 5_000;
+const NATIVE_REFRESH_QUARANTINE_MAX_FILES: usize = 64;
+const NATIVE_REFRESH_QUARANTINE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Clone)]
 struct NativeRefreshPendingReceipt {
@@ -797,6 +1006,12 @@ fn quarantine_native_refresh_pending_receipt_path(
             directory.display()
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", directory.display()))?;
+    }
     let stem = source
         .file_stem()
         .and_then(|value| value.to_str())
@@ -817,7 +1032,52 @@ fn quarantine_native_refresh_pending_receipt_path(
             destination.display()
         )
     })?;
+    if let Err(error) = prune_native_refresh_quarantine(config_dir) {
+        tracing::warn!(
+            error = %error,
+            directory = %directory.display(),
+            "failed to enforce OAuth refresh quarantine retention"
+        );
+    }
     Ok(Some(destination))
+}
+
+fn prune_native_refresh_quarantine(config_dir: &Path) -> anyhow::Result<usize> {
+    let directory = config_dir.join(NATIVE_REFRESH_QUARANTINE_DIR);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read OAuth refresh quarantine {}", directory.display()))
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let modified = entry.metadata()?.modified().unwrap_or(UNIX_EPOCH);
+        files.push((entry.path(), modified));
+    }
+    files.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for (index, (path, modified)) in files.into_iter().enumerate() {
+        let expired = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > NATIVE_REFRESH_QUARANTINE_MAX_AGE);
+        if index < NATIVE_REFRESH_QUARANTINE_MAX_FILES && !expired {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("prune OAuth refresh quarantine {}", path.display()))?;
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
 }
 
 fn native_refresh_pending_load_has_io_error(error: &anyhow::Error) -> bool {
@@ -1549,8 +1809,8 @@ pub struct ShareInFlightGuard {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareInFlightAcquireError {
-    ShareLimit,
-    UserLimit,
+    ShareLimit { current: u32, limit: u32 },
+    UserLimit { current: u32, limit: u32 },
 }
 
 #[derive(Debug, Default)]
@@ -1570,6 +1830,12 @@ pub struct AccountInFlightGuard {
     provider_type: String,
     account_id: String,
     max_concurrent: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountInFlightAcquireError {
+    pub current: u32,
+    pub limit: u32,
 }
 
 #[derive(Debug, Default)]
@@ -1621,17 +1887,20 @@ impl ShareInFlightTracker {
         let mut counts = self
             .counts
             .lock()
-            .map_err(|_| ShareInFlightAcquireError::ShareLimit)?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = *counts.get(share_id).unwrap_or(&0);
-        if parallel_limit.is_some_and(|limit| current >= limit) {
-            return Err(ShareInFlightAcquireError::ShareLimit);
+        if let Some(limit) = parallel_limit.filter(|limit| current >= *limit) {
+            return Err(ShareInFlightAcquireError::ShareLimit { current, limit });
         }
         let user_key =
             user_email.map(|email| format!("{share_id}\u{1f}{}", email.to_ascii_lowercase()));
         if let Some(user_key) = user_key.as_deref() {
             let user_current = *counts.get(user_key).unwrap_or(&0);
-            if user_parallel_limit.is_some_and(|limit| user_current >= limit) {
-                return Err(ShareInFlightAcquireError::UserLimit);
+            if let Some(limit) = user_parallel_limit.filter(|limit| user_current >= *limit) {
+                return Err(ShareInFlightAcquireError::UserLimit {
+                    current: user_current,
+                    limit,
+                });
             }
         }
         counts.insert(share_id.to_string(), current.saturating_add(1));
@@ -1685,12 +1954,18 @@ impl AccountInFlightTracker {
         provider_type: ProviderType,
         account_id: &str,
         max_concurrent: u32,
-    ) -> Option<AccountInFlightGuard> {
+    ) -> Result<AccountInFlightGuard, AccountInFlightAcquireError> {
         let key = account_in_flight_key(provider_type, account_id);
-        let mut counts = self.counts.lock().ok()?;
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = *counts.get(&key).unwrap_or(&0);
         if current >= max_concurrent {
-            return None;
+            return Err(AccountInFlightAcquireError {
+                current,
+                limit: max_concurrent,
+            });
         }
         let next = current.saturating_add(1);
         counts.insert(key.clone(), next);
@@ -1701,7 +1976,7 @@ impl AccountInFlightTracker {
             next,
             max_concurrent,
         );
-        Some(AccountInFlightGuard {
+        Ok(AccountInFlightGuard {
             tracker: self.clone(),
             key,
             provider_type: provider_type_label,
@@ -1979,7 +2254,11 @@ fn provider_bundle_views_from_store(
             continue;
         }
         grouped
-            .entry(provider_bundle_id(&stored.provider).to_string())
+            .entry(
+                provider_bundle_id(&stored.provider)
+                    .expect("explicit Provider Bundle Surface has a Bundle identity")
+                    .to_string(),
+            )
             .or_default()
             .push(ProviderView::from_stored_with_order_and_runtime(
                 &stored,
@@ -2076,6 +2355,15 @@ fn provider_bundle_surface_managed_error() -> ProviderCommandError {
     }
 }
 
+fn provider_management_id_conflict(id: &str) -> ProviderCommandError {
+    ProviderCommandError::Conflict {
+        code: "cc_switch_provider_management_id_conflict",
+        message: format!(
+            "Provider id {id} is already reserved by the other Provider management surface"
+        ),
+    }
+}
+
 fn ensure_ordinary_provider_not_bundle_managed(
     provider: &Provider,
 ) -> Result<(), ProviderCommandError> {
@@ -2091,6 +2379,14 @@ fn validate_ordinary_provider_write_drafts(
 ) -> Result<(), ProviderCommandError> {
     for draft in drafts {
         ensure_ordinary_provider_not_bundle_managed(&draft.provider)?;
+        if !draft.provider.id.trim().is_empty()
+            && current.providers.iter().any(|stored| {
+                is_explicit_bundle_surface(&stored.provider)
+                    && provider_bundle_id(&stored.provider) == Some(draft.provider.id.as_str())
+            })
+        {
+            return Err(provider_management_id_conflict(&draft.provider.id));
+        }
         let existing = current.providers.iter().find(|stored| {
             (stored.app == draft.app && stored.provider.id == draft.provider.id)
                 || draft
@@ -2890,6 +3186,29 @@ fn provider_runtime_projection_changes(
         .collect()
 }
 
+fn provider_capacity_source_changes(
+    before: &ProviderStore,
+    after: &ProviderStore,
+    accounts: &AccountStore,
+) -> anyhow::Result<BTreeSet<(AppKind, String)>> {
+    let keys = before
+        .providers
+        .iter()
+        .chain(after.providers.iter())
+        .map(|stored| (stored.app, stored.provider.id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut changed = BTreeSet::new();
+    for (app, provider_id) in keys {
+        let before_source =
+            resolve_provider_credential_source(before, accounts, app, &provider_id)?;
+        let after_source = resolve_provider_credential_source(after, accounts, app, &provider_id)?;
+        if before_source != after_source {
+            changed.insert((app, provider_id));
+        }
+    }
+    Ok(changed)
+}
+
 fn prepare_adopt_provider_profile(
     current: &ProviderStore,
     accounts: &AccountStore,
@@ -3470,6 +3789,16 @@ impl ServerStateInner {
         let data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
         crate::logging::ensure_log_dir(&config_dir)
             .with_context(|| format!("initialize log dir under {}", config_dir.display()))?;
+        match prune_native_refresh_quarantine(&config_dir) {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "pruned OAuth refresh quarantine retention")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to enforce OAuth refresh quarantine retention during startup"
+            ),
+        }
         if apply_codex_workspace_rebind_transaction(&config_dir)
             .context("recover pending Codex workspace rebind transaction during startup")?
         {
@@ -3499,16 +3828,38 @@ impl ServerStateInner {
         let usage = UsageStore::load_or_default(&config_dir)?;
         remove_obsolete_model_pricing_file(&config_dir)?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
-        let mut shares_changed = false;
-        let refreshed_capacity_pools = shares
-            .refresh_capacity_pool_ids(&providers, &accounts, &reasoning_root_key.key)
-            .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
-            .context("derive Share capacity pools during startup")?;
-        if !refreshed_capacity_pools.is_empty() {
-            shares_changed = true;
+        let integrity_outcomes =
+            shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
+        let mut shares_changed = integrity_outcomes.iter().any(|outcome| outcome.changed());
+        let repaired_shares = integrity_outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome.status == crate::domain::sharing::shares::ShareIntegrityStatus::Repaired
+            })
+            .count();
+        let disabled_shares = integrity_outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome.status == crate::domain::sharing::shares::ShareIntegrityStatus::Disabled
+            })
+            .count();
+        for outcome in integrity_outcomes.iter().filter(|outcome| {
+            outcome.status == crate::domain::sharing::shares::ShareIntegrityStatus::Disabled
+        }) {
+            if let Some(error) = outcome.error.as_ref() {
+                tracing::error!(
+                    share_id = %outcome.share_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "disabled an invalid Share during startup; other Shares remain available"
+                );
+            }
+        }
+        if repaired_shares > 0 || disabled_shares > 0 {
             tracing::info!(
-                refreshed_shares = refreshed_capacity_pools.len(),
-                "refreshed Share capacity pools from current Provider credentials"
+                repaired_shares,
+                disabled_shares,
+                "completed per-Share startup integrity repair"
             );
         }
         for error in
@@ -3573,6 +3924,7 @@ impl ServerStateInner {
             _data_directory_lock: data_directory_lock,
             web_dist_dir: cli.resolved_web_dist_dir(),
             provider_coverage,
+            config_persistence: StorePersistenceCoordinator::default(),
             config: RwLock::new(config),
             providers: RwLock::new(providers),
             provider_commits: AsyncMutex::new(()),
@@ -3581,12 +3933,16 @@ impl ServerStateInner {
             provider_import_preview_key,
             #[cfg(test)]
             provider_commit_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            accounts_persistence: StorePersistenceCoordinator::default(),
             accounts: RwLock::new(accounts),
             managed_auth_operations: AsyncMutex::new(()),
+            usage_persistence: StorePersistenceCoordinator::default(),
             usage: RwLock::new(usage),
+            shares_persistence: StorePersistenceCoordinator::default(),
             shares: RwLock::new(shares),
             share_quota_mutations: AsyncMutex::new(()),
             share_lifecycle: AsyncMutex::new(()),
+            ui_settings_persistence: StorePersistenceCoordinator::default(),
             ui_settings: RwLock::new(ui_settings),
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
@@ -3718,26 +4074,44 @@ impl ServerStateInner {
     }
 
     pub async fn replace_config(&self, mut config: ServerConfig) -> anyhow::Result<()> {
-        let mut current = self.config.write().await;
+        let _commit = self.config_persistence.gate.lock().await;
+        let current = self.config.read().await.clone();
         preserve_router_identity_from_stale_snapshot(&current, &mut config);
         preserve_setup_completion_from_stale_snapshot(&current, &mut config);
         preserve_client_tunnel_claim_from_stale_snapshot(&current, &mut config);
         preserve_client_subdomain_adoption_from_stale_snapshot(&current, &mut config);
         let http_client = build_http_client()?;
-        config.save(&self.config_dir)?;
+        persist_state_snapshot(&self.config_dir, config.clone()).await?;
         *self.http_client.write().await = http_client;
-        *current = config;
+        *self.config.write().await = config;
+        self.config_persistence.mark_published();
         Ok(())
+    }
+
+    async fn mutate_config_immediate<R>(
+        &self,
+        mutate: impl FnOnce(&mut ServerConfig) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let _commit = self.config_persistence.gate.lock().await;
+        let mut candidate = self.config.read().await.clone();
+        let result = mutate(&mut candidate)?;
+        #[cfg(test)]
+        self.config_persistence.apply_test_persist_delay().await;
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self.config.write().await = candidate;
+        self.config_persistence.mark_published();
+        Ok(result)
     }
 
     pub async fn set_upgrade_policy(
         &self,
         policy: crate::domain::settings::config::UpgradePolicyConfig,
     ) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        config.upgrade_policy = policy;
-        config.save(&self.config_dir)?;
-        Ok(())
+        self.mutate_config_immediate(|config| {
+            config.upgrade_policy = policy;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn config_snapshot(&self) -> ServerConfig {
@@ -3766,8 +4140,8 @@ impl ServerStateInner {
         self.recover_pending_codex_workspace_rebind_transaction(
             "Client subdomain adoption prepare",
         )?;
-        let mut current = self.config.write().await;
-        if let Some(existing) = current.client.subdomain_adoption.as_ref() {
+        self.mutate_config_immediate(|config| {
+        if let Some(existing) = config.client.subdomain_adoption.as_ref() {
             if existing.takeover_id == takeover_id {
                 if existing.from_subdomain != from_subdomain
                     || existing.to_subdomain != to_subdomain
@@ -3783,7 +4157,7 @@ impl ServerStateInner {
         if activate_at_ms > now.saturating_add(CLIENT_SUBDOMAIN_ADOPTION_MAX_FUTURE_MS) {
             anyhow::bail!("activateAtMs is outside the allowed activation window");
         }
-        let configured_subdomain = current
+        let configured_subdomain = config
             .client
             .tunnel_subdomain
             .as_deref()
@@ -3805,11 +4179,10 @@ impl ServerStateInner {
             prepared_at_ms: now,
             committed_at_ms: None,
         };
-        let mut next = current.clone();
-        next.client.subdomain_adoption = Some(adoption.clone());
-        next.save(&self.config_dir)?;
-        *current = next;
+        config.client.subdomain_adoption = Some(adoption.clone());
         Ok(adoption)
+        })
+        .await
     }
 
     pub(crate) async fn commit_client_subdomain_adoption(
@@ -3821,7 +4194,9 @@ impl ServerStateInner {
         // order could deadlock against a concurrent persistent-store reload.
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Client subdomain adoption")?;
-        let mut current = self.config.write().await;
+        let _config_commit = self.config_persistence.gate.lock().await;
+        let _shares_commit = self.shares_persistence.gate.lock().await;
+        let current = self.config.read().await.clone();
         let adoption = current
             .client
             .subdomain_adoption
@@ -3838,36 +4213,24 @@ impl ServerStateInner {
 
         let from_client = ClientSubdomain::parse(&adoption.from_subdomain)?;
         let to_client = ClientSubdomain::parse(&adoption.to_subdomain)?;
-        let mut shares = self.shares.write().await;
-        let mut candidate_shares = shares.clone();
+        let mut candidate_shares = self.shares.read().await.clone();
         let rebased_shares =
             candidate_shares.rebase_full_tunnel_subdomains(&from_client, &to_client);
-        if let Err(error) = candidate_shares.save(&self.config_dir) {
-            let disk_matches = ShareStore::load_or_default(&self.config_dir)
-                .ok()
-                .and_then(|store| serde_json::to_value(store).ok())
-                .zip(serde_json::to_value(&candidate_shares).ok())
-                .is_some_and(|(disk, expected)| disk == expected);
-            if !disk_matches {
-                return Err(error);
-            }
-            tracing::warn!(
-                %error,
-                "Shares reached the Client subdomain adoption commit point despite a persistence error"
-            );
-        }
-        *shares = candidate_shares;
+        persist_state_snapshot(&self.config_dir, candidate_shares.clone()).await?;
 
         let mut committed = adoption;
         committed.status = ClientSubdomainAdoptionStatus::Committed;
         committed.committed_at_ms = Some(now_ms_i64());
-        let mut next = current.clone();
+        let mut next = current;
         next.client.tunnel_subdomain = Some(committed.to_subdomain.clone());
         next.client.tunnel_status = Some("claimed_remote".to_string());
         next.client.claim_pending = None;
         next.client.subdomain_adoption = Some(committed.clone());
-        next.save(&self.config_dir)?;
-        *current = next;
+        persist_state_snapshot(&self.config_dir, next.clone()).await?;
+        *self.shares.write().await = candidate_shares;
+        *self.config.write().await = next;
+        self.shares_persistence.mark_published();
+        self.config_persistence.mark_published();
         if rebased_shares > 0 {
             tracing::info!(
                 takeover_id = %committed.takeover_id,
@@ -3884,21 +4247,20 @@ impl ServerStateInner {
     ) -> anyhow::Result<bool> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Client subdomain adoption abort")?;
-        let mut current = self.config.write().await;
-        let Some(adoption) = current.client.subdomain_adoption.as_ref() else {
-            return Ok(false);
-        };
-        if adoption.takeover_id != takeover_id.trim() {
-            anyhow::bail!("prepared Client subdomain adoption was not found");
-        }
-        if adoption.status == ClientSubdomainAdoptionStatus::Committed {
-            anyhow::bail!("committed Client subdomain adoption cannot be aborted");
-        }
-        let mut next = current.clone();
-        next.client.subdomain_adoption = None;
-        next.save(&self.config_dir)?;
-        *current = next;
-        Ok(true)
+        self.mutate_config_immediate(|config| {
+            let Some(adoption) = config.client.subdomain_adoption.as_ref() else {
+                return Ok(false);
+            };
+            if adoption.takeover_id != takeover_id.trim() {
+                anyhow::bail!("prepared Client subdomain adoption was not found");
+            }
+            if adoption.status == ClientSubdomainAdoptionStatus::Committed {
+                anyhow::bail!("committed Client subdomain adoption cannot be aborted");
+            }
+            config.client.subdomain_adoption = None;
+            Ok(true)
+        })
+        .await
     }
 
     pub(crate) async fn lock_client_tunnel_claim(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -3909,44 +4271,42 @@ impl ServerStateInner {
         &self,
         intent: &ClientTunnelClaimIntent,
     ) -> anyhow::Result<ServerConfig> {
-        let mut current = self.config.write().await;
-        if !intent.matches_config(&current) {
-            anyhow::bail!("client tunnel claim configuration changed before intent commit");
-        }
-        let mut next = current.clone();
-        next.client.claim_pending = Some(intent.clone());
-        next.client.tunnel_status = Some("claim_pending".to_string());
-        next.router.last_register_error = None;
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            if !intent.matches_config(config) {
+                anyhow::bail!("client tunnel claim configuration changed before intent commit");
+            }
+            config.client.claim_pending = Some(intent.clone());
+            config.client.tunnel_status = Some("claim_pending".to_string());
+            config.router.last_register_error = None;
+            Ok(config.clone())
+        })
+        .await
     }
 
     pub(crate) async fn commit_client_tunnel_claim_success(
         &self,
         intent: &ClientTunnelClaimIntent,
     ) -> anyhow::Result<ServerConfig> {
-        let mut current = self.config.write().await;
-        ensure_current_client_tunnel_claim(&current, intent)?;
-        let mut next = current.clone();
-        next.client.claim_pending = None;
-        next.client.tunnel_status = Some("claimed_remote".to_string());
-        next.router.last_register_error = None;
-        #[cfg(test)]
-        if self
-            .client_tunnel_claim_commit_failures
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
-        {
-            anyhow::bail!("injected client tunnel claim commit failure");
-        }
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            ensure_current_client_tunnel_claim(config, intent)?;
+            config.client.claim_pending = None;
+            config.client.tunnel_status = Some("claimed_remote".to_string());
+            config.router.last_register_error = None;
+            #[cfg(test)]
+            if self
+                .client_tunnel_claim_commit_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                anyhow::bail!("injected client tunnel claim commit failure");
+            }
+            Ok(config.clone())
+        })
+        .await
     }
 
     pub(crate) async fn commit_client_tunnel_claim_failure(
@@ -3955,19 +4315,18 @@ impl ServerStateInner {
         conflict: bool,
         message: String,
     ) -> anyhow::Result<ServerConfig> {
-        let mut current = self.config.write().await;
-        ensure_current_client_tunnel_claim(&current, intent)?;
-        let mut next = current.clone();
-        next.client.claim_pending = None;
-        next.client.tunnel_status = Some(if conflict {
-            "claim_conflict".to_string()
-        } else {
-            "claim_failed".to_string()
-        });
-        next.router.last_register_error = Some(message);
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            ensure_current_client_tunnel_claim(config, intent)?;
+            config.client.claim_pending = None;
+            config.client.tunnel_status = Some(if conflict {
+                "claim_conflict".to_string()
+            } else {
+                "claim_failed".to_string()
+            });
+            config.router.last_register_error = Some(message);
+            Ok(config.clone())
+        })
+        .await
     }
 
     pub(crate) async fn retain_client_tunnel_claim_pending(
@@ -3975,32 +4334,30 @@ impl ServerStateInner {
         intent: &ClientTunnelClaimIntent,
         message: String,
     ) -> anyhow::Result<ServerConfig> {
-        let mut current = self.config.write().await;
-        ensure_current_client_tunnel_claim(&current, intent)?;
-        let mut next = current.clone();
-        next.client.tunnel_status = Some("claim_pending".to_string());
-        next.router.last_register_error = Some(message);
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            ensure_current_client_tunnel_claim(config, intent)?;
+            config.client.tunnel_status = Some("claim_pending".to_string());
+            config.router.last_register_error = Some(message);
+            Ok(config.clone())
+        })
+        .await
     }
 
     pub(crate) async fn mark_client_tunnel_claim_skipped(&self) -> anyhow::Result<ServerConfig> {
         let _claim = self.client_tunnel_claim.lock().await;
-        let mut current = self.config.write().await;
-        if current.client.claim_pending.is_none()
-            && matches!(
-                current.client.tunnel_status.as_deref(),
-                Some("claimed_remote" | "connected" | "active" | "running")
-            )
-        {
-            return Ok(current.clone());
-        }
-        let mut next = current.clone();
-        next.client.tunnel_status = Some("claim_skipped".to_string());
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            if config.client.claim_pending.is_none()
+                && matches!(
+                    config.client.tunnel_status.as_deref(),
+                    Some("claimed_remote" | "connected" | "active" | "running")
+                )
+            {
+                return Ok(config.clone());
+            }
+            config.client.tunnel_status = Some("claim_skipped".to_string());
+            Ok(config.clone())
+        })
+        .await
     }
 
     pub(crate) async fn commit_client_tunnel_lease(
@@ -4008,28 +4365,26 @@ impl ServerStateInner {
         intent: &ClientTunnelClaimIntent,
         ssh_host: String,
     ) -> anyhow::Result<ServerConfig> {
-        let mut current = self.config.write().await;
-        if !intent.matches_config(&current) {
-            anyhow::bail!("client tunnel configuration changed before lease commit");
-        }
-        let mut next = current.clone();
-        next.client.tunnel_status = Some("connected".to_string());
-        next.router.ssh_host = Some(ssh_host);
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            if !intent.matches_config(config) {
+                anyhow::bail!("client tunnel configuration changed before lease commit");
+            }
+            config.client.tunnel_status = Some("connected".to_string());
+            config.router.ssh_host = Some(ssh_host);
+            Ok(config.clone())
+        })
+        .await
     }
 
     pub(crate) async fn record_client_tunnel_heartbeat(
         &self,
         heartbeat_ms: u128,
     ) -> anyhow::Result<ServerConfig> {
-        let mut current = self.config.write().await;
-        let mut next = current.clone();
-        next.client.last_heartbeat_ms = Some(heartbeat_ms);
-        next.save(&self.config_dir)?;
-        *current = next.clone();
-        Ok(next)
+        self.mutate_config_immediate(|config| {
+            config.client.last_heartbeat_ms = Some(heartbeat_ms);
+            Ok(config.clone())
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -4086,8 +4441,9 @@ impl ServerStateInner {
         let _flight = self.setup_completion_notification_flight.lock().await;
         let now_ms = now_ms_i64();
         let (config, setup) = {
-            let mut config = self.config.write().await;
-            let Some(notification) = config.setup_completion_notification.as_mut() else {
+            let _commit = self.config_persistence.gate.lock().await;
+            let mut candidate = self.config.read().await.clone();
+            let Some(notification) = candidate.setup_completion_notification.as_mut() else {
                 return Ok(());
             };
             match notification.status {
@@ -4114,7 +4470,9 @@ impl ServerStateInner {
                 notification.next_attempt_at_ms = None;
                 notification.last_error =
                     Some("setup-completed notification password hint is missing".to_string());
-                config.save(&self.config_dir)?;
+                persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+                *self.config.write().await = candidate;
+                self.config_persistence.mark_published();
                 return Ok(());
             };
             let setup = match client::InstallationSetupCompletedPayload::new(
@@ -4128,7 +4486,9 @@ impl ServerStateInner {
                     notification.updated_at_ms = now_ms;
                     notification.next_attempt_at_ms = None;
                     notification.last_error = Some(error.to_string());
-                    config.save(&self.config_dir)?;
+                    persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+                    *self.config.write().await = candidate;
+                    self.config_persistence.mark_published();
                     return Ok(());
                 }
             };
@@ -4141,16 +4501,19 @@ impl ServerStateInner {
             ));
             notification.router_ack_status = None;
             notification.last_error = None;
-            config.save(&self.config_dir)?;
-            (config.clone(), setup)
+            persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+            *self.config.write().await = candidate.clone();
+            self.config_persistence.mark_published();
+            (candidate, setup)
         };
 
         let setup_id = setup.setup_id.clone();
         let http_client = self.http_client().await;
         let result = client::send_installation_setup_completed(&http_client, &config, setup).await;
         let completed_at_ms = now_ms_i64();
-        let mut config = self.config.write().await;
-        let Some(notification) = config.setup_completion_notification.as_mut() else {
+        let _commit = self.config_persistence.gate.lock().await;
+        let mut candidate = self.config.read().await.clone();
+        let Some(notification) = candidate.setup_completion_notification.as_mut() else {
             return Ok(());
         };
         if notification.setup_id != setup_id {
@@ -4205,7 +4568,9 @@ impl ServerStateInner {
                 );
             }
         }
-        config.save(&self.config_dir)?;
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self.config.write().await = candidate;
+        self.config_persistence.mark_published();
         Ok(())
     }
 
@@ -4351,20 +4716,19 @@ impl ServerStateInner {
     }
 
     async fn ensure_pending_router_identity(&self) -> anyhow::Result<RouterIdentity> {
-        let mut config = self.config.write().await;
-        if let Some(identity) = config.router.identity.as_ref() {
-            if !identity.has_keypair() {
-                anyhow::bail!("router installation identity keypair is incomplete");
+        self.mutate_config_immediate(|config| {
+            if let Some(identity) = config.router.identity.as_ref() {
+                if !identity.has_keypair() {
+                    anyhow::bail!("router installation identity keypair is incomplete");
+                }
+                return Ok(identity.clone());
             }
-            return Ok(identity.clone());
-        }
 
-        let identity = client::generate_identity_without_installation();
-        let mut next = config.clone();
-        next.router.identity = Some(identity.clone());
-        next.save(&self.config_dir)?;
-        *config = next;
-        Ok(identity)
+            let identity = client::generate_identity_without_installation();
+            config.router.identity = Some(identity.clone());
+            Ok(identity)
+        })
+        .await
     }
 
     async fn merge_router_registration_response(
@@ -4379,63 +4743,65 @@ impl ServerStateInner {
             anyhow::bail!("router installation register returned an empty installation id");
         }
 
-        let mut config = self.config.write().await;
-        let current_api_base = config
-            .router_api_base()
-            .map(str::trim)
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        if current_api_base != expected_api_base {
-            anyhow::bail!("router configuration changed while registration was in progress");
-        }
-        let current = config
-            .router
-            .identity
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("pending router identity disappeared"))?;
-        if current.public_key.trim() != expected_public_key.trim() {
-            anyhow::bail!("pending router identity changed while registration was in progress");
-        }
-
-        let mut next = config.clone();
-        let identity = {
-            let identity = next
+        self.mutate_config_immediate(|config| {
+            let current_api_base = config
+                .router_api_base()
+                .map(str::trim)
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            if current_api_base != expected_api_base {
+                anyhow::bail!("router configuration changed while registration was in progress");
+            }
+            let current = config
                 .router
                 .identity
-                .as_mut()
-                .expect("router identity checked above");
-            identity.installation_id = installation_id.to_string();
-            identity.control_secret = Some(response.control_secret);
-            identity.clone()
-        };
-        if let Some(registered_at_ms) = registered_at_ms {
-            next.router.last_register_error = None;
-            next.router.last_registered_at_ms = Some(registered_at_ms);
-        }
-        next.save(&self.config_dir)?;
-        *config = next;
-        Ok(identity)
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("pending router identity disappeared"))?;
+            if current.public_key.trim() != expected_public_key.trim() {
+                anyhow::bail!("pending router identity changed while registration was in progress");
+            }
+
+            let identity = {
+                let identity = config
+                    .router
+                    .identity
+                    .as_mut()
+                    .expect("router identity checked above");
+                identity.installation_id = installation_id.to_string();
+                identity.control_secret = Some(response.control_secret);
+                identity.clone()
+            };
+            if let Some(registered_at_ms) = registered_at_ms {
+                config.router.last_register_error = None;
+                config.router.last_registered_at_ms = Some(registered_at_ms);
+            }
+            Ok(identity)
+        })
+        .await
     }
 
     async fn record_router_registration_error(&self, message: String) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        let mut next = config.clone();
-        next.router.last_register_error = Some(message);
-        next.save(&self.config_dir)?;
-        *config = next;
-        Ok(())
+        self.mutate_config_immediate(|config| {
+            config.router.last_register_error = Some(message);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn set_debug_token(&self, token: &str, expires_at_ms: i64) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        config.set_debug_token(token, expires_at_ms)?;
-        config.save(&self.config_dir)
+        self.mutate_config_immediate(|config| {
+            config.set_debug_token(token, expires_at_ms)?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn revoke_debug_token(&self) -> anyhow::Result<()> {
-        let mut config = self.config.write().await;
-        config.revoke_debug_token();
-        config.save(&self.config_dir)
+        self.mutate_config_immediate(|config| {
+            config.revoke_debug_token();
+            Ok(())
+        })
+        .await
     }
 
     fn recover_pending_codex_workspace_rebind_transaction(
@@ -4457,6 +4823,11 @@ impl ServerStateInner {
         let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        let _config_commit = self.config_persistence.gate.lock().await;
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let _usage_commit = self.usage_persistence.gate.lock().await;
+        let _shares_commit = self.shares_persistence.gate.lock().await;
+        let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
         self.reload_persistent_stores_under_provider_commit().await
     }
 
@@ -4485,12 +4856,12 @@ impl ServerStateInner {
                 &mut config,
                 &mut shares,
             )?;
-        let refreshed_capacity_pools = shares
-            .refresh_capacity_pool_ids(&providers, &accounts, &reasoning_root_key.key)
-            .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))
-            .context("derive Share capacity pools during reload")?;
-        if !refreshed_capacity_pools.is_empty() || rebased_client_share_subdomains > 0 {
-            shares.save(&self.config_dir)?;
+        let integrity_outcomes =
+            shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
+        if integrity_outcomes.iter().any(|outcome| outcome.changed())
+            || rebased_client_share_subdomains > 0
+        {
+            persist_state_snapshot(&self.config_dir, shares.clone()).await?;
         }
         let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
         crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
@@ -4500,7 +4871,7 @@ impl ServerStateInner {
         .context("validate subscription reference graph before reload")?;
 
         if preserved_client_state {
-            config.save(&self.config_dir)?;
+            persist_state_snapshot(&self.config_dir, config.clone()).await?;
         }
 
         *self.http_client.write().await = http_client;
@@ -4510,6 +4881,11 @@ impl ServerStateInner {
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
         *self.ui_settings.write().await = ui_settings;
+        self.config_persistence.mark_published();
+        self.accounts_persistence.mark_published();
+        self.usage_persistence.mark_published();
+        self.shares_persistence.mark_published();
+        self.ui_settings_persistence.mark_published();
         crate::proxy::reasoning_bridge::rotate(&reasoning_root_key.key)?;
         self.tunnels.reload_statuses().await?;
         Ok(())
@@ -4659,7 +5035,10 @@ impl ServerStateInner {
         let surfaces = providers
             .providers
             .iter()
-            .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+            .filter(|stored| {
+                is_explicit_bundle_surface(&stored.provider)
+                    && provider_bundle_id(&stored.provider) == Some(bundle_id)
+            })
             .collect::<Vec<_>>();
         if surfaces.is_empty() {
             return Err(ProviderCommandError::NotFound);
@@ -4714,7 +5093,10 @@ impl ServerStateInner {
             let surfaces = providers
                 .providers
                 .iter()
-                .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+                .filter(|stored| {
+                    is_explicit_bundle_surface(&stored.provider)
+                        && provider_bundle_id(&stored.provider) == Some(bundle_id.as_str())
+                })
                 .map(|stored| (stored.app, stored.provider.id.clone()))
                 .collect::<Vec<_>>();
             if surfaces.is_empty() {
@@ -4723,7 +5105,10 @@ impl ServerStateInner {
             let actual_revision = providers
                 .providers
                 .iter()
-                .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+                .filter(|stored| {
+                    is_explicit_bundle_surface(&stored.provider)
+                        && provider_bundle_id(&stored.provider) == Some(bundle_id.as_str())
+                })
                 .map(|stored| stored.resource.revision)
                 .max()
                 .unwrap_or_default();
@@ -5028,10 +5413,18 @@ impl ServerStateInner {
         let accounts = self.accounts.read().await.clone();
         let shares = self.shares.read().await.clone();
         self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
+            if store.providers.iter().any(|stored| {
+                !is_explicit_bundle_surface(&stored.provider) && stored.provider.id == bundle_id
+            }) {
+                return Err(provider_management_id_conflict(&bundle_id));
+            }
             let existing = store
                 .providers
                 .iter()
-                .filter(|stored| provider_bundle_id(&stored.provider) == bundle_id)
+                .filter(|stored| {
+                    is_explicit_bundle_surface(&stored.provider)
+                        && provider_bundle_id(&stored.provider) == Some(bundle_id.as_str())
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let actual_revision = existing
@@ -5744,6 +6137,15 @@ impl ServerStateInner {
         candidate
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index before commit")?;
+        let changed_projection_keys = provider_runtime_projection_changes(&current, &candidate);
+        let changed_capacity_source_keys =
+            provider_capacity_source_changes(&current, &candidate, &accounts)
+                .context("detect Provider capacity source changes")?;
+        let affected_capacity_share_ids = changed_projection_keys
+            .iter()
+            .chain(changed_capacity_source_keys.iter())
+            .flat_map(|(app, provider_id)| shares.share_ids_for_provider(*app, provider_id))
+            .collect::<BTreeSet<_>>();
         candidate
             .seal_for_commit(&self.config_dir)
             .context("seal Provider credentials before commit")?;
@@ -5754,7 +6156,12 @@ impl ServerStateInner {
             .context("resolve key for Share capacity pools")?;
         let mut projected_shares = shares.clone();
         let changed_capacity_share_ids = projected_shares
-            .refresh_capacity_pool_ids(&candidate, &accounts, &capacity_pool_root_key.key)
+            .refresh_capacity_pool_ids_for_shares(
+                &affected_capacity_share_ids,
+                &candidate,
+                &accounts,
+                &capacity_pool_root_key.key,
+            )
             .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))?;
         let capacity_pool_updates = changed_capacity_share_ids
             .iter()
@@ -5802,7 +6209,6 @@ impl ServerStateInner {
             );
         }
 
-        let changed_projection_keys = provider_runtime_projection_changes(&current, &candidate);
         *self.providers.write().await = candidate;
         let changed_capacity_share_ids = self
             .apply_share_capacity_pool_updates_under_provider_commit(&capacity_pool_updates)
@@ -5854,34 +6260,24 @@ impl ServerStateInner {
         if capacity_pool_updates.is_empty() {
             return Ok(Vec::new());
         }
-        let mut shares = self.shares.write().await;
-        let mut candidate = shares.clone();
+        let _commit = self.shares_persistence.gate.lock().await;
+        let mut candidate = self.shares.read().await.clone();
         let updated_ids = candidate.apply_capacity_pool_ids(capacity_pool_updates);
         if updated_ids.is_empty() {
             return Ok(updated_ids);
         }
-        if let Err(error) = candidate.save(&self.config_dir) {
-            let disk_matches = ShareStore::load_or_default(&self.config_dir)
-                .ok()
-                .and_then(|store| serde_json::to_value(store).ok())
-                .zip(serde_json::to_value(&candidate).ok())
-                .is_some_and(|(disk, expected)| disk == expected);
-            if !disk_matches {
-                return Err(error);
-            }
-            tracing::warn!(
-                %error,
-                "shares file reached the commit point while refreshing capacity pools"
-            );
-        }
-        *shares = candidate;
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self.shares.write().await = candidate;
+        self.shares_persistence.mark_published();
         Ok(updated_ids)
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Accounts save")?;
-        self.accounts.read().await.save(&self.config_dir)
+        let _commit = self.accounts_persistence.gate.lock().await;
+        let snapshot = self.accounts.read().await.clone();
+        persist_state_snapshot(&self.config_dir, snapshot).await
     }
 
     pub fn credential_persistence_degraded(&self) -> bool {
@@ -6344,10 +6740,10 @@ impl ServerStateInner {
                 .await;
         }
 
-        let providers = self.providers.read().await;
-        let mut accounts = self.accounts.write().await;
-        let shares = self.shares.read().await;
-        let current = accounts.clone();
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let providers = self.providers.read().await.clone();
+        let current = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let live = current
             .accounts
             .iter()
@@ -6427,10 +6823,10 @@ impl ServerStateInner {
                 "injected OAuth credential persistence failure"
             ))
         } else {
-            candidate.save(&self.config_dir)
+            persist_state_snapshot(&self.config_dir, candidate.clone()).await
         };
         #[cfg(not(test))]
-        let persist_result = candidate.save(&self.config_dir);
+        let persist_result = persist_state_snapshot(&self.config_dir, candidate.clone()).await;
 
         // Publish the degraded gate before credentials that failed to persist become visible.
         // A rotating refresh token may already have invalidated the previous token, so the new
@@ -6438,12 +6834,8 @@ impl ServerStateInner {
         if persist_result.is_err() {
             self.mark_credential_persistence_degraded();
         }
-        *accounts = candidate;
-        drop(shares);
-        drop(accounts);
-        drop(providers);
-        drop(_workspace_transaction);
-        drop(_references);
+        *self.accounts.write().await = candidate;
+        self.accounts_persistence.mark_published();
 
         if let Err(error) = persist_result {
             self.schedule_credential_persistence_retry();
@@ -6470,8 +6862,8 @@ impl ServerStateInner {
     ) -> Result<Account, NativeRefreshCommitError> {
         let _references = self.reference_mutations.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
-        let mut accounts = self.accounts.write().await;
-        let current = accounts.clone();
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let current = self.accounts.read().await.clone();
         let live = current
             .accounts
             .iter()
@@ -6519,7 +6911,7 @@ impl ServerStateInner {
             .credential_persistence_state
             .load(std::sync::atomic::Ordering::Acquire);
         let persist_result = if persistence_allowed {
-            candidate.save(&self.config_dir)
+            persist_state_snapshot(&self.config_dir, candidate.clone()).await
         } else {
             Err(state_error
                 .context("rotated OAuth credentials are waiting for local state recovery"))
@@ -6527,10 +6919,8 @@ impl ServerStateInner {
         if persist_result.is_err() {
             self.mark_credential_persistence_degraded();
         }
-        *accounts = candidate;
-        drop(accounts);
-        drop(_workspace_transaction);
-        drop(_references);
+        *self.accounts.write().await = candidate;
+        self.accounts_persistence.mark_published();
 
         if let Err(error) = persist_result {
             self.schedule_credential_persistence_retry();
@@ -6759,6 +7149,7 @@ impl ServerStateInner {
     }
 
     pub async fn mutate_accounts<R>(&self, mutate: impl FnOnce(&mut AccountStore) -> R) -> R {
+        let _commit = self.accounts_persistence.gate.lock().await;
         let mut accounts = self.accounts.write().await;
         mutate(&mut accounts)
     }
@@ -6798,11 +7189,10 @@ impl ServerStateInner {
     ) -> anyhow::Result<Result<R, E>> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Accounts commit")?;
-
-        let mut providers = self.providers.write().await;
-        let mut accounts = self.accounts.write().await;
-        let shares = self.shares.read().await;
-        let current = accounts.clone();
+        let _commit = self.accounts_persistence.gate.lock().await;
+        let providers = self.providers.read().await.clone();
+        let current = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
         let mut candidate = current.clone();
         let result = match mutate(&mut candidate) {
             Ok(result) => result,
@@ -6820,22 +7210,12 @@ impl ServerStateInner {
             .rebuild_runtime_index(&candidate)
             .context("rebuild Provider runtime index for account commit")?;
 
-        if let Err(error) = candidate.save(&self.config_dir) {
-            let disk_matches = AccountStore::load_or_default(&self.config_dir)
-                .ok()
-                .and_then(|store| serde_json::to_value(store).ok())
-                .zip(serde_json::to_value(&candidate).ok())
-                .is_some_and(|(disk, expected)| disk == expected);
-            if !disk_matches {
-                return Err(error);
-            }
-            tracing::warn!(
-                %error,
-                "accounts file reached the commit point despite a persistence error; reconciled live state"
-            );
-        }
-        *accounts = candidate;
-        *providers = candidate_providers;
+        #[cfg(test)]
+        self.accounts_persistence.apply_test_persist_delay().await;
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self.providers.write().await = candidate_providers;
+        *self.accounts.write().await = candidate;
+        self.accounts_persistence.mark_published();
         Ok(Ok(result))
     }
 
@@ -6913,10 +7293,12 @@ impl ServerStateInner {
         let _provider_commit = self.provider_commits.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Codex workspace selection")?;
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let _shares_commit = self.shares_persistence.gate.lock().await;
 
-        let mut providers = self.providers.write().await;
-        let mut accounts = self.accounts.write().await;
-        let mut shares = self.shares.write().await;
+        let providers = self.providers.read().await.clone();
+        let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
 
         let share_ids = crate::domain::sharing::subscription_identity::share_ids_for_account(
             account_id, &providers, &shares,
@@ -6972,21 +7354,9 @@ impl ServerStateInner {
         }
 
         if !providers_changed {
-            if let Err(error) = candidate_accounts.save(&self.config_dir) {
-                let disk_matches = AccountStore::load_or_default(&self.config_dir)
-                    .ok()
-                    .and_then(|store| serde_json::to_value(store).ok())
-                    .zip(serde_json::to_value(&candidate_accounts).ok())
-                    .is_some_and(|(disk, expected)| disk == expected);
-                if !disk_matches {
-                    return Err(error);
-                }
-                tracing::warn!(
-                    %error,
-                    "Codex workspace selection reached the commit point despite a persistence error; reconciled live state"
-                );
-            }
-            *accounts = candidate_accounts;
+            persist_state_snapshot(&self.config_dir, candidate_accounts.clone()).await?;
+            *self.accounts.write().await = candidate_accounts;
+            self.accounts_persistence.mark_published();
             self.emit_oauth_quota_updated_event(&updated_account, true);
             return Ok(Ok(updated_account));
         }
@@ -7013,25 +7383,39 @@ impl ServerStateInner {
             .rebuild_runtime_index(&candidate_accounts)
             .context("compile sealed Provider runtime index for Codex workspace selection")?;
 
-        prepare_codex_workspace_rebind_transaction(
-            &self.config_dir,
-            &accounts,
-            &providers,
-            &shares,
-            &candidate_accounts,
-            &candidate_providers,
-            &candidate_shares,
-        )?;
-        if let Err(error) = apply_codex_workspace_rebind_transaction(&self.config_dir) {
+        let config_dir = self.config_dir.clone();
+        let transaction_accounts = accounts.clone();
+        let transaction_providers = providers.clone();
+        let transaction_shares = shares.clone();
+        let persisted_accounts = candidate_accounts.clone();
+        let persisted_providers = candidate_providers.clone();
+        let persisted_shares = candidate_shares.clone();
+        let apply_error = tokio::task::spawn_blocking(move || {
+            prepare_codex_workspace_rebind_transaction(
+                &config_dir,
+                &transaction_accounts,
+                &transaction_providers,
+                &transaction_shares,
+                &persisted_accounts,
+                &persisted_providers,
+                &persisted_shares,
+            )?;
+            Ok::<_, anyhow::Error>(apply_codex_workspace_rebind_transaction(&config_dir).err())
+        })
+        .await
+        .context("Codex workspace selection persistence task panicked")??;
+        if let Some(error) = apply_error {
             tracing::error!(
                 %error,
                 marker = %codex_workspace_rebind_transaction_path(&self.config_dir).display(),
                 "Codex workspace selection is committed but its file application remains pending"
             );
         }
-        *providers = candidate_providers;
-        *accounts = candidate_accounts;
-        *shares = candidate_shares;
+        *self.providers.write().await = candidate_providers;
+        *self.accounts.write().await = candidate_accounts;
+        *self.shares.write().await = candidate_shares;
+        self.accounts_persistence.mark_published();
+        self.shares_persistence.mark_published();
         self.emit_oauth_quota_updated_event(&updated_account, true);
         Ok(Ok(updated_account))
     }
@@ -7097,11 +7481,13 @@ impl ServerStateInner {
         let _provider_commit = self.provider_commits.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Codex workspace rebind")?;
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let usage = self.usage.read().await.clone();
+        let _shares_commit = self.shares_persistence.gate.lock().await;
 
-        let mut providers = self.providers.write().await;
-        let mut accounts = self.accounts.write().await;
-        let usage = self.usage.read().await;
-        let mut shares = self.shares.write().await;
+        let providers = self.providers.read().await.clone();
+        let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
 
         let current_share = match shares.get(share_id).cloned() {
             Some(share) => share,
@@ -7266,21 +7652,9 @@ impl ServerStateInner {
         }
 
         if !identity_changed && provider_keys.is_empty() {
-            if let Err(error) = candidate_accounts.save(&self.config_dir) {
-                let disk_matches = AccountStore::load_or_default(&self.config_dir)
-                    .ok()
-                    .and_then(|store| serde_json::to_value(store).ok())
-                    .zip(serde_json::to_value(&candidate_accounts).ok())
-                    .is_some_and(|(disk, expected)| disk == expected);
-                if !disk_matches {
-                    return Err(error);
-                }
-                tracing::warn!(
-                    %error,
-                    "Codex workspace selection reached the commit point despite a persistence error; reconciled live state"
-                );
-            }
-            *accounts = candidate_accounts;
+            persist_state_snapshot(&self.config_dir, candidate_accounts.clone()).await?;
+            *self.accounts.write().await = candidate_accounts;
+            self.accounts_persistence.mark_published();
             self.emit_oauth_quota_updated_event(&updated_account, true);
             return Ok(Ok(CodexWorkspaceRebindResult {
                 account: updated_account,
@@ -7300,27 +7674,43 @@ impl ServerStateInner {
             .rebuild_runtime_index(&candidate_accounts)
             .context("compile sealed Provider runtime index for Codex workspace rebind")?;
 
-        prepare_codex_workspace_rebind_transaction(
-            &self.config_dir,
-            &accounts,
-            &providers,
-            &shares,
-            &candidate_accounts,
-            &candidate_providers,
-            &candidate_shares,
-        )?;
-        if let Err(error) = apply_codex_workspace_rebind_transaction(&self.config_dir) {
+        let config_dir = self.config_dir.clone();
+        let transaction_accounts = accounts.clone();
+        let transaction_providers = providers.clone();
+        let transaction_shares = shares.clone();
+        let persisted_accounts = candidate_accounts.clone();
+        let persisted_providers = candidate_providers.clone();
+        let persisted_shares = candidate_shares.clone();
+        let apply_error = tokio::task::spawn_blocking(move || {
+            prepare_codex_workspace_rebind_transaction(
+                &config_dir,
+                &transaction_accounts,
+                &transaction_providers,
+                &transaction_shares,
+                &persisted_accounts,
+                &persisted_providers,
+                &persisted_shares,
+            )?;
+            Ok::<_, anyhow::Error>(apply_codex_workspace_rebind_transaction(&config_dir).err())
+        })
+        .await
+        .context("Codex workspace rebind persistence task panicked")??;
+        if let Some(error) = apply_error {
             tracing::error!(
                 %error,
                 marker = %codex_workspace_rebind_transaction_path(&self.config_dir).display(),
                 "Codex workspace rebind is committed but its file application remains pending"
             );
         }
-        *providers = candidate_providers;
-        *accounts = candidate_accounts;
-        *shares = candidate_shares;
-
-        let share = shares.get(share_id).cloned().unwrap_or(updated_share);
+        let share = candidate_shares
+            .get(share_id)
+            .cloned()
+            .unwrap_or(updated_share);
+        *self.providers.write().await = candidate_providers;
+        *self.accounts.write().await = candidate_accounts;
+        *self.shares.write().await = candidate_shares;
+        self.accounts_persistence.mark_published();
+        self.shares_persistence.mark_published();
         self.emit_oauth_quota_updated_event(&updated_account, true);
         Ok(Ok(CodexWorkspaceRebindResult {
             account: updated_account,
@@ -7620,7 +8010,9 @@ impl ServerStateInner {
     }
 
     pub async fn save_usage(&self) -> anyhow::Result<()> {
-        self.usage.read().await.save(&self.config_dir)
+        let _commit = self.usage_persistence.gate.lock().await;
+        let snapshot = self.usage.read().await.clone();
+        persist_state_snapshot(&self.config_dir, snapshot).await
     }
 
     pub async fn usage_snapshot(&self) -> UsageStore {
@@ -7633,7 +8025,7 @@ impl ServerStateInner {
     ) -> anyhow::Result<Option<crate::domain::health::ProviderHealthSnapshot>> {
         let event_app = observation.app;
         let event_provider_id = observation.provider_id.clone();
-        let snapshot = {
+        {
             let providers = self.providers.read().await;
             let Some(provider) = providers.providers.iter().find(|provider| {
                 provider.app == observation.app && provider.provider.id == observation.provider_id
@@ -7651,14 +8043,17 @@ impl ServerStateInner {
             if !runtime_matches {
                 return Ok(None);
             }
-
-            let mut usage = self.usage.write().await;
-            let mut provider_health = usage.provider_health.clone();
-            let snapshot = provider_health.record(observation);
-            provider_health.save(&self.config_dir)?;
-            usage.provider_health = provider_health;
-            snapshot
-        };
+        }
+        let _commit = self.usage_persistence.gate.lock().await;
+        let mut candidate = self.usage.read().await.clone();
+        let snapshot = candidate.provider_health.record(observation);
+        let persisted_health = candidate.provider_health.clone();
+        let config_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || persisted_health.save(&config_dir))
+            .await
+            .context("provider health persistence task panicked")??;
+        *self.usage.write().await = candidate;
+        self.usage_persistence.mark_published();
         self.emit_event(
             ServerEvent::new("provider-health.changed", "provider_health")
                 .id(event_provider_id)
@@ -7670,22 +8065,45 @@ impl ServerStateInner {
     }
 
     pub async fn prune_provider_health_snapshots(&self) -> anyhow::Result<bool> {
-        let providers = self.providers.read().await;
-        let mut usage = self.usage.write().await;
-        let mut provider_health = usage.provider_health.clone();
-        let changed = provider_health.retain_providers(&providers.providers);
+        let providers = self.providers.read().await.providers.clone();
+        let _commit = self.usage_persistence.gate.lock().await;
+        let mut candidate = self.usage.read().await.clone();
+        let changed = candidate.provider_health.retain_providers(&providers);
         if changed {
-            provider_health.save(&self.config_dir)?;
-            usage.provider_health = provider_health;
+            let persisted_health = candidate.provider_health.clone();
+            let config_dir = self.config_dir.clone();
+            tokio::task::spawn_blocking(move || persisted_health.save(&config_dir))
+                .await
+                .context("provider health persistence task panicked")??;
+            *self.usage.write().await = candidate;
+            self.usage_persistence.mark_published();
         }
         Ok(changed)
     }
 
     pub async fn push_usage_log(&self, log: UsageLog) -> anyhow::Result<()> {
-        self.usage
-            .write()
-            .await
-            .push_and_persist(&self.config_dir, log)
+        let _commit = self.usage_persistence.gate.lock().await;
+        let mut candidate = self.usage.read().await.clone();
+        #[cfg(test)]
+        self.usage_persistence.apply_test_persist_delay().await;
+        let config_dir = self.config_dir.clone();
+        let expected_log = log.clone();
+        let (candidate, result) = tokio::task::spawn_blocking(move || {
+            let result = candidate.push_and_persist(&config_dir, log);
+            (candidate, result)
+        })
+        .await
+        .context("usage log persistence task panicked")?;
+        let published = match result {
+            Ok(()) => candidate,
+            Err(error) => {
+                reconcile_usage_store_after_persistence_error(&self.config_dir, expected_log, error)
+                    .await?
+            }
+        };
+        *self.usage.write().await = published;
+        self.usage_persistence.mark_published();
+        Ok(())
     }
 
     pub(crate) async fn push_health_usage_log_if_due(
@@ -7694,8 +8112,9 @@ impl ServerStateInner {
         min_interval_ms: u128,
     ) -> anyhow::Result<UsageLog> {
         anyhow::ensure!(log.is_health_check, "usage log is not a health check");
-        let mut usage = self.usage.write().await;
-        let latest = usage
+        let _commit = self.usage_persistence.gate.lock().await;
+        let mut candidate = self.usage.read().await.clone();
+        let latest = candidate
             .logs
             .iter()
             .filter(|existing| {
@@ -7713,8 +8132,25 @@ impl ServerStateInner {
                 return Ok(existing);
             }
         }
-        usage.push_and_persist(&self.config_dir, log.clone())?;
-        Ok(log)
+        let config_dir = self.config_dir.clone();
+        let returned_log = log.clone();
+        let expected_log = log.clone();
+        let (candidate, result) = tokio::task::spawn_blocking(move || {
+            let result = candidate.push_and_persist(&config_dir, log);
+            (candidate, result)
+        })
+        .await
+        .context("health usage log persistence task panicked")?;
+        let published = match result {
+            Ok(()) => candidate,
+            Err(error) => {
+                reconcile_usage_store_after_persistence_error(&self.config_dir, expected_log, error)
+                    .await?
+            }
+        };
+        *self.usage.write().await = published;
+        self.usage_persistence.mark_published();
+        Ok(returned_log)
     }
 
     pub async fn update_usage_log(
@@ -7722,16 +8158,51 @@ impl ServerStateInner {
         request_id: &str,
         update: impl FnOnce(&mut UsageLog),
     ) -> anyhow::Result<Option<UsageLog>> {
-        self.usage
-            .write()
-            .await
-            .update_log_and_persist(&self.config_dir, request_id, update)
+        let _commit = self.usage_persistence.gate.lock().await;
+        let mut candidate = self.usage.read().await.clone();
+        let Some(mut updated) = candidate
+            .logs
+            .iter()
+            .find(|log| log.request_id == request_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        update(&mut updated);
+        let expected_log = updated.clone();
+        let request_id = request_id.to_string();
+        let config_dir = self.config_dir.clone();
+        let (candidate, result) = tokio::task::spawn_blocking(move || {
+            let result = candidate.update_log_and_persist(&config_dir, &request_id, |log| {
+                *log = updated;
+            });
+            (candidate, result)
+        })
+        .await
+        .context("usage log update persistence task panicked")?;
+        let (published, persisted_result) = match result {
+            Ok(value) => (candidate, value),
+            Err(error) => {
+                let reconciled = reconcile_usage_store_after_persistence_error(
+                    &self.config_dir,
+                    expected_log.clone(),
+                    error,
+                )
+                .await?;
+                (reconciled, Some(expected_log))
+            }
+        };
+        *self.usage.write().await = published;
+        self.usage_persistence.mark_published();
+        Ok(persisted_result)
     }
 
     pub async fn save_shares(&self) -> anyhow::Result<()> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Shares save")?;
-        self.shares.read().await.save(&self.config_dir)
+        let _commit = self.shares_persistence.gate.lock().await;
+        let snapshot = self.shares.read().await.clone();
+        persist_state_snapshot(&self.config_dir, snapshot).await
     }
 
     pub async fn refresh_managed_account_if_needed(
@@ -8548,32 +9019,33 @@ impl ServerStateInner {
         expected_identity: Option<(ProviderType, u64)>,
         rejected_access_token: Option<&str>,
     ) -> Option<Account> {
-        let (before, account) = {
-            let mut accounts = self.accounts.write().await;
-            let before = accounts
-                .accounts
-                .iter()
-                .find(|account| account.id == account_id)
-                .cloned();
-            let matches_expected_identity =
-                expected_identity.is_none_or(|(provider_type, auth_identity_generation)| {
-                    before.as_ref().is_some_and(|account| {
-                        account.provider_type == provider_type
-                            && account.auth_identity_generation == auth_identity_generation
-                    })
-                });
-            let matches_rejected_token =
-                rejected_access_token.is_none_or(|rejected_access_token| {
-                    before.as_ref().is_some_and(|account| {
-                        account.access_token.as_deref().map(str::trim)
-                            == Some(rejected_access_token.trim())
-                    })
-                });
-            let account = (matches_expected_identity && matches_rejected_token)
-                .then(|| accounts.mark_rate_limited_until(account_id, rate_limited_until))
-                .flatten();
-            (before, account)
-        };
+        let (before, account) = self
+            .mutate_accounts(|accounts| {
+                let before = accounts
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+                    .cloned();
+                let matches_expected_identity =
+                    expected_identity.is_none_or(|(provider_type, auth_identity_generation)| {
+                        before.as_ref().is_some_and(|account| {
+                            account.provider_type == provider_type
+                                && account.auth_identity_generation == auth_identity_generation
+                        })
+                    });
+                let matches_rejected_token =
+                    rejected_access_token.is_none_or(|rejected_access_token| {
+                        before.as_ref().is_some_and(|account| {
+                            account.access_token.as_deref().map(str::trim)
+                                == Some(rejected_access_token.trim())
+                        })
+                    });
+                let account = (matches_expected_identity && matches_rejected_token)
+                    .then(|| accounts.mark_rate_limited_until(account_id, rate_limited_until))
+                    .flatten();
+                (before, account)
+            })
+            .await;
         if let Some(account) = account.as_ref() {
             if before
                 .as_ref()
@@ -8659,27 +9131,28 @@ impl ServerStateInner {
         if subscription_level.is_none() && entitlement_status.is_none() {
             return None;
         }
-        let account = {
-            let mut accounts = self.accounts.write().await;
-            let matches_expected_identity =
-                expected_identity.is_none_or(|(provider_type, auth_identity_generation)| {
-                    accounts.accounts.iter().any(|account| {
-                        account.id == account_id
-                            && account.provider_type == provider_type
-                            && account.auth_identity_generation == auth_identity_generation
+        let account = self
+            .mutate_accounts(|accounts| {
+                let matches_expected_identity =
+                    expected_identity.is_none_or(|(provider_type, auth_identity_generation)| {
+                        accounts.accounts.iter().any(|account| {
+                            account.id == account_id
+                                && account.provider_type == provider_type
+                                && account.auth_identity_generation == auth_identity_generation
+                        })
+                    });
+                matches_expected_identity
+                    .then(|| {
+                        accounts.update_entitlement_snapshot(
+                            account_id,
+                            subscription_level,
+                            entitlement_status,
+                            updated_at_ms,
+                        )
                     })
-                });
-            matches_expected_identity
-                .then(|| {
-                    accounts.update_entitlement_snapshot(
-                        account_id,
-                        subscription_level,
-                        entitlement_status,
-                        updated_at_ms,
-                    )
-                })
-                .flatten()
-        };
+                    .flatten()
+            })
+            .await;
         if account.is_some() {
             save_accounts_debounced(self);
         }
@@ -9309,6 +9782,7 @@ impl ServerStateInner {
     }
 
     pub async fn mutate_shares<R>(&self, mutate: impl FnOnce(&mut ShareStore) -> R) -> R {
+        let _commit = self.shares_persistence.gate.lock().await;
         let mut shares = self.shares.write().await;
         mutate(&mut shares)
     }
@@ -9328,27 +9802,17 @@ impl ServerStateInner {
     ) -> anyhow::Result<Result<R, E>> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Shares commit")?;
-        let mut shares = self.shares.write().await;
-        let mut candidate = shares.clone();
+        let _commit = self.shares_persistence.gate.lock().await;
+        let mut candidate = self.shares.read().await.clone();
         let result = match mutate(&mut candidate) {
             Ok(result) => result,
             Err(error) => return Ok(Err(error)),
         };
-        if let Err(error) = candidate.save(&self.config_dir) {
-            let disk_matches = ShareStore::load_or_default(&self.config_dir)
-                .ok()
-                .and_then(|store| serde_json::to_value(store).ok())
-                .zip(serde_json::to_value(&candidate).ok())
-                .is_some_and(|(disk, expected)| disk == expected);
-            if !disk_matches {
-                return Err(error);
-            }
-            tracing::warn!(
-                %error,
-                "shares file reached the commit point despite a persistence error; reconciled live state"
-            );
-        }
-        *shares = candidate;
+        #[cfg(test)]
+        self.shares_persistence.apply_test_persist_delay().await;
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self.shares.write().await = candidate;
+        self.shares_persistence.mark_published();
         Ok(Ok(result))
     }
 
@@ -9538,22 +10002,40 @@ impl ServerStateInner {
             )
             .map_err(|limit| ShareInvocationRejection {
                 reason: match limit {
-                    ShareInFlightAcquireError::ShareLimit => ShareRejectReason::ParallelLimit,
-                    ShareInFlightAcquireError::UserLimit => ShareRejectReason::UserParallelLimit,
+                    ShareInFlightAcquireError::ShareLimit { .. } => {
+                        ShareRejectReason::ParallelLimit
+                    }
+                    ShareInFlightAcquireError::UserLimit { .. } => {
+                        ShareRejectReason::UserParallelLimit
+                    }
                 },
-                message:
-                    "Share parallel limit has been reached. Wait for an in-flight request to finish."
-                        .to_string(),
+                message: match limit {
+                    ShareInFlightAcquireError::ShareLimit { current, limit } => format!(
+                        "Share concurrency limit has been reached ({current}/{limit}). Wait for an in-flight request to finish."
+                    ),
+                    ShareInFlightAcquireError::UserLimit { current, limit } => format!(
+                        "Your Share user concurrency limit has been reached ({current}/{limit}). Wait for an in-flight request to finish."
+                    ),
+                },
                 status_changed: false,
+                concurrency: Some(match limit {
+                    ShareInFlightAcquireError::ShareLimit { current, limit }
+                    | ShareInFlightAcquireError::UserLimit { current, limit } => {
+                        ShareConcurrencyLimit { current, limit }
+                    }
+                }),
             })?;
         Ok((invocation, guard))
     }
 
     pub async fn save_ui_settings(&self) -> anyhow::Result<()> {
-        self.ui_settings.read().await.save(&self.config_dir)
+        let _commit = self.ui_settings_persistence.gate.lock().await;
+        let snapshot = self.ui_settings.read().await.clone();
+        persist_state_snapshot(&self.config_dir, snapshot).await
     }
 
     pub async fn mutate_ui_settings<R>(&self, mutate: impl FnOnce(&mut UiSettingsStore) -> R) -> R {
+        let _commit = self.ui_settings_persistence.gate.lock().await;
         let mut ui_settings = self.ui_settings.write().await;
         mutate(&mut ui_settings)
     }
@@ -9562,8 +10044,16 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut UiSettingsStore) -> R,
     ) -> anyhow::Result<R> {
-        let result = self.mutate_ui_settings(mutate).await;
-        self.save_ui_settings().await?;
+        let _commit = self.ui_settings_persistence.gate.lock().await;
+        let mut candidate = self.ui_settings.read().await.clone();
+        let result = mutate(&mut candidate);
+        #[cfg(test)]
+        self.ui_settings_persistence
+            .apply_test_persist_delay()
+            .await;
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self.ui_settings.write().await = candidate;
+        self.ui_settings_persistence.mark_published();
         Ok(result)
     }
 
@@ -10493,7 +10983,7 @@ async fn run_periodic_share_sync_retry_once(state: &ServerState) {
             .collect::<Vec<_>>()
     };
     for share_id in pending_ids {
-        if let Err(error) = sync_one_share_to_router(state, &share_id).await {
+        if let Err(error) = sync_share_to_router_with_runtime_refresh(state, &share_id).await {
             tracing::warn!(share_id = %share_id, error = %error, "periodic router share sync retry failed");
         }
     }
@@ -11746,7 +12236,7 @@ async fn apply_and_ack_share_edit(
     summary: &mut ShareEditSyncSummary,
 ) {
     let apply_result = apply_share_edit_locally(state, &edit).await;
-    let (ack_status, ack_error) = match apply_result {
+    let (ack_status, ack_error, ack_error_code, ack_retryable) = match apply_result {
         Ok(()) => {
             summary.applied += 1;
             let sync_result = sync_one_share_to_router(state, &edit.share_id).await;
@@ -11762,12 +12252,19 @@ async fn apply_and_ack_share_edit(
                     );
                 }
             }
-            ("applied".to_string(), None)
+            ("applied".to_string(), None, None, None)
         }
         Err(error) => {
             summary.rejected += 1;
             let message = error.to_string();
-            ("rejected".to_string(), Some(message))
+            let patch_error =
+                error.downcast_ref::<crate::domain::sharing::shares::SharePatchError>();
+            (
+                "rejected".to_string(),
+                Some(message),
+                patch_error.map(|error| error.code().to_string()),
+                patch_error.map(|error| error.retryable()),
+            )
         }
     };
     let ack = ShareEditAckPayload {
@@ -11775,6 +12272,8 @@ async fn apply_and_ack_share_edit(
         revision: edit.revision,
         status: ack_status,
         error_message: ack_error,
+        error_code: ack_error_code,
+        retryable: ack_retryable,
     };
     let http_client = state.http_client().await;
     match client::ack_share_edit(&http_client, config, ack).await {
@@ -11824,6 +12323,42 @@ pub(crate) async fn sync_one_share_to_router(
 ) -> anyhow::Result<()> {
     let _sync = state.lock_router_share_sync().await;
     sync_one_share_to_router_locked(state, share_id).await
+}
+
+pub(crate) async fn sync_share_to_router_with_runtime_refresh(
+    state: &ServerState,
+    share_id: &str,
+) -> anyhow::Result<()> {
+    let _sync = state.lock_router_share_sync().await;
+    sync_one_share_to_router_locked(state, share_id).await?;
+    let Some((share_id, subdomain)) = state.shares.read().await.get(share_id).and_then(|share| {
+        share
+            .tunnel_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|subdomain| (share.id.clone(), subdomain.to_string()))
+    }) else {
+        return Ok(());
+    };
+    let config = state.config_snapshot().await;
+    let http_client = state.http_client().await;
+    if let Err(error) =
+        client::notify_runtime_refresh(&http_client, &config, share_id.clone(), subdomain).await
+    {
+        let message = error.to_string();
+        state
+            .mutate_shares_immediate(|store| {
+                store.last_router_error = Some(message.clone());
+                if let Some(share) = store.shares.iter_mut().find(|share| share.id == share_id) {
+                    share.router_last_sync_error = Some(message.clone());
+                }
+            })
+            .await
+            .context("persist Router Share runtime refresh failure")?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn push_router_share_operations(
@@ -12287,7 +12822,10 @@ async fn build_router_share_upsert_ops_with_policy(
         .into_iter()
         .filter_map(|(share_id, mut descriptor, _)| {
             let share = projection_state.get(&share_id)?;
-            if !force && !projection_state.descriptor_projection_pending(share) {
+            if !force
+                && !projection_state.descriptor_projection_pending(share)
+                && share.router_last_sync_error.is_none()
+            {
                 return None;
             }
             descriptor.descriptor_generation = share.descriptor_generation;
@@ -12377,8 +12915,8 @@ async fn mark_router_share_upserts_failed(
         })
         .collect::<Vec<_>>();
     let router_base = config.router_api_base().map(str::to_string);
-    state
-        .mutate_shares_debounced(|store| {
+    if let Err(error) = state
+        .mutate_shares_immediate(|store| {
             store.last_router_error = Some(message.clone());
             for (share_id, generation, fingerprint, revision) in &projections {
                 store.mark_router_descriptor_sync(
@@ -12391,7 +12929,14 @@ async fn mark_router_share_upserts_failed(
                 );
             }
         })
-        .await;
+        .await
+    {
+        tracing::error!(
+            error = %error,
+            router_error = %message,
+            "persist Router Share synchronization failure failed"
+        );
+    }
 }
 
 async fn record_router_share_delete_failures(
@@ -12923,7 +13468,9 @@ mod tests {
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
-    use crate::domain::sharing::shares::{Share, ShareAcl, ShareBinding, UpsertShareInput};
+    use crate::domain::sharing::shares::{
+        Share, ShareAcl, ShareBinding, SharePolicy, UpsertShareInput,
+    };
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
     use axum::extract::State as AxumState;
     use axum::http::StatusCode;
@@ -13023,6 +13570,7 @@ mod tests {
         batch_sizes: Arc<TokioMutex<Vec<usize>>>,
         request_order: Arc<TokioMutex<Vec<String>>>,
         prune_requests: Arc<AtomicUsize>,
+        runtime_refreshes: Arc<AtomicUsize>,
         prune_status: Arc<TokioMutex<StatusCode>>,
     }
 
@@ -13080,6 +13628,16 @@ mod tests {
         (prune_status, Json(json!({"ok": true})))
     }
 
+    async fn share_runtime_refresh_mock_handler(
+        AxumState(router): AxumState<SharePruneMockRouter>,
+        Json(_request): Json<Value>,
+    ) -> Json<Value> {
+        router
+            .runtime_refreshes
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        Json(json!({"ok": true}))
+    }
+
     async fn spawn_share_prune_mock_router(
         remote_share_ids: impl IntoIterator<Item = String>,
         prune_status: StatusCode,
@@ -13089,6 +13647,7 @@ mod tests {
             batch_sizes: Arc::new(TokioMutex::new(Vec::new())),
             request_order: Arc::new(TokioMutex::new(Vec::new())),
             prune_requests: Arc::new(AtomicUsize::new(0)),
+            runtime_refreshes: Arc::new(AtomicUsize::new(0)),
             prune_status: Arc::new(TokioMutex::new(prune_status)),
         };
         let app = Router::new()
@@ -13097,6 +13656,10 @@ mod tests {
                 post(share_prune_mock_batch_handler),
             )
             .route("/v1/shares/prune", post(share_prune_mock_handler))
+            .route(
+                "/v1/shares/runtime-refresh",
+                post(share_runtime_refresh_mock_handler),
+            )
             .with_state(router.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -13363,6 +13926,63 @@ mod tests {
             assert!(share.router_synced_revision < share.config_revision);
             assert!(share.router_last_sync_error.is_some());
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_share_sync_retries_error_only_state_and_clears_it_durably() {
+        let (router_url, router, server) =
+            spawn_share_prune_mock_router(Vec::<String>::new(), StatusCode::OK).await;
+        let state = test_state();
+        configure_registered_test_router(&state, &router_url, "inst-error-only-retry").await;
+        create_router_shares(&state, "erroronly", 1).await;
+
+        sync_one_share_to_router(&state, "erroronly0")
+            .await
+            .unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                let share = store
+                    .shares
+                    .iter_mut()
+                    .find(|share| share.id == "erroronly0")
+                    .unwrap();
+                assert_eq!(
+                    share.router_synced_descriptor_generation,
+                    share.descriptor_generation
+                );
+                share.router_last_sync_error = Some("runtime refresh failed".to_string());
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ShareStore::load_or_default(&state.config_dir)
+                .unwrap()
+                .get("erroronly0")
+                .unwrap()
+                .router_last_sync_error
+                .as_deref(),
+            Some("runtime refresh failed")
+        );
+
+        run_periodic_share_sync_retry_once(&state).await;
+
+        assert_eq!(router.batch_sizes.lock().await.as_slice(), &[1, 1]);
+        assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 1);
+        assert!(state
+            .shares
+            .read()
+            .await
+            .get("erroronly0")
+            .unwrap()
+            .router_last_sync_error
+            .is_none());
+        assert!(ShareStore::load_or_default(&state.config_dir)
+            .unwrap()
+            .get("erroronly0")
+            .unwrap()
+            .router_last_sync_error
+            .is_none());
         server.abort();
     }
 
@@ -16063,6 +16683,94 @@ mod tests {
         )])
     }
 
+    fn provider_resource(profile_id: &str, revision: u64) -> ProviderResourceMetadata {
+        ProviderResourceMetadata {
+            profile_id: Some(ProfileId::parse(profile_id).unwrap()),
+            profile_schema_revision: Some(1),
+            revision,
+            credential_generation: 1,
+            ..ProviderResourceMetadata::default()
+        }
+    }
+
+    fn colliding_bundle_store(provider_id: &str) -> ProviderStore {
+        let mut store = ProviderStore::default();
+        for (app, profile_id) in [
+            (AppKind::Claude, "claude.nvidia"),
+            (AppKind::Codex, "codex.nvidia"),
+        ] {
+            store.upsert_with_resource(
+                app,
+                Provider {
+                    id: provider_id.to_string(),
+                    name: "NVIDIA Bundle".to_string(),
+                    settings_config: json!({
+                        "apiKey": "nvidia-test-key",
+                        "modelMapping": {
+                            "mode": "single",
+                            "upstreamModel": "moonshotai/kimi-k2.5"
+                        }
+                    }),
+                    category: None,
+                    meta: None,
+                    extra: BTreeMap::from([
+                        ("bundleId".to_string(), json!(provider_id)),
+                        ("familyId".to_string(), json!("family.nvidia")),
+                        ("surfaceEnabled".to_string(), json!(true)),
+                    ]),
+                },
+                provider_resource(profile_id, 1),
+            );
+        }
+        store.upsert_with_resource(
+            AppKind::Gemini,
+            Provider {
+                id: provider_id.to_string(),
+                name: "Unrelated Gemini Provider".to_string(),
+                settings_config: json!({
+                    "apiKey": "gemini-test-key",
+                    "modelMapping": {"mode": "passthrough"}
+                }),
+                category: None,
+                meta: None,
+                extra: BTreeMap::new(),
+            },
+            provider_resource("gemini.google_api_key", 7),
+        );
+        store
+    }
+
+    #[tokio::test]
+    async fn bundle_delete_ignores_an_unrelated_ordinary_provider_with_the_same_id() {
+        let state = test_state();
+        state
+            .replace_provider_store_for_test(colliding_bundle_store("historical-collision"))
+            .await;
+
+        let preview = state
+            .provider_bundle_reference_preview("historical-collision")
+            .await
+            .unwrap();
+        assert_eq!(preview.revision, 1);
+
+        assert!(state
+            .delete_provider_bundle_command("historical-collision".to_string(), 1)
+            .await
+            .unwrap()
+            .unwrap());
+        let remaining = state.providers_snapshot().await;
+        assert_eq!(remaining.providers.len(), 1);
+        assert_eq!(remaining.providers[0].app, AppKind::Gemini);
+        assert_eq!(remaining.providers[0].resource.revision, 7);
+
+        assert!(state
+            .delete_provider_command(AppKind::Gemini, "historical-collision".to_string(), 7)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(state.providers_snapshot().await.providers.is_empty());
+    }
+
     fn openrouter_provider(app: AppKind, provider_id: &str, api_key: &str) -> StoredProvider {
         let credential_name = match app {
             AppKind::Claude => "ANTHROPIC_AUTH_TOKEN",
@@ -18003,6 +18711,36 @@ mod tests {
         );
 
         drop(restarted);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn native_refresh_quarantine_retention_bounds_json_files() {
+        let config_dir = provider_restore_test_dir("quarantine-retention");
+        let quarantine_dir = config_dir.join(NATIVE_REFRESH_QUARANTINE_DIR);
+        fs::create_dir_all(&quarantine_dir).unwrap();
+        for index in 0..(NATIVE_REFRESH_QUARANTINE_MAX_FILES + 6) {
+            fs::write(
+                quarantine_dir.join(format!("receipt-{index:03}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        fs::write(quarantine_dir.join("operator-note.txt"), b"keep").unwrap();
+
+        assert_eq!(prune_native_refresh_quarantine(&config_dir).unwrap(), 6);
+        assert_eq!(
+            fs::read_dir(&quarantine_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("json")
+                )
+                .count(),
+            NATIVE_REFRESH_QUARANTINE_MAX_FILES
+        );
+        assert!(quarantine_dir.join("operator-note.txt").exists());
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -20220,6 +20958,216 @@ mod tests {
         assert!(!state.credential_persistence_degraded());
     }
 
+    #[tokio::test]
+    async fn persistence_coordinators_prevent_delayed_snapshots_from_winning() {
+        fn usage_log(request_id: &str) -> UsageLog {
+            let mut log = UsageLog::new(
+                AppKind::Codex,
+                "persistence-provider".to_string(),
+                "Persistence Provider".to_string(),
+                ProviderType::Codex,
+                200,
+                1,
+                UsageModelMetadata::default(),
+                TokenUsage::default(),
+            );
+            log.request_id = request_id.to_string();
+            log
+        }
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+
+        state.config_persistence.delay_next_persist(100);
+        let delay_started = state.config_persistence.persist_delay_started.notified();
+        let older_state = state.clone();
+        let older = tokio::spawn(async move {
+            older_state
+                .mutate_config_immediate(|config| {
+                    config.router.last_register_error = Some("older-config".to_string());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), delay_started)
+            .await
+            .unwrap();
+        let newer_state = state.clone();
+        let newer = tokio::spawn(async move {
+            newer_state
+                .mutate_config_immediate(|config| {
+                    config.router.last_register_error = Some("newer-config".to_string());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        older.await.unwrap();
+        newer.await.unwrap();
+        assert_eq!(
+            ServerConfig::load_or_default(&config_dir)
+                .unwrap()
+                .router
+                .last_register_error
+                .as_deref(),
+            Some("newer-config")
+        );
+
+        state.accounts_persistence.delay_next_persist(100);
+        let delay_started = state.accounts_persistence.persist_delay_started.notified();
+        let older_state = state.clone();
+        let older = tokio::spawn(async move {
+            older_state
+                .mutate_accounts_immediate(|accounts| {
+                    accounts.upsert(refresh_test_account_input(
+                        "persistence-account",
+                        ProviderType::GrokOAuth,
+                        Some("older@example.com"),
+                        "older-access",
+                        "older-refresh",
+                        i64::MAX,
+                    ));
+                })
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), delay_started)
+            .await
+            .unwrap();
+        let newer_state = state.clone();
+        let newer = tokio::spawn(async move {
+            newer_state
+                .mutate_accounts_immediate(|accounts| {
+                    accounts.upsert(refresh_test_account_input(
+                        "persistence-account",
+                        ProviderType::GrokOAuth,
+                        Some("newer@example.com"),
+                        "newer-access",
+                        "newer-refresh",
+                        i64::MAX,
+                    ));
+                })
+                .await
+                .unwrap();
+        });
+        older.await.unwrap();
+        newer.await.unwrap();
+        assert_eq!(
+            AccountStore::load_or_default(&config_dir)
+                .unwrap()
+                .find_for_provider(ProviderType::GrokOAuth, Some("persistence-account"))
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("newer@example.com")
+        );
+
+        state.usage_persistence.delay_next_persist(100);
+        let delay_started = state.usage_persistence.persist_delay_started.notified();
+        let older_state = state.clone();
+        let older = tokio::spawn(async move {
+            older_state
+                .push_usage_log(usage_log("older-usage"))
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), delay_started)
+            .await
+            .unwrap();
+        let newer_state = state.clone();
+        let newer = tokio::spawn(async move {
+            newer_state
+                .push_usage_log(usage_log("newer-usage"))
+                .await
+                .unwrap();
+        });
+        older.await.unwrap();
+        newer.await.unwrap();
+        assert_eq!(
+            UsageStore::load_or_default(&config_dir)
+                .unwrap()
+                .logs
+                .iter()
+                .map(|log| log.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older-usage", "newer-usage"]
+        );
+
+        state.shares_persistence.delay_next_persist(100);
+        let delay_started = state.shares_persistence.persist_delay_started.notified();
+        let older_state = state.clone();
+        let older = tokio::spawn(async move {
+            let mut input = router_sync_share_input("persistence-share", "persistence-provider");
+            input.display_name = Some("Older Share".to_string());
+            older_state
+                .mutate_shares_immediate(|shares| shares.upsert(input))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), delay_started)
+            .await
+            .unwrap();
+        let newer_state = state.clone();
+        let newer = tokio::spawn(async move {
+            let mut input = router_sync_share_input("persistence-share", "persistence-provider");
+            input.display_name = Some("Newer Share".to_string());
+            newer_state
+                .mutate_shares_immediate(|shares| shares.upsert(input))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        older.await.unwrap();
+        newer.await.unwrap();
+        assert_eq!(
+            ShareStore::load_or_default(&config_dir)
+                .unwrap()
+                .get("persistence-share")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Newer Share")
+        );
+
+        state.ui_settings_persistence.delay_next_persist(100);
+        let delay_started = state
+            .ui_settings_persistence
+            .persist_delay_started
+            .notified();
+        let older_state = state.clone();
+        let older = tokio::spawn(async move {
+            older_state
+                .mutate_ui_settings_immediate(|settings| {
+                    settings.apply_patch(json!({"persistenceProbe": "older-ui"}));
+                })
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), delay_started)
+            .await
+            .unwrap();
+        let newer_state = state.clone();
+        let newer = tokio::spawn(async move {
+            newer_state
+                .mutate_ui_settings_immediate(|settings| {
+                    settings.apply_patch(json!({"persistenceProbe": "newer-ui"}));
+                })
+                .await
+                .unwrap();
+        });
+        older.await.unwrap();
+        newer.await.unwrap();
+        assert_eq!(
+            UiSettingsStore::load_or_default(&config_dir).unwrap().value["persistenceProbe"],
+            json!("newer-ui")
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[test]
     fn restore_tunnel_logic_skips_manually_stopped_client() {
         assert!(should_restore_client_tunnel(None));
@@ -20266,7 +21214,7 @@ mod tests {
             .validate_and_acquire_share_invocation(
                 &share.id,
                 AppKind::Codex,
-                None,
+                Some("owner@example.com"),
                 crate::infra::time::now_ms() as i64,
             )
             .await
@@ -20320,7 +21268,10 @@ mod tests {
             .expect("alice should acquire her first slot");
         assert!(matches!(
             tracker.try_acquire_for_user("share-1", Some(2), Some("alice@example.com"), Some(1)),
-            Err(ShareInFlightAcquireError::UserLimit)
+            Err(ShareInFlightAcquireError::UserLimit {
+                current: 1,
+                limit: 1
+            })
         ));
 
         let bob = tracker
@@ -20328,7 +21279,10 @@ mod tests {
             .expect("bob should use the remaining total slot");
         assert!(matches!(
             tracker.try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(2)),
-            Err(ShareInFlightAcquireError::ShareLimit)
+            Err(ShareInFlightAcquireError::ShareLimit {
+                current: 2,
+                limit: 2
+            })
         ));
 
         drop(alice);
@@ -20336,6 +21290,83 @@ mod tests {
             .try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(1))
             .is_ok());
         drop(bob);
+    }
+
+    #[tokio::test]
+    async fn share_user_parallel_limit_is_shared_across_api_surfaces() {
+        let state = test_state();
+        let mut input = router_sync_share_input("crosssurface", "codex-provider");
+        input.bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "claude-provider".to_string(),
+                provider_type: ProviderType::Claude,
+            },
+            ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "codex-provider".to_string(),
+                provider_type: ProviderType::Codex,
+            },
+        ];
+        let share = state
+            .mutate_shares_immediate(|store| store.upsert(input))
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|candidate| candidate.id == share.id)
+                    .unwrap()
+                    .user_grants
+                    .get_mut("owner@example.com")
+                    .unwrap()
+                    .policy
+                    .parallel_limit = Some(1);
+            })
+            .await
+            .unwrap();
+
+        let (_claude, guard) = state
+            .validate_and_acquire_share_invocation(
+                &share.id,
+                AppKind::Claude,
+                Some("owner@example.com"),
+                crate::infra::time::now_ms() as i64,
+            )
+            .await
+            .expect("Claude should acquire the user's shared slot");
+        let rejection = state
+            .validate_and_acquire_share_invocation(
+                &share.id,
+                AppKind::Codex,
+                Some("owner@example.com"),
+                crate::infra::time::now_ms() as i64,
+            )
+            .await
+            .expect_err("Codex must share the same user slot");
+
+        assert_eq!(rejection.reason, ShareRejectReason::UserParallelLimit);
+        assert_eq!(
+            rejection.concurrency,
+            Some(ShareConcurrencyLimit {
+                current: 1,
+                limit: 1,
+            })
+        );
+
+        drop(guard);
+        assert!(state
+            .validate_and_acquire_share_invocation(
+                &share.id,
+                AppKind::Codex,
+                Some("owner@example.com"),
+                crate::infra::time::now_ms() as i64,
+            )
+            .await
+            .is_ok());
     }
 
     #[test]
@@ -20351,9 +21382,13 @@ mod tests {
                 .current(ProviderType::ClaudeOAuth, "acct-1"),
             1
         );
-        assert!(tracker
-            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
-            .is_none());
+        assert!(matches!(
+            tracker.try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1),
+            Err(AccountInFlightAcquireError {
+                current: 1,
+                limit: 1,
+            })
+        ));
 
         drop(guard);
         assert_eq!(
@@ -20364,7 +21399,7 @@ mod tests {
         );
         assert!(tracker
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
-            .is_some());
+            .is_ok());
     }
 
     #[test]
@@ -20745,25 +21780,20 @@ mod tests {
             account_email: None,
             quota_percent: None,
             tunnel_subdomain: None,
-            acl: ShareAcl::default(),
-            token_limit: None,
-            parallel_limit: None,
+            policy: SharePolicy {
+                acl: ShareAcl::default(),
+                ..SharePolicy::default()
+            },
             tokens_used: 0,
             requests_count: 0,
-            expires_at: None,
             created_at_ms: 0,
-            for_sale: false,
-            free_access: false,
-            access_by_app: std::collections::BTreeMap::new(),
-            app_settings: std::collections::BTreeMap::new(),
-            for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
-            official_price_percent: None,
             auto_start,
             description: None,
             bindings: Vec::new(),
             binding_history: Vec::new(),
             runtime_snapshot: None,
             last_error: None,
+            integrity_error: None,
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_url: None,

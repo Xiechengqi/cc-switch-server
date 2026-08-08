@@ -70,6 +70,47 @@ pub struct ProxyError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyConcurrencyScope {
+    User,
+    Share,
+    ProviderAccount,
+}
+
+impl ProxyConcurrencyScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Share => "share",
+            Self::ProviderAccount => "provider_account",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "share" => Some(Self::Share),
+            "provider_account" => Some(Self::ProviderAccount),
+            _ => None,
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::User => "cc_switch_user_concurrency_limit_exceeded",
+            Self::Share => "cc_switch_share_concurrency_limit_exceeded",
+            Self::ProviderAccount => "cc_switch_provider_account_concurrency_limit_exceeded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyConcurrencyMetadata {
+    pub scope: ProxyConcurrencyScope,
+    pub current: u32,
+    pub limit: u32,
+}
+
 impl std::fmt::Display for ProxyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
@@ -83,6 +124,8 @@ impl ProxyError {
     const TOOL_JSON_INCOMPLETE_PREFIX: &'static str = "[TOOL_JSON_INCOMPLETE] ";
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
+    const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
+    const USER_IDENTITY_REQUIRED_PREFIX: &'static str = "[CC_USER_IDENTITY_REQUIRED] ";
 
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
@@ -91,17 +134,48 @@ impl ProxyError {
         }
     }
 
-    pub(super) fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
 
-    pub(super) fn conflict(message: impl Into<String>) -> Self {
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::CONFLICT,
             message: message.into(),
+        }
+    }
+
+    pub(super) fn concurrency_limited(
+        scope: ProxyConcurrencyScope,
+        current: u32,
+        limit: u32,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!(
+                "{}{scope}:{current}:{limit}] {}",
+                Self::CONCURRENCY_PREFIX,
+                message.into(),
+                scope = scope.as_str(),
+            ),
+        }
+    }
+
+    pub(super) fn user_identity_required(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            message: format!("{}{}", Self::USER_IDENTITY_REQUIRED_PREFIX, message.into()),
         }
     }
 
@@ -138,11 +212,15 @@ impl ProxyError {
     }
 
     pub fn client_message(&self) -> &str {
-        let message = self.message_without_retry_metadata();
+        let message = self
+            .concurrency_metadata_and_message()
+            .map(|(_, message)| message)
+            .unwrap_or_else(|| self.message_without_retry_metadata());
         message
             .strip_prefix(Self::TOOL_JSON_INVALID_PREFIX)
             .or_else(|| message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
+            .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
             .unwrap_or(message)
     }
 
@@ -150,6 +228,38 @@ impl ProxyError {
         let encoded = self.message.strip_prefix(Self::RETRY_AFTER_PREFIX)?;
         let (seconds, _) = encoded.split_once(']')?;
         seconds.parse::<u64>().ok()
+    }
+
+    pub fn concurrency_metadata(&self) -> Option<ProxyConcurrencyMetadata> {
+        self.concurrency_metadata_and_message()
+            .map(|(metadata, _)| metadata)
+    }
+
+    pub fn error_scope(&self) -> Option<&'static str> {
+        self.concurrency_metadata()
+            .map(|metadata| metadata.scope.as_str())
+    }
+
+    fn concurrency_metadata_and_message(&self) -> Option<(ProxyConcurrencyMetadata, &str)> {
+        let encoded = self
+            .message_without_retry_metadata()
+            .strip_prefix(Self::CONCURRENCY_PREFIX)?;
+        let (metadata, message) = encoded.split_once("] ")?;
+        let mut parts = metadata.split(':');
+        let scope = ProxyConcurrencyScope::from_str(parts.next()?)?;
+        let current = parts.next()?.parse().ok()?;
+        let limit = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((
+            ProxyConcurrencyMetadata {
+                scope,
+                current,
+                limit,
+            },
+            message,
+        ))
     }
 
     fn message_without_retry_metadata(&self) -> &str {
@@ -161,6 +271,12 @@ impl ProxyError {
 
     pub fn error_code(&self) -> &'static str {
         let message = self.message_without_retry_metadata();
+        if let Some(metadata) = self.concurrency_metadata() {
+            return metadata.scope.error_code();
+        }
+        if message.starts_with(Self::USER_IDENTITY_REQUIRED_PREFIX) {
+            return "cc_switch_user_identity_required";
+        }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX) {
             return "TOOL_JSON_INVALID";
         }
@@ -190,6 +306,9 @@ impl ProxyError {
 
     pub fn error_type(&self) -> &'static str {
         let message = self.message_without_retry_metadata();
+        if self.concurrency_metadata().is_some() {
+            return "concurrency_limit_error";
+        }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
             || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
         {
@@ -213,6 +332,11 @@ impl ProxyError {
 
     pub fn retryable(&self) -> bool {
         let message = self.message_without_retry_metadata();
+        if self.concurrency_metadata().is_some()
+            || message.starts_with(Self::USER_IDENTITY_REQUIRED_PREFIX)
+        {
+            return false;
+        }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
             || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
         {

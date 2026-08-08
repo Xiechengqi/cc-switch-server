@@ -418,7 +418,9 @@ export function buildOmoProfilePreview(
         result[k] = v;
       }
     }
-  } catch {}
+  } catch (error) {
+    console.warn("[OMO] Ignoring invalid preview-only extra fields", error);
+  }
 
   return result;
 }

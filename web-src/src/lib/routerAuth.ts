@@ -2,11 +2,9 @@ const AUTH_KEY = "cc_switch_router_auth_v2";
 const PROTOCOL_EPOCH = "namespace-flat-1";
 const AUTH_DEVICE_IDENTITY_LOCK_NAME =
   "cc-switch-server-auth-device-identity-v1";
-const SERVER_PASSWORD_KEY = "cc_switch_server_password";
 export const SERVER_AUTH_EXPIRED_EVENT = "cc-switch-server-auth-expired";
 
 let refreshInFlight: { promise: Promise<boolean> | null } = { promise: null };
-let reloginInFlight: { promise: Promise<boolean> | null } = { promise: null };
 let authDeviceIdentityInitialization: Promise<AuthDeviceIdentity> | null = null;
 let authExpiryNotified = false;
 
@@ -382,30 +380,6 @@ async function signAuthPayloadWithIdentity(
   };
 }
 
-function readCachedServerPassword(): string | null {
-  return localStorage.getItem(SERVER_PASSWORD_KEY);
-}
-
-async function reloginWithCachedWebPassword(): Promise<boolean> {
-  if (reloginInFlight.promise) {
-    return reloginInFlight.promise;
-  }
-  reloginInFlight.promise = (async () => {
-    const password = readCachedServerPassword();
-    if (!password) return false;
-    try {
-      await loginWithWebPassword(password);
-      return true;
-    } catch {
-      localStorage.removeItem(SERVER_PASSWORD_KEY);
-      return false;
-    } finally {
-      reloginInFlight.promise = null;
-    }
-  })();
-  return reloginInFlight.promise;
-}
-
 function authBearerHeaders(): Record<string, string> {
   const state = readAuthState();
   if (state.authProvider === "apiToken") {
@@ -451,8 +425,7 @@ async function refreshAccessToken(): Promise<boolean> {
             refreshToken: state.refreshToken,
           }),
         });
-        if (await applyPasswordAuthResponse(response)) return true;
-        return reloginWithCachedWebPassword();
+        return applyPasswordAuthResponse(response);
       }
       const response = await fetch("/v1/auth/session/refresh", {
         method: "POST",
@@ -469,8 +442,7 @@ async function refreshAccessToken(): Promise<boolean> {
           refreshToken: state.refreshToken,
         }),
       });
-      if (await applyRefreshResponse(clientWebResponse)) return true;
-      return reloginWithCachedWebPassword();
+      return applyRefreshResponse(clientWebResponse);
     } finally {
       refreshInFlight.promise = null;
     }
@@ -568,9 +540,6 @@ export async function routerAuthFetch(
 ): Promise<Response> {
   let response = await fetchWithAuth(input, init);
   if (response.status === 401 && (await refreshAccessToken())) {
-    response = await fetchWithAuth(input, init);
-  }
-  if (response.status === 401 && (await reloginWithCachedWebPassword())) {
     response = await fetchWithAuth(input, init);
   }
   if (response.status === 401) {

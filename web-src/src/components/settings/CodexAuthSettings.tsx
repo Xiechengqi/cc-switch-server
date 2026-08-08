@@ -134,7 +134,7 @@ export function CodexAuthSettings({
         }
         checkboxDefaultChecked
         confirmText={t("confirm.unifyCodexHistoryOff.confirm")}
-        onConfirm={(restoreBackup) => void handleDisableConfirm(restoreBackup)}
+        onConfirm={handleDisableConfirm}
         onCancel={() => setShowDisableConfirm(false)}
       />
     </section>

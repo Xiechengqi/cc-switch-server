@@ -10,9 +10,35 @@ import serverJa from "./server-locales/ja.json";
 import serverZh from "./server-locales/zh.json";
 import serverZhTW from "./server-locales/zh-TW.json";
 
-type Language = "zh" | "zh-TW" | "en" | "ja";
+export type Language = "zh" | "zh-TW" | "en" | "ja";
 
-const DEFAULT_LANGUAGE: Language = "zh";
+const DEFAULT_LANGUAGE: Language = "en";
+
+export function normalizeLanguage(value?: string): Language {
+  const normalized = value?.trim().replace(/_/g, "-").toLowerCase();
+  if (!normalized) return DEFAULT_LANGUAGE;
+  if (normalized === "zh") return "zh";
+  if (
+    normalized === "zh-tw" ||
+    normalized === "zh-hk" ||
+    normalized === "zh-mo" ||
+    normalized === "zh-hant" ||
+    normalized.startsWith("zh-hant-")
+  ) {
+    return "zh-TW";
+  }
+  if (
+    normalized === "zh-cn" ||
+    normalized === "zh-sg" ||
+    normalized === "zh-hans" ||
+    normalized.startsWith("zh-hans-")
+  ) {
+    return "zh";
+  }
+  if (normalized === "ja" || normalized.startsWith("ja-")) return "ja";
+  if (normalized === "en" || normalized.startsWith("en-")) return "en";
+  return DEFAULT_LANGUAGE;
+}
 
 const getInitialLanguage = (): Language => {
   if (typeof window !== "undefined") {
@@ -37,32 +63,7 @@ const getInitialLanguage = (): Language => {
         navigator.languages?.[0]?.toLowerCase())
       : undefined;
 
-  if (navigatorLang === "zh") {
-    return "zh";
-  }
-
-  if (
-    navigatorLang?.startsWith("zh-tw") ||
-    navigatorLang?.startsWith("zh-hk") ||
-    navigatorLang?.startsWith("zh-mo") ||
-    navigatorLang?.startsWith("zh-hant")
-  ) {
-    return "zh-TW";
-  }
-
-  if (navigatorLang?.startsWith("zh")) {
-    return "zh";
-  }
-
-  if (navigatorLang?.startsWith("ja")) {
-    return "ja";
-  }
-
-  if (navigatorLang?.startsWith("en")) {
-    return "en";
-  }
-
-  return DEFAULT_LANGUAGE;
+  return normalizeLanguage(navigatorLang);
 };
 
 const ACCOUNT_TRANSLATION_NAMESPACES = [

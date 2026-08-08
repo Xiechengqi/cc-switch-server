@@ -338,6 +338,7 @@ export function ProviderShareSection({
     setTokenLimitInput(formatShareLimitInput(share?.tokenLimit));
     setParallelLimitInput(formatShareLimitInput(share?.parallelLimit));
     const officialPricePercent =
+      share?.officialPricePercent ??
       share?.forSaleOfficialPricePercentByApp?.[shareableApp];
     setOfficialPricePercentInput(
       Number.isInteger(officialPricePercent)
@@ -641,6 +642,11 @@ export function ProviderShareSection({
       marketAccessMode: aclPayload.marketAccessMode,
       accessByApp: aclPayload.accessByApp,
       appSettings: aclPayload.appSettings,
+      forSaleOfficialPricePercentByApp: salePricingPayload,
+      officialPricePercent:
+        salePricingEligible && officialPricePercentInput !== ""
+          ? Number(officialPricePercentInput)
+          : null,
       userGrants: payloadUserGrants,
     });
     return created;
@@ -732,6 +738,10 @@ export function ProviderShareSection({
       accessByApp: aclPayload.accessByApp,
       appSettings: aclPayload.appSettings,
       forSaleOfficialPricePercentByApp: salePricingPayload,
+      officialPricePercent:
+        salePricingEligible && officialPricePercentInput !== ""
+          ? Number(officialPricePercentInput)
+          : null,
       tokenLimit,
       parallelLimit,
       expiresAt: nextExpiresAt,

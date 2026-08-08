@@ -1,11 +1,11 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
+import { useTranslation } from "react-i18next";
 
 import { AuthLanguageSwitcher } from "@/components/AuthLanguageSwitcher";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SecretInput } from "@/server/ui/SecretInput";
-import { useI18n } from "@/lib/i18n";
 import {
   clearRouterSessionTokens,
   getWebAuthMethods,
@@ -16,7 +16,7 @@ import {
   verifyRouterEmailCode,
   type WebAuthMethods,
 } from "@/lib/routerAuth";
-import { writeCachedPassword, type WebRuntimeContext } from "@/lib/runtime";
+import { type WebRuntimeContext } from "@/lib/runtime";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 type LoginMode = "email" | "token" | "password" | "setup";
@@ -29,7 +29,7 @@ export function ClientWebLoginPage({
 }: {
   onAuthenticated: () => Promise<WebRuntimeContext>;
 }) {
-  const { t } = useI18n();
+  const { t } = useTranslation();
   const [authMethods, setAuthMethods] = useState<WebAuthMethods | null>(null);
   const [mode, setMode] = useState<LoginMode>("password");
   const [code, setCode] = useState("");
@@ -131,7 +131,6 @@ export function ClientWebLoginPage({
     setError("");
     try {
       await loginWithWebPassword(password);
-      writeCachedPassword(password);
       await finishAuth();
       toast.success(t("server.auth.clientWeb.loggedInWithPassword"));
     } catch (err) {
@@ -148,7 +147,6 @@ export function ClientWebLoginPage({
     setError("");
     try {
       await setupWebPassword(setupPasswordValue);
-      writeCachedPassword(setupPasswordValue);
       await finishAuth();
       toast.success(t("server.auth.clientWeb.passwordSet"));
     } catch (err) {

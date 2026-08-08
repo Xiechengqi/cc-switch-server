@@ -2,12 +2,70 @@
   "common": {
     "copied": "已複製"
   },
+  "server": {
+    "common": {
+      "server": "Server",
+      "runtime": "執行環境",
+      "setup": "初始化",
+      "login": "登入",
+      "password": "密碼"
+    },
+    "auth": {
+      "ownerEmail": "Owner 信箱",
+      "clientSubdomain": "Client 子網域",
+      "loginTitle": "登入管理控制台",
+      "setupTitle": "初始化 Server",
+      "loginSubtitlePasswordOnly": "使用 Web 密碼登入。",
+      "setupSubtitle": "設定 Owner 信箱、Router、Client 子網域與管理員密碼。Client 子網域初始化後不可修改。",
+      "methodPassword": "密碼",
+      "methodEmail": "信箱驗證碼",
+      "methodApiToken": "API Token",
+      "apiToken": "API Token",
+      "apiTokenHint": "使用初始化或設定頁簽發的 API Token 登入。",
+      "emailLoginHint": "驗證碼由 Router 發送到已設定的 Owner 信箱。",
+      "codeSentTo": "驗證碼已發送至 {{destination}}",
+      "resendIn": "{{seconds}} 秒後可重發",
+      "clientSubdomainAuto": "留空時自動生成",
+      "clientSubdomainAvailable": "子網域可用",
+      "clientSubdomainTaken": "子網域已被佔用，請更換或隨機生成。",
+      "generateSubdomain": "隨機生成子網域",
+      "generateSubdomainFailed": "隨機生成子網域失敗",
+      "routerUnreachableForSubdomain": "Router 不可達，無法隨機生成子網域",
+      "subdomainUnchecked": "未能驗證子網域是否可用，提交時可能衝突",
+      "setupClaimPending": "Router client 註冊狀態：{{status}}。請檢查 Router 連線後重試。",
+      "clientWeb": {
+        "loginTitle": "Client Web 登入",
+        "setupTitle": "設定 Web 密碼",
+        "setupSubtitle": "首次存取需要設定 Web 管理密碼。",
+        "webPassword": "Web 密碼",
+        "setupPasswordPlaceholder": "設定 Web 密碼",
+        "setupAndLogin": "設定並登入",
+        "login": "登入",
+        "verificationCode": "驗證碼",
+        "sendCode": "發送驗證碼",
+        "verifyAndLogin": "驗證並登入",
+        "unauthorizedCredential": "登入憑證無權存取目前 client",
+        "codeSent": "驗證碼已發送",
+        "loggedIn": "已登入 client",
+        "loggedInWithToken": "已使用 API token 登入 client",
+        "loggedInWithPassword": "已使用 Web 密碼登入",
+        "passwordSet": "Web 密碼已設定"
+      }
+    },
+    "settings": {
+      "verificationCode": "驗證碼",
+      "requestCode": "請求驗證碼",
+      "verify": "驗證"
+    }
+  },
   "providers": {
     "addProvider": "新增供應商"
   },
   "providerBundle": {
     "account": "OAuth 帳號",
     "advancedSettings": "進階設定 JSON",
+    "apiUrlUnavailable": "尚未設定 API 位址",
+    "authHeader": "API Key Header 名稱",
     "basic": "基本資訊",
     "count": "{{count}} 個供應商節點",
     "create": "新增供應商",
@@ -18,17 +76,24 @@
     "deleted": "供應商已刪除",
     "driverOptions": "驅動程式選項",
     "edit": "編輯供應商",
+    "effectiveConfig": "有效執行設定",
     "family": "供應商類型",
+    "firstByteTimeout": "首位元組逾時（毫秒）",
     "modelPassthrough": "模型透傳",
     "modelSingle": "固定上游模型",
+    "queryParameter": "API Key 查詢參數名稱",
+    "requestTimeout": "請求逾時（毫秒）",
     "saved": "供應商已儲存",
     "selectAccount": "選擇 OAuth 帳號",
     "surfaceCredential": "驗證憑證",
     "surfaceEnabled": "啟用 API",
     "surfaces": "應用介面",
+    "streamIdleTimeout": "串流閒置逾時（毫秒）",
+    "testModel": "測試模型",
     "title": "供應商"
   },
   "provider": {
+    "clickToClearCurrent": "點擊即可停用",
     "share": {
       "sectionTitle": "遠端分享",
       "addPageBadge": "儲存後可用",
@@ -43,8 +108,18 @@
       "sectionHint": "每個 Provider 對應一個 Share。在此設定分享參數；Router Console 可管理進階營運選項。",
       "openRouterConsole": "開啟 Router Console",
       "disabledHint": "啟用後可設定遠端分享參數並建立 Share。",
+      "description": "描述",
+      "expiry": "有效期",
+      "forSale": "存取模式",
+      "free": "免費",
+      "market": "市場",
+      "parallelLimit": "並行上限",
+      "private": "私人",
       "routerSyncFailed": "Router 同步失敗：{{error}}",
       "routerSyncPending": "正在同步至 Router",
+      "sharedWith": "授權信箱",
+      "subdomain": "分享子網域",
+      "tokenLimit": "Token 上限",
       "ownerRequired": "請先在分享設定頁設定 Client Tunnel Owner 信箱"
     },
     "form": {
@@ -62,6 +137,9 @@
     },
     "market": {
       "allSelected": "已選取所有 Market"
+    },
+    "tunnel": {
+      "region": "區域"
     },
     "permanent": "永久",
     "expiration": "到期",
@@ -99,6 +177,11 @@
   "codexConfig": {
     "noCommonConfigToApply": "通用設定片段為空或沒有可寫入的內容"
   },
+  "serverProviderForm": {
+    "endpoint": {
+      "url": "上游 API 位址"
+    }
+  },
   "claudeDesktop": {
     "route": {
       "stopBlockedByTakeover": "其他應用程式正在使用代理接管。請先在設定中關閉對應應用程式的接管，再停止本機路由。"
@@ -121,6 +204,12 @@
   "settings": {
     "loadFailed": "無法載入設定，請重新整理頁面後再試。",
     "selectFileFailed": "選擇目錄失敗",
+    "unsavedChanges": {
+      "title": "放棄未儲存的設定？",
+      "message": "進階設定中有未儲存的變更，離開後這些變更將會遺失。",
+      "discard": "放棄變更",
+      "keepEditing": "繼續編輯"
+    },
     "authCenter": {
       "serverDescription": "管理供應商節點及其應用介面使用的官方 OAuth 帳號。",
       "claudeOauthDescription": "管理 Claude 官方訂閱帳號",
@@ -132,6 +221,9 @@
       "deepseekAccountDescription": "管理 DeepSeek 帳號"
     },
     "advanced": {
+      "apiManagement": {
+        "revokeTokenConfirm": "撤銷後，目前的偵錯權杖將立即失效。"
+      },
       "proxy": {
         "title": "Router Share 路由",
         "description": "查看 Router Share ingress 狀態和可路由的 Bundle Surface",

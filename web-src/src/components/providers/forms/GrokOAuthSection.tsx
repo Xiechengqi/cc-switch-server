@@ -95,7 +95,9 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
         removeAccount: removeAccountAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const handleLogout = async () => {
@@ -104,7 +106,9 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
         logout: logoutAsync,
         onAccountSelect,
       });
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const copyVerificationUrl = async () => {
@@ -139,7 +143,9 @@ export const GrokOAuthSection: React.FC<GrokOAuthSectionProps> = ({
           defaultValue: "Grok 账号已登录",
         }),
       );
-    } catch {}
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const importAuthJson = async () => {

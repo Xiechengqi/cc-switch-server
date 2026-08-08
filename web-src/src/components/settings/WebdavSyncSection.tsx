@@ -1859,7 +1859,7 @@ export function WebdavSyncSection({
         title={t("confirm.autoSync.title")}
         message={t("confirm.autoSync.message")}
         confirmText={t("confirm.autoSync.confirm")}
-        onConfirm={() => void handleAutoSyncConfirm()}
+        onConfirm={handleAutoSyncConfirm}
         onCancel={() => setShowAutoSyncConfirm(false)}
       />
     </section>

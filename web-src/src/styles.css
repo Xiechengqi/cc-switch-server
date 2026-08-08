@@ -352,8 +352,8 @@ to{
   color: hsl(var(--foreground));
   font-size: 1rem;
 }.readiness-flag.active{
-  background: hsl(151 48% 93%);
-  color: hsl(var(--success));
+  background: hsl(var(--success) / 0.14);
+  color: hsl(var(--foreground));
 }.icon-button.danger{
   color: hsl(var(--danger));
 }.auth-readiness-card header span:not(.status-pill){
