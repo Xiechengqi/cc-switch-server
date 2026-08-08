@@ -157,6 +157,10 @@ pub(crate) async fn control_apply_share_settings(
         Some(&accounts),
         Some(&usage),
     );
+    let config = state.config.read().await;
+    let descriptor =
+        crate::clients::router::client::canonicalize_share_descriptor(&config, descriptor)
+            .map_err(ApiError::internal)?;
     Ok(Json(ControlApplyShareSettingsResponse {
         ok: true,
         share: descriptor,

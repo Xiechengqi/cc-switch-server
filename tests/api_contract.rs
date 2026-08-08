@@ -620,6 +620,7 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
         private_key: "private-key".to_string(),
         control_secret: Some("control-secret".to_string()),
     });
+    config.client.tunnel_subdomain = Some("client-alpha".to_string());
     state.replace_config(config).await.unwrap();
     upsert_test_provider(
         &state,
@@ -634,15 +635,21 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
         },
     )
     .await;
-    state
+    let share = state
         .mutate_shares_immediate(|store| {
-            let _ = store.upsert(test_share_input("share-ctl", "p-ctl", ProviderType::Codex));
+            store
+                .upsert(test_share_input("share-ctl", "p-ctl", ProviderType::Codex))
+                .unwrap()
         })
         .await
         .unwrap();
+    let expected_subdomain = format!(
+        "{}--client-alpha",
+        share.tunnel_subdomain.as_deref().unwrap()
+    );
     let app = app_router(state);
     let body = serde_json::to_vec(&json!({
-        "shareId": "share-ctl",
+        "shareId": share.id,
         "patch": {"description": "updated by control"}
     }))
     .unwrap();
@@ -670,6 +677,8 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert_eq!(response["share"]["subdomain"], expected_subdomain);
 
     let response = app
         .oneshot(control_request(
@@ -769,6 +778,7 @@ async fn control_apply_share_settings_accepts_router_share_market_managed_grant(
         private_key: "private-key".to_string(),
         control_secret: Some("control-secret".to_string()),
     });
+    config.client.tunnel_subdomain = Some("client-alpha".to_string());
     state.replace_config(config).await.unwrap();
     let share = state
         .mutate_shares_immediate(|store| {
