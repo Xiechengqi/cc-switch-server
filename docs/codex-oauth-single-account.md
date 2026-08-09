@@ -56,8 +56,21 @@ Content-Type: application/json
 - 同 subject 重新登录复用稳定派生的本地账号 ID；refresh 返回不同 subject 时 fail closed。
 - authorize、token、quota、models、alpha search、inference、Images 和 WebSocket endpoint 固定为经审计的 OpenAI/ChatGPT 生产 origin，Provider 配置不能把 OAuth 凭据导向自定义 host。
 - Server 不自动读取或写入宿主机用户的 `~/.codex/auth.json`。
+- Codex CLI identity 的显式环境变量优先级最高；否则使用成功同步的原子缓存或内置 `0.144.1`，且绝不降到内置版本以下。后台只接受 OpenAI Codex GitHub latest release 中严格的三段稳定 semver，网络失败不阻断启动。
 
 账号 token 使用共享的加密 `accounts.json` 持久化。控制面只返回凭据存在性、脱敏身份、状态和 quota，不返回 access token、refresh token、ID token、extra headers、profile 或 raw 上游载荷。
+
+## Referral Provider 控制面
+
+邀请能力位于 OpenAI OAuth Provider 配置页，不属于 Share 推理数据面。管理员调用 eligibility、send 或 tracking 时必须提交 Provider id 和当前 expected revision；Server 只解析该 Provider/Bundle 已提交的唯一 Codex OAuth 账号、身份代际和 verified workspace。
+
+- 固定访问 ChatGPT consumer referral endpoint，默认 program/entrypoint 为 `codex_referral_consumer` / `persistent`。
+- eligibility 返回的 offer、grant、发送/奖励容量、规则和确认要求是唯一权益依据；UI 不把“邀请必得 1000 credits”写成固定承诺。
+- 每次最多发送 10 个规范化且去重的邮箱；响应体上限 1 MiB，并区分业务 403 与 Cloudflare HTML challenge。
+- cookie client 按 Provider 绑定身份、identity generation 和 workspace 隔离且有界复用，不能跨账号共享。
+- 首次 401 只强刷同一 Provider 账号并重读同一 expected revision 后重试一次；Provider 已变更、账号代际变化或 workspace 变化时直接冲突。
+
+Referral 不读取账号中心 active account，不遍历账号，也不会创建 Share 或改变 Share binding。
 
 ## Provider 与账号固定
 
@@ -72,6 +85,31 @@ Content-Type: application/json
 Share 不存在、没有 Codex binding、Surface 已禁用、绑定过期、账号需要重登、处于 cooldown、quota 耗尽或并发饱和时，请求直接失败。系统不会查询另一个 Codex Provider 或账号。账号中心是否选择 active account 不影响该判定。
 
 models manifest、alpha search、Provider 网络测试、模型发现、Images、HTTP、SSE、WebSocket 和 WS 到 HTTP fallback 使用同一 Bundle 绑定账号规则。账号中心 quota refresh 可独立使用 active account；credential persistence degraded 时，需要 OAuth 凭据的出站操作在网络前返回 `503`。
+
+## Share 执行策略
+
+OpenAI OAuth 的消耗策略保存在 Share，而不是账号池或全局调度器中。Bundle Share 和单 Provider Share 都可独立配置：
+
+- `allowPersonalCredits`：正常 Codex 使用窗口耗尽时，仅当固定账号存在可用 personal credits 且未达到 overage limit，当前 Share 才继续可用。其他 Share 不继承该开关。
+- `autoConsumeBankedReset`：当前 Share 的固定账号存在 fresh、workspace 精确匹配、`available`、`codex_rate_limits` 且带真实 credit id 的临期券时，才允许自动消费。
+- `bankedResetExpiryLeadMinutes`：临期窗口为 10 到 10080 分钟，默认 60；候选按最早到期选择。
+- `previousResponseCacheEnabled`：只为当前 Share 和签名用户展开可重放的工具上下文。
+
+自动 Reset 在 quota 阻断判定前运行，但不会扫描账号。不可逆消费前会重读 Share revision/policy、Codex binding、RuntimePlan fingerprint、账号 identity generation、verified workspace 和候选 credit。手动与自动路径共用账号进程锁及 `<config-dir>/.codex-banked-reset-locks/` 文件锁；自动请求 ID 由 Share/runtime/workspace/credit 稳定派生，手动请求则在锁内只生成一次随机 ID，两者在 401 refresh 后都复用原 ID，成功后强制刷新同一账号 quota。任一重读不一致都停止消费，不尝试其他账号。
+
+模型容量类 429 只为当前 Share 的 `(share, runtime fingerprint, lowercase model)` 写入五分钟 cooldown；明确 `usage_limit_reached` 或已耗尽的 Codex window 仍标记固定账号级 cooldown。模型 cooldown 不切模型，账号 cooldown 不换号，两者都不触发 Provider failover。
+
+## Previous Response 续传
+
+OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share 显式开启续传缓存后，Server 会在最终 body 清洗前尝试展开本地上下文，并在成功 `response.completed` 后记录下一轮所需的工具项：
+
+- namespace 为 Share id、规范化签名 principal、RuntimePlan fingerprint、verified workspace 和 response id；缺 principal 时禁用，不创建匿名共享空间。
+- 只缓存 tool call 和 tool call output，要求非空 `call_id` 并删除上游 server item `id`；message、reasoning、`encrypted_content`、image 和 web-search 内容都不缓存。
+- 当前 input 已有同一 `(type, call_id)` 时不重复注入；cache miss 保持原有清洗/转发行为。
+- HTTP 非流聚合、SSE、WebSocket 和 WS 到 HTTP fallback 共用该语义；只有 completed 写入，failed/incomplete/error 清空当前轮状态。
+- TTL 为 10 分钟；单条最多 8 MiB、200 items，全进程最多 64 MiB、2000 条，并按最近最少使用淘汰。
+
+该缓存只弥补 ChatGPT OAuth `store=false` 下的工具续传，不保存完整对话，也不能跨 Share、用户、runtime、账号 workspace 或重绑后的 Provider 使用。
 
 ## HTTP、SSE 与 Images
 
@@ -177,6 +215,10 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 - WS 只在 `response.create` 成功发送前 transport fallback；发送后的 read/close/首事件超时不重放。
 - overflow compact 默认关闭；开启后仅 HTTP Responses/Chat 和 Responses SSE 重试一次，摘要 usage 独立记录，摘要失败使用省略标记，超大最新 item 与 WebSocket lifecycle 不重放。
 - credential persistence degraded 时 `/ready` 为 503 且所有 Codex OAuth credentialed surface 零上游请求。
+- Referral eligibility/send/tracking 固定 Provider revision、账号和 workspace；reward 数量来自实时 eligibility，首次 401 只刷新该账号，Cloudflare challenge 不误报成无资格。
+- Personal credits、自动 Reset、模型 cooldown 和 previous-response cache 分别按 Share/runtime 执行；切换 Share、用户、workspace、账号代际或 Provider revision 后不得命中旧状态。
+- 自动 Reset 的同一候选在并发请求、进程重启锁竞争和 401 重试下只使用同一幂等 ID，其他账号上游请求数为零。
+- SSE/WS 续传只保留 tool call/call output，failed/incomplete 不写入，缺签名 principal 时始终 cache miss。
 
 真实 OAuth、订阅权限、图片能力和长连接生产可用性仍需要按 [`real-acceptance-runbook.md`](real-acceptance-runbook.md) 使用专用测试账号取证；离线测试不能替代真实上游验收。
 

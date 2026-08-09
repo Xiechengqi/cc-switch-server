@@ -1942,7 +1942,9 @@ fn redact_urls_in_text(value: &str) -> String {
     output
 }
 
-fn map_managed_account_refresh_error(error: crate::state::ManagedAccountRefreshError) -> ApiError {
+pub(in crate::api) fn map_managed_account_refresh_error(
+    error: crate::state::ManagedAccountRefreshError,
+) -> ApiError {
     use crate::state::ManagedAccountRefreshError;
     use axum::http::StatusCode;
     match error {

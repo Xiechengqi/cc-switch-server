@@ -1,6 +1,7 @@
 pub mod credential_source;
 pub mod invariants;
 pub mod model_health;
+pub mod previous_response_cache;
 pub mod router_contract;
 pub mod share_router_domain;
 pub mod shares;

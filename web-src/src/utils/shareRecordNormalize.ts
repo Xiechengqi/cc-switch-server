@@ -255,6 +255,26 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
       ) ?? null,
     routerLastSyncError:
       readString(record, "routerLastSyncError", "router_last_sync_error") ?? null,
+    allowPersonalCredits:
+      readBool(record, "allowPersonalCredits", "allow_personal_credits") ?? false,
+    autoConsumeBankedReset:
+      readBool(
+        record,
+        "autoConsumeBankedReset",
+        "auto_consume_banked_reset",
+      ) ?? false,
+    bankedResetExpiryLeadMinutes:
+      readNumber(
+        record,
+        "bankedResetExpiryLeadMinutes",
+        "banked_reset_expiry_lead_minutes",
+      ) ?? 60,
+    previousResponseCacheEnabled:
+      readBool(
+        record,
+        "previousResponseCacheEnabled",
+        "previous_response_cache_enabled",
+      ) ?? false,
     userGrants:
       (record.userGrants as ShareRecord["userGrants"]) ??
       (record.user_grants as ShareRecord["userGrants"]) ??

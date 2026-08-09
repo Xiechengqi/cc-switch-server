@@ -30,6 +30,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ProviderShareReuseDialog } from "@/components/providers/ProviderShareReuseDialog";
+import { CodexShareExecutionPolicyFields } from "@/components/providers/forms/CodexShareExecutionPolicyFields";
 import { shareApi } from "@/lib/api/share";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
@@ -124,6 +125,7 @@ interface ProviderShareSectionProps {
   providerName: string;
   onOpenShareSettings?: () => void;
   onDirtyChange?: (dirty: boolean) => void;
+  showCodexExecutionPolicy?: boolean;
 }
 
 function shareStateLabel(
@@ -164,6 +166,7 @@ export function ProviderShareSection({
   providerName,
   onOpenShareSettings,
   onDirtyChange,
+  showCodexExecutionPolicy = false,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
   const { share, state } = useProviderShare(appId, providerId);
@@ -218,6 +221,12 @@ export function ProviderShareSection({
     String(permanentExpiresInSecs()),
   );
   const [isPermanent, setIsPermanent] = useState(true);
+  const [allowPersonalCredits, setAllowPersonalCredits] = useState(false);
+  const [autoConsumeBankedReset, setAutoConsumeBankedReset] = useState(false);
+  const [bankedResetExpiryLeadMinutes, setBankedResetExpiryLeadMinutes] =
+    useState("60");
+  const [previousResponseCacheEnabled, setPreviousResponseCacheEnabled] =
+    useState(false);
 
   const subdomainManualRef = useRef(false);
   const shareInitRef = useRef<string | null>(null);
@@ -275,6 +284,14 @@ export function ProviderShareSection({
     setForSaleValue(share?.forSale ?? "Yes");
     setMarketAccessMode(share?.marketAccessMode ?? "all");
     setSubdomainInput(share?.shareSlug?.trim() ?? "");
+    setAllowPersonalCredits(share?.allowPersonalCredits ?? false);
+    setAutoConsumeBankedReset(share?.autoConsumeBankedReset ?? false);
+    setBankedResetExpiryLeadMinutes(
+      String(share?.bankedResetExpiryLeadMinutes ?? 60),
+    );
+    setPreviousResponseCacheEnabled(
+      share?.previousResponseCacheEnabled ?? false,
+    );
     subdomainManualRef.current = Boolean(share?.shareSlug?.trim());
 
     const appAccess = share?.accessByApp?.[shareableApp];
@@ -418,6 +435,10 @@ export function ProviderShareSection({
         : isPermanent
           ? { permanent: true }
           : { permanent: false, seconds: expiresInSecsInput.trim() },
+    allowPersonalCredits,
+    autoConsumeBankedReset,
+    bankedResetExpiryLeadMinutes,
+    previousResponseCacheEnabled,
   });
   const shareDraftFingerprintRef = useRef(shareDraftFingerprint);
   shareDraftFingerprintRef.current = shareDraftFingerprint;
@@ -488,6 +509,10 @@ export function ProviderShareSection({
     parallelLimitInput.trim()
       ? Number(parallelLimitInput)
       : UNLIMITED_PARALLEL_LIMIT;
+  const resolveBankedResetLeadMinutes = () =>
+    Number(bankedResetExpiryLeadMinutes);
+  const bankedResetLeadIsValid = (value: number) =>
+    Number.isSafeInteger(value) && value >= 10 && value <= 10080;
 
   const resolveTokenLimitForSave = () => {
     if (!tokenLimitTouchedRef.current && share) {
@@ -610,10 +635,15 @@ export function ProviderShareSection({
 
     const tokenLimit = resolveTokenLimitForSave();
     const parallelLimit = resolveParallelLimitForSave();
+    const resetLeadMinutes = resolveBankedResetLeadMinutes();
     if (Number.isNaN(tokenLimit) || Number.isNaN(parallelLimit)) {
       toast.error(
         t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
       );
+      return;
+    }
+    if (!bankedResetLeadIsValid(resetLeadMinutes)) {
+      toast.error(t("codexSharePolicy.resetLeadInvalid"));
       return;
     }
 
@@ -647,6 +677,10 @@ export function ProviderShareSection({
         salePricingEligible && officialPricePercentInput !== ""
           ? Number(officialPricePercentInput)
           : null,
+      allowPersonalCredits,
+      autoConsumeBankedReset,
+      bankedResetExpiryLeadMinutes: resetLeadMinutes,
+      previousResponseCacheEnabled,
       userGrants: payloadUserGrants,
     });
     return created;
@@ -713,10 +747,15 @@ export function ProviderShareSection({
 
     const tokenLimit = resolveTokenLimitForSave();
     const parallelLimit = resolveParallelLimitForSave();
+    const resetLeadMinutes = resolveBankedResetLeadMinutes();
     if (Number.isNaN(tokenLimit) || Number.isNaN(parallelLimit)) {
       toast.error(
         t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
       );
+      return false;
+    }
+    if (!bankedResetLeadIsValid(resetLeadMinutes)) {
+      toast.error(t("codexSharePolicy.resetLeadInvalid"));
       return false;
     }
 
@@ -745,6 +784,10 @@ export function ProviderShareSection({
       tokenLimit,
       parallelLimit,
       expiresAt: nextExpiresAt,
+      allowPersonalCredits,
+      autoConsumeBankedReset,
+      bankedResetExpiryLeadMinutes: resetLeadMinutes,
+      previousResponseCacheEnabled,
       userGrants: payloadUserGrants,
     });
     setShareDraftBaseline({
@@ -1237,6 +1280,34 @@ export function ProviderShareSection({
                     </Button>
                   </div>
                 </div>
+
+                {showCodexExecutionPolicy ? (
+                  <CodexShareExecutionPolicyFields
+                    allowPersonalCredits={allowPersonalCredits}
+                    autoConsumeBankedReset={autoConsumeBankedReset}
+                    bankedResetExpiryLeadMinutes={bankedResetExpiryLeadMinutes}
+                    previousResponseCacheEnabled={
+                      previousResponseCacheEnabled
+                    }
+                    disabled={busy}
+                    onAllowPersonalCreditsChange={(checked) => {
+                      setAllowPersonalCredits(checked);
+                      markShareDraftChanged();
+                    }}
+                    onAutoConsumeBankedResetChange={(checked) => {
+                      setAutoConsumeBankedReset(checked);
+                      markShareDraftChanged();
+                    }}
+                    onBankedResetExpiryLeadMinutesChange={(value) => {
+                      setBankedResetExpiryLeadMinutes(value);
+                      markShareDraftChanged();
+                    }}
+                    onPreviousResponseCacheEnabledChange={(checked) => {
+                      setPreviousResponseCacheEnabled(checked);
+                      markShareDraftChanged();
+                    }}
+                  />
+                ) : null}
 
                 <div className="space-y-2 md:col-span-2">
                   <Label htmlFor="provider-share-expires">

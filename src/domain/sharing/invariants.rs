@@ -163,6 +163,20 @@ fn canonical_price(pricing: &BTreeMap<AppKind, u16>) -> Result<Option<u16>, Shar
 pub fn validate_and_normalize_upsert_input(
     input: &mut UpsertShareInput,
 ) -> Result<ShareBinding, SharePatchError> {
+    if input
+        .banked_reset_expiry_lead_minutes
+        .is_some_and(|minutes| {
+            !(crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES
+                ..=crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES)
+                .contains(&minutes)
+        })
+    {
+        return Err(SharePatchError::Invalid(format!(
+            "bankedResetExpiryLeadMinutes must be between {} and {}",
+            crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES
+        )));
+    }
     let app = input.app;
     if input.bindings.is_empty() {
         input.bindings.push(ShareBinding {
@@ -309,6 +323,16 @@ pub fn validate_share_import(share: &Share) -> Result<(), SharePatchError> {
         return Err(SharePatchError::Invalid(
             "share official price percent requires forSale=Yes".into(),
         ));
+    }
+    if !(crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES
+        ..=crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES)
+        .contains(&share.banked_reset_expiry_lead_minutes)
+    {
+        return Err(SharePatchError::Invalid(format!(
+            "bankedResetExpiryLeadMinutes must be between {} and {}",
+            crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES
+        )));
     }
     Ok(())
 }

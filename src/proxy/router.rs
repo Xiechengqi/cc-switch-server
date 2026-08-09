@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::domain::accounts::store::{active_account_usage_block, AccountStore, AccountUsageBlock};
+use crate::domain::accounts::store::{
+    active_account_usage_block, active_account_usage_block_for_share, AccountStore,
+    AccountUsageBlock,
+};
 #[cfg(test)]
 use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::model::{AppKind, ProviderType};
@@ -334,23 +337,45 @@ pub(super) fn ensure_provider_account_usage_available(
     accounts: &AccountStore,
     now_ms: u128,
 ) -> Result<(), ProxyError> {
-    if let Some(block) = provider_account_usage_block(provider, accounts, now_ms) {
-        let retry_after_seconds = u64::try_from(block.until_ms.saturating_sub(now_ms as i64))
-            .unwrap_or(u64::MAX)
-            .saturating_add(999)
-            / 1_000;
-        return Err(ProxyError::rate_limited(
-            format!(
-                "provider {} account is {}: {} until {}",
-                provider.provider.id,
-                block.kind.availability(),
-                block.reason,
-                block.until_ms,
-            ),
-            retry_after_seconds.max(1),
-        ));
+    if let Some(block) = provider_account_usage_block(provider, accounts, now_ms, false) {
+        return Err(provider_account_usage_error(provider, now_ms, block));
     }
     Ok(())
+}
+
+pub(super) fn ensure_provider_account_usage_available_for_share(
+    provider: &StoredProvider,
+    accounts: &AccountStore,
+    share: &crate::domain::sharing::shares::Share,
+    now_ms: u128,
+) -> Result<(), ProxyError> {
+    if let Some(block) =
+        provider_account_usage_block(provider, accounts, now_ms, share.allow_personal_credits)
+    {
+        return Err(provider_account_usage_error(provider, now_ms, block));
+    }
+    Ok(())
+}
+
+fn provider_account_usage_error(
+    provider: &StoredProvider,
+    now_ms: u128,
+    block: AccountUsageBlock,
+) -> ProxyError {
+    let retry_after_seconds = u64::try_from(block.until_ms.saturating_sub(now_ms as i64))
+        .unwrap_or(u64::MAX)
+        .saturating_add(999)
+        / 1_000;
+    ProxyError::rate_limited(
+        format!(
+            "provider {} account is {}: {} until {}",
+            provider.provider.id,
+            block.kind.availability(),
+            block.reason,
+            block.until_ms,
+        ),
+        retry_after_seconds.max(1),
+    )
 }
 
 pub(super) fn ensure_provider_account_does_not_need_relogin(
@@ -374,10 +399,16 @@ fn provider_account_usage_block(
     provider: &StoredProvider,
     accounts: &AccountStore,
     now_ms: u128,
+    allow_personal_credits: bool,
 ) -> Option<AccountUsageBlock> {
     let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
-    bound_account_for_provider(provider, accounts)
-        .and_then(|account| active_account_usage_block(account, now_ms))
+    bound_account_for_provider(provider, accounts).and_then(|account| {
+        if allow_personal_credits {
+            active_account_usage_block_for_share(account, now_ms, true)
+        } else {
+            active_account_usage_block(account, now_ms)
+        }
+    })
 }
 
 #[cfg(test)]

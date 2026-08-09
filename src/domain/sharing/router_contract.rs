@@ -6,7 +6,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::{
-    active_account_usage_block, Account, AccountQuotaTier, AccountStore, AccountUsageBlock,
+    active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
+    AccountUsageBlock,
 };
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
@@ -47,6 +48,14 @@ pub struct ShareSettingsPatch {
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_personal_credits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_consume_banked_reset: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banked_reset_expiry_lead_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +253,17 @@ pub struct ShareDescriptor {
     pub model_health: ShareModelHealthSummary,
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_start: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_personal_credits: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_consume_banked_reset: bool,
+    #[serde(
+        default = "default_banked_reset_expiry_lead_minutes",
+        skip_serializing_if = "is_default_banked_reset_expiry_lead_minutes"
+    )]
+    pub banked_reset_expiry_lead_minutes: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub previous_response_cache_enabled: bool,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
@@ -262,6 +282,14 @@ fn is_zero_revision(value: &u64) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_banked_reset_expiry_lead_minutes() -> u32 {
+    crate::domain::sharing::shares::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
+}
+
+fn is_default_banked_reset_expiry_lead_minutes(value: &u32) -> bool {
+    *value == default_banked_reset_expiry_lead_minutes()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +690,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             let availability = provider_availability(
                 app.as_str(),
                 provider,
+                share,
                 accounts,
                 usage,
                 runtime_plan.as_deref(),
@@ -762,6 +791,10 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         app_availability,
         model_health,
         auto_start: share.auto_start,
+        allow_personal_credits: share.allow_personal_credits,
+        auto_consume_banked_reset: share.auto_consume_banked_reset,
+        banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
+        previous_response_cache_enabled: share.previous_response_cache_enabled,
         config_revision: share.config_revision,
         descriptor_generation: share.descriptor_generation,
         descriptor_fingerprint: share.descriptor_fingerprint.clone().unwrap_or_default(),
@@ -899,7 +932,7 @@ fn upstream_provider(
     let health = usage.map(|usage| provider_health(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
-    let usage_block = account.and_then(current_account_usage_block);
+    let usage_block = account.and_then(|account| current_account_usage_block(account, share));
     let quota_blocked = account.map(|_| usage_block.is_some());
     let available = health
         .as_ref()
@@ -917,7 +950,7 @@ fn upstream_provider(
         subscription_remaining_ms: account_context.subscription_remaining_ms,
         quota_percent: account_context.quota_percent,
         quota_blocked,
-        quota: account.and_then(upstream_quota_from_account),
+        quota: account.and_then(|account| upstream_quota_from_account(account, share)),
         api_url: provider_api_url(provider),
         models: provider_models(provider),
         health,
@@ -937,7 +970,7 @@ fn app_provider(
     let health = usage.map(|usage| provider_health(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
-    let usage_block = account.and_then(current_account_usage_block);
+    let usage_block = account.and_then(|account| current_account_usage_block(account, share));
     let quota_blocked = account.map(|_| usage_block.is_some());
     let available = health
         .as_ref()
@@ -964,7 +997,7 @@ fn app_provider(
         subscription_remaining_ms: account_context.subscription_remaining_ms,
         quota_percent: account_context.quota_percent,
         quota_blocked,
-        quota: account.and_then(upstream_quota_from_account),
+        quota: account.and_then(|account| upstream_quota_from_account(account, share)),
         api_url: provider_api_url(provider),
         models: provider_models(provider),
         health,
@@ -975,13 +1008,14 @@ fn app_provider(
 fn provider_availability(
     app: &str,
     provider: &StoredProvider,
+    share: &Share,
     accounts: Option<&AccountStore>,
     usage: Option<&UsageStore>,
     runtime_plan: Option<&ProviderRuntimePlan>,
 ) -> ShareProviderAvailability {
     let health = usage.map(|usage| health::provider_health_for_plan(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
-    let usage_block = account.and_then(current_account_usage_block);
+    let usage_block = account.and_then(|account| current_account_usage_block(account, share));
     let quota_blocked = account.map(|_| usage_block.is_some());
     let available = health
         .as_ref()
@@ -1022,10 +1056,11 @@ fn provider_health(
     }
 }
 
-fn current_account_usage_block(account: &Account) -> Option<AccountUsageBlock> {
-    active_account_usage_block(
+fn current_account_usage_block(account: &Account, share: &Share) -> Option<AccountUsageBlock> {
+    active_account_usage_block_for_share(
         account,
         crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+        share.allow_personal_credits,
     )
 }
 
@@ -1083,9 +1118,9 @@ fn account_subscription_remaining_ms(account: &Account) -> Option<i64> {
         })
 }
 
-fn upstream_quota_from_account(account: &Account) -> Option<ShareUpstreamQuota> {
+fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<ShareUpstreamQuota> {
     let subscription_period_end = account_subscription_expires_at(account);
-    let block = current_account_usage_block(account);
+    let block = current_account_usage_block(account, share);
     let availability = block
         .as_ref()
         .map(|block| block.kind.availability())

@@ -37,7 +37,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 multer = "3"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls-webpki-roots", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 russh = { version = "0.46", default-features = false, features = ["flate2"] }
 serde = { version = "1", features = ["derive"] }

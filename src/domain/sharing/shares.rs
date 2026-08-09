@@ -23,6 +23,13 @@ use crate::domain::usage::store::UsageStore;
 use crate::infra::time::now_ms;
 
 const SHARES_FILE_NAME: &str = "shares.json";
+pub const DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 60;
+pub const MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 10;
+pub const MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 7 * 24 * 60;
+
+fn default_banked_reset_expiry_lead_minutes() -> u32 {
+    DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
+}
 
 impl ShareUserUsage {
     pub fn tokens_for(&self, period: ShareTokenPeriod, now_ms: i64) -> u64 {
@@ -332,6 +339,14 @@ pub struct SharePolicy {
     pub free_access: bool,
     #[serde(default)]
     pub official_price_percent: Option<u16>,
+    #[serde(default)]
+    pub allow_personal_credits: bool,
+    #[serde(default)]
+    pub auto_consume_banked_reset: bool,
+    #[serde(default = "default_banked_reset_expiry_lead_minutes")]
+    pub banked_reset_expiry_lead_minutes: u32,
+    #[serde(default)]
+    pub previous_response_cache_enabled: bool,
 }
 
 impl Default for SharePolicy {
@@ -344,6 +359,10 @@ impl Default for SharePolicy {
             for_sale: false,
             free_access: false,
             official_price_percent: None,
+            allow_personal_credits: false,
+            auto_consume_banked_reset: false,
+            banked_reset_expiry_lead_minutes: DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            previous_response_cache_enabled: false,
         }
     }
 }
@@ -542,6 +561,14 @@ pub struct UpsertShareInput {
     #[serde(default)]
     pub official_price_percent: Option<u16>,
     #[serde(default)]
+    pub allow_personal_credits: Option<bool>,
+    #[serde(default)]
+    pub auto_consume_banked_reset: Option<bool>,
+    #[serde(default)]
+    pub banked_reset_expiry_lead_minutes: Option<u32>,
+    #[serde(default)]
+    pub previous_response_cache_enabled: Option<bool>,
+    #[serde(default)]
     pub auto_start: Option<bool>,
     #[serde(default)]
     pub description: Option<String>,
@@ -606,6 +633,11 @@ impl ShareStore {
             }
         }
         let owner_email = input.owner_email.clone();
+        let existing_policy = existing_id
+            .as_deref()
+            .and_then(|id| self.shares.iter().find(|share| share.id == id))
+            .map(|share| share.policy.clone())
+            .unwrap_or_default();
         let tunnel_subdomain = input.tunnel_subdomain.clone().or_else(|| {
             existing_id
                 .as_deref()
@@ -743,6 +775,18 @@ impl ShareStore {
                         .next()
                         .copied()
                 }),
+                allow_personal_credits: input
+                    .allow_personal_credits
+                    .unwrap_or(existing_policy.allow_personal_credits),
+                auto_consume_banked_reset: input
+                    .auto_consume_banked_reset
+                    .unwrap_or(existing_policy.auto_consume_banked_reset),
+                banked_reset_expiry_lead_minutes: input
+                    .banked_reset_expiry_lead_minutes
+                    .unwrap_or(existing_policy.banked_reset_expiry_lead_minutes),
+                previous_response_cache_enabled: input
+                    .previous_response_cache_enabled
+                    .unwrap_or(existing_policy.previous_response_cache_enabled),
             },
             tokens_used,
             requests_count,
@@ -1925,6 +1969,26 @@ impl ShareStore {
         }
         if let Some(expires_at) = patch.expires_at {
             share.expires_at = parse_share_expiration(&expires_at)?;
+        }
+        if let Some(allow_personal_credits) = patch.allow_personal_credits {
+            share.allow_personal_credits = allow_personal_credits;
+        }
+        if let Some(auto_consume_banked_reset) = patch.auto_consume_banked_reset {
+            share.auto_consume_banked_reset = auto_consume_banked_reset;
+        }
+        if let Some(lead_minutes) = patch.banked_reset_expiry_lead_minutes {
+            if !(MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES..=MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES)
+                .contains(&lead_minutes)
+            {
+                return Err(SharePatchError::Invalid(format!(
+                    "bankedResetExpiryLeadMinutes must be between {} and {}",
+                    MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES, MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES
+                )));
+            }
+            share.banked_reset_expiry_lead_minutes = lead_minutes;
+        }
+        if let Some(enabled) = patch.previous_response_cache_enabled {
+            share.previous_response_cache_enabled = enabled;
         }
         let explicit_user_grants = patch.user_grants;
         if let Some(user_grants) = explicit_user_grants.as_ref() {
@@ -3912,6 +3976,10 @@ mod tests {
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
             official_price_percent: None,
+            allow_personal_credits: None,
+            auto_consume_banked_reset: None,
+            banked_reset_expiry_lead_minutes: None,
+            previous_response_cache_enabled: None,
             auto_start: None,
             description: None,
             bindings: Vec::new(),
@@ -4752,6 +4820,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: Some(80),
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: Some(true),
                 description: Some("test".to_string()),
                 bindings: Vec::new(),
@@ -4992,6 +5064,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -5031,6 +5107,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -5251,6 +5331,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -5329,6 +5413,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -5536,6 +5624,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -5811,6 +5903,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),

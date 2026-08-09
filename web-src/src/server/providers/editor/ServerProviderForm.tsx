@@ -22,6 +22,7 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
+import { CodexReferralPanel } from "@/components/providers/forms/CodexReferralPanel";
 import {
   ProviderPresetSelector,
   type PresetEntry,
@@ -2407,6 +2408,18 @@ export function ServerProviderForm({
         </Section>
       ) : null}
 
+      {showCodexOptions &&
+      providerId &&
+      resource &&
+      state.accountId === resource.provider.meta?.authBinding?.accountId ? (
+        <Section title={t("codexReferrals.sectionTitle")}>
+          <CodexReferralPanel
+            providerId={providerId}
+            expectedRevision={resource.revision}
+          />
+        </Section>
+      ) : null}
+
       {profile.formComposition === "custom" ? (
         <Section title={t("serverProviderForm.usage.title")}>
           <div className="space-y-2">
@@ -2441,6 +2454,7 @@ export function ServerProviderForm({
           providerName={state.draft.name}
           onOpenShareSettings={onOpenShareSettings}
           onDirtyChange={setShareDirty}
+          showCodexExecutionPolicy={showCodexOptions}
         />
       ) : (
         <ProviderSharePlaceholder />

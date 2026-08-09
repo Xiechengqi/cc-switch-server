@@ -1,4 +1,5 @@
 pub mod codex_device;
+pub(crate) mod codex_referrals;
 pub(crate) mod codex_reset_credits;
 pub mod copilot_device;
 pub mod cursor;

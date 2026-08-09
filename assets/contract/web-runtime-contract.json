@@ -449,6 +449,27 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "codex_referral_eligibility",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Queries the referral eligibility of the account committed to an OpenAI OAuth Provider."
+    },
+    {
+      "name": "codex_referral_send",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Sends referrals using the account committed to an OpenAI OAuth Provider."
+    },
+    {
+      "name": "codex_referral_tracking",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Lists referral activity for the account committed to an OpenAI OAuth Provider."
+    },
+    {
       "name": "configure_tunnel",
       "support": "shim",
       "implemented": true,

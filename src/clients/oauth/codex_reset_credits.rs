@@ -4,6 +4,7 @@ use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use rand::RngCore;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 pub(crate) const CHATGPT_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
@@ -193,11 +194,41 @@ pub(crate) struct ConsumeResetCreditResult {
     pub(crate) remaining_credits: Vec<Value>,
 }
 
-fn generate_redeem_request_id() -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoResetCreditCandidate {
+    pub(crate) credit_id: String,
+    pub(crate) expires_at_ms: i64,
+}
+
+pub(crate) fn generate_redeem_request_id() -> String {
     let mut bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format_uuid(bytes)
+}
+
+pub(crate) fn stable_auto_reset_redeem_request_id(
+    share_id: &str,
+    runtime_fingerprint: &str,
+    workspace_id: &str,
+    credit_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:codex-auto-reset:v1\0");
+    for value in [share_id, runtime_fingerprint, workspace_id, credit_id] {
+        digest.update(value.trim().as_bytes());
+        digest.update([0]);
+    }
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format_uuid(bytes)
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
     let hex = hex::encode(bytes);
     format!(
         "{}-{}-{}-{}-{}",
@@ -301,15 +332,37 @@ fn sanitize_reset_credit_error_message(message: &str, sensitive_values: &[&str])
         .collect()
 }
 
-pub(crate) async fn consume_reset_credit(
+pub(crate) async fn consume_reset_credit_with_request_id(
     http: &reqwest::Client,
     access_token: &str,
     workspace_id: Option<&str>,
     credit_id: &str,
+    redeem_request_id: &str,
+    request_timeout: Duration,
+) -> Result<ConsumeResetCreditResult, BankedResetActionError> {
+    consume_reset_credit_from_url(
+        http,
+        CHATGPT_RESET_CREDIT_CONSUME_URL,
+        access_token,
+        workspace_id,
+        credit_id,
+        redeem_request_id,
+        request_timeout,
+    )
+    .await
+}
+
+async fn consume_reset_credit_from_url(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    workspace_id: Option<&str>,
+    credit_id: &str,
+    redeem_request_id: &str,
     request_timeout: Duration,
 ) -> Result<ConsumeResetCreditResult, BankedResetActionError> {
     let credit_id = credit_id.trim().to_string();
-    let redeem_request_id = generate_redeem_request_id();
+    let redeem_request_id = redeem_request_id.trim().to_string();
     let mut payload = Map::new();
     payload.insert(
         "redeem_request_id".to_string(),
@@ -321,7 +374,7 @@ pub(crate) async fn consume_reset_credit(
     let timeout = request_timeout.min(ACTION_TIMEOUT);
     let request = codex_authenticated_post(
         http,
-        CHATGPT_RESET_CREDIT_CONSUME_URL,
+        url,
         access_token,
         workspace_id,
         Value::Object(payload),
@@ -350,6 +403,63 @@ pub(crate) async fn consume_reset_credit(
         available_count,
         remaining_credits,
     })
+}
+
+pub(crate) fn select_auto_reset_credit(
+    snapshot: &Value,
+    workspace_id: &str,
+    now_ms: i64,
+    lead_minutes: u32,
+) -> Option<AutoResetCreditCandidate> {
+    if lead_minutes == 0
+        || snapshot
+            .get("workspaceId")
+            .or_else(|| snapshot.get("workspace_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            != Some(workspace_id.trim())
+        || snapshot.get("detailsAvailable").and_then(Value::as_bool) != Some(true)
+        || snapshot.get("detailsStale").and_then(Value::as_bool) == Some(true)
+        || snapshot
+            .get("availableCount")
+            .or_else(|| snapshot.get("available_count"))
+            .and_then(nonnegative_integer)
+            .is_some_and(|count| count == 0)
+    {
+        return None;
+    }
+    let deadline_ms = now_ms.saturating_add(i64::from(lead_minutes).saturating_mul(60_000));
+    snapshot
+        .get("credits")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|credit| credit_status(credit) == "available")
+        .filter(|credit| {
+            credit
+                .get("resetType")
+                .or_else(|| credit.get("reset_type"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("codex_rate_limits"))
+        })
+        .filter(|credit| credit.get("idAvailable").and_then(Value::as_bool) == Some(true))
+        .filter_map(|credit| {
+            let credit_id = credit.get("id")?.as_str()?.trim();
+            if credit_id.is_empty() {
+                return None;
+            }
+            let expires_at_ms = credit.get("expiresAt").and_then(timestamp_to_millis)?;
+            (expires_at_ms > now_ms && expires_at_ms <= deadline_ms).then(|| {
+                AutoResetCreditCandidate {
+                    credit_id: credit_id.to_string(),
+                    expires_at_ms,
+                }
+            })
+        })
+        .min_by(|left, right| {
+            left.expires_at_ms
+                .cmp(&right.expires_at_ms)
+                .then_with(|| left.credit_id.cmp(&right.credit_id))
+        })
 }
 
 pub(crate) fn parse_usage_available_count(usage: &Value) -> Option<i64> {
@@ -468,8 +578,9 @@ struct NormalizedCredit {
 
 fn normalize_credit(value: &Value, index: usize) -> Option<NormalizedCredit> {
     let object = value.as_object()?;
-    let id = string_field(object, &["id", "credit_id", "creditId"])
-        .unwrap_or_else(|| format!("credit-{}", index + 1));
+    let upstream_id = string_field(object, &["id", "credit_id", "creditId"]);
+    let id_available = upstream_id.is_some();
+    let id = upstream_id.unwrap_or_else(|| format!("credit-{}", index + 1));
     let raw_reset_type = string_field(object, &["reset_type", "resetType", "type"])
         .map(|value| value.to_ascii_lowercase());
     if raw_reset_type
@@ -500,6 +611,7 @@ fn normalize_credit(value: &Value, index: usize) -> Option<NormalizedCredit> {
     Some(NormalizedCredit {
         value: json!({
             "id": id,
+            "idAvailable": id_available,
             "resetType": reset_type,
             "status": status,
             "grantedAt": granted_at,
@@ -911,6 +1023,105 @@ mod tests {
         assert_eq!(user_agent.split('/').next(), Some(originator));
         assert!(request.headers().contains_key("version"));
         assert_eq!(request.headers()["chatgpt-account-id"], "workspace-a");
+    }
+
+    #[test]
+    fn stable_auto_reset_request_id_is_scoped_and_uuid_v8() {
+        let first =
+            stable_auto_reset_redeem_request_id("share-a", "runtime-a", "workspace-a", "credit-a");
+        assert_eq!(
+            first,
+            stable_auto_reset_redeem_request_id("share-a", "runtime-a", "workspace-a", "credit-a",)
+        );
+        assert_ne!(
+            first,
+            stable_auto_reset_redeem_request_id("share-b", "runtime-a", "workspace-a", "credit-a",)
+        );
+        assert_eq!(first.len(), 36);
+        assert_eq!(&first[14..15], "8");
+        assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    #[test]
+    fn auto_reset_candidate_requires_fresh_exact_workspace_details() {
+        let now = 1_700_000_000_000_i64;
+        let snapshot = json!({
+            "workspaceId": "workspace-a",
+            "availableCount": 3,
+            "detailsAvailable": true,
+            "detailsStale": false,
+            "credits": [
+                {
+                    "id": "later",
+                    "idAvailable": true,
+                    "resetType": "codex_rate_limits",
+                    "status": "available",
+                    "expiresAt": now + 50 * 60_000
+                },
+                {
+                    "id": "earlier",
+                    "idAvailable": true,
+                    "resetType": "codex_rate_limits",
+                    "status": "available",
+                    "expiresAt": now + 10 * 60_000
+                },
+                {
+                    "id": "wrong-type",
+                    "idAvailable": true,
+                    "resetType": "other",
+                    "status": "available",
+                    "expiresAt": now + 5 * 60_000
+                }
+            ]
+        });
+        assert_eq!(
+            select_auto_reset_credit(&snapshot, "workspace-a", now, 60),
+            Some(AutoResetCreditCandidate {
+                credit_id: "earlier".to_string(),
+                expires_at_ms: now + 10 * 60_000,
+            })
+        );
+        assert!(select_auto_reset_credit(&snapshot, "workspace-b", now, 60).is_none());
+        assert!(select_auto_reset_credit(&snapshot, "workspace-a", now, 5).is_none());
+
+        let mut stale = snapshot.clone();
+        stale["detailsStale"] = Value::Bool(true);
+        assert!(select_auto_reset_credit(&stale, "workspace-a", now, 60).is_none());
+        let mut synthetic_id = snapshot;
+        synthetic_id["credits"][1]["idAvailable"] = Value::Bool(false);
+        assert_eq!(
+            select_auto_reset_credit(&synthetic_id, "workspace-a", now, 60)
+                .unwrap()
+                .credit_id,
+            "later"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_uses_caller_supplied_redeem_request_id() {
+        let (url, request) = serve_one_http_response(
+            "200 OK",
+            r#"{"windows_reset":2,"available_count":0,"credits":[]}"#,
+        )
+        .await;
+        let result = consume_reset_credit_from_url(
+            &reqwest::Client::new(),
+            &url,
+            "secret-token",
+            Some("workspace-a"),
+            "credit-a",
+            "12345678-1234-8123-8123-123456789abc",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let request = request.await.unwrap();
+        assert_eq!(
+            result.redeem_request_id,
+            "12345678-1234-8123-8123-123456789abc"
+        );
+        assert!(request.contains("12345678-1234-8123-8123-123456789abc"));
+        assert!(request.contains("credit-a"));
     }
 
     #[tokio::test]

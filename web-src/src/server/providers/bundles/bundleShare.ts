@@ -26,6 +26,10 @@ export interface ProviderBundleShareDraft {
   expiry: ProviderBundleShareExpiry;
   sharedWithEmails: string[];
   userGrants: ShareUserGrantMap;
+  allowPersonalCredits: boolean;
+  autoConsumeBankedReset: boolean;
+  bankedResetExpiryLeadMinutes: string;
+  previousResponseCacheEnabled: boolean;
 }
 
 export const BUNDLE_SHARE_EXPIRY_PRESETS = [
@@ -121,6 +125,13 @@ export function createBundleShareDraft(
           defaultPolicy,
         })
       : {},
+    allowPersonalCredits: share?.allowPersonalCredits ?? false,
+    autoConsumeBankedReset: share?.autoConsumeBankedReset ?? false,
+    bankedResetExpiryLeadMinutes: String(
+      share?.bankedResetExpiryLeadMinutes ?? 60,
+    ),
+    previousResponseCacheEnabled:
+      share?.previousResponseCacheEnabled ?? false,
   };
 }
 
@@ -164,6 +175,16 @@ export async function saveBundleShare(
   const userGrants = Object.keys(draft.userGrants).length
     ? draft.userGrants
     : undefined;
+  const bankedResetExpiryLeadMinutes = limitValue(
+    draft.bankedResetExpiryLeadMinutes,
+    60,
+  );
+  if (
+    bankedResetExpiryLeadMinutes < 10 ||
+    bankedResetExpiryLeadMinutes > 7 * 24 * 60
+  ) {
+    throw new Error("Banked Reset lead time must be between 10 and 10080 minutes");
+  }
   return shareApi.saveProviderBundleShare({
     bundleId,
     shareId: existing?.id,
@@ -177,6 +198,10 @@ export async function saveBundleShare(
     parallelLimit,
     expiresAt: expiry,
     sharedWithEmails,
+    allowPersonalCredits: draft.allowPersonalCredits,
+    autoConsumeBankedReset: draft.autoConsumeBankedReset,
+    bankedResetExpiryLeadMinutes,
+    previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
     userGrants,
   });
 }

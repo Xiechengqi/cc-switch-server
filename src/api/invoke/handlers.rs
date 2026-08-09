@@ -617,6 +617,28 @@ pub(in crate::api) async fn web_share_upsert_input(
         app_settings,
         for_sale_official_price_percent_by_app,
         official_price_percent,
+        allow_personal_credits: web_optional_bool(
+            value,
+            &["allowPersonalCredits", "allow_personal_credits"],
+        ),
+        auto_consume_banked_reset: web_optional_bool(
+            value,
+            &["autoConsumeBankedReset", "auto_consume_banked_reset"],
+        ),
+        banked_reset_expiry_lead_minutes: web_optional_u32(
+            value,
+            &[
+                "bankedResetExpiryLeadMinutes",
+                "banked_reset_expiry_lead_minutes",
+            ],
+        ),
+        previous_response_cache_enabled: web_optional_bool(
+            value,
+            &[
+                "previousResponseCacheEnabled",
+                "previous_response_cache_enabled",
+            ],
+        ),
         auto_start: web_optional_bool(value, &["autoStart", "auto_start"]),
         description: web_optional_string_any(value, &["description"]),
         bindings,
@@ -988,10 +1010,22 @@ struct SaveProviderBundleShareCommand {
     shared_with_emails: Vec<String>,
     #[serde(default)]
     user_grants: Option<BTreeMap<String, ShareUserGrant>>,
+    #[serde(default)]
+    allow_personal_credits: bool,
+    #[serde(default)]
+    auto_consume_banked_reset: bool,
+    #[serde(default = "default_provider_bundle_banked_reset_expiry_lead_minutes")]
+    banked_reset_expiry_lead_minutes: u32,
+    #[serde(default)]
+    previous_response_cache_enabled: bool,
 }
 
 fn default_provider_bundle_market_access_mode() -> String {
     "all".to_string()
+}
+
+fn default_provider_bundle_banked_reset_expiry_lead_minutes() -> u32 {
+    crate::domain::sharing::shares::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
 }
 
 fn provider_bundle_share_conflict(message: impl Into<String>) -> ApiError {
@@ -1159,6 +1193,12 @@ fn stage_provider_bundle_share(
                     token_limit: Some(command.token_limit),
                     parallel_limit: Some(command.parallel_limit),
                     expires_at: Some(command.expires_at.clone()),
+                    allow_personal_credits: Some(command.allow_personal_credits),
+                    auto_consume_banked_reset: Some(command.auto_consume_banked_reset),
+                    banked_reset_expiry_lead_minutes: Some(
+                        command.banked_reset_expiry_lead_minutes,
+                    ),
+                    previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
                     user_grants: command.user_grants.clone(),
                     ..ShareSettingsPatch::default()
                 },
@@ -1202,6 +1242,10 @@ fn stage_provider_bundle_share(
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: Some(command.allow_personal_credits),
+                auto_consume_banked_reset: Some(command.auto_consume_banked_reset),
+                banked_reset_expiry_lead_minutes: Some(command.banked_reset_expiry_lead_minutes),
+                previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
                 auto_start: Some(true),
                 description,
                 bindings: bindings.to_vec(),
@@ -1244,6 +1288,16 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     provider_bundle_share_expiration(&command.expires_at)?;
     provider_bundle_share_sale(&command.for_sale)?;
     provider_bundle_market_access_mode(&command.market_access_mode)?;
+    if !(crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES
+        ..=crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES)
+        .contains(&command.banked_reset_expiry_lead_minutes)
+    {
+        return Err(ApiError::bad_request(format!(
+            "bankedResetExpiryLeadMinutes must be between {} and {}",
+            crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES,
+            crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES
+        )));
+    }
 
     let config = state.config.read().await.clone();
     let owner_email = config

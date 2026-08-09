@@ -502,6 +502,10 @@ export interface ShareRecord {
   appSettings?: Record<string, unknown>;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
   officialPricePercent?: number | null;
+  allowPersonalCredits?: boolean;
+  autoConsumeBankedReset?: boolean;
+  bankedResetExpiryLeadMinutes?: number;
+  previousResponseCacheEnabled?: boolean;
   autoStart: boolean;
   description?: string | null;
   bindings?: ShareBinding[];
@@ -537,6 +541,10 @@ export interface UpsertShareInput {
   appSettings?: Record<string, unknown>;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
   officialPricePercent?: number;
+  allowPersonalCredits?: boolean;
+  autoConsumeBankedReset?: boolean;
+  bankedResetExpiryLeadMinutes?: number;
+  previousResponseCacheEnabled?: boolean;
   autoStart?: boolean;
   description?: string | null;
   bindings?: ShareBinding[];

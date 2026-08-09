@@ -1886,21 +1886,186 @@ async fn web_invoke_dispatch(
         "apply_claude_plugin_config"
         | "apply_claude_onboarding_skip"
         | "clear_claude_onboarding_skip" => Ok(Value::Null),
-        "codex_banked_reset_status" => {
-            let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
-            let (account_id, _) =
-                resolve_codex_oauth_account_for_banked_reset(state, account_id.as_deref()).await?;
-            let _response = account_quota(
-                State(state.clone()),
-                headers.clone(),
-                Path(account_id.clone()),
-                Query(AccountQuotaQuery {
-                    refresh: Some(true),
-                    force: web_optional_bool(&args, &["force"]),
-                }),
+        "codex_referral_eligibility" => {
+            Box::pin(async {
+            let provider_id = web_optional_string_any(&args, &["providerId", "provider_id"])
+                .ok_or_else(|| ApiError::bad_request("providerId is required"))?;
+            let expected_revision = codex_provider_expected_revision(&args)?;
+            let mut target =
+                prepare_codex_provider_control_target(state, &provider_id, expected_revision)
+                    .await?;
+            let timeout = codex_control_timeout(state).await;
+            let mut result = crate::clients::oauth::codex_referrals::query_eligibility(
+                &target.session_key,
+                target.access_token()?,
+                &target.workspace_id,
+                timeout,
             )
-            .await?
-            .0;
+            .await
+            .map_err(map_referral_error)?;
+            if result.unauthorized() {
+                target = refresh_codex_provider_control_target(
+                    state,
+                    &provider_id,
+                    expected_revision,
+                    &target,
+                )
+                .await?;
+                result = crate::clients::oauth::codex_referrals::query_eligibility(
+                    &target.session_key,
+                    target.access_token()?,
+                    &target.workspace_id,
+                    timeout,
+                )
+                .await
+                .map_err(map_referral_error)?;
+            }
+            serde_json::to_value(result).map_err(ApiError::bad_request)
+            })
+            .await
+        }
+        "codex_referral_tracking" => {
+            Box::pin(async {
+            let provider_id = web_optional_string_any(&args, &["providerId", "provider_id"])
+                .ok_or_else(|| ApiError::bad_request("providerId is required"))?;
+            let expected_revision = codex_provider_expected_revision(&args)?;
+            let limit = web_optional_u64(&args, &["limit"])
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(100);
+            let mut target =
+                prepare_codex_provider_control_target(state, &provider_id, expected_revision)
+                    .await?;
+            let timeout = codex_control_timeout(state).await;
+            let mut result = crate::clients::oauth::codex_referrals::query_tracking(
+                &target.session_key,
+                target.access_token()?,
+                &target.workspace_id,
+                limit,
+                timeout,
+            )
+            .await
+            .map_err(map_referral_error)?;
+            if result.unauthorized() {
+                target = refresh_codex_provider_control_target(
+                    state,
+                    &provider_id,
+                    expected_revision,
+                    &target,
+                )
+                .await?;
+                result = crate::clients::oauth::codex_referrals::query_tracking(
+                    &target.session_key,
+                    target.access_token()?,
+                    &target.workspace_id,
+                    limit,
+                    timeout,
+                )
+                .await
+                .map_err(map_referral_error)?;
+            }
+            serde_json::to_value(result).map_err(ApiError::bad_request)
+            })
+            .await
+        }
+        "codex_referral_send" => {
+            Box::pin(async {
+            let provider_id = web_optional_string_any(&args, &["providerId", "provider_id"])
+                .ok_or_else(|| ApiError::bad_request("providerId is required"))?;
+            let expected_revision = codex_provider_expected_revision(&args)?;
+            let emails =
+                web_optional_deserialize::<Vec<String>>(&args, "emails")?.unwrap_or_default();
+            let emails = crate::clients::oauth::codex_referrals::normalize_referral_emails(&emails)
+                .map_err(map_referral_error)?;
+            let mut target =
+                prepare_codex_provider_control_target(state, &provider_id, expected_revision)
+                    .await?;
+            let timeout = codex_control_timeout(state).await;
+            let mut result = crate::clients::oauth::codex_referrals::send_invites(
+                &target.session_key,
+                target.access_token()?,
+                &target.workspace_id,
+                &emails,
+                timeout,
+            )
+            .await
+            .map_err(map_referral_error)?;
+            if result.unauthorized() {
+                target = refresh_codex_provider_control_target(
+                    state,
+                    &provider_id,
+                    expected_revision,
+                    &target,
+                )
+                .await?;
+                result = crate::clients::oauth::codex_referrals::send_invites(
+                    &target.session_key,
+                    target.access_token()?,
+                    &target.workspace_id,
+                    &emails,
+                    timeout,
+                )
+                .await
+                .map_err(map_referral_error)?;
+            }
+            serde_json::to_value(result).map_err(ApiError::bad_request)
+            })
+            .await
+        }
+        "codex_banked_reset_status" => {
+            Box::pin(async {
+            let provider_id = web_optional_string_any(&args, &["providerId", "provider_id"]);
+            let expected_revision =
+                web_optional_u64(&args, &["expectedRevision", "expected_revision"]);
+            let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
+            let mut target = resolve_codex_control_account(
+                state,
+                provider_id.as_deref(),
+                expected_revision,
+                account_id.as_deref(),
+            )
+            .await?;
+            let account_id = target.account.id.clone();
+            if provider_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            {
+                state
+                    .refresh_managed_account_if_needed_for_generation(
+                        ProviderType::CodexOAuth,
+                        &account_id,
+                        target.account.auth_identity_generation,
+                    )
+                    .await
+                    .map_err(crate::api::providers::map_managed_account_refresh_error)?;
+                target = resolve_codex_control_account(
+                    state,
+                    provider_id.as_deref(),
+                    expected_revision,
+                    Some(account_id.as_str()),
+                )
+                .await?;
+                state
+                    .refresh_codex_quota_for_account(
+                        &account_id,
+                        target.account.auth_identity_generation,
+                        web_optional_bool(&args, &["force"]).unwrap_or(false),
+                    )
+                    .await
+                    .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+            } else {
+                let _response = account_quota(
+                    State(state.clone()),
+                    headers.clone(),
+                    Path(account_id.clone()),
+                    Query(AccountQuotaQuery {
+                        refresh: Some(true),
+                        force: web_optional_bool(&args, &["force"]),
+                    }),
+                )
+                .await?
+                .0;
+            }
             let account = state
                 .find_account_by_id(&account_id)
                 .await
@@ -1911,58 +2076,101 @@ async fn web_invoke_dispatch(
                     crate::infra::time::now_ms() as i64,
                 ),
             )
+            })
+            .await
         }
         "codex_banked_reset_consume" => {
+            Box::pin(async {
+            let provider_id = web_optional_string_any(&args, &["providerId", "provider_id"]);
+            let expected_revision =
+                web_optional_u64(&args, &["expectedRevision", "expected_revision"]);
             let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
             let credit_id =
                 web_optional_string_any(&args, &["creditId", "credit_id"]).unwrap_or_default();
-            let (account_id, _) =
-                resolve_codex_oauth_account_for_banked_reset(state, account_id.as_deref()).await?;
-            let result = {
-                let _refresh_guard = state
-                    .account_refresh_locks
-                    .lock(ProviderType::CodexOAuth, &account_id)
-                    .await;
-                let (_, account) =
-                    resolve_codex_oauth_account_for_banked_reset(state, Some(account_id.as_str()))
-                        .await?;
-                let access_token = account
-                    .access_token
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        ApiError::bad_request("codex oauth account requires an access token")
-                    })?;
-                let workspace_id =
-                    crate::domain::accounts::store::effective_codex_workspace_id(&account);
+            let target = resolve_codex_control_account(
+                state,
+                provider_id.as_deref(),
+                expected_revision,
+                account_id.as_deref(),
+            )
+            .await?;
+            state
+                .refresh_managed_account_if_needed_for_generation(
+                    ProviderType::CodexOAuth,
+                    &target.account.id,
+                    target.account.auth_identity_generation,
+                )
+                .await
+                .map_err(crate::api::providers::map_managed_account_refresh_error)?;
+            let account_id = target.account.id.clone();
+            let (result, auth_identity_generation) = {
+                let _process_lock = state.lock_codex_banked_reset(&account_id).await;
+                let _file_lock = state
+                    .acquire_codex_banked_reset_file_lock(&account_id)
+                    .await
+                    .map_err(ApiError::bad_gateway)?;
+                let mut target = resolve_codex_control_account(
+                    state,
+                    provider_id.as_deref(),
+                    expected_revision,
+                    Some(account_id.as_str()),
+                )
+                .await?;
                 let http = state.http_client().await;
                 let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
                 let timeout = std::time::Duration::from_millis(timeout_ms.max(1_000) as u64);
-                crate::clients::oauth::codex_reset_credits::consume_reset_credit(
+                let redeem_request_id =
+                    crate::clients::oauth::codex_reset_credits::generate_redeem_request_id();
+                let mut result = crate::clients::oauth::codex_reset_credits::consume_reset_credit_with_request_id(
                     &http,
-                    access_token,
-                    workspace_id.as_deref(),
+                    target.access_token()?,
+                    Some(&target.workspace_id),
                     &credit_id,
+                    &redeem_request_id,
                     timeout,
                 )
-                .await
-                .map_err(|error| ApiError::bad_gateway(error.message()))?
+                .await;
+                if matches!(
+                    result,
+                    Err(crate::clients::oauth::codex_reset_credits::BankedResetActionError::UpstreamHttp(401, _))
+                ) {
+                    state
+                        .refresh_managed_account_now_for_generation(
+                            ProviderType::CodexOAuth,
+                            &account_id,
+                            target.account.auth_identity_generation,
+                        )
+                        .await
+                        .map_err(crate::api::providers::map_managed_account_refresh_error)?;
+                    let refreshed = resolve_codex_control_account(
+                        state,
+                        provider_id.as_deref(),
+                        expected_revision,
+                        Some(account_id.as_str()),
+                    )
+                    .await?;
+                    ensure_codex_control_identity_unchanged(&target, &refreshed)?;
+                    target = refreshed;
+                    result = crate::clients::oauth::codex_reset_credits::consume_reset_credit_with_request_id(
+                        &http,
+                        target.access_token()?,
+                        Some(&target.workspace_id),
+                        &credit_id,
+                        &redeem_request_id,
+                        timeout,
+                    )
+                    .await;
+                }
+                let result = result.map_err(|error| ApiError::bad_gateway(error.message()))?;
+                (result, target.account.auth_identity_generation)
             };
-            if let Err(error) = account_quota(
-                State(state.clone()),
-                headers.clone(),
-                Path(account_id.clone()),
-                Query(AccountQuotaQuery {
-                    refresh: Some(true),
-                    force: Some(true),
-                }),
-            )
-            .await
+            if let Err(error) = state
+                .refresh_codex_quota_for_account(&account_id, auth_identity_generation, true)
+                .await
             {
                 tracing::warn!(
                     account_id = %account_id,
-                    error = %error.message,
+                    error = %error,
                     "banked reset credit was consumed but the follow-up quota refresh failed"
                 );
             }
@@ -1974,6 +2182,8 @@ async fn web_invoke_dispatch(
                 "availableCount": result.available_count,
                 "remainingCredits": result.remaining_credits,
             }))
+            })
+            .await
         }
         "open_provider_terminal" => Err(ApiError::not_implemented(
             "open_provider_terminal is not available in server web runtime",
@@ -1984,10 +2194,182 @@ async fn web_invoke_dispatch(
     }
 }
 
-async fn resolve_codex_oauth_account_for_banked_reset(
+#[derive(Debug, Clone)]
+struct CodexControlTarget {
+    account: crate::domain::accounts::store::Account,
+    workspace_id: String,
+    session_key: String,
+}
+
+impl CodexControlTarget {
+    fn access_token(&self) -> Result<&str, ApiError> {
+        self.account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::bad_request("codex oauth account requires an access token"))
+    }
+}
+
+async fn codex_control_timeout(state: &ServerState) -> std::time::Duration {
+    let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
+    std::time::Duration::from_millis(timeout_ms.max(1_000) as u64)
+}
+
+fn codex_provider_expected_revision(args: &Value) -> Result<u64, ApiError> {
+    web_optional_u64(args, &["expectedRevision", "expected_revision"])
+        .ok_or_else(|| ApiError::bad_request("expectedRevision is required"))
+}
+
+fn map_referral_error(error: crate::clients::oauth::codex_referrals::ReferralError) -> ApiError {
+    match error {
+        crate::clients::oauth::codex_referrals::ReferralError::InvalidInput(message) => {
+            ApiError::bad_request(message)
+        }
+        other => ApiError::bad_gateway(other.message()),
+    }
+}
+
+async fn prepare_codex_provider_control_target(
     state: &ServerState,
+    provider_id: &str,
+    expected_revision: u64,
+) -> Result<CodexControlTarget, ApiError> {
+    let target =
+        resolve_codex_provider_control_target(state, provider_id, expected_revision).await?;
+    state
+        .refresh_managed_account_if_needed_for_generation(
+            ProviderType::CodexOAuth,
+            &target.account.id,
+            target.account.auth_identity_generation,
+        )
+        .await
+        .map_err(crate::api::providers::map_managed_account_refresh_error)?;
+    resolve_codex_provider_control_target(state, provider_id, expected_revision).await
+}
+
+async fn refresh_codex_provider_control_target(
+    state: &ServerState,
+    provider_id: &str,
+    expected_revision: u64,
+    current: &CodexControlTarget,
+) -> Result<CodexControlTarget, ApiError> {
+    state
+        .refresh_managed_account_now_for_generation(
+            ProviderType::CodexOAuth,
+            &current.account.id,
+            current.account.auth_identity_generation,
+        )
+        .await
+        .map_err(crate::api::providers::map_managed_account_refresh_error)?;
+    resolve_codex_provider_control_target(state, provider_id, expected_revision).await
+}
+
+async fn resolve_codex_provider_control_target(
+    state: &ServerState,
+    provider_id: &str,
+    expected_revision: u64,
+) -> Result<CodexControlTarget, ApiError> {
+    if state.credential_persistence_degraded() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed account credentials are waiting for durable persistence",
+        ));
+    }
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("providerId is required"));
+    }
+    let providers = state.providers_snapshot().await;
+    let surfaces = providers
+        .providers
+        .iter()
+        .filter(|stored| {
+            stored.provider.id == provider_id
+                || crate::domain::providers::bundle::bundle_id(&stored.provider)
+                    == Some(provider_id)
+        })
+        .collect::<Vec<_>>();
+    if surfaces.is_empty() {
+        return Err(ApiError::not_found("OpenAI OAuth Provider not found"));
+    }
+    let revision = surfaces
+        .iter()
+        .map(|stored| stored.resource.revision)
+        .max()
+        .unwrap_or_default();
+    if expected_revision != revision {
+        return Err(ApiError::conflict_code(
+            "cc_switch_provider_revision_conflict",
+            format!(
+                "Provider revision conflict: expected {}, current {revision}",
+                expected_revision
+            ),
+        ));
+    }
+    let accounts = state.accounts_snapshot().await;
+    let mut resolved: Option<crate::domain::accounts::store::Account> = None;
+    for stored in surfaces {
+        if crate::domain::providers::runtime::managed_account_provider_type(stored)
+            != Some(ProviderType::CodexOAuth)
+        {
+            continue;
+        }
+        let account =
+            crate::domain::providers::runtime::authoritative_managed_account(stored, &accounts)
+                .cloned()
+                .ok_or_else(|| {
+                    ApiError::conflict_code(
+                        "cc_switch_provider_account_identity_stale",
+                        "OpenAI OAuth Provider account binding is missing or stale",
+                    )
+                })?;
+        if resolved.as_ref().is_some_and(|current| {
+            current.id != account.id
+                || current.auth_identity_generation != account.auth_identity_generation
+        }) {
+            return Err(ApiError::conflict_code(
+                "cc_switch_provider_identity_conflict",
+                "OpenAI OAuth Provider surfaces do not share one account identity",
+            ));
+        }
+        resolved = Some(account);
+    }
+    let account = resolved.ok_or_else(|| {
+        ApiError::bad_request("Provider is not backed by an OpenAI OAuth account")
+    })?;
+    let mut target = codex_control_target(account)?;
+    target.session_key = format!(
+        "{}:{provider_id}:{revision}:{}",
+        state.process_instance_id, target.session_key
+    );
+    Ok(target)
+}
+
+async fn resolve_codex_control_account(
+    state: &ServerState,
+    provider_id: Option<&str>,
+    expected_revision: Option<u64>,
     account_id: Option<&str>,
-) -> Result<(String, crate::domain::accounts::store::Account), ApiError> {
+) -> Result<CodexControlTarget, ApiError> {
+    if let Some(provider_id) = provider_id.map(str::trim).filter(|value| !value.is_empty()) {
+        let expected_revision = expected_revision
+            .ok_or_else(|| ApiError::bad_request("expectedRevision is required"))?;
+        let target =
+            resolve_codex_provider_control_target(state, provider_id, expected_revision).await?;
+        if account_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|account_id| account_id != target.account.id)
+        {
+            return Err(ApiError::conflict_code(
+                "cc_switch_provider_account_binding_mismatch",
+                "requested account does not match the Provider binding",
+            ));
+        }
+        return Ok(target);
+    }
     if state.credential_persistence_degraded() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2010,6 +2392,7 @@ async fn resolve_codex_oauth_account_for_banked_reset(
     })?;
     if account_id
         .map(str::trim)
+        .filter(|value| !value.is_empty())
         .is_some_and(|requested| requested != account.id)
     {
         return Err(ApiError::conflict_code(
@@ -2017,7 +2400,45 @@ async fn resolve_codex_oauth_account_for_banked_reset(
             "Codex OAuth account is not active",
         ));
     }
-    Ok((account.id.clone(), account.clone()))
+    codex_control_target(account.clone())
+}
+
+fn ensure_codex_control_identity_unchanged(
+    before: &CodexControlTarget,
+    after: &CodexControlTarget,
+) -> Result<(), ApiError> {
+    if before.account.id != after.account.id
+        || before.account.auth_identity_generation != after.account.auth_identity_generation
+        || before.workspace_id != after.workspace_id
+    {
+        return Err(ApiError::conflict_code(
+            "cc_switch_provider_account_identity_stale",
+            "OpenAI OAuth account identity changed while consuming a reset credit",
+        ));
+    }
+    Ok(())
+}
+
+fn codex_control_target(
+    account: crate::domain::accounts::store::Account,
+) -> Result<CodexControlTarget, ApiError> {
+    let workspace_id = crate::domain::accounts::store::effective_codex_workspace_id(&account)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("codex oauth account requires a verified workspace")
+        })?;
+    let session_key = format!(
+        "{}:{}:{}",
+        account.id, account.auth_identity_generation, workspace_id
+    );
+    let target = CodexControlTarget {
+        account,
+        workspace_id,
+        session_key,
+    };
+    target.access_token()?;
+    Ok(target)
 }
 
 fn grok_oauth_default_models() -> Vec<Value> {

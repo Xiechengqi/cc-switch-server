@@ -777,6 +777,10 @@ mod tests {
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
             official_price_percent: None,
+            allow_personal_credits: None,
+            auto_consume_banked_reset: None,
+            banked_reset_expiry_lead_minutes: None,
+            previous_response_cache_enabled: None,
             auto_start: None,
             description: None,
             bindings: vec![ShareBinding {

@@ -24,6 +24,8 @@ import { ProviderIconControl } from "@/components/providers/ProviderIconControl"
 import { MarketSelectorField } from "@/components/providers/ProviderShareSection";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
+import { CodexReferralPanel } from "@/components/providers/forms/CodexReferralPanel";
+import { CodexShareExecutionPolicyFields } from "@/components/providers/forms/CodexShareExecutionPolicyFields";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -565,12 +567,14 @@ function BundleShareEditor({
   ownerEmail,
   shareUrl,
   onOpenShareSettings,
+  showCodexExecutionPolicy,
 }: {
   draft: ProviderBundleShareDraft;
   onChange: (draft: ProviderBundleShareDraft) => void;
   ownerEmail: string;
   shareUrl?: string | null;
   onOpenShareSettings?: () => void;
+  showCodexExecutionPolicy: boolean;
 }) {
   const { t } = useTranslation();
   const [marketSelectKey, setMarketSelectKey] = useState(0);
@@ -958,6 +962,30 @@ function BundleShareEditor({
               </Button>
             </div>
           </div>
+          {showCodexExecutionPolicy ? (
+            <CodexShareExecutionPolicyFields
+              allowPersonalCredits={draft.allowPersonalCredits}
+              autoConsumeBankedReset={draft.autoConsumeBankedReset}
+              bankedResetExpiryLeadMinutes={
+                draft.bankedResetExpiryLeadMinutes
+              }
+              previousResponseCacheEnabled={
+                draft.previousResponseCacheEnabled
+              }
+              onAllowPersonalCreditsChange={(allowPersonalCredits) =>
+                onChange({ ...draft, allowPersonalCredits })
+              }
+              onAutoConsumeBankedResetChange={(autoConsumeBankedReset) =>
+                onChange({ ...draft, autoConsumeBankedReset })
+              }
+              onBankedResetExpiryLeadMinutesChange={(
+                bankedResetExpiryLeadMinutes,
+              ) => onChange({ ...draft, bankedResetExpiryLeadMinutes })}
+              onPreviousResponseCacheEnabledChange={(
+                previousResponseCacheEnabled,
+              ) => onChange({ ...draft, previousResponseCacheEnabled })}
+            />
+          ) : null}
           <div className="space-y-2 md:col-span-2">
             <Label>
               {t("provider.share.expiry", { defaultValue: "有效期" })}
@@ -1602,6 +1630,18 @@ export function ProviderBundleEditor({
           </Section>
         ) : null}
 
+        {codexDriverOptions &&
+        persisted &&
+        draft.accountId &&
+        draft.expectedRevision != null ? (
+          <Section title={t("codexReferrals.sectionTitle")}>
+            <CodexReferralPanel
+              providerId={draft.id}
+              expectedRevision={draft.expectedRevision}
+            />
+          </Section>
+        ) : null}
+
         <Section
           title={t("providerBundle.surfaces", { defaultValue: "应用接口" })}
         >
@@ -1642,6 +1682,7 @@ export function ProviderBundleEditor({
             ownerEmail={ownerEmail}
             shareUrl={shareUrl}
             onOpenShareSettings={onOpenShareSettings}
+            showCodexExecutionPolicy={codexDriverOptions}
           />
         </div>
       </div>

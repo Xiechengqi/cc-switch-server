@@ -2,7 +2,8 @@ use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::accounts::store::{
-    active_account_usage_block, Account, AccountStore, AccountUsageBlock,
+    active_account_usage_block, active_account_usage_block_for_share, Account, AccountStore,
+    AccountUsageBlock,
 };
 use crate::domain::health::ProviderHealthStatus;
 use crate::domain::providers::model::AppKind;
@@ -65,7 +66,8 @@ pub fn summary_for_share(
             continue;
         };
 
-        let result = if let Some(block) = quota_block_for_provider(provider, accounts) {
+        let result = if let Some(block) = quota_block_for_share_provider(share, provider, accounts)
+        {
             Some(quota_blocked_result(
                 app,
                 provider,
@@ -314,6 +316,17 @@ pub(crate) fn quota_block_for_provider(
     let now = now_ms().min(i64::MAX as u128) as i64;
     account_for_provider(accounts, provider)
         .and_then(|account| active_account_usage_block(account, now))
+}
+
+pub(crate) fn quota_block_for_share_provider(
+    share: &Share,
+    provider: &StoredProvider,
+    accounts: Option<&AccountStore>,
+) -> Option<AccountUsageBlock> {
+    let now = now_ms().min(i64::MAX as u128) as i64;
+    account_for_provider(accounts, provider).and_then(|account| {
+        active_account_usage_block_for_share(account, now, share.allow_personal_credits)
+    })
 }
 
 pub(crate) fn quota_block_message(block: &AccountUsageBlock) -> String {

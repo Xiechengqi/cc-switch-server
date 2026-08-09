@@ -1651,6 +1651,10 @@ mod grok_catalog_provider_tests {
                         app_settings: Default::default(),
                         for_sale_official_price_percent_by_app: Default::default(),
                         official_price_percent: None,
+                        allow_personal_credits: None,
+                        auto_consume_banked_reset: None,
+                        banked_reset_expiry_lead_minutes: None,
+                        previous_response_cache_enabled: None,
                         auto_start: Some(true),
                         description: None,
                         bindings: vec![ShareBinding {

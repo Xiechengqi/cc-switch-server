@@ -8394,6 +8394,45 @@ async fn codex_active_account_selection_is_exposed_and_enforced_by_provider_writ
 }
 
 #[tokio::test]
+async fn codex_provider_control_commands_require_expected_revision() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    for (command, mut body) in [
+        ("codex_referral_eligibility", json!({})),
+        ("codex_referral_tracking", json!({})),
+        (
+            "codex_referral_send",
+            json!({"emails": ["recipient@example.com"]}),
+        ),
+        ("codex_banked_reset_status", json!({})),
+        (
+            "codex_banked_reset_consume",
+            json!({"creditId": "credit-a"}),
+        ),
+    ] {
+        body["providerId"] = json!("missing-provider");
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/web-api/invoke/{command}"),
+                body,
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{command}");
+        assert_eq!(
+            json_body(response).await["error"],
+            "expectedRevision is required",
+            "{command}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn codex_banked_reset_and_manual_refresh_reject_non_active_accounts_without_outbound_io() {
     let state = test_state();
     state
@@ -11809,6 +11848,10 @@ fn test_share_input_for_app(
         official_price_percent: None,
         auto_start: None,
         description: None,
+        allow_personal_credits: None,
+        auto_consume_banked_reset: None,
+        banked_reset_expiry_lead_minutes: None,
+        previous_response_cache_enabled: None,
         bindings: Vec::new(),
         runtime_snapshot: None,
         user_grants: BTreeMap::new(),

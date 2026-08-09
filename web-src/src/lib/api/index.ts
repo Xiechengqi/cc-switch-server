@@ -10,6 +10,7 @@ export { subscriptionApi } from "./subscription";
 export { vscodeApi } from "./vscode";
 export { proxyApi } from "./proxy";
 export { codexBankedResetApi } from "./codexBankedReset";
+export { codexReferralsApi } from "./codexReferrals";
 export { openclawApi } from "./openclaw";
 export { sessionsApi } from "./sessions";
 export { workspaceApi } from "./workspace";
@@ -81,6 +82,16 @@ export type {
   CodexBankedResetCredit,
   CodexBankedResetStatus,
 } from "./codexBankedReset";
+export type {
+  CodexReferralEligibility,
+  CodexReferralGrant,
+  CodexReferralInviteItem,
+  CodexReferralSendResult,
+  CodexReferralTarget,
+  CodexReferralTimeFrameRule,
+  CodexReferralTracking,
+  CodexReferralTrackingItem,
+} from "./codexReferrals";
 export {
   isLocalCallbackAuthProvider,
   isRemoteWebMode,

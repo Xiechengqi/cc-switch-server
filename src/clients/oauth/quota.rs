@@ -316,6 +316,10 @@ async fn refresh_codex_quota(
         .rate_limit
         .as_ref()
         .and_then(|rate_limit| rate_limit.limit_reached);
+    let personal_credits = usage
+        .credits
+        .as_ref()
+        .map(codex_personal_credits_projection);
     let signed_recovery = if trusted_workspace.is_none() {
         recover_signed_codex_workspace(http, account, now_ms).await
     } else {
@@ -498,6 +502,7 @@ async fn refresh_codex_quota(
                 "discardedReasons": resolution.discarded_reasons,
             },
             "subscriptionExpirySnapshot": expiry_snapshot,
+            "personalCredits": personal_credits,
             "bankedReset": reset_credits,
             "warningCodes": expiry_warning_code.into_iter().collect::<Vec<_>>(),
             "queriedAt": now_ms,
@@ -4235,6 +4240,75 @@ fn codex_account_id(account: &Account) -> Option<String> {
 struct CodexUsageResponse {
     plan_type: Option<String>,
     rate_limit: Option<CodexRateLimit>,
+    credits: Option<CodexPersonalCredits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexPersonalCredits {
+    #[serde(default)]
+    has_credits: Option<bool>,
+    #[serde(default)]
+    unlimited: Option<bool>,
+    #[serde(default)]
+    overage_limit_reached: Option<bool>,
+    #[serde(default)]
+    balance: Option<Value>,
+    #[serde(default)]
+    approx_local_messages: Vec<i64>,
+    #[serde(default)]
+    approx_cloud_messages: Vec<i64>,
+}
+
+fn codex_personal_credits_projection(credits: &CodexPersonalCredits) -> Value {
+    let balance = credits.balance.as_ref().and_then(decimal_value_string);
+    let balance_positive = balance.as_deref().and_then(decimal_string_is_positive);
+    let available = credits.unlimited == Some(true)
+        || (credits.has_credits == Some(true)
+            && credits.overage_limit_reached != Some(true)
+            && balance_positive == Some(true));
+    json!({
+        "hasCredits": credits.has_credits,
+        "unlimited": credits.unlimited,
+        "overageLimitReached": credits.overage_limit_reached,
+        "balance": balance,
+        "balancePositive": balance_positive,
+        "available": available,
+        "approxLocalMessages": credits.approx_local_messages,
+        "approxCloudMessages": credits.approx_cloud_messages,
+    })
+}
+
+fn decimal_value_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn decimal_string_is_positive(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = value.strip_prefix('+').unwrap_or(value);
+    if value.starts_with('-') || value.is_empty() {
+        return Some(false);
+    }
+    let mut decimal_points = 0_u8;
+    let mut digits = 0_usize;
+    let mut non_zero = false;
+    for character in value.chars() {
+        match character {
+            '0'..='9' => {
+                digits = digits.saturating_add(1);
+                non_zero |= character != '0';
+            }
+            '.' if decimal_points == 0 => decimal_points = 1,
+            _ => return None,
+        }
+    }
+    (digits > 0).then_some(non_zero)
 }
 
 #[derive(Debug, Deserialize)]
@@ -6783,6 +6857,46 @@ mod tests {
             status_code: Some(502),
             skipped_reason: None,
         }
+    }
+
+    #[test]
+    fn codex_personal_credit_projection_uses_exact_decimal_strings() {
+        for value in ["1", "0.01", "+000.00010"] {
+            assert_eq!(decimal_string_is_positive(value), Some(true));
+        }
+        for value in ["0", "0.000", "-1", "-0.01"] {
+            assert_eq!(decimal_string_is_positive(value), Some(false));
+        }
+        for value in ["", ".", "1e-3", "NaN", "1.2.3"] {
+            assert_eq!(decimal_string_is_positive(value), None);
+        }
+
+        let credits: CodexPersonalCredits = serde_json::from_value(json!({
+            "has_credits": true,
+            "unlimited": false,
+            "overage_limit_reached": false,
+            "balance": "0000000000000000000000.000000000000000001",
+            "approx_local_messages": [3, 4]
+        }))
+        .unwrap();
+        let projection = codex_personal_credits_projection(&credits);
+        assert_eq!(projection["available"], true);
+        assert_eq!(
+            projection["balance"],
+            "0000000000000000000000.000000000000000001"
+        );
+        assert_eq!(projection["approxLocalMessages"], json!([3, 4]));
+
+        let capped: CodexPersonalCredits = serde_json::from_value(json!({
+            "has_credits": true,
+            "overage_limit_reached": true,
+            "balance": "10.00"
+        }))
+        .unwrap();
+        assert_eq!(
+            codex_personal_credits_projection(&capped)["available"],
+            false
+        );
     }
 
     fn imported_account(provider_type: ProviderType, raw: Value) -> Account {

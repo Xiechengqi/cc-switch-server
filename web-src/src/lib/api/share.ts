@@ -113,6 +113,10 @@ export interface ShareRecord {
   routerSyncedDescriptorGeneration: number;
   routerSyncedDescriptorFingerprint?: string | null;
   routerLastSyncError?: string | null;
+  allowPersonalCredits: boolean;
+  autoConsumeBankedReset: boolean;
+  bankedResetExpiryLeadMinutes: number;
+  previousResponseCacheEnabled: boolean;
   userGrants: ShareUserGrantMap;
 }
 
@@ -132,6 +136,10 @@ export interface CreateShareParams {
   appSettings?: ShareAppSettingsByApp;
   forSaleOfficialPricePercentByApp?: Record<string, number>;
   officialPricePercent?: number | null;
+  allowPersonalCredits?: boolean;
+  autoConsumeBankedReset?: boolean;
+  bankedResetExpiryLeadMinutes?: number;
+  previousResponseCacheEnabled?: boolean;
   userGrants?: ShareUserGrantMap;
 }
 
@@ -225,6 +233,10 @@ export interface SaveProviderShareParams {
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;
+  allowPersonalCredits: boolean;
+  autoConsumeBankedReset: boolean;
+  bankedResetExpiryLeadMinutes: number;
+  previousResponseCacheEnabled: boolean;
   userGrants: ShareUserGrantMap;
 }
 
@@ -242,6 +254,10 @@ export interface SaveProviderBundleShareParams {
   parallelLimit: number;
   expiresAt: string;
   sharedWithEmails: string[];
+  allowPersonalCredits: boolean;
+  autoConsumeBankedReset: boolean;
+  bankedResetExpiryLeadMinutes: number;
+  previousResponseCacheEnabled: boolean;
   userGrants?: ShareUserGrantMap;
 }
 

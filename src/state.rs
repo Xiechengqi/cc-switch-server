@@ -20,6 +20,10 @@ use crate::cli::Cli;
 use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
+use crate::clients::oauth::codex_reset_credits::{
+    select_auto_reset_credit, stable_auto_reset_redeem_request_id, AutoResetCreditCandidate,
+    BankedResetActionError,
+};
 use crate::clients::oauth::copilot_device;
 use crate::clients::oauth::grok_device::{
     GrokDeviceFlowStore, GrokDevicePollLease, GrokDevicePollResult, PendingGrokDeviceFlow,
@@ -48,12 +52,14 @@ use crate::clients::router::tunnel::{
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::{
     account_credential_ownership, AccountCredentialOwnership, AccountRefreshFlightFailure,
-    AccountRefreshFlightFailureDetails, AccountRefreshFlightStage, AccountRefreshLocks,
+    AccountRefreshFlightFailureDetails, AccountRefreshFlightStage, AccountRefreshGuard,
+    AccountRefreshLocks,
 };
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    active_account_usage_block, gemini_v1internal_project_id, native_refresh_snapshot_matches,
-    Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
+    active_account_usage_block, effective_codex_workspace_id, gemini_v1internal_project_id,
+    native_refresh_snapshot_matches, Account, AccountRefreshUpdate, AccountStore,
+    ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
@@ -87,6 +93,9 @@ use crate::domain::settings::config::{
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::credential_source::resolve_provider_credential_source;
+use crate::domain::sharing::previous_response_cache::{
+    PreviousResponseCache, PreviousResponseCacheScope,
+};
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint,
     ShareRequestLogEntry, ShareSyncOperation,
@@ -108,9 +117,160 @@ const CLIENT_SUBDOMAIN_ADOPTION_MAX_FUTURE_MS: i64 = 60_000;
 const CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_BASE: Duration = Duration::from_secs(2);
 const CLIENT_SUBDOMAIN_ADOPTION_AUTH_RETRY_MAX: Duration = Duration::from_secs(30);
 const MAX_PROVIDER_IMPORT_ITEMS: usize = 256;
+const MAX_SHARE_MODEL_COOLDOWNS: usize = 2_048;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA: u32 = 1;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_FILE: &str = ".codex-workspace-rebind-transaction.json";
 const CODEX_WORKSPACE_REBIND_STAGE_DIRECTORY: &str = ".codex-workspace-rebind-stage";
+const CODEX_BANKED_RESET_LOCK_DIRECTORY: &str = ".codex-banked-reset-locks";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ShareModelCooldownKey {
+    share_id: String,
+    runtime_fingerprint: String,
+    model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShareModelCooldown {
+    pub until_ms: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+struct ShareModelCooldownTracker {
+    entries: BTreeMap<ShareModelCooldownKey, ShareModelCooldown>,
+}
+
+impl ShareModelCooldownTracker {
+    fn get(
+        &mut self,
+        share_id: &str,
+        runtime_fingerprint: &str,
+        model: &str,
+        now_ms: i64,
+    ) -> Option<ShareModelCooldown> {
+        self.cleanup(now_ms);
+        self.entries
+            .get(&share_model_cooldown_key(
+                share_id,
+                runtime_fingerprint,
+                model,
+            ))
+            .cloned()
+    }
+
+    fn mark(
+        &mut self,
+        share_id: &str,
+        runtime_fingerprint: &str,
+        model: &str,
+        until_ms: i64,
+        reason: &str,
+        now_ms: i64,
+    ) {
+        self.cleanup(now_ms);
+        let key = share_model_cooldown_key(share_id, runtime_fingerprint, model);
+        self.entries.insert(
+            key,
+            ShareModelCooldown {
+                until_ms,
+                reason: reason.to_string(),
+            },
+        );
+        while self.entries.len() > MAX_SHARE_MODEL_COOLDOWNS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cooldown)| cooldown.until_ms)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn cleanup(&mut self, now_ms: i64) {
+        self.entries
+            .retain(|_, cooldown| cooldown.until_ms > now_ms);
+    }
+}
+
+fn share_model_cooldown_key(
+    share_id: &str,
+    runtime_fingerprint: &str,
+    model: &str,
+) -> ShareModelCooldownKey {
+    ShareModelCooldownKey {
+        share_id: share_id.trim().to_string(),
+        runtime_fingerprint: runtime_fingerprint.trim().to_string(),
+        model: model.trim().to_ascii_lowercase(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexAutoResetContext {
+    share_id: String,
+    share_revision: u64,
+    provider_id: String,
+    provider_revision: u64,
+    runtime_fingerprint: String,
+    account_id: String,
+    auth_identity_generation: u64,
+    workspace_id: String,
+    candidate: AutoResetCreditCandidate,
+}
+
+pub(crate) struct CodexBankedResetFileLock {
+    file: std::fs::File,
+}
+
+impl Drop for CodexBankedResetFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn ensure_codex_auto_reset_account_matches(
+    context: &CodexAutoResetContext,
+    account: &Account,
+) -> anyhow::Result<()> {
+    if account.provider_type != ProviderType::CodexOAuth
+        || account.id != context.account_id
+        || account.auth_identity_generation != context.auth_identity_generation
+        || effective_codex_workspace_id(account).as_deref() != Some(context.workspace_id.as_str())
+    {
+        anyhow::bail!("Codex OAuth account identity changed before banked reset consume");
+    }
+    Ok(())
+}
+
+async fn consume_auto_reset_credit(
+    http: &reqwest::Client,
+    account: &Account,
+    context: &CodexAutoResetContext,
+    redeem_request_id: &str,
+    timeout: Duration,
+) -> Result<
+    crate::clients::oauth::codex_reset_credits::ConsumeResetCreditResult,
+    BankedResetActionError,
+> {
+    let access_token = account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(BankedResetActionError::RequestFailed)?;
+    crate::clients::oauth::codex_reset_credits::consume_reset_credit_with_request_id(
+        http,
+        access_token,
+        Some(&context.workspace_id),
+        &context.candidate.credit_id,
+        redeem_request_id,
+        timeout,
+    )
+    .await
+}
 #[cfg(test)]
 pub(crate) async fn install_openai_test_jwk(jwk: jsonwebtoken::jwk::Jwk) {
     crate::clients::oauth::openai_jwks::install_test_jwk(jwk).await;
@@ -525,9 +685,12 @@ pub struct ServerStateInner {
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
     cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
     pub account_refresh_locks: AccountRefreshLocks,
+    codex_banked_reset_locks: AccountRefreshLocks,
     native_refresh_receipt_journal: Mutex<NativeRefreshReceiptJournal>,
     pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
+    share_model_cooldowns: Mutex<ShareModelCooldownTracker>,
+    previous_response_cache: Mutex<PreviousResponseCache>,
     pub control_nonces: Arc<ControlNonceCache>,
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
     client_tunnel_claim: AsyncMutex<()>,
@@ -3768,6 +3931,360 @@ fn prepare_account_binding_migration_preview(
 }
 
 impl ServerStateInner {
+    pub(crate) fn share_model_cooldown(
+        &self,
+        share_id: &str,
+        runtime_fingerprint: &str,
+        model: &str,
+        now_ms: i64,
+    ) -> Option<ShareModelCooldown> {
+        self.share_model_cooldowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(share_id, runtime_fingerprint, model, now_ms)
+    }
+
+    pub(crate) fn mark_share_model_cooldown(
+        &self,
+        share_id: &str,
+        runtime_fingerprint: &str,
+        model: &str,
+        until_ms: i64,
+        reason: &str,
+        now_ms: i64,
+    ) {
+        self.share_model_cooldowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark(
+                share_id,
+                runtime_fingerprint,
+                model,
+                until_ms,
+                reason,
+                now_ms,
+            );
+    }
+
+    pub(crate) fn previous_response_context(
+        &self,
+        scope: &PreviousResponseCacheScope,
+        response_id: &str,
+        now_ms: i64,
+    ) -> Option<Vec<Value>> {
+        self.previous_response_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope, response_id, now_ms)
+    }
+
+    pub(crate) fn cache_previous_response_context(
+        &self,
+        scope: PreviousResponseCacheScope,
+        response_id: &str,
+        items: Vec<Value>,
+        now_ms: i64,
+    ) -> bool {
+        self.previous_response_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(scope, response_id, items, now_ms)
+    }
+
+    pub(crate) async fn lock_codex_banked_reset(&self, account_id: &str) -> AccountRefreshGuard {
+        self.codex_banked_reset_locks
+            .lock(ProviderType::CodexOAuth, account_id)
+            .await
+    }
+
+    pub(crate) async fn acquire_codex_banked_reset_file_lock(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<CodexBankedResetFileLock> {
+        let directory = self.config_dir.join(CODEX_BANKED_RESET_LOCK_DIRECTORY);
+        let digest = Sha256::digest(account_id.trim().as_bytes());
+        let path = directory.join(format!("{}.lock", hex::encode(digest)));
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&directory)
+                .with_context(|| format!("create {}", directory.display()))?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("open {}", path.display()))?;
+            fs2::FileExt::lock_exclusive(&file)
+                .with_context(|| format!("lock {}", path.display()))?;
+            Ok(CodexBankedResetFileLock { file })
+        })
+        .await
+        .context("join Codex banked reset file lock task")?
+    }
+
+    pub(crate) async fn maybe_auto_consume_banked_reset_for_share(
+        self: &Arc<Self>,
+        share_id: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(initial) = self.codex_auto_reset_context(share_id).await else {
+            return Ok(false);
+        };
+        let _process_lock = self.lock_codex_banked_reset(&initial.account_id).await;
+        let _file_lock = self
+            .acquire_codex_banked_reset_file_lock(&initial.account_id)
+            .await?;
+        let Some(current) = self.codex_auto_reset_context(share_id).await else {
+            return Ok(false);
+        };
+        if current != initial {
+            return Ok(false);
+        }
+
+        let redeem_request_id = stable_auto_reset_redeem_request_id(
+            &current.share_id,
+            &current.runtime_fingerprint,
+            &current.workspace_id,
+            &current.candidate.credit_id,
+        );
+        let timeout_ms = self.oauth_quota_refresh_timeout_ms().await;
+        let timeout = Duration::from_millis(timeout_ms.max(1_000) as u64);
+        let http = self.http_client().await;
+        let mut account = self
+            .find_account_for_provider(ProviderType::CodexOAuth, &current.account_id)
+            .await
+            .context("bound Codex OAuth account disappeared before reset consume")?;
+        ensure_codex_auto_reset_account_matches(&current, &account)?;
+        let mut result =
+            consume_auto_reset_credit(&http, &account, &current, &redeem_request_id, timeout).await;
+        if matches!(result, Err(BankedResetActionError::UpstreamHttp(401, _))) {
+            self.refresh_managed_account_now_for_generation(
+                ProviderType::CodexOAuth,
+                &current.account_id,
+                current.auth_identity_generation,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Codex OAuth refresh failed: {error:?}"))?;
+            let Some(after_refresh) = self.codex_auto_reset_context(share_id).await else {
+                return Ok(false);
+            };
+            if after_refresh != current {
+                return Ok(false);
+            }
+            account = self
+                .find_account_for_provider(ProviderType::CodexOAuth, &current.account_id)
+                .await
+                .context("bound Codex OAuth account disappeared after reset auth refresh")?;
+            ensure_codex_auto_reset_account_matches(&current, &account)?;
+            result =
+                consume_auto_reset_credit(&http, &account, &current, &redeem_request_id, timeout)
+                    .await;
+        }
+        let result = result.map_err(|error| anyhow::anyhow!(error.message()))?;
+        self.refresh_codex_quota_for_account(
+            &current.account_id,
+            current.auth_identity_generation,
+            true,
+        )
+        .await?;
+        tracing::info!(
+            share_id = %current.share_id,
+            provider_id = %current.provider_id,
+            account_id = %current.account_id,
+            workspace_id = %current.workspace_id,
+            credit_id = %current.candidate.credit_id,
+            redeem_request_id = %result.redeem_request_id,
+            windows_reset = ?result.windows_reset,
+            "automatically consumed a Share-scoped Codex banked reset credit"
+        );
+        Ok(true)
+    }
+
+    async fn codex_auto_reset_context(&self, share_id: &str) -> Option<CodexAutoResetContext> {
+        let share = self.shares.read().await.get(share_id).cloned()?;
+        if !share.enabled || share.status != "active" || !share.auto_consume_banked_reset {
+            return None;
+        }
+        let provider_id = share
+            .bindings
+            .iter()
+            .find(|binding| binding.app == AppKind::Codex)
+            .map(|binding| binding.provider_id.clone())
+            .or_else(|| (share.app == AppKind::Codex).then(|| share.provider_id.clone()))?;
+        let providers = self.providers.read().await;
+        let provider = providers
+            .providers
+            .iter()
+            .find(|provider| {
+                provider.app == AppKind::Codex
+                    && provider.provider.id == provider_id
+                    && provider.provider_type == ProviderType::CodexOAuth
+                    && surface_enabled(&provider.provider)
+            })?
+            .clone();
+        let runtime_fingerprint = providers
+            .runtime_plan(AppKind::Codex, &provider_id)?
+            .runtime_fingerprint
+            .clone();
+        drop(providers);
+        let (ProviderType::CodexOAuth, account_id) = managed_account_binding(&provider)? else {
+            return None;
+        };
+        let account = self
+            .accounts
+            .read()
+            .await
+            .find_for_provider(ProviderType::CodexOAuth, Some(account_id))
+            .cloned()?;
+        if account.needs_relogin {
+            return None;
+        }
+        let workspace_id = effective_codex_workspace_id(&account)?;
+        let snapshot = crate::clients::oauth::quota::codex_banked_reset_status_snapshot(
+            &account,
+            crate::infra::time::now_ms() as i64,
+        );
+        let candidate = select_auto_reset_credit(
+            &snapshot,
+            &workspace_id,
+            crate::infra::time::now_ms() as i64,
+            share.banked_reset_expiry_lead_minutes,
+        )?;
+        Some(CodexAutoResetContext {
+            share_id: share.id,
+            share_revision: share.config_revision,
+            provider_id,
+            provider_revision: provider.resource.revision,
+            runtime_fingerprint,
+            account_id: account.id,
+            auth_identity_generation: account.auth_identity_generation,
+            workspace_id,
+            candidate,
+        })
+    }
+
+    pub(crate) async fn refresh_codex_quota_for_account(
+        self: &Arc<Self>,
+        account_id: &str,
+        auth_identity_generation: u64,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let mut refresh_guard = self
+            .account_refresh_locks
+            .lock(ProviderType::CodexOAuth, account_id)
+            .await;
+        let account_before_refresh = self
+            .find_account_for_provider(ProviderType::CodexOAuth, account_id)
+            .await
+            .context("Codex OAuth account disappeared before quota refresh")?;
+        if account_before_refresh.auth_identity_generation != auth_identity_generation {
+            anyhow::bail!("Codex OAuth account identity changed before quota refresh");
+        }
+        let now = crate::infra::time::now_ms() as i64;
+        let http = self.http_client().await;
+        let timeout_ms = self.oauth_quota_refresh_timeout_ms().await;
+        let success_cooldown_ms = self.oauth_quota_refresh_interval_ms().await;
+        let mut active_account = account_before_refresh.clone();
+        let mut result = refresh_account_quota(
+            &http,
+            &active_account,
+            now,
+            force,
+            success_cooldown_ms,
+            timeout_ms,
+        )
+        .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.upstream_status == Some(401))
+        {
+            match self
+                .recover_quota_unauthorized(
+                    &http,
+                    &active_account,
+                    now,
+                    success_cooldown_ms,
+                    &mut refresh_guard,
+                )
+                .await
+            {
+                Ok(refreshed) => {
+                    self.refresh_account_runtime_metadata_if_changed(
+                        &account_before_refresh,
+                        &refreshed,
+                    )
+                    .await?;
+                    if refreshed.auth_identity_generation != auth_identity_generation {
+                        anyhow::bail!(
+                            "Codex OAuth account identity changed during quota auth recovery"
+                        );
+                    }
+                    active_account = refreshed;
+                    result = refresh_account_quota(
+                        &http,
+                        &active_account,
+                        now,
+                        true,
+                        success_cooldown_ms,
+                        timeout_ms,
+                    )
+                    .await;
+                }
+                Err(QuotaUnauthorizedRecoveryError::Unavailable) => {}
+                Err(QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
+                    if let Some(updated) = updated {
+                        self.refresh_account_runtime_metadata_if_changed(
+                            &account_before_refresh,
+                            &updated,
+                        )
+                        .await?;
+                        emit_oauth_quota_updated(self, &updated, false);
+                    }
+                    let diagnostic =
+                        redact_account_error_for_log(&active_account, &failure.message);
+                    tracing::warn!(
+                        account_id = %active_account.id,
+                        error = %diagnostic,
+                        "Provider-bound Codex quota 401 OAuth recovery failed"
+                    );
+                    anyhow::bail!("Codex quota OAuth recovery failed");
+                }
+                Err(QuotaUnauthorizedRecoveryError::Commit(error)) => {
+                    anyhow::bail!("Codex quota OAuth recovery commit failed: {error}");
+                }
+                Err(QuotaUnauthorizedRecoveryError::State(error)) => {
+                    return Err(error.context("Codex quota OAuth recovery state update failed"));
+                }
+            }
+        }
+        match result {
+            Ok(QuotaRefreshResult::Updated { update, .. }) => {
+                let updated = self
+                    .commit_account_quota_refresh_update(&active_account, update)
+                    .await?
+                    .map_err(|_| anyhow::anyhow!("Codex quota response became stale"))?;
+                self.refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
+                    .await?;
+                emit_oauth_quota_updated(self, &updated, true);
+                Ok(())
+            }
+            Ok(QuotaRefreshResult::SkippedCooldown { .. }) => Ok(()),
+            Err(error) => {
+                let message = error.message.clone();
+                let mut update = error
+                    .partial_update
+                    .map(|update| *update)
+                    .unwrap_or_default();
+                update.quota_next_refresh_at = error.next_refresh_at;
+                update.last_refresh_error = Some(message.clone());
+                let updated = self
+                    .commit_account_quota_refresh_update(&active_account, update)
+                    .await?
+                    .map_err(|_| anyhow::anyhow!("Codex quota failure became stale"))?;
+                emit_oauth_quota_updated(self, &updated, false);
+                anyhow::bail!("Codex quota refresh failed: {message}")
+            }
+        }
+    }
+
     pub fn load(cli: Cli, log_capture: SharedLogCapture) -> anyhow::Result<ServerState> {
         Self::load_with_cursor_api_key_verifier(
             cli,
@@ -3960,9 +4477,12 @@ impl ServerStateInner {
                 crate::proxy::cursor::credential_cache::CursorModelCatalogCache::default(),
             cursor_api_key_verifier,
             account_refresh_locks: AccountRefreshLocks::default(),
+            codex_banked_reset_locks: AccountRefreshLocks::default(),
             native_refresh_receipt_journal: Mutex::new(NativeRefreshReceiptJournal::default()),
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
+            share_model_cooldowns: Mutex::new(ShareModelCooldownTracker::default()),
+            previous_response_cache: Mutex::new(PreviousResponseCache::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
             router_registration_flight: AsyncMutex::new(None),
             client_tunnel_claim: AsyncMutex::new(()),
@@ -11024,6 +11544,35 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
     });
 }
 
+pub fn spawn_codex_cli_version_sync(state: ServerState) {
+    if let Err(error) = crate::codex_identity::initialize_synced_version_cache(&state.config_dir) {
+        tracing::warn!(
+            error = %error,
+            "ignored invalid Codex CLI version sync cache"
+        );
+    }
+    if crate::codex_identity::version_sync_disabled() {
+        tracing::info!("Codex CLI version synchronization is disabled by environment");
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let http = state.http_client().await;
+            match crate::codex_identity::sync_latest_version(&http, &state.config_dir).await {
+                Ok(version) => {
+                    tracing::info!(version, "synchronized the official Codex CLI version")
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    effective_version = %crate::codex_identity::configured_version(),
+                    "Codex CLI version synchronization failed; retaining the cached or built-in version"
+                ),
+            }
+            tokio::time::sleep(crate::codex_identity::version_sync_interval()).await;
+        }
+    });
+}
+
 async fn refresh_due_native_account_tokens(state: &ServerState) {
     if state.credential_persistence_degraded() {
         return;
@@ -13505,6 +14054,10 @@ mod tests {
             app_settings: BTreeMap::new(),
             for_sale_official_price_percent_by_app: BTreeMap::new(),
             official_price_percent: None,
+            allow_personal_credits: None,
+            auto_consume_banked_reset: None,
+            banked_reset_expiry_lead_minutes: None,
+            previous_response_cache_enabled: None,
             auto_start: None,
             description: None,
             bindings: Vec::new(),
@@ -14383,6 +14936,10 @@ mod tests {
                 app_settings: std::collections::BTreeMap::new(),
                 for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -14811,6 +15368,10 @@ mod tests {
                 app_settings: BTreeMap::new(),
                 for_sale_official_price_percent_by_app: BTreeMap::new(),
                 official_price_percent: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
                 bindings: Vec::new(),
@@ -21779,6 +22340,51 @@ mod tests {
             .abort_client_subdomain_adoption("takeover-auth-gate")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn share_model_cooldowns_are_bounded_expiring_and_scope_isolated() {
+        let mut tracker = ShareModelCooldownTracker::default();
+        tracker.mark(
+            "share-a",
+            "runtime-a",
+            "GPT-5.4",
+            2_000,
+            "model_capacity",
+            1_000,
+        );
+        assert_eq!(
+            tracker.get("share-a", "runtime-a", "gpt-5.4", 1_500),
+            Some(ShareModelCooldown {
+                until_ms: 2_000,
+                reason: "model_capacity".to_string(),
+            })
+        );
+        assert!(tracker
+            .get("share-b", "runtime-a", "gpt-5.4", 1_500)
+            .is_none());
+        assert!(tracker
+            .get("share-a", "runtime-b", "gpt-5.4", 1_500)
+            .is_none());
+        assert!(tracker
+            .get("share-a", "runtime-a", "gpt-5.3", 1_500)
+            .is_none());
+        assert!(tracker
+            .get("share-a", "runtime-a", "gpt-5.4", 2_000)
+            .is_none());
+
+        for index in 0..=MAX_SHARE_MODEL_COOLDOWNS {
+            tracker.mark(
+                &format!("share-{index}"),
+                "runtime",
+                "model",
+                10_000 + index as i64,
+                "rate_limited_model",
+                3_000,
+            );
+        }
+        assert_eq!(tracker.entries.len(), MAX_SHARE_MODEL_COOLDOWNS);
+        assert!(tracker.get("share-0", "runtime", "model", 3_000).is_none());
     }
 
     fn share(id: &str, auto_start: bool, enabled: bool, status: &str) -> Share {

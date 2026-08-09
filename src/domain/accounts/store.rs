@@ -281,6 +281,33 @@ pub fn active_account_usage_block(account: &Account, now_ms: i64) -> Option<Acco
     })
 }
 
+pub fn codex_personal_credits_available(account: &Account) -> bool {
+    account.provider_type == ProviderType::CodexOAuth
+        && account
+            .quota
+            .as_ref()
+            .filter(|quota| quota.success && account.last_refresh_error.is_none())
+            .and_then(|quota| quota.extra_usage.as_ref())
+            .and_then(|extra| extra.pointer("/personalCredits/available"))
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+pub fn active_account_usage_block_for_share(
+    account: &Account,
+    now_ms: i64,
+    allow_personal_credits: bool,
+) -> Option<AccountUsageBlock> {
+    let block = active_account_usage_block(account, now_ms)?;
+    if block.kind == AccountUsageBlockKind::QuotaExhausted
+        && allow_personal_credits
+        && codex_personal_credits_available(account)
+    {
+        return None;
+    }
+    Some(block)
+}
+
 fn quota_evidence_deadline(account: &Account, now_ms: i64) -> Option<i64> {
     let refreshed_at = account.quota_refreshed_at?;
     let deadline = account
@@ -2437,6 +2464,43 @@ mod tests {
         let block = active_account_usage_block(account, now_ms + 90_000).expect("quota block");
         assert_eq!(block.kind, AccountUsageBlockKind::QuotaExhausted);
         assert!(account.last_refresh_error.is_none());
+    }
+
+    #[test]
+    fn personal_credits_only_override_codex_quota_for_opted_in_share() {
+        let now_ms = 1_000_000_000;
+        let account = quota_account(
+            ProviderType::CodexOAuth,
+            now_ms,
+            json!({
+                "subscriptionEvidence": {
+                    "usageAllowed": false,
+                    "usageLimitReached": true
+                },
+                "personalCredits": {
+                    "available": true,
+                    "balance": "0.01"
+                }
+            }),
+            vec![AccountQuotaTier {
+                name: "five_hour".to_string(),
+                utilization: Some(1.0),
+                resets_at: Some(now_ms + 60_000),
+                ..Default::default()
+            }],
+        );
+
+        assert!(active_account_usage_block(&account, now_ms).is_some());
+        assert!(active_account_usage_block_for_share(&account, now_ms, false).is_some());
+        assert!(active_account_usage_block_for_share(&account, now_ms, true).is_none());
+
+        let mut rate_limited = account.clone();
+        rate_limited.rate_limited_until = Some(now_ms + 60_000);
+        assert_eq!(
+            active_account_usage_block_for_share(&rate_limited, now_ms, true)
+                .map(|block| block.kind),
+            Some(AccountUsageBlockKind::RateLimited)
+        );
     }
 
     #[test]
