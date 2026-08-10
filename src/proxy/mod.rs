@@ -14,6 +14,7 @@ pub(crate) mod cursor;
 mod deepseek;
 mod forwarder;
 mod grok;
+pub(crate) mod kimi;
 pub(crate) mod kiro;
 mod outbound_identity;
 pub(crate) mod outbound_request;
@@ -122,6 +123,10 @@ impl std::error::Error for ProxyError {}
 impl ProxyError {
     const TOOL_JSON_INVALID_PREFIX: &'static str = "[TOOL_JSON_INVALID] ";
     const TOOL_JSON_INCOMPLETE_PREFIX: &'static str = "[TOOL_JSON_INCOMPLETE] ";
+    const TOOL_JSON_LIMIT_PREFIX: &'static str = "[TOOL_JSON_LIMIT] ";
+    const KIRO_EVENT_STREAM_INVALID_PREFIX: &'static str = "[KIRO_EVENT_STREAM_INVALID] ";
+    const KIRO_EVENT_STREAM_LIMIT_PREFIX: &'static str = "[KIRO_EVENT_STREAM_LIMIT] ";
+    const KIRO_UPSTREAM_STREAM_ERROR_PREFIX: &'static str = "[KIRO_UPSTREAM_STREAM_ERROR] ";
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
     const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
@@ -219,6 +224,10 @@ impl ProxyError {
         message
             .strip_prefix(Self::TOOL_JSON_INVALID_PREFIX)
             .or_else(|| message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
+            .or_else(|| message.strip_prefix(Self::TOOL_JSON_LIMIT_PREFIX))
+            .or_else(|| message.strip_prefix(Self::KIRO_EVENT_STREAM_INVALID_PREFIX))
+            .or_else(|| message.strip_prefix(Self::KIRO_EVENT_STREAM_LIMIT_PREFIX))
+            .or_else(|| message.strip_prefix(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
             .unwrap_or(message)
@@ -283,6 +292,18 @@ impl ProxyError {
         if message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX) {
             return "TOOL_JSON_INCOMPLETE";
         }
+        if message.starts_with(Self::TOOL_JSON_LIMIT_PREFIX) {
+            return "TOOL_JSON_LIMIT";
+        }
+        if message.starts_with(Self::KIRO_EVENT_STREAM_INVALID_PREFIX) {
+            return "KIRO_EVENT_STREAM_INVALID";
+        }
+        if message.starts_with(Self::KIRO_EVENT_STREAM_LIMIT_PREFIX) {
+            return "KIRO_EVENT_STREAM_LIMIT";
+        }
+        if message.starts_with(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX) {
+            return "KIRO_UPSTREAM_STREAM_ERROR";
+        }
         if message.starts_with(Self::CURSOR_SESSION_LOST_PREFIX) {
             return "cursor_session_lost";
         }
@@ -311,8 +332,15 @@ impl ProxyError {
         }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
             || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
+            || message.starts_with(Self::TOOL_JSON_LIMIT_PREFIX)
         {
             return "upstream_tool_json_error";
+        }
+        if message.starts_with(Self::KIRO_EVENT_STREAM_INVALID_PREFIX)
+            || message.starts_with(Self::KIRO_EVENT_STREAM_LIMIT_PREFIX)
+            || message.starts_with(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX)
+        {
+            return "upstream_protocol_error";
         }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "invalid_request_error",
@@ -339,6 +367,7 @@ impl ProxyError {
         }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
             || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
+            || message.starts_with(Self::TOOL_JSON_LIMIT_PREFIX)
         {
             return false;
         }

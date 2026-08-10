@@ -68,6 +68,11 @@ impl StreamEventTransformer {
             (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::OpenAiChat) => Some(
                 StreamBridgeState::ResponsesChat(ResponsesChatState::default()),
             ),
+            (Some(UpstreamFormat::AnthropicMessages), UpstreamFormat::OpenAiChat) => {
+                Some(StreamBridgeState::AnthropicChat(Box::new(
+                    AnthropicChatState::new(responses_tool_context.clone()),
+                )))
+            }
             (Some(UpstreamFormat::OpenAiChat), UpstreamFormat::OpenAiResponses) => {
                 Some(StreamBridgeState::ChatResponses(Box::new(
                     ChatResponsesState::new(responses_tool_context.clone()),
@@ -356,6 +361,7 @@ enum StreamBridgeState {
     GeminiAnthropic(GeminiAnthropicState),
     GeminiOpenAi(Box<GeminiOpenAiState>),
     ResponsesChat(ResponsesChatState),
+    AnthropicChat(Box<AnthropicChatState>),
     ChatResponses(Box<ChatResponsesState>),
     AnthropicResponses(AnthropicResponsesState),
     ToGemini(Box<ToGeminiState>),
@@ -369,6 +375,7 @@ impl StreamBridgeState {
             Self::GeminiAnthropic(state) => state.transform(input),
             Self::GeminiOpenAi(state) => return state.transform(input),
             Self::ResponsesChat(state) => state.transform(input),
+            Self::AnthropicChat(state) => state.transform(input),
             Self::ChatResponses(state) => state.transform(input),
             Self::AnthropicResponses(state) => state.transform(input),
             Self::ToGemini(state) => return state.transform(input),
@@ -382,6 +389,7 @@ impl StreamBridgeState {
             Self::GeminiOpenAi(state) => state.finish_stream(),
             Self::ToGemini(state) => state.finish_stream(),
             Self::ResponsesChat(state) if state.completed => Ok(Vec::new()),
+            Self::AnthropicChat(state) if state.completed() => Ok(Vec::new()),
             Self::AnthropicResponses(state) if state.completed => Ok(Vec::new()),
             Self::ResponsesAnthropic(state) if state.completed => Ok(Vec::new()),
             Self::ChatAnthropic(state) if state.completed => Ok(Vec::new()),
@@ -423,6 +431,7 @@ impl StreamBridgeState {
             Self::GeminiAnthropic(state) => state.completed,
             Self::GeminiOpenAi(state) => state.completed(),
             Self::ResponsesChat(state) => state.completed,
+            Self::AnthropicChat(state) => state.completed(),
             Self::ChatResponses(state) => state.completed,
             Self::AnthropicResponses(state) => state.completed,
             Self::ToGemini(state) => state.completed(),
@@ -447,6 +456,8 @@ struct ResponsesAnthropicState {
     defer_tool_blocks: bool,
     saw_tool: bool,
     saw_reasoning: bool,
+    web_search_requests: u64,
+    x_search_requests: u64,
     completed: bool,
 }
 
@@ -485,6 +496,7 @@ impl ResponsesAnthropicState {
         match input.get("type").and_then(Value::as_str) {
             Some("response.created") => self.ensure_message_start(input),
             Some("response.output_text.delta") => self.text_delta(input),
+            Some("response.output_text.annotation.added") => self.annotation_added(input),
             Some(
                 "response.reasoning_summary_text.delta"
                 | "response.reasoning_text.delta"
@@ -604,13 +616,32 @@ impl ResponsesAnthropicState {
         if item.get("type").and_then(Value::as_str) == Some("reasoning") {
             return self.ensure_message_start(input);
         }
+        if hosted_search_name(item).is_some() {
+            let output_index = response_output_index(input).unwrap_or_else(|| {
+                -(i64::try_from(self.item_ids.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1))
+            });
+            if let Some(item_id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                self.item_ids.insert(output_index, item_id.to_string());
+            }
+            merge_bridge_item(
+                self.pending_tool_items.entry(output_index).or_default(),
+                item,
+            );
+            return self.ensure_message_start(input);
+        }
         if !matches!(
             item.get("type").and_then(Value::as_str),
             Some("function_call" | "custom_tool_call" | "tool_search_call")
         ) {
             return Vec::new();
         }
-        let Some(output_index) = response_output_index(input) else {
+        let Some(output_index) = self.event_output_index(input) else {
             protocol_error("missing_output_index");
             return Vec::new();
         };
@@ -741,7 +772,7 @@ impl ResponsesAnthropicState {
     }
 
     fn custom_input_delta(&mut self, input: &Value) -> Vec<StreamFrame> {
-        let Some(output_index) = response_output_index(input) else {
+        let Some(output_index) = self.event_output_index(input) else {
             protocol_error("missing_output_index");
             return Vec::new();
         };
@@ -764,7 +795,7 @@ impl ResponsesAnthropicState {
     }
 
     fn custom_input_done(&mut self, input: &Value) -> Vec<StreamFrame> {
-        let Some(output_index) = response_output_index(input) else {
+        let Some(output_index) = self.event_output_index(input) else {
             protocol_error("missing_output_index");
             return Vec::new();
         };
@@ -849,6 +880,9 @@ impl ResponsesAnthropicState {
                 &self.item_ids,
             );
             return frames;
+        }
+        if hosted_search_name(item).is_some() {
+            return self.finish_hosted_search(input, item);
         }
         if !matches!(
             item.get("type").and_then(Value::as_str),
@@ -938,13 +972,27 @@ impl ResponsesAnthropicState {
             }
         }
         frames.extend(self.close_reasoning_block(None));
-        if self.text_block.is_none() && self.tools.is_empty() && !self.saw_reasoning {
+        if self.text_block.is_none()
+            && self.tools.is_empty()
+            && !self.saw_reasoning
+            && self.web_search_requests == 0
+            && self.x_search_requests == 0
+        {
             frames.extend(self.ensure_text_block());
         }
         frames.extend(self.close_open_blocks());
         let stop_reason =
             transforms::openai_response_to_anthropic_stop_with_tools(response, self.saw_tool);
-        let usage = transforms::anthropic_usage_from_openai_usage(response.get("usage"));
+        let mut usage = transforms::anthropic_usage_from_openai_usage(response.get("usage"));
+        let hosted_search_requests = self
+            .web_search_requests
+            .saturating_add(self.x_search_requests);
+        if hosted_search_requests > 0 {
+            usage["server_tool_use"] = json!({
+                "web_search_requests": hosted_search_requests,
+                "x_search_requests": self.x_search_requests
+            });
+        }
         frames.push(StreamFrame::event(
             "message_delta",
             json!({
@@ -971,6 +1019,154 @@ impl ResponsesAnthropicState {
             return;
         };
         self.item_ids.insert(output_index, item_id.to_string());
+    }
+
+    fn event_output_index(&self, input: &Value) -> Option<i64> {
+        response_output_index(input).or_else(|| {
+            let item_id = input
+                .get("item_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())?;
+            self.item_ids
+                .iter()
+                .find_map(|(index, known_id)| (known_id == item_id).then_some(*index))
+        })
+    }
+
+    fn item_output_index(&self, input: &Value, item: &Value) -> Option<i64> {
+        self.event_output_index(input).or_else(|| {
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())?;
+            self.item_ids
+                .iter()
+                .find_map(|(index, known_id)| (known_id == item_id).then_some(*index))
+        })
+    }
+
+    fn annotation_added(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let Some(annotation) = input.get("annotation") else {
+            return Vec::new();
+        };
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            return Vec::new();
+        }
+        let Some(block) = self.text_block.filter(|block| block.open) else {
+            return Vec::new();
+        };
+        vec![StreamFrame::event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": block.index,
+                "delta": {
+                    "type": "citations_delta",
+                    "citation": hosted_search_citation(annotation)
+                }
+            }),
+        )]
+    }
+
+    fn finish_hosted_search(&mut self, input: &Value, item: &Value) -> Vec<StreamFrame> {
+        if response_item_was_emitted(
+            &self.completed_tool_items,
+            input,
+            Some(item),
+            &self.item_ids,
+        ) {
+            return Vec::new();
+        }
+        let Some(output_index) = self.item_output_index(input, item) else {
+            protocol_error("missing_output_index");
+            return Vec::new();
+        };
+        let output_index = self.resolve_tool_index(output_index, item);
+        let mut effective_item = self
+            .pending_tool_items
+            .remove(&output_index)
+            .unwrap_or_else(|| json!({}));
+        merge_bridge_item(&mut effective_item, item);
+        let Some(name) = hosted_search_name(&effective_item) else {
+            return Vec::new();
+        };
+        let query = if name == "web_search" {
+            effective_item
+                .pointer("/action/query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            let pending = self
+                .pending_custom_inputs
+                .remove(&output_index)
+                .unwrap_or_default();
+            hosted_search_query(
+                pending
+                    .done
+                    .or_else(|| effective_item.get("input").cloned())
+                    .unwrap_or_else(|| Value::String(pending.delta)),
+            )
+        };
+        let raw_id = effective_item
+            .get("id")
+            .or_else(|| effective_item.get("call_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("search");
+        let tool_use_id = if raw_id.starts_with("srvtoolu_") {
+            raw_id.to_string()
+        } else {
+            format!("srvtoolu_{raw_id}")
+        };
+        let mut frames = self.ensure_message_start(input);
+        frames.extend(self.close_reasoning_block(None));
+        frames.extend(self.close_text_block());
+        let tool_index = self.allocate_index();
+        let result_index = self.allocate_index();
+        frames.push(StreamFrame::event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": {}
+                }
+            }),
+        ));
+        frames.push(input_json_delta(
+            tool_index,
+            &json!({"query": query}).to_string(),
+        ));
+        frames.push(content_block_stop(tool_index));
+        frames.push(StreamFrame::event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": result_index,
+                "content_block": {
+                    "type": format!("{name}_tool_result"),
+                    "tool_use_id": tool_use_id,
+                    "content": []
+                }
+            }),
+        ));
+        frames.push(content_block_stop(result_index));
+        if name == "web_search" {
+            self.web_search_requests = self.web_search_requests.saturating_add(1);
+        } else {
+            self.x_search_requests = self.x_search_requests.saturating_add(1);
+        }
+        mark_response_item_emitted(
+            &mut self.completed_tool_items,
+            input,
+            Some(&effective_item),
+            &self.item_ids,
+        );
+        frames
     }
 
     fn remember_deferred_tool_metadata(&mut self, output_index: i64, input: &Value) {
@@ -1762,6 +1958,30 @@ impl GeminiOpenAiState {
             GeminiOpenAiTarget::Responses(state) => state.completed,
             GeminiOpenAiTarget::Chat { chat, .. } => chat.completed,
         }
+    }
+}
+
+#[derive(Debug)]
+struct AnthropicChatState {
+    responses: AnthropicResponsesState,
+    chat: ResponsesChatState,
+}
+
+impl AnthropicChatState {
+    fn new(responses_tool_context: transforms::ResponsesToolContext) -> Self {
+        Self {
+            responses: AnthropicResponsesState::new(responses_tool_context),
+            chat: ResponsesChatState::default(),
+        }
+    }
+
+    fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let response_events = self.responses.transform(input);
+        relay_json_frames(response_events, |event| self.chat.transform(event))
+    }
+
+    fn completed(&self) -> bool {
+        self.chat.completed
     }
 }
 
@@ -3684,6 +3904,45 @@ fn response_output_index(input: &Value) -> Option<i64> {
                 .and_then(Value::as_u64)
                 .and_then(|value| i64::try_from(value).ok())
         })
+}
+
+fn hosted_search_name(item: &Value) -> Option<&'static str> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("web_search_call") => Some("web_search"),
+        Some("custom_tool_call")
+            if item
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "x_search" || name.starts_with("x_")) =>
+        {
+            Some("x_search")
+        }
+        _ => None,
+    }
+}
+
+fn hosted_search_query(input: Value) -> String {
+    let input = match input {
+        Value::String(value) => {
+            serde_json::from_str::<Value>(&value).unwrap_or_else(|_| Value::String(value))
+        }
+        value => value,
+    };
+    input
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| input.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn hosted_search_citation(annotation: &Value) -> Value {
+    json!({
+        "type": "web_search_result_location",
+        "url": annotation.get("url").and_then(Value::as_str).unwrap_or_default(),
+        "title": annotation.get("title").and_then(Value::as_str).unwrap_or_default(),
+        "cited_text": annotation.get("text").and_then(Value::as_str).unwrap_or_default()
+    })
 }
 
 fn response_item_keys(
@@ -5752,6 +6011,141 @@ mod tests {
         );
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].payload_json()["type"], "content_block_stop");
+    }
+
+    #[test]
+    fn responses_hosted_searches_emit_server_tools_citations_and_usage() {
+        let mut state = ResponsesAnthropicState::default();
+        state.transform(&json!({
+            "type": "response.output_item.added",
+            "item": {"type": "web_search_call", "id": "ws_1"}
+        }));
+        let hosted = state.transform(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "action": {"query": "rust news"}
+            }
+        }));
+        assert!(hosted
+            .iter()
+            .any(|frame| { frame.payload_json()["content_block"]["type"] == "server_tool_use" }));
+        assert!(hosted.iter().any(|frame| {
+            frame.payload_json()["content_block"]["type"] == "web_search_tool_result"
+        }));
+
+        state.transform(&json!({
+            "type": "response.output_item.added",
+            "output_index": 4,
+            "item": {"type": "custom_tool_call", "id": "xs_1", "name": "x_search"}
+        }));
+        state.transform(&json!({
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "xs_1",
+            "delta": "{\"query\":\"release notes\"}"
+        }));
+        let x_hosted = state.transform(&json!({
+            "type": "response.output_item.done",
+            "item": {"type": "custom_tool_call", "id": "xs_1", "name": "x_search"}
+        }));
+        assert!(x_hosted.iter().any(|frame| {
+            frame.payload_json()["content_block"]["type"] == "x_search_tool_result"
+        }));
+
+        state.transform(&json!({
+            "type": "response.output_text.delta",
+            "delta": "Result"
+        }));
+        let citation = state.transform(&json!({
+            "type": "response.output_text.annotation.added",
+            "annotation": {
+                "type": "url_citation",
+                "url": "https://example.com",
+                "title": "Example",
+                "text": "cited"
+            }
+        }));
+        assert_eq!(
+            citation[0].payload_json()["delta"]["type"],
+            "citations_delta"
+        );
+        assert_eq!(
+            citation[0].payload_json()["delta"]["citation"]["url"],
+            "https://example.com"
+        );
+
+        let completed = state.transform(&json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"input_tokens": 4, "output_tokens": 3}}
+        }));
+        let delta = completed
+            .iter()
+            .find(|frame| frame.payload_json()["type"] == "message_delta")
+            .unwrap()
+            .payload_json();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert_eq!(delta["usage"]["server_tool_use"]["web_search_requests"], 2);
+        assert_eq!(delta["usage"]["server_tool_use"]["x_search_requests"], 1);
+    }
+
+    #[test]
+    fn responses_x_search_correlates_done_input_by_item_id() {
+        let mut state = ResponsesAnthropicState::default();
+        state.transform(&json!({
+            "type": "response.output_item.added",
+            "item": {"type": "custom_tool_call", "id": "xs_done", "name": "x_search"}
+        }));
+        state.transform(&json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "xs_done",
+            "input": {"query": "done-only query"}
+        }));
+
+        let frames = state.transform(&json!({
+            "type": "response.output_item.done",
+            "item": {"type": "custom_tool_call", "id": "xs_done", "name": "x_search"}
+        }));
+        let input_delta = frames
+            .iter()
+            .find(|frame| frame.payload_json()["delta"]["type"] == "input_json_delta")
+            .unwrap()
+            .payload_json();
+
+        assert_eq!(
+            input_delta["delta"]["partial_json"],
+            json!("{\"query\":\"done-only query\"}")
+        );
+    }
+
+    #[test]
+    fn responses_x_search_keeps_synthetic_index_input_when_done_adds_index() {
+        let mut state = ResponsesAnthropicState::default();
+        state.transform(&json!({
+            "type": "response.output_item.added",
+            "item": {"type": "custom_tool_call", "id": "xs_synthetic", "name": "x_search"}
+        }));
+        state.transform(&json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "xs_synthetic",
+            "input": {"query": "done-only query"}
+        }));
+
+        let frames = state.transform(&json!({
+            "type": "response.output_item.done",
+            "output_index": 7,
+            "item": {"type": "custom_tool_call", "id": "xs_synthetic", "name": "x_search"}
+        }));
+        let input_delta = frames
+            .iter()
+            .find(|frame| frame.payload_json()["delta"]["type"] == "input_json_delta")
+            .unwrap()
+            .payload_json();
+
+        assert_eq!(
+            input_delta["delta"]["partial_json"],
+            json!("{\"query\":\"done-only query\"}")
+        );
     }
 
     #[test]

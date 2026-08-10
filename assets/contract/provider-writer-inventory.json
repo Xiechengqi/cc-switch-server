@@ -9,11 +9,11 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "ac999738c66799f88c4b4411a389723032ab849c17cc1c9c478c6933d357722a"
+      "sha256": "9cba46ba4f7e6b206375b58db397e0aadf0a820b50e2a6cd9db55f362d2a9684"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "5f85eb07e5d3e704cf5d4797e92a064c2276c29ad8d7c06bd68d572420804fe1"
+      "sha256": "e8d385b055bcbf441eea48ae14b968b5929bc9070d0acc8e4a1a66d89bf0c762"
     },
     {
       "path": "src/api/types/providers.rs",
@@ -21,7 +21,7 @@
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "28d0f1f2d9500c78c241e0a4401ee9f036252c9d0e7ecdb348af664e8125e5fe"
+      "sha256": "7d8ebdcd831cc87788cc1aa31a2d1a234e72c53054f91ab3e4e2c1845ae348c3"
     },
     {
       "path": "src/domain/providers/migrate.rs",
@@ -33,15 +33,15 @@
     },
     {
       "path": "src/domain/providers/store.rs",
-      "sha256": "75871c5936cf9ec71a24484db1a7fb3282b0891690f1d945303a295847d36770"
+      "sha256": "5edb61d8a31405a3c9ea48199e2002b455971c6e82c7f977719646f02eda70d1"
     },
     {
       "path": "src/domain/providers/store_v2.rs",
-      "sha256": "03fdfa359faa490d74167779cba476f4cf1af9c1ddef17b72f324553551eb9eb"
+      "sha256": "e044bb8db7fdcfac8c3042f755b536d27a2657362cd7c22523c34b472363f363"
     },
     {
       "path": "src/infra/backup.rs",
-      "sha256": "1f5e5b075f573afaa8e448974770e4760d56989d5a24efaf8550c394bf3f6deb"
+      "sha256": "e057976353571a08280bc066f05c64dceeb868dcd36aaf09a19a83e0f59626da"
     },
     {
       "path": "src/infra/credentials.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "a09c1dea0c7021a597e6c1dbc9e7c7b451b9f5d50a14695c46d73d3cfb218601"
+      "sha256": "98bac517c710e169f3c6748dbe0e74be1f539b5da47405f6db63d2c1fc02969c"
     }
   ],
   "entries": [

@@ -19,14 +19,17 @@ const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const ROUTER_TUNNEL_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_AUDIT_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_SETUP_COMPLETED_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_REGISTER_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
+const ROUTER_AUDIT_BATCH_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
 const ROUTER_ERROR_BODY_LIMIT: usize = 512;
 const ROUTER_SHARE_PRUNE_MAX_IDS: usize = 10_000;
 const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_ACTION: &str = "installation_setup_completed_v1";
+pub const INSTALLATION_AUDIT_BATCH_ACTION: &str = "installation_audit_batch_v1";
 const CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION: &str =
     "client_subdomain_takeover_authorization";
 
@@ -245,6 +248,44 @@ pub struct InstallationHeartbeatPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
     pub log_collection_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationAuditBatchPayload {
+    pub protocol_version: u8,
+    pub boot_id: String,
+    pub server_version: String,
+    pub commit_id: String,
+    pub events: Vec<crate::logging::AuditEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationAuditBatchResponse {
+    #[serde(default)]
+    pub ok: bool,
+    pub boot_id: String,
+    pub sequence: u64,
+    #[serde(default)]
+    pub accepted: usize,
+    #[serde(default)]
+    pub gap_detected: bool,
+    #[serde(default)]
+    pub restart_detected: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InstallationAuditBatchError {
+    #[error("send router audit batch: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("router audit batch rejected: {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("parse router audit batch response: {0}")]
+    InvalidResponse(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -859,6 +900,62 @@ pub async fn send_installation_heartbeat(
         .await
         .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
     Err(classify_installation_heartbeat_failure(status, &body))
+}
+
+pub async fn send_installation_audit_batch(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    boot_id: &str,
+    events: Vec<crate::logging::AuditEvent>,
+) -> Result<InstallationAuditBatchResponse, InstallationAuditBatchError> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| {
+            InstallationAuditBatchError::InvalidResponse(
+                "router api base is not configured".to_string(),
+            )
+        })?
+        .trim_end_matches('/');
+    let identity = config.registered_router_identity().ok_or_else(|| {
+        InstallationAuditBatchError::InvalidResponse(
+            "router installation is not registered".to_string(),
+        )
+    })?;
+    let build = crate::build_info::build_info();
+    let payload = InstallationAuditBatchPayload {
+        protocol_version: 1,
+        boot_id: boot_id.to_string(),
+        server_version: crate::build_info::router_registration_version().to_string(),
+        commit_id: build.commit_id.to_string(),
+        events,
+    };
+    let request = signed_request(identity, INSTALLATION_AUDIT_BATCH_ACTION, payload)
+        .map_err(|error| InstallationAuditBatchError::InvalidResponse(error.to_string()))?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/audit-events/batch"))
+        .json(&request)
+        .timeout(ROUTER_AUDIT_BATCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(InstallationAuditBatchError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_bounded_router_error_body(response)
+            .await
+            .map_err(InstallationAuditBatchError::Request)?;
+        return Err(InstallationAuditBatchError::Rejected { status, body });
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(InstallationAuditBatchError::Request)?;
+    if bytes.len() > ROUTER_AUDIT_BATCH_RESPONSE_BODY_LIMIT {
+        return Err(InstallationAuditBatchError::InvalidResponse(format!(
+            "router audit response exceeds {ROUTER_AUDIT_BATCH_RESPONSE_BODY_LIMIT} bytes"
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| InstallationAuditBatchError::InvalidResponse(error.to_string()))
 }
 
 pub async fn send_installation_setup_completed(
@@ -2658,6 +2755,73 @@ mod tests {
             "ownerEmail": "owner@example.com"
         }));
         assert!(response.is_err());
+    }
+
+    #[test]
+    fn audit_batch_payload_matches_cross_repository_schema_fixture() {
+        use sha2::Digest;
+
+        let payload = InstallationAuditBatchPayload {
+            protocol_version: 1,
+            boot_id: "boot-fixture".to_string(),
+            server_version: "1.2.3".to_string(),
+            commit_id: "abcdef0".to_string(),
+            events: vec![crate::logging::AuditEvent {
+                schema_version: 1,
+                sequence: 7,
+                timestamp_ms: 1_700_000_000_123,
+                boot_id: "boot-fixture".to_string(),
+                level: "info".to_string(),
+                event: "inference.provider.failover".to_string(),
+                request_id: Some("request-fixture".to_string()),
+                transport_request_id: Some("transport-fixture".to_string()),
+                parent_request_id: Some("parent-fixture".to_string()),
+                connection_id: Some("connection-fixture".to_string()),
+                turn_id: Some("turn-fixture".to_string()),
+                app: Some("codex".to_string()),
+                surface: Some("openai".to_string()),
+                operation: Some("responses_websocket_turn".to_string()),
+                route: Some("/v1/responses".to_string()),
+                method: Some("WS".to_string()),
+                body_sha256: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ),
+                provider_type: Some("codex_oauth".to_string()),
+                provider_ref: Some("provider_0123456789abcdef".to_string()),
+                previous_provider_ref: Some("provider_fedcba9876543210".to_string()),
+                account_ref: Some("account_0123456789abcdef".to_string()),
+                requested_model: Some("gpt-requested".to_string()),
+                actual_model: Some("gpt-actual".to_string()),
+                status_code: Some(502),
+                upstream_status: Some(503),
+                outcome: Some("failed_over".to_string()),
+                stage: Some("provider_selection".to_string()),
+                error_code: Some("upstream_unavailable".to_string()),
+                error_class: Some("upstream_error".to_string()),
+                component: Some("provider_selection".to_string()),
+                failure_kind: Some("upstream_unavailable".to_string()),
+                network_error_kind: Some("timeout".to_string()),
+                error_fingerprint: Some("error_0123456789abcdef".to_string()),
+                retry_decision: Some("failover".to_string()),
+                backoff_ms: Some(250),
+                retryable: Some(true),
+                duration_ms: Some(1_234),
+                first_token_ms: Some(321),
+                streaming: Some(true),
+                stream_status: Some("interrupted".to_string()),
+                attempt: Some(2),
+                retry_count: Some(1),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                total_tokens: Some(30),
+            }],
+        };
+
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(encoded)),
+            "3fb028aa02ae49462857380e25a2c3aedd9ecebc2d56c857193bc58955300640"
+        );
     }
 
     #[test]

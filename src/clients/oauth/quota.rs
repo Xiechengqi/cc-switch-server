@@ -13,13 +13,15 @@ use crate::clients::oauth::kiro_device::{
     default_profile_arn, fetch_usage_limits, machine_id_from_refresh_token, quota_from_usage_limits,
 };
 use crate::domain::accounts::claude_subscription::{
-    resolve_claude_subscription, ClaudeSubscriptionCandidate, ClaudeSubscriptionResolution,
-    ClaudeSubscriptionSource,
+    parse_claude_subscription_plan, resolve_claude_subscription, ClaudeSubscriptionCandidate,
+    ClaudeSubscriptionResolution, ClaudeSubscriptionSource,
 };
 use crate::domain::accounts::store::{
     gemini_v1internal_project_id, Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
 };
-use crate::domain::claude_cli::claude_cli_user_agent;
+use crate::domain::claude_cli::{
+    claude_axios_user_agent, claude_cli_user_agent, claude_code_user_agent,
+};
 use crate::domain::grok_cli::{
     grok_cli_user_agent, grok_cli_version, GROK_CLI_CLIENT_IDENTIFIER,
     GROK_CLI_MONTHLY_BILLING_URL, GROK_CLI_TOKEN_AUTH, GROK_CLI_USER_URL,
@@ -37,6 +39,10 @@ fn quota_request_timeout(timeout_ms: i64) -> Duration {
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_BOOTSTRAP_URL: &str = "https://api.anthropic.com/api/claude_cli/bootstrap";
+const CLAUDE_ROLES_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/roles";
+const MAX_CLAUDE_CONTROL_RESPONSE_BODY_BYTES: usize = 512 * 1024;
+const CLAUDE_PLAN_CACHE_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+const CLAUDE_PLAN_CACHE_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CHATGPT_ACCOUNTS_CHECK_URL: &str =
     "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
@@ -531,13 +537,14 @@ async fn refresh_claude_quota(
         .header("anthropic-beta", "oauth-2025-04-20")
         .header(ACCEPT, "application/json")
         .header("accept-language", "*")
-        .header(USER_AGENT, claude_cli_user_agent())
+        .header(USER_AGENT, claude_code_user_agent())
         .header("x-app", "cli")
         .timeout(request_timeout);
-    let (body, profile_lookup, bootstrap_profile) = tokio::join!(
+    let (body, profile_lookup, bootstrap_profile, roles_profile) = tokio::join!(
         request_json(account.provider_type, usage_request, now_ms),
-        fetch_claude_profile_lookup(http, access_token, request_timeout),
+        fetch_claude_profile_lookup(http, access_token, request_timeout, now_ms),
         fetch_claude_bootstrap_profile_with_timeout(http, access_token, request_timeout, now_ms,),
+        fetch_claude_roles_profile(http, access_token, request_timeout, now_ms),
     );
     let body = body?;
     let subscription = resolve_claude_quota_subscription(
@@ -545,19 +552,17 @@ async fn refresh_claude_quota(
         &body,
         profile_lookup.as_ref(),
         bootstrap_profile.as_ref(),
+        now_ms,
     );
     let quota = parse_claude_quota(&body, subscription.as_ref(), now_ms);
-    let subscription_level = quota.credential_message.clone();
-    let bootstrap_merged = merge_profile_overlay(account.profile.as_ref(), bootstrap_profile);
-    let existing = bootstrap_merged.as_ref().or(account.profile.as_ref());
-    let profile = merge_profile_overlay(
-        existing,
+    let profile = merge_claude_profile_enrichments(
+        account.profile.as_ref(),
+        roles_profile,
+        bootstrap_profile,
         profile_lookup.and_then(|lookup| lookup.profile_overlay),
-    )
-    .or(bootstrap_merged);
-    Ok(update_from_quota(
+    );
+    Ok(update_from_claude_quota(
         quota,
-        subscription_level,
         profile,
         now_ms,
         success_cooldown_ms,
@@ -607,7 +612,8 @@ async fn fetch_claude_bootstrap_profile_with_timeout(
         crate::metrics::record_claude_bootstrap("http_error");
         return None;
     }
-    let body = match response.json::<Value>().await {
+    let mut response = response;
+    let body = match read_claude_control_json(&mut response).await {
         Ok(body) => body,
         Err(_) => {
             crate::metrics::record_claude_bootstrap("parse_error");
@@ -621,6 +627,55 @@ async fn fetch_claude_bootstrap_profile_with_timeout(
         "empty"
     });
     profile
+}
+
+async fn fetch_claude_roles_profile(
+    http: &reqwest::Client,
+    access_token: &str,
+    request_timeout: Duration,
+    now_ms: i64,
+) -> Option<Value> {
+    let response = http
+        .get(CLAUDE_ROLES_URL)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(USER_AGENT, claude_axios_user_agent())
+        .timeout(request_timeout)
+        .send()
+        .await;
+    let mut response = match response {
+        Ok(response) if response.status().is_success() => response,
+        Ok(_) => {
+            crate::metrics::record_claude_roles("http_error");
+            return None;
+        }
+        Err(_) => {
+            crate::metrics::record_claude_roles("network_error");
+            return None;
+        }
+    };
+    let roles = match read_claude_control_json(&mut response).await {
+        Ok(roles) => roles,
+        Err(_) => {
+            crate::metrics::record_claude_roles("parse_error");
+            return None;
+        }
+    };
+    crate::metrics::record_claude_roles("success");
+    Some(json!({
+        "claudeCliRoles": roles,
+        "rolesRefreshedAt": now_ms,
+    }))
+}
+
+async fn read_claude_control_json(response: &mut reqwest::Response) -> Result<Value, String> {
+    let body = crate::infra::http::read_response_body_limited(
+        response,
+        MAX_CLAUDE_CONTROL_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body).map_err(|error| error.to_string())
 }
 
 fn normalize_claude_bootstrap_profile(body: &Value, now_ms: i64) -> Option<Value> {
@@ -651,6 +706,15 @@ fn normalize_claude_bootstrap_profile(body: &Value, now_ms: i64) -> Option<Value
         return None;
     }
     profile.insert("bootstrapRefreshedAt".to_string(), json!(now_ms));
+    if profile.contains_key("organizationType") {
+        profile.insert("organizationTypeObservedAt".to_string(), json!(now_ms));
+    }
+    if profile.contains_key("organizationRateLimitTier") {
+        profile.insert(
+            "organizationRateLimitTierObservedAt".to_string(),
+            json!(now_ms),
+        );
+    }
     Some(Value::Object(profile))
 }
 
@@ -666,6 +730,22 @@ fn merge_profile_overlay(existing: Option<&Value>, overlay: Option<Value>) -> Op
         }
     }
     Some(Value::Object(merged))
+}
+
+fn merge_claude_profile_enrichments(
+    existing: Option<&Value>,
+    roles_profile: Option<Value>,
+    bootstrap_profile: Option<Value>,
+    profile_lookup: Option<Value>,
+) -> Option<Value> {
+    let mut profile = existing.cloned();
+    for overlay in [roles_profile, bootstrap_profile, profile_lookup]
+        .into_iter()
+        .flatten()
+    {
+        profile = merge_profile_overlay(profile.as_ref(), Some(overlay));
+    }
+    profile
 }
 
 async fn refresh_gemini_quota(
@@ -2484,6 +2564,25 @@ fn update_from_quota(
     }
 }
 
+fn update_from_claude_quota(
+    quota: AccountQuota,
+    profile: Option<Value>,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+) -> AccountRefreshUpdate {
+    let subscription_level = quota.credential_message.clone();
+    let clear_subscription_level = subscription_level.is_none();
+    let mut update = update_from_quota(
+        quota,
+        subscription_level,
+        profile,
+        now_ms,
+        success_cooldown_ms,
+    );
+    update.clear_subscription_level = clear_subscription_level;
+    update
+}
+
 fn quota_percent_from_tiers(tiers: &[AccountQuotaTier]) -> Option<f64> {
     tiers
         .iter()
@@ -2697,12 +2796,19 @@ fn codex_window_used_fraction(window: &CodexRateLimitWindow) -> Option<f64> {
     Some((normalized / 100.0).clamp(0.0, 1.0))
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeQuotaSubscriptionResolution {
+    resolution: ClaudeSubscriptionResolution,
+    observed_at_ms: i64,
+}
+
 fn resolve_claude_quota_subscription(
     account: &Account,
     usage: &Value,
     profile_lookup: Option<&ClaudeProfileLookup>,
     bootstrap_profile: Option<&Value>,
-) -> Option<ClaudeSubscriptionResolution> {
+    now_ms: i64,
+) -> Option<ClaudeQuotaSubscriptionResolution> {
     let usage_tier = string_at(usage, &["/tier"]);
     let usage_plan = string_at(usage, &["/plan"]);
     let usage_subscription_type = string_at(usage, &["/subscription_type"]);
@@ -2713,7 +2819,8 @@ fn resolve_claude_quota_subscription(
     let profile_rate_limit_tier = profile_lookup.and_then(|lookup| lookup.rate_limit_tier.clone());
     let profile_organization_type =
         profile_lookup.and_then(|lookup| lookup.organization_type.clone());
-    let cached_profile_rate_limit_tier = account.profile.as_ref().and_then(|value| {
+    let cached_profile = account.profile.as_ref();
+    let cached_profile_rate_limit_tier = cached_profile.and_then(|value| {
         string_at(
             value,
             &[
@@ -2726,7 +2833,7 @@ fn resolve_claude_quota_subscription(
             ],
         )
     });
-    let cached_profile_organization_type = account.profile.as_ref().and_then(|value| {
+    let cached_profile_organization_type = cached_profile.and_then(|value| {
         string_at(
             value,
             &[
@@ -2740,8 +2847,26 @@ fn resolve_claude_quota_subscription(
         )
     });
     let cached_subscription_level = account.subscription_level.clone();
+    let cached_profile_rate_limit_observed_at = cached_profile
+        .and_then(|profile| {
+            cached_claude_profile_plan_observed_at(
+                profile,
+                ClaudeCachedProfileEvidence::RateLimitTier,
+            )
+        })
+        .and_then(|observed_at| reusable_claude_plan_observation(observed_at, now_ms));
+    let cached_profile_organization_observed_at = cached_profile
+        .and_then(|profile| {
+            cached_claude_profile_plan_observed_at(
+                profile,
+                ClaudeCachedProfileEvidence::OrganizationType,
+            )
+        })
+        .and_then(|observed_at| reusable_claude_plan_observation(observed_at, now_ms));
+    let cached_subscription_observed_at = cached_claude_canonical_plan_observed_at(account)
+        .and_then(|observed_at| reusable_claude_plan_observation(observed_at, now_ms));
 
-    resolve_claude_subscription(
+    let resolution = resolve_claude_subscription(
         [
             usage_tier.as_deref().map(|value| {
                 ClaudeSubscriptionCandidate::new(ClaudeSubscriptionSource::UsageTier, value)
@@ -2779,33 +2904,133 @@ fn resolve_claude_quota_subscription(
                     value,
                 )
             }),
-            cached_profile_rate_limit_tier.as_deref().map(|value| {
-                ClaudeSubscriptionCandidate::new(
-                    ClaudeSubscriptionSource::CachedProfileRateLimitTier,
-                    value,
-                )
-            }),
-            cached_profile_organization_type.as_deref().map(|value| {
-                ClaudeSubscriptionCandidate::new(
-                    ClaudeSubscriptionSource::CachedProfileOrganizationType,
-                    value,
-                )
-            }),
-            cached_subscription_level.as_deref().map(|value| {
-                ClaudeSubscriptionCandidate::new(
-                    ClaudeSubscriptionSource::CachedSubscriptionLevel,
-                    value,
-                )
-            }),
+            cached_profile_rate_limit_tier
+                .as_deref()
+                .zip(cached_profile_rate_limit_observed_at)
+                .map(|(value, _)| {
+                    ClaudeSubscriptionCandidate::new(
+                        ClaudeSubscriptionSource::CachedProfileRateLimitTier,
+                        value,
+                    )
+                }),
+            cached_profile_organization_type
+                .as_deref()
+                .zip(cached_profile_organization_observed_at)
+                .map(|(value, _)| {
+                    ClaudeSubscriptionCandidate::new(
+                        ClaudeSubscriptionSource::CachedProfileOrganizationType,
+                        value,
+                    )
+                }),
+            cached_subscription_level
+                .as_deref()
+                .zip(cached_subscription_observed_at)
+                .map(|(value, _)| {
+                    ClaudeSubscriptionCandidate::new(
+                        ClaudeSubscriptionSource::CachedSubscriptionLevel,
+                        value,
+                    )
+                }),
         ]
         .into_iter()
         .flatten(),
-    )
+    )?;
+    let observed_at_ms = match resolution.source {
+        ClaudeSubscriptionSource::UsageTier
+        | ClaudeSubscriptionSource::UsagePlan
+        | ClaudeSubscriptionSource::UsageSubscriptionType
+        | ClaudeSubscriptionSource::BootstrapRateLimitTier
+        | ClaudeSubscriptionSource::ProfileRateLimitTier
+        | ClaudeSubscriptionSource::BootstrapOrganizationType
+        | ClaudeSubscriptionSource::ProfileOrganizationType => now_ms,
+        ClaudeSubscriptionSource::CachedProfileRateLimitTier => {
+            cached_profile_rate_limit_observed_at?
+        }
+        ClaudeSubscriptionSource::CachedProfileOrganizationType => {
+            cached_profile_organization_observed_at?
+        }
+        ClaudeSubscriptionSource::CachedSubscriptionLevel => cached_subscription_observed_at?,
+    };
+    Some(ClaudeQuotaSubscriptionResolution {
+        resolution,
+        observed_at_ms,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClaudeCachedProfileEvidence {
+    RateLimitTier,
+    OrganizationType,
+}
+
+fn cached_claude_profile_plan_observed_at(
+    profile: &Value,
+    evidence: ClaudeCachedProfileEvidence,
+) -> Option<i64> {
+    let evidence_paths: &[&str] = match evidence {
+        ClaudeCachedProfileEvidence::RateLimitTier => &[
+            "/organizationRateLimitTierObservedAt",
+            "/profileRaw/organizationRateLimitTierObservedAt",
+            "/raw/organizationRateLimitTierObservedAt",
+        ],
+        ClaudeCachedProfileEvidence::OrganizationType => &[
+            "/organizationTypeObservedAt",
+            "/profileRaw/organizationTypeObservedAt",
+            "/raw/organizationTypeObservedAt",
+        ],
+    };
+    latest_timestamp_at(profile, evidence_paths).or_else(|| {
+        latest_timestamp_at(
+            profile,
+            &[
+                "/profileRefreshedAt",
+                "/bootstrapRefreshedAt",
+                "/profileRaw/profileRefreshedAt",
+                "/profileRaw/bootstrapRefreshedAt",
+                "/raw/profileRefreshedAt",
+                "/raw/bootstrapRefreshedAt",
+            ],
+        )
+    })
+}
+
+fn cached_claude_canonical_plan_observed_at(account: &Account) -> Option<i64> {
+    let account_plan = account
+        .subscription_level
+        .as_deref()
+        .and_then(parse_claude_subscription_plan)?;
+    let subscription = account
+        .quota
+        .as_ref()
+        .and_then(|quota| quota.extra_usage.as_ref())
+        .and_then(|extra| extra.pointer("/subscription"));
+    let recorded_plan = subscription
+        .and_then(|value| string_at(value, &["/planType", "/planLabel"]))
+        .as_deref()
+        .and_then(parse_claude_subscription_plan)?;
+    if recorded_plan != account_plan {
+        return None;
+    }
+    subscription
+        .and_then(|value| latest_timestamp_at(value, &["/planObservedAt"]))
+        .or_else(|| {
+            (subscription.and_then(|value| value.get("planStale").and_then(Value::as_bool))
+                == Some(false))
+            .then_some(account.quota_refreshed_at)
+            .flatten()
+        })
+}
+
+fn reusable_claude_plan_observation(observed_at_ms: i64, now_ms: i64) -> Option<i64> {
+    (observed_at_ms > 0
+        && observed_at_ms <= now_ms.saturating_add(CLAUDE_PLAN_CACHE_CLOCK_SKEW_MS)
+        && now_ms.saturating_sub(observed_at_ms) <= CLAUDE_PLAN_CACHE_MAX_AGE_MS)
+        .then_some(observed_at_ms)
 }
 
 fn parse_claude_quota(
     body: &Value,
-    subscription: Option<&ClaudeSubscriptionResolution>,
+    subscription: Option<&ClaudeQuotaSubscriptionResolution>,
     now_ms: i64,
 ) -> AccountQuota {
     const KNOWN_TIERS: &[&str] = &[
@@ -2827,16 +3052,20 @@ fn parse_claude_quota(
             push_claude_tier(&mut tiers, name, Some(value));
         }
     }
-    let plan_label = subscription.map(|resolution| resolution.plan.label().to_string());
-    let subscription_json = subscription.map(|resolution| {
+    let plan_label =
+        subscription.map(|subscription| subscription.resolution.plan.label().to_string());
+    let subscription_json = subscription.map(|subscription| {
+        let resolution = &subscription.resolution;
         json!({
             "planType": resolution.plan.plan_type(),
             "planLabel": resolution.plan.label(),
             "planSource": resolution.source.as_str(),
             "planStale": resolution.stale,
+            "planObservedAt": subscription.observed_at_ms,
         })
     });
-    let subscription_evidence = subscription.map(|resolution| {
+    let subscription_evidence = subscription.map(|subscription| {
+        let resolution = &subscription.resolution;
         let mut observed_sources = Vec::new();
         for observation in &resolution.observations {
             let source = observation.source.as_str();
@@ -2847,17 +3076,19 @@ fn parse_claude_quota(
         json!({
             "source": resolution.source.as_str(),
             "stale": resolution.stale,
+            "observedAt": subscription.observed_at_ms,
+            "cacheMaxAgeMs": CLAUDE_PLAN_CACHE_MAX_AGE_MS,
             "conflict": resolution.conflict,
             "conflictingPlanTypes": resolution.conflicting_plan_types,
             "observedSources": observed_sources,
         })
     });
     let warning_codes = subscription
-        .filter(|resolution| resolution.conflict)
+        .filter(|subscription| subscription.resolution.conflict)
         .map(|_| vec!["claude_plan_conflict"])
         .unwrap_or_default();
     let warnings = subscription
-        .filter(|resolution| resolution.conflict)
+        .filter(|subscription| subscription.resolution.conflict)
         .map(|_| {
             vec!["Conflicting Claude subscription plan evidence was returned; the highest-authority source was used."]
         })
@@ -3254,15 +3485,13 @@ async fn fetch_claude_profile_lookup(
     http: &reqwest::Client,
     access_token: &str,
     request_timeout: Duration,
+    now_ms: i64,
 ) -> Option<ClaudeProfileLookup> {
     let response = http
         .get(CLAUDE_PROFILE_URL)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header(ACCEPT, "application/json")
-        .header("accept-language", "*")
-        .header(USER_AGENT, claude_cli_user_agent())
-        .header("x-app", "cli")
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(USER_AGENT, claude_axios_user_agent())
         .timeout(request_timeout)
         .send()
         .await
@@ -3270,11 +3499,12 @@ async fn fetch_claude_profile_lookup(
     if !response.status().is_success() {
         return None;
     }
-    let body = response.json::<Value>().await.ok()?;
-    parse_claude_profile_lookup(&body)
+    let mut response = response;
+    let body = read_claude_control_json(&mut response).await.ok()?;
+    parse_claude_profile_lookup(&body, now_ms)
 }
 
-fn parse_claude_profile_lookup(body: &Value) -> Option<ClaudeProfileLookup> {
+fn parse_claude_profile_lookup(body: &Value, now_ms: i64) -> Option<ClaudeProfileLookup> {
     let organization = body.get("organization")?.as_object()?;
     let organization_type = organization
         .get("organization_type")
@@ -3311,12 +3541,23 @@ fn parse_claude_profile_lookup(body: &Value) -> Option<ClaudeProfileLookup> {
     {
         overlay.insert("billingSource".to_string(), Value::String(billing_source));
     }
-    (organization_type.is_some() || rate_limit_tier.is_some() || !overlay.is_empty()).then(|| {
-        ClaudeProfileLookup {
-            organization_type,
-            rate_limit_tier,
-            profile_overlay: (!overlay.is_empty()).then_some(Value::Object(overlay)),
-        }
+    if organization_type.is_none() && rate_limit_tier.is_none() && overlay.is_empty() {
+        return None;
+    }
+    overlay.insert("profileRefreshedAt".to_string(), json!(now_ms));
+    if organization_type.is_some() {
+        overlay.insert("organizationTypeObservedAt".to_string(), json!(now_ms));
+    }
+    if rate_limit_tier.is_some() {
+        overlay.insert(
+            "organizationRateLimitTierObservedAt".to_string(),
+            json!(now_ms),
+        );
+    }
+    Some(ClaudeProfileLookup {
+        organization_type,
+        rate_limit_tier,
+        profile_overlay: Some(Value::Object(overlay)),
     })
 }
 
@@ -4709,6 +4950,20 @@ fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
     })
 }
 
+fn latest_timestamp_at(value: &Value, pointers: &[&str]) -> Option<i64> {
+    pointers
+        .iter()
+        .filter_map(|pointer| {
+            let value = value.pointer(pointer)?;
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        })
+        .filter(|value| *value > 0)
+        .max()
+}
+
 fn number_at(value: &Value, pointers: &[&str]) -> Option<f64> {
     pointers.iter().find_map(|pointer| {
         let value = value.pointer(pointer)?;
@@ -6070,7 +6325,8 @@ mod tests {
             }
         });
         let account = imported_account(ProviderType::ClaudeOAuth, json!({}));
-        let subscription = resolve_claude_quota_subscription(&account, &body, None, None).unwrap();
+        let subscription =
+            resolve_claude_quota_subscription(&account, &body, None, None, 1_000).unwrap();
         let quota = parse_claude_quota(&body, Some(&subscription), 1_000);
 
         assert_eq!(quota.credential_message.as_deref(), Some("Claude Pro"));
@@ -6098,7 +6354,7 @@ mod tests {
                 "organizationRateLimitTier": rate_limit_tier,
             });
             let subscription =
-                resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap))
+                resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap), 1_000)
                     .unwrap();
             let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
             let extra = quota.extra_usage.unwrap();
@@ -6106,6 +6362,7 @@ mod tests {
             assert_eq!(quota.credential_message.as_deref(), Some(expected_label));
             assert_eq!(extra["subscription"]["planType"], expected_type);
             assert_eq!(extra["subscription"]["planLabel"], expected_label);
+            assert_eq!(extra["subscription"]["planObservedAt"], 1_000);
             assert_eq!(
                 extra["subscriptionEvidence"]["source"],
                 "bootstrap_rate_limit_tier"
@@ -6125,13 +6382,13 @@ mod tests {
             profile_overlay: None,
         };
         let subscription =
-            resolve_claude_quota_subscription(&account, &usage, Some(&profile_lookup), None)
+            resolve_claude_quota_subscription(&account, &usage, Some(&profile_lookup), None, 1_000)
                 .unwrap();
 
-        assert_eq!(subscription.plan.plan_type(), "claude_max");
-        assert_eq!(subscription.plan.label(), "Claude Max");
-        assert!(!subscription.stale);
-        assert!(!subscription.conflict);
+        assert_eq!(subscription.resolution.plan.plan_type(), "claude_max");
+        assert_eq!(subscription.resolution.plan.label(), "Claude Max");
+        assert!(!subscription.resolution.stale);
+        assert!(!subscription.resolution.conflict);
     }
 
     #[test]
@@ -6143,7 +6400,8 @@ mod tests {
             "organizationRateLimitTier": "default_claude_max_20x",
         });
         let subscription =
-            resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap)).unwrap();
+            resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap), 1_000)
+                .unwrap();
         let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
         let extra = quota.extra_usage.unwrap();
 
@@ -6158,20 +6416,167 @@ mod tests {
         account.profile = Some(json!({
             "organizationType": "claude_max",
             "organizationRateLimitTier": "default_claude_max_5x",
+            "organizationTypeObservedAt": 100,
+            "organizationRateLimitTierObservedAt": 100,
         }));
         account.subscription_level = Some("Claude Max 5x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_5x",
+                    "planStale": false,
+                    "planObservedAt": 100,
+                }
+            })),
+            ..Default::default()
+        });
         let usage = json!({"plan": "claude_max"});
-        let subscription = resolve_claude_quota_subscription(&account, &usage, None, None).unwrap();
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, None, None, 1_000).unwrap();
         let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
         let extra = quota.extra_usage.unwrap();
 
         assert_eq!(quota.credential_message.as_deref(), Some("Claude Max 5x"));
         assert_eq!(extra["subscription"]["planType"], "claude_max_5x");
         assert_eq!(extra["subscription"]["planStale"], true);
+        assert_eq!(extra["subscription"]["planObservedAt"], 100);
         assert_eq!(
             extra["subscriptionEvidence"]["source"],
             "cached_subscription_level"
         );
+    }
+
+    #[test]
+    fn claude_subscription_does_not_renew_stale_multiplier_observation() {
+        let observed_at = 1_000;
+        let now_ms = observed_at + 60_000;
+        let mut account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        account.subscription_level = Some("Claude Max 20x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_20x",
+                    "planStale": true,
+                    "planObservedAt": observed_at,
+                }
+            })),
+            ..Default::default()
+        });
+
+        let usage = json!({"plan": "claude_max"});
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, None, None, now_ms).unwrap();
+        let quota = parse_claude_quota(&usage, Some(&subscription), now_ms);
+        let extra = quota.extra_usage.unwrap();
+
+        assert_eq!(extra["subscription"]["planType"], "claude_max_20x");
+        assert_eq!(extra["subscription"]["planStale"], true);
+        assert_eq!(extra["subscription"]["planObservedAt"], observed_at);
+        assert_eq!(extra["queriedAt"], now_ms);
+    }
+
+    #[test]
+    fn claude_subscription_rejects_observation_from_a_different_cached_plan() {
+        let mut account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        account.subscription_level = Some("Claude Max 20x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_5x",
+                    "planStale": false,
+                    "planObservedAt": 900,
+                }
+            })),
+            ..Default::default()
+        });
+
+        let usage = json!({"plan": "claude_max"});
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, None, None, 1_000).unwrap();
+
+        assert_eq!(subscription.resolution.plan.plan_type(), "claude_max");
+        assert_eq!(
+            subscription.resolution.source,
+            ClaudeSubscriptionSource::UsagePlan
+        );
+        assert!(!subscription.resolution.stale);
+        assert_eq!(subscription.observed_at_ms, 1_000);
+    }
+
+    #[test]
+    fn claude_subscription_drops_expired_cached_multiplier_to_live_generic_max() {
+        let observed_at = 1_000;
+        let now_ms = observed_at + CLAUDE_PLAN_CACHE_MAX_AGE_MS + 1;
+        let mut account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        account.profile = Some(json!({
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_5x",
+            "organizationTypeObservedAt": observed_at,
+            "organizationRateLimitTierObservedAt": observed_at,
+        }));
+        account.subscription_level = Some("Claude Max 5x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_5x",
+                    "planStale": true,
+                    "planObservedAt": observed_at,
+                }
+            })),
+            ..Default::default()
+        });
+
+        let usage = json!({"plan": "claude_max"});
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, None, None, now_ms).unwrap();
+        let quota = parse_claude_quota(&usage, Some(&subscription), now_ms);
+        let extra = quota.extra_usage.unwrap();
+
+        assert_eq!(quota.credential_message.as_deref(), Some("Claude Max"));
+        assert_eq!(extra["subscription"]["planType"], "claude_max");
+        assert_eq!(extra["subscription"]["planSource"], "usage_plan");
+        assert_eq!(extra["subscription"]["planStale"], false);
+        assert_eq!(extra["subscription"]["planObservedAt"], now_ms);
+    }
+
+    #[test]
+    fn claude_subscription_clears_expired_multiplier_without_live_plan_evidence() {
+        let observed_at = 1_000;
+        let now_ms = observed_at + CLAUDE_PLAN_CACHE_MAX_AGE_MS + 1;
+        let mut account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        account.profile = Some(json!({
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_20x",
+            "organizationTypeObservedAt": observed_at,
+            "organizationRateLimitTierObservedAt": observed_at,
+        }));
+        account.subscription_level = Some("Claude Max 20x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_20x",
+                    "planStale": true,
+                    "planObservedAt": observed_at,
+                }
+            })),
+            ..Default::default()
+        });
+        let usage = json!({
+            "five_hour": {"utilization": 10.0}
+        });
+
+        let subscription = resolve_claude_quota_subscription(&account, &usage, None, None, now_ms);
+        assert!(subscription.is_none());
+        let quota = parse_claude_quota(&usage, None, now_ms);
+        let update = update_from_claude_quota(quota, account.profile.clone(), now_ms, 60_000);
+
+        assert!(update.subscription_level.is_none());
+        assert!(update.clear_subscription_level);
     }
 
     #[test]
@@ -6468,6 +6873,8 @@ mod tests {
         assert_eq!(profile["organizationUUID"], "org-1");
         assert_eq!(profile["organizationRateLimitTier"], "tier-2");
         assert_eq!(profile["bootstrapRefreshedAt"], 1234);
+        assert_eq!(profile["organizationTypeObservedAt"], 1234);
+        assert_eq!(profile["organizationRateLimitTierObservedAt"], 1234);
         assert!(profile.get("unexpected_secret").is_none());
 
         let merged = merge_profile_overlay(
@@ -6480,16 +6887,143 @@ mod tests {
     }
 
     #[test]
+    fn claude_profile_enrichment_keeps_existing_fields_when_roles_fail() {
+        let existing = json!({
+            "email": "owner@example.com",
+            "billingSource": "stripe",
+            "organizationType": "claude_max",
+            "claudeCliRoles": ["old-role"],
+        });
+        let merged = merge_claude_profile_enrichments(
+            Some(&existing),
+            None,
+            Some(json!({
+                "accountUUID": "acct-1",
+                "bootstrapRefreshedAt": 200,
+            })),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(merged["email"], "owner@example.com");
+        assert_eq!(merged["billingSource"], "stripe");
+        assert_eq!(merged["organizationType"], "claude_max");
+        assert_eq!(merged["claudeCliRoles"], json!(["old-role"]));
+        assert_eq!(merged["accountUUID"], "acct-1");
+    }
+
+    #[test]
+    fn claude_profile_enrichment_keeps_roles_when_bootstrap_fails() {
+        let existing = json!({
+            "email": "owner@example.com",
+            "billingSource": "stripe",
+        });
+        let merged = merge_claude_profile_enrichments(
+            Some(&existing),
+            Some(json!({
+                "claudeCliRoles": ["max_user"],
+                "rolesRefreshedAt": 200,
+            })),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(merged["email"], "owner@example.com");
+        assert_eq!(merged["billingSource"], "stripe");
+        assert_eq!(merged["claudeCliRoles"], json!(["max_user"]));
+        assert_eq!(merged["rolesRefreshedAt"], 200);
+    }
+
+    #[test]
+    fn claude_profile_enrichment_accumulates_all_endpoint_overlays() {
+        let existing = json!({
+            "providerType": "claude_oauth",
+            "organizationTypeObservedAt": 100,
+            "organizationRateLimitTierObservedAt": 100,
+        });
+        let merged = merge_claude_profile_enrichments(
+            Some(&existing),
+            Some(json!({
+                "claudeCliRoles": ["max_user"],
+                "rolesRefreshedAt": 200,
+            })),
+            Some(json!({
+                "accountUUID": "acct-1",
+                "organizationType": "claude_max",
+                "organizationTypeObservedAt": 300,
+                "bootstrapRefreshedAt": 300,
+            })),
+            Some(json!({
+                "organizationRateLimitTier": "default_claude_max_20x",
+                "organizationRateLimitTierObservedAt": 400,
+                "billingSource": "stripe",
+                "profileRefreshedAt": 400,
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(merged["providerType"], "claude_oauth");
+        assert_eq!(merged["claudeCliRoles"], json!(["max_user"]));
+        assert_eq!(merged["accountUUID"], "acct-1");
+        assert_eq!(merged["organizationType"], "claude_max");
+        assert_eq!(
+            merged["organizationRateLimitTier"],
+            "default_claude_max_20x"
+        );
+        assert_eq!(merged["billingSource"], "stripe");
+        assert_eq!(merged["rolesRefreshedAt"], 200);
+        assert_eq!(merged["organizationTypeObservedAt"], 300);
+        assert_eq!(merged["organizationRateLimitTierObservedAt"], 400);
+    }
+
+    #[test]
+    fn claude_profile_enrichment_does_not_refresh_unobserved_plan_evidence() {
+        let existing = json!({
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_5x",
+            "organizationTypeObservedAt": 100,
+            "organizationRateLimitTierObservedAt": 100,
+        });
+        let bootstrap = normalize_claude_bootstrap_profile(
+            &json!({"oauth_account": {"account_uuid": "acct-1"}}),
+            300,
+        );
+        let profile =
+            parse_claude_profile_lookup(&json!({"organization": {"billing_type": "stripe"}}), 400)
+                .and_then(|lookup| lookup.profile_overlay);
+        let merged = merge_claude_profile_enrichments(
+            Some(&existing),
+            Some(json!({
+                "claudeCliRoles": ["max_user"],
+                "rolesRefreshedAt": 200,
+            })),
+            bootstrap,
+            profile,
+        )
+        .unwrap();
+
+        assert_eq!(merged["rolesRefreshedAt"], 200);
+        assert_eq!(merged["bootstrapRefreshedAt"], 300);
+        assert_eq!(merged["profileRefreshedAt"], 400);
+        assert_eq!(merged["organizationTypeObservedAt"], 100);
+        assert_eq!(merged["organizationRateLimitTierObservedAt"], 100);
+    }
+
+    #[test]
     fn claude_profile_lookup_keeps_plan_and_billing_source_independent() {
-        let lookup = parse_claude_profile_lookup(&json!({
-            "organization": {
-                "uuid": "org-1",
-                "name": "Example",
-                "organization_type": "team",
-                "rate_limit_tier": "tier-2",
-                "billing_type": "apple_subscription"
-            }
-        }))
+        let lookup = parse_claude_profile_lookup(
+            &json!({
+                "organization": {
+                    "uuid": "org-1",
+                    "name": "Example",
+                    "organization_type": "team",
+                    "rate_limit_tier": "tier-2",
+                    "billing_type": "apple_subscription"
+                }
+            }),
+            1_234,
+        )
         .unwrap();
 
         assert_eq!(lookup.organization_type.as_deref(), Some("team"));
@@ -6498,17 +7032,23 @@ mod tests {
         assert_eq!(profile["organizationUUID"], "org-1");
         assert_eq!(profile["organizationName"], "Example");
         assert_eq!(profile["billingSource"], "apple_subscription");
+        assert_eq!(profile["profileRefreshedAt"], 1_234);
+        assert_eq!(profile["organizationTypeObservedAt"], 1_234);
+        assert_eq!(profile["organizationRateLimitTierObservedAt"], 1_234);
         assert!(profile.get("planType").is_none());
         assert!(profile.get("subscriptionExpiresAt").is_none());
 
-        let unknown = parse_claude_profile_lookup(&json!({
-            "organization": {"billing_type": "future_partner"}
-        }))
+        let unknown = parse_claude_profile_lookup(
+            &json!({
+                "organization": {"billing_type": "future_partner"}
+            }),
+            2_345,
+        )
         .unwrap();
-        assert_eq!(
-            unknown.profile_overlay.unwrap()["billingSource"],
-            "future_partner"
-        );
+        let unknown = unknown.profile_overlay.unwrap();
+        assert_eq!(unknown["billingSource"], "future_partner");
+        assert_eq!(unknown["profileRefreshedAt"], 2_345);
+        assert!(unknown.get("organizationTypeObservedAt").is_none());
     }
 
     #[test]

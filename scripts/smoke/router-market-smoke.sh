@@ -408,8 +408,8 @@ echo
 echo "== provider health =="
 fetch_required "provider health" "$SERVER_URL/api/providers/health" "${auth_header[@]}"
 
-echo "== recent usage logs =="
-fetch_required "recent usage logs" "$SERVER_URL/api/usage/logs?limit=20" "${auth_header[@]}"
+echo "== recent Usage requests =="
+fetch_required "recent Usage requests" "$SERVER_URL/web-api/usage/requests?limit=20" "${auth_header[@]}"
 
 echo "== summary =="
 echo "failures=${FAILURES} warnings=${WARNINGS}"

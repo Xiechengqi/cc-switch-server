@@ -145,6 +145,7 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::AgyOAuth
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
+        | ProviderType::KimiCode
         | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
         ProviderType::Claude
         | ProviderType::ClaudeAuth
@@ -376,7 +377,7 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::{AccountQuota, AccountStore, UpsertAccountInput};
 
-    const ALL_PROVIDER_TYPES: [ProviderType; 20] = [
+    const ALL_PROVIDER_TYPES: [ProviderType; 21] = [
         ProviderType::Claude,
         ProviderType::ClaudeAuth,
         ProviderType::ClaudeOAuth,
@@ -388,6 +389,7 @@ mod tests {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::KimiCode,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -433,7 +435,7 @@ mod tests {
 
     #[test]
     fn capability_matrix_covers_every_provider_type() {
-        assert_eq!(ALL_PROVIDER_TYPES.len(), 20);
+        assert_eq!(ALL_PROVIDER_TYPES.len(), 21);
         for provider_type in ALL_PROVIDER_TYPES {
             let expected = match provider_type {
                 ProviderType::ClaudeOAuth => SubscriptionExpiryCapability::ManualRequired,
@@ -446,6 +448,7 @@ mod tests {
                 | ProviderType::AgyOAuth
                 | ProviderType::GitHubCopilot
                 | ProviderType::KiroOAuth
+                | ProviderType::KimiCode
                 | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
                 _ => SubscriptionExpiryCapability::NotApplicable,
             };

@@ -596,6 +596,7 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::KimiCode,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -652,7 +653,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::DeepSeekAccount) => {
             planned("claude_deepseek_account_planned")
         }
-        (AppKind::Claude, ProviderType::KiroOAuth) => planned("claude_kiro_codewhisperer_planned"),
+        (AppKind::Claude, ProviderType::KiroOAuth) => {
+            ("claude_kiro_codewhisperer", AdapterSupport::Native)
+        }
         (AppKind::Claude, ProviderType::CursorOAuth) => {
             ("claude_cursor_agentservice", AdapterSupport::Native)
         }
@@ -674,6 +677,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Claude, ProviderType::GrokOAuth) => {
             ("claude_to_grok_responses", AdapterSupport::Native)
+        }
+        (AppKind::Claude, ProviderType::KimiCode) => {
+            ("claude_to_kimi_chat", AdapterSupport::Native)
         }
 
         (AppKind::Codex, ProviderType::Codex) => {
@@ -703,7 +709,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Codex, ProviderType::GitHubCopilot) => fallback("codex_copilot_skeleton"),
         (AppKind::Codex, ProviderType::DeepSeekAccount) => fallback("codex_deepseek_skeleton"),
-        (AppKind::Codex, ProviderType::KiroOAuth) => fallback("codex_kiro_skeleton"),
+        (AppKind::Codex, ProviderType::KiroOAuth) => {
+            ("codex_to_kiro_anthropic", AdapterSupport::Native)
+        }
         (AppKind::Codex, ProviderType::AntigravityOAuth | ProviderType::AgyOAuth) => {
             ("codex_antigravity_gemini_native", AdapterSupport::Native)
         }
@@ -714,6 +722,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::GrokOAuth) => {
             ("codex_grok_responses", AdapterSupport::Native)
         }
+        (AppKind::Codex, ProviderType::KimiCode) => ("codex_to_kimi_chat", AdapterSupport::Native),
 
         (AppKind::Gemini, ProviderType::Gemini) => ("gemini_api_key", AdapterSupport::Native),
         (AppKind::Gemini, ProviderType::GeminiCli) => {
@@ -750,6 +759,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Gemini, ProviderType::GrokOAuth) => {
             ("gemini_to_grok_responses", AdapterSupport::Native)
+        }
+        (AppKind::Gemini, ProviderType::KimiCode) => {
+            ("gemini_to_kimi_chat", AdapterSupport::Native)
         }
     };
 
@@ -790,6 +802,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::GrokOAuth
+                | ProviderType::KimiCode
         ),
         AppKind::Codex => matches!(
             provider_type,
@@ -808,6 +821,8 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::KiroOAuth
+                | ProviderType::KimiCode
         ),
         AppKind::Gemini => matches!(
             provider_type,
@@ -824,6 +839,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::KimiCode
         ),
     }
 }
@@ -848,6 +864,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::KiroOAuth
                 | ProviderType::DeepSeekAccount
                 | ProviderType::GrokOAuth
+                | ProviderType::KimiCode
         ) | (
             AppKind::Codex,
             ProviderType::Claude
@@ -864,6 +881,8 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::KiroOAuth
+                | ProviderType::KimiCode
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -880,6 +899,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::KimiCode
         )
     )
 }
@@ -895,6 +915,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::KiroOAuth
         ) | (
             AppKind::Codex,
             ProviderType::Codex
@@ -903,6 +924,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::KiroOAuth
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -932,6 +954,7 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         | ProviderType::CodexOAuth
         | ProviderType::OllamaCloud
         | ProviderType::GrokOAuth => AppKind::Codex,
+        ProviderType::KimiCode => AppKind::Codex,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {
@@ -1382,6 +1405,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
     match stored.app {
         AppKind::Claude => match stored.provider_type {
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
+            ProviderType::KiroOAuth => Some(UpstreamFormat::AnthropicMessages),
             ProviderType::GitHubCopilot => Some(UpstreamFormat::OpenAiChat),
             ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
                 Some(UpstreamFormat::OpenAiChat)
@@ -1389,6 +1413,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::OllamaCloud => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Nvidia => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
+            ProviderType::KimiCode => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Gemini | ProviderType::GeminiCli => Some(UpstreamFormat::GeminiNative),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1404,6 +1429,8 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             }
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
+            ProviderType::KimiCode => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::KiroOAuth => Some(UpstreamFormat::AnthropicMessages),
             ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
                 Some(UpstreamFormat::AnthropicMessages)
             }
@@ -1424,6 +1451,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             }
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
+            ProviderType::KimiCode => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1850,6 +1878,9 @@ pub(super) fn finalize_runtime_request(
     stored: &StoredProvider,
     request: &mut AdapterRequest,
 ) -> Result<(), ProxyError> {
+    if stored.provider_type == ProviderType::KimiCode {
+        super::kimi::finalize_request(plan, request)?;
+    }
     if plan.driver_id.as_str() == "http.bedrock_bearer" {
         apply_bedrock_bearer_forward_contract(plan, request)?;
     }
@@ -1869,6 +1900,9 @@ pub(super) fn finalize_runtime_protocol_auth(
     endpoint: &mut String,
     headers: &mut Vec<(String, String)>,
 ) -> Result<(), ProxyError> {
+    if stored.provider_type == ProviderType::KimiCode {
+        super::kimi::finalize_account_identity(plan, accounts, headers)?;
+    }
     if is_gemini_v1internal_provider_type(stored.provider_type) {
         apply_gemini_v1internal_contract(plan, stored, accounts, request, endpoint)?;
     }
@@ -4269,12 +4303,25 @@ mod tests {
     }
 
     #[test]
-    fn claude_kiro_capability_is_planned_with_stream_usage() {
-        let capability = capability_for(AppKind::Claude, ProviderType::KiroOAuth);
-        assert_eq!(capability.adapter, "claude_kiro_codewhisperer_planned");
-        assert_eq!(capability.support, AdapterSupport::Planned);
-        assert!(capability.requires_transform);
-        assert!(capability.supports_stream_usage);
+    fn kiro_capabilities_are_native_for_claude_and_codex_only() {
+        for (app, adapter) in [
+            (AppKind::Claude, "claude_kiro_codewhisperer"),
+            (AppKind::Codex, "codex_to_kiro_anthropic"),
+        ] {
+            let capability = capability_for(app, ProviderType::KiroOAuth);
+            assert_eq!(capability.adapter, adapter);
+            assert_eq!(capability.support, AdapterSupport::Native);
+            assert!(capability.requires_transform);
+            assert!(capability.supports_stream_usage);
+            assert!(capability.supports_model_list);
+        }
+
+        let gemini = capability_for(AppKind::Gemini, ProviderType::KiroOAuth);
+        assert_eq!(gemini.adapter, "gemini_kiro_skeleton");
+        assert_eq!(gemini.support, AdapterSupport::GenericFallback);
+        assert!(!gemini.requires_transform);
+        assert!(!gemini.supports_stream_usage);
+        assert!(!gemini.supports_model_list);
     }
 
     #[test]
@@ -4303,11 +4350,6 @@ mod tests {
                 AppKind::Codex,
                 ProviderType::DeepSeekAccount,
                 "codex_deepseek_skeleton",
-            ),
-            (
-                AppKind::Codex,
-                ProviderType::KiroOAuth,
-                "codex_kiro_skeleton",
             ),
             (
                 AppKind::Gemini,
@@ -5068,7 +5110,7 @@ mod tests {
     #[test]
     fn exposes_all_provider_type_capabilities_for_each_app() {
         let capabilities = all_capabilities();
-        assert_eq!(capabilities.len(), 60);
+        assert_eq!(capabilities.len(), 63);
         assert!(capabilities.iter().any(|item| {
             item.app == AppKind::Gemini && item.provider_type == ProviderType::AntigravityOAuth
         }));

@@ -1,0 +1,84 @@
+{
+  "format": "cc-switch-claude-oauth-wire-profile",
+  "schemaVersion": 1,
+  "profileId": "claude-code-2.1.220-captured-2026-08-09",
+  "capturedAt": "2026-08-09T00:00:00Z",
+  "versions": {
+    "claudeCode": "2.1.220",
+    "stainlessSdk": "0.94.0",
+    "node": "v26.3.0",
+    "axios": "1.15.2"
+  },
+  "endpointIdentities": {
+    "usage": "claude-code/2.1.220",
+    "bootstrap": "claude-cli/2.1.220 (external, cli)",
+    "profile": "axios/1.15.2",
+    "roles": "axios/1.15.2",
+    "token": "axios/1.15.2",
+    "inference": {
+      "userAgent": "claude-cli/2.1.220 (external, cli)",
+      "xStainlessPackageVersion": "0.94.0",
+      "xStainlessRuntime": "node",
+      "xStainlessRuntimeVersion": "v26.3.0"
+    }
+  },
+  "tokenEndpointOrder": [
+    "https://platform.claude.com/v1/oauth/token",
+    "https://api.anthropic.com/v1/oauth/token"
+  ],
+  "billing": {
+    "ccEntrypoint": "cli",
+    "versionStrategy": "public_cli_version_without_guessed_build_suffix",
+    "privateBuildSuffixInvented": false
+  },
+  "cch": {
+    "algorithm": "xxhash64_seeded_canonical_body",
+    "seedHex": "6e52736ac806831e",
+    "signedAfterBodyNormalization": true
+  },
+  "betaMatrices": {
+    "messages": {
+      "always": ["claude-code-20250219", "oauth-2025-04-20"],
+      "shapeGated": [
+        "interleaved-thinking-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14",
+        "computer-use-2024-10-22",
+        "context-management-2025-06-27",
+        "context-1m-2025-08-07",
+        "effort-2025-11-24",
+        "extended-cache-ttl-2025-04-11"
+      ],
+      "auditedClientCompatibility": [
+        "prompt-caching-2024-07-31",
+        "token-efficient-tools-2025-02-19"
+      ]
+    },
+    "countTokens": {
+      "always": [
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+        "token-counting-2024-11-01"
+      ],
+      "shapeGated": ["context-1m-2025-08-07"],
+      "generationOnlyBetasAllowed": false,
+      "auditedClientCompatibility": [
+        "prompt-caching-2024-07-31",
+        "token-efficient-tools-2025-02-19"
+      ]
+    }
+  },
+  "modelCatalog": {
+    "source": "claude_code_wire_profile",
+    "stale": false,
+    "models": [
+      "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5-20251001"
+    ]
+  },
+  "provenance": {
+    "kind": "sanitized_protocol_capture",
+    "containsSecrets": false,
+    "notes": "Values retain only public endpoint, version, header-family, beta-policy, and model identifiers required by the Server contract. Tokens, account identifiers, request bodies, response bodies, and private build metadata are excluded."
+  }
+}

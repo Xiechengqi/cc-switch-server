@@ -3,8 +3,10 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use serde::Serialize;
 
@@ -15,6 +17,7 @@ use crate::logging::{
 
 const PERSISTENT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const PERSISTENT_LOG_BACKUP_COUNT: usize = 2;
+const PERSISTENT_LOG_WRITE_QUEUE_CAPACITY: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogTailAccessError {
@@ -42,20 +45,53 @@ pub struct LogTailResponse {
 #[derive(Debug)]
 pub struct LogCapture {
     enabled: AtomicBool,
-    file_error_reported: AtomicBool,
+    file_error_reported: Arc<AtomicBool>,
     buffer: Mutex<VecDeque<String>>,
     file_path: Mutex<PathBuf>,
     capacity: usize,
+    file_sender: Option<SyncSender<(PathBuf, String)>>,
+    file_writer: Option<JoinHandle<()>>,
+    dropped_file_lines: AtomicU64,
 }
 
 impl LogCapture {
     pub fn new(capacity: usize) -> Self {
+        let (file_sender, file_receiver) =
+            mpsc::sync_channel::<(PathBuf, String)>(PERSISTENT_LOG_WRITE_QUEUE_CAPACITY);
+        let file_error_reported = Arc::new(AtomicBool::new(false));
+        let writer_error = file_error_reported.clone();
+        let file_writer = std::thread::Builder::new()
+            .name("cc-switch-log-writer".to_string())
+            .spawn(move || {
+                while let Ok((path, line)) = file_receiver.recv() {
+                    match append_rotating_line(
+                        &path,
+                        &line,
+                        PERSISTENT_LOG_MAX_BYTES,
+                        PERSISTENT_LOG_BACKUP_COUNT,
+                    ) {
+                        Ok(()) => writer_error.store(false, Ordering::Relaxed),
+                        Err(error) => {
+                            if !writer_error.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "cc-switch-server persistent log write failed for {}: {error}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn persistent log writer");
         Self {
             enabled: AtomicBool::new(true),
-            file_error_reported: AtomicBool::new(false),
+            file_error_reported,
             buffer: Mutex::new(VecDeque::with_capacity(capacity.min(RING_BUFFER_CAPACITY))),
             file_path: Mutex::new(PathBuf::new()),
             capacity: capacity.min(RING_BUFFER_CAPACITY),
+            file_sender: Some(file_sender),
+            file_writer: Some(file_writer),
+            dropped_file_lines: AtomicU64::new(0),
         }
     }
 
@@ -75,32 +111,36 @@ impl LogCapture {
             return;
         }
         let stored = trimmed.to_string();
-        {
-            let file_path = self.file_path.lock().expect("log file path lock");
-            if !file_path.as_os_str().is_empty() {
-                match append_rotating_line(
-                    &file_path,
-                    &stored,
-                    PERSISTENT_LOG_MAX_BYTES,
-                    PERSISTENT_LOG_BACKUP_COUNT,
-                ) {
-                    Ok(()) => self.file_error_reported.store(false, Ordering::Relaxed),
-                    Err(error) => {
-                        if !self.file_error_reported.swap(true, Ordering::Relaxed) {
-                            eprintln!(
-                                "cc-switch-server persistent log write failed for {}: {error}",
-                                file_path.display()
-                            );
-                        }
-                    }
-                }
-            }
-        }
         let mut buffer = self.buffer.lock().expect("log buffer lock");
         if buffer.len() >= self.capacity {
             buffer.pop_front();
         }
-        buffer.push_back(stored);
+        buffer.push_back(stored.clone());
+        drop(buffer);
+
+        let file_path = self.file_path.lock().expect("log file path lock").clone();
+        if file_path.as_os_str().is_empty() {
+            return;
+        }
+        let Some(file_sender) = self.file_sender.as_ref() else {
+            return;
+        };
+        match file_sender.try_send((file_path, stored)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let dropped = self.dropped_file_lines.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped == 1 || dropped.is_power_of_two() {
+                    eprintln!(
+                        "cc-switch-server persistent log queue is full; dropped {dropped} file lines"
+                    );
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                if !self.file_error_reported.swap(true, Ordering::Relaxed) {
+                    eprintln!("cc-switch-server persistent log writer is unavailable");
+                }
+            }
+        }
     }
 
     pub fn tail_lines(&self, lines: usize) -> Vec<String> {
@@ -155,7 +195,20 @@ impl LogCapture {
     }
 }
 
-fn append_rotating_line(
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        drop(self.file_sender.take());
+        if self
+            .file_writer
+            .take()
+            .is_some_and(|writer| writer.join().is_err())
+        {
+            eprintln!("cc-switch-server persistent log writer panicked during shutdown");
+        }
+    }
+}
+
+pub(super) fn append_rotating_line(
     path: &Path,
     line: &str,
     max_bytes: u64,
@@ -267,7 +320,7 @@ fn tail_rotating_files(path: &Path, lines: usize, backup_count: usize) -> io::Re
     Ok(collected)
 }
 
-fn rotated_path(path: &Path, index: usize) -> PathBuf {
+pub(super) fn rotated_path(path: &Path, index: usize) -> PathBuf {
     let mut rotated = path.as_os_str().to_os_string();
     rotated.push(format!(".{index}"));
     PathBuf::from(rotated)
@@ -320,6 +373,7 @@ mod tests {
         capture.push_line("three".into());
         let lines = capture.tail_lines(10);
         assert_eq!(lines, vec!["two", "three"]);
+        drop(capture);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -336,6 +390,21 @@ mod tests {
         assert_eq!(tail.content, "current process");
         assert_eq!(tail.lines, 1);
         assert!(!tail.truncated);
+        drop(capture);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dropping_capture_drains_persistent_log_queue() {
+        let path = test_log_path("drain-on-drop");
+        let capture = LogCapture::new(10);
+        capture.set_file_path_for_test(path.clone());
+        capture.push_line("one".into());
+        capture.push_line("two".into());
+
+        drop(capture);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

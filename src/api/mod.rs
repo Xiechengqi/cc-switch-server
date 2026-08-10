@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod web;
 
@@ -14,6 +14,7 @@ pub(in crate::api) mod logs;
 pub(in crate::api) mod models;
 pub(in crate::api) mod provider_health_scheduler;
 pub(in crate::api) mod providers;
+mod request_audit;
 pub(in crate::api) mod router;
 pub(in crate::api) mod self_update;
 pub(crate) mod session;
@@ -41,7 +42,7 @@ pub use error::ApiError;
 pub(crate) use error::{
     map_account_write_error, map_codex_active_account_selection_error, map_codex_device_error,
     map_codex_workspace_rebind_error, map_copilot_device_error, map_email_auth_error,
-    map_grok_device_error, map_kiro_device_error, map_share_patch_error,
+    map_grok_device_error, map_kimi_device_error, map_kiro_device_error, map_share_patch_error,
     map_subscription_binding_error, map_web_auth_error, ErrorResponse, InferenceApiError,
     InferenceSurface,
 };
@@ -85,14 +86,18 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
+use request_audit::{
+    audit_inference_request, is_inference_path, new_transport_request_id, record_ingress_rejection,
+};
+
 use crate::api::web::assets as web_assets;
 use crate::api::web::coverage::ProviderCoverage;
 use crate::api::web::runtime::{self as web_runtime, WebRuntimeCommandSupport};
 use crate::build_info::build_info;
 use crate::clients::oauth::quota::{refresh_account_quota, QuotaRefreshResult};
 use crate::clients::oauth::refresh::{
-    account_needs_native_refresh, execute_oauth_json_request, execute_oauth_token_request,
-    provider_native_refresh_available, AccountRefreshFailure,
+    execute_oauth_json_request, execute_oauth_token_request, provider_native_refresh_available,
+    AccountRefreshFailure,
 };
 
 use crate::domain::accounts::cursor_import::{
@@ -127,7 +132,6 @@ use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
     Share, ShareAcl, ShareBinding, ShareDeleteTombstone, ShareStore, UpsertShareInput,
 };
-use crate::domain::usage::store::{UsageStatsFilter, UsageStore};
 use crate::proxy::adapters::ProviderAdapter;
 use crate::proxy::{self, ProxyRoute};
 use crate::state::{ServerEvent, ServerState, Session, ShareInFlightGuard};
@@ -151,7 +155,45 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
 
     provider_health_scheduler::spawn_share_model_health_scheduler(state.clone());
     tracing::info!("cc-switch-server listening on {}", state.bind_addr);
-    axum::serve(listener, app).await.context("serve http")
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state))
+        .await
+        .context("serve http")
+}
+
+async fn shutdown_signal(state: ServerState) {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "failed to listen for Ctrl-C");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to listen for SIGTERM");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    state.begin_managed_account_refresh_shutdown();
+    if !state
+        .drain_managed_account_refreshes(Duration::from_secs(35))
+        .await
+    {
+        tracing::error!("managed OAuth refresh owners did not drain before the shutdown deadline");
+    }
 }
 
 pub fn app_router(state: ServerState) -> Router {
@@ -370,6 +412,18 @@ pub fn app_router(state: ServerState) -> Router {
             "/api/accounts/grok/device/cancel",
             post(cancel_grok_device_login),
         )
+        .route(
+            "/api/accounts/kimi/device/start",
+            post(start_kimi_device_login),
+        )
+        .route(
+            "/api/accounts/kimi/device/poll",
+            post(poll_kimi_device_login),
+        )
+        .route(
+            "/api/accounts/kimi/device/cancel",
+            post(cancel_kimi_device_login),
+        )
         .route("/api/accounts/:id", delete(delete_account))
         .route(
             "/api/accounts/:id/delete-preview",
@@ -378,12 +432,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/accounts/:id/refresh", post(refresh_account))
         .route("/api/accounts/:id/refresh-plan", get(account_refresh_plan))
         .route("/api/accounts/:id/quota", get(account_quota))
-        .route("/api/usage/trends", get(usage_trends))
-        .route("/api/usage/provider-stats", get(usage_provider_stats))
-        .route("/api/usage/model-stats", get(usage_model_stats))
-        .route("/api/usage/logs/:id", get(usage_log_detail))
-        .route("/api/usage/logs", get(usage_logs))
-        .route("/api/usage/summary", get(usage_summary))
         .route("/api/provider-limits", get(provider_limits))
         .route(
             "/api/providers/:id/limits",
@@ -467,6 +515,17 @@ pub fn app_router(state: ServerState) -> Router {
             get(openai_cli_oauth_callback),
         )
         .route("/web-api/context", get(web_runtime_context))
+        .route("/web-api/usage/overview", get(usage_overview))
+        .route("/web-api/usage/trends", get(usage_trends))
+        .route("/web-api/usage/facets", get(usage_facets))
+        .route(
+            "/web-api/usage/provider-bundles",
+            get(usage_provider_bundles),
+        )
+        .route("/web-api/usage/models", get(usage_models))
+        .route("/web-api/usage/shares", get(usage_shares))
+        .route("/web-api/usage/requests/:id", get(usage_request_detail))
+        .route("/web-api/usage/requests", get(usage_requests))
         .route("/web-api/invoke/*command", post(web_invoke_compat))
         .route(
             "/web-api/terminal/stream",
@@ -508,7 +567,7 @@ pub fn app_router(state: ServerState) -> Router {
             "/web-api/admin/logs/tail",
             get(crate::api::logs::admin_logs_tail),
         )
-        .merge(inference_router())
+        .merge(inference_router(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             verify_router_ingress,
@@ -538,7 +597,7 @@ pub fn app_router(state: ServerState) -> Router {
     app
 }
 
-fn inference_router() -> Router<ServerState> {
+fn inference_router(state: ServerState) -> Router<ServerState> {
     Router::new()
         .route("/v1/models", get(proxy_models_or_manifest))
         .route("/models", get(proxy_models_or_manifest))
@@ -658,6 +717,10 @@ fn inference_router() -> Router<ServerState> {
         .route("/gemini/v1/*path", any(proxy_gemini))
         .route("/gemini/v1beta/*path", any(proxy_gemini))
         .layer(middleware::from_fn(require_router_share_ingress))
+        .layer(middleware::from_fn_with_state(
+            state,
+            audit_inference_request,
+        ))
 }
 
 async fn require_router_share_ingress(request: Request, next: Next) -> Response {
@@ -681,6 +744,12 @@ async fn verify_router_ingress(
 ) -> Response {
     use crate::clients::router::ingress::{INGRESS_CONTEXT_HEADER, INGRESS_SIGNATURE_HEADER};
 
+    let transport_request_id = new_transport_request_id();
+    request
+        .extensions_mut()
+        .insert(transport_request_id.clone());
+    let audit_method = request.method().clone();
+    let audit_path = request.uri().path().to_string();
     let encoded = request
         .headers()
         .get(INGRESS_CONTEXT_HEADER)
@@ -699,7 +768,11 @@ async fn verify_router_ingress(
         "x-cc-switch-share-host",
         "x-cc-switch-user-email",
         "x-cc-switch-user-country",
+        "x-cc-switch-user-country-iso3",
         "x-cc-switch-request-id",
+        "x-cc-switch-health-check",
+        "x-cc-switch-data-source",
+        "x-cc-switch-source",
         "x-cc-switch-web-user-email",
         "x-cc-switch-web-role",
         "x-cc-switch-installation-id",
@@ -714,22 +787,46 @@ async fn verify_router_ingress(
         (Some(encoded), Some(signature)) => {
             let config = state.config.read().await;
             let Some(identity) = config.registered_router_identity() else {
-                return router_ingress_rejection("router_identity_unavailable", None);
+                return audited_router_ingress_rejection(
+                    &state,
+                    &audit_method,
+                    &audit_path,
+                    &transport_request_id,
+                    "router_identity_unavailable",
+                    None,
+                );
             };
             let Some(control_secret) = identity.control_secret.as_deref() else {
-                return router_ingress_rejection("control_secret_unavailable", None);
+                return audited_router_ingress_rejection(
+                    &state,
+                    &audit_method,
+                    &audit_path,
+                    &transport_request_id,
+                    "control_secret_unavailable",
+                    None,
+                );
             };
             let router_id = match crate::clients::router::client::tunnel_router_id(&config) {
                 Ok(router_id) => router_id,
-                Err(_) => return router_ingress_rejection("router_binding_invalid", None),
+                Err(_) => {
+                    return audited_router_ingress_rejection(
+                        &state,
+                        &audit_method,
+                        &audit_path,
+                        &transport_request_id,
+                        "router_binding_invalid",
+                        None,
+                    )
+                }
             };
-            match crate::clients::router::ingress::verify(
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            match crate::clients::router::ingress::verify_envelope(
                 &encoded,
                 &signature,
                 control_secret,
                 &router_id,
                 &identity.installation_id,
-                chrono::Utc::now().timestamp_millis(),
+                now_ms,
             ) {
                 Ok(context) => Some(context),
                 Err(error) => {
@@ -740,11 +837,27 @@ async fn verify_router_ingress(
                         ingress_age_ms = timing.map(|(issued_at_ms, now_ms)| now_ms.saturating_sub(issued_at_ms)),
                         "router ingress context rejected"
                     );
-                    return router_ingress_rejection(error.code(), timing);
+                    return audited_router_ingress_rejection(
+                        &state,
+                        &audit_method,
+                        &audit_path,
+                        &transport_request_id,
+                        error.code(),
+                        timing,
+                    );
                 }
             }
         }
-        _ => return router_ingress_rejection("headers_incomplete", None),
+        _ => {
+            return audited_router_ingress_rejection(
+                &state,
+                &audit_method,
+                &audit_path,
+                &transport_request_id,
+                "headers_incomplete",
+                None,
+            )
+        }
     };
 
     let Some(context) = context else {
@@ -752,6 +865,76 @@ async fn verify_router_ingress(
         strip_internal_ingress_response_headers(&mut response);
         return response;
     };
+    if context.signature_version == crate::clients::router::ingress::SIGNATURE_VERSION_V2 {
+        let method = request.method().as_str().to_string();
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map(|target| target.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let body_limit = router_ingress_body_limit(request.uri().path());
+        let (parts, body) = request.into_parts();
+        let body = match axum::body::to_bytes(body, body_limit).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(body_limit, error = %error, "router ingress request body rejected");
+                record_ingress_rejection(
+                    &state,
+                    &audit_method,
+                    &audit_path,
+                    &transport_request_id,
+                    "request_body_too_large",
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                );
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
+        };
+        let body_sha256 = crate::clients::router::ingress::body_sha256_hex(&body);
+        if let Err(error) = crate::clients::router::ingress::verify_request_binding(
+            &context,
+            &method,
+            &path_and_query,
+            &body_sha256,
+        ) {
+            tracing::warn!(
+                error = %error,
+                ingress_error = error.code(),
+                "router ingress request binding rejected"
+            );
+            return audited_router_ingress_rejection(
+                &state,
+                &audit_method,
+                &audit_path,
+                &transport_request_id,
+                error.code(),
+                None,
+            );
+        }
+        request = Request::from_parts(parts, Body::from(body));
+    }
+    match state.accept_router_ingress_request(&context, chrono::Utc::now().timestamp_millis()) {
+        crate::clients::router::ingress::IngressReplayDecision::Accepted => {}
+        crate::clients::router::ingress::IngressReplayDecision::Replay => {
+            return audited_router_ingress_rejection(
+                &state,
+                &audit_method,
+                &audit_path,
+                &transport_request_id,
+                "replayed_request_id",
+                None,
+            );
+        }
+        crate::clients::router::ingress::IngressReplayDecision::Capacity => {
+            return audited_router_ingress_rejection(
+                &state,
+                &audit_method,
+                &audit_path,
+                &transport_request_id,
+                "replay_cache_capacity",
+                None,
+            );
+        }
+    }
     request.extensions_mut().insert(context.clone());
     let headers = request.headers_mut();
     for (name, value) in [
@@ -800,6 +983,37 @@ async fn verify_router_ingress(
     let mut response = next.run(request).await;
     strip_internal_ingress_response_headers(&mut response);
     response
+}
+
+fn audited_router_ingress_rejection(
+    state: &ServerState,
+    method: &Method,
+    path: &str,
+    transport_request_id: &request_audit::TransportRequestId,
+    code: &'static str,
+    timing: Option<(i64, i64)>,
+) -> Response {
+    if is_inference_path(path) {
+        record_ingress_rejection(
+            state,
+            method,
+            path,
+            transport_request_id,
+            code,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+    router_ingress_rejection(code, timing)
+}
+
+fn router_ingress_body_limit(path: &str) -> usize {
+    match path {
+        "/v1/images/generations" | "/images/generations" | "/v1/images/edits" | "/images/edits" => {
+            proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
+        }
+        "/v1/videos/generations" | "/videos/generations" => proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        _ => 2 * 1024 * 1024,
+    }
 }
 
 fn router_ingress_rejection(code: &'static str, timing: Option<(i64, i64)>) -> Response {
@@ -1040,9 +1254,82 @@ async fn proxy_models_for_selection(
 ) -> Json<OpenAiModelsResponse> {
     let providers = state.providers.read().await.clone();
     let mut data = openai_model_list(&providers.providers, app, provider_id);
+    let claude_catalog = resolve_claude_catalog_provider(&providers, app, provider_id)
+        .map(|_| crate::clients::oauth::claude_models::static_claude_model_catalog());
     let cursor_catalog =
         append_cursor_api_key_models(state, &providers.providers, app, provider_id, &mut data)
             .await;
+    let kiro_provider = resolve_kiro_catalog_provider(&providers, app, provider_id).cloned();
+    let kiro_catalog = if let Some(provider) = kiro_provider.as_ref() {
+        if let Some((account_id, expected_generation)) =
+            kiro_catalog_managed_account_binding(&providers, provider)
+        {
+            let refresh = state
+                .refresh_managed_account_if_needed_for_generation(
+                    ProviderType::KiroOAuth,
+                    &account_id,
+                    expected_generation,
+                )
+                .await;
+            if let Err(error) = refresh {
+                tracing::warn!(error = ?error, "Kiro model discovery token refresh failed");
+                Some(crate::clients::oauth::kiro_runtime::static_model_catalog(
+                    "token_refresh_failed",
+                ))
+            } else if let Some(account) = state
+                .find_account_for_provider(ProviderType::KiroOAuth, &account_id)
+                .await
+                .filter(|account| account.auth_identity_generation == expected_generation)
+            {
+                #[cfg(test)]
+                let endpoint_override = providers
+                    .runtime_plan(provider.app, &provider.provider.id)
+                    .and_then(|plan| {
+                        plan.driver_options
+                            .get("testKiroModelsUrl")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                #[cfg(not(test))]
+                let endpoint_override: Option<&str> = None;
+                Some(
+                    crate::clients::oauth::kiro_runtime::model_catalog(
+                        &state.http_client().await,
+                        &account,
+                        endpoint_override.as_deref(),
+                    )
+                    .await,
+                )
+            } else {
+                Some(crate::clients::oauth::kiro_runtime::static_model_catalog(
+                    "bound_account_unavailable",
+                ))
+            }
+        } else {
+            Some(crate::clients::oauth::kiro_runtime::static_model_catalog(
+                "managed_account_binding_unavailable",
+            ))
+        }
+    } else {
+        None
+    };
+    if let (Some(provider), Some(catalog)) = (kiro_provider.as_ref(), kiro_catalog.as_ref()) {
+        // A live bound-account catalog replaces the static fallback for this exact Provider.
+        data.clear();
+        let owned_by = model_owner(provider);
+        for id in &catalog.models {
+            if !data.iter().any(|model| model.id == *id) {
+                data.push(OpenAiModel {
+                    id: id.clone(),
+                    object: "model",
+                    owned_by: owned_by.clone(),
+                    reasoning_efforts: None,
+                    input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+                });
+            }
+        }
+        data.sort_by(|left, right| left.id.cmp(&right.id));
+    }
     let grok_provider = resolve_grok_catalog_provider(&providers, app, provider_id).cloned();
     #[cfg(test)]
     let grok_models_test_url = grok_provider.as_ref().and_then(|provider| {
@@ -1170,6 +1457,16 @@ async fn proxy_models_for_selection(
             .as_ref()
             .map(|catalog| catalog.source.to_string())
             .or_else(|| {
+                kiro_catalog
+                    .as_ref()
+                    .map(|catalog| catalog.source.to_string())
+            })
+            .or_else(|| {
+                claude_catalog
+                    .as_ref()
+                    .map(|catalog| catalog.source.to_string())
+            })
+            .or_else(|| {
                 cursor_catalog
                     .as_ref()
                     .map(|_| "cursor_public_api".to_string())
@@ -1177,9 +1474,13 @@ async fn proxy_models_for_selection(
         stale: grok_catalog
             .as_ref()
             .map(|catalog| catalog.stale)
+            .or_else(|| kiro_catalog.as_ref().map(|catalog| catalog.stale))
+            .or_else(|| claude_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| cursor_catalog.as_ref().map(|catalog| catalog.stale)),
         fetched_at_ms: grok_catalog
             .and_then(|catalog| catalog.fetched_at_ms)
+            .or_else(|| kiro_catalog.and_then(|catalog| catalog.fetched_at_ms))
+            .or_else(|| claude_catalog.map(|catalog| catalog.fetched_at_ms))
             .or_else(|| cursor_catalog.map(|catalog| catalog.fetched_at_ms)),
     })
 }
@@ -1266,20 +1567,20 @@ async fn append_cursor_api_key_models(
             },
         });
         let owner = model_owner(provider);
+        let mut occupied = data
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         for model in catalog.models {
-            if data
-                .iter()
-                .any(|existing| existing.id == model && existing.owned_by == owner)
-            {
-                continue;
+            for id in cursor_catalog_ids(&model, &mut occupied) {
+                data.push(OpenAiModel {
+                    id,
+                    object: "model",
+                    owned_by: owner.clone(),
+                    reasoning_efforts: None,
+                    input_modalities: None,
+                });
             }
-            data.push(OpenAiModel {
-                id: model,
-                object: "model",
-                owned_by: owner.clone(),
-                reasoning_efforts: None,
-                input_modalities: None,
-            });
         }
     }
     data.sort_by(|left, right| {
@@ -1288,6 +1589,22 @@ async fn append_cursor_api_key_models(
             .then_with(|| left.owned_by.cmp(&right.owned_by))
     });
     used_catalog
+}
+
+fn cursor_catalog_ids(
+    model: &str,
+    occupied: &mut std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(model.to_string())
+        .chain(crate::proxy::cursor::model::cursor_namespaced_model_ids(
+            model,
+        ))
+        .filter(|id| occupied.insert(id.clone()))
+        .collect()
 }
 
 fn cursor_provider_api_key(provider: &StoredProvider) -> Option<String> {
@@ -1352,6 +1669,22 @@ mod cursor_provider_api_key_tests {
             provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
             resource: ProviderResourceMetadata::default(),
         }
+    }
+
+    #[test]
+    fn cursor_catalog_keeps_non_conflicting_ids_and_namespaces_every_wire_model() {
+        let mut occupied = ["cursor".to_string(), "shared-model".to_string()]
+            .into_iter()
+            .collect();
+
+        let ids = cursor_catalog_ids("shared-model", &mut occupied);
+
+        assert!(!ids.iter().any(|id| id == "shared-model"));
+        assert!(ids.iter().any(|id| id == "cursor:shared-model"));
+        assert!(ids.iter().any(|id| id == "cursor-agent:shared-model"));
+        assert!(ids.iter().any(|id| id == "cursor-plan:shared-model"));
+        assert!(ids.iter().any(|id| id == "cursor-ask:shared-model"));
+        assert_eq!(ids.len(), 4);
     }
 
     #[test]
@@ -1528,6 +1861,21 @@ fn resolve_grok_catalog_provider<'a>(
     matches.next().is_none().then_some(provider)
 }
 
+fn resolve_claude_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::ClaudeOAuth
+            && provider.provider.id == provider_id
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
+}
+
 fn grok_catalog_managed_account_binding(
     providers: &crate::domain::providers::store::ProviderStore,
     provider: &StoredProvider,
@@ -1543,6 +1891,42 @@ fn grok_catalog_managed_account_binding(
         RuntimeAuthRef::ManagedAccount {
             account_id,
             expected_provider_type: ProviderType::GrokOAuth,
+            auth_identity_generation,
+        } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
+        _ => None,
+    }
+}
+
+fn resolve_kiro_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::KiroOAuth
+            && provider.provider.id == provider_id
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
+}
+
+fn kiro_catalog_managed_account_binding(
+    providers: &crate::domain::providers::store::ProviderStore,
+    provider: &StoredProvider,
+) -> Option<(String, u64)> {
+    let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
+    if plan.provider_revision != provider.resource.revision
+        || plan.configuration_state == RuntimeConfigurationState::NeedsAttention
+        || plan.driver_id.as_str() != "special.kiro"
+    {
+        return None;
+    }
+    match &plan.auth_ref {
+        RuntimeAuthRef::ManagedAccount {
+            account_id,
+            expected_provider_type: ProviderType::KiroOAuth,
             auth_identity_generation,
         } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
         _ => None,
@@ -1565,6 +1949,15 @@ mod grok_catalog_provider_tests {
     const TEST_ROUTER_DOMAIN: &str = "router.test";
     const TEST_INSTALLATION_ID: &str = "inst-api-tests";
     const TEST_CONTROL_SECRET: &str = "api-test-control-secret-0123456789";
+    static TEST_INGRESS_REQUEST_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    fn unique_test_ingress_request_id(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            TEST_INGRESS_REQUEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
 
     fn catalog_test_state(name: &str) -> ServerState {
         let nanos = SystemTime::now()
@@ -1603,9 +1996,43 @@ mod grok_catalog_provider_tests {
     }
 
     async fn configure_test_share(state: &ServerState, share_id: &str, app: AppKind) {
+        configure_test_share_with_provider_type(state, share_id, app, ProviderType::GrokOAuth)
+            .await;
+    }
+
+    async fn configure_test_share_with_provider_type(
+        state: &ServerState,
+        share_id: &str,
+        app: AppKind,
+        provider_type: ProviderType,
+    ) {
         let provider_id = format!("{share_id}-provider");
         let provider_id_for_store = provider_id.clone();
         let provider_name = format!("{share_id} Provider");
+        let managed_account_id = format!("{share_id}-account");
+        if provider_type == ProviderType::ClaudeOAuth {
+            let account_id = managed_account_id.clone();
+            state
+                .mutate_accounts_immediate(move |accounts| {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": account_id,
+                            "providerType": "claude_oauth",
+                            "accessToken": "test-access-token",
+                            "expiresAt": i64::MAX / 2
+                        }))
+                        .unwrap(),
+                    );
+                })
+                .await
+                .unwrap();
+        }
+        let auth_binding = (provider_type == ProviderType::ClaudeOAuth).then(|| AuthBinding {
+            source: Some("account_store".to_string()),
+            auth_provider: Some(provider_type.as_str().to_string()),
+            account_id: Some(managed_account_id),
+            auth_identity_generation: Some(1),
+        });
         state
             .mutate_providers_immediate(move |providers| {
                 providers.upsert(
@@ -1616,7 +2043,8 @@ mod grok_catalog_provider_tests {
                         settings_config: json!({}),
                         category: None,
                         meta: Some(ProviderMeta {
-                            provider_type: Some(ProviderType::GrokOAuth.as_str().to_string()),
+                            provider_type: Some(provider_type.as_str().to_string()),
+                            auth_binding,
                             ..Default::default()
                         }),
                         extra: Default::default(),
@@ -1633,7 +2061,7 @@ mod grok_catalog_provider_tests {
                         owner_email: Some("owner@example.com".to_string()),
                         app,
                         provider_id: provider_id.clone(),
-                        provider_type: ProviderType::GrokOAuth,
+                        provider_type,
                         display_name: Some(share_id.to_string()),
                         enabled: Some(true),
                         status: Some("active".to_string()),
@@ -1660,7 +2088,7 @@ mod grok_catalog_provider_tests {
                         bindings: vec![ShareBinding {
                             app,
                             provider_id,
-                            provider_type: ProviderType::GrokOAuth,
+                            provider_type,
                         }],
                         runtime_snapshot: None,
                         user_grants: Default::default(),
@@ -1671,7 +2099,7 @@ mod grok_catalog_provider_tests {
             .unwrap();
     }
 
-    fn router_ingress_request(
+    async fn router_ingress_request(
         request: Request,
         request_id: &str,
         share_id: Option<&str>,
@@ -1682,15 +2110,52 @@ mod grok_catalog_provider_tests {
             share_id,
             chrono::Utc::now().timestamp_millis(),
         )
+        .await
     }
 
-    fn router_ingress_request_at(
-        mut request: Request,
+    async fn router_ingress_request_at(
+        request: Request,
         request_id: &str,
         share_id: Option<&str>,
         issued_at_ms: i64,
     ) -> Request {
+        router_ingress_request_with_version_at(
+            request,
+            &unique_test_ingress_request_id(request_id),
+            share_id,
+            crate::clients::router::ingress::SIGNATURE_VERSION_V2,
+            issued_at_ms,
+        )
+        .await
+    }
+
+    async fn router_ingress_request_with_version_at(
+        request: Request,
+        request_id: &str,
+        share_id: Option<&str>,
+        signature_version: u8,
+        issued_at_ms: i64,
+    ) -> Request {
+        let method = request.method().as_str().to_string();
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map(|target| target.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let (method, path_and_query, body_sha256) =
+            if signature_version == crate::clients::router::ingress::SIGNATURE_VERSION_V2 {
+                (
+                    method,
+                    path_and_query,
+                    crate::clients::router::ingress::body_sha256_hex(&body),
+                )
+            } else {
+                (String::new(), String::new(), String::new())
+            };
         let context = crate::clients::router::ingress::IngressContext {
+            signature_version,
             protocol_epoch: crate::clients::router::ingress::PROTOCOL_EPOCH.to_string(),
             router_id: TEST_ROUTER_DOMAIN.to_string(),
             route_id: share_id
@@ -1704,15 +2169,27 @@ mod grok_catalog_provider_tests {
             user_email: Some("owner@example.com".to_string()),
             user_role: share_id.is_none().then(|| "owner".to_string()),
             user_country: Some("JP".to_string()),
+            method,
+            path_and_query,
+            body_sha256,
             issued_at_ms,
         };
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).unwrap());
         let mut mac = Hmac::<Sha256>::new_from_slice(TEST_CONTROL_SECRET.as_bytes()).unwrap();
-        mac.update(b"cc-switch-router-ingress-v1\n");
+        mac.update(match signature_version {
+            crate::clients::router::ingress::SIGNATURE_VERSION_V1 => {
+                b"cc-switch-router-ingress-v1\n"
+            }
+            crate::clients::router::ingress::SIGNATURE_VERSION_V2 => {
+                b"cc-switch-router-ingress-v2\n"
+            }
+            _ => panic!("unsupported test signature version"),
+        });
         mac.update(crate::clients::router::ingress::PROTOCOL_EPOCH.as_bytes());
         mac.update(b"\n");
         mac.update(encoded.as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let mut request = Request::from_parts(parts, Body::from(body));
         request.headers_mut().insert(
             crate::clients::router::ingress::INGRESS_CONTEXT_HEADER,
             encoded.parse().unwrap(),
@@ -1743,15 +2220,18 @@ mod grok_catalog_provider_tests {
         ] {
             let response = app
                 .clone()
-                .oneshot(router_ingress_request_at(
-                    axum::http::Request::builder()
-                        .uri("/web-api/auth/methods")
-                        .body(Body::empty())
-                        .unwrap(),
-                    "freshness-rejection",
-                    None,
-                    issued_at_ms,
-                ))
+                .oneshot(
+                    router_ingress_request_at(
+                        axum::http::Request::builder()
+                            .uri("/web-api/auth/methods")
+                            .body(Body::empty())
+                            .unwrap(),
+                        "freshness-rejection",
+                        None,
+                        issued_at_ms,
+                    )
+                    .await,
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1773,6 +2253,156 @@ mod grok_catalog_provider_tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_models_route_uses_versioned_static_catalog() {
+        let state = catalog_test_state("claude-oauth-static-models");
+        configure_test_router(&state).await;
+        configure_test_share_with_provider_type(
+            &state,
+            "share-claude-models",
+            AppKind::Claude,
+            ProviderType::ClaudeOAuth,
+        )
+        .await;
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(
+                router_ingress_request(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/v1/models?app=claude")
+                        .body(Body::empty())
+                        .unwrap(),
+                    "claude-oauth-models",
+                    Some("share-claude-models"),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["source"], "claude_code_wire_profile");
+        assert_eq!(body["stale"], false);
+        assert_eq!(
+            body["fetchedAtMs"],
+            crate::clients::oauth::claude_models::CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS
+        );
+        let models = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let mut expected = crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(models, expected);
+    }
+
+    #[tokio::test]
+    async fn ingress_v2_rejects_request_binding_tampering_and_replay() {
+        let state = catalog_test_state("ingress-v2-binding");
+        configure_test_router(&state).await;
+        let app = app_router(state);
+
+        let mut method_tampered = router_ingress_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/auth/methods")
+                .body(Body::empty())
+                .unwrap(),
+            "method-tamper",
+            None,
+        )
+        .await;
+        *method_tampered.method_mut() = Method::POST;
+
+        let mut path_tampered = router_ingress_request(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/auth/methods?source=signed")
+                .body(Body::empty())
+                .unwrap(),
+            "path-tamper",
+            None,
+        )
+        .await;
+        *path_tampered.uri_mut() = "/web-api/auth/methods?source=changed".parse().unwrap();
+
+        let mut body_tampered = router_ingress_request(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web-api/auth/methods")
+                .body(Body::from("signed"))
+                .unwrap(),
+            "body-tamper",
+            None,
+        )
+        .await;
+        *body_tampered.body_mut() = Body::from("changed");
+
+        for (request, expected_code) in [
+            (method_tampered, "method_mismatch"),
+            (path_tampered, "path_mismatch"),
+            (body_tampered, "body_digest_mismatch"),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::clients::router::ingress::INTERNAL_INGRESS_ERROR_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_code)
+            );
+        }
+
+        let replay_request_id = "fixed-replay-request-id";
+        let first = router_ingress_request_with_version_at(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/auth/methods")
+                .body(Body::empty())
+                .unwrap(),
+            replay_request_id,
+            None,
+            crate::clients::router::ingress::SIGNATURE_VERSION_V2,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+        let second = router_ingress_request_with_version_at(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web-api/auth/methods")
+                .body(Body::empty())
+                .unwrap(),
+            replay_request_id,
+            None,
+            crate::clients::router::ingress::SIGNATURE_VERSION_V2,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+
+        let first = app.clone().oneshot(first).await.unwrap();
+        assert_ne!(first.status(), StatusCode::UNAUTHORIZED);
+        let replay = app.oneshot(second).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            replay
+                .headers()
+                .get(crate::clients::router::ingress::INTERNAL_INGRESS_ERROR_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("replayed_request_id")
+        );
     }
 
     #[test]
@@ -1874,7 +2504,8 @@ mod grok_catalog_provider_tests {
                 .unwrap(),
             "media-above-default",
             Some("share-media"),
-        );
+        )
+        .await;
         let accepted_by_extractor = app.clone().oneshot(above_default).await.unwrap();
         assert_ne!(
             accepted_by_extractor.status(),
@@ -1893,7 +2524,8 @@ mod grok_catalog_provider_tests {
                 .unwrap(),
             "media-codex-envelope",
             Some("share-media"),
-        );
+        )
+        .await;
         let accepted_codex_envelope = app.clone().oneshot(codex_envelope).await.unwrap();
         assert_ne!(
             accepted_codex_envelope.status(),
@@ -1913,7 +2545,8 @@ mod grok_catalog_provider_tests {
                 .unwrap(),
             "media-above-images-envelope",
             Some("share-media"),
-        );
+        )
+        .await;
         let rejected = app.oneshot(above_images_envelope).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -1947,15 +2580,18 @@ mod grok_catalog_provider_tests {
 
             let client_ingress = app
                 .clone()
-                .oneshot(router_ingress_request(
-                    axum::http::Request::builder()
-                        .method(method.clone())
-                        .uri(&path)
-                        .body(Body::empty())
-                        .unwrap(),
-                    &format!("image-client-{}", method.as_str().to_ascii_lowercase()),
-                    None,
-                ))
+                .oneshot(
+                    router_ingress_request(
+                        axum::http::Request::builder()
+                            .method(method.clone())
+                            .uri(&path)
+                            .body(Body::empty())
+                            .unwrap(),
+                        &format!("image-client-{}", method.as_str().to_ascii_lowercase()),
+                        None,
+                    )
+                    .await,
+                )
                 .await
                 .unwrap();
             assert_eq!(client_ingress.status(), StatusCode::FORBIDDEN);
@@ -1963,15 +2599,18 @@ mod grok_catalog_provider_tests {
 
         let get_response = app
             .clone()
-            .oneshot(router_ingress_request(
-                axum::http::Request::builder()
-                    .method(Method::GET)
-                    .uri(&path)
-                    .body(Body::empty())
-                    .unwrap(),
-                "image-get",
-                Some("share-image"),
-            ))
+            .oneshot(
+                router_ingress_request(
+                    axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri(&path)
+                        .body(Body::empty())
+                        .unwrap(),
+                    "image-get",
+                    Some("share-image"),
+                )
+                .await,
+            )
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
@@ -1988,15 +2627,18 @@ mod grok_catalog_provider_tests {
 
         let head_response = app
             .clone()
-            .oneshot(router_ingress_request(
-                axum::http::Request::builder()
-                    .method(Method::HEAD)
-                    .uri(&path)
-                    .body(Body::empty())
-                    .unwrap(),
-                "image-head",
-                Some("share-image"),
-            ))
+            .oneshot(
+                router_ingress_request(
+                    axum::http::Request::builder()
+                        .method(Method::HEAD)
+                        .uri(&path)
+                        .body(Body::empty())
+                        .unwrap(),
+                    "image-head",
+                    Some("share-image"),
+                )
+                .await,
+            )
             .await
             .unwrap();
         assert_eq!(head_response.status(), StatusCode::OK);
@@ -2018,15 +2660,18 @@ mod grok_catalog_provider_tests {
         ] {
             let response = app
                 .clone()
-                .oneshot(router_ingress_request(
-                    axum::http::Request::builder()
-                        .method(Method::GET)
-                        .uri(invalid_path)
-                        .body(Body::empty())
-                        .unwrap(),
-                    "image-invalid",
-                    Some("share-image"),
-                ))
+                .oneshot(
+                    router_ingress_request(
+                        axum::http::Request::builder()
+                            .method(Method::GET)
+                            .uri(invalid_path)
+                            .body(Body::empty())
+                            .unwrap(),
+                        "image-invalid",
+                        Some("share-image"),
+                    )
+                    .await,
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -2055,16 +2700,19 @@ mod grok_catalog_provider_tests {
 
         let client_ingress = app
             .clone()
-            .oneshot(router_ingress_request(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/messages")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-                "client-inference",
-                None,
-            ))
+            .oneshot(
+                router_ingress_request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/messages")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                    "client-inference",
+                    None,
+                )
+                .await,
+            )
             .await
             .unwrap();
         assert_eq!(client_ingress.status(), StatusCode::FORBIDDEN);
@@ -2076,16 +2724,19 @@ mod grok_catalog_provider_tests {
         ] {
             let response = app
                 .clone()
-                .oneshot(router_ingress_request(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(body)
-                        .unwrap(),
-                    &format!("missing-share-{uri}"),
-                    Some("missing-share"),
-                ))
+                .oneshot(
+                    router_ingress_request(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(body)
+                            .unwrap(),
+                        &format!("missing-share-{uri}"),
+                        Some("missing-share"),
+                    )
+                    .await,
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
@@ -2141,15 +2792,18 @@ mod grok_catalog_provider_tests {
         let app = app_router(state);
 
         let response = app
-            .oneshot(router_ingress_request(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/v1/models")
-                    .body(Body::empty())
-                    .unwrap(),
-                "disabled-share-surface",
-                Some("share-disabled"),
-            ))
+            .oneshot(
+                router_ingress_request(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/v1/models")
+                        .body(Body::empty())
+                        .unwrap(),
+                    "disabled-share-surface",
+                    Some("share-disabled"),
+                )
+                .await,
+            )
             .await
             .unwrap();
 
@@ -2560,6 +3214,112 @@ mod grok_catalog_provider_tests {
         assert_eq!(
             observed_authorization.lock().unwrap().as_str(),
             "Bearer runtime-bound-access"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_share_catalog_replaces_static_fallback_without_account_union() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_authorization = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let observed_for_route = std::sync::Arc::clone(&observed_authorization);
+        let upstream = Router::new().route(
+            "/models",
+            get(move |headers: HeaderMap| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    *observed.lock().unwrap() = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    Json(json!({"models": [{"modelId": "kiro-runtime-only"}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = catalog_test_state("kiro-runtime-bound-account");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                for (id, access_token) in [
+                    ("kiro-model-distractor", "kiro-distractor-access"),
+                    ("kiro-model-bound", "kiro-runtime-bound-access"),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "kiro_oauth",
+                            "accessToken": access_token,
+                            "expiresAt": i64::MAX / 2,
+                            "profile": {
+                                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                                "apiRegion": "us-east-1",
+                                "machineId": id,
+                                "authMethod": "social"
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "kiro-runtime-bound-provider".to_string(),
+                        name: "Kiro runtime-bound provider".to_string(),
+                        settings_config: json!({"testKiroModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("kiro_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("kiro_oauth".to_string()),
+                                account_id: Some("kiro-model-bound".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+
+        let response = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("kiro-runtime-bound-provider"),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            response.source.as_deref(),
+            Some("kiro_list_available_models")
+        );
+        assert_eq!(
+            response
+                .data
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["kiro-runtime-only"]
+        );
+        assert_eq!(
+            observed_authorization.lock().unwrap().as_str(),
+            "Bearer kiro-runtime-bound-access"
         );
         server.abort();
     }

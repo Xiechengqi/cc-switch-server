@@ -387,6 +387,8 @@ pub struct AccountRefreshUpdate {
     pub profile: Option<Value>,
     pub raw: Option<Value>,
     pub subscription_level: Option<String>,
+    #[serde(default)]
+    pub clear_subscription_level: bool,
     pub entitlement_status: Option<String>,
     pub quota_percent: Option<f64>,
     pub quota: Option<AccountQuota>,
@@ -986,6 +988,9 @@ impl AccountStore {
         if let Some(value) = update.raw {
             account.raw = Some(value);
         }
+        if update.clear_subscription_level {
+            account.subscription_level = None;
+        }
         if let Some(value) = update.subscription_level {
             account.subscription_level = Some(value);
         }
@@ -1203,9 +1208,12 @@ impl AccountStore {
         if kind == OAuthErrorKind::InvalidGrant {
             account.refresh_consecutive_failures =
                 account.refresh_consecutive_failures.saturating_add(1);
-            if immediate_relogin || account.refresh_consecutive_failures >= threshold.max(1) {
-                account.needs_relogin = true;
-            }
+        }
+        if immediate_relogin
+            || (kind == OAuthErrorKind::InvalidGrant
+                && account.refresh_consecutive_failures >= threshold.max(1))
+        {
+            account.needs_relogin = true;
         }
         Some(account.clone())
     }
@@ -2643,6 +2651,31 @@ mod tests {
         let changed_type = store.upsert(changed_type);
         assert_eq!(changed_type.manual_subscription_expires_at_ms, None);
         assert_eq!(changed_type.manual_subscription_expiry_updated_at_ms, None);
+    }
+
+    #[test]
+    fn refresh_can_explicitly_clear_a_stale_subscription_level() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-stale-plan".to_string());
+        input.subscription_level = Some("Claude Max 20x".to_string());
+        store.upsert(input);
+
+        let refreshed = store
+            .mark_refresh_success(
+                "claude-stale-plan",
+                AccountRefreshUpdate {
+                    clear_subscription_level: true,
+                    quota: Some(AccountQuota {
+                        success: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(refreshed.subscription_level.is_none());
     }
 
     #[test]

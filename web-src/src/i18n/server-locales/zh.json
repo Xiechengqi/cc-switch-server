@@ -80,6 +80,14 @@
     "family": "供应商类型",
     "firstByteTimeout": "首字节超时（毫秒）",
     "modelPassthrough": "模型透传",
+    "modelProfileFixed": "Profile 固定",
+    "modelScope": "控制范围",
+    "modelScopeGlobal": "全局",
+    "modelScopeMergeConfirm": "切换为全局",
+    "modelScopeMergeMessage": "各 App 当前使用不同的模型策略。切换后将统一应用全局策略。",
+    "modelScopeMergeTitle": "统一模型策略",
+    "modelScopePerApp": "按 App 独立",
+    "modelSummarySingle": "固定：{{model}}",
     "modelSingle": "固定上游模型",
     "queryParameter": "API Key 查询参数名",
     "requestTimeout": "请求超时（毫秒）",
@@ -90,6 +98,7 @@
     "surfaces": "应用接口",
     "streamIdleTimeout": "流空闲超时（毫秒）",
     "testModel": "测试模型",
+    "testAllModels": "测试所有 App 模型",
     "title": "供应商"
   },
   "provider": {

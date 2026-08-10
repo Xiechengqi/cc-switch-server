@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context};
 use rand::RngCore;
@@ -61,15 +62,25 @@ fn create_backup_inner(
     set_private_directory_permissions(&backup_dir)?;
 
     let mut files = Vec::new();
-    for source in targets {
-        if !source.exists() {
-            continue;
+    for source in expand_backup_sources(targets)? {
+        let relative = source.strip_prefix(config_dir).with_context(|| {
+            format!(
+                "backup source {} must be inside {}",
+                source.display(),
+                config_dir.display()
+            )
+        })?;
+        let file_name = relative
+            .to_str()
+            .context("backup source path must be valid UTF-8")?;
+        validate_backup_file_name(file_name)?;
+        let destination = backup_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create backup directory {}", parent.display()))?;
+            set_private_directory_permissions(parent)?;
         }
-        let Some(file_name) = source.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let destination = backup_dir.join(file_name);
-        fs::copy(source, &destination).with_context(|| {
+        fs::copy(&source, &destination).with_context(|| {
             format!(
                 "copy backup file {} to {}",
                 source.display(),
@@ -158,8 +169,19 @@ pub fn restore_backup_with_validator(
         false,
     )
     .ok();
+    for directory in replacement_directories(config_dir, &restored)? {
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .with_context(|| format!("replace restored directory {}", directory.display()))?;
+        }
+    }
     for (file, content) in staged {
         let destination = config_dir.join(&file.file_name);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create restore directory {}", parent.display()))?;
+            set_private_directory_permissions(parent)?;
+        }
         crate::infra::storage::write_bytes_atomic(&destination, &content).with_context(|| {
             format!(
                 "restore backup file {} to {}",
@@ -210,7 +232,14 @@ fn validate_restore_stage(
     set_private_directory_permissions(&stage_dir)?;
     let result = (|| {
         for (file, content) in staged {
-            crate::infra::storage::write_bytes_atomic(&stage_dir.join(&file.file_name), content)
+            let destination = stage_dir.join(&file.file_name);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("create restore stage directory {}", parent.display())
+                })?;
+                set_private_directory_permissions(parent)?;
+            }
+            crate::infra::storage::write_bytes_atomic(&destination, content)
                 .with_context(|| format!("stage backup file {}", file.file_name))?;
         }
 
@@ -318,14 +347,74 @@ fn backup_dir(config_dir: &Path, backup_id: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn manifest_targets(config_dir: &Path, manifest: &BackupManifest) -> anyhow::Result<Vec<PathBuf>> {
-    manifest
-        .files
-        .iter()
-        .map(|file| {
-            validate_backup_file_name(&file.file_name)?;
-            Ok(config_dir.join(&file.file_name))
-        })
-        .collect()
+    let mut targets = BTreeSet::new();
+    for file in &manifest.files {
+        validate_backup_file_name(&file.file_name)?;
+        let path = Path::new(&file.file_name);
+        if path.components().count() > 1 {
+            let top = path
+                .components()
+                .next()
+                .and_then(|component| match component {
+                    Component::Normal(value) => Some(value),
+                    _ => None,
+                })
+                .context("backup path has no top-level directory")?;
+            targets.insert(config_dir.join(top));
+        } else {
+            targets.insert(config_dir.join(path));
+        }
+    }
+    Ok(targets.into_iter().collect())
+}
+
+fn replacement_directories(
+    config_dir: &Path,
+    manifest: &BackupManifest,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let targets = manifest_targets(config_dir, manifest)?;
+    Ok(targets
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|value| value.to_str()) == Some("usage"))
+        .collect())
+}
+
+fn expand_backup_sources(targets: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    fn collect(path: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+        };
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "backup targets cannot be symlinks"
+        );
+        if metadata.is_file() {
+            files.push(path.to_path_buf());
+            return Ok(());
+        }
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "backup target is not a file or directory"
+        );
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("read backup target directory {}", path.display()))?
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            collect(&entry.path(), files)?;
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    for target in targets {
+        collect(target, &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 fn generate_backup_id() -> String {
@@ -347,10 +436,19 @@ fn validate_backup_id(value: &str) -> anyhow::Result<()> {
 }
 
 fn validate_backup_file_name(value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    let components = path.components().collect::<Vec<_>>();
+    let normal_components = components
+        .iter()
+        .all(|component| matches!(component, Component::Normal(_)));
+    let nested_usage_path = components.len() <= 1
+        || matches!(components.first(), Some(Component::Normal(value)) if *value == "usage");
     let valid = !value.is_empty()
-        && !value.contains('/')
         && !value.contains('\\')
-        && (value.ends_with(".json") || value == "accounts.key");
+        && !path.is_absolute()
+        && normal_components
+        && nested_usage_path
+        && (value.ends_with(".json") || value.ends_with(".jsonl") || value == "accounts.key");
     if !valid {
         bail!("invalid backup file name");
     }
@@ -398,6 +496,40 @@ mod tests {
 
         let content = fs::read_to_string(config_path).unwrap();
         assert!(content.contains("before@example.com"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backup_round_trips_usage_directory_without_leaving_stale_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-backup-usage-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let usage = dir.join("usage");
+        let events = usage.join("events");
+        fs::create_dir_all(&events).unwrap();
+        fs::write(usage.join("manifest.json"), br#"{"schemaVersion":1}"#).unwrap();
+        fs::write(usage.join("requests.json"), br#"{"logs":["before"]}"#).unwrap();
+        fs::write(events.join("2026-08-10.jsonl"), b"before\n").unwrap();
+
+        let backup = create_backup(&dir, std::slice::from_ref(&usage), None).unwrap();
+        assert!(backup
+            .files
+            .iter()
+            .any(|file| file.file_name == "usage/events/2026-08-10.jsonl"));
+        fs::write(usage.join("requests.json"), br#"{"logs":["after"]}"#).unwrap();
+        fs::write(events.join("2026-08-11.jsonl"), b"stale\n").unwrap();
+
+        restore_backup(&dir, &backup.id).unwrap();
+
+        assert!(fs::read_to_string(usage.join("requests.json"))
+            .unwrap()
+            .contains("before"));
+        assert!(events.join("2026-08-10.jsonl").exists());
+        assert!(!events.join("2026-08-11.jsonl").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

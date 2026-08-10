@@ -584,7 +584,10 @@ pub fn has_authoritative_subscription_oauth_binding(stored: &StoredProvider) -> 
     if provider_account_id(stored).is_none()
         || !matches!(
             stored.provider_type,
-            ProviderType::ClaudeOAuth | ProviderType::CodexOAuth | ProviderType::GrokOAuth
+            ProviderType::ClaudeOAuth
+                | ProviderType::CodexOAuth
+                | ProviderType::GrokOAuth
+                | ProviderType::KimiCode
         )
     {
         return false;
@@ -714,7 +717,11 @@ fn runtime_driver_options(
         }
     }
     #[cfg(test)]
-    for name in ["testGrokWebsocketUrl", "testGrokModelsUrl"] {
+    for name in [
+        "testGrokWebsocketUrl",
+        "testGrokModelsUrl",
+        "testKiroModelsUrl",
+    ] {
         if let Some(value) = provider
             .settings_config
             .get(name)
@@ -927,6 +934,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::GitHubCopilot => Some("https://api.githubcopilot.com"),
         ProviderType::DeepSeekAccount => Some("https://chat.deepseek.com"),
         ProviderType::KiroOAuth => Some("https://q.us-east-1.amazonaws.com"),
+        ProviderType::KimiCode => Some("https://api.kimi.com/coding/v1"),
         ProviderType::CursorOAuth => Some("https://api2.cursor.sh"),
         ProviderType::CursorApiKey => Some("https://api.cursor.com"),
         ProviderType::OllamaCloud => Some("https://ollama.com"),
@@ -943,6 +951,7 @@ fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
         ProviderType::ClaudeOAuth
             | ProviderType::CodexOAuth
             | ProviderType::GrokOAuth
+            | ProviderType::KimiCode
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
     )
@@ -1106,6 +1115,7 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
         ProviderType::GitHubCopilot => "special.copilot",
         ProviderType::DeepSeekAccount => "special.deepseek_account",
         ProviderType::KiroOAuth => "special.kiro",
+        ProviderType::KimiCode => "oauth.kimi_code",
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => "special.cursor",
         ProviderType::AntigravityOAuth => "special.antigravity",
         ProviderType::AgyOAuth => "special.agy",

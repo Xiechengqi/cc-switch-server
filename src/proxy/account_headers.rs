@@ -75,6 +75,19 @@ pub(super) fn account_header_override_blocked(name: &str, provider_type: Provide
     {
         return true;
     }
+    if provider_type == ProviderType::KimiCode
+        && matches!(
+            normalized.as_str(),
+            "x-msh-platform"
+                | "x-msh-version"
+                | "x-msh-device-name"
+                | "x-msh-device-model"
+                | "x-msh-os-version"
+                | "x-msh-device-id"
+        )
+    {
+        return true;
+    }
     if provider_type == ProviderType::GitHubCopilot
         && matches!(
             normalized.as_str(),
@@ -151,6 +164,24 @@ mod tests {
             "x-enterprise-sso",
             ProviderType::GitHubCopilot
         ));
+    }
+
+    #[test]
+    fn kimi_account_headers_cannot_override_account_device_identity() {
+        for name in [
+            "x-msh-platform",
+            "x-msh-version",
+            "x-msh-device-name",
+            "x-msh-device-model",
+            "x-msh-os-version",
+            "x-msh-device-id",
+            "user-agent",
+        ] {
+            assert!(account_header_override_blocked(
+                name,
+                ProviderType::KimiCode
+            ));
+        }
     }
 
     #[test]

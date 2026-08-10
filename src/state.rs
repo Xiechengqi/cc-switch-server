@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::Serialize;
@@ -27,6 +27,9 @@ use crate::clients::oauth::codex_reset_credits::{
 use crate::clients::oauth::copilot_device;
 use crate::clients::oauth::grok_device::{
     GrokDeviceFlowStore, GrokDevicePollLease, GrokDevicePollResult, PendingGrokDeviceFlow,
+};
+use crate::clients::oauth::kimi_device::{
+    KimiDeviceFlowStore, KimiDevicePollLease, KimiDevicePollResult, PendingKimiDeviceFlow,
 };
 use crate::clients::oauth::kiro_device::{
     KiroDeviceFlowStore, PendingKiroDeviceFlow, PendingKiroSocialDeviceFlow,
@@ -63,9 +66,10 @@ use crate::domain::accounts::store::{
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
-    bundle_id as provider_bundle_id, credential_source_app, has_bundle_managed_metadata,
-    is_explicit_bundle_surface, surface_enabled, ProviderBundleReferencePreview,
-    ProviderBundleView, ProviderBundleWriteDraft,
+    bundle_id as provider_bundle_id, bundle_model_policy_scope, bundle_model_policy_source,
+    credential_source_app, has_bundle_managed_metadata, is_explicit_bundle_surface,
+    surface_enabled, ModelPolicyScope, ProviderBundleReferencePreview, ProviderBundleView,
+    ProviderBundleWriteDraft,
 };
 use crate::domain::providers::credentials::{
     merge_provider_credentials, reveal_provider_credential, CredentialPatch,
@@ -104,8 +108,15 @@ use crate::domain::sharing::shares::{
     RouterDescriptorSyncMode, Share, ShareConcurrencyLimit, ShareDeleteTombstone, ShareInvocation,
     ShareInvocationRejection, ShareRejectReason, ShareStore,
 };
-use crate::domain::usage::store::{UsageLog, UsageStore};
-use crate::logging::{LogTailAccessError, LogTailResponse, SharedLogCapture};
+use crate::domain::usage::store::{
+    PreparedUsageAppend, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageOutcome,
+    UsageState, UsageStore,
+};
+use crate::logging::{
+    classify_network_error, error_fingerprint, opaque_ref, AuditCursor, AuditEvent, AuditLog,
+    AuditRequestDetails, AuditUploadCursor, AuditWriteError, LogTailAccessError, LogTailResponse,
+    SharedAuditLog, SharedLogCapture,
+};
 use crate::proxy::cursor::session::CursorSessionManager;
 
 const ROUTER_INSTALLATION_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -663,6 +674,7 @@ pub struct ServerStateInner {
     accounts_persistence: StorePersistenceCoordinator,
     pub(crate) accounts: RwLock<AccountStore>,
     managed_auth_operations: AsyncMutex<()>,
+    codex_active_account_operations: RwLock<()>,
     usage_persistence: StorePersistenceCoordinator,
     pub(crate) usage: RwLock<UsageStore>,
     shares_persistence: StorePersistenceCoordinator,
@@ -678,13 +690,16 @@ pub struct ServerStateInner {
     image_capabilities: Arc<crate::image_store::ImageCapabilityStore>,
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
+    kimi_device_flows: RwLock<KimiDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
     pub cursor_api_key_tokens: crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache,
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
     cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
+    managed_account_refreshes: ManagedAccountRefreshCoordinator,
     pub account_refresh_locks: AccountRefreshLocks,
+    gemini_project_locks: AccountRefreshLocks,
     codex_banked_reset_locks: AccountRefreshLocks,
     native_refresh_receipt_journal: Mutex<NativeRefreshReceiptJournal>,
     pub account_in_flight: Arc<AccountInFlightTracker>,
@@ -692,6 +707,7 @@ pub struct ServerStateInner {
     share_model_cooldowns: Mutex<ShareModelCooldownTracker>,
     previous_response_cache: Mutex<PreviousResponseCache>,
     pub control_nonces: Arc<ControlNonceCache>,
+    router_ingress_replays: Mutex<crate::clients::router::ingress::IngressReplayCache>,
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
     client_tunnel_claim: AsyncMutex<()>,
     client_subdomain_adoption_schedulers: Mutex<BTreeSet<String>>,
@@ -710,6 +726,8 @@ pub struct ServerStateInner {
     #[cfg(test)]
     gemini_project_commit_failures: std::sync::atomic::AtomicU64,
     #[cfg(test)]
+    managed_account_refresh_panics: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
     client_tunnel_claim_commit_failures: std::sync::atomic::AtomicU64,
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
@@ -720,6 +738,7 @@ pub struct ServerStateInner {
     pub process_instance_id: String,
     pub upgrade: crate::self_update::upgrade::SharedUpgradeRegistry,
     pub(crate) log_capture: SharedLogCapture,
+    audit_log: SharedAuditLog,
     pub(crate) terminal: crate::api::terminal::OpsTerminalManager,
     /// Startup-discovered public IPv4 reported to router via heartbeat.
     reported_public_ip: RwLock<Option<String>>,
@@ -797,11 +816,12 @@ impl RouterRegistrationFlight {
 
 pub type ServerState = Arc<ServerStateInner>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ManagedAccountRefreshError {
     Conflict {
         provider_type: ProviderType,
     },
+    InactiveCodexAccount,
     IdentityChanged {
         provider_type: ProviderType,
     },
@@ -812,6 +832,257 @@ pub enum ManagedAccountRefreshError {
         message: String,
         retry_after_ms: Option<i64>,
     },
+}
+
+fn record_managed_refresh_terminal_audit(
+    state: &ServerState,
+    provider_type: ProviderType,
+    account_id: &str,
+    forced: bool,
+    elapsed: Duration,
+    result: &Result<(), ManagedAccountRefreshError>,
+) {
+    let (event_name, outcome, error_code, error_class, upstream_status, retryable) = match result {
+        Ok(()) => (
+            "oauth.refresh.completed",
+            "completed",
+            None,
+            None,
+            None,
+            None,
+        ),
+        Err(ManagedAccountRefreshError::Refresh { status_code, .. }) => (
+            "oauth.refresh.failed",
+            "failed",
+            Some(if *status_code == 429 {
+                "oauth_refresh_rate_limited"
+            } else if matches!(*status_code, 400 | 401 | 403) {
+                "oauth_refresh_rejected"
+            } else {
+                "oauth_refresh_upstream_failed"
+            }),
+            Some("upstream_refresh_error"),
+            Some(*status_code),
+            Some(*status_code == 429 || *status_code >= 500),
+        ),
+        Err(ManagedAccountRefreshError::CredentialPersistenceDegraded) => (
+            "oauth.refresh.failed",
+            "failed",
+            Some("credential_persistence_degraded"),
+            Some("persistence_error"),
+            None,
+            Some(true),
+        ),
+        Err(ManagedAccountRefreshError::IdentityChanged { .. }) => (
+            "oauth.refresh.failed",
+            "failed",
+            Some("oauth_identity_changed"),
+            Some("identity_conflict"),
+            None,
+            Some(false),
+        ),
+        Err(ManagedAccountRefreshError::Conflict { .. }) => (
+            "oauth.refresh.failed",
+            "failed",
+            Some("oauth_refresh_conflict"),
+            Some("account_conflict"),
+            None,
+            Some(false),
+        ),
+        Err(ManagedAccountRefreshError::InactiveCodexAccount) => (
+            "oauth.refresh.failed",
+            "failed",
+            Some("inactive_codex_account"),
+            Some("account_inactive"),
+            None,
+            Some(false),
+        ),
+        Err(ManagedAccountRefreshError::NotFound) => (
+            "oauth.refresh.failed",
+            "failed",
+            Some("oauth_account_not_found"),
+            Some("account_not_found"),
+            None,
+            Some(false),
+        ),
+    };
+    let mut event = AuditEvent::new(event_name);
+    event.provider_type = Some(provider_type.as_str().to_string());
+    event.account_ref = Some(opaque_ref("account", account_id));
+    event.operation = Some(if forced { "forced" } else { "scheduled" }.into());
+    event.stage = Some("oauth_refresh".to_string());
+    event.outcome = Some(outcome.to_string());
+    event.error_code = error_code.map(str::to_string);
+    event.error_class = error_class.map(str::to_string);
+    event.upstream_status = upstream_status;
+    event.retryable = retryable;
+    event.duration_ms = Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+    state.emit_audit_event_best_effort(event);
+    if result.is_ok() {
+        tracing::info!(
+            target: "cc_switch_server::request_audit",
+            event = "oauth.refresh.completed",
+            provider_type = provider_type.as_str(),
+            account_ref = %opaque_ref("account", account_id),
+            forced,
+            duration_ms = elapsed.as_millis(),
+            "OAuth refresh completed"
+        );
+    } else {
+        tracing::warn!(
+            target: "cc_switch_server::request_audit",
+            event = "oauth.refresh.failed",
+            provider_type = provider_type.as_str(),
+            account_ref = %opaque_ref("account", account_id),
+            forced,
+            duration_ms = elapsed.as_millis(),
+            error_code = error_code.unwrap_or("oauth_refresh_failed"),
+            upstream_status = upstream_status.unwrap_or(0),
+            retryable = retryable.unwrap_or(false),
+            "OAuth refresh failed"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedAccountRefreshAccess {
+    BoundAccount,
+    ActiveAccount,
+}
+
+impl ManagedAccountRefreshAccess {
+    fn flight_key(self) -> &'static str {
+        match self {
+            Self::BoundAccount => "bound",
+            Self::ActiveAccount => "active",
+        }
+    }
+}
+
+const MAX_ACTIVE_MANAGED_ACCOUNT_REFRESHES: usize = 128;
+const MANAGED_ACCOUNT_REFRESH_DEADLINE: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct ManagedAccountRefreshFlight {
+    result: watch::Sender<Option<Result<(), ManagedAccountRefreshError>>>,
+}
+
+impl ManagedAccountRefreshFlight {
+    fn new() -> Self {
+        Self {
+            result: watch::channel(None).0,
+        }
+    }
+
+    async fn wait(&self) -> Result<(), ManagedAccountRefreshError> {
+        let mut receiver = self.result.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| ManagedAccountRefreshError::Refresh {
+                    status_code: 500,
+                    message: "managed account refresh owner stopped unexpectedly".to_string(),
+                    retry_after_ms: None,
+                })?;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ManagedAccountRefreshCoordinator {
+    active: Mutex<BTreeMap<String, Arc<ManagedAccountRefreshFlight>>>,
+    shutting_down: std::sync::atomic::AtomicBool,
+    drained: Notify,
+}
+
+impl ManagedAccountRefreshCoordinator {
+    fn flight(
+        &self,
+        key: String,
+    ) -> Result<(Arc<ManagedAccountRefreshFlight>, bool), ManagedAccountRefreshError> {
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                message: "managed account refresh is unavailable during shutdown".to_string(),
+                retry_after_ms: None,
+            });
+        }
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| ManagedAccountRefreshError::Refresh {
+                status_code: 500,
+                message: "managed account refresh coordinator lock is unavailable".to_string(),
+                retry_after_ms: None,
+            })?;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                message: "managed account refresh is unavailable during shutdown".to_string(),
+                retry_after_ms: None,
+            });
+        }
+        if let Some(flight) = active.get(&key) {
+            return Ok((Arc::clone(flight), false));
+        }
+        if active.len() >= MAX_ACTIVE_MANAGED_ACCOUNT_REFRESHES {
+            return Err(ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                message: "managed account refresh coordinator is at capacity".to_string(),
+                retry_after_ms: Some(1_000),
+            });
+        }
+        let flight = Arc::new(ManagedAccountRefreshFlight::new());
+        active.insert(key, Arc::clone(&flight));
+        Ok((flight, true))
+    }
+
+    fn complete(&self, key: &str, flight: &Arc<ManagedAccountRefreshFlight>) {
+        if let Ok(mut active) = self.active.lock() {
+            if active
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, flight))
+            {
+                active.remove(key);
+            }
+            if active.is_empty() {
+                self.drained.notify_waiters();
+            }
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn drain(&self, deadline: Duration) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.drained.notified();
+                if self
+                    .active
+                    .lock()
+                    .map(|active| active.is_empty())
+                    .unwrap_or(true)
+                {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(deadline, wait).await.is_ok()
+    }
 }
 
 #[derive(Debug)]
@@ -836,17 +1107,6 @@ pub(crate) enum NativeRefreshCommitError {
     Persistence(#[source] anyhow::Error),
 }
 
-#[derive(Debug)]
-pub(crate) enum QuotaUnauthorizedRecoveryError {
-    Unavailable,
-    Refresh {
-        failure: AccountRefreshFailure,
-        updated: Option<Box<Account>>,
-    },
-    Commit(NativeRefreshCommitError),
-    State(anyhow::Error),
-}
-
 impl NativeRefreshCommitError {
     pub(crate) fn is_persistence_degraded(&self) -> bool {
         matches!(self, Self::Persistence(_))
@@ -864,6 +1124,24 @@ fn ensure_account_identity_generation(
 ) -> Result<(), ManagedAccountRefreshError> {
     if expected.is_some_and(|expected| account.auth_identity_generation != expected) {
         return Err(ManagedAccountRefreshError::IdentityChanged { provider_type });
+    }
+    Ok(())
+}
+
+fn ensure_managed_account_refresh_access(
+    accounts: &AccountStore,
+    provider_type: ProviderType,
+    account_id: &str,
+    access: ManagedAccountRefreshAccess,
+) -> Result<(), ManagedAccountRefreshError> {
+    if access == ManagedAccountRefreshAccess::ActiveAccount
+        && provider_type == ProviderType::CodexOAuth
+        && accounts
+            .active_codex_oauth_account()
+            .map(|account| account.id.as_str())
+            != Some(account_id)
+    {
+        return Err(ManagedAccountRefreshError::InactiveCodexAccount);
     }
     Ok(())
 }
@@ -1010,7 +1288,7 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::providers::store::providers_path(config_dir),
         crate::domain::accounts::store::accounts_path(config_dir),
         crate::domain::accounts::store::accounts_key_path(config_dir),
-        crate::domain::usage::store::usage_path(config_dir),
+        crate::domain::usage::store::usage_directory(config_dir),
         crate::domain::health::provider_health_path(config_dir),
         crate::domain::sharing::shares::shares_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
@@ -1297,6 +1575,7 @@ fn refresh_update_from_recovery_account(account: &Account) -> AccountRefreshUpda
         profile: account.profile.clone(),
         raw: account.raw.clone(),
         subscription_level: account.subscription_level.clone(),
+        clear_subscription_level: false,
         entitlement_status: account.entitlement_status.clone(),
         quota_percent: account.quota_percent,
         quota: account.quota.clone(),
@@ -1781,8 +2060,8 @@ fn validate_server_backup_restore_stage(
             .as_ref()
             .expect("account restore preflight loaded staged accounts");
     }
-    if includes("usage-logs.json") {
-        UsageStore::load_or_default(stage_dir).context("validate staged usage-logs.json")?;
+    if includes("usage/manifest.json") {
+        UsageStore::load_or_default(stage_dir).context("validate staged Usage storage")?;
     }
     if includes("provider-health.json") {
         crate::domain::health::ProviderHealthStore::load_or_default(stage_dir)
@@ -1978,7 +2257,13 @@ pub enum ShareInFlightAcquireError {
 
 #[derive(Debug, Default)]
 pub struct AccountInFlightTracker {
-    counts: Mutex<BTreeMap<String, u32>>,
+    counts: Mutex<AccountInFlightCounts>,
+}
+
+#[derive(Debug, Default)]
+struct AccountInFlightCounts {
+    by_account: BTreeMap<String, u32>,
+    by_provider_type: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1991,8 +2276,6 @@ pub struct AccountInFlightGuard {
     tracker: Arc<AccountInFlightTracker>,
     key: String,
     provider_type: String,
-    account_id: String,
-    max_concurrent: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2107,7 +2390,7 @@ impl AccountInFlightTracker {
         let counts = self
             .counts
             .lock()
-            .map(|counts| counts.clone())
+            .map(|counts| counts.by_account.clone())
             .unwrap_or_default();
         AccountInFlightSnapshot { counts }
     }
@@ -2123,45 +2406,56 @@ impl AccountInFlightTracker {
             .counts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = *counts.get(&key).unwrap_or(&0);
+        let current = *counts.by_account.get(&key).unwrap_or(&0);
         if current >= max_concurrent {
+            crate::metrics::record_account_lease(provider_type.as_str(), "rejected");
             return Err(AccountInFlightAcquireError {
                 current,
                 limit: max_concurrent,
             });
         }
         let next = current.saturating_add(1);
-        counts.insert(key.clone(), next);
+        counts.by_account.insert(key.clone(), next);
+        crate::metrics::record_account_lease(provider_type.as_str(), "acquired");
         let provider_type_label = provider_type.as_str().to_string();
-        crate::metrics::record_account_inflight(
-            &provider_type_label,
-            account_id,
-            next,
-            max_concurrent,
-        );
+        let provider_total = counts
+            .by_provider_type
+            .entry(provider_type_label.clone())
+            .or_default();
+        *provider_total = provider_total.saturating_add(1);
+        crate::metrics::record_account_inflight(&provider_type_label, *provider_total);
         Ok(AccountInFlightGuard {
             tracker: self.clone(),
             key,
             provider_type: provider_type_label,
-            account_id: account_id.to_string(),
-            max_concurrent,
         })
     }
 
-    fn release(&self, key: &str, provider_type: &str, account_id: &str, max_concurrent: u32) {
+    fn release(&self, key: &str, provider_type: &str) {
         let Ok(mut counts) = self.counts.lock() else {
             return;
         };
-        let Some(current) = counts.get_mut(key) else {
+        let Some(current) = counts.by_account.get_mut(key) else {
             return;
         };
         let next = current.saturating_sub(1);
         if next == 0 {
-            counts.remove(key);
+            counts.by_account.remove(key);
         } else {
             *current = next;
         }
-        crate::metrics::record_account_inflight(provider_type, account_id, next, max_concurrent);
+        let provider_total = counts
+            .by_provider_type
+            .get_mut(provider_type)
+            .map(|current| {
+                *current = current.saturating_sub(1);
+                *current
+            })
+            .unwrap_or_default();
+        if provider_total == 0 {
+            counts.by_provider_type.remove(provider_type);
+        }
+        crate::metrics::record_account_inflight(provider_type, provider_total);
     }
 }
 
@@ -2176,12 +2470,7 @@ impl AccountInFlightSnapshot {
 
 impl Drop for AccountInFlightGuard {
     fn drop(&mut self) {
-        self.tracker.release(
-            &self.key,
-            &self.provider_type,
-            &self.account_id,
-            self.max_concurrent,
-        );
+        self.tracker.release(&self.key, &self.provider_type);
     }
 }
 
@@ -3326,7 +3615,36 @@ fn provider_runtime_transition(
     Ok((transition, warnings))
 }
 
-fn provider_runtime_projection_changes(
+fn provider_share_projection_signature(
+    store: &ProviderStore,
+    app: AppKind,
+    provider_id: &str,
+) -> Option<(String, String, String)> {
+    let stored = store
+        .providers
+        .iter()
+        .find(|stored| stored.app == app && stored.provider.id == provider_id)?;
+    let runtime_fingerprint = store
+        .runtime_plan(app, provider_id)
+        .map(|plan| plan.runtime_fingerprint.clone())
+        .unwrap_or_else(|| "missing-runtime-plan".to_string());
+    let model_policy_scope = match bundle_model_policy_scope(&stored.provider) {
+        Ok(Some(scope)) => scope.as_str().to_string(),
+        Ok(None) => ModelPolicyScope::PerApp.as_str().to_string(),
+        Err(error) => format!("invalid:{error}"),
+    };
+    let profile = stored
+        .resource
+        .profile_id
+        .as_ref()
+        .and_then(|profile_id| profile_by_id(profile_id.as_str()));
+    let model_policy_source = bundle_model_policy_source(&stored.provider, profile)
+        .map(|source| source.as_str().to_string())
+        .unwrap_or_else(|error| format!("invalid:{error}"));
+    Some((runtime_fingerprint, model_policy_scope, model_policy_source))
+}
+
+fn provider_share_projection_changes(
     before: &ProviderStore,
     after: &ProviderStore,
 ) -> BTreeSet<(AppKind, String)> {
@@ -3338,13 +3656,8 @@ fn provider_runtime_projection_changes(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter(|(app, provider_id)| {
-            let before_fingerprint = before
-                .runtime_plan(*app, provider_id)
-                .map(|plan| plan.runtime_fingerprint.clone());
-            let after_fingerprint = after
-                .runtime_plan(*app, provider_id)
-                .map(|plan| plan.runtime_fingerprint.clone());
-            before_fingerprint != after_fingerprint
+            provider_share_projection_signature(before, *app, provider_id)
+                != provider_share_projection_signature(after, *app, provider_id)
         })
         .collect()
 }
@@ -3931,6 +4244,17 @@ fn prepare_account_binding_migration_preview(
 }
 
 impl ServerStateInner {
+    pub(crate) fn accept_router_ingress_request(
+        &self,
+        context: &crate::clients::router::ingress::IngressContext,
+        now_ms: i64,
+    ) -> crate::clients::router::ingress::IngressReplayDecision {
+        self.router_ingress_replays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accept(context, now_ms)
+    }
+
     pub(crate) fn share_model_cooldown(
         &self,
         share_id: &str,
@@ -4009,6 +4333,7 @@ impl ServerStateInner {
                 .with_context(|| format!("create {}", directory.display()))?;
             let file = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&path)
@@ -4167,7 +4492,14 @@ impl ServerStateInner {
         auth_identity_generation: u64,
         force: bool,
     ) -> anyhow::Result<()> {
-        let mut refresh_guard = self
+        self.refresh_managed_account_if_needed_for_generation(
+            ProviderType::CodexOAuth,
+            account_id,
+            auth_identity_generation,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Codex quota token refresh failed: {error:?}"))?;
+        let mut _refresh_guard = self
             .account_refresh_locks
             .lock(ProviderType::CodexOAuth, account_id)
             .await;
@@ -4195,65 +4527,37 @@ impl ServerStateInner {
         if result
             .as_ref()
             .is_err_and(|error| error.upstream_status == Some(401))
+            && !active_account.needs_relogin
+            && account_has_refresh_token(&active_account)
         {
-            match self
-                .recover_quota_unauthorized(
-                    &http,
-                    &active_account,
-                    now,
-                    success_cooldown_ms,
-                    &mut refresh_guard,
-                )
+            _refresh_guard.release();
+            self.refresh_managed_account_now_for_generation(
+                ProviderType::CodexOAuth,
+                account_id,
+                auth_identity_generation,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Codex quota OAuth recovery failed: {error:?}"))?;
+            _refresh_guard = self
+                .account_refresh_locks
+                .lock(ProviderType::CodexOAuth, account_id)
+                .await;
+            active_account = self
+                .find_account_for_provider(ProviderType::CodexOAuth, account_id)
                 .await
-            {
-                Ok(refreshed) => {
-                    self.refresh_account_runtime_metadata_if_changed(
-                        &account_before_refresh,
-                        &refreshed,
-                    )
-                    .await?;
-                    if refreshed.auth_identity_generation != auth_identity_generation {
-                        anyhow::bail!(
-                            "Codex OAuth account identity changed during quota auth recovery"
-                        );
-                    }
-                    active_account = refreshed;
-                    result = refresh_account_quota(
-                        &http,
-                        &active_account,
-                        now,
-                        true,
-                        success_cooldown_ms,
-                        timeout_ms,
-                    )
-                    .await;
-                }
-                Err(QuotaUnauthorizedRecoveryError::Unavailable) => {}
-                Err(QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
-                    if let Some(updated) = updated {
-                        self.refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await?;
-                        emit_oauth_quota_updated(self, &updated, false);
-                    }
-                    let diagnostic =
-                        redact_account_error_for_log(&active_account, &failure.message);
-                    tracing::warn!(
-                        account_id = %active_account.id,
-                        error = %diagnostic,
-                        "Provider-bound Codex quota 401 OAuth recovery failed"
-                    );
-                    anyhow::bail!("Codex quota OAuth recovery failed");
-                }
-                Err(QuotaUnauthorizedRecoveryError::Commit(error)) => {
-                    anyhow::bail!("Codex quota OAuth recovery commit failed: {error}");
-                }
-                Err(QuotaUnauthorizedRecoveryError::State(error)) => {
-                    return Err(error.context("Codex quota OAuth recovery state update failed"));
-                }
+                .context("Codex OAuth account disappeared during quota auth recovery")?;
+            if active_account.auth_identity_generation != auth_identity_generation {
+                anyhow::bail!("Codex OAuth account identity changed during quota auth recovery");
             }
+            result = refresh_account_quota(
+                &http,
+                &active_account,
+                now,
+                true,
+                success_cooldown_ms,
+                timeout_ms,
+            )
+            .await;
         }
         match result {
             Ok(QuotaRefreshResult::Updated { update, .. }) => {
@@ -4414,11 +4718,17 @@ impl ServerStateInner {
             shares.save(&config_dir)?;
         }
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
-        log_capture.apply_config(
-            &ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&ui_settings)),
-            &config_dir,
-        );
+        let parsed_log_config =
+            ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&ui_settings));
+        log_capture.apply_config(&parsed_log_config, &config_dir);
         let process_instance_id = new_process_instance_id();
+        let audit_log = AuditLog::new(&config_dir, process_instance_id.clone())
+            .context("initialize request audit log")?;
+        audit_log.set_enabled(
+            parsed_log_config.enabled
+                && parsed_log_config.collection_enabled
+                && parsed_log_config.level.eq_ignore_ascii_case("info"),
+        );
         let bind_addr = SocketAddr::new(cli.host, cli.port);
         let http_client = build_http_client()?;
         let (events, _) = broadcast::channel(256);
@@ -4453,6 +4763,7 @@ impl ServerStateInner {
             accounts_persistence: StorePersistenceCoordinator::default(),
             accounts: RwLock::new(accounts),
             managed_auth_operations: AsyncMutex::new(()),
+            codex_active_account_operations: RwLock::new(()),
             usage_persistence: StorePersistenceCoordinator::default(),
             usage: RwLock::new(usage),
             shares_persistence: StorePersistenceCoordinator::default(),
@@ -4468,6 +4779,7 @@ impl ServerStateInner {
             image_capabilities,
             grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
+            kimi_device_flows: RwLock::new(KimiDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
@@ -4476,7 +4788,9 @@ impl ServerStateInner {
             cursor_model_catalogs:
                 crate::proxy::cursor::credential_cache::CursorModelCatalogCache::default(),
             cursor_api_key_verifier,
+            managed_account_refreshes: ManagedAccountRefreshCoordinator::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
+            gemini_project_locks: AccountRefreshLocks::default(),
             codex_banked_reset_locks: AccountRefreshLocks::default(),
             native_refresh_receipt_journal: Mutex::new(NativeRefreshReceiptJournal::default()),
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
@@ -4484,6 +4798,9 @@ impl ServerStateInner {
             share_model_cooldowns: Mutex::new(ShareModelCooldownTracker::default()),
             previous_response_cache: Mutex::new(PreviousResponseCache::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
+            router_ingress_replays: Mutex::new(
+                crate::clients::router::ingress::IngressReplayCache::default(),
+            ),
             router_registration_flight: AsyncMutex::new(None),
             client_tunnel_claim: AsyncMutex::new(()),
             client_subdomain_adoption_schedulers: Mutex::new(BTreeSet::new()),
@@ -4501,6 +4818,8 @@ impl ServerStateInner {
             #[cfg(test)]
             gemini_project_commit_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
+            managed_account_refresh_panics: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             client_tunnel_claim_commit_failures: std::sync::atomic::AtomicU64::new(0),
             http_client: RwLock::new(http_client),
             events,
@@ -4511,6 +4830,7 @@ impl ServerStateInner {
             process_instance_id,
             upgrade,
             log_capture,
+            audit_log,
             terminal: crate::api::terminal::OpsTerminalManager::new(),
             reported_public_ip: RwLock::new(None),
             installation_heartbeat_wakeup: Notify::new(),
@@ -4522,6 +4842,11 @@ impl ServerStateInner {
         let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
         drop(store);
         self.log_capture.apply_config(&config, &self.config_dir);
+        self.audit_log.set_enabled(
+            config.enabled
+                && config.collection_enabled
+                && config.level.eq_ignore_ascii_case("info"),
+        );
         let level = if config.enabled {
             config.level.as_str()
         } else {
@@ -4535,6 +4860,41 @@ impl ServerStateInner {
         let store = self.ui_settings.read().await;
         let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
         config.enabled && config.collection_enabled && config.level.eq_ignore_ascii_case("info")
+    }
+
+    pub(crate) fn audit_log(&self) -> SharedAuditLog {
+        self.audit_log.clone()
+    }
+
+    pub(crate) fn emit_audit_event(
+        &self,
+        event: AuditEvent,
+    ) -> Result<Option<AuditCursor>, AuditWriteError> {
+        self.audit_log.emit(event)
+    }
+
+    pub(crate) fn emit_audit_event_best_effort(&self, event: AuditEvent) {
+        self.audit_log.emit_best_effort(event);
+    }
+
+    pub(crate) fn emit_audit_event_backpressured_best_effort(&self, event: AuditEvent) {
+        self.audit_log.emit_backpressured_best_effort(event);
+    }
+
+    pub(crate) fn register_audit_request(&self, request_id: &str) {
+        self.audit_log.register_request(request_id);
+    }
+
+    pub(crate) fn enrich_audit_request(&self, request_id: &str, details: AuditRequestDetails) {
+        self.audit_log.enrich_request(request_id, details);
+    }
+
+    pub(crate) fn mark_audit_route_selected(&self, request_id: &str) -> bool {
+        self.audit_log.mark_route_selected(request_id)
+    }
+
+    pub(crate) fn take_audit_request_details(&self, request_id: &str) -> AuditRequestDetails {
+        self.audit_log.take_request_details(request_id)
     }
 
     pub async fn read_router_log_tail(
@@ -5459,6 +5819,10 @@ impl ServerStateInner {
 
     pub async fn http_client(&self) -> reqwest::Client {
         self.http_client.read().await.clone()
+    }
+
+    pub(crate) async fn kiro_ide_version(&self) -> String {
+        crate::clients::oauth::kiro_runtime::effective_ide_version(&self.http_client().await).await
     }
 
     pub fn emit_event(&self, event: ServerEvent) {
@@ -6506,6 +6870,7 @@ impl ServerStateInner {
         }
 
         let mut providers = self.providers.write().await;
+        let accounts = self.accounts.read().await;
         let stored = providers
             .providers
             .iter_mut()
@@ -6521,21 +6886,11 @@ impl ServerStateInner {
             .expect("test Provider settingsConfig object")
             .insert(
                 "testRuntimeEndpoint".to_string(),
-                serde_json::Value::String(endpoint.clone()),
+                serde_json::Value::String(endpoint),
             );
-        let mut plan = providers
-            .runtime_plan(app, provider_id)
-            .with_context(|| {
-                format!(
-                    "test Provider runtime plan not found: {}/{provider_id}",
-                    app.as_str()
-                )
-            })?
-            .as_ref()
-            .clone();
-        plan.endpoint = endpoint;
-        plan.runtime_fingerprint = format!("{}:loopback-test", plan.runtime_fingerprint);
-        Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        providers
+            .rebuild_runtime_index(&accounts)
+            .context("rebuild Provider runtime index for test endpoint")?;
         Ok(())
     }
 
@@ -6657,7 +7012,7 @@ impl ServerStateInner {
         candidate
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index before commit")?;
-        let changed_projection_keys = provider_runtime_projection_changes(&current, &candidate);
+        let changed_projection_keys = provider_share_projection_changes(&current, &candidate);
         let changed_capacity_source_keys =
             provider_capacity_source_changes(&current, &candidate, &accounts)
                 .context("detect Provider capacity source changes")?;
@@ -6819,7 +7174,18 @@ impl ServerStateInner {
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    if current & 1 == 0 {
+                        let mut event = AuditEvent::new("observability.component.degraded");
+                        event.component = Some("credential_storage".to_string());
+                        event.failure_kind = Some("durable_write".to_string());
+                        event.retry_decision = Some("retry".to_string());
+                        event.outcome = Some("degraded".to_string());
+                        event.retryable = Some(true);
+                        self.emit_audit_event_best_effort(event);
+                    }
+                    break;
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -6838,6 +7204,13 @@ impl ServerStateInner {
         ) {
             Ok(_) => {
                 crate::metrics::set_credential_persistence_degraded(false);
+                let mut event = AuditEvent::new("observability.component.recovered");
+                event.component = Some("credential_storage".to_string());
+                event.failure_kind = Some("durable_write".to_string());
+                event.retry_decision = Some("resume".to_string());
+                event.outcome = Some("recovered".to_string());
+                event.retryable = Some(false);
+                self.emit_audit_event_best_effort(event);
                 true
             }
             Err(actual) => actual & 1 == 0,
@@ -7087,6 +7460,7 @@ impl ServerStateInner {
                 retryable: failure.retryable,
                 retry_after_ms: failure.retry_after_ms,
                 immediate_relogin: failure.immediate_relogin,
+                outcome_unknown: false,
                 endpoint_fallback_safe: false,
             });
         }
@@ -7138,67 +7512,6 @@ impl ServerStateInner {
             }
         }
         result
-    }
-
-    pub(crate) async fn recover_quota_unauthorized(
-        self: &Arc<Self>,
-        http: &reqwest::Client,
-        account: &Account,
-        now_ms: i64,
-        quota_refresh_interval_ms: i64,
-        refresh_guard: &mut crate::domain::accounts::managers::AccountRefreshGuard,
-    ) -> Result<Account, QuotaUnauthorizedRecoveryError> {
-        if account.needs_relogin
-            || !provider_native_refresh_available(account.provider_type)
-            || !account_has_refresh_token(account)
-        {
-            return Err(QuotaUnauthorizedRecoveryError::Unavailable);
-        }
-        if self.credential_persistence_degraded() {
-            return Err(QuotaUnauthorizedRecoveryError::State(anyhow::anyhow!(
-                "managed account credentials are waiting for durable persistence"
-            )));
-        }
-
-        let update = match self
-            .execute_native_account_refresh_with_recovery(
-                http,
-                account,
-                now_ms,
-                quota_refresh_interval_ms,
-                refresh_guard,
-            )
-            .await
-        {
-            Ok(update) => update,
-            Err(failure) => {
-                let updated = self
-                    .commit_native_refresh_failure_with_quota_cooldown(
-                        account,
-                        failure.message.clone(),
-                        failure.kind,
-                        failure.immediate_relogin,
-                        now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS),
-                    )
-                    .await
-                    .map_err(QuotaUnauthorizedRecoveryError::State)?;
-                if let Some(current) = updated.as_ref() {
-                    if !native_refresh_snapshot_matches(current, account) {
-                        return Err(QuotaUnauthorizedRecoveryError::Commit(
-                            NativeRefreshCommitError::Superseded(Box::new(current.clone())),
-                        ));
-                    }
-                }
-                return Err(QuotaUnauthorizedRecoveryError::Refresh {
-                    failure,
-                    updated: updated.map(Box::new),
-                });
-            }
-        };
-
-        self.commit_native_refresh_success(account, update)
-            .await
-            .map_err(QuotaUnauthorizedRecoveryError::Commit)
     }
 
     pub(crate) async fn commit_native_refresh_success(
@@ -7467,24 +7780,6 @@ impl ServerStateInner {
             .await
     }
 
-    async fn commit_native_refresh_failure_with_quota_cooldown(
-        self: &Arc<Self>,
-        expected: &Account,
-        message: String,
-        kind: crate::domain::accounts::oauth::OAuthErrorKind,
-        immediate_relogin: bool,
-        quota_next_refresh_at: i64,
-    ) -> anyhow::Result<Option<Account>> {
-        self.commit_native_refresh_failure_state(
-            expected,
-            message,
-            kind,
-            immediate_relogin,
-            Some(quota_next_refresh_at),
-        )
-        .await
-    }
-
     async fn commit_native_refresh_failure_state(
         self: &Arc<Self>,
         expected: &Account,
@@ -7625,6 +7920,12 @@ impl ServerStateInner {
             .store(count, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(test)]
+    fn inject_managed_account_refresh_panics(&self, count: u64) {
+        self.managed_account_refresh_panics
+            .store(count, std::sync::atomic::Ordering::Release);
+    }
+
     pub async fn accounts_snapshot(&self) -> AccountStore {
         self.accounts.read().await.clone()
     }
@@ -7762,6 +8063,7 @@ impl ServerStateInner {
         account_id: String,
     ) -> anyhow::Result<Result<Account, CodexActiveAccountSelectionError>> {
         let account_id = account_id.trim().to_string();
+        let _operation_guard = self.codex_active_account_operations.write().await;
         self.try_mutate_accounts_immediate(|accounts| {
             accounts
                 .select_active_codex_oauth_account(&account_id)
@@ -8539,6 +8841,13 @@ impl ServerStateInner {
         self.usage.read().await.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn lock_usage_publication_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, UsageStore> {
+        self.usage.write().await
+    }
+
     pub async fn record_provider_health_observation(
         &self,
         observation: crate::domain::health::ProviderHealthObservation,
@@ -8566,6 +8875,13 @@ impl ServerStateInner {
         }
         let _commit = self.usage_persistence.gate.lock().await;
         let mut candidate = self.usage.read().await.clone();
+        let previous = candidate
+            .provider_health
+            .get(event_app, &event_provider_id)
+            .cloned();
+        let failure_kind = observation.error_category.clone();
+        let error_message = observation.error_message.clone();
+        let transient_failure = observation.transient_failure;
         let snapshot = candidate.provider_health.record(observation);
         let persisted_health = candidate.provider_health.clone();
         let config_dir = self.config_dir.clone();
@@ -8576,11 +8892,44 @@ impl ServerStateInner {
         self.usage_persistence.mark_published();
         self.emit_event(
             ServerEvent::new("provider-health.changed", "provider_health")
-                .id(event_provider_id)
+                .id(event_provider_id.clone())
                 .app(event_app)
                 .success(snapshot.status.is_success())
                 .message(format!("{:?}", snapshot.status).to_ascii_lowercase()),
         );
+        if previous.as_ref().is_none_or(|previous| {
+            previous.status != snapshot.status
+                || previous.effective_available != snapshot.effective_available
+        }) {
+            let recovered = snapshot.status.is_success() && snapshot.effective_available;
+            let mut event = AuditEvent::new(if recovered {
+                "observability.component.recovered"
+            } else {
+                "observability.component.degraded"
+            });
+            event.component = Some("provider_health".to_string());
+            event.app = Some(event_app.as_str().to_string());
+            event.provider_ref = Some(opaque_ref("provider", &event_provider_id));
+            event.status_code = snapshot.status_code;
+            event.failure_kind = failure_kind
+                .or_else(|| Some(format!("{:?}", snapshot.status).to_ascii_lowercase()));
+            event.network_error_kind = error_message
+                .as_deref()
+                .and_then(classify_network_error)
+                .map(str::to_string);
+            event.error_fingerprint = error_message.as_deref().map(|error| {
+                error_fingerprint(
+                    "provider_health",
+                    event.failure_kind.as_deref().unwrap_or("unknown"),
+                    error,
+                )
+            });
+            event.retry_decision =
+                Some(if recovered { "resume" } else { "probe_again" }.to_string());
+            event.outcome = Some(if recovered { "recovered" } else { "degraded" }.to_string());
+            event.retryable = Some(!recovered && transient_failure);
+            self.emit_audit_event_best_effort(event);
+        }
         Ok(Some(snapshot))
     }
 
@@ -8603,27 +8952,66 @@ impl ServerStateInner {
 
     pub async fn push_usage_log(&self, log: UsageLog) -> anyhow::Result<()> {
         let _commit = self.usage_persistence.gate.lock().await;
-        let mut candidate = self.usage.read().await.clone();
         #[cfg(test)]
         self.usage_persistence.apply_test_persist_delay().await;
-        let config_dir = self.config_dir.clone();
-        let expected_log = log.clone();
-        let (candidate, result) = tokio::task::spawn_blocking(move || {
-            let result = candidate.push_and_persist(&config_dir, log);
-            (candidate, result)
-        })
-        .await
-        .context("usage log persistence task panicked")?;
-        let published = match result {
-            Ok(()) => candidate,
-            Err(error) => {
-                reconcile_usage_store_after_persistence_error(&self.config_dir, expected_log, error)
-                    .await?
-            }
-        };
-        *self.usage.write().await = published;
-        self.usage_persistence.mark_published();
+        let append = self.usage.read().await.prepare_append(log)?;
+        self.commit_usage_append(append).await?;
         Ok(())
+    }
+
+    async fn commit_usage_append(&self, append: PreparedUsageAppend) -> anyhow::Result<UsageLog> {
+        let expected_log = append.log().clone();
+        let persisted_append = append.clone();
+        let config_dir = self.config_dir.clone();
+        let result = tokio::task::spawn_blocking(move || persisted_append.persist(&config_dir))
+            .await
+            .context("usage journal persistence task panicked")?;
+        if let Err(error) = result {
+            let reconciled = reconcile_usage_store_after_persistence_error(
+                &self.config_dir,
+                expected_log.clone(),
+                error,
+            )
+            .await?;
+            *self.usage.write().await = reconciled;
+            self.usage_persistence.mark_published();
+            return Ok(expected_log);
+        }
+
+        let compact_candidate = {
+            let mut usage = self.usage.write().await;
+            usage.apply_append(append);
+            usage
+                .needs_compaction(&self.config_dir)
+                .then(|| usage.clone())
+        };
+        if let Some(mut candidate) = compact_candidate {
+            let config_dir = self.config_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                let result = candidate.compact_if_due(&config_dir);
+                (candidate, result)
+            })
+            .await
+            {
+                Ok((compacted, Ok(_))) => {
+                    *self.usage.write().await = compacted;
+                }
+                Ok((_, Err(error))) => {
+                    tracing::warn!(
+                        %error,
+                        "usage compaction deferred; the durable journal remains authoritative"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "usage compaction task panicked; the durable journal remains authoritative"
+                    );
+                }
+            }
+        }
+        self.usage_persistence.mark_published();
+        Ok(expected_log)
     }
 
     pub(crate) async fn push_health_usage_log_if_due(
@@ -8633,44 +9021,29 @@ impl ServerStateInner {
     ) -> anyhow::Result<UsageLog> {
         anyhow::ensure!(log.is_health_check, "usage log is not a health check");
         let _commit = self.usage_persistence.gate.lock().await;
-        let mut candidate = self.usage.read().await.clone();
-        let latest = candidate
-            .logs
-            .iter()
-            .filter(|existing| {
-                existing.is_health_check
-                    && existing.share_id == log.share_id
-                    && existing.app == log.app
-                    && existing.provider_id == log.provider_id
-                    && existing.data_source == log.data_source
-                    && existing.requested_model == log.requested_model
-            })
-            .max_by_key(|existing| existing.created_at_ms)
-            .cloned();
-        if let Some(existing) = latest {
-            if log.created_at_ms.saturating_sub(existing.created_at_ms) < min_interval_ms {
-                return Ok(existing);
+        let append = {
+            let usage = self.usage.read().await;
+            let latest = usage
+                .logs
+                .iter()
+                .filter(|existing| {
+                    existing.is_health_check
+                        && existing.share_id == log.share_id
+                        && existing.app == log.app
+                        && existing.provider_id == log.provider_id
+                        && existing.data_source == log.data_source
+                        && existing.requested_model == log.requested_model
+                })
+                .max_by_key(|existing| existing.created_at_ms)
+                .cloned();
+            if let Some(existing) = latest {
+                if log.created_at_ms.saturating_sub(existing.created_at_ms) < min_interval_ms {
+                    return Ok(existing);
+                }
             }
-        }
-        let config_dir = self.config_dir.clone();
-        let returned_log = log.clone();
-        let expected_log = log.clone();
-        let (candidate, result) = tokio::task::spawn_blocking(move || {
-            let result = candidate.push_and_persist(&config_dir, log);
-            (candidate, result)
-        })
-        .await
-        .context("health usage log persistence task panicked")?;
-        let published = match result {
-            Ok(()) => candidate,
-            Err(error) => {
-                reconcile_usage_store_after_persistence_error(&self.config_dir, expected_log, error)
-                    .await?
-            }
+            usage.prepare_append(log)?
         };
-        *self.usage.write().await = published;
-        self.usage_persistence.mark_published();
-        Ok(returned_log)
+        self.commit_usage_append(append).await
     }
 
     pub async fn update_usage_log(
@@ -8679,42 +9052,136 @@ impl ServerStateInner {
         update: impl FnOnce(&mut UsageLog),
     ) -> anyhow::Result<Option<UsageLog>> {
         let _commit = self.usage_persistence.gate.lock().await;
-        let mut candidate = self.usage.read().await.clone();
-        let Some(mut updated) = candidate
-            .logs
-            .iter()
-            .find(|log| log.request_id == request_id)
-            .cloned()
-        else {
-            return Ok(None);
+        let append = {
+            let usage = self.usage.read().await;
+            let Some(mut updated) = usage
+                .logs
+                .iter()
+                .find(|log| log.request_id == request_id)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            update(&mut updated);
+            usage.prepare_append(updated)?
         };
-        update(&mut updated);
-        let expected_log = updated.clone();
-        let request_id = request_id.to_string();
-        let config_dir = self.config_dir.clone();
-        let (candidate, result) = tokio::task::spawn_blocking(move || {
-            let result = candidate.update_log_and_persist(&config_dir, &request_id, |log| {
-                *log = updated;
-            });
-            (candidate, result)
-        })
-        .await
-        .context("usage log update persistence task panicked")?;
-        let (published, persisted_result) = match result {
-            Ok(value) => (candidate, value),
-            Err(error) => {
-                let reconciled = reconcile_usage_store_after_persistence_error(
-                    &self.config_dir,
-                    expected_log.clone(),
-                    error,
-                )
-                .await?;
-                (reconciled, Some(expected_log))
+        self.commit_usage_append(append).await.map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finalize_usage_request_lifecycle(
+        &self,
+        app: AppKind,
+        request_id: String,
+        share_id: Option<String>,
+        user_email: Option<String>,
+        status_code: u16,
+        started_at_ms: u128,
+        completed_at_ms: u128,
+        attempt_count: u32,
+        interrupted: bool,
+        failure_kind: Option<String>,
+    ) {
+        let outcome = if interrupted {
+            UsageOutcome::Interrupted
+        } else {
+            UsageOutcome::from_status(status_code)
+        };
+        let duration_ms = completed_at_ms.saturating_sub(started_at_ms);
+        let update_failure_kind = failure_kind.clone();
+        match self
+            .update_usage_log(&request_id, |log| {
+                log.status_code = status_code;
+                log.outcome = outcome;
+                log.failure_kind = update_failure_kind;
+                log.completed_at_ms = completed_at_ms;
+                log.end_to_end_duration_ms = duration_ms;
+                log.attempt_count = log.attempt_count.max(attempt_count.max(1));
+                if interrupted {
+                    log.usage_state = UsageState::Interrupted;
+                } else if log.usage_state == UsageState::Pending {
+                    log.usage_state = UsageState::Missing;
+                }
+                log.usage_revision = log.usage_revision.saturating_add(1);
+            })
+            .await
+        {
+            Ok(Some(_)) => {
+                self.emit_event(
+                    ServerEvent::new("usage.updated", "usage")
+                        .id(request_id)
+                        .app(app)
+                        .message("request_finalized"),
+                );
+                return;
             }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(request_id, error = %error, "failed to finalize Usage request");
+                return;
+            }
+        }
+
+        let (share_name, share_slug) = if let Some(share_id) = share_id.as_deref() {
+            self.shares
+                .read()
+                .await
+                .shares
+                .iter()
+                .find(|share| share.id == share_id)
+                .map(|share| (share.display_name.clone(), share.tunnel_subdomain.clone()))
+                .unwrap_or_default()
+        } else {
+            (None, None)
         };
-        *self.usage.write().await = published;
-        self.usage_persistence.mark_published();
-        Ok(persisted_result)
+        let provider_type = match app {
+            AppKind::Claude => ProviderType::Claude,
+            AppKind::Codex => ProviderType::Codex,
+            AppKind::Gemini => ProviderType::Gemini,
+        };
+        let mut log = UsageLog::new(
+            app,
+            "unresolved-route".to_string(),
+            "Unresolved route".to_string(),
+            provider_type,
+            status_code,
+            duration_ms,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+        );
+        log.bundle_id = "unresolved-route".to_string();
+        log.apply_context(UsageLogContext {
+            request_id: Some(request_id.clone()),
+            share_id,
+            share_name,
+            share_slug,
+            user_email,
+            data_source: Some("router_share".to_string()),
+            usage_state: Some(if interrupted {
+                UsageState::Interrupted
+            } else {
+                UsageState::Missing
+            }),
+            error_message: failure_kind.clone(),
+            started_at_ms: Some(started_at_ms),
+            completed_at_ms: Some(completed_at_ms),
+            end_to_end_duration_ms: Some(duration_ms),
+            upstream_duration_ms: Some(0),
+            attempt_count: Some(attempt_count.max(1)),
+            outcome: Some(outcome),
+            failure_kind,
+            ..UsageLogContext::default()
+        });
+        if let Err(error) = self.push_usage_log(log).await {
+            tracing::warn!(request_id, error = %error, "failed to persist unresolved Usage request");
+            return;
+        }
+        self.emit_event(
+            ServerEvent::new("usage.created", "usage")
+                .id(request_id)
+                .app(app)
+                .message("unresolved_route"),
+        );
     }
 
     pub async fn save_shares(&self) -> anyhow::Result<()> {
@@ -8730,8 +9197,22 @@ impl ServerStateInner {
         provider_type: ProviderType,
         account_id: &str,
     ) -> Result<(), ManagedAccountRefreshError> {
-        self.refresh_managed_account_inner(provider_type, account_id, None, false)
-            .await
+        self.refresh_managed_account_inner(
+            provider_type,
+            account_id,
+            None,
+            false,
+            ManagedAccountRefreshAccess::BoundAccount,
+        )
+        .await
+    }
+
+    pub fn begin_managed_account_refresh_shutdown(&self) {
+        self.managed_account_refreshes.begin_shutdown();
+    }
+
+    pub async fn drain_managed_account_refreshes(&self, deadline: Duration) -> bool {
+        self.managed_account_refreshes.drain(deadline).await
     }
 
     pub async fn refresh_managed_account_if_needed_for_generation(
@@ -8745,6 +9226,23 @@ impl ServerStateInner {
             account_id,
             Some(expected_auth_identity_generation),
             false,
+            ManagedAccountRefreshAccess::BoundAccount,
+        )
+        .await
+    }
+
+    pub async fn refresh_active_account_if_needed_for_generation(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.refresh_managed_account_inner(
+            provider_type,
+            account_id,
+            Some(expected_auth_identity_generation),
+            false,
+            ManagedAccountRefreshAccess::ActiveAccount,
         )
         .await
     }
@@ -8754,8 +9252,14 @@ impl ServerStateInner {
         provider_type: ProviderType,
         account_id: &str,
     ) -> Result<(), ManagedAccountRefreshError> {
-        self.refresh_managed_account_inner(provider_type, account_id, None, true)
-            .await
+        self.refresh_managed_account_inner(
+            provider_type,
+            account_id,
+            None,
+            true,
+            ManagedAccountRefreshAccess::BoundAccount,
+        )
+        .await
     }
 
     pub async fn refresh_managed_account_now_for_generation(
@@ -8769,6 +9273,23 @@ impl ServerStateInner {
             account_id,
             Some(expected_auth_identity_generation),
             true,
+            ManagedAccountRefreshAccess::BoundAccount,
+        )
+        .await
+    }
+
+    pub async fn refresh_active_account_now_for_generation(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        self.refresh_managed_account_inner(
+            provider_type,
+            account_id,
+            Some(expected_auth_identity_generation),
+            true,
+            ManagedAccountRefreshAccess::ActiveAccount,
         )
         .await
     }
@@ -8779,6 +9300,183 @@ impl ServerStateInner {
         account_id: &str,
         expected_auth_identity_generation: Option<u64>,
         force: bool,
+        access: ManagedAccountRefreshAccess,
+    ) -> Result<(), ManagedAccountRefreshError> {
+        let now = crate::infra::time::now_ms() as i64;
+        let account = {
+            let accounts = self.accounts.read().await;
+            ensure_managed_account_refresh_access(&accounts, provider_type, account_id, access)?;
+            accounts
+                .find_for_provider(provider_type, Some(account_id))
+                .cloned()
+        };
+        let Some(account) = account else {
+            return if expected_auth_identity_generation.is_some() {
+                Err(ManagedAccountRefreshError::NotFound)
+            } else {
+                Ok(())
+            };
+        };
+        ensure_account_identity_generation(
+            &account,
+            provider_type,
+            expected_auth_identity_generation,
+        )?;
+        if !force && !account_needs_native_refresh(&account, now) {
+            return Ok(());
+        }
+        let refresh_generation = (
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        );
+        let key = format!(
+            "{}:{}:{}:{}:{}:{}",
+            provider_type.as_str(),
+            account.id.len(),
+            account.id,
+            refresh_generation.0,
+            refresh_generation.1,
+            access.flight_key(),
+        );
+        let (flight, owner) = self.managed_account_refreshes.flight(key.clone())?;
+        if owner {
+            let state = Arc::clone(self);
+            let account_id = account_id.to_string();
+            let owner_flight = Arc::clone(&flight);
+            tokio::spawn(async move {
+                let refresh_started = std::time::Instant::now();
+                let mut started_event = AuditEvent::new("oauth.refresh.started");
+                started_event.provider_type = Some(provider_type.as_str().to_string());
+                started_event.account_ref = Some(opaque_ref("account", &account_id));
+                started_event.operation = Some(if force { "forced" } else { "scheduled" }.into());
+                started_event.stage = Some("oauth_refresh".to_string());
+                started_event.outcome = Some("started".to_string());
+                state.emit_audit_event_best_effort(started_event);
+                tracing::info!(
+                    target: "cc_switch_server::request_audit",
+                    event = "oauth.refresh.started",
+                    provider_type = provider_type.as_str(),
+                    account_ref = %opaque_ref("account", &account_id),
+                    forced = force,
+                    "OAuth refresh started"
+                );
+                let result =
+                    match std::panic::AssertUnwindSafe(state.refresh_managed_account_owner(
+                        provider_type,
+                        &account_id,
+                        expected_auth_identity_generation,
+                        force,
+                        refresh_generation,
+                        access,
+                    ))
+                    .catch_unwind()
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            state
+                                .fail_closed_managed_account_refresh_panic(
+                                    provider_type,
+                                    &account_id,
+                                    refresh_generation,
+                                    refresh_started.elapsed(),
+                                )
+                                .await;
+                            Err(ManagedAccountRefreshError::Refresh {
+                                status_code: 500,
+                                message: "managed account refresh owner panicked".to_string(),
+                                retry_after_ms: None,
+                            })
+                        }
+                    };
+                record_managed_refresh_terminal_audit(
+                    &state,
+                    provider_type,
+                    &account_id,
+                    force,
+                    refresh_started.elapsed(),
+                    &result,
+                );
+                let _ = owner_flight.result.send(Some(result));
+                state
+                    .managed_account_refreshes
+                    .complete(&key, &owner_flight);
+            });
+        }
+        flight.wait().await
+    }
+
+    async fn fail_closed_managed_account_refresh_panic(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        refresh_generation: (u64, u64),
+        elapsed: Duration,
+    ) {
+        crate::metrics::record_oauth_refresh_attempt(
+            provider_type.as_str(),
+            "outcome_unknown",
+            elapsed,
+            true,
+        );
+        let account = self
+            .find_account_for_provider(provider_type, account_id)
+            .await
+            .filter(|account| {
+                (
+                    account.auth_identity_generation,
+                    account.token_refresh_generation,
+                ) == refresh_generation
+            });
+        let Some(account) = account else {
+            tracing::warn!(
+                provider_type = %provider_type.as_str(),
+                "managed OAuth refresh owner panicked after credentials changed; live credentials were preserved"
+            );
+            return;
+        };
+        let updated = match self
+            .commit_native_refresh_failure(
+                &account,
+                "OAuth refresh owner panicked; refresh outcome is unknown".to_string(),
+                crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                true,
+            )
+            .await
+        {
+            Ok(Some(updated)) if native_refresh_snapshot_matches(&updated, &account) => updated,
+            Ok(_) => return,
+            Err(error) => {
+                tracing::error!(
+                    account_id = %account.id,
+                    provider_type = %account.provider_type.as_str(),
+                    %error,
+                    "could not isolate OAuth credentials after refresh owner panic"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .refresh_account_runtime_metadata_if_changed(&account, &updated)
+            .await
+        {
+            tracing::warn!(
+                account_id = %account.id,
+                provider_type = %account.provider_type.as_str(),
+                %error,
+                "refresh owner panic isolation Share metadata sync remains pending"
+            );
+        }
+    }
+
+    async fn refresh_managed_account_owner(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_auth_identity_generation: Option<u64>,
+        force: bool,
+        refresh_generation_before_lock: (u64, u64),
+        access: ManagedAccountRefreshAccess,
     ) -> Result<(), ManagedAccountRefreshError> {
         let now = crate::infra::time::now_ms() as i64;
         let account = {
@@ -8799,21 +9497,33 @@ impl ServerStateInner {
             provider_type,
             expected_auth_identity_generation,
         )?;
+        if (
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        ) != refresh_generation_before_lock
+        {
+            return Ok(());
+        }
         if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
         }
-        let refresh_generation_before_lock = (
-            account.auth_identity_generation,
-            account.token_refresh_generation,
-        );
 
         let mut refresh_guard = self
             .account_refresh_locks
             .lock(account.provider_type, &account.id)
             .await;
 
+        let _active_account_guard = if access == ManagedAccountRefreshAccess::ActiveAccount
+            && provider_type == ProviderType::CodexOAuth
+        {
+            Some(self.codex_active_account_operations.read().await)
+        } else {
+            None
+        };
+
         let account = {
             let accounts = self.accounts.read().await;
+            ensure_managed_account_refresh_access(&accounts, provider_type, account_id, access)?;
             accounts
                 .find_for_provider(provider_type, Some(account_id))
                 .cloned()
@@ -8833,11 +9543,10 @@ impl ServerStateInner {
                 retry_after_ms: failure.retry_after_ms,
             });
         }
-        if force
-            && (
-                account.auth_identity_generation,
-                account.token_refresh_generation,
-            ) != refresh_generation_before_lock
+        if (
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        ) != refresh_generation_before_lock
         {
             return Ok(());
         }
@@ -8848,18 +9557,58 @@ impl ServerStateInner {
             return Err(ManagedAccountRefreshError::CredentialPersistenceDegraded);
         }
 
+        #[cfg(test)]
+        if self
+            .managed_account_refresh_panics
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            panic!("injected managed account refresh owner panic");
+        }
+
         let http_client = self.http_client().await;
         let interval_ms = self.oauth_quota_refresh_interval_ms().await;
-        let update = match self
-            .execute_native_account_refresh_with_recovery(
+        let refresh_started = std::time::Instant::now();
+        let refresh_result = tokio::time::timeout(
+            MANAGED_ACCOUNT_REFRESH_DEADLINE,
+            self.execute_native_account_refresh_with_recovery(
                 &http_client,
                 &account,
                 now,
                 interval_ms,
                 &mut refresh_guard,
-            )
-            .await
-        {
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            let result = Err(AccountRefreshFailure::outcome_unknown(
+                "OAuth refresh outcome is unknown after the 30 second owner deadline",
+            ));
+            record_refresh_flight_failure(&mut refresh_guard, &account, &result);
+            result
+        });
+        let (refresh_outcome, outcome_unknown) = match &refresh_result {
+            Ok(_) => ("receipt_validated", false),
+            Err(error) if error.outcome_unknown => ("outcome_unknown", true),
+            Err(error) if error.retryable => ("retryable_error", false),
+            Err(error)
+                if error.kind == crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant =>
+            {
+                ("invalid_grant", false)
+            }
+            Err(_) => ("terminal_error", false),
+        };
+        crate::metrics::record_oauth_refresh_attempt(
+            provider_type.as_str(),
+            refresh_outcome,
+            refresh_started.elapsed(),
+            outcome_unknown,
+        );
+        let update = match refresh_result {
             Ok(update) => update,
             Err(error) => {
                 let diagnostic = redact_account_error_for_log(&account, &error.message);
@@ -9050,6 +9799,10 @@ impl ServerStateInner {
             return Ok(());
         }
 
+        let mut project_guard = self
+            .gemini_project_locks
+            .lock(provider_type, account_id)
+            .await;
         let mut refresh_guard = self
             .account_refresh_locks
             .lock(provider_type, account_id)
@@ -9066,7 +9819,10 @@ impl ServerStateInner {
         if gemini_v1internal_project_id(&account).is_some() {
             return Ok(());
         }
-        if let Some(failure) = refresh_guard.coalesced_gemini_project_failure_for(&account) {
+        if let Some(failure) = project_guard
+            .coalesced_gemini_project_failure_for(&account)
+            .or_else(|| refresh_guard.coalesced_native_failure_for(&account))
+        {
             return Err(ManagedAccountRefreshError::Refresh {
                 status_code: failure.status_code,
                 message: failure
@@ -9138,7 +9894,7 @@ impl ServerStateInner {
                                 %error,
                                 "persisting Gemini Code Assist project metadata failed"
                             );
-                            refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                            project_guard.record_failure(AccountRefreshFlightFailure::for_account(
                                 &account,
                                 AccountRefreshFlightStage::GeminiProjectDiscovery,
                                 AccountRefreshFlightFailureDetails {
@@ -9191,14 +9947,43 @@ impl ServerStateInner {
                             .is_some_and(|token| !token.trim().is_empty()) =>
                 {
                     retried_after_unauthorized = true;
-                    account = self
-                        .refresh_gemini_project_account_after_unauthorized(
-                            &http_client,
-                            account,
-                            now,
-                            &mut refresh_guard,
+                    let recovery_auth_identity_generation = account.auth_identity_generation;
+                    refresh_guard.release();
+                    let refresh_result = self
+                        .refresh_managed_account_now_for_generation(
+                            provider_type,
+                            account_id,
+                            recovery_auth_identity_generation,
                         )
-                        .await?;
+                        .await;
+                    if let Err(error) = refresh_result {
+                        let failure_account = self
+                            .find_account_for_provider(provider_type, account_id)
+                            .await
+                            .unwrap_or_else(|| account.clone());
+                        project_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                            &failure_account,
+                            AccountRefreshFlightStage::NativeRefresh,
+                            managed_refresh_flight_failure_details(&error),
+                        ));
+                        return Err(error);
+                    }
+                    refresh_guard = self
+                        .account_refresh_locks
+                        .lock(provider_type, account_id)
+                        .await;
+                    account = self
+                        .find_account_for_provider(provider_type, account_id)
+                        .await
+                        .ok_or(ManagedAccountRefreshError::NotFound)?;
+                    ensure_account_identity_generation(
+                        &account,
+                        provider_type,
+                        Some(recovery_auth_identity_generation),
+                    )?;
+                    if gemini_v1internal_project_id(&account).is_some() {
+                        return Ok(());
+                    }
                 }
                 Err(error) => {
                     let next_refresh_at = error
@@ -9222,7 +10007,7 @@ impl ServerStateInner {
                     }
                     let public_message = "Gemini Code Assist project discovery failed".to_string();
                     let retry_after_ms = Some(next_refresh_at.saturating_sub(now));
-                    refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                    project_guard.record_failure(AccountRefreshFlightFailure::for_account(
                         &account,
                         AccountRefreshFlightStage::GeminiProjectDiscovery,
                         AccountRefreshFlightFailureDetails {
@@ -9244,125 +10029,6 @@ impl ServerStateInner {
                 }
             }
         }
-    }
-
-    async fn refresh_gemini_project_account_after_unauthorized(
-        self: &Arc<Self>,
-        http_client: &reqwest::Client,
-        account: Account,
-        now: i64,
-        refresh_guard: &mut crate::domain::accounts::managers::AccountRefreshGuard,
-    ) -> Result<Account, ManagedAccountRefreshError> {
-        let interval_ms = self.oauth_quota_refresh_interval_ms().await;
-        let update = match self
-            .execute_native_account_refresh_with_recovery(
-                http_client,
-                &account,
-                now,
-                interval_ms,
-                refresh_guard,
-            )
-            .await
-        {
-            Ok(update) => update,
-            Err(error) => {
-                let before = account.clone();
-                let updated = self
-                    .commit_native_refresh_failure(
-                        &account,
-                        error.message,
-                        error.kind,
-                        error.immediate_relogin,
-                    )
-                    .await
-                    .map_err(|commit_error| ManagedAccountRefreshError::Refresh {
-                        status_code: 500,
-                        message: format!(
-                            "managed account refresh failure could not be persisted: {commit_error}"
-                        ),
-                        retry_after_ms: None,
-                    })?;
-                if let Some(updated) = updated {
-                    if let Err(sync_error) = self
-                        .refresh_account_runtime_metadata_if_changed(&before, &updated)
-                        .await
-                    {
-                        tracing::warn!(
-                            account_id = %before.id,
-                            error = %sync_error,
-                            "Gemini project recovery failure Share metadata sync remains pending"
-                        );
-                    }
-                }
-                return Err(ManagedAccountRefreshError::Refresh {
-                    status_code: error.status_code,
-                    message: "managed account refresh after loadCodeAssist rejection failed"
-                        .to_string(),
-                    retry_after_ms: error.retry_after_ms,
-                });
-            }
-        };
-        let before = account.clone();
-        let updated = match self.commit_native_refresh_success(&account, update).await {
-            Ok(updated) => updated,
-            Err(error) => {
-                if error.is_superseded() {
-                    return Err(ManagedAccountRefreshError::Refresh {
-                        status_code: 409,
-                        message: "managed account credentials changed during OAuth refresh"
-                            .to_string(),
-                        retry_after_ms: None,
-                    });
-                }
-                let persistence_degraded = error.is_persistence_degraded();
-                let failure_account = if persistence_degraded {
-                    self.find_account_by_id(&account.id)
-                        .await
-                        .unwrap_or_else(|| account.clone())
-                } else {
-                    account.clone()
-                };
-                let status_code = if persistence_degraded { 503 } else { 500 };
-                let public_message = if persistence_degraded {
-                    "rotated credentials are live but durable persistence is degraded"
-                } else {
-                    "managed account refresh state commit failed"
-                };
-                refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
-                    &failure_account,
-                    AccountRefreshFlightStage::NativeRefresh,
-                    AccountRefreshFlightFailureDetails {
-                        status_code,
-                        upstream_status: None,
-                        message: error.to_string(),
-                        public_message: Some(public_message.to_string()),
-                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
-                        retryable: true,
-                        retry_after_ms: Some(QUOTA_FAILURE_COOLDOWN_MS),
-                        immediate_relogin: false,
-                    },
-                ));
-                if persistence_degraded {
-                    return Err(ManagedAccountRefreshError::CredentialPersistenceDegraded);
-                }
-                return Err(ManagedAccountRefreshError::Refresh {
-                    status_code,
-                    message: public_message.to_string(),
-                    retry_after_ms: Some(QUOTA_FAILURE_COOLDOWN_MS),
-                });
-            }
-        };
-        if let Err(error) = self
-            .refresh_account_runtime_metadata_if_changed(&before, &updated)
-            .await
-        {
-            tracing::warn!(
-                account_id = %updated.id,
-                %error,
-                "Gemini project recovery Share metadata sync remains pending"
-            );
-        }
-        Ok(updated)
     }
 
     async fn commit_gemini_project_update(
@@ -9866,6 +10532,9 @@ impl ServerStateInner {
             ProviderType::GrokOAuth => {
                 self.cancel_grok_device_flow(device_code).await;
             }
+            ProviderType::KimiCode => {
+                self.cancel_kimi_device_flow(device_code).await;
+            }
             _ => {}
         }
         true
@@ -9894,6 +10563,9 @@ impl ServerStateInner {
                 }
                 ProviderType::GrokOAuth => {
                     self.cancel_grok_device_flow(device_code).await;
+                }
+                ProviderType::KimiCode => {
+                    self.cancel_kimi_device_flow(device_code).await;
                 }
                 _ => {}
             }
@@ -10011,6 +10683,52 @@ impl ServerStateInner {
 
     pub async fn remove_grok_device_flow(&self, device_code: &str) -> bool {
         self.grok_device_flows.write().await.cancel(device_code)
+    }
+
+    pub async fn insert_kimi_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingKimiDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.kimi_device_flows
+            .write()
+            .await
+            .insert(device_code, flow, now_ms);
+    }
+
+    pub async fn begin_kimi_device_poll(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<KimiDevicePollLease> {
+        self.kimi_device_flows
+            .write()
+            .await
+            .begin_poll(device_code, now_ms)
+    }
+
+    pub async fn finish_kimi_device_poll(
+        &self,
+        device_code: &str,
+        result: KimiDevicePollResult,
+        now_ms: i64,
+    ) -> bool {
+        self.kimi_device_flows
+            .write()
+            .await
+            .finish_poll(device_code, result, now_ms)
+    }
+
+    pub async fn fail_kimi_device_poll(&self, device_code: &str, terminal: bool, now_ms: i64) {
+        self.kimi_device_flows
+            .write()
+            .await
+            .fail_poll(device_code, terminal, now_ms);
+    }
+
+    pub async fn cancel_kimi_device_flow(&self, device_code: &str) -> bool {
+        self.kimi_device_flows.write().await.cancel(device_code)
     }
 
     pub async fn insert_codex_device_flow(
@@ -11172,6 +11890,425 @@ const PUBLIC_IP_RETRY_INITIAL: Duration = Duration::from_secs(30);
 const PUBLIC_IP_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 const ROUTER_HEARTBEAT_SUSTAINED_FAILURES: u32 = 3;
 const ROUTER_HEARTBEAT_STATE_ERROR_MAX_CHARS: usize = 2 * 1024;
+const AUDIT_UPLOAD_IDLE_INTERVAL: Duration = Duration::from_secs(1);
+const AUDIT_UPLOAD_DISABLED_INTERVAL: Duration = Duration::from_secs(5);
+const AUDIT_UPLOAD_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const AUDIT_UPLOAD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+pub fn spawn_audit_log_uploader(state: ServerState) {
+    tokio::spawn(async move {
+        let mut retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+        let mut last_failure = None::<String>;
+        let mut cursor_loss_reported = None::<AuditCursor>;
+        loop {
+            if !state.audit_log().is_enabled() {
+                retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+                last_failure = None;
+                sleep(AUDIT_UPLOAD_DISABLED_INTERVAL).await;
+                continue;
+            }
+
+            let config = state.config_snapshot().await;
+            let Some(router_api_base) = config
+                .router_api_base()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+            else {
+                sleep(AUDIT_UPLOAD_DISABLED_INTERVAL).await;
+                continue;
+            };
+            let Some(installation_id) = config
+                .registered_router_identity()
+                .map(|identity| identity.installation_id.trim().to_string())
+                .filter(|value| !value.is_empty())
+            else {
+                sleep(AUDIT_UPLOAD_DISABLED_INTERVAL).await;
+                continue;
+            };
+
+            let audit = state.audit_log();
+            let loaded_cursor = match tokio::task::spawn_blocking({
+                let audit = audit.clone();
+                move || audit.load_upload_cursor()
+            })
+            .await
+            {
+                Ok(Ok(cursor)) => cursor,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    let cursor_error = error.to_string();
+                    match fence_audit_upload_destination(
+                        audit.clone(),
+                        router_api_base.clone(),
+                        installation_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(latest_cursor) => {
+                            tracing::warn!(
+                                target: "cc_switch_server::audit_upload",
+                                error = %cursor_error,
+                                installation_ref = %opaque_ref("installation", &installation_id),
+                                fenced_through_boot_id = latest_cursor.as_ref().map(|cursor| cursor.boot_id.as_str()).unwrap_or("-"),
+                                fenced_through_sequence = latest_cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0),
+                                "invalid audit upload cursor was replaced; retained events were fenced to prevent cross-Client disclosure"
+                            );
+                            retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+                            last_failure = None;
+                            cursor_loss_reported = None;
+                            continue;
+                        }
+                        Err(fence_error) => {
+                            audit_upload_failure(
+                                &audit,
+                                &mut last_failure,
+                                "cursor_recovery",
+                                &format!("{cursor_error}; recovery failed: {fence_error}"),
+                                retry_delay,
+                            );
+                            sleep(retry_delay).await;
+                            retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                            continue;
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    audit_upload_failure(
+                        &audit,
+                        &mut last_failure,
+                        "cursor_read",
+                        &error.to_string(),
+                        retry_delay,
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                    continue;
+                }
+                Err(error) => {
+                    audit_upload_failure(
+                        &audit,
+                        &mut last_failure,
+                        "cursor_task",
+                        &error.to_string(),
+                        retry_delay,
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                    continue;
+                }
+            };
+            if loaded_cursor.is_none() {
+                match fence_audit_upload_destination(
+                    audit.clone(),
+                    router_api_base.clone(),
+                    installation_id.clone(),
+                )
+                .await
+                {
+                    Ok(latest_cursor) => {
+                        tracing::warn!(
+                            target: "cc_switch_server::audit_upload",
+                            installation_ref = %opaque_ref("installation", &installation_id),
+                            fenced_through_boot_id = latest_cursor.as_ref().map(|cursor| cursor.boot_id.as_str()).unwrap_or("-"),
+                            fenced_through_sequence = latest_cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0),
+                            "audit upload cursor was initialized; retained events were fenced because their destination identity could not be proven"
+                        );
+                        retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+                        last_failure = None;
+                        cursor_loss_reported = None;
+                        continue;
+                    }
+                    Err(error) => {
+                        audit_upload_failure(
+                            &audit,
+                            &mut last_failure,
+                            "cursor_initialize",
+                            &error,
+                            retry_delay,
+                        );
+                        sleep(retry_delay).await;
+                        retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                        continue;
+                    }
+                }
+            }
+            if loaded_cursor.as_ref().is_some_and(|cursor| {
+                !cursor.targets_destination(&router_api_base, &installation_id)
+            }) {
+                match fence_audit_upload_destination(
+                    audit.clone(),
+                    router_api_base.clone(),
+                    installation_id.clone(),
+                )
+                .await
+                {
+                    Ok(latest_cursor) => {
+                        let previous_installation_ref = loaded_cursor
+                            .as_ref()
+                            .map(|cursor| opaque_ref("installation", &cursor.installation_id))
+                            .unwrap_or_else(|| "installation_unknown".to_string());
+                        tracing::warn!(
+                            target: "cc_switch_server::audit_upload",
+                            previous_installation_ref,
+                            installation_ref = %opaque_ref("installation", &installation_id),
+                            fenced_through_boot_id = latest_cursor.as_ref().map(|cursor| cursor.boot_id.as_str()).unwrap_or("-"),
+                            fenced_through_sequence = latest_cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0),
+                            "audit upload destination changed; retained events from the previous Client identity were fenced from the new destination"
+                        );
+                        retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+                        last_failure = None;
+                        cursor_loss_reported = None;
+                        continue;
+                    }
+                    Err(error) => {
+                        audit_upload_failure(
+                            &audit,
+                            &mut last_failure,
+                            "destination_fence",
+                            &error,
+                            retry_delay,
+                        );
+                    }
+                }
+                sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                continue;
+            }
+            let event_cursor = loaded_cursor
+                .as_ref()
+                .and_then(AuditUploadCursor::event_cursor);
+            let batch = match tokio::task::spawn_blocking({
+                let audit = audit.clone();
+                let event_cursor = event_cursor.clone();
+                move || {
+                    audit.read_batch(
+                        event_cursor.as_ref(),
+                        crate::logging::AUDIT_UPLOAD_BATCH_LIMIT,
+                    )
+                }
+            })
+            .await
+            {
+                Ok(Ok(batch)) => batch,
+                Ok(Err(error)) => {
+                    audit_upload_failure(
+                        &audit,
+                        &mut last_failure,
+                        "spool_read",
+                        &error.to_string(),
+                        retry_delay,
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                    continue;
+                }
+                Err(error) => {
+                    audit_upload_failure(
+                        &audit,
+                        &mut last_failure,
+                        "spool_task",
+                        &error.to_string(),
+                        retry_delay,
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                    continue;
+                }
+            };
+            if batch.events.is_empty() {
+                if audit_upload_recovered(&audit, &mut last_failure) {
+                    tracing::info!(
+                        target: "cc_switch_server::audit_upload",
+                        "router audit upload recovered"
+                    );
+                }
+                retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+                sleep(AUDIT_UPLOAD_IDLE_INTERVAL).await;
+                continue;
+            }
+            if !batch.cursor_found
+                && event_cursor.is_some()
+                && cursor_loss_reported.as_ref() != event_cursor.as_ref()
+            {
+                tracing::warn!(
+                    target: "cc_switch_server::audit_upload",
+                    boot_id = event_cursor.as_ref().map(|cursor| cursor.boot_id.as_str()).unwrap_or("-"),
+                    sequence = event_cursor.as_ref().map(|cursor| cursor.sequence).unwrap_or(0),
+                    "audit upload cursor is no longer present in the local spool; resuming from the oldest retained event"
+                );
+                cursor_loss_reported = event_cursor.clone();
+            }
+
+            let boot_id = batch.events[0].boot_id.clone();
+            let events = batch
+                .events
+                .into_iter()
+                .take_while(|event| event.boot_id == boot_id)
+                .collect::<Vec<_>>();
+            let Some(last_event) = events.last() else {
+                sleep(AUDIT_UPLOAD_IDLE_INTERVAL).await;
+                continue;
+            };
+            let expected_sequence = last_event.sequence;
+            let http = state.http_client().await;
+            match client::send_installation_audit_batch(&http, &config, &boot_id, events).await {
+                Ok(response)
+                    if response.ok
+                        && response.boot_id == boot_id
+                        && response.sequence == expected_sequence =>
+                {
+                    let upload_cursor = AuditUploadCursor {
+                        router_api_base: router_api_base.clone(),
+                        installation_id: installation_id.clone(),
+                        boot_id: response.boot_id,
+                        sequence: response.sequence,
+                    };
+                    let stored = tokio::task::spawn_blocking({
+                        let audit = audit.clone();
+                        let upload_cursor = upload_cursor.clone();
+                        move || audit.store_upload_cursor(&upload_cursor)
+                    })
+                    .await;
+                    match stored {
+                        Ok(Ok(())) => {
+                            if audit_upload_recovered(&audit, &mut last_failure) {
+                                tracing::info!(
+                                    target: "cc_switch_server::audit_upload",
+                                    "router audit upload recovered"
+                                );
+                            }
+                            if response.gap_detected {
+                                tracing::warn!(
+                                    target: "cc_switch_server::audit_upload",
+                                    boot_id = %boot_id,
+                                    sequence = expected_sequence,
+                                    "router detected an audit sequence gap"
+                                );
+                            }
+                            if response.restart_detected {
+                                tracing::info!(
+                                    target: "cc_switch_server::audit_upload",
+                                    boot_id = %boot_id,
+                                    "router accepted a new audit boot stream"
+                                );
+                            }
+                            retry_delay = AUDIT_UPLOAD_RETRY_INITIAL;
+                        }
+                        Ok(Err(error)) => {
+                            audit_upload_failure(
+                                &audit,
+                                &mut last_failure,
+                                "cursor_write",
+                                &error.to_string(),
+                                retry_delay,
+                            );
+                            sleep(retry_delay).await;
+                            retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                        }
+                        Err(error) => {
+                            audit_upload_failure(
+                                &audit,
+                                &mut last_failure,
+                                "cursor_task",
+                                &error.to_string(),
+                                retry_delay,
+                            );
+                            sleep(retry_delay).await;
+                            retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                        }
+                    }
+                }
+                Ok(response) => {
+                    audit_upload_failure(
+                        &audit,
+                        &mut last_failure,
+                        "invalid_ack",
+                        &format!(
+                            "expected {boot_id}:{expected_sequence}, got {}:{} (ok={})",
+                            response.boot_id, response.sequence, response.ok
+                        ),
+                        retry_delay,
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                }
+                Err(error) => {
+                    audit_upload_failure(
+                        &audit,
+                        &mut last_failure,
+                        "request",
+                        &error.to_string(),
+                        retry_delay,
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(AUDIT_UPLOAD_RETRY_MAX);
+                }
+            }
+        }
+    });
+}
+
+async fn fence_audit_upload_destination(
+    audit: crate::logging::SharedAuditLog,
+    router_api_base: String,
+    installation_id: String,
+) -> Result<Option<AuditCursor>, String> {
+    tokio::task::spawn_blocking(move || {
+        audit.fence_upload_destination(&router_api_base, &installation_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+fn audit_upload_failure(
+    audit: &SharedAuditLog,
+    last_failure: &mut Option<String>,
+    kind: &str,
+    error: &str,
+    retry_delay: Duration,
+) {
+    if last_failure.as_deref() == Some(kind) {
+        tracing::debug!(
+            target: "cc_switch_server::audit_upload",
+            failure_kind = kind,
+            retry_secs = retry_delay.as_secs(),
+            "router audit upload remains unavailable"
+        );
+        return;
+    }
+    tracing::warn!(
+        target: "cc_switch_server::audit_upload",
+        failure_kind = kind,
+        retry_secs = retry_delay.as_secs(),
+        error,
+        "router audit upload failed"
+    );
+    let mut event = AuditEvent::new("observability.component.degraded");
+    event.component = Some("router_log_upload".to_string());
+    event.failure_kind = Some(kind.to_string());
+    event.network_error_kind = classify_network_error(error).map(str::to_string);
+    event.error_fingerprint = Some(error_fingerprint("router_log_upload", kind, error));
+    event.retry_decision = Some("retry".to_string());
+    event.backoff_ms = Some(u64::try_from(retry_delay.as_millis()).unwrap_or(u64::MAX));
+    event.outcome = Some("degraded".to_string());
+    event.retryable = Some(true);
+    audit.emit_best_effort(event);
+    *last_failure = Some(kind.to_string());
+}
+
+fn audit_upload_recovered(audit: &SharedAuditLog, last_failure: &mut Option<String>) -> bool {
+    let Some(failure_kind) = last_failure.take() else {
+        return false;
+    };
+    let mut event = AuditEvent::new("observability.component.recovered");
+    event.component = Some("router_log_upload".to_string());
+    event.failure_kind = Some(failure_kind);
+    event.retry_decision = Some("resume".to_string());
+    event.outcome = Some("recovered".to_string());
+    event.retryable = Some(false);
+    audit.emit_best_effort(event);
+    true
+}
 
 pub fn spawn_installation_heartbeat(state: ServerState) {
     tokio::spawn(async move {
@@ -11582,7 +12719,7 @@ async fn refresh_due_native_account_tokens(state: &ServerState) {
     let candidates = due_native_refresh_candidates(&accounts, now);
     drop(accounts);
     for account in candidates {
-        refresh_one_native_account_token(state, account, now).await;
+        refresh_one_native_account_token(state, account).await;
     }
 }
 
@@ -11602,17 +12739,11 @@ fn due_native_refresh_candidates(accounts: &AccountStore, now: i64) -> Vec<Accou
         .collect()
 }
 
-async fn refresh_one_native_account_token(state: &ServerState, account: Account, now: i64) {
+async fn refresh_one_native_account_token(state: &ServerState, account: Account) {
     if state.credential_persistence_degraded() {
         return;
     }
-    let Some(mut refresh_guard) = state
-        .account_refresh_locks
-        .try_lock(account.provider_type, &account.id)
-    else {
-        return;
-    };
-    let Some(account) = ({
+    let is_still_eligible = {
         let accounts = state.accounts.read().await;
         accounts
             .find_for_provider(account.provider_type, Some(&account.id))
@@ -11622,166 +12753,39 @@ async fn refresh_one_native_account_token(state: &ServerState, account: Account,
                         .active_codex_oauth_account()
                         .is_some_and(|active| active.id == account.id)
             })
-            .cloned()
-    }) else {
-        return;
+            .is_some()
     };
-    if state.credential_persistence_degraded() || !account_needs_native_refresh(&account, now) {
+    if !is_still_eligible {
         return;
     }
 
-    let http_client = state.http_client().await;
-    let interval_ms = state.oauth_quota_refresh_interval_ms().await;
     match state
-        .execute_native_account_refresh_with_recovery(
-            &http_client,
-            &account,
-            now,
-            interval_ms,
-            &mut refresh_guard,
+        .refresh_managed_account_if_needed_for_generation(
+            account.provider_type,
+            &account.id,
+            account.auth_identity_generation,
         )
         .await
     {
-        Ok(update) => {
-            let updated = match state.commit_native_refresh_success(&account, update).await {
-                Ok(updated) => {
-                    crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
-                    Some(updated)
-                }
-                Err(error) => {
-                    if error.is_superseded() {
-                        crate::metrics::record_warm_refresh(
-                            account.provider_type.as_str(),
-                            "superseded",
-                        );
-                        return;
-                    }
-                    crate::metrics::record_warm_refresh(
-                        account.provider_type.as_str(),
-                        if error.is_persistence_degraded() {
-                            "persistence_degraded"
-                        } else {
-                            "commit_failure"
-                        },
-                    );
-                    let persistence_degraded = error.is_persistence_degraded();
-                    let failure_account = if persistence_degraded {
-                        state
-                            .find_account_by_id(&account.id)
-                            .await
-                            .unwrap_or_else(|| account.clone())
-                    } else {
-                        account.clone()
-                    };
-                    refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
-                        &failure_account,
-                        AccountRefreshFlightStage::NativeRefresh,
-                        AccountRefreshFlightFailureDetails {
-                            status_code: if persistence_degraded { 503 } else { 500 },
-                            upstream_status: None,
-                            message: error.to_string(),
-                            public_message: Some(
-                                if persistence_degraded {
-                                    "rotated credentials are live but durable persistence is degraded"
-                                } else {
-                                    "background OAuth credential state commit failed"
-                                }
-                                .to_string(),
-                            ),
-                            kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
-                            retryable: persistence_degraded,
-                            retry_after_ms: None,
-                            immediate_relogin: false,
-                        },
-                    ));
-                    if persistence_degraded {
-                        tracing::error!(
-                            account_id = %account.id,
-                            provider_type = %account.provider_type.as_str(),
-                            %error,
-                            "background OAuth refresh kept rotated credentials live but persistence is degraded"
-                        );
-                        Some(failure_account)
-                    } else {
-                        tracing::error!(
-                            account_id = %account.id,
-                            provider_type = %account.provider_type.as_str(),
-                            %error,
-                            "background OAuth credential state commit failed"
-                        );
-                        None
-                    }
-                }
-            };
-            if let Some(updated) = updated {
-                if let Err(error) = state
-                    .refresh_account_runtime_metadata_if_changed(&account, &updated)
-                    .await
-                {
-                    tracing::warn!(
-                        account_id = %account.id,
-                        %error,
-                        "background OAuth refresh Share descriptor sync remains pending"
-                    );
-                }
-            }
+        Ok(()) => {
+            crate::metrics::record_warm_refresh(account.provider_type.as_str(), "success");
         }
         Err(error) => {
-            let metric_result =
-                if error.kind == crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant {
-                    "invalid_grant"
-                } else {
-                    "failure"
-                };
+            let metric_result = match error {
+                ManagedAccountRefreshError::IdentityChanged { .. }
+                | ManagedAccountRefreshError::InactiveCodexAccount
+                | ManagedAccountRefreshError::NotFound => "superseded",
+                ManagedAccountRefreshError::CredentialPersistenceDegraded => "persistence_degraded",
+                ManagedAccountRefreshError::Conflict { .. }
+                | ManagedAccountRefreshError::Refresh { .. } => "failure",
+            };
             crate::metrics::record_warm_refresh(account.provider_type.as_str(), metric_result);
-            let diagnostic = redact_account_error_for_log(&account, &error.message);
             tracing::warn!(
                 account_id = %account.id,
                 provider_type = %account.provider_type.as_str(),
-                error = %diagnostic,
+                error = ?error,
                 "background OAuth token warm-refresh failed"
             );
-            let updated = match state
-                .commit_native_refresh_failure(
-                    &account,
-                    error.message,
-                    error.kind,
-                    error.immediate_relogin,
-                )
-                .await
-            {
-                Ok(updated) => updated,
-                Err(persist_error) => {
-                    tracing::error!(
-                        account_id = %account.id,
-                        error = %persist_error,
-                        "persisting background OAuth refresh failure state failed"
-                    );
-                    None
-                }
-            };
-            if updated
-                .as_ref()
-                .is_some_and(|account| account.needs_relogin)
-            {
-                tracing::error!(
-                    account_id = %account.id,
-                    provider_type = %account.provider_type.as_str(),
-                    "managed OAuth account isolated after repeated invalid_grant refresh failures"
-                );
-            }
-            if let Some(updated) = updated {
-                if let Err(error) = state
-                    .refresh_account_runtime_metadata_if_changed(&account, &updated)
-                    .await
-                {
-                    tracing::warn!(
-                        account_id = %account.id,
-                        %error,
-                        "background OAuth refresh failure Share descriptor sync remains pending"
-                    );
-                }
-            }
         }
     }
 }
@@ -11818,6 +12822,51 @@ fn managed_account_refresh_public_message(
         OAuthErrorKind::Parse => "OAuth provider returned an invalid response",
         OAuthErrorKind::Unsupported => "OAuth operation is not supported for this account",
         OAuthErrorKind::Unknown => "OAuth request failed",
+    }
+}
+
+fn managed_refresh_flight_failure_details(
+    error: &ManagedAccountRefreshError,
+) -> AccountRefreshFlightFailureDetails {
+    let (status_code, message, retry_after_ms) = match error {
+        ManagedAccountRefreshError::Conflict { .. } => (
+            409,
+            "managed account refresh is already in progress".to_string(),
+            None,
+        ),
+        ManagedAccountRefreshError::InactiveCodexAccount => (
+            409,
+            "Codex OAuth account is no longer active".to_string(),
+            None,
+        ),
+        ManagedAccountRefreshError::IdentityChanged { .. } => (
+            409,
+            "managed account identity changed during OAuth refresh".to_string(),
+            None,
+        ),
+        ManagedAccountRefreshError::NotFound => {
+            (404, "managed account not found".to_string(), None)
+        }
+        ManagedAccountRefreshError::CredentialPersistenceDegraded => (
+            503,
+            "managed account credentials are waiting for durable persistence".to_string(),
+            None,
+        ),
+        ManagedAccountRefreshError::Refresh {
+            status_code,
+            message,
+            retry_after_ms,
+        } => (*status_code, message.clone(), *retry_after_ms),
+    };
+    AccountRefreshFlightFailureDetails {
+        status_code,
+        upstream_status: None,
+        public_message: Some(message.clone()),
+        message,
+        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+        retryable: status_code == 429 || status_code >= 500,
+        retry_after_ms,
+        immediate_relogin: false,
     }
 }
 
@@ -11902,7 +12951,27 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         account.auth_identity_generation,
         account.token_refresh_generation,
     );
-    let Some(mut refresh_guard) = state
+    if !background_quota_outbound_allowed(state, &account).await {
+        return;
+    }
+    if let Err(error) = state
+        .refresh_managed_account_if_needed_for_generation(
+            locked_provider_type,
+            &account.id,
+            account.auth_identity_generation,
+        )
+        .await
+    {
+        tracing::warn!(
+            account_id = %account.id,
+            provider_type = %account.provider_type.as_str(),
+            error = ?error,
+            "background quota OAuth token refresh failed"
+        );
+        defer_background_quota_after_managed_refresh_failure(state, &account, now).await;
+        return;
+    }
+    let Some(mut _refresh_guard) = state
         .account_refresh_locks
         .try_lock(locked_provider_type, &account.id)
     else {
@@ -11931,154 +13000,10 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
     let success_cooldown_ms = state.oauth_quota_refresh_interval_ms().await;
     let account_before_refresh = account.clone();
     let mut active_account = account;
-    let mut native_refresh_attempted = (
+    let native_refresh_attempted = (
         active_account.auth_identity_generation,
         active_account.token_refresh_generation,
     ) != refresh_generation_before_lock;
-    if account_needs_native_refresh(&active_account, now) {
-        let http_client = state.http_client().await;
-        let update = match state
-            .execute_native_account_refresh_with_recovery(
-                &http_client,
-                &active_account,
-                now,
-                success_cooldown_ms,
-                &mut refresh_guard,
-            )
-            .await
-        {
-            Ok(update) => update,
-            Err(error) => {
-                let diagnostic = redact_account_error_for_log(&active_account, &error.message);
-                tracing::warn!(
-                    account_id = %active_account.id,
-                    provider_type = %active_account.provider_type.as_str(),
-                    error_kind = ?error.kind,
-                    error = %diagnostic,
-                    "background quota OAuth token refresh failed"
-                );
-                let quota_next_refresh_at =
-                    now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS);
-                let updated = match state
-                    .commit_native_refresh_failure_with_quota_cooldown(
-                        &active_account,
-                        error.message,
-                        error.kind,
-                        error.immediate_relogin,
-                        quota_next_refresh_at,
-                    )
-                    .await
-                {
-                    Ok(updated) => updated,
-                    Err(persist_error) => {
-                        tracing::error!(
-                            account_id = %active_account.id,
-                            error = %persist_error,
-                            "persisting background quota OAuth refresh failure state failed"
-                        );
-                        return;
-                    }
-                };
-                if let Some(updated) = updated {
-                    if updated.needs_relogin {
-                        tracing::error!(
-                            account_id = %updated.id,
-                            provider_type = %updated.provider_type.as_str(),
-                            "background quota OAuth account requires re-login"
-                        );
-                    }
-                    if let Err(sync_error) = state
-                        .refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            account_id = %updated.id,
-                            error = %sync_error,
-                            "background quota OAuth refresh failure Share descriptor sync remains pending"
-                        );
-                    }
-                }
-                return;
-            }
-        };
-        active_account = match state
-            .commit_native_refresh_success(&active_account, update)
-            .await
-        {
-            Ok(account) => {
-                native_refresh_attempted = true;
-                account
-            }
-            Err(error) => {
-                if error.is_superseded() {
-                    tracing::info!(
-                        account_id = %active_account.id,
-                        "discarded background quota token refresh after credentials changed"
-                    );
-                    return;
-                }
-                let persistence_degraded = error.is_persistence_degraded();
-                let failure_account = if persistence_degraded {
-                    state
-                        .find_account_by_id(&active_account.id)
-                        .await
-                        .unwrap_or_else(|| active_account.clone())
-                } else {
-                    active_account.clone()
-                };
-                refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
-                    &failure_account,
-                    AccountRefreshFlightStage::NativeRefresh,
-                    AccountRefreshFlightFailureDetails {
-                        status_code: if persistence_degraded { 503 } else { 500 },
-                        upstream_status: None,
-                        message: error.to_string(),
-                        public_message: Some(
-                            if persistence_degraded {
-                                "rotated credentials are live but durable persistence is degraded"
-                            } else {
-                                "background quota OAuth credential state commit failed"
-                            }
-                            .to_string(),
-                        ),
-                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
-                        retryable: persistence_degraded,
-                        retry_after_ms: Some(
-                            crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS,
-                        ),
-                        immediate_relogin: false,
-                    },
-                ));
-                if persistence_degraded {
-                    tracing::error!(
-                        account_id = %active_account.id,
-                        %error,
-                        "quota refresh stopped because rotated OAuth credentials are not durable"
-                    );
-                } else {
-                    tracing::error!(
-                        account_id = %active_account.id,
-                        %error,
-                        "quota refresh stopped because OAuth credential state commit failed"
-                    );
-                }
-                return;
-            }
-        };
-        if let Err(error) = state
-            .refresh_account_runtime_metadata_if_changed(&account_before_refresh, &active_account)
-            .await
-        {
-            tracing::warn!(
-                account_id = %active_account.id,
-                %error,
-                "background OAuth refresh Share descriptor sync remains pending"
-            );
-        }
-    }
 
     if !background_quota_outbound_allowed(state, &active_account).await {
         return;
@@ -12098,71 +13023,60 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
         && quota_result
             .as_ref()
             .is_err_and(|error| error.upstream_status == Some(401))
+        && !active_account.needs_relogin
+        && provider_native_refresh_available(active_account.provider_type)
+        && account_has_refresh_token(&active_account)
     {
-        match state
-            .recover_quota_unauthorized(
-                &http_client,
-                &active_account,
-                now,
-                success_cooldown_ms,
-                &mut refresh_guard,
+        let recovery_auth_identity_generation = active_account.auth_identity_generation;
+        _refresh_guard.release();
+        if let Err(error) = state
+            .refresh_managed_account_now_for_generation(
+                active_account.provider_type,
+                &active_account.id,
+                recovery_auth_identity_generation,
             )
             .await
         {
-            Ok(refreshed) => {
-                active_account = refreshed;
-                if !background_quota_outbound_allowed(state, &active_account).await {
-                    return;
-                }
-                quota_result = refresh_account_quota(
-                    &http_client,
-                    &active_account,
-                    now,
-                    true,
-                    success_cooldown_ms,
-                    timeout_ms,
-                )
-                .await;
-            }
-            Err(QuotaUnauthorizedRecoveryError::Unavailable) => {}
-            Err(QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
-                let diagnostic = redact_account_error_for_log(&active_account, &failure.message);
-                tracing::warn!(
-                    account_id = %active_account.id,
-                    provider_type = %active_account.provider_type.as_str(),
-                    error = %diagnostic,
-                    "background quota 401 OAuth recovery failed"
-                );
-                if let Some(updated) = updated {
-                    if let Err(error) = state
-                        .refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await
-                    {
-                        tracing::warn!(account_id = %updated.id, %error, "background quota auth recovery Share descriptor sync remains pending");
-                    }
-                }
-                return;
-            }
-            Err(QuotaUnauthorizedRecoveryError::Commit(error)) => {
-                tracing::warn!(
-                    account_id = %active_account.id,
-                    %error,
-                    "background quota 401 OAuth recovery commit was not applied"
-                );
-                return;
-            }
-            Err(QuotaUnauthorizedRecoveryError::State(error)) => {
-                tracing::error!(
-                    account_id = %active_account.id,
-                    %error,
-                    "background quota 401 OAuth recovery state update failed"
-                );
-                return;
-            }
+            tracing::warn!(
+                account_id = %active_account.id,
+                provider_type = %active_account.provider_type.as_str(),
+                error = ?error,
+                "background quota 401 OAuth recovery failed"
+            );
+            defer_background_quota_after_managed_refresh_failure(state, &active_account, now).await;
+            return;
         }
+        let Some(guard) = state
+            .account_refresh_locks
+            .try_lock(active_account.provider_type, &active_account.id)
+        else {
+            return;
+        };
+        _refresh_guard = guard;
+        let Some(refreshed) =
+            state
+                .find_account_by_id(&active_account.id)
+                .await
+                .filter(|account| {
+                    account.provider_type == locked_provider_type
+                        && account.auth_identity_generation == recovery_auth_identity_generation
+                })
+        else {
+            return;
+        };
+        active_account = refreshed;
+        if !background_quota_outbound_allowed(state, &active_account).await {
+            return;
+        }
+        quota_result = refresh_account_quota(
+            &http_client,
+            &active_account,
+            now,
+            true,
+            success_cooldown_ms,
+            timeout_ms,
+        )
+        .await;
     }
     match quota_result {
         Ok(QuotaRefreshResult::Updated { update, .. }) => {
@@ -12248,6 +13162,55 @@ async fn refresh_one_account_quota(state: &ServerState, account: Account, now: i
                 );
             }
         }
+    }
+}
+
+async fn defer_background_quota_after_managed_refresh_failure(
+    state: &ServerState,
+    expected: &Account,
+    now: i64,
+) {
+    let Some(current) = state
+        .find_account_by_id(&expected.id)
+        .await
+        .filter(|account| {
+            account.provider_type == expected.provider_type
+                && account.auth_identity_generation == expected.auth_identity_generation
+        })
+    else {
+        return;
+    };
+    let next_refresh_at = current
+        .quota_next_refresh_at
+        .unwrap_or(i64::MIN)
+        .max(now.saturating_add(crate::clients::oauth::quota::QUOTA_FAILURE_COOLDOWN_MS));
+    let update = AccountRefreshUpdate {
+        quota_next_refresh_at: Some(next_refresh_at),
+        last_refresh_error: current.last_refresh_error.clone(),
+        ..Default::default()
+    };
+    match state
+        .commit_account_quota_refresh_update(&current, update)
+        .await
+    {
+        Ok(Ok(updated)) => {
+            if let Err(error) = state
+                .refresh_account_runtime_metadata_if_changed(&current, &updated)
+                .await
+            {
+                tracing::warn!(
+                    account_id = %updated.id,
+                    %error,
+                    "background OAuth refresh cooldown Share metadata sync remains pending"
+                );
+            }
+        }
+        Ok(Err(_)) => {}
+        Err(error) => tracing::error!(
+            account_id = %current.id,
+            %error,
+            "persisting background OAuth refresh cooldown failed"
+        ),
     }
 }
 
@@ -13396,6 +14359,7 @@ async fn mark_router_share_upserts_synced_with_outcome(
     operations: &[ShareSyncOperation],
     outcome: client::ShareDescriptorSyncOutcome,
 ) {
+    let was_degraded = state.shares.read().await.last_router_error.is_some();
     let projections = operations
         .iter()
         .filter_map(|operation| {
@@ -13440,6 +14404,15 @@ async fn mark_router_share_upserts_synced_with_outcome(
         .await
     {
         tracing::warn!(%error, "persist Router Share descriptor ACK failed");
+    } else if was_degraded {
+        let mut event = AuditEvent::new("observability.component.recovered");
+        event.component = Some("router_share_sync".to_string());
+        event.operation = Some("share_descriptor_sync".to_string());
+        event.failure_kind = Some("remote_sync".to_string());
+        event.retry_decision = Some("resume".to_string());
+        event.outcome = Some("recovered".to_string());
+        event.retryable = Some(false);
+        state.emit_audit_event_best_effort(event);
     }
 }
 
@@ -13449,6 +14422,7 @@ async fn mark_router_share_upserts_failed(
     operations: &[ShareSyncOperation],
     message: String,
 ) {
+    let was_degraded = state.shares.read().await.last_router_error.is_some();
     let projections = operations
         .iter()
         .filter_map(|operation| {
@@ -13484,6 +14458,21 @@ async fn mark_router_share_upserts_failed(
             router_error = %message,
             "persist Router Share synchronization failure failed"
         );
+    } else if !was_degraded {
+        let mut event = AuditEvent::new("observability.component.degraded");
+        event.component = Some("router_share_sync".to_string());
+        event.operation = Some("share_descriptor_sync".to_string());
+        event.failure_kind = Some("remote_sync".to_string());
+        event.network_error_kind = classify_network_error(&message).map(str::to_string);
+        event.error_fingerprint = Some(error_fingerprint(
+            "router_share_sync",
+            "remote_sync",
+            &message,
+        ));
+        event.retry_decision = Some("retry".to_string());
+        event.outcome = Some("degraded".to_string());
+        event.retryable = Some(true);
+        state.emit_audit_event_best_effort(event);
     }
 }
 
@@ -13761,23 +14750,20 @@ pub(crate) async fn share_request_log_entry(
 }
 
 async fn mark_usage_router_sync(state: &ServerState, request_id: &str, result: Result<(), String>) {
-    let persisted =
-        state
-            .usage
-            .write()
-            .await
-            .update_log_and_persist(&state.config_dir, request_id, |log| {
-                log.router_sync_attempt_count = log.router_sync_attempt_count.saturating_add(1);
-                match &result {
-                    Ok(()) => {
-                        log.router_last_synced_at_ms = Some(crate::infra::time::now_ms());
-                        log.router_last_sync_error = None;
-                    }
-                    Err(error) => {
-                        log.router_last_sync_error = Some(error.clone());
-                    }
+    let persisted = state
+        .update_usage_log(request_id, |log| {
+            log.router_sync_attempt_count = log.router_sync_attempt_count.saturating_add(1);
+            match &result {
+                Ok(()) => {
+                    log.router_last_synced_at_ms = Some(crate::infra::time::now_ms());
+                    log.router_last_sync_error = None;
                 }
-            });
+                Err(error) => {
+                    log.router_last_sync_error = Some(error.clone());
+                }
+            }
+        })
+        .await;
     if let Err(error) = persisted {
         tracing::warn!(error = %error, "persist usage after router request log sync failed");
     }
@@ -14861,6 +15847,7 @@ mod tests {
     #[tokio::test]
     async fn health_usage_log_if_due_deduplicates_matching_binding_and_model() {
         let state = test_state();
+        let base_time_ms = crate::infra::time::now_ms();
         let make_log = |request_id: &str, model: &str, created_at_ms: u128| {
             let mut log = UsageLog::new(
                 AppKind::Codex,
@@ -14888,15 +15875,21 @@ mod tests {
         };
 
         let first = state
-            .push_health_usage_log_if_due(make_log("health-1", "gpt-5.5", 1_000), 10_000)
+            .push_health_usage_log_if_due(make_log("health-1", "gpt-5.5", base_time_ms), 10_000)
             .await
             .unwrap();
         let duplicate = state
-            .push_health_usage_log_if_due(make_log("health-2", "gpt-5.5", 2_000), 10_000)
+            .push_health_usage_log_if_due(
+                make_log("health-2", "gpt-5.5", base_time_ms.saturating_add(1_000)),
+                10_000,
+            )
             .await
             .unwrap();
         let changed_model = state
-            .push_health_usage_log_if_due(make_log("health-3", "gpt-5.6", 3_000), 10_000)
+            .push_health_usage_log_if_due(
+                make_log("health-3", "gpt-5.6", base_time_ms.saturating_add(2_000)),
+                10_000,
+            )
             .await
             .unwrap();
 
@@ -17277,6 +18270,7 @@ mod tests {
                         ("bundleId".to_string(), json!(provider_id)),
                         ("familyId".to_string(), json!("family.nvidia")),
                         ("surfaceEnabled".to_string(), json!(true)),
+                        ("modelPolicyScope".to_string(), json!("global")),
                     ]),
                 },
                 provider_resource(profile_id, 1),
@@ -17298,6 +18292,30 @@ mod tests {
             provider_resource("gemini.google_api_key", 7),
         );
         store
+    }
+
+    #[test]
+    fn provider_share_projection_changes_track_model_policy_scope_only() {
+        let before = colliding_bundle_store("scope-change-bundle");
+        let mut after = before.clone();
+        for stored in &mut after.providers {
+            if crate::domain::providers::bundle::bundle_id(&stored.provider)
+                == Some("scope-change-bundle")
+            {
+                stored
+                    .provider
+                    .extra
+                    .insert("modelPolicyScope".to_string(), json!("per_app"));
+            }
+        }
+
+        assert_eq!(
+            provider_share_projection_changes(&before, &after),
+            BTreeSet::from([
+                (AppKind::Claude, "scope-change-bundle".to_string()),
+                (AppKind::Codex, "scope-change-bundle".to_string()),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -19505,6 +20523,263 @@ mod tests {
 
         server.abort();
         drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn managed_refresh_coordinator_rejects_new_flights_after_shutdown_begins() {
+        let coordinator = ManagedAccountRefreshCoordinator::default();
+        coordinator.begin_shutdown();
+
+        assert!(matches!(
+            coordinator.flight("claude_oauth:shutdown".to_string()),
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert!(coordinator.active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_refresh_owner_panic_isolates_matching_credentials() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "refresh-owner-panic-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "panic-access-original",
+                        "refreshToken": "panic-refresh-original",
+                        "tokenType": "Bearer",
+                        "raw": {"testOAuthTokenUrl": "http://127.0.0.1:1/token"},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        state.inject_managed_account_refresh_panics(1);
+
+        assert!(matches!(
+            state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "refresh-owner-panic-account",
+                )
+                .await,
+            Err(ManagedAccountRefreshError::Refresh {
+                status_code: 500,
+                ..
+            })
+        ));
+        assert!(
+            state
+                .drain_managed_account_refreshes(Duration::from_secs(1))
+                .await
+        );
+        let account = state
+            .find_account_by_id("refresh-owner-panic-account")
+            .await
+            .unwrap();
+        assert!(account.needs_relogin);
+        assert_eq!(account.token_refresh_generation, 1);
+        assert!(account
+            .last_refresh_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outcome is unknown")));
+
+        let persisted = AccountStore::load_or_default(&config_dir).unwrap();
+        assert!(
+            persisted
+                .find_for_provider(
+                    ProviderType::ClaudeOAuth,
+                    Some("refresh-owner-panic-account")
+                )
+                .unwrap()
+                .needs_relogin
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_owner_panic_does_not_isolate_newer_credentials() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "stale-refresh-owner-panic-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "stale-panic-access-original",
+                        "refreshToken": "stale-panic-refresh-original",
+                        "tokenType": "Bearer",
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let original = state
+            .find_account_by_id("stale-refresh-owner-panic-account")
+            .await
+            .unwrap();
+        let original_generation = (
+            original.auth_identity_generation,
+            original.token_refresh_generation,
+        );
+        let updated = state
+            .commit_native_refresh_success(
+                &original,
+                AccountRefreshUpdate {
+                    access_token: Some("stale-panic-access-rotated".to_string()),
+                    refresh_token: Some("stale-panic-refresh-rotated".to_string()),
+                    expires_at: Some(i64::MAX),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            updated.token_refresh_generation,
+            original.token_refresh_generation
+        );
+
+        state
+            .fail_closed_managed_account_refresh_panic(
+                ProviderType::ClaudeOAuth,
+                "stale-refresh-owner-panic-account",
+                original_generation,
+                Duration::ZERO,
+            )
+            .await;
+        let live = state
+            .find_account_by_id("stale-refresh-owner-panic-account")
+            .await
+            .unwrap();
+        assert!(!live.needs_relogin);
+        assert_eq!(
+            live.refresh_token.as_deref(),
+            Some("stale-panic-refresh-rotated")
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_waiter_does_not_cancel_rotation_commit() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let request_started_for_route = Arc::clone(&request_started);
+        let upstream = Router::new().route(
+            "/token",
+            post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let request_started = Arc::clone(&request_started_for_route);
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    request_started.notify_waiters();
+                    sleep(Duration::from_millis(100)).await;
+                    Json(json!({
+                        "access_token": "cancel-owner-access-rotated",
+                        "refresh_token": "cancel-owner-refresh-rotated",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "account": {"uuid": "cancel-owner-principal"}
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "cancelled-refresh-waiter-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "cancel-owner-access-original",
+                        "refreshToken": "cancel-owner-refresh-original",
+                        "tokenType": "Bearer",
+                        "profile": {"accountUUID": "cancel-owner-principal"},
+                        "raw": {"testOAuthTokenUrl": token_url},
+                        "expiresAt": 1
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let request_reached_endpoint = request_started.notified();
+        tokio::pin!(request_reached_endpoint);
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_state
+                .refresh_managed_account_now(
+                    ProviderType::ClaudeOAuth,
+                    "cancelled-refresh-waiter-account",
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut request_reached_endpoint)
+            .await
+            .expect("refresh request did not reach the token endpoint");
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let account = state
+                    .find_account_by_id("cancelled-refresh-waiter-account")
+                    .await
+                    .unwrap();
+                if account.refresh_token.as_deref() == Some("cancel-owner-refresh-rotated") {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached refresh owner did not commit rotated credentials");
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            state
+                .drain_managed_account_refreshes(Duration::from_secs(1))
+                .await
+        );
+
+        drop(state);
+        let restarted = test_state_at(config_dir.clone());
+        let persisted = restarted
+            .find_account_by_id("cancelled-refresh-waiter-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("cancel-owner-refresh-rotated")
+        );
+
+        server.abort();
+        drop(restarted);
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -21952,12 +23227,24 @@ mod tests {
         let guard = tracker
             .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
             .expect("first request should acquire account capacity");
+        let other_account_guard = tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-2", 1)
+            .expect("a different account keeps an independent capacity limit");
 
         assert_eq!(
             tracker
                 .snapshot()
                 .current(ProviderType::ClaudeOAuth, "acct-1"),
             1
+        );
+        assert_eq!(
+            tracker
+                .counts
+                .lock()
+                .unwrap()
+                .by_provider_type
+                .get(ProviderType::ClaudeOAuth.as_str()),
+            Some(&2)
         );
         assert!(matches!(
             tracker.try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1),
@@ -21968,6 +23255,22 @@ mod tests {
         ));
 
         drop(guard);
+        assert_eq!(
+            tracker
+                .counts
+                .lock()
+                .unwrap()
+                .by_provider_type
+                .get(ProviderType::ClaudeOAuth.as_str()),
+            Some(&1)
+        );
+        drop(other_account_guard);
+        assert!(!tracker
+            .counts
+            .lock()
+            .unwrap()
+            .by_provider_type
+            .contains_key(ProviderType::ClaudeOAuth.as_str()));
         assert_eq!(
             tracker
                 .snapshot()

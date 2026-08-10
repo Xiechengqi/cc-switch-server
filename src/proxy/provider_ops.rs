@@ -115,19 +115,22 @@ impl ProviderExecution {
                 self.plan.warnings.join("; ")
             )));
         }
-        if self.stored.provider_type == ProviderType::GrokOAuth
-            && !matches!(
-                &self.plan.auth_ref,
-                RuntimeAuthRef::ManagedAccount {
-                    account_id,
-                    expected_provider_type: ProviderType::GrokOAuth,
-                    ..
-                } if !account_id.trim().is_empty()
-            )
-        {
+        if matches!(
+            self.stored.provider_type,
+            ProviderType::GrokOAuth | ProviderType::KimiCode
+        ) && !matches!(
+            &self.plan.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type,
+                ..
+            } if !account_id.trim().is_empty()
+                && *expected_provider_type == self.stored.provider_type
+        ) {
             return Err(ProxyError::bad_request(format!(
-                "Provider {} must explicitly bind a grok_oauth managed account",
-                self.stored.provider.id
+                "Provider {} must explicitly bind a {} managed account",
+                self.stored.provider.id,
+                self.stored.provider_type.as_str()
             )));
         }
         if matches!(

@@ -11,8 +11,8 @@ use twox_hash::XxHash64;
 
 use crate::domain::claude_cli::{
     claude_billing_header_text, claude_cch_seed, claude_cli_user_agent, claude_stainless_arch,
-    claude_stainless_os, claude_stainless_runtime, claude_stainless_runtime_version,
-    CLAUDE_CODE_IDENTITY_TEXT, DEFAULT_STAINLESS_PACKAGE_VERSION,
+    claude_stainless_os, claude_stainless_package_version, claude_stainless_runtime,
+    claude_stainless_runtime_version, CLAUDE_CODE_IDENTITY_TEXT,
 };
 
 use super::ProxyError;
@@ -27,10 +27,11 @@ const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 const EFFORT_BETA: &str = "effort-2025-11-24";
 const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const TOKEN_COUNTING_BETA: &str = "token-counting-2024-11-01";
-const KNOWN_SAFE_CLIENT_BETAS: &[&str] = &[
+const MESSAGES_CLIENT_BETAS: &[&str] = &[
     "prompt-caching-2024-07-31",
     "token-efficient-tools-2025-02-19",
 ];
+const COUNT_TOKENS_CLIENT_BETAS: &[&str] = MESSAGES_CLIENT_BETAS;
 const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
 const CLAUDE_CACHE_TTL_ENV: &str = "CC_SWITCH_CLAUDE_CACHE_TTL";
 const CLAUDE_CODE_PROMPT_MATCH_THRESHOLD: f64 = 0.5;
@@ -65,6 +66,28 @@ pub(crate) enum ClaudeBodyRetryStage {
     Thinking,
     SignatureSensitive,
     WebSearchHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeBetaOperation {
+    Messages,
+    CountTokens,
+}
+
+impl ClaudeBetaOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "count_tokens",
+        }
+    }
+
+    fn client_betas(self) -> &'static [&'static str] {
+        match self {
+            Self::Messages => MESSAGES_CLIENT_BETAS,
+            Self::CountTokens => COUNT_TOKENS_CLIENT_BETAS,
+        }
+    }
 }
 
 impl ClaudeBodyRetryStage {
@@ -142,6 +165,11 @@ fn apply_forward_contract_inner(
     retry_stage: Option<ClaudeBodyRetryStage>,
     is_count_tokens: bool,
 ) -> Result<ClaudeForwardContract, ProxyError> {
+    let beta_operation = if is_count_tokens {
+        ClaudeBetaOperation::CountTokens
+    } else {
+        ClaudeBetaOperation::Messages
+    };
     *url = ensure_claude_oauth_beta_query(url);
     let mut session_id = claude_session_id_from_headers(client_headers);
     let mut body_shape = None;
@@ -184,7 +212,7 @@ fn apply_forward_contract_inner(
             &internal_betas,
             context_1m_requested,
             true,
-            is_count_tokens,
+            beta_operation,
         ),
     ));
     Ok(ClaudeForwardContract {
@@ -489,7 +517,7 @@ fn claude_cli_headers(
         ("x-stainless-lang", "js".to_string()),
         (
             "x-stainless-package-version",
-            DEFAULT_STAINLESS_PACKAGE_VERSION.to_string(),
+            claude_stainless_package_version().to_string(),
         ),
         ("x-stainless-os", claude_stainless_os(Some(identity_seed))),
         (
@@ -1007,7 +1035,7 @@ fn build_anthropic_beta_value(
     internal_betas: &[String],
     context_1m_requested: bool,
     is_claude_oauth: bool,
-    is_count_tokens: bool,
+    operation: ClaudeBetaOperation,
 ) -> String {
     let mut betas = vec![CLAUDE_CODE_BETA.to_string()];
     if is_claude_oauth {
@@ -1025,23 +1053,28 @@ fn build_anthropic_beta_value(
         });
     let mut dropped_count = 0_u32;
     for item in client_betas.chain(internal_betas.iter().map(String::as_str)) {
-        if is_claude_oauth
-            && !beta_allowed_for_request(item, body, context_1m_requested, is_count_tokens)
+        if is_claude_oauth && !beta_allowed_for_request(item, body, context_1m_requested, operation)
         {
             dropped_count = dropped_count.saturating_add(1);
-            crate::metrics::record_claude_beta_decision(if is_request_shape_beta(item) {
-                "dropped_model"
-            } else {
-                "dropped_unknown"
-            });
+            crate::metrics::record_claude_beta_decision(
+                operation.as_str(),
+                if is_request_shape_beta(item) {
+                    "dropped_shape"
+                } else {
+                    "dropped_unknown"
+                },
+            );
             continue;
         }
         if is_claude_oauth {
-            crate::metrics::record_claude_beta_decision(if is_request_shape_beta(item) {
-                "allowed_shape"
-            } else {
-                "allowed_client"
-            });
+            crate::metrics::record_claude_beta_decision(
+                operation.as_str(),
+                if is_request_shape_beta(item) {
+                    "allowed_shape"
+                } else {
+                    "allowed_client"
+                },
+            );
         }
         push_beta(&mut betas, item);
     }
@@ -1053,37 +1086,9 @@ fn build_anthropic_beta_value(
     }
 
     if is_claude_oauth {
-        if body.is_some_and(body_has_thinking) {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, INTERLEAVED_THINKING_BETA);
-        }
-        if body.is_some_and(body_has_streaming_tools) {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, FINE_GRAINED_TOOL_STREAMING_BETA);
-        }
-        if body.is_some_and(body_has_computer_use_tool) {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, COMPUTER_USE_BETA);
-        }
-        if body.is_some_and(body_has_context_management) {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, CONTEXT_MANAGEMENT_BETA);
-        }
-        if body.is_some_and(body_has_effort) {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, EFFORT_BETA);
-        }
-        if body.is_some_and(body_has_extended_cache_ttl) {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, EXTENDED_CACHE_TTL_BETA);
-        }
-        if context_1m_requested {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, CONTEXT_1M_BETA);
-        }
-        if is_count_tokens {
-            crate::metrics::record_claude_beta_decision("allowed_shape");
-            push_beta(&mut betas, TOKEN_COUNTING_BETA);
+        for beta in automatic_betas_for_request(operation, body, context_1m_requested) {
+            crate::metrics::record_claude_beta_decision(operation.as_str(), "allowed_shape");
+            push_beta(&mut betas, beta);
         }
     }
 
@@ -1108,19 +1113,51 @@ fn beta_allowed_for_request(
     beta: &str,
     body: Option<&Value>,
     context_1m_requested: bool,
-    is_count_tokens: bool,
+    operation: ClaudeBetaOperation,
 ) -> bool {
-    match beta {
-        INTERLEAVED_THINKING_BETA => body.is_some_and(body_has_thinking),
-        FINE_GRAINED_TOOL_STREAMING_BETA => body.is_some_and(body_has_streaming_tools),
-        COMPUTER_USE_BETA => body.is_some_and(body_has_computer_use_tool),
-        CONTEXT_MANAGEMENT_BETA => body.is_some_and(body_has_context_management),
-        CONTEXT_1M_BETA => context_1m_requested,
-        EFFORT_BETA => body.is_some_and(body_has_effort),
-        EXTENDED_CACHE_TTL_BETA => body.is_some_and(body_has_extended_cache_ttl),
-        TOKEN_COUNTING_BETA => is_count_tokens,
-        _ => is_known_safe_client_beta(beta),
+    automatic_betas_for_request(operation, body, context_1m_requested).contains(&beta)
+        || matches!(beta, CLAUDE_CODE_BETA | CLAUDE_OAUTH_BETA)
+        || operation.client_betas().contains(&beta)
+}
+
+fn automatic_betas_for_request(
+    operation: ClaudeBetaOperation,
+    body: Option<&Value>,
+    context_1m_requested: bool,
+) -> Vec<&'static str> {
+    let mut betas = Vec::new();
+    match operation {
+        ClaudeBetaOperation::Messages => {
+            if body.is_some_and(body_has_thinking) {
+                betas.push(INTERLEAVED_THINKING_BETA);
+            }
+            if body.is_some_and(body_has_streaming_tools) {
+                betas.push(FINE_GRAINED_TOOL_STREAMING_BETA);
+            }
+            if body.is_some_and(body_has_computer_use_tool) {
+                betas.push(COMPUTER_USE_BETA);
+            }
+            if body.is_some_and(body_has_context_management) {
+                betas.push(CONTEXT_MANAGEMENT_BETA);
+            }
+            if body.is_some_and(body_has_effort) {
+                betas.push(EFFORT_BETA);
+            }
+            if body.is_some_and(body_has_extended_cache_ttl) {
+                betas.push(EXTENDED_CACHE_TTL_BETA);
+            }
+            if context_1m_requested {
+                betas.push(CONTEXT_1M_BETA);
+            }
+        }
+        ClaudeBetaOperation::CountTokens => {
+            if context_1m_requested {
+                betas.push(CONTEXT_1M_BETA);
+            }
+            betas.push(TOKEN_COUNTING_BETA);
+        }
     }
+    betas
 }
 
 fn take_internal_anthropic_betas(body: &mut Value) -> Vec<String> {
@@ -1154,10 +1191,6 @@ fn take_internal_anthropic_betas(body: &mut Value) -> Vec<String> {
         }
     }
     betas
-}
-
-fn is_known_safe_client_beta(beta: &str) -> bool {
-    matches!(beta, CLAUDE_CODE_BETA | CLAUDE_OAUTH_BETA) || KNOWN_SAFE_CLIENT_BETAS.contains(&beta)
 }
 
 fn push_beta(betas: &mut Vec<String>, beta: &str) {
@@ -1426,6 +1459,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const WIRE_PROFILE_JSON: &str =
+        include_str!("../../assets/contract/claude-oauth-wire-profile.json");
+
     #[test]
     fn ensure_beta_query_appends_or_merges() {
         assert_eq!(
@@ -1614,8 +1650,79 @@ mod tests {
     #[test]
     fn anthropic_beta_for_claude_oauth_includes_oauth_marker() {
         let headers = HeaderMap::new();
-        let beta = build_anthropic_beta_value(&headers, None, &[], false, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            None,
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
         assert_eq!(beta, "claude-code-20250219,oauth-2025-04-20");
+    }
+
+    #[test]
+    fn beta_policy_matches_the_wire_profile_asset() {
+        fn strings(value: &Value) -> Vec<&str> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_str().unwrap())
+                .collect()
+        }
+
+        fn sorted(mut values: Vec<&str>) -> Vec<&str> {
+            values.sort_unstable();
+            values
+        }
+
+        let profile: Value = serde_json::from_str(WIRE_PROFILE_JSON).unwrap();
+        let messages = &profile["betaMatrices"]["messages"];
+        let count_tokens = &profile["betaMatrices"]["countTokens"];
+        let maximal_messages_body = json!({
+            "stream": true,
+            "thinking": {"type": "adaptive"},
+            "tools": [{"type": "computer_use_20250124"}],
+            "context_management": {"edits": []},
+            "output_config": {"effort": "high"},
+            "system": [{"cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        });
+
+        assert_eq!(
+            strings(&messages["always"]),
+            vec![CLAUDE_CODE_BETA, CLAUDE_OAUTH_BETA]
+        );
+        assert_eq!(
+            sorted(strings(&messages["shapeGated"])),
+            sorted(automatic_betas_for_request(
+                ClaudeBetaOperation::Messages,
+                Some(&maximal_messages_body),
+                true,
+            ))
+        );
+        assert_eq!(
+            strings(&messages["auditedClientCompatibility"]),
+            MESSAGES_CLIENT_BETAS
+        );
+        assert_eq!(
+            strings(&count_tokens["always"]),
+            vec![CLAUDE_CODE_BETA, CLAUDE_OAUTH_BETA, TOKEN_COUNTING_BETA]
+        );
+        assert_eq!(
+            sorted(strings(&count_tokens["shapeGated"])),
+            sorted(
+                automatic_betas_for_request(ClaudeBetaOperation::CountTokens, None, true)
+                    .into_iter()
+                    .filter(|beta| *beta != TOKEN_COUNTING_BETA)
+                    .collect(),
+            )
+        );
+        assert_eq!(
+            strings(&count_tokens["auditedClientCompatibility"]),
+            COUNT_TOKENS_CLIENT_BETAS
+        );
+        assert_eq!(count_tokens["generationOnlyBetasAllowed"], false);
     }
 
     #[test]
@@ -1628,7 +1735,14 @@ mod tests {
             ),
         );
         let body = json!({"thinking": {"type": "enabled"}});
-        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            Some(&body),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
         assert_eq!(
             beta,
             "claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31,token-efficient-tools-2025-02-19,interleaved-thinking-2025-05-14"
@@ -1649,7 +1763,14 @@ mod tests {
             axum::http::HeaderValue::from_static("unknown-beta,token-efficient-tools-2025-02-19"),
         );
 
-        let beta = build_anthropic_beta_value(&headers, None, &[], false, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            None,
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert!(beta.contains("prompt-caching-2024-07-31"));
         assert!(beta.contains("token-efficient-tools-2025-02-19"));
@@ -1671,7 +1792,14 @@ mod tests {
             "stream": false
         });
 
-        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            Some(&body),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert_eq!(beta, "claude-code-20250219,oauth-2025-04-20");
     }
@@ -1684,7 +1812,14 @@ mod tests {
             axum::http::HeaderValue::from_static("custom-beta"),
         );
 
-        let beta = build_anthropic_beta_value(&headers, None, &[], false, false, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            None,
+            &[],
+            false,
+            false,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert_eq!(beta, "claude-code-20250219,custom-beta");
     }
@@ -1693,7 +1828,14 @@ mod tests {
     fn anthropic_beta_for_claude_oauth_tracks_context_management() {
         let headers = HeaderMap::new();
         let body = json!({"context_management": {"edits": []}});
-        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            Some(&body),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert!(beta
             .split(',')
@@ -1716,7 +1858,14 @@ mod tests {
             }]
         });
         let internal = take_internal_anthropic_betas(&mut body);
-        let beta = build_anthropic_beta_value(&headers, Some(&body), &internal, true, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            Some(&body),
+            &internal,
+            true,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert!(body.get("anthropic_beta").is_none());
         assert!(body.get("betas").is_none());
@@ -1734,8 +1883,22 @@ mod tests {
             axum::http::HeaderValue::from_static(CONTEXT_1M_BETA),
         );
 
-        let blocked = build_anthropic_beta_value(&headers, None, &[], false, true, false);
-        let allowed = build_anthropic_beta_value(&headers, None, &[], true, true, false);
+        let blocked = build_anthropic_beta_value(
+            &headers,
+            None,
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        let allowed = build_anthropic_beta_value(
+            &headers,
+            None,
+            &[],
+            true,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert!(!blocked.contains(CONTEXT_1M_BETA));
         assert!(allowed.contains(CONTEXT_1M_BETA));
@@ -2081,7 +2244,14 @@ mod tests {
                 {"name": "computer", "type": "computer_use_20250124"}
             ]
         });
-        let beta = build_anthropic_beta_value(&headers, Some(&body), &[], false, true, false);
+        let beta = build_anthropic_beta_value(
+            &headers,
+            Some(&body),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
 
         assert!(beta.contains(INTERLEAVED_THINKING_BETA));
         assert!(beta.contains(FINE_GRAINED_TOOL_STREAMING_BETA));

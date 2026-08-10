@@ -3,25 +3,26 @@
 const shareUrl = (process.env.CC_SWITCH_SHARE_URL || "").trim().replace(/\/+$/, "");
 const routerToken = (process.env.ROUTER_API_TOKEN || "").trim();
 const routerTokenHeader = (process.env.ROUTER_API_TOKEN_HEADER || "Authorization").trim();
+const serverUrl = (process.env.SERVER_URL || "").trim().replace(/\/+$/, "");
+const serverToken = (process.env.CC_SWITCH_SERVER_TOKEN || "").trim();
+const max5xAccount = (process.env.CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT || "").trim();
+const max20xAccount = (process.env.CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT || "").trim();
 const model = (process.env.CC_SWITCH_CLAUDE_MODEL || "claude-sonnet-4-6").trim();
 const timeoutMs = Math.max(
   1_000,
   Math.min(300_000, Number(process.env.CC_SWITCH_REAL_TIMEOUT_MS || 120_000)),
 );
 
-if (!shareUrl || !routerToken) {
-  console.log(
-    "[SKIP] Claude OAuth real-account gate requires CC_SWITCH_SHARE_URL and ROUTER_API_TOKEN",
-  );
-  process.exit(0);
-}
-
 function fail(message) {
   throw new Error(message);
 }
 
 function redact(value) {
-  return String(value).split(routerToken).join("[REDACTED]");
+  let redacted = String(value);
+  for (const secret of [routerToken, serverToken]) {
+    if (secret) redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted;
 }
 
 function applyRouterAuth(headers) {
@@ -40,7 +41,7 @@ function isNonNegativeInteger(value) {
   return Number.isInteger(value) && value >= 0;
 }
 
-async function request(path, init = {}) {
+async function shareRequest(path, init = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const headers = new Headers(init.headers || {});
@@ -62,7 +63,7 @@ async function request(path, init = {}) {
 }
 
 async function requireJson(path, body, label) {
-  const { response, stopTimeout } = await request(path, {
+  const { response, stopTimeout } = await shareRequest(path, {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -114,7 +115,7 @@ function parseSseEvent(frame) {
 }
 
 async function validateStream() {
-  const { response, stopTimeout } = await request("/v1/messages", {
+  const { response, stopTimeout } = await shareRequest("/v1/messages", {
     method: "POST",
     body: JSON.stringify({
       model,
@@ -189,7 +190,14 @@ async function validateStream() {
   }
 }
 
-async function main() {
+async function validateShareInference() {
+  if (!shareUrl || !routerToken) {
+    console.log(
+      "[SKIP] Claude OAuth Share inference gate requires CC_SWITCH_SHARE_URL and ROUTER_API_TOKEN",
+    );
+    return false;
+  }
+
   const count = await requireJson(
     "/v1/messages/count_tokens",
     {
@@ -228,7 +236,197 @@ async function main() {
 
   await validateStream();
   console.log("[PASS] streaming lifecycle and terminal contract");
-  console.log(`[PASS] Claude OAuth real-account gate complete (model=${model})`);
+  console.log(`[PASS] Claude OAuth Share inference gate complete (model=${model})`);
+  return true;
+}
+
+async function requireServerJson(path, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${serverUrl}${path}`, {
+      headers: { authorization: `Bearer ${serverToken}` },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      fail(`${label} returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      fail(`${label} returned invalid JSON: ${error.message}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let accountListPromise;
+
+async function listClaudeAccounts() {
+  accountListPromise ||= requireServerJson("/api/accounts", "account list");
+  const payload = await accountListPromise;
+  if (!payload?.ok || !Array.isArray(payload.accounts)) {
+    fail("account list does not satisfy the public API contract");
+  }
+  return payload.accounts.filter(
+    (account) => account?.providerType === "claude_oauth",
+  );
+}
+
+function resolveClaudeAccount(accounts, selector, label) {
+  const normalizedEmail = selector.toLowerCase();
+  const matches = accounts.filter(
+    (account) =>
+      account?.id === selector ||
+      (typeof account?.email === "string" &&
+        account.email.trim().toLowerCase() === normalizedEmail),
+  );
+  if (matches.length === 0) {
+    fail(`${label} selector did not match a Claude OAuth account`);
+  }
+  if (matches.length > 1) {
+    fail(`${label} selector matched multiple Claude OAuth accounts`);
+  }
+  return matches[0];
+}
+
+function requireCanonicalPlan(payload, expectedPlanType, expectedLabel, label) {
+  const account = payload?.account;
+  const quota = payload?.quota;
+  const subscription = quota?.extraUsage?.subscription;
+  const evidence = quota?.extraUsage?.subscriptionEvidence;
+  if (!payload?.ok || !quota?.success) {
+    fail(`${label} quota refresh did not return a successful public quota`);
+  }
+  if (account?.providerType !== "claude_oauth") {
+    fail(`${label} quota response is not bound to a Claude OAuth account`);
+  }
+  if (
+    account.subscriptionLevel !== expectedLabel ||
+    quota.credentialMessage !== expectedLabel
+  ) {
+    fail(`${label} did not publish the expected subscription label`);
+  }
+  if (
+    subscription?.planType !== expectedPlanType ||
+    subscription?.planLabel !== expectedLabel
+  ) {
+    fail(`${label} did not publish the expected canonical subscription metadata`);
+  }
+  if (
+    typeof subscription.planSource !== "string" ||
+    !subscription.planSource ||
+    typeof subscription.planStale !== "boolean" ||
+    !Number.isFinite(subscription.planObservedAt) ||
+    typeof evidence?.source !== "string" ||
+    !evidence.source ||
+    typeof evidence.stale !== "boolean" ||
+    !Number.isFinite(evidence.observedAt) ||
+    typeof evidence.conflict !== "boolean"
+  ) {
+    fail(`${label} did not publish complete subscription evidence metadata`);
+  }
+  if (
+    subscription.planSource !== evidence.source ||
+    subscription.planStale !== evidence.stale ||
+    subscription.planObservedAt !== evidence.observedAt
+  ) {
+    fail(`${label} subscription and evidence provenance disagree`);
+  }
+  if (evidence.conflict) {
+    fail(`${label} returned conflicting live subscription evidence`);
+  }
+  if (subscription.planStale || evidence.stale) {
+    fail(`${label} resolved only from cached subscription evidence`);
+  }
+  return evidence;
+}
+
+async function validateMaxPlan({ selector, selectorEnv, expectedPlanType, expectedLabel }) {
+  if (!selector) {
+    console.log(`[SKIP] ${expectedLabel} plan gate requires ${selectorEnv}`);
+    return false;
+  }
+  if (!serverUrl || !serverToken) {
+    console.log(
+      `[SKIP] ${expectedLabel} plan gate requires SERVER_URL and CC_SWITCH_SERVER_TOKEN`,
+    );
+    return false;
+  }
+
+  const account = resolveClaudeAccount(
+    await listClaudeAccounts(),
+    selector,
+    expectedLabel,
+  );
+  const payload = await requireServerJson(
+    `/api/accounts/${encodeURIComponent(account.id)}/quota?refresh=true&force=true`,
+    `${expectedLabel} quota refresh`,
+  );
+  const evidence = requireCanonicalPlan(
+    payload,
+    expectedPlanType,
+    expectedLabel,
+    expectedLabel,
+  );
+  console.log(
+    `[PASS] ${expectedLabel} plan contract (planType=${expectedPlanType}, source=${evidence.source}, stale=${evidence.stale})`,
+  );
+  return true;
+}
+
+async function runGate(label, operation, failures) {
+  try {
+    return await operation();
+  } catch (error) {
+    failures.push(
+      `${label}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
+}
+
+async function main() {
+  const failures = [];
+  const results = [];
+  results.push(
+    await runGate("Share inference", validateShareInference, failures),
+  );
+  results.push(
+    await runGate(
+      "Max 5x plan",
+      () =>
+        validateMaxPlan({
+          selector: max5xAccount,
+          selectorEnv: "CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT",
+          expectedPlanType: "claude_max_5x",
+          expectedLabel: "Claude Max 5x",
+        }),
+      failures,
+    ),
+  );
+  results.push(
+    await runGate(
+      "Max 20x plan",
+      () =>
+        validateMaxPlan({
+          selector: max20xAccount,
+          selectorEnv: "CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT",
+          expectedPlanType: "claude_max_20x",
+          expectedLabel: "Claude Max 20x",
+        }),
+      failures,
+    ),
+  );
+  if (failures.length > 0) {
+    fail(failures.join(" | "));
+  }
+  const passed = results.filter(Boolean).length;
+  if (passed > 0) {
+    console.log(`[PASS] Claude OAuth real-account gates complete (${passed}/3 passed)`);
+  }
 }
 
 main().catch((error) => {

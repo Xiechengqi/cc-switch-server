@@ -9,7 +9,8 @@ export type ManagedAuthProvider =
   | "antigravity_oauth"
   | "agy_oauth"
   | "cursor_oauth"
-  | "kiro_oauth";
+  | "kiro_oauth"
+  | "kimi_code";
 
 export interface DeepSeekAccount {
   id: string;

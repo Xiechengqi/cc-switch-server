@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::{oauth_error_public_message, redact_account_public_diagnostic};
+use crate::api::redact_account_public_diagnostic;
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::runtime::{
     authoritative_managed_account, managed_account_binding_with_generation,
@@ -465,6 +465,27 @@ pub async fn refresh_share_usage_items(
     items
 }
 
+fn control_managed_refresh_error_code(
+    error: &crate::state::ManagedAccountRefreshError,
+) -> &'static str {
+    use crate::state::ManagedAccountRefreshError;
+
+    match error {
+        ManagedAccountRefreshError::Conflict { .. } => "account_refresh_in_progress",
+        ManagedAccountRefreshError::InactiveCodexAccount => "codex_inactive_account",
+        ManagedAccountRefreshError::IdentityChanged { .. } => "account_credentials_changed",
+        ManagedAccountRefreshError::NotFound => "account_not_found",
+        ManagedAccountRefreshError::CredentialPersistenceDegraded => {
+            "credential_persistence_degraded"
+        }
+        ManagedAccountRefreshError::Refresh { status_code, .. } => match status_code {
+            400 | 401 | 403 => "oauth_credentials_rejected",
+            429 => "oauth_refresh_rate_limited",
+            _ => "oauth_refresh_failed",
+        },
+    }
+}
+
 pub(crate) async fn refresh_share_usage_item(
     state: &ServerState,
     app: AppKind,
@@ -520,7 +541,26 @@ pub(crate) async fn refresh_share_usage_item(
         active_account.auth_identity_generation,
         active_account.token_refresh_generation,
     );
-    let Some(mut refresh_guard) = state
+    if let Err(error) = state
+        .refresh_managed_account_if_needed_for_generation(
+            active_account.provider_type,
+            &active_account.id,
+            expected_generation,
+        )
+        .await
+    {
+        return ControlRefreshShareUsageItem {
+            app: app.as_str().to_string(),
+            provider_id: Some(provider_id),
+            provider_name,
+            auth_provider,
+            account_id: Some(account_id),
+            refreshed: false,
+            error: Some(control_managed_refresh_error_code(&error).to_string()),
+            message: None,
+        };
+    }
+    let Some(mut _refresh_guard) = state
         .account_refresh_locks
         .try_lock(active_account.provider_type, &active_account.id)
     else {
@@ -552,7 +592,7 @@ pub(crate) async fn refresh_share_usage_item(
         };
     };
     active_account = latest_account;
-    let mut native_refresh_attempted = (
+    let native_refresh_attempted = (
         active_account.auth_identity_generation,
         active_account.token_refresh_generation,
     ) != refresh_generation_before_lock;
@@ -571,123 +611,6 @@ pub(crate) async fn refresh_share_usage_item(
     let account_before_refresh = active_account.clone();
     let now = now_ms() as i64;
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-
-    if account_needs_native_refresh(&active_account, now) {
-        let http_client = state.http_client().await;
-        match state
-            .execute_native_account_refresh_with_recovery(
-                &http_client,
-                &active_account,
-                now,
-                interval_ms,
-                &mut refresh_guard,
-            )
-            .await
-        {
-            Ok(update) => {
-                match state
-                    .commit_native_refresh_success(&active_account, update)
-                    .await
-                {
-                    Ok(updated) => {
-                        native_refresh_attempted = true;
-                        active_account = updated;
-                    }
-                    Err(error) => {
-                        if error.is_superseded() {
-                            return ControlRefreshShareUsageItem {
-                                app: app.as_str().to_string(),
-                                provider_id: Some(provider_id),
-                                provider_name,
-                                auth_provider,
-                                account_id: Some(account_id),
-                                refreshed: false,
-                                error: Some("account_credentials_changed".to_string()),
-                                message: None,
-                            };
-                        }
-                        let persistence_degraded = error.is_persistence_degraded();
-                        if persistence_degraded {
-                            tracing::error!(
-                                account_id = %active_account.id,
-                                %error,
-                                "control OAuth refresh persistence degraded"
-                            );
-                        } else {
-                            tracing::error!(
-                                account_id = %active_account.id,
-                                %error,
-                                "control OAuth credential state commit failed"
-                            );
-                        }
-                        return ControlRefreshShareUsageItem {
-                            app: app.as_str().to_string(),
-                            provider_id: Some(provider_id),
-                            provider_name,
-                            auth_provider,
-                            account_id: Some(account_id),
-                            refreshed: false,
-                            error: Some(
-                                if persistence_degraded {
-                                    "credential_persistence_degraded"
-                                } else {
-                                    "credential_commit_failed"
-                                }
-                                .to_string(),
-                            ),
-                            message: None,
-                        };
-                    }
-                }
-            }
-            Err(error) => {
-                let public_error = oauth_error_public_message(error.kind).to_string();
-                let updated = state
-                    .commit_native_refresh_failure(
-                        &active_account,
-                        error.message.clone(),
-                        error.kind,
-                        error.immediate_relogin,
-                    )
-                    .await;
-                match updated {
-                    Ok(Some(updated)) => {
-                        if let Err(sync_error) = state
-                            .refresh_account_runtime_metadata_if_changed(
-                                &account_before_refresh,
-                                &updated,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                account_id = %active_account.id,
-                                error = %sync_error,
-                                "control OAuth refresh failure Share descriptor sync remains pending"
-                            );
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(persist_error) => {
-                        tracing::error!(
-                            account_id = %active_account.id,
-                            error = %persist_error,
-                            "persisting control OAuth refresh failure state failed"
-                        );
-                    }
-                }
-                return ControlRefreshShareUsageItem {
-                    app: app.as_str().to_string(),
-                    provider_id: Some(provider_id),
-                    provider_name,
-                    auth_provider,
-                    account_id: Some(account_id),
-                    refreshed: false,
-                    error: Some(public_error),
-                    message: None,
-                };
-            }
-        }
-    }
 
     if state.credential_persistence_degraded() {
         return ControlRefreshShareUsageItem {
@@ -716,86 +639,75 @@ pub(crate) async fn refresh_share_usage_item(
         && quota_result
             .as_ref()
             .is_err_and(|error| error.upstream_status == Some(StatusCode::UNAUTHORIZED.as_u16()))
+        && !active_account.needs_relogin
+        && provider_native_refresh_available(active_account.provider_type)
+        && active_account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
     {
-        match state
-            .recover_quota_unauthorized(
-                &http_client,
-                &active_account,
-                now,
-                interval_ms,
-                &mut refresh_guard,
+        _refresh_guard.release();
+        if let Err(error) = state
+            .refresh_managed_account_now_for_generation(
+                active_account.provider_type,
+                &active_account.id,
+                expected_generation,
             )
             .await
         {
-            Ok(refreshed) => {
-                active_account = refreshed;
-                quota_result = refresh_account_quota(
-                    &http_client,
-                    &active_account,
-                    now,
-                    true,
-                    interval_ms,
-                    timeout_ms,
-                )
-                .await;
-            }
-            Err(crate::state::QuotaUnauthorizedRecoveryError::Unavailable) => {}
-            Err(crate::state::QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
-                if let Some(updated) = updated {
-                    if let Err(error) = state
-                        .refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await
-                    {
-                        tracing::warn!(account_id = %updated.id, %error, "control quota auth recovery Share descriptor sync remains pending");
-                    }
-                }
-                return ControlRefreshShareUsageItem {
-                    app: app.as_str().to_string(),
-                    provider_id: Some(provider_id),
-                    provider_name,
-                    auth_provider,
-                    account_id: Some(account_id),
-                    refreshed: false,
-                    error: Some(oauth_error_public_message(failure.kind).to_string()),
-                    message: None,
-                };
-            }
-            Err(crate::state::QuotaUnauthorizedRecoveryError::Commit(error)) => {
-                let error_code = if error.is_superseded() {
-                    "account_credentials_changed"
-                } else if error.is_persistence_degraded() {
-                    "credential_persistence_degraded"
-                } else {
-                    "credential_commit_failed"
-                };
-                return ControlRefreshShareUsageItem {
-                    app: app.as_str().to_string(),
-                    provider_id: Some(provider_id),
-                    provider_name,
-                    auth_provider,
-                    account_id: Some(account_id),
-                    refreshed: false,
-                    error: Some(error_code.to_string()),
-                    message: None,
-                };
-            }
-            Err(crate::state::QuotaUnauthorizedRecoveryError::State(error)) => {
-                tracing::warn!(account_id, %error, "control quota auth recovery state update failed");
-                return ControlRefreshShareUsageItem {
-                    app: app.as_str().to_string(),
-                    provider_id: Some(provider_id),
-                    provider_name,
-                    auth_provider,
-                    account_id: Some(account_id),
-                    refreshed: false,
-                    error: Some("account_state_update_failed".to_string()),
-                    message: None,
-                };
-            }
+            return ControlRefreshShareUsageItem {
+                app: app.as_str().to_string(),
+                provider_id: Some(provider_id),
+                provider_name,
+                auth_provider,
+                account_id: Some(account_id),
+                refreshed: false,
+                error: Some(control_managed_refresh_error_code(&error).to_string()),
+                message: None,
+            };
         }
+        let Some(guard) = state
+            .account_refresh_locks
+            .try_lock(active_account.provider_type, &active_account.id)
+        else {
+            return ControlRefreshShareUsageItem {
+                app: app.as_str().to_string(),
+                provider_id: Some(provider_id),
+                provider_name,
+                auth_provider,
+                account_id: Some(account_id),
+                refreshed: false,
+                error: Some("account_refresh_in_progress".to_string()),
+                message: None,
+            };
+        };
+        _refresh_guard = guard;
+        let refreshed = state.find_account_by_id(&active_account.id).await;
+        let Some(refreshed) = refreshed.filter(|account| {
+            account.provider_type == account_provider_type
+                && account.auth_identity_generation == expected_generation
+        }) else {
+            return ControlRefreshShareUsageItem {
+                app: app.as_str().to_string(),
+                provider_id: Some(provider_id),
+                provider_name,
+                auth_provider,
+                account_id: Some(account_id),
+                refreshed: false,
+                error: Some("account_credentials_changed".to_string()),
+                message: None,
+            };
+        };
+        active_account = refreshed;
+        quota_result = refresh_account_quota(
+            &http_client,
+            &active_account,
+            now,
+            true,
+            interval_ms,
+            timeout_ms,
+        )
+        .await;
     }
     match quota_result {
         Ok(QuotaRefreshResult::Updated { update, message }) => {

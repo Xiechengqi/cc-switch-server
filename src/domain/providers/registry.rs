@@ -305,6 +305,7 @@ pub enum ManagedIdentityFamily {
     CodexCli,
     GeminiCli,
     GrokCli,
+    KimiCli,
     Kiro,
     Cursor,
     Copilot,
@@ -824,9 +825,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     }
 
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 19usize),
-        (AppKind::Codex, 9usize),
-        (AppKind::Gemini, 6usize),
+        (AppKind::Claude, 20usize),
+        (AppKind::Codex, 11usize),
+        (AppKind::Gemini, 7usize),
     ]);
     for (app, expected) in expected_counts {
         let actual = registry
@@ -847,9 +848,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 40 {
+    if registry.profiles.len() != 44 {
         bail!(
-            "Provider registry contains {} profiles, expected 40",
+            "Provider registry contains {} profiles, expected 44",
             registry.profiles.len()
         );
     }
@@ -899,8 +900,12 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         "claude.anthropic_api_key",
         "claude.bearer_relay",
         "claude.google_oauth",
+        "claude.kimi_code",
+        "codex.kiro_oauth",
+        "codex.kimi_code",
         "codex.openai_api_key",
         "gemini.google_api_key",
+        "gemini.kimi_code",
     ]);
     let expected_mapped_profile_ids = registry
         .profiles
@@ -1208,7 +1213,7 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.profiles.len(), 40);
+        assert_eq!(registry.profiles.len(), 44);
         assert_eq!(registry.legacy_preset_mappings.len(), 29);
         assert_eq!(
             registry
@@ -1255,6 +1260,7 @@ mod tests {
             (ProviderType::GitHubCopilot, AppKind::Claude),
             (ProviderType::DeepSeekAccount, AppKind::Claude),
             (ProviderType::KiroOAuth, AppKind::Claude),
+            (ProviderType::KiroOAuth, AppKind::Codex),
             (ProviderType::CursorOAuth, AppKind::Claude),
             (ProviderType::CursorOAuth, AppKind::Codex),
             (ProviderType::CursorApiKey, AppKind::Claude),

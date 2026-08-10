@@ -11,6 +11,7 @@ pub mod event_emitter;
 pub mod h2_client;
 pub mod identity;
 pub mod image;
+pub mod model;
 pub mod protocol;
 pub mod request_builder;
 pub mod session;
@@ -24,6 +25,7 @@ use serde_json::Value;
 use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::store::StoredProvider;
 
+use super::adapters::AdapterRequest;
 use super::router::ProxyRoute;
 use super::{setting, ProxyError};
 
@@ -31,6 +33,59 @@ use protocol::CursorResponseFormat;
 use request_builder::{build_plan, validate_tool_result_context, AgentRunPlan, InboundProtocol};
 
 pub use agent_driver::{forward_agentservice, AgentServiceForwardOptions};
+
+pub(super) fn apply_agentservice_model_selection(
+    request: &mut AdapterRequest,
+) -> Result<model::CursorModelResolution, ProxyError> {
+    let explicit_selector = request
+        .requested_model
+        .as_deref()
+        .filter(|model| model::is_explicit_cursor_selector(model))
+        .map(str::to_string);
+    let body_model = request_body_model(&request.body);
+    let selected = explicit_selector
+        .as_deref()
+        .or(request.actual_model.as_deref())
+        .or(request.model.as_deref())
+        .or(body_model.as_deref())
+        .unwrap_or("default")
+        .to_string();
+    let resolved = model::resolve_cursor_model(&selected).map_err(|message| {
+        ProxyError::bad_request(format!(
+            "invalid Cursor model selector `{selected}`: {message}"
+        ))
+    })?;
+    request.body = replace_request_body_model(&request.body, &selected)?;
+    request.model = Some(resolved.model_id.clone());
+    request.actual_model = Some(resolved.model_id.clone());
+    if explicit_selector.is_some() {
+        request.actual_model_source = Some("cursor_explicit_selector".to_string());
+    } else if selected != resolved.model_id {
+        request.actual_model_source = Some("cursor_model_resolution".to_string());
+    }
+    Ok(resolved)
+}
+
+fn request_body_model(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn replace_request_body_model(body: &[u8], model: &str) -> Result<bytes::Bytes, ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
+        ProxyError::bad_request(format!("Cursor request body must be valid JSON: {error}"))
+    })?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::bad_request("Cursor request body must be a JSON object"))?;
+    object.insert("model".to_string(), Value::String(model.to_string()));
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("Cursor request encode failed: {error}")))
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,6 +253,7 @@ fn truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use serde_json::{json, Value};
 
     use crate::domain::providers::model::{AppKind, Provider, ProviderMeta};
@@ -222,6 +278,35 @@ mod tests {
             provider_type_id: "cursor_oauth".to_string(),
             resource: Default::default(),
         }
+    }
+
+    fn cursor_request(model: &str) -> AdapterRequest {
+        super::super::adapters::cursor_agentservice_request(
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            ),
+            &stored(json!({})),
+            ProxyRoute::ClaudeMessages,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn apply_single_model_result(request: &mut AdapterRequest, model: &str) {
+        request.body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        request.model = Some(model.to_string());
+        request.actual_model = Some(model.to_string());
+        request.actual_model_source = Some("runtime_plan_single_model".to_string());
     }
 
     #[test]
@@ -249,6 +334,61 @@ mod tests {
         assert!(!agentservice_driver_requested(&stored(json!({
             "cursorAgentService": {"enabled": false}
         }))));
+    }
+
+    #[test]
+    fn explicit_cursor_selector_overrides_single_model_result() {
+        let mut request = cursor_request("cursor-plan:gpt-5.5-fast");
+        apply_single_model_result(&mut request, "composer-2.5");
+
+        let resolved = apply_agentservice_model_selection(&mut request).unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(body["model"], "cursor-plan:gpt-5.5-fast");
+        assert_eq!(resolved.model_id, "gpt-5.5");
+        assert_eq!(resolved.mode, model::CursorAgentMode::Plan);
+        assert!(resolved.fast);
+        assert_eq!(request.actual_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            request.actual_model_source.as_deref(),
+            Some("cursor_explicit_selector")
+        );
+    }
+
+    #[test]
+    fn composer_fast_alias_overrides_single_model_result() {
+        let mut request = cursor_request("composer-2.5-fast");
+        apply_single_model_result(&mut request, "gpt-5.5");
+
+        let resolved = apply_agentservice_model_selection(&mut request).unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(body["model"], "composer-2.5-fast");
+        assert_eq!(resolved.model_id, "composer-2.5");
+        assert_eq!(resolved.mode, model::CursorAgentMode::Agent);
+        assert!(resolved.fast);
+        assert_eq!(request.actual_model.as_deref(), Some("composer-2.5"));
+        assert_eq!(
+            request.actual_model_source.as_deref(),
+            Some("cursor_explicit_selector")
+        );
+    }
+
+    #[test]
+    fn ordinary_model_keeps_single_model_result() {
+        let mut request = cursor_request("gpt-5.5");
+        apply_single_model_result(&mut request, "composer-2.5");
+
+        let resolved = apply_agentservice_model_selection(&mut request).unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(body["model"], "composer-2.5");
+        assert_eq!(resolved.model_id, "composer-2.5");
+        assert_eq!(request.requested_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            request.actual_model_source.as_deref(),
+            Some("runtime_plan_single_model")
+        );
     }
 
     #[test]

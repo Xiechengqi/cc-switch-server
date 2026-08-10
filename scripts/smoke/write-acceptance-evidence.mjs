@@ -237,7 +237,7 @@ const evidence = {
     routerDiagnosticsStatus: env("ROUTER_DIAGNOSTICS_STATUS"),
     routerTunnelsStatus: env("ROUTER_TUNNELS_STATUS"),
     sharesStatus: env("SHARES_STATUS"),
-    usageLogsStatus: env("USAGE_LOGS_STATUS"),
+    usageRequestsStatus: env("USAGE_REQUESTS_STATUS"),
     providerHealthStatus: env("PROVIDER_HEALTH_STATUS"),
     diagnosticsClassification: env("DIAGNOSTICS_CLASSIFICATION"),
     matrixTotal: env("MATRIX_TOTAL"),

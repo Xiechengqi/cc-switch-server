@@ -54,8 +54,12 @@ test("first-class Server Profiles are committed additions, not candidates", () =
     "claude.anthropic_api_key",
     "claude.bearer_relay",
     "claude.google_oauth",
+    "claude.kimi_code",
+    "codex.kiro_oauth",
+    "codex.kimi_code",
     "codex.openai_api_key",
     "gemini.google_api_key",
+    "gemini.kimi_code",
   ]);
   assert.equal("directApiCandidates" in mappings, false);
 
@@ -96,7 +100,7 @@ test("inventory validation rejects altered first-class Profile additions", () =>
 
 test("every required Provider type/app pair has a creatable visible Profile", () => {
   const registry = contract("provider-registry.json");
-  assert.equal(requiredProviderProfilePairs().length, 33);
+  assert.equal(requiredProviderProfilePairs().length, 37);
   assert.doesNotThrow(() => assertRequiredProviderProfileCoverage(registry));
 
   const missing = structuredClone(registry);

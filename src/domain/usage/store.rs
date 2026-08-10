@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use anyhow::Context;
+use chrono::{TimeZone, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -11,28 +12,99 @@ use crate::domain::health::ProviderHealthStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::infra::time::now_ms;
 
-const USAGE_FILE_NAME: &str = "usage-logs.json";
-const USAGE_JSONL_FILE_NAME: &str = "usage-logs.jsonl";
-const USAGE_ROLLUPS_FILE_NAME: &str = "usage-rollups.json";
-const MAX_USAGE_LOGS: usize = 2_000;
+const USAGE_DIRECTORY_NAME: &str = "usage";
+const USAGE_MANIFEST_FILE_NAME: &str = "manifest.json";
+const USAGE_SNAPSHOT_FILE_NAME: &str = "requests.json";
+const USAGE_EVENTS_DIRECTORY_NAME: &str = "events";
+const USAGE_ROLLUPS_FILE_NAME: &str = "rollups.json";
+const USAGE_DETAIL_RETENTION_DAYS: u128 = 32;
+const USAGE_DETAIL_RETENTION_MS: u128 = USAGE_DETAIL_RETENTION_DAYS * USAGE_DAY_MS;
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
-const USAGE_SCHEMA_VERSION: u8 = 4;
-const USAGE_JOURNAL_VERSION: u8 = 2;
-const DEFAULT_USAGE_STATS_WINDOW_MS: u128 = 60 * 60 * 1000;
-const DEFAULT_USAGE_STATS_LIMIT: usize = 50;
+const USAGE_SCHEMA_VERSION: u8 = 1;
+const USAGE_JOURNAL_VERSION: u8 = 1;
 
 pub const CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE: &str = "codex_overflow_compact_summary";
 
-const fn legacy_usage_schema_version() -> u8 {
-    1
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageRecordKind {
+    #[default]
+    UserInference,
+    InternalSupplemental,
+    HealthProbe,
+}
+
+impl UsageRecordKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserInference => "user_inference",
+            Self::InternalSupplemental => "internal_supplemental",
+            Self::HealthProbe => "health_probe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageOutcome {
+    Pending,
+    #[default]
+    Success,
+    ClientError,
+    RateLimited,
+    UpstreamError,
+    Timeout,
+    Interrupted,
+    InternalError,
+}
+
+impl UsageOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Success => "success",
+            Self::ClientError => "client_error",
+            Self::RateLimited => "rate_limited",
+            Self::UpstreamError => "upstream_error",
+            Self::Timeout => "timeout",
+            Self::Interrupted => "interrupted",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    pub fn from_status(status_code: u16) -> Self {
+        match status_code {
+            200..=299 => Self::Success,
+            408 | 504 => Self::Timeout,
+            429 => Self::RateLimited,
+            400..=499 => Self::ClientError,
+            500..=599 => Self::UpstreamError,
+            _ => Self::InternalError,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UsageManifest {
+    schema_version: u8,
+    detail_retention_days: u16,
+}
+
+impl Default for UsageManifest {
+    fn default() -> Self {
+        Self {
+            schema_version: USAGE_SCHEMA_VERSION,
+            detail_retention_days: USAGE_DETAIL_RETENTION_DAYS as u16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageStore {
-    #[serde(default = "legacy_usage_schema_version")]
     pub schema_version: u8,
     #[serde(default)]
     pub logs: Vec<UsageLog>,
@@ -71,6 +143,21 @@ struct UsageJournalRecord {
     log: UsageLog,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedUsageAppend {
+    record: UsageJournalRecord,
+}
+
+impl PreparedUsageAppend {
+    pub(crate) fn log(&self) -> &UsageLog {
+        &self.record.log
+    }
+
+    pub(crate) fn persist(&self, config_dir: &Path) -> anyhow::Result<()> {
+        append_usage_journal_record(config_dir, &self.record)
+    }
+}
+
 impl Default for UsageStore {
     fn default() -> Self {
         let checkpoint = UsageJournalCheckpoint::new();
@@ -90,13 +177,28 @@ impl Default for UsageStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageLog {
     pub request_id: String,
+    pub record_kind: UsageRecordKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
     pub app: AppKind,
+    pub bundle_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<String>,
+    pub supported_apps: Vec<AppKind>,
     pub provider_id: String,
     pub provider_name: String,
     pub provider_type: ProviderType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_identity_generation: Option<u64>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -120,9 +222,17 @@ pub struct UsageLog {
     #[serde(default)]
     pub service_tier_decision: Option<String>,
     pub status_code: u16,
+    pub outcome: UsageOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
     #[serde(default)]
     pub error_message: Option<String>,
     pub duration_ms: u128,
+    pub started_at_ms: u128,
+    pub completed_at_ms: u128,
+    pub end_to_end_duration_ms: u128,
+    pub upstream_duration_ms: u128,
+    pub attempt_count: u32,
     #[serde(default)]
     pub first_token_ms: Option<u128>,
     #[serde(default)]
@@ -151,6 +261,8 @@ pub struct UsageLog {
     pub image_size: Option<String>,
     #[serde(default)]
     pub share_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_slug: Option<String>,
     #[serde(default)]
     pub user_email: Option<String>,
     #[serde(default)]
@@ -183,23 +295,36 @@ pub struct UsageLog {
 }
 
 impl UsageLog {
-    pub fn quota_tokens(&self) -> u64 {
-        self.total_tokens
-            .or_else(|| match (self.input_tokens, self.output_tokens) {
-                (Some(input), Some(output)) => Some(input.saturating_add(output)),
-                (Some(input), None) => Some(input),
-                (None, Some(output)) => Some(output),
-                (None, None) => None,
-            })
+    pub fn is_user_inference(&self) -> bool {
+        self.record_kind == UsageRecordKind::UserInference
+    }
+
+    pub fn processed_tokens(&self) -> u64 {
+        self.input_tokens
             .unwrap_or(0)
+            .saturating_add(self.output_tokens.unwrap_or(0))
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+    }
+
+    pub fn quota_tokens(&self) -> u64 {
+        let processed = self.processed_tokens();
+        if processed > 0 {
+            processed
+        } else {
+            self.total_tokens.unwrap_or(0)
+        }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
     pub request_id: Option<String>,
+    pub record_kind: UsageRecordKind,
+    pub parent_request_id: Option<String>,
     pub share_id: Option<String>,
     pub share_name: Option<String>,
+    pub share_slug: Option<String>,
     pub user_email: Option<String>,
     pub session_id: Option<String>,
     pub data_source: Option<String>,
@@ -217,6 +342,13 @@ pub struct UsageLogContext {
     pub client_service_tier: Option<String>,
     pub effective_service_tier: Option<String>,
     pub service_tier_decision: Option<String>,
+    pub started_at_ms: Option<u128>,
+    pub completed_at_ms: Option<u128>,
+    pub end_to_end_duration_ms: Option<u128>,
+    pub upstream_duration_ms: Option<u128>,
+    pub attempt_count: Option<u32>,
+    pub outcome: Option<UsageOutcome>,
+    pub failure_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -255,10 +387,29 @@ impl UsageState {
 impl UsageStore {
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = usage_path(config_dir);
-        let jsonl_path = usage_jsonl_path(config_dir);
         let provider_health = ProviderHealthStore::load_rebuildable(config_dir);
+        let usage_dir = usage_directory(config_dir);
+        if !usage_dir.exists() {
+            let mut store = Self::default();
+            store.provider_health = provider_health;
+            store.save(config_dir)?;
+            return Ok(store);
+        }
+
+        let manifest = load_usage_manifest(config_dir)?;
+        anyhow::ensure!(
+            manifest.schema_version == USAGE_SCHEMA_VERSION,
+            "unsupported Usage schema version {}; expected {}",
+            manifest.schema_version,
+            USAGE_SCHEMA_VERSION
+        );
+        anyhow::ensure!(
+            manifest.detail_retention_days == USAGE_DETAIL_RETENTION_DAYS as u16,
+            "Usage detail retention does not match the Server contract"
+        );
+
         let snapshot_exists = path.exists();
-        let mut store = if snapshot_exists {
+        let mut store: UsageStore = if snapshot_exists {
             let content = fs::read_to_string(&path)
                 .with_context(|| format!("read usage {}", path.display()))?;
             serde_json::from_str(&content)
@@ -266,104 +417,90 @@ impl UsageStore {
         } else {
             Self::default()
         };
+        anyhow::ensure!(
+            store.schema_version == USAGE_SCHEMA_VERSION,
+            "unsupported Usage snapshot schema version {}; expected {}",
+            store.schema_version,
+            USAGE_SCHEMA_VERSION
+        );
         store.provider_health = provider_health;
-        let snapshot_needs_migration = store.schema_version < USAGE_SCHEMA_VERSION;
-        let journal = load_usage_journal(&jsonl_path)?;
-        let journal_needs_migration = journal.needs_migration();
-        let mut loaded_rollups = load_usage_rollups(config_dir)?;
-        let rollups_need_migration = loaded_rollups
-            .as_ref()
-            .is_some_and(|rollups| rollups.schema_version < USAGE_SCHEMA_VERSION);
-        if rollups_need_migration {
-            if let Some(rollups) = loaded_rollups.as_mut() {
-                rollups.backfill_quota_tokens();
-            }
-        }
-        let normalized_rollups = loaded_rollups
-            .as_mut()
-            .is_some_and(UsageRollupStore::normalize_keys);
+        let journal = load_usage_journal(config_dir)?;
+        let loaded_rollups = load_usage_rollups(config_dir)?;
 
         if !snapshot_exists {
-            store.schema_version = USAGE_SCHEMA_VERSION;
-            for entry in &journal.entries {
-                store.push_log_only(entry.log().clone());
-            }
-            store.trim_recent_window();
-            let checkpoint = UsageJournalCheckpoint::new();
-            store.journal_checkpoint = Some(checkpoint.clone());
-            store.rollups = rebuild_usage_rollups(&store.logs, checkpoint);
-            store.writes_since_compact = 0;
-            store.save_rollups(config_dir)?;
-            store.save_recent_snapshot(config_dir)?;
-            if !journal.entries.is_empty() {
-                truncate_usage_journal(config_dir)?;
-            }
+            anyhow::ensure!(
+                journal.entries.is_empty(),
+                "Usage events exist without their authoritative snapshot"
+            );
+            store.save(config_dir)?;
             return Ok(store);
         }
 
-        let Some(snapshot_checkpoint) = store.journal_checkpoint.clone() else {
-            let recovered = recover_unambiguous_legacy_journal_tail(&mut store, &journal);
-            store.trim_recent_window();
-            store.schema_version = USAGE_SCHEMA_VERSION;
-            let checkpoint = UsageJournalCheckpoint::new();
-            store.journal_checkpoint = Some(checkpoint.clone());
-            store.rollups = loaded_rollups
-                .unwrap_or_else(|| rebuild_usage_rollups(&store.logs, checkpoint.clone()));
-            store.rollups.schema_version = USAGE_SCHEMA_VERSION;
-            store.rollups.journal_checkpoint = Some(checkpoint);
-            store.writes_since_compact = 0;
-            store.save_rollups(config_dir)?;
-            store.save_recent_snapshot(config_dir)?;
-            truncate_usage_journal(config_dir)?;
-            if !journal.entries.is_empty() {
-                tracing::warn!(
-                    recovered,
-                    path = %jsonl_path.display(),
-                    "migrated legacy usage journal conservatively; existing request ids remain snapshot-authoritative"
-                );
-            }
-            return Ok(store);
-        };
+        let snapshot_checkpoint = store
+            .journal_checkpoint
+            .clone()
+            .context("Usage snapshot is missing its journal checkpoint")?;
 
-        store.trim_recent_window();
         store.rollups =
             compatible_usage_rollups(&store.logs, &snapshot_checkpoint, loaded_rollups, &journal);
         let replayed = replay_versioned_usage_journal(&mut store, &journal, &snapshot_checkpoint);
         store.writes_since_compact = replayed as u64;
-        let normalized_active_rollups = store.rollups.normalize_keys();
-        let needs_migration = snapshot_needs_migration
-            || journal_needs_migration
-            || rollups_need_migration
-            || normalized_rollups
-            || normalized_active_rollups;
-        store.schema_version = USAGE_SCHEMA_VERSION;
-        store.rollups.schema_version = USAGE_SCHEMA_VERSION;
-        if needs_migration {
-            store.save_rollups(config_dir)?;
-            store.save_recent_snapshot(config_dir)?;
-            truncate_usage_journal(config_dir)?;
-            store.writes_since_compact = 0;
-            tracing::info!("migrated usage storage schema");
+        store.trim_recent_window();
+        if store.recover_pending_after_restart() {
+            store.save(config_dir)?;
         }
         Ok(store)
     }
 
+    fn recover_pending_after_restart(&mut self) -> bool {
+        let now = now_ms();
+        let mut replacements = Vec::new();
+        for log in &mut self.logs {
+            if log.record_kind != UsageRecordKind::UserInference
+                || (log.usage_state != UsageState::Pending && log.outcome != UsageOutcome::Pending)
+            {
+                continue;
+            }
+            let previous = log.clone();
+            log.usage_state = UsageState::Interrupted;
+            log.outcome = UsageOutcome::Interrupted;
+            log.failure_kind = Some("server_restarted".to_string());
+            log.completed_at_ms = now;
+            log.end_to_end_duration_ms = now.saturating_sub(log.started_at_ms);
+            log.usage_revision = log.usage_revision.saturating_add(1);
+            replacements.push((previous, log.clone()));
+        }
+        for (previous, updated) in &replacements {
+            self.rollups.replace_log(previous, updated);
+        }
+        !replacements.is_empty()
+    }
+
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
         self.save_recent_snapshot(config_dir)?;
-        self.save_rollups(config_dir)
+        self.save_rollups(config_dir)?;
+        save_usage_manifest(config_dir)
     }
 
     pub fn save_recent_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(config_dir)
-            .with_context(|| format!("create config dir {}", config_dir.display()))?;
+        fs::create_dir_all(usage_directory(config_dir)).with_context(|| {
+            format!(
+                "create Usage directory {}",
+                usage_directory(config_dir).display()
+            )
+        })?;
         let path = usage_path(config_dir);
         crate::infra::storage::write_json_pretty(&path, self)
             .with_context(|| format!("write usage {}", path.display()))
     }
 
     pub fn save_rollups(&self, config_dir: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(config_dir)
-            .with_context(|| format!("create config dir {}", config_dir.display()))?;
+        fs::create_dir_all(usage_directory(config_dir)).with_context(|| {
+            format!(
+                "create Usage directory {}",
+                usage_directory(config_dir).display()
+            )
+        })?;
         let path = usage_rollups_path(config_dir);
         crate::infra::storage::write_json_pretty(&path, &self.rollups)
             .with_context(|| format!("write usage rollups {}", path.display()))
@@ -398,74 +535,58 @@ impl UsageStore {
             return (0, 0);
         };
         let normalized_email = user_email.trim();
-        self.rollups
+        if starts_at_ms >= ends_at_ms {
+            return (0, 0);
+        }
+        let first_full_bucket_ms = ceil_to_usage_bucket(starts_at_ms);
+        let after_last_full_bucket_ms = ends_at_ms - (ends_at_ms % USAGE_ROLLUP_BUCKET_MS);
+        if first_full_bucket_ms >= after_last_full_bucket_ms {
+            return quota_usage_from_logs(
+                &self.logs,
+                share_id,
+                normalized_email,
+                starts_at_ms,
+                ends_at_ms,
+            );
+        }
+
+        let rolled_up = self
+            .rollups
             .buckets
             .values()
             .filter(|bucket| {
-                bucket.bucket_start_ms >= starts_at_ms
-                    && bucket.bucket_start_ms < ends_at_ms
-                    && bucket.share_id.as_deref() == Some(share_id)
-                    && bucket
-                        .user_email
-                        .as_deref()
-                        .is_some_and(|email| email.trim().eq_ignore_ascii_case(normalized_email))
-                    && !bucket.is_health_check
+                bucket.bucket_start_ms >= first_full_bucket_ms
+                    && bucket.bucket_start_ms < after_last_full_bucket_ms
+                    && bucket.share_id == share_id
+                    && bucket.user_email.eq_ignore_ascii_case(normalized_email)
             })
             .fold((0u64, 0u64), |(tokens, requests), bucket| {
                 (
                     tokens.saturating_add(bucket.stats.quota_tokens),
-                    requests.saturating_add(bucket.share_quota_requests()),
+                    requests.saturating_add(bucket.stats.request_count),
                 )
-            })
-    }
-
-    pub fn push_and_persist(&mut self, config_dir: &Path, log: UsageLog) -> anyhow::Result<()> {
-        self.ensure_journal_checkpoint(config_dir)?;
-        let sequence = self.append_usage_journal(config_dir, &log)?;
-        self.push(log);
-        self.advance_journal_checkpoint(sequence);
-        self.save_rollups(config_dir)?;
-        self.writes_since_compact = self.writes_since_compact.saturating_add(1);
-        if self.compact_due(config_dir) {
-            self.save_recent_snapshot(config_dir)?;
-            truncate_usage_journal(config_dir)?;
-            self.writes_since_compact = 0;
-        }
-        Ok(())
-    }
-
-    pub fn update_log_and_persist<F>(
-        &mut self,
-        config_dir: &Path,
-        request_id: &str,
-        update: F,
-    ) -> anyhow::Result<Option<UsageLog>>
-    where
-        F: FnOnce(&mut UsageLog),
-    {
-        let Some(index) = self
+            });
+        let edge = self
             .logs
             .iter()
-            .position(|log| log.request_id == request_id)
-        else {
-            return Ok(None);
-        };
-        self.ensure_journal_checkpoint(config_dir)?;
-        let previous = self.logs[index].clone();
-        let mut updated = previous.clone();
-        update(&mut updated);
-        let sequence = self.append_usage_journal(config_dir, &updated)?;
-        self.rollups.replace_log(&previous, &updated);
-        self.logs[index] = updated.clone();
-        self.advance_journal_checkpoint(sequence);
-        self.save_rollups(config_dir)?;
-        self.writes_since_compact = self.writes_since_compact.saturating_add(1);
-        if self.compact_due(config_dir) {
-            self.save_recent_snapshot(config_dir)?;
-            truncate_usage_journal(config_dir)?;
-            self.writes_since_compact = 0;
-        }
-        Ok(Some(updated))
+            .filter(|log| {
+                let created_at_ms = log.created_at_ms;
+                (created_at_ms >= starts_at_ms && created_at_ms < first_full_bucket_ms)
+                    || (created_at_ms >= after_last_full_bucket_ms && created_at_ms < ends_at_ms)
+            })
+            .filter(|log| quota_log_matches(log, share_id, normalized_email))
+            .fold((0u64, 0u64), |(tokens, requests), log| {
+                (
+                    tokens.saturating_add(log.quota_tokens()),
+                    requests.saturating_add(u64::from(
+                        log.record_kind == UsageRecordKind::UserInference,
+                    )),
+                )
+            });
+        (
+            rolled_up.0.saturating_add(edge.0),
+            rolled_up.1.saturating_add(edge.1),
+        )
     }
 
     fn push_log_only(&mut self, log: UsageLog) {
@@ -481,33 +602,27 @@ impl UsageStore {
         self.trim_recent_window();
     }
 
-    fn ensure_journal_checkpoint(&mut self, config_dir: &Path) -> anyhow::Result<()> {
-        if self.journal_checkpoint.is_some() {
-            return Ok(());
-        }
-        let checkpoint = UsageJournalCheckpoint::new();
-        self.journal_checkpoint = Some(checkpoint.clone());
-        self.rollups.journal_checkpoint = Some(checkpoint);
-        self.save_rollups(config_dir)?;
-        self.save_recent_snapshot(config_dir)
-    }
-
-    fn append_usage_journal(&self, config_dir: &Path, log: &UsageLog) -> anyhow::Result<u64> {
+    pub(crate) fn prepare_append(&self, log: UsageLog) -> anyhow::Result<PreparedUsageAppend> {
         let checkpoint = self
             .journal_checkpoint
             .as_ref()
             .context("usage journal checkpoint is unavailable")?;
         let sequence = checkpoint.through_sequence.saturating_add(1);
-        append_usage_journal_record(
-            config_dir,
-            &UsageJournalRecord {
+        Ok(PreparedUsageAppend {
+            record: UsageJournalRecord {
                 version: USAGE_JOURNAL_VERSION,
                 generation: checkpoint.generation.clone(),
                 sequence,
-                log: log.clone(),
+                log,
             },
-        )?;
-        Ok(sequence)
+        })
+    }
+
+    pub(crate) fn apply_append(&mut self, append: PreparedUsageAppend) {
+        let sequence = append.record.sequence;
+        self.push(append.record.log);
+        self.advance_journal_checkpoint(sequence);
+        self.writes_since_compact = self.writes_since_compact.saturating_add(1);
     }
 
     fn advance_journal_checkpoint(&mut self, sequence: u64) {
@@ -518,14 +633,27 @@ impl UsageStore {
     }
 
     fn trim_recent_window(&mut self) {
-        if self.logs.len() > MAX_USAGE_LOGS {
-            let excess = self.logs.len() - MAX_USAGE_LOGS;
-            self.logs.drain(0..excess);
-        }
+        let cutoff = now_ms().saturating_sub(USAGE_DETAIL_RETENTION_MS);
+        self.logs.retain(|log| log.created_at_ms >= cutoff);
     }
 
     fn compact_due(&self, config_dir: &Path) -> bool {
         self.writes_since_compact >= USAGE_COMPACT_EVERY_EVENTS || !usage_path(config_dir).exists()
+    }
+
+    pub(crate) fn needs_compaction(&self, config_dir: &Path) -> bool {
+        self.compact_due(config_dir)
+    }
+
+    pub(crate) fn compact_if_due(&mut self, config_dir: &Path) -> anyhow::Result<bool> {
+        if !self.compact_due(config_dir) {
+            return Ok(false);
+        }
+        self.save_rollups(config_dir)?;
+        self.save_recent_snapshot(config_dir)?;
+        truncate_usage_journal(config_dir)?;
+        self.writes_since_compact = 0;
+        Ok(true)
     }
 
     pub fn latest_filtered(&self, query: UsageLogFilter) -> Vec<UsageLog> {
@@ -538,151 +666,50 @@ impl UsageStore {
             .collect()
     }
 
-    pub fn rollup(&self) -> UsageRollup {
-        if self.rollups.has_data() {
-            return self.rollups.rollup_filtered(&UsageStatsFilter::default());
-        }
-        let mut rollup = UsageRollup::default();
-        for log in self.logs.iter().filter(|log| !log.is_health_check) {
-            rollup.requests += 1;
-            if (200..400).contains(&log.status_code) {
-                rollup.successes += 1;
-            } else {
-                rollup.failures += 1;
-            }
-            rollup.input_tokens += log.input_tokens.unwrap_or(0);
-            rollup.output_tokens += log.output_tokens.unwrap_or(0);
-            rollup.cache_read_tokens += log.cache_read_tokens.unwrap_or(0);
-            rollup.cache_creation_tokens += log.cache_creation_tokens.unwrap_or(0);
-            rollup.total_tokens += log.total_tokens.unwrap_or(0);
-        }
-        rollup
-    }
-
-    pub fn rollup_filtered(&self, query: &UsageStatsFilter) -> UsageRollup {
-        if self.rollups.has_data() {
-            return self.rollups.rollup_filtered(query);
-        }
-        let mut rollup = UsageRollup::default();
-        for log in self
-            .logs
-            .iter()
-            .filter(|log| matches_stats_filter(log, query))
-        {
-            add_log_to_rollup(&mut rollup, log);
-        }
-        rollup
-    }
-
-    pub fn summary_by_app(&self, query: &UsageStatsFilter) -> Vec<serde_json::Value> {
-        if self.rollups.has_data() {
-            return self.rollups.summary_by_app(query);
-        }
-        let mut by_app = BTreeMap::<String, UsageRollup>::new();
-        for log in self
-            .logs
-            .iter()
-            .filter(|log| matches_stats_filter(log, query))
-        {
-            add_log_to_rollup(by_app.entry(log.app.as_str().to_string()).or_default(), log);
-        }
-        usage_summary_by_app_items(by_app)
-    }
-
-    pub fn trends(&self, query: &UsageStatsFilter) -> Vec<UsageTrendPoint> {
-        if self.rollups.has_data() {
-            return self.rollups.trends(query);
-        }
-        let window_ms = query
-            .window_ms
-            .unwrap_or(DEFAULT_USAGE_STATS_WINDOW_MS)
-            .max(1);
-        let mut buckets = BTreeMap::<u128, UsageStatsAccumulator>::new();
-        for log in self
-            .logs
-            .iter()
-            .filter(|log| matches_stats_filter(log, query))
-        {
-            let start_ms = log.created_at_ms - (log.created_at_ms % window_ms);
-            buckets.entry(start_ms).or_default().push(log);
-        }
-        let mut points = buckets
-            .into_iter()
-            .map(|(start_ms, accumulator)| {
-                let avg_duration_ms = accumulator.avg_duration_ms();
-                let avg_first_token_ms = accumulator.avg_first_token_ms();
-                UsageTrendPoint {
-                    start_ms,
-                    end_ms: start_ms.saturating_add(window_ms),
-                    rollup: accumulator.rollup,
-                    avg_duration_ms,
-                    avg_first_token_ms,
-                    last_request_at_ms: accumulator.last_request_at_ms,
-                }
-            })
-            .collect::<Vec<_>>();
-        limit_latest_points(&mut points, query.limit);
-        points
-    }
-
-    pub fn provider_stats(&self, query: &UsageStatsFilter) -> Vec<ProviderUsageStats> {
-        if self.rollups.has_data() {
-            return self.rollups.provider_stats(query);
-        }
-        let mut groups = BTreeMap::<String, ProviderUsageAccumulator>::new();
-        for log in self
-            .logs
-            .iter()
-            .filter(|log| matches_stats_filter(log, query))
-        {
-            let key = format!("{}:{}", log.app.as_str(), log.provider_id);
-            groups
-                .entry(key)
-                .or_insert_with(|| ProviderUsageAccumulator::new(log))
-                .push(log);
-        }
-        let mut stats = groups
-            .into_values()
-            .map(ProviderUsageAccumulator::finish)
-            .collect::<Vec<_>>();
-        sort_provider_stats(&mut stats);
-        stats.truncate(query.limit.unwrap_or(DEFAULT_USAGE_STATS_LIMIT));
-        stats
-    }
-
-    pub fn model_stats(&self, query: &UsageStatsFilter) -> Vec<ModelUsageStats> {
-        if self.rollups.has_data() {
-            return self.rollups.model_stats(query);
-        }
-        let mut groups = BTreeMap::<String, ModelUsageAccumulator>::new();
-        for log in self
-            .logs
-            .iter()
-            .filter(|log| matches_stats_filter(log, query))
-        {
-            let model = usage_model_key(log);
-            let key = format!("{}:{model}", log.app.as_str());
-            groups
-                .entry(key)
-                .or_insert_with(|| ModelUsageAccumulator::new(log, model))
-                .push(log);
-        }
-        let mut stats = groups
-            .into_values()
-            .map(ModelUsageAccumulator::finish)
-            .collect::<Vec<_>>();
-        sort_model_stats(&mut stats);
-        stats.truncate(query.limit.unwrap_or(DEFAULT_USAGE_STATS_LIMIT));
-        stats
-    }
-
     pub fn request_detail(&self, request_id: &str) -> Option<UsageLog> {
         self.logs
             .iter()
             .rev()
-            .find(|log| log.request_id == request_id)
+            .find(|log| log.is_user_inference() && log.request_id == request_id)
             .cloned()
     }
+}
+
+fn ceil_to_usage_bucket(value: u128) -> u128 {
+    let remainder = value % USAGE_ROLLUP_BUCKET_MS;
+    if remainder == 0 {
+        value
+    } else {
+        value.saturating_add(USAGE_ROLLUP_BUCKET_MS - remainder)
+    }
+}
+
+fn quota_log_matches(log: &UsageLog, share_id: &str, user_email: &str) -> bool {
+    is_share_user_quota_record(log)
+        && log.share_id.as_deref() == Some(share_id)
+        && log
+            .user_email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(user_email))
+}
+
+fn quota_usage_from_logs(
+    logs: &[UsageLog],
+    share_id: &str,
+    user_email: &str,
+    starts_at_ms: u128,
+    ends_at_ms: u128,
+) -> (u64, u64) {
+    logs.iter()
+        .filter(|log| log.created_at_ms >= starts_at_ms && log.created_at_ms < ends_at_ms)
+        .filter(|log| quota_log_matches(log, share_id, user_email))
+        .fold((0u64, 0u64), |(tokens, requests), log| {
+            (
+                tokens.saturating_add(log.quota_tokens()),
+                requests
+                    .saturating_add(u64::from(log.record_kind == UsageRecordKind::UserInference)),
+            )
+        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -700,45 +727,6 @@ pub struct UsageLogFilter {
     pub stream_status: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct UsageStatsFilter {
-    pub limit: Option<usize>,
-    pub from_ms: Option<u128>,
-    pub to_ms: Option<u128>,
-    pub window_ms: Option<u128>,
-    pub app: Option<AppKind>,
-    pub provider_id: Option<String>,
-    pub provider_name: Option<String>,
-    pub model: Option<String>,
-    pub share_id: Option<String>,
-    pub user_email: Option<String>,
-    pub session_id: Option<String>,
-    pub data_source: Option<String>,
-    pub is_health_check: Option<bool>,
-    pub stream_status: Option<String>,
-}
-
-impl Default for UsageStatsFilter {
-    fn default() -> Self {
-        Self {
-            limit: None,
-            from_ms: None,
-            to_ms: None,
-            window_ms: None,
-            app: None,
-            provider_id: None,
-            provider_name: None,
-            model: None,
-            share_id: None,
-            user_email: None,
-            session_id: None,
-            data_source: None,
-            is_health_check: Some(false),
-            stream_status: None,
-        }
-    }
-}
-
 impl UsageLog {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -751,12 +739,24 @@ impl UsageLog {
         model: UsageModelMetadata,
         usage: TokenUsage,
     ) -> Self {
+        let completed_at_ms = now_ms();
+        let started_at_ms = completed_at_ms.saturating_sub(duration_ms);
+        let outcome = UsageOutcome::from_status(status_code);
         Self {
             request_id: generate_request_id(),
+            record_kind: UsageRecordKind::UserInference,
+            parent_request_id: None,
             app,
+            bundle_id: provider_id.clone(),
+            family_id: None,
+            supported_apps: vec![app],
             provider_id,
             provider_name,
             provider_type,
+            profile_id: None,
+            account_ref: None,
+            account_display: None,
+            auth_identity_generation: None,
             model: model.model,
             request_agent: None,
             session_id: None,
@@ -769,8 +769,15 @@ impl UsageLog {
             effective_service_tier: None,
             service_tier_decision: None,
             status_code,
+            outcome,
+            failure_kind: None,
             error_message: None,
             duration_ms,
+            started_at_ms,
+            completed_at_ms,
+            end_to_end_duration_ms: duration_ms,
+            upstream_duration_ms: duration_ms,
+            attempt_count: 1,
             first_token_ms: None,
             raw_input_tokens: usage.raw_input_tokens,
             input_tokens: usage.input_tokens,
@@ -785,6 +792,7 @@ impl UsageLog {
             image_height: None,
             image_size: None,
             share_id: None,
+            share_slug: None,
             user_email: None,
             data_source: None,
             is_health_check: false,
@@ -803,7 +811,7 @@ impl UsageLog {
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_sync_attempt_count: 0,
-            created_at_ms: now_ms(),
+            created_at_ms: started_at_ms,
         }
     }
 
@@ -811,9 +819,22 @@ impl UsageLog {
         if let Some(request_id) = context.request_id {
             self.request_id = request_id;
         }
+        self.record_kind = if context.is_health_check {
+            UsageRecordKind::HealthProbe
+        } else if context.data_source.as_deref() == Some(CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE)
+        {
+            UsageRecordKind::InternalSupplemental
+        } else {
+            context.record_kind
+        };
+        self.parent_request_id = context.parent_request_id;
         self.share_id = context.share_id;
         self.share_name = context.share_name;
-        self.user_email = context.user_email;
+        self.share_slug = context.share_slug;
+        self.user_email = context
+            .user_email
+            .map(|email| email.trim().to_ascii_lowercase())
+            .filter(|email| !email.is_empty());
         self.session_id = context.session_id;
         self.data_source = context.data_source;
         self.is_health_check = context.is_health_check;
@@ -835,6 +856,31 @@ impl UsageLog {
         self.client_service_tier = context.client_service_tier;
         self.effective_service_tier = context.effective_service_tier;
         self.service_tier_decision = context.service_tier_decision;
+        if let Some(started_at_ms) = context.started_at_ms {
+            self.started_at_ms = started_at_ms;
+            self.created_at_ms = started_at_ms;
+        }
+        if self.usage_state == UsageState::Pending {
+            self.completed_at_ms = 0;
+            self.end_to_end_duration_ms = 0;
+        } else {
+            self.completed_at_ms = context.completed_at_ms.unwrap_or_else(now_ms);
+            self.end_to_end_duration_ms = context
+                .end_to_end_duration_ms
+                .unwrap_or_else(|| self.completed_at_ms.saturating_sub(self.started_at_ms));
+        }
+        self.upstream_duration_ms = context.upstream_duration_ms.unwrap_or(self.duration_ms);
+        self.attempt_count = context.attempt_count.unwrap_or(1).max(1);
+        self.failure_kind = context.failure_kind;
+        self.outcome = context.outcome.unwrap_or_else(|| {
+            if self.usage_state == UsageState::Pending {
+                UsageOutcome::Pending
+            } else if self.usage_state == UsageState::Interrupted {
+                UsageOutcome::Interrupted
+            } else {
+                UsageOutcome::from_status(self.status_code)
+            }
+        });
         if let Some(image) = context.image {
             self.image_count = Some(image.count);
             self.image_bytes = Some(image.bytes);
@@ -846,40 +892,9 @@ impl UsageLog {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageRollup {
-    pub requests: u64,
-    pub successes: u64,
-    pub failures: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub total_tokens: u64,
-}
-
-impl UsageRollup {
-    fn add_assign(&mut self, other: &UsageRollup) {
-        self.requests = self.requests.saturating_add(other.requests);
-        self.successes = self.successes.saturating_add(other.successes);
-        self.failures = self.failures.saturating_add(other.failures);
-        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
-        self.cache_read_tokens = self
-            .cache_read_tokens
-            .saturating_add(other.cache_read_tokens);
-        self.cache_creation_tokens = self
-            .cache_creation_tokens
-            .saturating_add(other.cache_creation_tokens);
-        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRollupStore {
-    #[serde(default = "legacy_usage_schema_version")]
     schema_version: u8,
     #[serde(default)]
     buckets: BTreeMap<String, UsageRollupBucket>,
@@ -898,41 +913,10 @@ impl Default for UsageRollupStore {
 }
 
 impl UsageRollupStore {
-    fn has_data(&self) -> bool {
-        !self.buckets.is_empty()
-    }
-
-    fn normalize_keys(&mut self) -> bool {
-        let previous = std::mem::take(&mut self.buckets);
-        let mut changed = false;
-        for (previous_key, bucket) in previous {
-            let key = usage_rollup_bucket_key(&bucket);
-            changed |= key != previous_key;
-            if let Some(existing) = self.buckets.get_mut(&key) {
-                existing.merge(bucket);
-                changed = true;
-            } else {
-                self.buckets.insert(key, bucket);
-            }
-        }
-        changed
-    }
-
-    fn backfill_quota_tokens(&mut self) {
-        for bucket in self.buckets.values_mut() {
-            bucket.stats.quota_tokens = if bucket.stats.rollup.total_tokens > 0 {
-                bucket.stats.rollup.total_tokens
-            } else {
-                bucket
-                    .stats
-                    .rollup
-                    .input_tokens
-                    .saturating_add(bucket.stats.rollup.output_tokens)
-            };
-        }
-    }
-
     fn add_log(&mut self, log: &UsageLog) {
+        if !is_share_user_quota_record(log) {
+            return;
+        }
         let key = usage_rollup_key(log);
         self.buckets
             .entry(key)
@@ -941,10 +925,13 @@ impl UsageRollupStore {
     }
 
     fn remove_log(&mut self, log: &UsageLog) {
+        if !is_share_user_quota_record(log) {
+            return;
+        }
         let key = usage_rollup_key(log);
         let should_remove = if let Some(bucket) = self.buckets.get_mut(&key) {
             bucket.remove(log);
-            bucket.stats.rollup.requests == 0
+            bucket.stats.is_empty()
         } else {
             false
         };
@@ -957,271 +944,41 @@ impl UsageRollupStore {
         self.remove_log(previous);
         self.add_log(updated);
     }
-
-    fn rollup_filtered(&self, query: &UsageStatsFilter) -> UsageRollup {
-        let mut accumulator = UsageStatsAccumulator::default();
-        for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
-            accumulator.merge(&bucket.stats);
-        }
-        accumulator.rollup
-    }
-
-    fn summary_by_app(&self, query: &UsageStatsFilter) -> Vec<serde_json::Value> {
-        let mut by_app = BTreeMap::<String, UsageRollup>::new();
-        for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
-            by_app
-                .entry(bucket.app.as_str().to_string())
-                .or_default()
-                .add_assign(&bucket.stats.rollup);
-        }
-        usage_summary_by_app_items(by_app)
-    }
-
-    fn trends(&self, query: &UsageStatsFilter) -> Vec<UsageTrendPoint> {
-        let window_ms = query
-            .window_ms
-            .unwrap_or(DEFAULT_USAGE_STATS_WINDOW_MS)
-            .max(1);
-        let mut buckets = BTreeMap::<u128, UsageStatsAccumulator>::new();
-        for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
-            let start_ms = bucket.bucket_start_ms - (bucket.bucket_start_ms % window_ms);
-            buckets.entry(start_ms).or_default().merge(&bucket.stats);
-        }
-        let mut points = buckets
-            .into_iter()
-            .map(|(start_ms, accumulator)| {
-                let avg_duration_ms = accumulator.avg_duration_ms();
-                let avg_first_token_ms = accumulator.avg_first_token_ms();
-                UsageTrendPoint {
-                    start_ms,
-                    end_ms: start_ms.saturating_add(window_ms),
-                    rollup: accumulator.rollup,
-                    avg_duration_ms,
-                    avg_first_token_ms,
-                    last_request_at_ms: accumulator.last_request_at_ms,
-                }
-            })
-            .collect::<Vec<_>>();
-        limit_latest_points(&mut points, query.limit);
-        points
-    }
-
-    fn provider_stats(&self, query: &UsageStatsFilter) -> Vec<ProviderUsageStats> {
-        let mut groups = BTreeMap::<String, ProviderUsageAccumulator>::new();
-        for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
-            let key = format!("{}:{}", bucket.app.as_str(), bucket.provider_id);
-            groups
-                .entry(key)
-                .or_insert_with(|| {
-                    ProviderUsageAccumulator::new_parts(
-                        bucket.app,
-                        bucket.provider_id.clone(),
-                        bucket.provider_name.clone(),
-                        bucket.provider_type,
-                    )
-                })
-                .merge(&bucket.stats);
-        }
-        let mut stats = groups
-            .into_values()
-            .map(ProviderUsageAccumulator::finish)
-            .collect::<Vec<_>>();
-        sort_provider_stats(&mut stats);
-        stats.truncate(query.limit.unwrap_or(DEFAULT_USAGE_STATS_LIMIT));
-        stats
-    }
-
-    fn model_stats(&self, query: &UsageStatsFilter) -> Vec<ModelUsageStats> {
-        let mut groups = BTreeMap::<String, ModelUsageAccumulator>::new();
-        for bucket in self.buckets.values().filter(|bucket| bucket.matches(query)) {
-            let key = format!("{}:{}", bucket.app.as_str(), bucket.model);
-            groups
-                .entry(key)
-                .or_insert_with(|| {
-                    ModelUsageAccumulator::new_parts(
-                        bucket.app,
-                        bucket.model.clone(),
-                        bucket.requested_model.clone(),
-                        bucket.actual_model.clone(),
-                        bucket.actual_model_source.clone(),
-                    )
-                })
-                .merge(&bucket.stats);
-        }
-        let mut stats = groups
-            .into_values()
-            .map(ModelUsageAccumulator::finish)
-            .collect::<Vec<_>>();
-        sort_model_stats(&mut stats);
-        stats.truncate(query.limit.unwrap_or(DEFAULT_USAGE_STATS_LIMIT));
-        stats
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageRollupBucket {
     bucket_start_ms: u128,
-    bucket_end_ms: u128,
-    day_start_ms: u128,
-    app: AppKind,
-    provider_id: String,
-    provider_name: String,
-    provider_type: ProviderType,
-    model: String,
-    requested_model: Option<String>,
-    actual_model: Option<String>,
-    actual_model_source: Option<String>,
-    share_id: Option<String>,
-    user_email: Option<String>,
-    session_id: Option<String>,
-    data_source: Option<String>,
-    #[serde(default)]
-    is_health_check: bool,
-    stream_status: Option<String>,
-    stats: UsageStatsAccumulator,
+    share_id: String,
+    user_email: String,
+    record_kind: UsageRecordKind,
+    stats: UsageQuotaAccumulator,
 }
 
 impl UsageRollupBucket {
-    fn share_quota_requests(&self) -> u64 {
-        if self.data_source.as_deref() == Some(CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE) {
-            0
-        } else {
-            self.stats.rollup.requests
-        }
-    }
-
     fn new(log: &UsageLog) -> Self {
         let bucket_start_ms = log.created_at_ms - (log.created_at_ms % USAGE_ROLLUP_BUCKET_MS);
-        let day_start_ms = log.created_at_ms - (log.created_at_ms % USAGE_DAY_MS);
         Self {
             bucket_start_ms,
-            bucket_end_ms: bucket_start_ms.saturating_add(USAGE_ROLLUP_BUCKET_MS),
-            day_start_ms,
-            app: log.app,
-            provider_id: log.provider_id.clone(),
-            provider_name: log.provider_name.clone(),
-            provider_type: log.provider_type,
-            model: usage_model_key(log),
-            requested_model: log.requested_model.clone(),
-            actual_model: log.actual_model.clone(),
-            actual_model_source: log.actual_model_source.clone(),
-            share_id: log.share_id.clone(),
-            user_email: log.user_email.clone(),
-            session_id: log.session_id.clone(),
-            data_source: log.data_source.clone(),
-            is_health_check: log.is_health_check,
-            stream_status: log.stream_status.clone(),
-            stats: UsageStatsAccumulator::default(),
+            share_id: log.share_id.clone().expect("quota record has a Share ID"),
+            user_email: log
+                .user_email
+                .as_deref()
+                .map(|email| email.trim().to_ascii_lowercase())
+                .expect("quota record has a user email"),
+            record_kind: log.record_kind,
+            stats: UsageQuotaAccumulator::default(),
         }
     }
 
     fn push(&mut self, log: &UsageLog) {
         self.stats.push(log);
-        if self.provider_name.is_empty() && !log.provider_name.is_empty() {
-            self.provider_name = log.provider_name.clone();
-        }
     }
 
     fn remove(&mut self, log: &UsageLog) {
         self.stats.remove(log);
     }
-
-    fn merge(&mut self, other: Self) {
-        self.bucket_end_ms = self.bucket_end_ms.max(other.bucket_end_ms);
-        if self.provider_name.is_empty() {
-            self.provider_name = other.provider_name;
-        }
-        if self.requested_model.is_none() {
-            self.requested_model = other.requested_model;
-        }
-        if self.actual_model.is_none() {
-            self.actual_model = other.actual_model;
-        }
-        if self.actual_model_source.is_none() {
-            self.actual_model_source = other.actual_model_source;
-        }
-        self.stats.merge(&other.stats);
-    }
-
-    fn matches(&self, query: &UsageStatsFilter) -> bool {
-        query.from_ms.is_none_or(|from| self.bucket_end_ms > from)
-            && query.to_ms.is_none_or(|to| self.bucket_start_ms <= to)
-            && query.app.is_none_or(|app| self.app == app)
-            && query
-                .provider_id
-                .as_deref()
-                .is_none_or(|provider_id| self.provider_id == provider_id)
-            && query
-                .provider_name
-                .as_deref()
-                .is_none_or(|provider_name| self.provider_name == provider_name)
-            && query
-                .model
-                .as_deref()
-                .is_none_or(|model| self.model == model)
-            && query
-                .share_id
-                .as_deref()
-                .is_none_or(|share_id| self.share_id.as_deref() == Some(share_id))
-            && query
-                .user_email
-                .as_deref()
-                .is_none_or(|user_email| self.user_email.as_deref() == Some(user_email))
-            && query
-                .session_id
-                .as_deref()
-                .is_none_or(|session_id| self.session_id.as_deref() == Some(session_id))
-            && query
-                .data_source
-                .as_deref()
-                .is_none_or(|source| self.data_source.as_deref() == Some(source))
-            && query
-                .is_health_check
-                .is_none_or(|value| self.is_health_check == value)
-            && query
-                .stream_status
-                .as_deref()
-                .is_none_or(|status| self.stream_status.as_deref() == Some(status))
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageTrendPoint {
-    pub start_ms: u128,
-    pub end_ms: u128,
-    pub rollup: UsageRollup,
-    pub avg_duration_ms: Option<f64>,
-    pub avg_first_token_ms: Option<f64>,
-    pub last_request_at_ms: Option<u128>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderUsageStats {
-    pub app: AppKind,
-    pub provider_id: String,
-    pub provider_name: String,
-    pub provider_type: ProviderType,
-    pub rollup: UsageRollup,
-    pub avg_duration_ms: Option<f64>,
-    pub avg_first_token_ms: Option<f64>,
-    pub last_request_at_ms: Option<u128>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelUsageStats {
-    pub app: AppKind,
-    pub model: String,
-    pub requested_model: Option<String>,
-    pub actual_model: Option<String>,
-    pub actual_model_source: Option<String>,
-    pub rollup: UsageRollup,
-    pub avg_duration_ms: Option<f64>,
-    pub avg_first_token_ms: Option<f64>,
-    pub last_request_at_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1484,433 +1241,115 @@ fn matches_log_filter(log: &UsageLog, query: &UsageLogFilter) -> bool {
             .is_none_or(|status| log.stream_status.as_deref() == Some(status))
 }
 
-fn matches_stats_filter(log: &UsageLog, query: &UsageStatsFilter) -> bool {
-    query.from_ms.is_none_or(|from| log.created_at_ms >= from)
-        && query.to_ms.is_none_or(|to| log.created_at_ms <= to)
-        && query.app.is_none_or(|app| log.app == app)
-        && query
-            .provider_id
-            .as_deref()
-            .is_none_or(|provider_id| log.provider_id == provider_id)
-        && query
-            .provider_name
-            .as_deref()
-            .is_none_or(|provider_name| log.provider_name == provider_name)
-        && query
-            .model
-            .as_deref()
-            .is_none_or(|model| usage_model_key(log) == model)
-        && query
-            .share_id
-            .as_deref()
-            .is_none_or(|share_id| log.share_id.as_deref() == Some(share_id))
-        && query
-            .user_email
-            .as_deref()
-            .is_none_or(|user_email| log.user_email.as_deref() == Some(user_email))
-        && query
-            .session_id
-            .as_deref()
-            .is_none_or(|session_id| log.session_id.as_deref() == Some(session_id))
-        && query
-            .data_source
-            .as_deref()
-            .is_none_or(|source| log.data_source.as_deref() == Some(source))
-        && query
-            .is_health_check
-            .is_none_or(|value| log.is_health_check == value)
-        && query
-            .stream_status
-            .as_deref()
-            .is_none_or(|status| log.stream_status.as_deref() == Some(status))
-}
-
-fn usage_summary_view(rollup: &UsageRollup) -> serde_json::Value {
-    let success_rate = if rollup.requests > 0 {
-        (rollup.successes as f32 / rollup.requests as f32) * 100.0
-    } else {
-        0.0
-    };
-    let cacheable_input =
-        rollup.input_tokens + rollup.cache_creation_tokens + rollup.cache_read_tokens;
-    let cache_hit_rate = if cacheable_input > 0 {
-        rollup.cache_read_tokens as f64 / cacheable_input as f64
-    } else {
-        0.0
-    };
-    let real_total_tokens = rollup.input_tokens
-        + rollup.output_tokens
-        + rollup.cache_creation_tokens
-        + rollup.cache_read_tokens;
-    serde_json::json!({
-        "totalRequests": rollup.requests,
-        "totalInputTokens": rollup.input_tokens,
-        "totalOutputTokens": rollup.output_tokens,
-        "totalCacheCreationTokens": rollup.cache_creation_tokens,
-        "totalCacheReadTokens": rollup.cache_read_tokens,
-        "successRate": success_rate,
-        "realTotalTokens": real_total_tokens,
-        "cacheHitRate": cache_hit_rate,
-    })
-}
-
-fn usage_summary_by_app_items(by_app: BTreeMap<String, UsageRollup>) -> Vec<serde_json::Value> {
-    let mut items = by_app
-        .into_iter()
-        .map(|(app_type, rollup)| {
-            let summary = usage_summary_view(&rollup);
-            (app_type, summary)
-        })
-        .filter(|(_, summary)| {
-            summary["totalRequests"].as_u64().unwrap_or(0) > 0
-                || summary["realTotalTokens"].as_u64().unwrap_or(0) > 0
-        })
-        .map(|(app_type, summary)| {
-            serde_json::json!({
-                "appType": app_type,
-                "summary": summary,
-            })
-        })
-        .collect::<Vec<_>>();
-    items.sort_by(|left, right| {
-        let left_tokens = left["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
-        let right_tokens = right["summary"]["realTotalTokens"].as_u64().unwrap_or(0);
-        right_tokens.cmp(&left_tokens)
-    });
-    items
-}
-
-fn add_log_to_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
-    rollup.requests += 1;
-    if (200..400).contains(&log.status_code) {
-        rollup.successes += 1;
-    } else {
-        rollup.failures += 1;
-    }
-    rollup.input_tokens += log.input_tokens.unwrap_or(0);
-    rollup.output_tokens += log.output_tokens.unwrap_or(0);
-    rollup.cache_read_tokens += log.cache_read_tokens.unwrap_or(0);
-    rollup.cache_creation_tokens += log.cache_creation_tokens.unwrap_or(0);
-    rollup.total_tokens += log.total_tokens.unwrap_or(0);
-}
-
-fn subtract_log_from_rollup(rollup: &mut UsageRollup, log: &UsageLog) {
-    rollup.requests = rollup.requests.saturating_sub(1);
-    if (200..400).contains(&log.status_code) {
-        rollup.successes = rollup.successes.saturating_sub(1);
-    } else {
-        rollup.failures = rollup.failures.saturating_sub(1);
-    }
-    rollup.input_tokens = rollup
-        .input_tokens
-        .saturating_sub(log.input_tokens.unwrap_or(0));
-    rollup.output_tokens = rollup
-        .output_tokens
-        .saturating_sub(log.output_tokens.unwrap_or(0));
-    rollup.cache_read_tokens = rollup
-        .cache_read_tokens
-        .saturating_sub(log.cache_read_tokens.unwrap_or(0));
-    rollup.cache_creation_tokens = rollup
-        .cache_creation_tokens
-        .saturating_sub(log.cache_creation_tokens.unwrap_or(0));
-    rollup.total_tokens = rollup
-        .total_tokens
-        .saturating_sub(log.total_tokens.unwrap_or(0));
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct UsageStatsAccumulator {
-    rollup: UsageRollup,
-    #[serde(default)]
+struct UsageQuotaAccumulator {
     quota_tokens: u64,
-    duration_sum_ms: u128,
-    duration_count: u64,
-    first_token_sum_ms: u128,
-    first_token_count: u64,
-    last_request_at_ms: Option<u128>,
+    request_count: u64,
+    record_count: u64,
 }
 
-impl UsageStatsAccumulator {
+impl UsageQuotaAccumulator {
     fn push(&mut self, log: &UsageLog) {
-        add_log_to_rollup(&mut self.rollup, log);
         self.quota_tokens = self.quota_tokens.saturating_add(log.quota_tokens());
-        self.duration_sum_ms = self.duration_sum_ms.saturating_add(log.duration_ms);
-        self.duration_count = self.duration_count.saturating_add(1);
-        if let Some(first_token_ms) = log.first_token_ms {
-            self.first_token_sum_ms = self.first_token_sum_ms.saturating_add(first_token_ms);
-            self.first_token_count = self.first_token_count.saturating_add(1);
+        if log.record_kind == UsageRecordKind::UserInference {
+            self.request_count = self.request_count.saturating_add(1);
         }
-        self.last_request_at_ms = Some(
-            self.last_request_at_ms
-                .map(|last| last.max(log.created_at_ms))
-                .unwrap_or(log.created_at_ms),
-        );
+        self.record_count = self.record_count.saturating_add(1);
     }
 
     fn remove(&mut self, log: &UsageLog) {
-        subtract_log_from_rollup(&mut self.rollup, log);
         self.quota_tokens = self.quota_tokens.saturating_sub(log.quota_tokens());
-        self.duration_sum_ms = self.duration_sum_ms.saturating_sub(log.duration_ms);
-        self.duration_count = self.duration_count.saturating_sub(1);
-        if let Some(first_token_ms) = log.first_token_ms {
-            self.first_token_sum_ms = self.first_token_sum_ms.saturating_sub(first_token_ms);
-            self.first_token_count = self.first_token_count.saturating_sub(1);
+        if log.record_kind == UsageRecordKind::UserInference {
+            self.request_count = self.request_count.saturating_sub(1);
         }
-        if self.rollup.requests == 0 {
-            self.last_request_at_ms = None;
-        }
+        self.record_count = self.record_count.saturating_sub(1);
     }
 
-    fn merge(&mut self, other: &UsageStatsAccumulator) {
-        self.rollup.add_assign(&other.rollup);
-        self.quota_tokens = self.quota_tokens.saturating_add(other.quota_tokens);
-        self.duration_sum_ms = self.duration_sum_ms.saturating_add(other.duration_sum_ms);
-        self.duration_count = self.duration_count.saturating_add(other.duration_count);
-        self.first_token_sum_ms = self
-            .first_token_sum_ms
-            .saturating_add(other.first_token_sum_ms);
-        self.first_token_count = self
-            .first_token_count
-            .saturating_add(other.first_token_count);
-        self.last_request_at_ms = match (self.last_request_at_ms, other.last_request_at_ms) {
-            (Some(left), Some(right)) => Some(left.max(right)),
-            (Some(left), None) => Some(left),
-            (None, Some(right)) => Some(right),
-            (None, None) => None,
-        };
-    }
-
-    fn avg_duration_ms(&self) -> Option<f64> {
-        (self.duration_count > 0).then(|| self.duration_sum_ms as f64 / self.duration_count as f64)
-    }
-
-    fn avg_first_token_ms(&self) -> Option<f64> {
-        (self.first_token_count > 0)
-            .then(|| self.first_token_sum_ms as f64 / self.first_token_count as f64)
+    fn is_empty(&self) -> bool {
+        self.record_count == 0
     }
 }
 
-struct ProviderUsageAccumulator {
-    app: AppKind,
-    provider_id: String,
-    provider_name: String,
-    provider_type: ProviderType,
-    stats: UsageStatsAccumulator,
-}
-
-impl ProviderUsageAccumulator {
-    fn new_parts(
-        app: AppKind,
-        provider_id: String,
-        provider_name: String,
-        provider_type: ProviderType,
-    ) -> Self {
-        Self {
-            app,
-            provider_id,
-            provider_name,
-            provider_type,
-            stats: UsageStatsAccumulator::default(),
-        }
-    }
-
-    fn new(log: &UsageLog) -> Self {
-        Self::new_parts(
-            log.app,
-            log.provider_id.clone(),
-            log.provider_name.clone(),
-            log.provider_type,
-        )
-    }
-
-    fn push(&mut self, log: &UsageLog) {
-        self.stats.push(log);
-        if self.provider_name.is_empty() && !log.provider_name.is_empty() {
-            self.provider_name = log.provider_name.clone();
-        }
-    }
-
-    fn merge(&mut self, stats: &UsageStatsAccumulator) {
-        self.stats.merge(stats);
-    }
-
-    fn finish(self) -> ProviderUsageStats {
-        let avg_duration_ms = self.stats.avg_duration_ms();
-        let avg_first_token_ms = self.stats.avg_first_token_ms();
-        ProviderUsageStats {
-            app: self.app,
-            provider_id: self.provider_id,
-            provider_name: self.provider_name,
-            provider_type: self.provider_type,
-            rollup: self.stats.rollup,
-            avg_duration_ms,
-            avg_first_token_ms,
-            last_request_at_ms: self.stats.last_request_at_ms,
-        }
-    }
-}
-
-struct ModelUsageAccumulator {
-    app: AppKind,
-    model: String,
-    requested_model: Option<String>,
-    actual_model: Option<String>,
-    actual_model_source: Option<String>,
-    stats: UsageStatsAccumulator,
-}
-
-impl ModelUsageAccumulator {
-    fn new_parts(
-        app: AppKind,
-        model: String,
-        requested_model: Option<String>,
-        actual_model: Option<String>,
-        actual_model_source: Option<String>,
-    ) -> Self {
-        Self {
-            app,
-            model,
-            requested_model,
-            actual_model,
-            actual_model_source,
-            stats: UsageStatsAccumulator::default(),
-        }
-    }
-
-    fn new(log: &UsageLog, model: String) -> Self {
-        Self::new_parts(
-            log.app,
-            model,
-            log.requested_model.clone(),
-            log.actual_model.clone(),
-            log.actual_model_source.clone(),
-        )
-    }
-
-    fn push(&mut self, log: &UsageLog) {
-        self.stats.push(log);
-        self.requested_model = self
-            .requested_model
-            .clone()
-            .or_else(|| log.requested_model.clone());
-        self.actual_model = self
-            .actual_model
-            .clone()
-            .or_else(|| log.actual_model.clone());
-        self.actual_model_source = self
-            .actual_model_source
-            .clone()
-            .or_else(|| log.actual_model_source.clone());
-    }
-
-    fn merge(&mut self, stats: &UsageStatsAccumulator) {
-        self.stats.merge(stats);
-    }
-
-    fn finish(self) -> ModelUsageStats {
-        let avg_duration_ms = self.stats.avg_duration_ms();
-        let avg_first_token_ms = self.stats.avg_first_token_ms();
-        ModelUsageStats {
-            app: self.app,
-            model: self.model,
-            requested_model: self.requested_model,
-            actual_model: self.actual_model,
-            actual_model_source: self.actual_model_source,
-            rollup: self.stats.rollup,
-            avg_duration_ms,
-            avg_first_token_ms,
-            last_request_at_ms: self.stats.last_request_at_ms,
-        }
-    }
-}
-
-fn usage_model_key(log: &UsageLog) -> String {
-    log.actual_model
-        .as_deref()
-        .or(log.requested_model.as_deref())
-        .or(log.model.as_deref())
-        .unwrap_or("unknown")
-        .to_string()
+fn is_share_user_quota_record(log: &UsageLog) -> bool {
+    !log.is_health_check
+        && log.record_kind != UsageRecordKind::HealthProbe
+        && log
+            .share_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && log
+            .user_email
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
 }
 
 fn usage_rollup_key(log: &UsageLog) -> String {
     let bucket_start_ms = log.created_at_ms - (log.created_at_ms % USAGE_ROLLUP_BUCKET_MS);
     [
         bucket_start_ms.to_string(),
-        log.app.as_str().to_string(),
-        log.provider_id.clone(),
-        log.provider_type.as_str().to_string(),
-        usage_model_key(log),
         log.share_id.clone().unwrap_or_default(),
-        log.user_email.clone().unwrap_or_default(),
-        log.session_id.clone().unwrap_or_default(),
-        log.data_source.clone().unwrap_or_default(),
-        log.is_health_check.to_string(),
-        log.stream_status.clone().unwrap_or_default(),
+        log.user_email
+            .as_deref()
+            .map(|email| email.trim().to_ascii_lowercase())
+            .unwrap_or_default(),
+        log.record_kind.as_str().to_string(),
     ]
     .join("\u{1f}")
-}
-
-fn usage_rollup_bucket_key(bucket: &UsageRollupBucket) -> String {
-    [
-        bucket.bucket_start_ms.to_string(),
-        bucket.app.as_str().to_string(),
-        bucket.provider_id.clone(),
-        bucket.provider_type.as_str().to_string(),
-        bucket.model.clone(),
-        bucket.share_id.clone().unwrap_or_default(),
-        bucket.user_email.clone().unwrap_or_default(),
-        bucket.session_id.clone().unwrap_or_default(),
-        bucket.data_source.clone().unwrap_or_default(),
-        bucket.is_health_check.to_string(),
-        bucket.stream_status.clone().unwrap_or_default(),
-    ]
-    .join("\u{1f}")
-}
-
-fn sort_provider_stats(stats: &mut [ProviderUsageStats]) {
-    stats.sort_by(|left, right| {
-        right
-            .rollup
-            .total_tokens
-            .cmp(&left.rollup.total_tokens)
-            .then(right.rollup.requests.cmp(&left.rollup.requests))
-            .then(left.app.as_str().cmp(right.app.as_str()))
-            .then(left.provider_id.cmp(&right.provider_id))
-    });
-}
-
-fn sort_model_stats(stats: &mut [ModelUsageStats]) {
-    stats.sort_by(|left, right| {
-        right
-            .rollup
-            .total_tokens
-            .cmp(&left.rollup.total_tokens)
-            .then(right.rollup.requests.cmp(&left.rollup.requests))
-            .then(left.app.as_str().cmp(right.app.as_str()))
-            .then(left.model.cmp(&right.model))
-    });
-}
-
-fn limit_latest_points(points: &mut Vec<UsageTrendPoint>, limit: Option<usize>) {
-    let limit = limit.unwrap_or(DEFAULT_USAGE_STATS_LIMIT);
-    if points.len() <= limit {
-        return;
-    }
-    let keep_from = points.len() - limit;
-    points.drain(0..keep_from);
 }
 
 pub fn usage_path(config_dir: &Path) -> std::path::PathBuf {
-    config_dir.join(USAGE_FILE_NAME)
+    usage_directory(config_dir).join(USAGE_SNAPSHOT_FILE_NAME)
 }
 
 pub fn usage_jsonl_path(config_dir: &Path) -> std::path::PathBuf {
-    config_dir.join(USAGE_JSONL_FILE_NAME)
+    usage_event_path(config_dir, now_ms())
 }
 
 pub fn usage_rollups_path(config_dir: &Path) -> std::path::PathBuf {
-    config_dir.join(USAGE_ROLLUPS_FILE_NAME)
+    usage_directory(config_dir).join(USAGE_ROLLUPS_FILE_NAME)
+}
+
+pub fn usage_directory(config_dir: &Path) -> std::path::PathBuf {
+    config_dir.join(USAGE_DIRECTORY_NAME)
+}
+
+fn usage_manifest_path(config_dir: &Path) -> std::path::PathBuf {
+    usage_directory(config_dir).join(USAGE_MANIFEST_FILE_NAME)
+}
+
+fn usage_events_directory(config_dir: &Path) -> std::path::PathBuf {
+    usage_directory(config_dir).join(USAGE_EVENTS_DIRECTORY_NAME)
+}
+
+fn usage_event_path(config_dir: &Path, timestamp_ms: u128) -> std::path::PathBuf {
+    let timestamp_ms = i64::try_from(timestamp_ms).unwrap_or(i64::MAX);
+    let day = Utc
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .unwrap_or_else(|| {
+            Utc.timestamp_millis_opt(0)
+                .single()
+                .expect("Unix epoch is valid")
+        })
+        .format("%Y-%m-%d");
+    usage_events_directory(config_dir).join(format!("{day}.jsonl"))
+}
+
+fn load_usage_manifest(config_dir: &Path) -> anyhow::Result<UsageManifest> {
+    let path = usage_manifest_path(config_dir);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read Usage manifest {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("parse Usage manifest {}", path.display()))
+}
+
+fn save_usage_manifest(config_dir: &Path) -> anyhow::Result<()> {
+    let directory = usage_directory(config_dir);
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create Usage directory {}", directory.display()))?;
+    let path = usage_manifest_path(config_dir);
+    crate::infra::storage::write_json_pretty(&path, &UsageManifest::default())
+        .with_context(|| format!("write Usage manifest {}", path.display()))
 }
 
 fn load_usage_rollups(config_dir: &Path) -> anyhow::Result<Option<UsageRollupStore>> {
@@ -1920,8 +1359,14 @@ fn load_usage_rollups(config_dir: &Path) -> anyhow::Result<Option<UsageRollupSto
     }
     let content = fs::read_to_string(&path)
         .with_context(|| format!("read usage rollups {}", path.display()))?;
-    let rollups = serde_json::from_str(&content)
+    let rollups: UsageRollupStore = serde_json::from_str(&content)
         .with_context(|| format!("parse usage rollups {}", path.display()))?;
+    anyhow::ensure!(
+        rollups.schema_version == USAGE_SCHEMA_VERSION,
+        "unsupported Usage rollup schema version {}; expected {}",
+        rollups.schema_version,
+        USAGE_SCHEMA_VERSION
+    );
     Ok(Some(rollups))
 }
 
@@ -1930,65 +1375,50 @@ struct LoadedUsageJournal {
     entries: Vec<LoadedUsageJournalEntry>,
 }
 
-impl LoadedUsageJournal {
-    fn needs_migration(&self) -> bool {
-        self.entries.iter().any(|entry| match entry {
-            LoadedUsageJournalEntry::Legacy(_) => true,
-            LoadedUsageJournalEntry::Versioned(record) => record.version < USAGE_JOURNAL_VERSION,
-        })
-    }
-}
-
 #[derive(Debug)]
-enum LoadedUsageJournalEntry {
-    Legacy(UsageLog),
-    Versioned(UsageJournalRecord),
+struct LoadedUsageJournalEntry {
+    record: UsageJournalRecord,
 }
 
-impl LoadedUsageJournalEntry {
-    fn log(&self) -> &UsageLog {
-        match self {
-            Self::Legacy(log) => log,
-            Self::Versioned(record) => &record.log,
-        }
-    }
-}
-
-fn load_usage_journal(path: &Path) -> anyhow::Result<LoadedUsageJournal> {
-    if !path.exists() {
+fn load_usage_journal(config_dir: &Path) -> anyhow::Result<LoadedUsageJournal> {
+    let events_directory = usage_events_directory(config_dir);
+    if !events_directory.exists() {
         return Ok(LoadedUsageJournal::default());
     }
-    let file =
-        fs::File::open(path).with_context(|| format!("open usage jsonl {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut paths = fs::read_dir(&events_directory)
+        .with_context(|| format!("read Usage events {}", events_directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
     let mut journal = LoadedUsageJournal::default();
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("read usage jsonl {}", path.display()))?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(record) = serde_json::from_str::<UsageJournalRecord>(line) {
-            if (1..=USAGE_JOURNAL_VERSION).contains(&record.version) {
-                journal
-                    .entries
-                    .push(LoadedUsageJournalEntry::Versioned(record));
-            } else {
-                tracing::warn!(
-                    version = record.version,
-                    path = %path.display(),
-                    "skip unsupported usage journal record"
-                );
+    for path in paths {
+        let file = fs::File::open(&path)
+            .with_context(|| format!("open Usage events {}", path.display()))?;
+        let reader = BufReader::new(file);
+        for (line_number, line) in reader.lines().enumerate() {
+            let line = line.with_context(|| format!("read Usage events {}", path.display()))?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-            continue;
-        }
-        match serde_json::from_str::<UsageLog>(line) {
-            Ok(log) => journal.entries.push(LoadedUsageJournalEntry::Legacy(log)),
-            Err(error) => tracing::warn!(
-                error = %error,
-                path = %path.display(),
-                "skip malformed usage jsonl line"
-            ),
+            let record: UsageJournalRecord = serde_json::from_str(line).with_context(|| {
+                format!(
+                    "parse Usage event {}:{}",
+                    path.display(),
+                    line_number.saturating_add(1)
+                )
+            })?;
+            anyhow::ensure!(
+                record.version == USAGE_JOURNAL_VERSION,
+                "unsupported Usage event version {} in {}:{}; expected {}",
+                record.version,
+                path.display(),
+                line_number.saturating_add(1),
+                USAGE_JOURNAL_VERSION
+            );
+            journal.entries.push(LoadedUsageJournalEntry { record });
         }
     }
     Ok(journal)
@@ -1998,9 +1428,10 @@ fn append_usage_journal_record(
     config_dir: &Path,
     record: &UsageJournalRecord,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(config_dir)
-        .with_context(|| format!("create config dir {}", config_dir.display()))?;
-    let path = usage_jsonl_path(config_dir);
+    let directory = usage_events_directory(config_dir);
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create Usage events directory {}", directory.display()))?;
+    let path = usage_event_path(config_dir, record.log.created_at_ms);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -2018,13 +1449,21 @@ fn append_usage_journal_record(
 }
 
 fn truncate_usage_journal(config_dir: &Path) -> anyhow::Result<()> {
-    let path = usage_jsonl_path(config_dir);
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .with_context(|| format!("truncate usage jsonl {}", path.display()))?;
+    let directory = usage_events_directory(config_dir);
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&directory)
+        .with_context(|| format!("read Usage events {}", directory.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("read Usage event entry {}", directory.display()))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove compacted Usage events {}", path.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -2052,13 +1491,9 @@ fn compatible_usage_rollups(
     let max_journal_sequence = journal
         .entries
         .iter()
-        .filter_map(|entry| match entry {
-            LoadedUsageJournalEntry::Versioned(record)
-                if record.generation == snapshot_checkpoint.generation =>
-            {
-                Some(record.sequence)
-            }
-            _ => None,
+        .filter_map(|entry| {
+            (entry.record.generation == snapshot_checkpoint.generation)
+                .then_some(entry.record.sequence)
         })
         .max()
         .unwrap_or(snapshot_checkpoint.through_sequence);
@@ -2086,13 +1521,8 @@ fn replay_versioned_usage_journal(
     let mut records = journal
         .entries
         .iter()
-        .filter_map(|entry| match entry {
-            LoadedUsageJournalEntry::Versioned(record)
-                if record.generation == snapshot_checkpoint.generation =>
-            {
-                Some(record)
-            }
-            _ => None,
+        .filter_map(|entry| {
+            (entry.record.generation == snapshot_checkpoint.generation).then_some(&entry.record)
         })
         .collect::<Vec<_>>();
     records.sort_by_key(|record| record.sequence);
@@ -2131,39 +1561,6 @@ fn replay_versioned_usage_journal(
     replayed
 }
 
-fn recover_unambiguous_legacy_journal_tail(
-    store: &mut UsageStore,
-    journal: &LoadedUsageJournal,
-) -> usize {
-    let snapshot_ids = store
-        .logs
-        .iter()
-        .map(|log| log.request_id.as_str())
-        .collect::<HashSet<_>>();
-    let snapshot_latest = store.logs.iter().map(|log| log.created_at_ms).max();
-    let mut candidates = BTreeMap::<String, UsageLog>::new();
-    for entry in &journal.entries {
-        let log = entry.log();
-        if snapshot_ids.contains(log.request_id.as_str())
-            || snapshot_latest.is_some_and(|latest| log.created_at_ms <= latest)
-        {
-            continue;
-        }
-        candidates.insert(log.request_id.clone(), log.clone());
-    }
-    let mut recovered = candidates.into_values().collect::<Vec<_>>();
-    recovered.sort_by(|left, right| {
-        left.created_at_ms
-            .cmp(&right.created_at_ms)
-            .then(left.request_id.cmp(&right.request_id))
-    });
-    let count = recovered.len();
-    for log in recovered {
-        store.push_log_only(log);
-    }
-    count
-}
-
 fn generate_journal_generation() -> String {
     let mut bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -2182,6 +1579,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn persisted_test_log(request_id: impl Into<String>, created_at_ms: u128) -> UsageLog {
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                total_tokens: Some(2),
+                ..Default::default()
+            },
+        );
+        log.request_id = request_id.into();
+        log.created_at_ms = created_at_ms;
+        log
+    }
+
+    fn persist_test_append(store: &mut UsageStore, dir: &Path, log: UsageLog) {
+        let append = store.prepare_append(log).unwrap();
+        append.persist(dir).unwrap();
+        store.apply_append(append);
+    }
 
     #[test]
     fn parses_openai_and_anthropic_usage_shapes() {
@@ -2591,10 +2015,17 @@ mod tests {
     }
 
     #[test]
-    fn share_user_quota_uses_persistent_rollups_beyond_recent_log_limit() {
-        let starts_at_ms = 1_800_000_000_000u128;
+    fn share_user_quota_uses_persistent_rollups_beyond_detail_retention() {
+        let current_ms = now_ms();
+        let expired_ms = current_ms
+            .saturating_sub(USAGE_DETAIL_RETENTION_MS + USAGE_ROLLUP_BUCKET_MS)
+            / USAGE_ROLLUP_BUCKET_MS
+            * USAGE_ROLLUP_BUCKET_MS;
         let mut store = UsageStore::default();
-        for index in 0..=MAX_USAGE_LOGS {
+        for (request_id, created_at_ms) in [
+            ("req_quota_expired", expired_ms),
+            ("req_quota_current", current_ms),
+        ] {
             let mut log = UsageLog::new(
                 AppKind::Codex,
                 "p1".to_string(),
@@ -2604,28 +2035,27 @@ mod tests {
                 10,
                 UsageModelMetadata::default(),
                 TokenUsage {
-                    input_tokens: Some(40),
-                    output_tokens: Some(2),
                     total_tokens: Some(7),
                     ..TokenUsage::default()
                 },
             );
-            log.request_id = format!("req_quota_{index}");
+            log.request_id = request_id.to_string();
             log.share_id = Some("share-1".to_string());
             log.user_email = Some("User@Example.com".to_string());
-            log.created_at_ms = starts_at_ms + index as u128;
+            log.created_at_ms = created_at_ms;
             store.push(log);
         }
 
-        assert_eq!(store.logs.len(), MAX_USAGE_LOGS);
+        assert_eq!(store.logs.len(), 1);
+        assert_eq!(store.logs[0].request_id, "req_quota_current");
         assert_eq!(
             store.share_user_quota_usage(
                 "share-1",
                 "user@example.com",
-                starts_at_ms as i64,
-                (starts_at_ms + 60_000) as i64,
+                expired_ms as i64,
+                current_ms.saturating_add(60_000) as i64,
             ),
-            (7 * (MAX_USAGE_LOGS as u64 + 1), MAX_USAGE_LOGS as u64 + 1)
+            (14, 2)
         );
     }
 
@@ -2666,6 +2096,7 @@ mod tests {
         summary.request_id = "req_summary".to_string();
         summary.share_id = Some("share-1".to_string());
         summary.user_email = Some("user@example.com".to_string());
+        summary.record_kind = UsageRecordKind::InternalSupplemental;
         summary.data_source = Some(CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE.to_string());
         summary.created_at_ms = starts_at_ms + 1;
 
@@ -2682,6 +2113,74 @@ mod tests {
             ),
             (17, 1)
         );
+    }
+
+    #[test]
+    fn share_user_quota_uses_exact_half_open_edges_for_unaligned_anchors() {
+        let bucket_start_ms = now_ms().saturating_sub(USAGE_ROLLUP_BUCKET_MS)
+            / USAGE_ROLLUP_BUCKET_MS
+            * USAGE_ROLLUP_BUCKET_MS;
+        let mut store = UsageStore::default();
+        for (request_id, offset_ms) in [
+            ("before", 9_999),
+            ("start", 10_000),
+            ("middle", 30_000),
+            ("end", 50_000),
+        ] {
+            let mut log = UsageLog::new(
+                AppKind::Codex,
+                "p1".to_string(),
+                "provider 1".to_string(),
+                ProviderType::Codex,
+                200,
+                10,
+                UsageModelMetadata::default(),
+                TokenUsage {
+                    total_tokens: Some(7),
+                    ..TokenUsage::default()
+                },
+            );
+            log.request_id = request_id.to_string();
+            log.share_id = Some("share-1".to_string());
+            log.user_email = Some("user@example.com".to_string());
+            log.created_at_ms = bucket_start_ms + offset_ms;
+            store.push(log);
+        }
+
+        assert_eq!(
+            store.share_user_quota_usage(
+                "share-1",
+                "user@example.com",
+                (bucket_start_ms + 10_000) as i64,
+                (bucket_start_ms + 50_000) as i64,
+            ),
+            (14, 2)
+        );
+    }
+
+    #[test]
+    fn request_detail_exposes_only_user_inference_records() {
+        let mut inference = UsageLog::new(
+            AppKind::Codex,
+            "p1".to_string(),
+            "provider 1".to_string(),
+            ProviderType::Codex,
+            200,
+            10,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+        );
+        inference.request_id = "inference".to_string();
+        let mut supplemental = inference.clone();
+        supplemental.request_id = "supplemental".to_string();
+        supplemental.record_kind = UsageRecordKind::InternalSupplemental;
+        let store = UsageStore {
+            logs: vec![inference, supplemental],
+            ..UsageStore::default()
+        };
+
+        assert!(store.request_detail("inference").is_some());
+        assert!(store.request_detail("supplemental").is_none());
     }
 
     #[test]
@@ -2811,249 +2310,23 @@ mod tests {
     }
 
     #[test]
-    fn business_usage_stats_exclude_health_checks_by_default() {
-        let mut business = UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::Codex,
-            200,
-            10,
-            UsageModelMetadata::default(),
-            TokenUsage {
-                input_tokens: Some(10),
-                output_tokens: Some(5),
-                total_tokens: Some(15),
-                ..Default::default()
-            },
-        );
-        business.request_id = "business".to_string();
-
-        let mut health_check = business.clone();
-        health_check.request_id = "health".to_string();
-        health_check.status_code = 599;
-        health_check.is_health_check = true;
-        health_check.input_tokens = Some(100);
-        health_check.output_tokens = Some(50);
-        health_check.total_tokens = Some(150);
-
-        let mut store = UsageStore::default();
-        store.push(business);
-        store.push(health_check);
-
-        let business_rollup = store.rollup();
-        assert_eq!(business_rollup.requests, 1);
-        assert_eq!(business_rollup.successes, 1);
-        assert_eq!(business_rollup.failures, 0);
-        assert_eq!(business_rollup.total_tokens, 15);
-        assert_eq!(
-            store.rollup_filtered(&UsageStatsFilter::default()).requests,
-            1
-        );
-
-        let health_rollup = store.rollup_filtered(&UsageStatsFilter {
-            is_health_check: Some(true),
-            ..UsageStatsFilter::default()
-        });
-        assert_eq!(health_rollup.requests, 1);
-        assert_eq!(health_rollup.failures, 1);
-        assert_eq!(health_rollup.total_tokens, 150);
-    }
-
-    #[test]
-    fn usage_stats_share_one_filter_fixture() {
-        let mut codex = UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::Codex,
-            200,
-            100,
-            UsageModelMetadata {
-                model: Some("gpt-5.5".to_string()),
-                requested_model: Some("gpt-5.5".to_string()),
-                actual_model: Some("glm-5.2".to_string()),
-                actual_model_source: Some("model_mapping".to_string()),
-            },
-            TokenUsage {
-                input_tokens: Some(10),
-                output_tokens: Some(5),
-                total_tokens: Some(15),
-                ..Default::default()
-            },
-        );
-        codex.request_id = "req_codex".to_string();
-        codex.created_at_ms = 10_000;
-        codex.first_token_ms = Some(25);
-        codex.data_source = Some("direct".to_string());
-
-        let mut claude = UsageLog::new(
-            AppKind::Claude,
-            "p2".to_string(),
-            "provider 2".to_string(),
-            ProviderType::Claude,
-            500,
-            200,
-            UsageModelMetadata {
-                model: Some("claude-sonnet".to_string()),
-                requested_model: Some("claude-sonnet".to_string()),
-                actual_model: None,
-                actual_model_source: None,
-            },
-            TokenUsage {
-                input_tokens: Some(20),
-                output_tokens: Some(10),
-                total_tokens: Some(30),
-                ..Default::default()
-            },
-        );
-        claude.request_id = "req_claude".to_string();
-        claude.created_at_ms = 20_000;
-        claude.data_source = Some("market".to_string());
-
-        let store = UsageStore {
-            logs: vec![codex, claude],
-            ..Default::default()
-        };
-        let filter = UsageStatsFilter {
-            from_ms: Some(0),
-            to_ms: Some(15_000),
-            window_ms: Some(10_000),
-            data_source: Some("direct".to_string()),
-            ..Default::default()
-        };
-
-        let summary = store.rollup_filtered(&filter);
-        assert_eq!(summary.requests, 1);
-        assert_eq!(summary.successes, 1);
-        assert_eq!(summary.total_tokens, 15);
-
-        let trends = store.trends(&filter);
-        assert_eq!(trends.len(), 1);
-        assert_eq!(trends[0].start_ms, 10_000);
-        assert_eq!(trends[0].rollup.total_tokens, 15);
-
-        let providers = store.provider_stats(&filter);
-        assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].provider_id, "p1");
-        assert_eq!(providers[0].avg_first_token_ms, Some(25.0));
-
-        let models = store.model_stats(&filter);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].model, "glm-5.2");
-        assert_eq!(models[0].rollup.total_tokens, 15);
-
-        let detail = store.request_detail("req_codex").unwrap();
-        assert_eq!(detail.actual_model.as_deref(), Some("glm-5.2"));
-    }
-
-    #[test]
-    fn rollups_keep_token_totals_after_recent_window_trims() {
-        let mut store = UsageStore::default();
-        for index in 0..3_000 {
-            let mut log = UsageLog::new(
-                AppKind::Codex,
-                "p1".to_string(),
-                "provider 1".to_string(),
-                ProviderType::Codex,
-                200,
-                10,
-                UsageModelMetadata {
-                    model: Some("gpt-5.5".to_string()),
-                    requested_model: Some("gpt-5.5".to_string()),
-                    actual_model: Some("gpt-5.5".to_string()),
-                    actual_model_source: Some("test".to_string()),
-                },
-                TokenUsage {
-                    input_tokens: Some(1),
-                    output_tokens: Some(1),
-                    total_tokens: Some(2),
-                    ..Default::default()
-                },
-            );
-            log.request_id = format!("req_{index}");
-            log.created_at_ms = 1_000_000 + index;
-            store.push(log);
-        }
-
-        assert_eq!(store.logs.len(), MAX_USAGE_LOGS);
-        let filter = UsageStatsFilter {
-            from_ms: Some(0),
-            app: Some(AppKind::Codex),
-            provider_id: Some("p1".to_string()),
-            ..Default::default()
-        };
-        let summary = store.rollup_filtered(&filter);
-        assert_eq!(summary.requests, 3_000);
-        assert_eq!(summary.total_tokens, 6_000);
-        let by_app = store.summary_by_app(&filter);
-        assert_eq!(by_app[0]["summary"]["totalRequests"], 3_000);
-        assert_eq!(by_app[0]["summary"]["realTotalTokens"], 6_000);
-    }
-
-    #[test]
-    fn summary_by_app_groups_logs_and_sorts_by_tokens() {
-        let mut store = UsageStore::default();
-        for (app, request_id, input_tokens) in [
-            (AppKind::Claude, "req_claude", 100),
-            (AppKind::Codex, "req_codex", 300),
-            (AppKind::Gemini, "req_gemini", 200),
-        ] {
-            let mut log = UsageLog::new(
-                app,
-                "p1".to_string(),
-                "provider 1".to_string(),
-                ProviderType::Claude,
-                200,
-                10,
-                UsageModelMetadata::default(),
-                TokenUsage {
-                    input_tokens: Some(input_tokens),
-                    output_tokens: Some(1),
-                    total_tokens: Some(input_tokens + 1),
-                    ..Default::default()
-                },
-            );
-            log.request_id = request_id.to_string();
-            store.push(log);
-        }
-
-        let items = store.summary_by_app(&UsageStatsFilter::default());
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0]["appType"].as_str(), Some("codex"));
-        assert_eq!(items[0]["summary"]["realTotalTokens"].as_u64(), Some(301));
-        assert_eq!(items[2]["appType"].as_str(), Some("claude"));
-    }
-
-    #[test]
     fn single_persisted_push_appends_jsonl_without_rewriting_snapshot() {
         let dir = std::env::temp_dir().join(format!("cc-switch-server-usage-test-{}", now_ms()));
         fs::create_dir_all(&dir).unwrap();
         let mut store = UsageStore::default();
-        store.save_recent_snapshot(&dir).unwrap();
+        store.save(&dir).unwrap();
         let before = fs::read_to_string(usage_path(&dir)).unwrap();
+        let rollups_before = fs::read_to_string(usage_rollups_path(&dir)).unwrap();
 
-        let mut log = UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::Codex,
-            200,
-            10,
-            UsageModelMetadata::default(),
-            TokenUsage {
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-                total_tokens: Some(2),
-                ..Default::default()
-            },
-        );
-        log.request_id = "req_append_only".to_string();
-        store.push_and_persist(&dir, log).unwrap();
+        let log = persisted_test_log("req_append_only", now_ms());
+        let event_path = usage_event_path(&dir, log.created_at_ms);
+        persist_test_append(&mut store, &dir, log);
 
         let after = fs::read_to_string(usage_path(&dir)).unwrap();
-        let jsonl = fs::read_to_string(usage_jsonl_path(&dir)).unwrap();
+        let rollups_after = fs::read_to_string(usage_rollups_path(&dir)).unwrap();
+        let jsonl = fs::read_to_string(event_path).unwrap();
         assert_eq!(before, after);
+        assert_eq!(rollups_before, rollups_after);
         assert!(jsonl.contains("req_append_only"));
         assert!(usage_rollups_path(&dir).exists());
 
@@ -3067,53 +2340,28 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let mut store = UsageStore::default();
         store.save(&dir).unwrap();
+        let created_at_ms = now_ms();
 
-        let mut first = UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::Codex,
-            200,
-            10,
-            UsageModelMetadata::default(),
-            TokenUsage {
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-                total_tokens: Some(2),
-                ..Default::default()
-            },
+        persist_test_append(
+            &mut store,
+            &dir,
+            persisted_test_log("req_replay_first", created_at_ms),
         );
-        first.request_id = "req_replay_first".to_string();
-        first.created_at_ms = 1_000;
-        store.push_and_persist(&dir, first).unwrap();
 
-        let mut second = UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::Codex,
-            200,
-            5,
-            UsageModelMetadata::default(),
-            TokenUsage::default(),
-        );
-        second.request_id = "req_replay_second".to_string();
-        second.created_at_ms = 2_000;
-        store.push_and_persist(&dir, second).unwrap();
-        store
-            .update_log_and_persist(&dir, "req_replay_second", |log| {
-                log.duration_ms = 55;
-                log.input_tokens = Some(7);
-                log.output_tokens = Some(3);
-                log.total_tokens = Some(10);
-                log.stream_status = Some("completed".to_string());
-            })
-            .unwrap();
+        let second = persisted_test_log("req_replay_second", created_at_ms.saturating_add(1));
+        persist_test_append(&mut store, &dir, second.clone());
+        let mut updated_second = second;
+        updated_second.duration_ms = 55;
+        updated_second.input_tokens = Some(7);
+        updated_second.output_tokens = Some(3);
+        updated_second.total_tokens = Some(10);
+        updated_second.stream_status = Some("completed".to_string());
+        persist_test_append(&mut store, &dir, updated_second);
 
         let disk_snapshot = fs::read_to_string(usage_path(&dir)).unwrap();
         assert!(!disk_snapshot.contains("req_replay_first"));
-        let journal = fs::read_to_string(usage_jsonl_path(&dir)).unwrap();
-        assert!(journal.contains("\"version\":2"));
+        let journal = fs::read_to_string(usage_event_path(&dir, created_at_ms)).unwrap();
+        assert!(journal.contains("\"version\":1"));
         assert!(journal.contains("\"sequence\":3"));
 
         let loaded = UsageStore::load_or_default(&dir).unwrap();
@@ -3127,274 +2375,144 @@ mod tests {
         assert_eq!(final_second.input_tokens, Some(7));
         assert_eq!(final_second.output_tokens, Some(3));
         assert_eq!(final_second.stream_status.as_deref(), Some("completed"));
-        let rollup = loaded.rollup();
-        assert_eq!(rollup.requests, 2);
-        assert_eq!(rollup.input_tokens, 8);
-        assert_eq!(rollup.output_tokens, 4);
+        let overview = loaded.query_overview(&crate::domain::usage::query::UsageQuery::default());
+        assert_eq!(overview.metrics.request_count, 2);
+        assert_eq!(overview.metrics.fresh_input_tokens, 8);
+        assert_eq!(overview.metrics.output_tokens, 4);
 
         loaded.save_recent_snapshot(&dir).unwrap();
         let reloaded = UsageStore::load_or_default(&dir).unwrap();
         assert_eq!(reloaded.logs.len(), 2);
-        assert_eq!(reloaded.rollup().requests, 2);
+        assert_eq!(
+            reloaded
+                .query_overview(&crate::domain::usage::query::UsageQuery::default())
+                .metrics
+                .request_count,
+            2
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn legacy_journal_recovery_keeps_snapshot_updates_authoritative() {
-        let dir =
-            std::env::temp_dir().join(format!("cc-switch-server-usage-legacy-test-{}", now_ms()));
+    fn five_hundredth_journal_write_compacts_snapshot_and_rollups() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-usage-compaction-test-{}",
+            now_ms()
+        ));
         fs::create_dir_all(&dir).unwrap();
+        let mut store = UsageStore::default();
+        store.save(&dir).unwrap();
+        let created_at_ms = now_ms();
 
-        let mut snapshot_log = UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::Codex,
-            200,
-            10,
-            UsageModelMetadata::default(),
-            TokenUsage {
-                input_tokens: Some(5),
-                output_tokens: Some(1),
-                total_tokens: Some(6),
-                ..Default::default()
-            },
+        for index in 0..USAGE_COMPACT_EVERY_EVENTS {
+            persist_test_append(
+                &mut store,
+                &dir,
+                persisted_test_log(format!("req_compact_{index}"), created_at_ms),
+            );
+        }
+
+        assert!(store.needs_compaction(&dir));
+        assert!(store.compact_if_due(&dir).unwrap());
+        assert_eq!(store.writes_since_compact, 0);
+        assert!(load_usage_journal(&dir).unwrap().entries.is_empty());
+
+        let snapshot: UsageStore =
+            serde_json::from_str(&fs::read_to_string(usage_path(&dir)).unwrap()).unwrap();
+        let rollups = load_usage_rollups(&dir).unwrap().unwrap();
+        assert_eq!(snapshot.logs.len(), USAGE_COMPACT_EVERY_EVENTS as usize);
+        assert_eq!(snapshot.journal_checkpoint, store.journal_checkpoint);
+        assert_eq!(rollups.journal_checkpoint, store.journal_checkpoint);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compacted_store_recovers_after_journal_truncation_and_accepts_new_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-usage-compacted-restart-test-{}",
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut store = UsageStore::default();
+        store.save(&dir).unwrap();
+        let created_at_ms = now_ms();
+
+        for index in 0..USAGE_COMPACT_EVERY_EVENTS {
+            persist_test_append(
+                &mut store,
+                &dir,
+                persisted_test_log(format!("req_restart_{index}"), created_at_ms),
+            );
+        }
+        store.compact_if_due(&dir).unwrap();
+        drop(store);
+
+        let mut restarted = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(restarted.logs.len(), USAGE_COMPACT_EVERY_EVENTS as usize);
+        assert_eq!(restarted.writes_since_compact, 0);
+        persist_test_append(
+            &mut restarted,
+            &dir,
+            persisted_test_log("req_after_restart", created_at_ms.saturating_add(1)),
         );
-        snapshot_log.request_id = "req_snapshot".to_string();
-        snapshot_log.created_at_ms = 1_000;
-        fs::write(
-            usage_path(&dir),
-            serde_json::to_vec_pretty(&json!({"logs": [snapshot_log.clone()]})).unwrap(),
-        )
-        .unwrap();
+        drop(restarted);
 
-        let mut stale_same_id = snapshot_log.clone();
-        stale_same_id.input_tokens = Some(1);
-        let mut newer_request = snapshot_log.clone();
-        newer_request.request_id = "req_legacy_new".to_string();
-        newer_request.created_at_ms = 2_000;
-        let mut trimmed_old_request = snapshot_log.clone();
-        trimmed_old_request.request_id = "req_legacy_trimmed".to_string();
-        trimmed_old_request.created_at_ms = 500;
-        let legacy_journal = [stale_same_id, newer_request, trimmed_old_request]
-            .into_iter()
-            .map(|log| serde_json::to_string(&log).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(usage_jsonl_path(&dir), format!("{legacy_journal}\n")).unwrap();
-
-        let mut loaded = UsageStore::load_or_default(&dir).unwrap();
-        assert_eq!(loaded.logs.len(), 2);
-        assert_eq!(
-            loaded
-                .logs
-                .iter()
-                .find(|log| log.request_id == "req_snapshot")
-                .and_then(|log| log.input_tokens),
-            Some(5)
-        );
-        assert!(loaded
-            .logs
-            .iter()
-            .any(|log| log.request_id == "req_legacy_new"));
-        assert!(loaded
-            .logs
-            .iter()
-            .all(|log| log.request_id != "req_legacy_trimmed"));
-
-        let mut post_migration = snapshot_log;
-        post_migration.request_id = "req_post_migration".to_string();
-        post_migration.created_at_ms = 3_000;
-        loaded.push_and_persist(&dir, post_migration).unwrap();
         let reloaded = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(reloaded.logs.len(), USAGE_COMPACT_EVERY_EVENTS as usize + 1);
         assert!(reloaded
             .logs
             .iter()
-            .any(|log| log.request_id == "req_post_migration"));
+            .any(|log| log.request_id == "req_after_restart"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn schema_v3_logs_without_codex_policy_fields_migrate_to_v4() {
+    fn failed_compaction_keeps_live_state_and_journal_authoritative() {
         let dir = std::env::temp_dir().join(format!(
-            "cc-switch-server-usage-policy-migration-test-{}",
+            "cc-switch-server-usage-compaction-failure-test-{}",
             now_ms()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let mut legacy_log = serde_json::to_value(UsageLog::new(
-            AppKind::Codex,
-            "p1".to_string(),
-            "provider 1".to_string(),
-            ProviderType::CodexOAuth,
-            200,
-            10,
-            UsageModelMetadata::default(),
-            TokenUsage::default(),
-        ))
-        .unwrap();
-        let object = legacy_log.as_object_mut().unwrap();
-        for field in [
-            "requestedReasoningEffort",
-            "effectiveReasoningEffort",
-            "clientServiceTier",
-            "effectiveServiceTier",
-            "serviceTierDecision",
-        ] {
-            object.remove(field);
+        let mut store = UsageStore::default();
+        store.save(&dir).unwrap();
+        let created_at_ms = now_ms();
+
+        for index in 0..USAGE_COMPACT_EVERY_EVENTS {
+            persist_test_append(
+                &mut store,
+                &dir,
+                persisted_test_log(format!("req_failed_compact_{index}"), created_at_ms),
+            );
         }
-        fs::write(
-            usage_path(&dir),
-            serde_json::to_vec_pretty(&json!({
-                "schemaVersion": 3,
-                "logs": [legacy_log]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
 
-        let loaded = UsageStore::load_or_default(&dir).unwrap();
-
-        assert_eq!(loaded.schema_version, 4);
-        let log = loaded.logs.first().unwrap();
-        assert_eq!(log.requested_reasoning_effort, None);
-        assert_eq!(log.effective_reasoning_effort, None);
-        assert_eq!(log.client_service_tier, None);
-        assert_eq!(log.effective_service_tier, None);
-        assert_eq!(log.service_tier_decision, None);
-        let persisted =
-            serde_json::from_slice::<serde_json::Value>(&fs::read(usage_path(&dir)).unwrap())
-                .unwrap();
-        assert_eq!(persisted["schemaVersion"], 4);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn token_only_migration_strips_cost_fields_and_merges_pricing_buckets() {
-        let dir = std::env::temp_dir().join(format!(
-            "cc-switch-server-usage-token-only-migration-test-{}",
-            now_ms()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-
-        let legacy_log = json!({
-            "requestId": "req_legacy_cost",
-            "app": "codex",
-            "providerId": "p1",
-            "providerName": "provider 1",
-            "providerType": "codex",
-            "model": "gpt-5.5",
-            "requestedModel": "gpt-5.5",
-            "actualModel": "gpt-5.5",
-            "actualModelSource": "response",
-            "pricingModel": "priced-a",
-            "costMultiplier": 1.5,
-            "statusCode": 200,
-            "durationMs": 10,
-            "rawInputTokens": 7,
-            "billedInputTokens": 7,
-            "inputTokens": 7,
-            "outputTokens": 3,
-            "cacheReadTokens": 0,
-            "cacheCreationTokens": 0,
-            "totalTokens": 10,
-            "inputCostUsd": 0.01,
-            "outputCostUsd": 0.02,
-            "totalCostUsd": 0.03,
-            "isHealthCheck": false,
-            "isStreaming": false,
-            "routerSyncAttemptCount": 0,
-            "createdAtMs": 1_000
-        });
-        fs::write(
-            usage_path(&dir),
-            serde_json::to_vec_pretty(&json!({
-                "schemaVersion": 1,
-                "logs": [legacy_log]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let bucket = |pricing_model: &str, requests: u64, total_tokens: u64| {
-            json!({
-                "bucketStartMs": 0,
-                "bucketEndMs": 60_000,
-                "dayStartMs": 0,
-                "app": "codex",
-                "providerId": "p1",
-                "providerName": "provider 1",
-                "providerType": "codex",
-                "model": "gpt-5.5",
-                "requestedModel": "gpt-5.5",
-                "actualModel": "gpt-5.5",
-                "actualModelSource": "response",
-                "pricingModel": pricing_model,
-                "stats": {
-                    "rollup": {
-                        "requests": requests,
-                        "successes": requests,
-                        "failures": 0,
-                        "inputTokens": total_tokens,
-                        "outputTokens": 0,
-                        "cacheReadTokens": 0,
-                        "cacheCreationTokens": 0,
-                        "totalTokens": total_tokens,
-                        "totalCostUsd": 99.0
-                    },
-                    "duration_sum_ms": requests * 10,
-                    "duration_count": requests,
-                    "first_token_sum_ms": 0,
-                    "first_token_count": 0,
-                    "last_request_at_ms": 1_000
-                }
-            })
-        };
-        fs::write(
-            usage_rollups_path(&dir),
-            serde_json::to_vec_pretty(&json!({
-                "schemaVersion": 1,
-                "buckets": {
-                    "legacy-priced-a": bucket("priced-a", 2, 20),
-                    "legacy-priced-b": bucket("priced-b", 3, 30)
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let loaded = UsageStore::load_or_default(&dir).unwrap();
-        assert_eq!(loaded.schema_version, USAGE_SCHEMA_VERSION);
-        assert_eq!(loaded.rollups.schema_version, USAGE_SCHEMA_VERSION);
-        assert_eq!(loaded.rollups.buckets.len(), 1);
-        let rollup = loaded.rollup();
-        assert_eq!(rollup.requests, 5);
-        assert_eq!(rollup.total_tokens, 50);
+        let rollups_path = usage_rollups_path(&dir);
+        fs::remove_file(&rollups_path).unwrap();
+        fs::create_dir(&rollups_path).unwrap();
+        let mut candidate = store.clone();
+        assert!(candidate.compact_if_due(&dir).is_err());
+        assert_eq!(store.logs.len(), USAGE_COMPACT_EVERY_EVENTS as usize);
         assert_eq!(
-            loaded
-                .rollups
-                .buckets
-                .values()
-                .map(|bucket| bucket.stats.quota_tokens)
-                .sum::<u64>(),
-            50
+            load_usage_journal(&dir).unwrap().entries.len(),
+            USAGE_COMPACT_EVERY_EVENTS as usize
         );
 
-        let snapshot = fs::read_to_string(usage_path(&dir)).unwrap();
-        let rollups = fs::read_to_string(usage_rollups_path(&dir)).unwrap();
-        for obsolete in [
-            "pricingModel",
-            "costMultiplier",
-            "billedInputTokens",
-            "inputCostUsd",
-            "outputCostUsd",
-            "totalCostUsd",
-        ] {
-            assert!(!snapshot.contains(obsolete), "snapshot kept {obsolete}");
-            assert!(!rollups.contains(obsolete), "rollups kept {obsolete}");
-        }
+        fs::remove_dir(&rollups_path).unwrap();
+        store.save_rollups(&dir).unwrap();
+        let recovered = UsageStore::load_or_default(&dir).unwrap();
+        assert_eq!(
+            serde_json::to_value(&recovered.logs).unwrap(),
+            serde_json::to_value(&store.logs).unwrap()
+        );
+        assert_eq!(
+            recovered
+                .query_overview(&crate::domain::usage::query::UsageQuery::default())
+                .metrics
+                .request_count,
+            USAGE_COMPACT_EVERY_EVENTS
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,6 +1,12 @@
+mod audit;
 mod capture;
 mod init;
 
+pub use audit::{
+    classify_network_error, error_fingerprint, opaque_ref, AuditBatch, AuditCursor, AuditEvent,
+    AuditLog, AuditRequestDetails, AuditUploadCursor, AuditWriteError, SharedAuditLog,
+    AUDIT_UPLOAD_BATCH_LIMIT,
+};
 pub use capture::{
     LogCapture, LogTailAccessError, LogTailResponse, LogTailSource, SharedLogCapture,
 };
@@ -135,11 +141,54 @@ pub fn redact_sensitive_text(input: &str) -> String {
         "secret",
     ];
     let input = mask_kiro_api_keys(input);
-    input
+    let redacted = input
         .lines()
         .map(|line| redact_sensitive_line(line, KEYS))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    mask_email_addresses(&redacted)
+}
+
+fn mask_email_addresses(input: &str) -> String {
+    fn local_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
+    }
+
+    fn domain_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
+    }
+
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut copied_through = 0;
+    let mut search_from = 0;
+    while let Some(relative_at) = input[search_from..].find('@') {
+        let at = search_from + relative_at;
+        let mut start = at;
+        while start > 0 && local_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = at + 1;
+        while end < bytes.len() && domain_byte(bytes[end]) {
+            end += 1;
+        }
+        let domain = &input[at + 1..end];
+        let valid = start < at
+            && end > at + 1
+            && domain.contains('.')
+            && !domain.starts_with('.')
+            && !domain.ends_with('.');
+        if valid {
+            output.push_str(&input[copied_through..start]);
+            output.push_str("[REDACTED_EMAIL]");
+            copied_through = end;
+            search_from = end;
+        } else {
+            search_from = at + 1;
+        }
+    }
+    output.push_str(&input[copied_through..]);
+    output
 }
 
 pub fn redact_sensitive_text_with_values<'a>(
@@ -294,13 +343,16 @@ mod tests {
 
     #[test]
     fn redacts_common_secret_fields() {
-        let redacted = redact_sensitive_text("authorization: Bearer abc\nnormal line\napi_key=xyz");
+        let redacted = redact_sensitive_text(
+            "authorization: Bearer abc\nnormal line\napi_key=xyz\nowner=user@example.com",
+        );
         assert_eq!(
             redacted,
-            "authorization: Bearer [REDACTED]\nnormal line\napi_key= [REDACTED]"
+            "authorization: Bearer [REDACTED]\nnormal line\napi_key= [REDACTED]\nowner=[REDACTED_EMAIL]"
         );
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("xyz"));
+        assert!(!redacted.contains("user@example.com"));
         assert_eq!(
             redact_sensitive_text("token router connected"),
             "token router connected"

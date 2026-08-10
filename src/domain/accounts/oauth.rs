@@ -189,12 +189,11 @@ static CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const CODEX_CLI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 static CODEX_AUTHORIZE_SCOPE: &str = "openid profile email offline_access";
 static CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
-static CLAUDE_TOKEN_URLS: &[&str] = &[CLAUDE_API_TOKEN_URL, CLAUDE_PLATFORM_TOKEN_URL];
+static CLAUDE_TOKEN_URLS: &[&str] = &[CLAUDE_PLATFORM_TOKEN_URL, CLAUDE_API_TOKEN_URL];
 static CLAUDE_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const CLAUDE_WEB_PASTE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 pub const CLAUDE_API_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 pub const CLAUDE_PLATFORM_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CLAUDE_PLATFORM_TOKEN_USER_AGENT: &str = "axios/1.13.6";
 static GEMINI_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 static CURSOR_TOKEN_URLS: &[&str] = &["https://api2.cursor.sh/oauth/token"];
@@ -208,21 +207,16 @@ static XAI_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
 static XAI_AUTHORIZE_SCOPE: &str =
     "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write";
 pub const XAI_LOOPBACK_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
+static KIMI_TOKEN_URLS: &[&str] = &[crate::domain::kimi_cli::KIMI_TOKEN_URL];
 
 pub fn claude_oauth_token_urls_for_redirect(redirect_uri: &str) -> Vec<&'static str> {
-    if redirect_uri == CLAUDE_WEB_PASTE_REDIRECT_URI {
-        vec![CLAUDE_PLATFORM_TOKEN_URL, CLAUDE_API_TOKEN_URL]
-    } else {
-        vec![CLAUDE_API_TOKEN_URL, CLAUDE_PLATFORM_TOKEN_URL]
-    }
+    let _ = redirect_uri;
+    vec![CLAUDE_PLATFORM_TOKEN_URL, CLAUDE_API_TOKEN_URL]
 }
 
-pub fn claude_oauth_user_agent_for_token_url(token_url: &str) -> &'static str {
-    if token_url == CLAUDE_PLATFORM_TOKEN_URL {
-        CLAUDE_PLATFORM_TOKEN_USER_AGENT
-    } else {
-        "cc-switch-server-claude-oauth"
-    }
+pub fn claude_oauth_user_agent_for_token_url(token_url: &str) -> String {
+    let _ = token_url;
+    crate::domain::claude_cli::claude_axios_user_agent()
 }
 
 pub fn parse_claude_authorization_code_input(
@@ -358,15 +352,17 @@ fn set_oauth_user_agent(
     let user_agent = if provider_type == ProviderType::ClaudeOAuth {
         claude_oauth_user_agent_for_token_url(token_url)
     } else {
-        default_user_agent.unwrap_or("cc-switch-server-oauth")
+        default_user_agent
+            .unwrap_or("cc-switch-server-oauth")
+            .to_string()
     };
     if let Some(entry) = headers
         .iter_mut()
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
     {
-        entry.1 = user_agent.to_string();
+        entry.1 = user_agent.clone();
     } else {
-        headers.push(("User-Agent".to_string(), user_agent.to_string()));
+        headers.push(("User-Agent".to_string(), user_agent));
     }
 }
 
@@ -455,6 +451,7 @@ pub fn oauth_quota_auth_provider_label(provider_type: ProviderType) -> &'static 
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::CursorApiKey => "cursor_apikey",
         ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::KimiCode => "kimi_code",
         ProviderType::OllamaCloud => "ollama_cloud",
         other => other.as_str(),
     }
@@ -592,6 +589,26 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             refresh_capability: OAuthRefreshCapability::OAuthRequest,
             quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
+        ProviderType::KimiCode => Some(OAuthProviderSpec {
+            provider_type,
+            stage: OAuthSupportStage::NativeRefreshProfile,
+            authorize_url: None,
+            authorize_flow: OAuthAuthorizeFlow::Unsupported,
+            authorize_scope: None,
+            token_urls: KIMI_TOKEN_URLS,
+            token_body_format: OAuthRequestBodyFormat::Form,
+            client_id: Some(crate::domain::kimi_cli::KIMI_CLIENT_ID),
+            client_id_env: None,
+            client_secret: None,
+            client_secret_env: None,
+            refresh_scope: None,
+            user_agent: Some(crate::domain::kimi_cli::KIMI_USER_AGENT),
+            profile_url: None,
+            profile_strategy: OAuthProfileStrategy::ProviderSpecific,
+            quota_strategy: OAuthQuotaStrategy::NotAvailable,
+            refresh_capability: OAuthRefreshCapability::OAuthRequest,
+            quota_capability: OAuthQuotaCapability::Unavailable,
+        }),
         ProviderType::KiroOAuth => Some(OAuthProviderSpec {
             provider_type,
             stage: OAuthSupportStage::NativeRefreshProfile,
@@ -665,6 +682,7 @@ pub fn oauth_specs() -> Vec<OAuthProviderSpec> {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::KimiCode,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
         ProviderType::AgyOAuth,
@@ -841,7 +859,6 @@ pub fn build_authorization_code_request(
         ),
     ];
     set_oauth_user_agent(&mut headers, provider_type, token_url, spec.user_agent);
-
     let mut body = json!({
         "grant_type": "authorization_code",
         "code": code,
@@ -939,6 +956,25 @@ pub fn build_refresh_request_for_token_url(
         },
     )];
     set_oauth_user_agent(&mut headers, provider_type, token_url, spec.user_agent);
+    if provider_type == ProviderType::KimiCode {
+        let identity =
+            crate::domain::kimi_cli::device_identity_from_profile(account.profile.as_ref())
+                .ok_or_else(|| {
+                    missing_credential(
+                        "Kimi account-scoped device identity is required for refresh",
+                    )
+                })?;
+        for (name, value) in identity.headers() {
+            if let Some(entry) = headers
+                .iter_mut()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&name))
+            {
+                entry.1 = value;
+            } else {
+                headers.push((name, value));
+            }
+        }
+    }
 
     let mut body = json!({
         "grant_type": "refresh_token",
@@ -2068,6 +2104,8 @@ fn login_profile_value(
                 "organizationType",
                 "organizationRateLimitTier",
                 "bootstrapRefreshedAt",
+                "organizationTypeObservedAt",
+                "organizationRateLimitTierObservedAt",
             ] {
                 if let Some(field) = profile_raw.get(key) {
                     value[key] = field.clone();
@@ -2496,7 +2534,7 @@ mod tests {
         assert!(request
             .headers
             .iter()
-            .any(|(name, value)| name == "User-Agent" && value == "axios/1.13.6"));
+            .any(|(name, value)| name == "User-Agent" && value == "axios/1.15.2"));
     }
 
     #[test]
@@ -2582,6 +2620,7 @@ mod tests {
     fn claude_refresh_request_keeps_api_and_platform_fallback_urls() {
         let spec = oauth_provider_spec(ProviderType::ClaudeOAuth).unwrap();
         assert_eq!(spec.token_urls.len(), 2);
+        assert_eq!(spec.token_urls, CLAUDE_TOKEN_URLS);
         assert_eq!(spec.token_body_format, OAuthRequestBodyFormat::Json);
         assert_eq!(
             spec.profile_strategy,
@@ -2594,7 +2633,7 @@ mod tests {
             &account(ProviderType::ClaudeOAuth),
         )
         .expect("claude request");
-        assert_eq!(request.url, "https://api.anthropic.com/v1/oauth/token");
+        assert_eq!(request.url, CLAUDE_PLATFORM_TOKEN_URL);
         assert_eq!(request.body_format, OAuthRequestBodyFormat::Json);
     }
 
@@ -3399,6 +3438,11 @@ mod tests {
                 OAuthQuotaCapability::LiveRefresh,
             ),
             (
+                ProviderType::KimiCode,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::Unavailable,
+            ),
+            (
                 ProviderType::CursorOAuth,
                 OAuthRefreshCapability::OAuthRequest,
                 OAuthQuotaCapability::ImportedSnapshot,
@@ -3440,7 +3484,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(cases.len(), 15);
+        assert_eq!(cases.len(), 16);
         for (provider_type, refresh_capability, quota_capability) in cases {
             let spec = oauth_provider_spec(provider_type).expect("provider spec");
             assert_eq!(

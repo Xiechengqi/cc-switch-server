@@ -272,8 +272,12 @@ export function formatQuotaSummary(
   t?: (key: string, options?: Record<string, unknown>) => string,
   nowMs = Date.now(),
 ): string {
-  const planLabel =
+  const resolvedPlanLabel =
     quota.subscription?.planLabel?.trim() || quota.credentialMessage?.trim();
+  const planLabel =
+    resolvedPlanLabel && quota.subscription?.planStale
+      ? `${resolvedPlanLabel} ${t ? t("subscription.planCached") : "(cached)"}`
+      : resolvedPlanLabel;
   const segments = [
     planLabel,
     quota.subscription

@@ -1,7 +1,9 @@
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{
-    ImageUsageMetadata, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageState,
+    ImageUsageMetadata, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageOutcome,
+    UsageState,
 };
+use crate::logging::{opaque_ref, AuditEvent, AuditRequestDetails};
 use crate::state::{ServerEvent, ServerState};
 
 use super::streaming::StreamUsageResult;
@@ -25,8 +27,76 @@ pub(super) async fn log_usage(
         model,
         usage,
     );
+    log.bundle_id = crate::domain::providers::bundle::bundle_id(&stored.provider)
+        .unwrap_or(stored.provider.id.as_str())
+        .to_string();
+    log.family_id =
+        crate::domain::providers::bundle::bundle_family_id(&stored.provider).map(str::to_string);
+    log.supported_apps = crate::domain::providers::bundle::bundle_supported_apps(&stored.provider)
+        .unwrap_or_else(|| vec![stored.app]);
+    log.profile_id = stored
+        .resource
+        .profile_id
+        .as_ref()
+        .map(|profile_id| profile_id.as_str().to_string());
+    let auth_binding = stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref());
+    let account_id = auth_binding.and_then(|binding| binding.account_id.as_deref());
+    log.account_ref = account_id.map(|account_id| opaque_ref("account", account_id));
+    log.auth_identity_generation =
+        auth_binding.and_then(|binding| binding.auth_identity_generation);
+    if let Some(account_id) = account_id {
+        log.account_display = state
+            .find_account_by_id(account_id)
+            .await
+            .and_then(|account| account.email)
+            .or_else(|| log.account_ref.clone());
+    }
     log.apply_context(context);
     let request_id = log.request_id.clone();
+    let account_ref = stored
+        .provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.auth_binding.as_ref())
+        .and_then(|binding| binding.account_id.as_deref())
+        .map(|account_id| opaque_ref("account", account_id));
+    let audit_details = AuditRequestDetails {
+        provider_type: Some(stored.provider_type.as_str().to_string()),
+        provider_ref: Some(opaque_ref("provider", &stored.provider.id)),
+        account_ref,
+        requested_model: log.requested_model.clone(),
+        actual_model: log.actual_model.clone().or_else(|| log.model.clone()),
+        upstream_status: Some(status_code),
+        streaming: Some(log.is_streaming),
+        stream_status: log.stream_status.clone(),
+        input_tokens: log.input_tokens,
+        output_tokens: log.output_tokens,
+        total_tokens: log.total_tokens,
+        ..AuditRequestDetails::default()
+    };
+    state.enrich_audit_request(&request_id, audit_details.clone());
+    if state.mark_audit_route_selected(&request_id) {
+        let mut route_selected = AuditEvent::new("inference.route.selected");
+        route_selected.request_id = Some(request_id.clone());
+        route_selected.app = Some(stored.app.as_str().to_string());
+        audit_details.apply_to(&mut route_selected);
+        state.emit_audit_event_best_effort(route_selected);
+        tracing::info!(
+            target: "cc_switch_server::request_audit",
+            event = "inference.route.selected",
+            request_id = %request_id,
+            app = stored.app.as_str(),
+            provider_type = stored.provider_type.as_str(),
+            provider_ref = %opaque_ref("provider", &stored.provider.id),
+            requested_model = log.requested_model.as_deref().unwrap_or("-"),
+            actual_model = log.actual_model.as_deref().or(log.model.as_deref()).unwrap_or("-"),
+            "inference route selected"
+        );
+    }
     if let Err(error) = state.push_usage_log(log).await {
         tracing::warn!("failed to persist usage log: {error}");
     }
@@ -119,6 +189,19 @@ async fn update_stream_usage_with_parse_status(
             }
         })
         .await;
+    state.enrich_audit_request(
+        request_id,
+        AuditRequestDetails {
+            upstream_status: Some(status_code),
+            first_token_ms: first_token_ms.map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+            streaming: Some(true),
+            stream_status: stream_status.map(str::to_string),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            ..AuditRequestDetails::default()
+        },
+    );
     match persisted {
         Ok(Some(_)) => {}
         Ok(None) => return,
@@ -181,6 +264,19 @@ pub(super) async fn update_image_stream_usage(
             }
         })
         .await;
+    state.enrich_audit_request(
+        request_id,
+        AuditRequestDetails {
+            upstream_status: Some(status_code),
+            first_token_ms: first_token_ms.map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+            streaming: Some(true),
+            stream_status: Some(stream_status.to_string()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            ..AuditRequestDetails::default()
+        },
+    );
     match persisted {
         Ok(Some(_)) => {}
         Ok(None) => return,
@@ -228,6 +324,19 @@ pub(super) async fn update_websocket_stream_usage(
             }
         })
         .await;
+    state.enrich_audit_request(
+        request_id,
+        AuditRequestDetails {
+            upstream_status: Some(status_code),
+            first_token_ms: first_token_ms.map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+            streaming: Some(true),
+            stream_status: Some(stream_status.to_string()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            ..AuditRequestDetails::default()
+        },
+    );
     match persisted {
         Ok(Some(_)) => {}
         Ok(None) => return,
@@ -292,6 +401,25 @@ fn apply_stream_usage_fields(
     let next_usage_state = usage_state_for_stream(usage, usage_parse_error, stream_status);
     router_visible_changed |= log.usage_state != next_usage_state;
     log.usage_state = next_usage_state;
+    log.upstream_duration_ms = duration_ms;
+    if next_usage_state == UsageState::Pending {
+        log.completed_at_ms = 0;
+        log.end_to_end_duration_ms = 0;
+        log.outcome = UsageOutcome::Pending;
+    } else {
+        log.completed_at_ms = crate::infra::time::now_ms();
+        log.end_to_end_duration_ms = log.completed_at_ms.saturating_sub(log.started_at_ms);
+        log.outcome = if next_usage_state == UsageState::Interrupted {
+            UsageOutcome::Interrupted
+        } else {
+            UsageOutcome::from_status(status_code)
+        };
+        log.failure_kind = if log.outcome == UsageOutcome::Success {
+            None
+        } else {
+            stream_status.map(str::to_string)
+        };
+    }
     if router_visible_changed {
         log.usage_revision = log.usage_revision.saturating_add(1);
     }

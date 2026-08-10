@@ -8,7 +8,6 @@ use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareUserGrant,
 };
-use crate::domain::usage::store::{UsageLog, UsageRollup};
 
 pub(in crate::api) async fn web_provider_health_json(
     state: &ServerState,
@@ -2332,338 +2331,6 @@ pub(in crate::api) fn web_optional_string_any(args: &Value, keys: &[&str]) -> Op
     })
 }
 
-pub(in crate::api) fn web_usage_stats_filter_from_args(args: &Value) -> UsageStatsFilter {
-    let app = web_optional_string_any(args, &["appType", "app", "app_type"])
-        .as_deref()
-        .and_then(|value| parse_app_kind(value).ok());
-    let from_ms = web_request_log_date_bound_ms(args, true);
-    let to_ms = web_request_log_date_bound_ms(args, false);
-    let window_ms = web_optional_u64(args, &["windowMs", "window_ms"])
-        .map(u128::from)
-        .or_else(|| {
-            from_ms.zip(to_ms).map(|(from, to)| {
-                if to.saturating_sub(from) <= 24 * 60 * 60 * 1_000 {
-                    60 * 60 * 1_000
-                } else {
-                    24 * 60 * 60 * 1_000
-                }
-            })
-        });
-    UsageStatsFilter {
-        from_ms,
-        to_ms,
-        window_ms,
-        app,
-        provider_id: web_optional_string_any(args, &["providerId", "provider_id"]),
-        provider_name: web_optional_string_any(args, &["providerName", "provider_name"]),
-        model: web_optional_string_any(args, &["model"]),
-        ..UsageStatsFilter::default()
-    }
-}
-
-pub(in crate::api) fn web_usage_summary_json(usage: &UsageStore, args: &Value) -> Value {
-    let filter = web_usage_stats_filter_from_args(args);
-    web_usage_rollup_json(&usage.rollup_filtered(&filter))
-}
-
-pub(in crate::api) fn web_usage_trends_json(usage: &UsageStore, args: &Value) -> Value {
-    let filter = web_usage_stats_filter_from_args(args);
-    Value::Array(
-        usage
-            .trends(&filter)
-            .into_iter()
-            .map(|point| {
-                let rollup = &point.rollup;
-                json!({
-                    "date": web_request_log_u128_to_u64(point.start_ms),
-                    "requestCount": rollup.requests,
-                    "totalTokens": web_usage_real_total_tokens(rollup),
-                    "totalInputTokens": rollup.input_tokens,
-                    "totalOutputTokens": rollup.output_tokens,
-                    "totalCacheCreationTokens": rollup.cache_creation_tokens,
-                    "totalCacheReadTokens": rollup.cache_read_tokens,
-                })
-            })
-            .collect(),
-    )
-}
-
-pub(in crate::api) fn web_provider_stats_json(usage: &UsageStore, args: &Value) -> Value {
-    let filter = web_usage_stats_filter_from_args(args);
-    Value::Array(
-        usage
-            .provider_stats(&filter)
-            .into_iter()
-            .map(|stat| {
-                json!({
-                    "providerId": stat.provider_id,
-                    "providerName": stat.provider_name,
-                    "requestCount": stat.rollup.requests,
-                    "totalTokens": web_usage_real_total_tokens(&stat.rollup),
-                    "successRate": web_usage_success_rate(&stat.rollup),
-                    "avgLatencyMs": stat.avg_duration_ms.unwrap_or(0.0).round(),
-                })
-            })
-            .collect(),
-    )
-}
-
-pub(in crate::api) fn web_model_stats_json(usage: &UsageStore, args: &Value) -> Value {
-    let filter = web_usage_stats_filter_from_args(args);
-    Value::Array(
-        usage
-            .model_stats(&filter)
-            .into_iter()
-            .map(|stat| {
-                json!({
-                    "model": stat.model,
-                    "requestCount": stat.rollup.requests,
-                    "totalTokens": web_usage_real_total_tokens(&stat.rollup),
-                    "successRate": web_usage_success_rate(&stat.rollup),
-                    "avgLatencyMs": stat.avg_duration_ms.unwrap_or(0.0).round(),
-                })
-            })
-            .collect(),
-    )
-}
-
-fn web_usage_rollup_json(rollup: &UsageRollup) -> Value {
-    let cacheable_input = rollup
-        .input_tokens
-        .saturating_add(rollup.cache_creation_tokens)
-        .saturating_add(rollup.cache_read_tokens);
-    let cache_hit_rate = if cacheable_input > 0 {
-        rollup.cache_read_tokens as f64 / cacheable_input as f64
-    } else {
-        0.0
-    };
-    json!({
-        "totalRequests": rollup.requests,
-        "totalInputTokens": rollup.input_tokens,
-        "totalOutputTokens": rollup.output_tokens,
-        "totalCacheCreationTokens": rollup.cache_creation_tokens,
-        "totalCacheReadTokens": rollup.cache_read_tokens,
-        "successRate": web_usage_success_rate(rollup),
-        "realTotalTokens": web_usage_real_total_tokens(rollup),
-        "cacheHitRate": cache_hit_rate,
-    })
-}
-
-fn web_usage_real_total_tokens(rollup: &UsageRollup) -> u64 {
-    rollup
-        .input_tokens
-        .saturating_add(rollup.output_tokens)
-        .saturating_add(rollup.cache_creation_tokens)
-        .saturating_add(rollup.cache_read_tokens)
-}
-
-fn web_usage_success_rate(rollup: &UsageRollup) -> f64 {
-    if rollup.requests > 0 {
-        rollup.successes as f64 / rollup.requests as f64 * 100.0
-    } else {
-        0.0
-    }
-}
-
-pub(in crate::api) fn web_request_logs_json(usage: &UsageStore, args: &Value) -> Value {
-    const DEFAULT_PAGE_SIZE: usize = 20;
-    const MAX_PAGE_SIZE: usize = 200;
-
-    let filters = args
-        .get("filters")
-        .filter(|value| value.is_object())
-        .unwrap_or(args);
-    let app_type = web_optional_string_any(filters, &["appType", "app_type", "app"])
-        .filter(|value| value != "all");
-    let provider_name = web_optional_string_any(filters, &["providerName", "provider_name"]);
-    let model = web_optional_string_any(filters, &["model"]);
-    let share_id = web_optional_string_any(filters, &["shareId", "share_id"]);
-    let status_code = web_optional_u32(filters, &["statusCode", "status_code"])
-        .and_then(|value| u16::try_from(value).ok());
-    let from_ms = web_request_log_date_bound_ms(filters, true);
-    let to_ms = web_request_log_date_bound_ms(filters, false);
-
-    let page = web_optional_u64(args, &["page"])
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0);
-    let page_size = web_optional_u64(args, &["pageSize", "page_size"])
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-
-    let matches = |log: &&UsageLog| {
-        !log.is_health_check
-            && from_ms.is_none_or(|from| log.created_at_ms >= from)
-            && to_ms.is_none_or(|to| log.created_at_ms <= to)
-            && app_type
-                .as_deref()
-                .is_none_or(|app_type| log.app.as_str() == app_type)
-            && provider_name
-                .as_deref()
-                .is_none_or(|provider_name| log.provider_name == provider_name)
-            && model
-                .as_deref()
-                .is_none_or(|model| web_request_log_effective_model(log) == model)
-            && share_id
-                .as_deref()
-                .is_none_or(|share_id| log.share_id.as_deref() == Some(share_id))
-            && status_code.is_none_or(|status_code| log.status_code == status_code)
-    };
-    let mut matching = usage.logs.iter().filter(matches).collect::<Vec<_>>();
-    matching.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
-    let total = matching.len();
-    let offset = page.saturating_mul(page_size);
-    let data = matching
-        .into_iter()
-        .skip(offset)
-        .take(page_size)
-        .map(web_request_log_json)
-        .collect::<Vec<_>>();
-
-    json!({
-        "data": data,
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    })
-}
-
-fn web_request_log_date_bound_ms(filters: &Value, is_start: bool) -> Option<u128> {
-    let (seconds_keys, milliseconds_keys) = if is_start {
-        (["startDate", "start_date"], ["fromMs", "from_ms"])
-    } else {
-        (["endDate", "end_date"], ["toMs", "to_ms"])
-    };
-    if let Some(seconds) = web_optional_u64(filters, &seconds_keys) {
-        let milliseconds = u128::from(seconds).saturating_mul(1_000);
-        return Some(if is_start {
-            milliseconds
-        } else {
-            milliseconds.saturating_add(999)
-        });
-    }
-    web_optional_u64(filters, &milliseconds_keys).map(u128::from)
-}
-
-fn web_request_log_effective_model(log: &UsageLog) -> &str {
-    log.actual_model
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .or(log.requested_model.as_deref())
-        .or(log.model.as_deref())
-        .unwrap_or_default()
-}
-
-pub(in crate::api) fn web_request_log_json(log: &UsageLog) -> Value {
-    let model = log
-        .model
-        .as_deref()
-        .or(log.requested_model.as_deref())
-        .or(log.actual_model.as_deref())
-        .unwrap_or_default();
-    let requested_model = log.requested_model.as_deref().unwrap_or(model);
-    let actual_model = log.actual_model.as_deref().unwrap_or(model);
-
-    json!({
-        "requestId": log.request_id,
-        "providerId": log.provider_id,
-        "providerName": log.provider_name,
-        "appType": log.app.as_str(),
-        "model": model,
-        "requestModel": requested_model,
-        "requestAgent": log.request_agent.as_deref().unwrap_or_default(),
-        "requestedModel": requested_model,
-        "actualModel": actual_model,
-        "actualModelSource": log.actual_model_source.as_deref().unwrap_or("server"),
-        "requestedReasoningEffort": log.requested_reasoning_effort,
-        "effectiveReasoningEffort": log.effective_reasoning_effort,
-        "clientServiceTier": log.client_service_tier,
-        "effectiveServiceTier": log.effective_service_tier,
-        "serviceTierDecision": log.service_tier_decision,
-        "rawInputTokens": log.raw_input_tokens,
-        "inputTokens": web_request_log_token_count(log.input_tokens),
-        "outputTokens": web_request_log_token_count(log.output_tokens),
-        "cacheReadTokens": web_request_log_token_count(log.cache_read_tokens),
-        "cacheCreationTokens": web_request_log_token_count(log.cache_creation_tokens),
-        "totalTokens": log.total_tokens,
-        "imageCount": log.image_count,
-        "imageBytes": log.image_bytes,
-        "imageFormat": log.image_format,
-        "imageWidth": log.image_width,
-        "imageHeight": log.image_height,
-        "imageSize": log.image_size,
-        "isStreaming": log.is_streaming,
-        "streamStatus": log.stream_status,
-        "usageState": log.usage_state.as_str(),
-        "usageRevision": log.usage_revision,
-        "latencyMs": web_request_log_u128_to_u64(log.duration_ms),
-        "firstTokenMs": log.first_token_ms.map(web_request_log_u128_to_u64),
-        "durationMs": web_request_log_u128_to_u64(log.duration_ms),
-        "statusCode": log.status_code,
-        "errorMessage": log.error_message,
-        "createdAt": web_request_log_u128_to_i64(log.created_at_ms / 1_000),
-        "shareId": log.share_id,
-        "shareName": log.share_name,
-        "userEmail": log.user_email,
-        "dataSource": log.data_source,
-    })
-}
-
-#[cfg(test)]
-mod request_log_policy_tests {
-    use super::*;
-    use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
-
-    #[test]
-    fn invoke_request_log_exposes_requested_and_effective_policy() {
-        let mut log = UsageLog::new(
-            AppKind::Codex,
-            "codex-provider".to_string(),
-            "Codex".to_string(),
-            ProviderType::CodexOAuth,
-            200,
-            25,
-            UsageModelMetadata {
-                model: Some("gpt-5.4".to_string()),
-                requested_model: Some("gpt-5.4".to_string()),
-                actual_model: Some("gpt-5.4".to_string()),
-                actual_model_source: Some("request".to_string()),
-            },
-            TokenUsage::default(),
-        );
-        log.apply_context(UsageLogContext {
-            requested_reasoning_effort: Some("ultra".to_string()),
-            effective_reasoning_effort: Some("max".to_string()),
-            client_service_tier: Some("default".to_string()),
-            effective_service_tier: Some("priority".to_string()),
-            service_tier_decision: Some("server_forced_priority".to_string()),
-            ..UsageLogContext::default()
-        });
-
-        let value = web_request_log_json(&log);
-
-        assert_eq!(value["requestedReasoningEffort"], "ultra");
-        assert_eq!(value["effectiveReasoningEffort"], "max");
-        assert_eq!(value["clientServiceTier"], "default");
-        assert_eq!(value["effectiveServiceTier"], "priority");
-        assert_eq!(value["serviceTierDecision"], "server_forced_priority");
-        assert_eq!(value["usageState"], "missing");
-        assert_eq!(value["usageRevision"], 1);
-    }
-}
-
-fn web_request_log_token_count(value: Option<u64>) -> u64 {
-    value.unwrap_or(0)
-}
-
-fn web_request_log_u128_to_u64(value: u128) -> u64 {
-    value.min(u128::from(u64::MAX)) as u64
-}
-
-fn web_request_log_u128_to_i64(value: u128) -> i64 {
-    value.min(i64::MAX as u128) as i64
-}
-
 pub(in crate::api) fn web_optional_bool(args: &Value, keys: &[&str]) -> Option<bool> {
     keys.iter()
         .find_map(|key| args.get(*key).and_then(Value::as_bool))
@@ -2734,6 +2401,7 @@ pub(in crate::api) fn web_parse_auth_provider_type(value: &str) -> Result<Provid
         "github_copilot" => Ok(ProviderType::GitHubCopilot),
         "codex_oauth" => Ok(ProviderType::CodexOAuth),
         "grok_oauth" => Ok(ProviderType::GrokOAuth),
+        "kimi_code" => Ok(ProviderType::KimiCode),
         "claude_oauth" => Ok(ProviderType::ClaudeOAuth),
         "antigravity_oauth" => Ok(ProviderType::AntigravityOAuth),
         "cursor_oauth" => Ok(ProviderType::CursorOAuth),
@@ -2753,6 +2421,7 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::GitHubCopilot => "github_copilot",
         ProviderType::CodexOAuth => "codex_oauth",
         ProviderType::GrokOAuth => "grok_oauth",
+        ProviderType::KimiCode => "kimi_code",
         ProviderType::ClaudeOAuth => "claude_oauth",
         ProviderType::GeminiCli => "google_gemini_oauth",
         ProviderType::AntigravityOAuth => "antigravity_oauth",
@@ -2834,6 +2503,14 @@ mod managed_auth_provider_label_tests {
         assert_eq!(
             managed_auth_provider_label(ProviderType::DeepSeekAccount),
             "deepseek_account"
+        );
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::KimiCode),
+            "kimi_code"
+        );
+        assert_eq!(
+            web_parse_auth_provider_type("kimi_code").unwrap(),
+            ProviderType::KimiCode
         );
     }
 
@@ -3180,6 +2857,23 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 response.device.interval,
             ))
         }
+        ProviderType::KimiCode => {
+            let response = start_kimi_device_login(
+                State(state),
+                headers,
+                Json(StartKimiDeviceLoginRequest {}),
+            )
+            .await?
+            .0;
+            Ok(map_managed_auth_device_code(
+                provider_label,
+                &response.device.device_code,
+                &response.device.user_code,
+                &response.device.verification_uri,
+                response.device.expires_in,
+                response.device.interval,
+            ))
+        }
         ProviderType::CodexOAuth if !managed_auth_is_cli_oauth_flow(oauth_flow_mode_ref) => {
             let response = start_codex_device_login(
                 State(state),
@@ -3286,6 +2980,26 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 .map(|account| account.id.as_str())
                 .ok_or_else(|| {
                     ApiError::bad_gateway("kiro device flow completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
+        ProviderType::KimiCode => {
+            let response = poll_kimi_device_login(
+                State(state.clone()),
+                headers,
+                Json(PollKimiDeviceLoginRequest { device_code }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("Kimi device flow completed without account")
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
@@ -3404,7 +3118,7 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
     }
     if matches!(
         provider_type,
-        ProviderType::GitHubCopilot | ProviderType::KiroOAuth
+        ProviderType::GitHubCopilot | ProviderType::KiroOAuth | ProviderType::KimiCode
     ) {
         let principal = require_web_admin_session(&state, &headers).await?;
         let managed_auth_operation = state.lock_managed_auth_operations().await;

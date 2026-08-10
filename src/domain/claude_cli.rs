@@ -1,16 +1,33 @@
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_CLAUDE_CLI_VERSION: &str = "2.1.195";
-pub const DEFAULT_CLAUDE_CLI_BUILD: &str = "47e";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaudeWireProfile {
+    pub id: &'static str,
+    pub claude_code_version: &'static str,
+    pub stainless_package_version: &'static str,
+    pub node_version: &'static str,
+    pub axios_version: &'static str,
+    pub cch_seed: u64,
+    pub billing_version_strategy: &'static str,
+}
+
+pub const CLAUDE_WIRE_PROFILE: ClaudeWireProfile = ClaudeWireProfile {
+    id: "claude-code-2.1.220-captured-2026-08-09",
+    claude_code_version: "2.1.220",
+    stainless_package_version: "0.94.0",
+    node_version: "v26.3.0",
+    axios_version: "1.15.2",
+    cch_seed: 0x6E52736AC806831E,
+    // Capture evidence does not expose a trustworthy private build suffix.
+    billing_version_strategy: "public_cli_version_without_guessed_build_suffix",
+};
+
 pub const DEFAULT_CLAUDE_CC_ENTRYPOINT: &str = "cli";
-pub const DEFAULT_STAINLESS_PACKAGE_VERSION: &str = "0.55.1";
 pub const DEFAULT_STAINLESS_RUNTIME: &str = "node";
-pub const DEFAULT_STAINLESS_RUNTIME_VERSION: &str = "v20.19.0";
-pub const DEFAULT_CCH_SEED: u64 = 0x6E52736AC806831E;
 pub const CLAUDE_CODE_IDENTITY_TEXT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 
-const CCH_SEED_BY_VERSION_PREFIX: &[(&str, u64)] = &[("2.1.", DEFAULT_CCH_SEED)];
+const CCH_SEED_BY_VERSION_PREFIX: &[(&str, u64)] = &[("2.1.", CLAUDE_WIRE_PROFILE.cch_seed)];
 const STAINLESS_IDENTITY_PROFILES: &[(&str, &str)] = &[
     ("MacOS", "arm64"),
     ("MacOS", "x64"),
@@ -25,7 +42,7 @@ pub fn claude_cli_version() -> String {
         .or_else(|| std::env::var("CC_SWITCH_CLI_UA_VERSION").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_CLAUDE_CLI_VERSION.to_string())
+        .unwrap_or_else(|| CLAUDE_WIRE_PROFILE.claude_code_version.to_string())
 }
 
 pub fn claude_cli_user_agent() -> String {
@@ -36,8 +53,24 @@ pub fn claude_cli_user_agent() -> String {
         .unwrap_or_else(|| format!("claude-cli/{} (external, cli)", claude_cli_version()))
 }
 
+pub fn claude_code_user_agent() -> String {
+    format!("claude-code/{}", claude_cli_version())
+}
+
+pub fn claude_axios_user_agent() -> String {
+    format!("axios/{}", CLAUDE_WIRE_PROFILE.axios_version)
+}
+
+pub fn claude_stainless_package_version() -> &'static str {
+    CLAUDE_WIRE_PROFILE.stainless_package_version
+}
+
+pub fn claude_wire_profile_id() -> &'static str {
+    CLAUDE_WIRE_PROFILE.id
+}
+
 pub fn claude_cch_version() -> String {
-    format!("{}.{}", claude_cli_version(), DEFAULT_CLAUDE_CLI_BUILD)
+    claude_cli_version()
 }
 
 pub fn claude_cch_seed() -> u64 {
@@ -94,7 +127,7 @@ pub fn claude_stainless_runtime_version() -> String {
         .ok()
         .map(|value| normalize_node_version(&value))
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_STAINLESS_RUNTIME_VERSION.to_string())
+        .unwrap_or_else(|| CLAUDE_WIRE_PROFILE.node_version.to_string())
 }
 
 fn claude_cli_version_from_user_agent(user_agent: &str) -> Option<String> {
@@ -110,7 +143,7 @@ fn claude_cch_seed_for_version(version: &str) -> u64 {
     CCH_SEED_BY_VERSION_PREFIX
         .iter()
         .find_map(|(prefix, seed)| version.starts_with(prefix).then_some(*seed))
-        .unwrap_or(DEFAULT_CCH_SEED)
+        .unwrap_or(CLAUDE_WIRE_PROFILE.cch_seed)
 }
 
 fn parse_cch_seed_hex(value: &str) -> Option<u64> {

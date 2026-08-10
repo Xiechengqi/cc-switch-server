@@ -10,6 +10,7 @@ export const PROVIDER_TYPES = {
   CURSOR_OAUTH: "cursor_oauth",
   CURSOR_APIKEY: "cursor_apikey",
   KIRO_OAUTH: "kiro_oauth",
+  KIMI_CODE: "kimi_code",
   DEEPSEEK_ACCOUNT: "deepseek_account",
   OLLAMA_CLOUD: "ollama_cloud",
 } as const;

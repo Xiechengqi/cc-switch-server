@@ -77,7 +77,16 @@ pub(in crate::api) fn openai_model_list(
             && provider_id.is_none_or(|id| provider.provider.id == id)
     }) {
         let owned_by = model_owner(provider);
-        let mut provider_models = provider_model_ids(provider);
+        let mut provider_models = if provider.app == AppKind::Claude
+            && provider.provider_type == ProviderType::ClaudeOAuth
+        {
+            crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect()
+        } else {
+            provider_model_ids(provider)
+        };
         if provider.app == AppKind::Codex && provider.provider_type == ProviderType::CodexOAuth {
             provider_models.extend(
                 crate::proxy::codex_models::BUILTIN_CODEX_MODELS
@@ -85,6 +94,18 @@ pub(in crate::api) fn openai_model_list(
                     .map(|capability| capability.id.to_string()),
             );
             provider_models.extend(crate::proxy::codex_models::manifest_model_ids(provider));
+        }
+        if provider.provider_type == ProviderType::KimiCode {
+            provider_models.extend(crate::proxy::kimi::supported_models());
+        }
+        if provider.provider_type == ProviderType::KiroOAuth {
+            provider_models.extend(crate::proxy::kiro::supported_models());
+        }
+        if matches!(
+            provider.provider_type,
+            ProviderType::CursorOAuth | ProviderType::CursorApiKey
+        ) {
+            provider_models.extend(crate::proxy::cursor::model::cursor_supported_models());
         }
         for model_id in dedupe_non_empty(provider_models) {
             let capability = (provider.app == AppKind::Codex)

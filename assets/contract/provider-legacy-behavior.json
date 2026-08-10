@@ -217,8 +217,8 @@
       },
       "production": {
         "branch": "special_forwarder",
-        "adapter": "claude_kiro_codewhisperer_planned",
-        "adapterSupport": "planned"
+        "adapter": "claude_kiro_codewhisperer",
+        "adapterSupport": "native"
       },
       "endpoint": {
         "origin": "https://q.us-east-1.amazonaws.com",

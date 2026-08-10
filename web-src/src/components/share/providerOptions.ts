@@ -25,12 +25,12 @@ export const SHARE_PROVIDER_AUTH_PROVIDERS = [
   PROVIDER_TYPES.ANTIGRAVITY_OAUTH,
   PROVIDER_TYPES.CURSOR_OAUTH,
   PROVIDER_TYPES.KIRO_OAUTH,
+  PROVIDER_TYPES.KIMI_CODE,
 ] as const satisfies readonly ManagedAuthProvider[];
 
 type ShareProviderAuthProvider = (typeof SHARE_PROVIDER_AUTH_PROVIDERS)[number];
 type ShareAccountProvider =
-  | ShareProviderAuthProvider
-  | typeof PROVIDER_TYPES.DEEPSEEK_ACCOUNT;
+  ShareProviderAuthProvider | typeof PROVIDER_TYPES.DEEPSEEK_ACCOUNT;
 
 const SHARE_PROVIDER_AUTH_PROVIDER_SET = new Set<string>(
   SHARE_PROVIDER_AUTH_PROVIDERS,

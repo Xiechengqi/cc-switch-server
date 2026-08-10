@@ -3,75 +3,144 @@ use crate::domain::accounts::store::{
     active_account_usage_block, AccountStore, AccountUsageBlockKind,
 };
 use crate::domain::providers::runtime::authoritative_managed_account;
-pub(in crate::api) async fn usage_logs(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Query(query): Query<UsageLogsQuery>,
-) -> Result<Json<UsageLogsResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    Ok(Json(UsageLogsResponse {
-        ok: true,
-        logs: state.usage.read().await.latest_filtered(query.into()),
-    }))
-}
+use crate::domain::usage::query::UsageQuery;
 
-pub(in crate::api) async fn usage_summary(
+const DEFAULT_USAGE_RANGE_MS: u128 = 24 * 60 * 60 * 1_000;
+const MAX_USAGE_RANGE_MS: u128 = 32 * 24 * 60 * 60 * 1_000;
+const DEFAULT_USAGE_REQUEST_LIMIT: usize = 50;
+const MAX_USAGE_REQUEST_LIMIT: usize = 200;
+const MAX_USAGE_TREND_POINTS: u128 = 2_000;
+
+pub(in crate::api) async fn usage_overview(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Query(query): Query<UsageStatsQuery>,
-) -> Result<Json<UsageSummaryResponse>, ApiError> {
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<UsageOverviewResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let filter = UsageStatsFilter::from(query);
-    Ok(Json(UsageSummaryResponse {
-        ok: true,
-        summary: state.usage.read().await.rollup_filtered(&filter),
-    }))
+    let (query, meta) = usage_query(params)?;
+    let data = state.usage.read().await.query_overview(&query);
+    Ok(Json(UsageDataResponse { data, meta }))
 }
 
 pub(in crate::api) async fn usage_trends(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Query(query): Query<UsageStatsQuery>,
+    Query(params): Query<UsageQueryParams>,
 ) -> Result<Json<UsageTrendsResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let filter = UsageStatsFilter::from(query);
-    Ok(Json(UsageTrendsResponse {
-        ok: true,
-        trends: state.usage.read().await.trends(&filter),
-    }))
+    let requested_window_ms = params.window_ms.map(u128::from);
+    let (query, meta) = usage_query(params)?;
+    let range_ms = meta.to_ms.saturating_sub(meta.from_ms);
+    let window_ms = requested_window_ms.unwrap_or_else(|| {
+        if range_ms <= DEFAULT_USAGE_RANGE_MS {
+            60 * 60 * 1_000
+        } else {
+            24 * 60 * 60 * 1_000
+        }
+    });
+    if !(60 * 1_000..=24 * 60 * 60 * 1_000).contains(&window_ms) {
+        return Err(ApiError::bad_request(
+            "windowMs must be between one minute and one day",
+        ));
+    }
+    let aligned_from_ms = meta.from_ms - (meta.from_ms % window_ms);
+    let point_count = meta
+        .to_ms
+        .saturating_sub(aligned_from_ms)
+        .saturating_add(window_ms.saturating_sub(1))
+        / window_ms;
+    if point_count > MAX_USAGE_TREND_POINTS {
+        return Err(ApiError::bad_request(
+            "windowMs produces more than 2000 trend points for this range",
+        ));
+    }
+    let data = state.usage.read().await.query_trends(&query, window_ms);
+    Ok(Json(UsageDataResponse { data, meta }))
 }
 
-pub(in crate::api) async fn usage_provider_stats(
+pub(in crate::api) async fn usage_facets(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Query(query): Query<UsageStatsQuery>,
-) -> Result<Json<UsageProviderStatsResponse>, ApiError> {
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<UsageFacetsResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let filter = UsageStatsFilter::from(query);
-    Ok(Json(UsageProviderStatsResponse {
-        ok: true,
-        providers: state.usage.read().await.provider_stats(&filter),
-    }))
+    let (query, meta) = usage_query(params)?;
+    let data = state.usage.read().await.query_facets(&query);
+    Ok(Json(UsageDataResponse { data, meta }))
 }
 
-pub(in crate::api) async fn usage_model_stats(
+pub(in crate::api) async fn usage_provider_bundles(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Query(query): Query<UsageStatsQuery>,
-) -> Result<Json<UsageModelStatsResponse>, ApiError> {
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<UsageProviderBundlesResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let filter = UsageStatsFilter::from(query);
-    Ok(Json(UsageModelStatsResponse {
-        ok: true,
-        models: state.usage.read().await.model_stats(&filter),
+    let (query, meta) = usage_query(params)?;
+    let data = state.usage.read().await.query_provider_bundles(&query);
+    Ok(Json(UsageDataResponse { data, meta }))
+}
+
+pub(in crate::api) async fn usage_models(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<UsageModelsResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let (query, meta) = usage_query(params)?;
+    let data = state.usage.read().await.query_models(&query);
+    Ok(Json(UsageDataResponse { data, meta }))
+}
+
+pub(in crate::api) async fn usage_shares(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<UsageSharesResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let (query, meta) = usage_query(params)?;
+    let data = state.usage.read().await.query_shares(&query);
+    Ok(Json(UsageDataResponse { data, meta }))
+}
+
+pub(in crate::api) async fn usage_requests(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(params): Query<UsageQueryParams>,
+) -> Result<Json<UsageRequestPageResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let cursor = normalized_optional(params.cursor.clone());
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_USAGE_REQUEST_LIMIT)
+        .clamp(1, MAX_USAGE_REQUEST_LIMIT);
+    let (query, meta) = usage_query(params)?;
+    let (data, next_cursor, total) = state
+        .usage
+        .read()
+        .await
+        .query_requests(&query, cursor.as_deref(), limit)
+        .map_err(|_| {
+            ApiError::bad_request(
+                "cursor does not identify a request in the current filtered range",
+            )
+        })?;
+    Ok(Json(UsageRequestPageResponse {
+        data,
+        meta: UsageRequestPageMeta {
+            from_ms: meta.from_ms,
+            to_ms: meta.to_ms,
+            generated_at_ms: meta.generated_at_ms,
+            total,
+            next_cursor,
+        },
     }))
 }
 
-pub(in crate::api) async fn usage_log_detail(
+pub(in crate::api) async fn usage_request_detail(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<UsageLogDetailResponse>, ApiError> {
+) -> Result<Json<UsageRequestDetailResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let log = state
         .usage
@@ -79,7 +148,60 @@ pub(in crate::api) async fn usage_log_detail(
         .await
         .request_detail(&id)
         .ok_or_else(|| ApiError::not_found("usage request not found"))?;
-    Ok(Json(UsageLogDetailResponse { ok: true, log }))
+    let generated_at_ms = now_ms();
+    Ok(Json(UsageDataResponse {
+        meta: UsageResponseMeta {
+            from_ms: log.started_at_ms,
+            to_ms: log.completed_at_ms.max(log.started_at_ms).saturating_add(1),
+            generated_at_ms,
+        },
+        data: log,
+    }))
+}
+
+fn usage_query(params: UsageQueryParams) -> Result<(UsageQuery, UsageResponseMeta), ApiError> {
+    let generated_at_ms = now_ms();
+    let to_ms = params
+        .to_ms
+        .map(u128::from)
+        .unwrap_or_else(|| generated_at_ms.saturating_add(1));
+    let from_ms = params
+        .from_ms
+        .map(u128::from)
+        .unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_USAGE_RANGE_MS));
+    if from_ms >= to_ms {
+        return Err(ApiError::bad_request("fromMs must be less than toMs"));
+    }
+    if to_ms.saturating_sub(from_ms) > MAX_USAGE_RANGE_MS {
+        return Err(ApiError::bad_request(
+            "Usage queries cannot exceed the 32-day detail retention window",
+        ));
+    }
+    Ok((
+        UsageQuery {
+            from_ms: Some(from_ms),
+            to_ms: Some(to_ms),
+            app: params.app,
+            bundle_id: normalized_optional(params.bundle_id),
+            share_id: normalized_optional(params.share_id),
+            user_email: normalized_optional(params.user_email)
+                .map(|email| email.to_ascii_lowercase()),
+            actual_model: normalized_optional(params.actual_model),
+            outcome: params.outcome,
+            usage_state: params.usage_state,
+        },
+        UsageResponseMeta {
+            from_ms,
+            to_ms,
+            generated_at_ms,
+        },
+    ))
+}
+
+fn normalized_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(in crate::api) async fn provider_limits(

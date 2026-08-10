@@ -35,8 +35,8 @@ Run the checks manually at:
 - Every visible, creatable Family appears exactly once, including Custom HTTP, and the matrix matches the provider coverage audit. OpenCode, OpenClaw, Hermes, Claude Desktop, Universal Providers, raw env/TOML editors, automatic failover, and outbound proxy controls never appear.
 - Selecting Grok OAuth automatically shows Claude, Codex, and Gemini as icon-labelled tabs. Switching tabs does not discard unsaved values or change Bundle-wide fields.
 - Bundle name, Family identity, OAuth/managed account, shared credentials, common endpoint, shared driver options, and Remote Share controls remain outside the Surface tabs.
-- The shared model policy sits below credentials and outside the Surface tabs. Official Claude and Codex OAuth Families force passthrough; other Families expose only the model policies allowed by every Surface profile.
-- Each Surface tab contains only that App's enable state, custom endpoint override when the Family permits it, protocol/auth configuration when custom binding permits it, Surface credential slots and headers, test model, and typed request/stream timeouts.
+- Model policy control defaults to Global below credentials and outside the Surface tabs. Global applies one policy to every configurable Surface; fixed Profiles remain read-only exceptions and are identified in the global summary. Per-App control is offered only when at least two Surfaces are configurable.
+- Each Surface tab contains an independent model policy only in Per-App mode. In Global mode it contains only that App's enable state, custom endpoint override when the Family permits it, protocol/auth configuration when custom binding permits it, Surface credential slots and headers, test model, and typed request/stream timeouts.
 - No editable raw Provider JSON, env object, TOML, `settingsConfig`, `meta`, cache/thinking/governance switch, image model, or video model appears. Saved Surfaces may expose the secret-free compiled Runtime Plan under a collapsed, read-only Effective Runtime Configuration diagnostic with a copy action.
 - Custom Header and Query authentication require an explicit header or query-parameter name. Custom Header names, extra Header names, URL fields, timeout ranges, and test-model length reject invalid values before save and are revalidated by the Server.
 - Managed Families require one explicitly selected compatible Account shared by their enabled Surfaces. Account and quota refresh updates do not mark unrelated Bundle fields dirty.
@@ -46,6 +46,7 @@ Run the checks manually at:
 - The editor has exactly one global Save action at the bottom. There are no per-tab Save buttons, and saving submits the complete Bundle plus the one Bundle-scoped Share configuration.
 - Create/edit/test/fetch-model actions follow the capability gates of the active Surface without introducing a current/selected Provider state.
 - Bundle cards and the editor expose no Switch, Select, Set Current, Clear Current, or hot-switch action. Runtime routing is resolved from the request route, Bundle Surface, or Share binding.
+- Bundle cards show the explicit Global or Per-App scope and each enabled App's effective model policy. A Global summary is compacted once, while fixed Profile exceptions remain labelled separately and long model names truncate without resizing actions.
 - Saving, reloading, editing, and deleting a Bundle preserve its complete Surface set and revision. A Bundle referenced by a Share cannot be deleted until the reference is removed.
 
 ## Shares
@@ -65,8 +66,12 @@ Run the checks manually at:
 
 ## Usage
 
-- Summary, trends, logs, detail, provider stats, model stats, and fresh/cache/output/total Token fields match server API names.
-- Filters for app, provider, share, user, source, session, health, stream, and time window remain usable.
+- Overview cards and trends use the same half-open time range and global filters as every table. Request count includes only user inference; supplemental calls add Token volume without adding requests; health probes stay absent.
+- The four tabs are Requests, Providers, Models, and Share / Users. Provider rows aggregate a Bundle once and show its Claude/Codex/Gemini Surface breakdown; models are grouped by `(Surface, actual upstream model)`.
+- Filters for Claude/Codex/Gemini Surface, Provider Bundle, Share, normalized user email, `(Surface, actual model)`, outcome, Usage state, and time range remain usable. Selecting a model also selects its Surface.
+- Request records use cursor pagination, preserve filter state, show final outcome/status, attempt count, Token observation state, and end-to-end latency, and open a complete lifecycle detail dialog without turning numeric zero into a missing value.
+- All `/web-api/usage/*` requests require an authenticated Server session, return `{ data, meta }`, reject ranges over the 32-day detail window, and treat the selected range as `[fromMs, toMs)`. Trend queries reject a granularity that would exceed 2,000 points.
+- Restart recovery marks unfinished requests interrupted, and completed streaming requests retain their terminal Token and latency values after reload.
 - No model-cost CRUD, USD totals, cost columns, or provider cost-limit warnings are present.
 - OAuth quota remains display-only unless the upstream reports an explicit, unexpired rate-limit or exhaustion state; Share Token limits and Token Market sale pricing remain available in their owning screens.
 

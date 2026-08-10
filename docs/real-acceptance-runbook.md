@@ -245,10 +245,10 @@ Claude OAuth 专项补充：
 21. profile refresh 后 `organization.billing_type` 应进入 `profile.billingSource`；Apple/Stripe 不应改变 plan 或生成订阅到期日，未知 billing type 应原样保留。
 22. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出其固定 Provider 内的账号调度；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
 23. `GET /metrics` 应能看到账号 inflight/max、Claude retry、Provider outcome、warm-refresh、CLI version-gate、beta decision、count_tokens outcome 与 stream protocol error 指标；labels 必须保持固定枚举。该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
-24. 分别使用真实 `CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT` 与 `CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT` 完成 OAuth 登录并强制刷新 quota。Auth Center 账号行、Provider 账号选择器和订阅 quota 应分别稳定显示 `Claude Max 5x` / `Claude Max 20x`，后端 subscription `planType` 应分别为 `claude_max_5x` / `claude_max_20x`。不得提交 `accounts.json`、token、完整 profile/bootstrap/usage body 或未脱敏 email。
+24. 分别使用真实 `CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT` 与 `CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT` 完成 OAuth 登录；变量值使用账号 ID 或 email。设置 `SERVER_URL`、`CC_SWITCH_SERVER_TOKEN`、`CC_SWITCH_SHARE_URL` 和 `ROUTER_API_TOKEN` 后运行 `node scripts/smoke/claude-oauth-real.mjs`。脚本通过公开账号 API 强制刷新两个账号 quota，并独立验收普通 Share count_tokens、Messages JSON 与完整 SSE terminal。Auth Center 账号行、Provider 账号选择器和订阅 quota 应分别稳定显示 `Claude Max 5x` / `Claude Max 20x`，后端 subscription `planType` 应分别为 `claude_max_5x` / `claude_max_20x`。不得提交 `accounts.json`、token、完整 profile/bootstrap/roles/usage body 或未脱敏 email。
 25. 对每个真实等级只记录脱敏账号、`planType`、`planLabel`、evidence `source` / `stale` / `conflict`、HTTP 状态与时间。全新登录应优先由实时 usage/bootstrap/profile 证据解析且 `stale=false`；只有实时证据仅给通用 Max、兼容旧倍率被采用时才允许 `stale=true`。实时 5x 与 20x 相互冲突时必须出现 `claude_plan_conflict`，不能静默覆盖。
 26. 20x 已有本地 `default_claude_max_20x` fixture 证据，但仍需真实账号确认当前 Anthropic 响应。5x 当前只有同形 `..._5x` 解析规则，没有 checked-in 真实 fixture；在 5x 账号和脱敏响应证据齐备前，release evidence 必须写 `blocked-inputs` 或 `SKIP`，不得写 live passed。
-27. 真实专项账号缺少任一个时，只运行本地 resolver/API/UI 测试并将对应等级标为未验收；不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。
+27. 真实专项账号缺少任一个时，脚本会为对应等级输出独立 `[SKIP]`；只运行本地 resolver/API/UI 测试并将该等级标为未验收。不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。Share、5x、20x 三个 gate 的 SKIP/FAIL/PASS 必须分别记录，不能用其中一个 PASS 覆盖其他 gate 的缺失输入。
 
 Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Market 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-market-acceptance.md)。
 

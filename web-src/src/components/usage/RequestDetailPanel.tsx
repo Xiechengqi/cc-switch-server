@@ -1,385 +1,132 @@
 import { useTranslation } from "react-i18next";
+
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useRequestDetail } from "@/lib/query/usage";
-import {
-  getFreshInputTokens,
-  getTotalTokens,
-  hasObservedUsage,
-} from "@/types/usage";
+import { useUsageRequest } from "@/lib/query/usage";
+import { requestProcessedTokens, usageToken } from "@/types/usage";
+import { getLocaleFromLanguage } from "./format";
 
 interface RequestDetailPanelProps {
   requestId: string;
   onClose: () => void;
 }
 
-export function RequestDetailPanel({
-  requestId,
-  onClose,
-}: RequestDetailPanelProps) {
+function Detail({ label, value, mono = false }: { label: string; value: React.ReactNode; mono?: boolean }) {
+  return <div className="min-w-0"><dt className="text-xs text-muted-foreground">{label}</dt><dd className={`mt-1 break-words text-sm ${mono ? "font-mono text-xs" : ""}`}>{value ?? "-"}</dd></div>;
+}
+
+export function RequestDetailPanel({ requestId, onClose }: RequestDetailPanelProps) {
   const { t, i18n } = useTranslation();
-  const { data: request, isLoading } = useRequestDetail(requestId);
-  const dateLocale =
-    i18n.language === "zh"
-      ? "zh-CN"
-      : i18n.language === "zh-TW"
-        ? "zh-TW"
-        : i18n.language === "ja"
-          ? "ja-JP"
-          : "en-US";
-
-  if (isLoading) {
-    return (
-      <Dialog open onOpenChange={onClose}>
-        <DialogContent className="max-w-2xl">
-          <div className="h-[400px] animate-pulse rounded bg-muted" />
-        </DialogContent>
-      </Dialog>
-    );
-  }
-
-  if (!request) {
-    return (
-      <Dialog open onOpenChange={onClose}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle>
-          </DialogHeader>
-          <div className="text-center text-muted-foreground">
-            {t("usage.requestNotFound", "请求未找到")}
-          </div>
-        </DialogContent>
-      </Dialog>
-    );
-  }
-
-  const freshInput = getFreshInputTokens(request);
-  const usageObserved = hasObservedUsage(request);
-  const usageStateLabel = t(
-    `usage.usageState.${request.usageState || "observed"}`,
-    { defaultValue: request.usageState || "observed" },
-  );
-  const rawInput =
-    request.rawInputTokens ??
-    freshInput + request.cacheReadTokens + request.cacheCreationTokens;
-  const hasSeparateCachedInput = rawInput !== freshInput;
-  const totalTokens = getTotalTokens(request);
-  const hasImageOutput =
-    request.imageCount != null ||
-    request.imageBytes != null ||
-    request.imageFormat != null ||
-    request.imageSize != null;
-  const imageDimensions =
-    request.imageWidth != null && request.imageHeight != null
-      ? `${request.imageWidth} x ${request.imageHeight}`
-      : request.imageSize;
-  const hasRequestPolicy = Boolean(
-    request.requestedReasoningEffort ||
-    request.effectiveReasoningEffort ||
-    request.clientServiceTier ||
-    request.effectiveServiceTier ||
-    request.serviceTierDecision,
-  );
-  const fastDecision = request.serviceTierDecision
-    ? t(`usage.serviceTierDecision.${request.serviceTierDecision}`, {
-        defaultValue: request.serviceTierDecision,
-      })
-    : null;
+  const response = useUsageRequest(requestId);
+  const request = response.data?.data;
+  const locale = getLocaleFromLanguage(i18n.resolvedLanguage || i18n.language || "en");
+  const yes = t("usage.yes", "Yes");
+  const no = t("usage.no", "No");
+  const serviceTierDecision = request?.serviceTierDecision
+    ? t(`usage.serviceTierDecision.${request.serviceTierDecision}`, request.serviceTierDecision)
+    : undefined;
+  const imageDimensions = request?.imageWidth != null && request.imageHeight != null
+    ? `${request.imageWidth} x ${request.imageHeight}`
+    : request?.imageSize;
 
   return (
-    <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle>
-        </DialogHeader>
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+        <DialogHeader><DialogTitle>{t("usage.requestDetail", "请求详情")}</DialogTitle></DialogHeader>
+        {response.isLoading ? <div className="h-64 animate-pulse rounded bg-muted" /> : response.isError ? (
+          <div className="py-16 text-center text-muted-foreground">{t("usage.queryFailed", "查询失败")}</div>
+        ) : !request ? (
+          <div className="py-16 text-center text-muted-foreground">{t("usage.requestNotFound", "请求未找到")}</div>
+        ) : (
+          <div className="space-y-6">
+            <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <Detail label={t("usage.requestId", "请求 ID")} value={request.requestId} mono />
+              <Detail label={t("usage.recordKind", "记录类型")} value={request.recordKind} mono />
+              <Detail label={t("usage.parentRequestId", "父请求 ID")} value={request.parentRequestId} mono />
+              <Detail label={t("usage.startedAt", "开始时间")} value={new Date(request.startedAtMs).toLocaleString(locale)} />
+              <Detail label={t("usage.completedAt", "完成时间")} value={request.completedAtMs > 0 ? new Date(request.completedAtMs).toLocaleString(locale) : t("usage.pending", "进行中")} />
+              <Detail label={t("usage.outcome", "结果")} value={`${t(`usage.outcomeValue.${request.outcome}`, request.outcome)} (${request.statusCode})`} mono />
+              <Detail label={t("usage.failureKind", "失败分类")} value={request.failureKind} mono />
+              <Detail label={t("usage.errorMessage", "错误信息")} value={request.errorMessage} mono />
+              <Detail label={t("usage.usageStateLabel", "Usage 状态")} value={t(`usage.usageState.${request.usageState}`, request.usageState)} mono />
+              <Detail label={t("usage.usageRevision", "Usage 修订")} value={request.usageRevision} />
+              <Detail label={t("usage.usageEstimated", "估算 Usage")} value={request.usageEstimated ? yes : no} />
+            </dl>
 
-        <div className="space-y-4">
-          {/* 基本信息 */}
-          <div className="rounded-lg border p-4">
-            <h3 className="mb-3 font-semibold">
-              {t("usage.basicInfo", "基本信息")}
-            </h3>
-            {usageObserved ? (
-              <dl className="grid grid-cols-2 gap-3 text-sm">
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.requestId", "请求ID")}
-                </dt>
-                <dd className="font-mono">{request.requestId}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.time", "时间")}
-                </dt>
-                <dd>
-                  {new Date(request.createdAt * 1000).toLocaleString(
-                    dateLocale,
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.provider", "供应商")}
-                </dt>
-                <dd className="text-sm">
-                  <span className="font-medium">
-                    {request.providerName || t("usage.unknownProvider", "未知")}
-                  </span>
-                  <span className="ml-2 font-mono text-xs text-muted-foreground">
-                    {request.providerId}
-                  </span>
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.appType", "应用类型")}
-                </dt>
-                <dd>{request.appType}</dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.requestModel", "请求模型")}
-                </dt>
-                <dd className="font-mono">
-                  {request.requestedModel ||
-                    request.requestModel ||
-                    request.model}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.actualModel", "实际模型")}
-                </dt>
-                <dd className="font-mono">
-                  {request.actualModel || request.model}
-                </dd>
-                {request.actualModelSource && (
-                  <dd className="mt-1 text-xs text-muted-foreground">
-                    {request.actualModelSource}
-                  </dd>
-                )}
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.status", "状态")}
-                </dt>
-                <dd>
-                  <span
-                    className={`inline-flex rounded-full px-2 py-1 text-xs ${
-                      request.statusCode >= 200 && request.statusCode < 300
-                        ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                        : "bg-red-500/10 text-red-700 dark:text-red-300"
-                    }`}
-                  >
-                    {request.statusCode}
-                  </span>
-                </dd>
-              </div>
+            <section>
+              <h3 className="mb-3 text-sm font-semibold">{t("usage.routeIdentity", "路由与身份")}</h3>
+              <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <Detail label={t("usage.surface", "应用接口")} value={request.app} />
+                <Detail label={t("usage.providerBundle", "供应商 Bundle")} value={`${request.providerName} · ${request.bundleId}`} mono />
+                <Detail label={t("usage.familyId", "供应商家族")} value={request.familyId} mono />
+                <Detail label={t("usage.supportedApps", "支持的应用接口")} value={request.supportedApps.map((app) => t(`usage.appFilter.${app}`, app)).join(", ")} />
+                <Detail label={t("usage.providerId", "Surface Provider ID")} value={request.providerId} mono />
+                <Detail label={t("usage.providerType", "供应商类型")} value={request.providerType} mono />
+                <Detail label={t("usage.profileId", "Profile ID")} value={request.profileId} mono />
+                <Detail label={t("usage.account", "上游账号")} value={request.accountDisplay} mono />
+                <Detail label={t("usage.accountRef", "账号引用")} value={request.accountRef} mono />
+                <Detail label={t("usage.identityGeneration", "身份代次")} value={request.authIdentityGeneration} />
+                <Detail label={t("usage.share", "Share")} value={request.shareName} />
+                <Detail label={t("usage.shareId", "Share ID")} value={request.shareId} mono />
+                <Detail label={t("usage.shareSlug", "Share 子域名")} value={request.shareSlug} mono />
+                <Detail label={t("usage.userEmail", "用户邮箱")} value={request.userEmail} mono />
+                <Detail label={t("usage.userCountry", "用户国家/地区")} value={[request.userCountry, request.userCountryIso3].filter(Boolean).join(" · ") || undefined} />
+                <Detail label={t("usage.dataSourceLabel", "数据来源")} value={request.dataSource} mono />
+                <Detail label={t("usage.requestAgent", "请求客户端")} value={request.requestAgent} mono />
+                <Detail label={t("usage.sessionId", "会话 ID")} value={request.sessionId} mono />
               </dl>
-            ) : (
-              <div className="text-sm text-muted-foreground">
-                <div>{usageStateLabel}</div>
-                {request.streamStatus && (
-                  <div className="mt-1 font-mono text-xs">
-                    {request.streamStatus}
-                  </div>
-                )}
-              </div>
+            </section>
+
+            <section>
+              <h3 className="mb-3 text-sm font-semibold">{t("usage.modelPath", "模型路径")}</h3>
+              <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <Detail label={t("usage.requestedModel", "请求模型")} value={request.requestedModel || request.model} mono />
+                <Detail label={t("usage.actualModel", "实际上游模型")} value={request.actualModel || request.model} mono />
+                <Detail label={t("usage.actualModelSource", "模型决策来源")} value={request.actualModelSource} mono />
+                <Detail label={t("usage.requestedReasoningEffort", "请求推理等级")} value={request.requestedReasoningEffort} mono />
+                <Detail label={t("usage.effectiveReasoningEffort", "实际推理等级")} value={request.effectiveReasoningEffort} mono />
+                <Detail label={t("usage.clientServiceTier", "客户端 Service Tier")} value={request.clientServiceTier} mono />
+                <Detail label={t("usage.effectiveServiceTier", "实际 Service Tier")} value={request.effectiveServiceTier} mono />
+                <Detail label={t("usage.fastDecision", "Service Tier 决策")} value={serviceTierDecision} />
+                <Detail label={t("usage.attempts", "上游尝试次数")} value={request.attemptCount} />
+              </dl>
+            </section>
+
+            <section>
+              <h3 className="mb-3 text-sm font-semibold">{t("usage.performance", "性能与 Token")}</h3>
+              <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <Detail label={t("usage.endToEnd", "端到端耗时")} value={`${request.endToEndDurationMs} ms`} />
+                <Detail label={t("usage.upstreamDuration", "上游耗时")} value={`${request.upstreamDurationMs} ms`} />
+                <Detail label={t("usage.firstToken", "首 Token")} value={request.firstTokenMs == null ? "-" : `${request.firstTokenMs} ms`} />
+                <Detail label={t("usage.streaming", "流式请求")} value={request.isStreaming ? yes : no} />
+                <Detail label={t("usage.streamStatus", "流状态")} value={request.streamStatus} mono />
+                <Detail label={t("usage.processedTokens", "处理 Tokens")} value={requestProcessedTokens(request).toLocaleString(locale)} />
+                <Detail label={t("usage.rawInput", "原始输入")} value={request.rawInputTokens?.toLocaleString(locale)} />
+                <Detail label={t("usage.freshInput", "新增输入")} value={usageToken(request.inputTokens).toLocaleString(locale)} />
+                <Detail label={t("usage.output", "输出")} value={usageToken(request.outputTokens).toLocaleString(locale)} />
+                <Detail label={t("usage.cacheRead", "缓存读取")} value={usageToken(request.cacheReadTokens).toLocaleString(locale)} />
+                <Detail label={t("usage.cacheWrite", "缓存写入")} value={usageToken(request.cacheCreationTokens).toLocaleString(locale)} />
+                <Detail label={t("usage.reportedTotal", "上游上报总量")} value={request.totalTokens?.toLocaleString(locale)} />
+              </dl>
+            </section>
+
+            {(request.imageCount != null || request.imageBytes != null || request.imageFormat || imageDimensions) && (
+              <section>
+                <h3 className="mb-3 text-sm font-semibold">{t("usage.imageOutput", "图片输出")}</h3>
+                <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <Detail label={t("usage.imageCount", "图片数量")} value={request.imageCount} />
+                  <Detail label={t("usage.imageBytes", "输出字节")} value={request.imageBytes?.toLocaleString(locale)} />
+                  <Detail label={t("usage.imageFormat", "图片格式")} value={request.imageFormat} mono />
+                  <Detail label={t("usage.imageDimensions", "图片尺寸")} value={imageDimensions} mono />
+                </dl>
+              </section>
             )}
           </div>
-
-          {hasRequestPolicy && (
-            <div className="rounded-lg border p-4">
-              <h3 className="mb-3 font-semibold">{t("usage.requestPolicy")}</h3>
-              <dl className="grid grid-cols-2 gap-3 text-sm">
-                {request.requestedReasoningEffort && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.requestedReasoningEffort")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.requestedReasoningEffort}
-                    </dd>
-                  </div>
-                )}
-                {request.effectiveReasoningEffort && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.effectiveReasoningEffort")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.effectiveReasoningEffort}
-                    </dd>
-                  </div>
-                )}
-                {request.clientServiceTier && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.clientServiceTier")}
-                    </dt>
-                    <dd className="font-mono">{request.clientServiceTier}</dd>
-                  </div>
-                )}
-                {request.effectiveServiceTier && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.effectiveServiceTier")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.effectiveServiceTier}
-                    </dd>
-                  </div>
-                )}
-                {fastDecision && (
-                  <div className="col-span-2">
-                    <dt className="text-muted-foreground">
-                      {t("usage.fastDecision")}
-                    </dt>
-                    <dd>{fastDecision}</dd>
-                  </div>
-                )}
-              </dl>
-            </div>
-          )}
-
-          {/* Token 使用量 */}
-          <div className="rounded-lg border p-4">
-            <h3 className="mb-3 font-semibold">
-              {t("usage.tokenUsage", "Token 使用量")}
-            </h3>
-            <dl className="grid grid-cols-2 gap-3 text-sm">
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.inputTokens", "输入 Tokens")}
-                </dt>
-                <dd className="font-mono">
-                  {freshInput.toLocaleString()}
-                  {hasSeparateCachedInput && (
-                    <span className="ml-2 text-xs text-muted-foreground/70 font-normal">
-                      ({t("usage.rawInputLabel", "原始")}:{" "}
-                      {rawInput.toLocaleString()})
-                    </span>
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.outputTokens", "输出 Tokens")}
-                </dt>
-                <dd className="font-mono">
-                  {request.outputTokens.toLocaleString()}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.cacheReadTokens", "缓存读取")}
-                </dt>
-                <dd className="font-mono">
-                  {request.cacheReadTokens.toLocaleString()}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.cacheCreationTokens", "缓存写入")}
-                </dt>
-                <dd className="font-mono">
-                  {request.cacheCreationTokens.toLocaleString()}
-                </dd>
-              </div>
-              <div className="col-span-2">
-                <dt className="text-muted-foreground">
-                  {t("usage.totalTokens", "总计")}
-                </dt>
-                <dd className="text-lg font-semibold">
-                  {totalTokens.toLocaleString()}
-                </dd>
-              </div>
-            </dl>
-          </div>
-
-          {hasImageOutput && (
-            <div className="rounded-lg border p-4">
-              <h3 className="mb-3 font-semibold">
-                {t("usage.imageOutput", "图片输出")}
-              </h3>
-              <dl className="grid grid-cols-2 gap-3 text-sm">
-                {request.imageCount != null && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.imageCount", "图片数量")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.imageCount.toLocaleString()}
-                    </dd>
-                  </div>
-                )}
-                {request.imageBytes != null && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.imageBytes", "输出字节")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.imageBytes.toLocaleString()} B
-                    </dd>
-                  </div>
-                )}
-                {request.imageFormat && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.imageFormat", "图片格式")}
-                    </dt>
-                    <dd className="font-mono">{request.imageFormat}</dd>
-                  </div>
-                )}
-                {imageDimensions && (
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.imageDimensions", "图片尺寸")}
-                    </dt>
-                    <dd className="font-mono">{imageDimensions}</dd>
-                  </div>
-                )}
-              </dl>
-            </div>
-          )}
-
-          {/* 性能信息 */}
-          <div className="rounded-lg border p-4">
-            <h3 className="mb-3 font-semibold">
-              {t("usage.performance", "性能信息")}
-            </h3>
-            <dl className="grid grid-cols-2 gap-3 text-sm">
-              <div>
-                <dt className="text-muted-foreground">
-                  {t("usage.latency", "延迟")}
-                </dt>
-                <dd className="font-mono">{request.latencyMs}ms</dd>
-              </div>
-              {request.firstTokenMs != null && (
-                <div>
-                  <dt className="text-muted-foreground">
-                    {t("usage.firstToken", "首 Token")}
-                  </dt>
-                  <dd className="font-mono">{request.firstTokenMs}ms</dd>
-                </div>
-              )}
-            </dl>
-          </div>
-
-          {/* 错误信息 */}
-          {request.errorMessage && (
-            <div className="rounded-lg border border-red-200 bg-red-50 p-4">
-              <h3 className="mb-2 font-semibold text-red-700 dark:text-red-300">
-                {t("usage.errorMessage", "错误信息")}
-              </h3>
-              <p className="text-sm text-red-700">{request.errorMessage}</p>
-            </div>
-          )}
-        </div>
+        )}
       </DialogContent>
     </Dialog>
   );

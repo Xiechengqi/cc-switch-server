@@ -17,6 +17,9 @@ import {
   claudeBearerRelayPreset,
   claudeGoogleOAuthPreset,
   googleGeminiApiKeyPreset,
+  kimiCodeClaudePreset,
+  kimiCodeCodexPreset,
+  kimiCodeGeminiPreset,
   openAiApiKeyPreset,
 } from "@/server/directProviderPresets";
 import {
@@ -137,6 +140,15 @@ export function providerPresetForProfile(
   }
   if (profile.profileId === "gemini.google_api_key") {
     return googleGeminiApiKeyPreset;
+  }
+  if (profile.profileId === "claude.kimi_code") {
+    return kimiCodeClaudePreset;
+  }
+  if (profile.profileId === "codex.kimi_code") {
+    return kimiCodeCodexPreset;
+  }
+  if (profile.profileId === "gemini.kimi_code") {
+    return kimiCodeGeminiPreset;
   }
   const legacyName = legacyPresetNameForProfile(profile.app, profile.profileId);
   if (!legacyName) return undefined;

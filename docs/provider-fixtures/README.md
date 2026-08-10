@@ -10,3 +10,9 @@
 - OAuth/账号型 provider 没有真实凭据时，只能保存脱敏配置结构和协议样例，不能标记真实登录能力完成。
 
 OpenAI OAuth/Codex 的当前可执行协议样例保存在 `assets/contract/openai-oauth-protocol.json`。它固定官方 OAuth/上游地址、CLI callback、workspace header、可信 claim 合并样例和 WebSocket fallback 边界；Rust 单测直接消费 identity 与 fallback status 样例，修改实现或证据时必须同步更新并 review。
+
+Claude OAuth 的当前脱敏 wire capture 保存在 `assets/contract/claude-oauth-wire-profile.json`。它只保留 Claude Code/Stainless/Node/Axios 公开版本、endpoint identity family、token endpoint 顺序、CCH/beta 合同和静态模型 ID；token、账号标识、请求/响应 body 与未验证的私有 build metadata 明确排除。Rust 的 `ClaudeWireProfile`、Messages/CountTokens beta 矩阵、profile/bootstrap/roles 请求身份和静态模型目录以该 capture 为共同证据，任一项变化都必须同步更新 fixture、实现、测试和 `UPSTREAM_IMPORT.md`。
+
+Claude Max 20x 的本地 resolver 测试包含脱敏的 `default_claude_max_20x` 协议形状；5x 仅有同形解析规则。两者都不是 live credential evidence，仍必须分别通过 `scripts/smoke/claude-oauth-real.mjs` 的真实账号 gate 才能标记真实通过。
+
+Kiro 的机器可读协议合同保存在 `assets/contract/kiro-wire-protocol.json`。它固定单一显式账号、同账号 401 最多一次刷新和一次重放、不可覆盖的生产 inference endpoint、Claude/Codex 下游协议、严格 AWS EventStream、tool `stop=true` 出流门禁、图片预算、账号代际模型缓存、prompt-cache namespace 和稳定错误码；明确排除账号池、轮询、跨账号目录并集与故障转移。`src/proxy/kiro.rs`、`src/proxy/kiro/{endpoint,image,wire}.rs` 和 `src/clients/oauth/kiro_runtime.rs` 的 Rust 测试直接消费该 fixture。本地状态仅为 `fixture_verified`，真实账号仍为 `live_pending`。

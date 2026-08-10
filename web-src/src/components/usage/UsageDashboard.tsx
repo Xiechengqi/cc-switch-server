@@ -1,24 +1,8 @@
 import { useMemo, useState } from "react";
+import { Activity, BarChart3, LayoutGrid, ListFilter, RefreshCw, Share2 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { UsageHero } from "./UsageHero";
-import { UsageTrendChart } from "./UsageTrendChart";
-import { RequestLogTable } from "./RequestLogTable";
-import { ProviderStatsTable } from "./ProviderStatsTable";
-import { ModelStatsTable } from "./ModelStatsTable";
-import {
-  KNOWN_APP_TYPES,
-  type AppType,
-  type AppTypeFilter,
-  type UsageRangeSelection,
-} from "@/types/usage";
-import { motion } from "framer-motion";
-import {
-  BarChart3,
-  ListFilter,
-  Activity,
-  RefreshCw,
-  LayoutGrid,
-} from "lucide-react";
+
 import { ProviderIcon } from "@/components/ProviderIcon";
 import {
   Select,
@@ -27,339 +11,188 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useQueryClient } from "@tanstack/react-query";
-import { usageKeys, useModelStats, useProviderStats } from "@/lib/query/usage";
-import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
-import { cn } from "@/lib/utils";
-import { getLocaleFromLanguage } from "./format";
-import { getUsageRangePresetLabel, resolveUsageRange } from "@/lib/usageRange";
-import { UsageDateRangePicker } from "./UsageDateRangePicker";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
+import { usageKeys, useUsageFacets } from "@/lib/query/usage";
+import { getUsageRangePresetLabel, resolveUsageRange } from "@/lib/usageRange";
+import { cn } from "@/lib/utils";
+import {
+  USAGE_APPS,
+  type UsageApp,
+  type UsageAppFilter,
+  type UsageFilters,
+  type UsageOutcome,
+  type UsageRangeSelection,
+  type UsageState,
+} from "@/types/usage";
+import { getLocaleFromLanguage } from "./format";
+import { ModelStatsTable } from "./ModelStatsTable";
+import { ProviderStatsTable } from "./ProviderStatsTable";
+import { RequestDetailPanel } from "./RequestDetailPanel";
+import { RequestLogTable } from "./RequestLogTable";
+import { ShareUsageTable } from "./ShareUsageTable";
+import { UsageDateRangePicker } from "./UsageDateRangePicker";
+import { UsageHero } from "./UsageHero";
+import { UsageTrendChart } from "./UsageTrendChart";
 
-const APP_FILTER_OPTIONS: AppTypeFilter[] = ["all", ...KNOWN_APP_TYPES];
+const APP_ICONS: Record<UsageApp, string> = { claude: "claude", codex: "openai", gemini: "gemini" };
+const ALL = "__all__";
+const REFRESH_INTERVALS = [0, 10_000, 30_000, 60_000] as const;
 
-// 0 表示关闭自动刷新（refetchInterval=false）
-const REFRESH_INTERVAL_OPTIONS_MS = [0, 5000, 10000, 30000, 60000] as const;
+function encoded(value?: string | null) {
+  return value ? `v:${value}` : ALL;
+}
 
-// 与 AppSwitcher 的 appIconName 保持一致（codex 复用 openai 图标）
-const APP_FILTER_ICON: Record<AppType, string> = {
-  claude: "claude",
-  codex: "openai",
-  gemini: "gemini",
-  opencode: "opencode",
-};
-
-// Select 的 "all" 哨兵和用户自定义名称同处一个值域——真有来源/模型叫 "all"
-// 就会撞名（重复 value、选中即清空筛选）。动态选项统一加前缀编码隔离值域。
-const DYNAMIC_OPTION_PREFIX = "v:";
-const encodeOptionValue = (name: string) => `${DYNAMIC_OPTION_PREFIX}${name}`;
-const decodeOptionValue = (value: string) =>
-  value === "all" ? undefined : value.slice(DYNAMIC_OPTION_PREFIX.length);
+function decoded(value: string) {
+  return value === ALL ? undefined : value.slice(2);
+}
 
 export function UsageDashboard() {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [range, setRange] = useState<UsageRangeSelection>({ preset: "today" });
-  const [appType, setAppType] = useState<AppTypeFilter>("all");
-  const [providerName, setProviderName] = useState<string | undefined>(
-    undefined,
-  );
-  const [model, setModel] = useState<string | undefined>(undefined);
-  const [refreshIntervalMs, setRefreshIntervalMs] = useState(30000);
+  const [app, setApp] = useState<UsageAppFilter>("all");
+  const [bundleId, setBundleId] = useState<string>();
+  const [shareId, setShareId] = useState<string>();
+  const [userEmail, setUserEmail] = useState<string>();
+  const [modelKey, setModelKey] = useState<string>();
+  const [outcome, setOutcome] = useState<UsageOutcome>();
+  const [usageState, setUsageState] = useState<UsageState>();
+  const [refreshIntervalMs, setRefreshIntervalMs] = useState(30_000);
+  const [requestId, setRequestId] = useState<string>();
 
-  // 切应用时清掉下游筛选，避免留下一个在新范围内查无数据的"幽灵"组合；
-  // 切 Provider 同理清掉模型（模型选项随 Provider 级联）。
-  const changeAppType = (next: AppTypeFilter) => {
-    setAppType(next);
-    if (next !== appType) {
-      setProviderName(undefined);
-      setModel(undefined);
-    }
-  };
-  const changeProviderName = (next: string | undefined) => {
-    setProviderName(next);
-    if (next !== providerName) {
-      setModel(undefined);
-    }
-  };
-
-  // 后端写入新日志时 emit `usage-log-recorded`，本 hook 立刻 invalidate 所有
-  // usage 查询，实现实时刷新（仅在 Dashboard 挂载时生效，离开页面自动取消监听）
   useUsageEventBridge();
 
-  const changeRefreshInterval = (next: number) => {
-    setRefreshIntervalMs(next);
-    queryClient.invalidateQueries({ queryKey: usageKeys.all });
+  const parsedModel = useMemo(() => {
+    if (!modelKey) return undefined;
+    try {
+      const [modelApp, actualModel] = JSON.parse(modelKey) as [UsageApp, string];
+      return { app: modelApp, actualModel };
+    } catch {
+      return undefined;
+    }
+  }, [modelKey]);
+  const filters = useMemo<UsageFilters>(() => ({
+    app: app === "all" ? parsedModel?.app : app,
+    bundleId,
+    shareId,
+    userEmail,
+    actualModel: parsedModel?.actualModel,
+    outcome,
+    usageState,
+  }), [app, bundleId, outcome, parsedModel, shareId, usageState, userEmail]);
+
+  const facets = useUsageFacets({
+    range,
+    options: { refetchInterval: refreshIntervalMs || false },
+  }).data?.data;
+  const locale = getLocaleFromLanguage(i18n.resolvedLanguage || i18n.language || "en");
+  const resolvedRange = resolveUsageRange(range);
+  const rangeLabel = range.preset === "custom"
+    ? `${new Date(resolvedRange.startDate * 1_000).toLocaleString(locale)} - ${new Date(resolvedRange.endDate * 1_000).toLocaleString(locale)}`
+    : getUsageRangePresetLabel(range.preset, t);
+  const requestTableKey = JSON.stringify([
+    range.preset,
+    range.customStartDate ?? null,
+    range.customEndDate ?? null,
+    range.liveEndTime ?? false,
+    filters.app ?? null,
+    filters.bundleId ?? null,
+    filters.shareId ?? null,
+    filters.userEmail ?? null,
+    filters.actualModel ?? null,
+    filters.outcome ?? null,
+    filters.usageState ?? null,
+  ]);
+
+  const changeApp = (next: UsageAppFilter) => {
+    setApp(next);
+    if (parsedModel && parsedModel.app !== next) setModelKey(undefined);
   };
 
-  const language = i18n.resolvedLanguage || i18n.language || "en";
-  const locale = getLocaleFromLanguage(language);
-  const resolvedRange = useMemo(() => resolveUsageRange(range), [range]);
-  const rangeLabel = useMemo(() => {
-    if (range.preset !== "custom") {
-      return getUsageRangePresetLabel(range.preset, t);
+  const changeModel = (value: string) => {
+    const nextModelKey = decoded(value);
+    setModelKey(nextModelKey);
+    if (!nextModelKey) return;
+    try {
+      const [modelApp] = JSON.parse(nextModelKey) as [UsageApp, string];
+      setApp(modelApp);
+    } catch {
+      setModelKey(undefined);
     }
-
-    const startStr = new Date(resolvedRange.startDate * 1000).toLocaleString(
-      locale,
-    );
-
-    if (range.liveEndTime) {
-      return `${startStr} → ${t("usage.liveEndTimeNow", "现在")}`;
-    }
-
-    const endStr = new Date(resolvedRange.endDate * 1000).toLocaleString(
-      locale,
-    );
-    return `${startStr} - ${endStr}`;
-  }, [locale, range, resolvedRange.endDate, resolvedRange.startDate, t]);
-
-  // 顶栏下拉的选项池：Provider 列表只跟应用/时间范围走（不受自身选中值影响），
-  // 模型列表随所选 Provider 级联。两者都只列当前范围内真实有数据的条目。
-  // refetchInterval 必须跟随面板的刷新设置——未筛选时这两个查询与统计表共享
-  // query key，落下的话会以默认 30s 拖着同 key 查询一起轮询，"--" 形同虚设。
-  const optionsRefetch = {
-    refetchInterval:
-      refreshIntervalMs > 0 ? refreshIntervalMs : (false as const),
   };
-  const { data: providerOptionsData } = useProviderStats(
-    range,
-    { appType },
-    optionsRefetch,
-  );
-  const { data: modelOptionsData } = useModelStats(
-    range,
-    { appType, providerName },
-    optionsRefetch,
-  );
-
-  const providerOptions = useMemo(() => {
-    const names = new Set<string>();
-    for (const stat of providerOptionsData ?? []) {
-      names.add(stat.providerName);
-    }
-    // 数据刷新后选中项可能掉出列表（如改了时间范围）；补回去保证 Select
-    // 仍能渲染选中文案，用户看得见才能主动清除。
-    if (providerName) names.add(providerName);
-    return Array.from(names);
-  }, [providerOptionsData, providerName]);
-
-  const modelOptions = useMemo(() => {
-    const names = new Set<string>();
-    for (const stat of modelOptionsData ?? []) {
-      names.add(stat.model);
-    }
-    if (model) names.add(model);
-    return Array.from(names);
-  }, [modelOptionsData, model]);
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4 }}
-      className="space-y-8 pb-8"
-    >
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-2">
-        <div className="flex flex-col gap-1">
-          <h2 className="text-2xl font-bold tracking-tight">
-            {t("usage.title")}
-          </h2>
-          <p className="text-sm text-muted-foreground">{t("usage.subtitle")}</p>
+    <div className="space-y-6 pb-8">
+      <header className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold">{t("usage.title", "使用统计")}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{t("usage.subtitle", "查看经 Router Share 进入 Server 的请求、Token 与路由链路。")}</p>
         </div>
-
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center p-1 bg-muted/30 rounded-lg border border-border/50">
-            {APP_FILTER_OPTIONS.map((type) => {
-              const label = t(`usage.appFilter.${type}`);
-              return (
-                <button
-                  key={type}
-                  type="button"
-                  onClick={() => changeAppType(type)}
-                  title={label}
-                  aria-label={label}
-                  className={cn(
-                    "flex h-8 items-center justify-center px-2.5 rounded-md transition-all",
-                    appType === type
-                      ? "bg-background text-primary shadow-sm"
-                      : "text-muted-foreground hover:text-foreground hover:bg-muted/50",
-                  )}
-                >
-                  {type === "all" ? (
-                    <LayoutGrid className="h-4 w-4" />
-                  ) : (
-                    <ProviderIcon
-                      icon={APP_FILTER_ICON[type]}
-                      name={label}
-                      size={16}
-                    />
-                  )}
-                </button>
-              );
+          <div className="flex h-9 items-center rounded-md border bg-background p-1">
+            {(["all", ...USAGE_APPS] as UsageAppFilter[]).map((value) => {
+              const label = value === "all" ? t("common.all", "全部") : t(`usage.appFilter.${value}`, value);
+              return <button key={value} type="button" title={label} aria-label={label} onClick={() => changeApp(value)} className={cn("flex h-7 min-w-8 items-center justify-center rounded px-2", app === value ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground")}>
+                {value === "all" ? <LayoutGrid className="h-4 w-4" /> : <ProviderIcon icon={APP_ICONS[value]} name={value} size={16} />}
+              </button>;
             })}
           </div>
 
-          <Select
-            value={
-              providerName != null ? encodeOptionValue(providerName) : "all"
-            }
-            onValueChange={(v) => changeProviderName(decodeOptionValue(v))}
-          >
-            <SelectTrigger
-              className="h-9 w-[100px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
-              title={providerName ?? t("usage.filterBySource")}
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="max-w-[280px]">
-              <SelectItem value="all">{t("usage.allSources")}</SelectItem>
-              {providerOptions.map((name) => (
-                <SelectItem
-                  key={name}
-                  value={encodeOptionValue(name)}
-                  title={name}
-                  className="[&>span]:min-w-0 [&>span]:truncate"
-                >
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
+          <FilterSelect value={encoded(bundleId)} onChange={(value) => setBundleId(decoded(value))} placeholder={t("usage.allProviders", "所有供应商")}>
+            {(facets?.bundles ?? []).map((item) => <SelectItem key={item.bundleId} value={encoded(item.bundleId)}>{item.providerName}</SelectItem>)}
+          </FilterSelect>
+          <FilterSelect value={encoded(shareId)} onChange={(value) => setShareId(decoded(value))} placeholder={t("usage.allShares", "所有 Share")}>
+            {(facets?.shares ?? []).map((item) => <SelectItem key={item.shareId} value={encoded(item.shareId)}>{item.shareName || item.shareSlug || item.shareId}</SelectItem>)}
+          </FilterSelect>
+          <FilterSelect value={encoded(userEmail)} onChange={(value) => setUserEmail(decoded(value))} placeholder={t("usage.allUsers", "所有用户")}>
+            {(facets?.users ?? []).map((item) => <SelectItem key={item.userEmail} value={encoded(item.userEmail)}>{item.userEmail}</SelectItem>)}
+          </FilterSelect>
+          <FilterSelect value={modelKey ? encoded(modelKey) : ALL} onChange={changeModel} placeholder={t("usage.allModels", "所有模型")}>
+            {(facets?.models ?? []).filter((item) => app === "all" || item.app === app).map((item) => {
+              const key = JSON.stringify([item.app, item.actualModel]);
+              return <SelectItem key={key} value={encoded(key)}>{item.app} · {item.actualModel}</SelectItem>;
+            })}
+          </FilterSelect>
+          <FilterSelect value={encoded(outcome)} onChange={(value) => setOutcome(decoded(value) as UsageOutcome | undefined)} placeholder={t("usage.allOutcomes", "所有结果")}>
+            {(facets?.outcomes ?? []).map((item) => <SelectItem key={item.value} value={encoded(item.value)}>{t(`usage.outcomeValue.${item.value}`, item.value)}</SelectItem>)}
+          </FilterSelect>
+          <FilterSelect value={encoded(usageState)} onChange={(value) => setUsageState(decoded(value) as UsageState | undefined)} placeholder={t("usage.allUsageStates", "所有 Usage 状态")}>
+            {(facets?.usageStates ?? []).map((item) => <SelectItem key={item.value} value={encoded(item.value)}>{t(`usage.usageState.${item.value}`, item.value)}</SelectItem>)}
+          </FilterSelect>
+
+          <Select value={String(refreshIntervalMs)} onValueChange={(value) => { setRefreshIntervalMs(Number(value)); void queryClient.invalidateQueries({ queryKey: usageKeys.all }); }}>
+            <SelectTrigger className="h-9 w-[92px]" title={t("usage.refreshInterval", "刷新间隔")}><span className="flex items-center gap-2"><RefreshCw className="h-3.5 w-3.5" /><SelectValue /></span></SelectTrigger>
+            <SelectContent>{REFRESH_INTERVALS.map((value) => <SelectItem key={value} value={String(value)}>{value === 0 ? t("usage.refreshOff", "关闭") : `${value / 1_000}s`}</SelectItem>)}</SelectContent>
           </Select>
-
-          <Select
-            value={model != null ? encodeOptionValue(model) : "all"}
-            onValueChange={(v) => setModel(decodeOptionValue(v))}
-          >
-            <SelectTrigger
-              className="h-9 w-[100px] bg-background text-xs focus:border-border-default [&>span]:min-w-0 [&>span]:truncate"
-              title={model ?? t("usage.filterByModel")}
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="max-w-[280px]">
-              <SelectItem value="all">{t("usage.allModels")}</SelectItem>
-              {modelOptions.map((name) => (
-                <SelectItem
-                  key={name}
-                  value={encodeOptionValue(name)}
-                  title={name}
-                  className="[&>span]:min-w-0 [&>span]:truncate"
-                >
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <div className="flex items-center gap-2 ml-auto lg:ml-0">
-            <Select
-              value={String(refreshIntervalMs)}
-              onValueChange={(v) => changeRefreshInterval(Number(v))}
-            >
-              <SelectTrigger
-                className="h-9 w-[100px] bg-background text-xs focus:border-border-default"
-                title={t("usage.refreshInterval")}
-                aria-label={t("usage.refreshInterval")}
-              >
-                <span className="flex items-center gap-2">
-                  <RefreshCw className="h-3.5 w-3.5 shrink-0" />
-                  <SelectValue />
-                </span>
-              </SelectTrigger>
-              <SelectContent>
-                {REFRESH_INTERVAL_OPTIONS_MS.map((ms) => (
-                  <SelectItem key={ms} value={String(ms)}>
-                    {ms > 0 ? `${ms / 1000}s` : t("usage.refreshOff")}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            <UsageDateRangePicker
-              selection={range}
-              triggerLabel={rangeLabel}
-              onApply={(nextRange) => setRange(nextRange)}
-            />
-          </div>
+          <UsageDateRangePicker selection={range} triggerLabel={rangeLabel} onApply={setRange} />
         </div>
-      </div>
+      </header>
 
-      <UsageHero
-        range={range}
-        appType={appType === "all" ? undefined : appType}
-        providerName={providerName}
-        model={model}
-        refreshIntervalMs={refreshIntervalMs}
-      />
+      <UsageHero range={range} filters={filters} refreshIntervalMs={refreshIntervalMs} />
+      <UsageTrendChart range={range} filters={filters} rangeLabel={rangeLabel} refreshIntervalMs={refreshIntervalMs} />
 
-      <UsageTrendChart
-        range={range}
-        rangeLabel={rangeLabel}
-        appType={appType}
-        providerName={providerName}
-        model={model}
-        refreshIntervalMs={refreshIntervalMs}
-      />
+      <Tabs defaultValue="requests">
+        <TabsList>
+          <TabsTrigger value="requests" className="gap-2"><ListFilter className="h-4 w-4" />{t("usage.requestLogs", "请求记录")}</TabsTrigger>
+          <TabsTrigger value="providers" className="gap-2"><Activity className="h-4 w-4" />{t("usage.providerStats", "供应商")}</TabsTrigger>
+          <TabsTrigger value="models" className="gap-2"><BarChart3 className="h-4 w-4" />{t("usage.modelStats", "模型")}</TabsTrigger>
+          <TabsTrigger value="shares" className="gap-2"><Share2 className="h-4 w-4" />{t("usage.shareUsers", "Share / 用户")}</TabsTrigger>
+        </TabsList>
+        <TabsContent value="requests" className="mt-4"><RequestLogTable key={requestTableKey} range={range} filters={filters} refreshIntervalMs={refreshIntervalMs} onSelect={setRequestId} /></TabsContent>
+        <TabsContent value="providers" className="mt-4"><ProviderStatsTable range={range} filters={filters} refreshIntervalMs={refreshIntervalMs} /></TabsContent>
+        <TabsContent value="models" className="mt-4"><ModelStatsTable range={range} filters={filters} refreshIntervalMs={refreshIntervalMs} /></TabsContent>
+        <TabsContent value="shares" className="mt-4"><ShareUsageTable range={range} filters={filters} refreshIntervalMs={refreshIntervalMs} /></TabsContent>
+      </Tabs>
 
-      <div className="space-y-4">
-        <Tabs defaultValue="logs" className="w-full">
-          <div className="flex items-center justify-between mb-4">
-            <TabsList className="bg-muted/50">
-              <TabsTrigger value="logs" className="gap-2">
-                <ListFilter className="h-4 w-4" />
-                {t("usage.requestLogs")}
-              </TabsTrigger>
-              <TabsTrigger value="providers" className="gap-2">
-                <Activity className="h-4 w-4" />
-                {t("usage.providerStats")}
-              </TabsTrigger>
-              <TabsTrigger value="models" className="gap-2">
-                <BarChart3 className="h-4 w-4" />
-                {t("usage.modelStats")}
-              </TabsTrigger>
-            </TabsList>
-          </div>
-
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.2 }}
-          >
-            <TabsContent value="logs" className="mt-0">
-              <RequestLogTable
-                range={range}
-                rangeLabel={rangeLabel}
-                appType={appType}
-                providerName={providerName}
-                model={model}
-                refreshIntervalMs={refreshIntervalMs}
-                onRangeChange={setRange}
-              />
-            </TabsContent>
-
-            <TabsContent value="providers" className="mt-0">
-              <ProviderStatsTable
-                range={range}
-                appType={appType}
-                providerName={providerName}
-                model={model}
-                refreshIntervalMs={refreshIntervalMs}
-              />
-            </TabsContent>
-
-            <TabsContent value="models" className="mt-0">
-              <ModelStatsTable
-                range={range}
-                appType={appType}
-                providerName={providerName}
-                model={model}
-                refreshIntervalMs={refreshIntervalMs}
-              />
-            </TabsContent>
-          </motion.div>
-        </Tabs>
-      </div>
-    </motion.div>
+      {requestId && <RequestDetailPanel requestId={requestId} onClose={() => setRequestId(undefined)} />}
+    </div>
   );
+}
+
+function FilterSelect({ value, onChange, placeholder, children }: { value: string; onChange: (value: string) => void; placeholder: string; children: React.ReactNode }) {
+  return <Select value={value} onValueChange={onChange}>
+    <SelectTrigger className="h-9 w-[132px]" title={placeholder}><SelectValue /></SelectTrigger>
+    <SelectContent className="max-w-[320px]"><SelectItem value={ALL}>{placeholder}</SelectItem>{children}</SelectContent>
+  </Select>;
 }

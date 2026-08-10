@@ -49,7 +49,7 @@ pub struct AgentRunPlan {
     pub images: Vec<ImageRef>,
     pub tool_results: Vec<ToolResultBlock>,
     /// Cursor's `RequestedModel.model_id` — the value passed to
-    /// `resolve_requested_model`. Comes from the upstream-mapped body.
+    /// Cursor's model resolver. Comes from the upstream-mapped body.
     pub model_id: String,
     /// Optional Responses API `previous_response_id` — used to find a parked
     /// session.

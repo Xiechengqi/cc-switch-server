@@ -1164,7 +1164,82 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .ensure_operation_supported(proxy::provider_ops::ProviderOperation::Discovery)
         .map_err(ApiError::proxy)?;
+    if stored.provider_type == ProviderType::ClaudeOAuth
+        && execution.driver_is("oauth.claude_messages")
+    {
+        return Ok(claude_provider_models_fetch_result(
+            crate::clients::oauth::claude_models::static_claude_model_catalog(),
+        ));
+    }
     ensure_provider_outbound_allowed(state, execution).await?;
+    if stored.provider_type == ProviderType::KiroOAuth {
+        let managed_binding = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::KiroOAuth,
+                auth_identity_generation,
+            } if execution.driver_is("special.kiro") && !account_id.trim().is_empty() => {
+                Some((account_id.as_str(), *auth_identity_generation))
+            }
+            _ => None,
+        };
+        let mut result_url = "static://kiro/models".to_string();
+        let catalog = match managed_binding {
+            None => crate::clients::oauth::kiro_runtime::static_model_catalog(
+                "managed_account_binding_unavailable",
+            ),
+            Some((account_id, expected_generation)) => {
+                let refresh = state
+                    .refresh_managed_account_if_needed_for_generation(
+                        ProviderType::KiroOAuth,
+                        account_id,
+                        expected_generation,
+                    )
+                    .await;
+                if let Err(error) = refresh {
+                    tracing::warn!(error = ?error, "Kiro model discovery token refresh failed");
+                    crate::clients::oauth::kiro_runtime::static_model_catalog(
+                        "token_refresh_failed",
+                    )
+                } else if let Some(account) = state
+                    .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+                    .await
+                    .filter(|account| account.auth_identity_generation == expected_generation)
+                {
+                    #[cfg(test)]
+                    let endpoint_override = execution
+                        .plan
+                        .driver_options
+                        .get("testKiroModelsUrl")
+                        .and_then(Value::as_str);
+                    #[cfg(not(test))]
+                    let endpoint_override: Option<&str> = None;
+                    result_url = endpoint_override
+                        .map(str::to_string)
+                        .or_else(|| {
+                            crate::clients::oauth::kiro_runtime::model_discovery_url(&account).ok()
+                        })
+                        .unwrap_or_else(|| "static://kiro/models".to_string());
+                    let timeout = timeout_ms
+                        .filter(|value| *value > 0)
+                        .map(std::time::Duration::from_millis)
+                        .unwrap_or_else(|| execution.request_timeout());
+                    crate::clients::oauth::kiro_runtime::model_catalog_with_timeout(
+                        &state.http_client().await,
+                        &account,
+                        endpoint_override,
+                        timeout,
+                    )
+                    .await
+                } else {
+                    crate::clients::oauth::kiro_runtime::static_model_catalog(
+                        "bound_account_unavailable",
+                    )
+                }
+            }
+        };
+        return Ok(kiro_provider_models_fetch_result(catalog, &result_url));
+    }
     if stored.provider_type == ProviderType::GrokOAuth {
         let managed_binding = match &execution.plan.auth_ref {
             crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
@@ -1366,6 +1441,59 @@ fn grok_provider_models_fetch_result(
     }
 }
 
+fn kiro_provider_models_fetch_result(
+    catalog: crate::clients::oauth::kiro_runtime::KiroModelCatalog,
+    url: &str,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .models
+        .iter()
+        .map(|id| FetchedProviderModel {
+            id: id.clone(),
+            upstream_model: id.clone(),
+            display_name: None,
+            raw: serde_json::json!({
+                "id": id,
+                "object": "model",
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: url.to_string(),
+        models,
+        source: Some(catalog.source.to_string()),
+        stale: Some(catalog.stale),
+        fetched_at_ms: catalog.fetched_at_ms,
+    }
+}
+
+fn claude_provider_models_fetch_result(
+    catalog: crate::clients::oauth::claude_models::ClaudeModelCatalog,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .models
+        .iter()
+        .map(|id| FetchedProviderModel {
+            id: id.clone(),
+            upstream_model: id.clone(),
+            display_name: None,
+            raw: serde_json::json!({
+                "id": id,
+                "object": "model",
+                "wireProfileId": catalog.wire_profile_id,
+                "claudeCodeVersion": catalog.claude_code_version,
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: format!("static://{}/models", catalog.wire_profile_id),
+        models,
+        source: Some(catalog.source.to_string()),
+        stale: Some(catalog.stale),
+        fetched_at_ms: Some(catalog.fetched_at_ms),
+    }
+}
+
 pub(in crate::api) fn parse_provider_models(raw: &Value) -> Vec<FetchedProviderModel> {
     let models = raw
         .get("data")
@@ -1514,6 +1642,8 @@ fn s1_provider_for_profile(
                 "env": {"ANTHROPIC_BASE_URL": "https://cloudcode-pa.googleapis.com"}
             }),
         ),
+        "codex.kiro_oauth" => ("Kiro OAuth", json!({})),
+        "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi Code", json!({})),
         "codex.openai_api_key" => (
             "OpenAI API Key",
             json!({
@@ -1955,6 +2085,10 @@ pub(in crate::api) fn map_managed_account_refresh_error(
                 provider_type.as_str()
             ),
         ),
+        ManagedAccountRefreshError::InactiveCodexAccount => ApiError::conflict_code(
+            "cc_switch_codex_inactive_account",
+            "Codex OAuth account is no longer active",
+        ),
         ManagedAccountRefreshError::IdentityChanged { provider_type } => ApiError::conflict_code(
             "cc_switch_provider_account_identity_stale",
             format!(
@@ -2188,6 +2322,216 @@ mod tests {
             observed_authorization.lock().unwrap().as_str(),
             "Bearer grok-model-access"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_model_discovery_uses_only_the_explicit_codex_binding() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed_authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_route = std::sync::Arc::clone(&observed_authorizations);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |headers: HeaderMap| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    observed.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    axum::Json(json!({
+                        "models": [
+                            {"modelId": "kiro-bound-live"},
+                            {"modelId": "kiro-bound-live"}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("kiro-bound-model-catalog");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                for (id, token) in [
+                    ("kiro-bound-model-account", "kiro-bound-model-access"),
+                    ("kiro-unbound-model-account", "kiro-unbound-model-access"),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "kiro_oauth",
+                            "accessToken": token,
+                            "expiresAt": i64::MAX / 2,
+                            "profile": {
+                                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                                "apiRegion": "us-east-1",
+                                "machineId": id,
+                                "authMethod": "social"
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "kiro-codex-model-provider".to_string(),
+                        name: "Kiro Codex model provider".to_string(),
+                        settings_config: json!({"testKiroModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("kiro_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("kiro_oauth".to_string()),
+                                account_id: Some("kiro-bound-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Codex, "kiro-codex-model-provider")
+                .await
+                .unwrap();
+        assert!(execution.driver_is("special.kiro"));
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fetched.source.as_deref(),
+            Some("kiro_list_available_models")
+        );
+        assert_eq!(fetched.stale, Some(false));
+        assert_eq!(fetched.models.len(), 1);
+        assert_eq!(fetched.models[0].id, "kiro-bound-live");
+        assert_eq!(
+            observed_authorizations.lock().unwrap().as_slice(),
+            ["Bearer kiro-bound-model-access"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_model_discovery_is_static_and_performs_no_oauth_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({"access_token": "must-not-be-requested"}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("claude-static-model-catalog");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "claude-static-model-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "expired-access-token",
+                        "refreshToken": "refresh-that-must-not-be-used",
+                        "expiresAt": 1,
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Claude,
+                    Provider {
+                        id: "claude-static-model-provider".to_string(),
+                        name: "Claude static model provider".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("claude_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("claude_oauth".to_string()),
+                                account_id: Some("claude-static-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Claude,
+            "claude-static-model-provider",
+        )
+        .await
+        .unwrap();
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.source.as_deref(), Some("claude_code_wire_profile"));
+        assert_eq!(fetched.stale, Some(false));
+        assert_eq!(
+            fetched.fetched_at_ms,
+            Some(crate::clients::oauth::claude_models::CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS)
+        );
+        assert_eq!(
+            fetched
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS
+        );
+        assert!(fetched.models.iter().all(|model| {
+            model.raw["wireProfileId"] == crate::domain::claude_cli::CLAUDE_WIRE_PROFILE.id
+                && model.raw["claudeCodeVersion"]
+                    == crate::domain::claude_cli::CLAUDE_WIRE_PROFILE.claude_code_version
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         server.abort();
     }
 

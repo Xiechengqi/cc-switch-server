@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{OnceLock, RwLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,33 +13,69 @@ use sha2::Sha256;
 const ENVELOPE_PREFIX: &str = "ccswitch-server-reasoning-v1:";
 const KEY_INFO: &[u8] = b"cc-switch-server/proxy-reasoning-bridge/v1";
 const MAX_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(not(test))]
+const MAX_RETIRED_BRIDGE_KEYS: usize = 1;
+#[cfg(test)]
+const MAX_RETIRED_BRIDGE_KEYS: usize = 512;
 
 static BRIDGE_KEY: OnceLock<BridgeKeySlot> = OnceLock::new();
 
 #[derive(Debug)]
 struct BridgeKeySlot {
-    key: RwLock<[u8; 32]>,
+    keys: RwLock<BridgeKeys>,
+    max_retired: usize,
+}
+
+#[derive(Debug)]
+struct BridgeKeys {
+    current: [u8; 32],
+    retired: VecDeque<[u8; 32]>,
 }
 
 impl BridgeKeySlot {
     fn new(key: [u8; 32]) -> Self {
+        Self::with_retention(key, MAX_RETIRED_BRIDGE_KEYS)
+    }
+
+    fn with_retention(key: [u8; 32], max_retired: usize) -> Self {
         Self {
-            key: RwLock::new(key),
+            keys: RwLock::new(BridgeKeys {
+                current: key,
+                retired: VecDeque::with_capacity(max_retired),
+            }),
+            max_retired,
         }
     }
 
-    fn snapshot(&self) -> [u8; 32] {
-        *self
-            .key
+    fn current(&self) -> [u8; 32] {
+        self.keys
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
+    }
+
+    fn verification_keys(&self) -> Vec<[u8; 32]> {
+        let keys = self
+            .keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::iter::once(keys.current)
+            .chain(keys.retired.iter().copied())
+            .collect()
     }
 
     fn replace(&self, key: [u8; 32]) {
-        *self
-            .key
+        let mut keys = self
+            .keys
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = key;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keys.current == key {
+            return;
+        }
+        keys.retired.retain(|retired| *retired != key);
+        let current = std::mem::replace(&mut keys.current, key);
+        keys.retired.push_front(current);
+        keys.retired.truncate(self.max_retired);
     }
 }
 
@@ -206,7 +243,7 @@ fn encode_envelope(kind: EnvelopeKind, value: &Value) -> Option<String> {
         crate::metrics::record_reasoning_bridge("encode", "too_large");
         return None;
     }
-    let mut mac = Hmac::<Sha256>::new_from_slice(&bridge_key()).ok()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&bridge_keys().current()).ok()?;
     mac.update(ENVELOPE_PREFIX.as_bytes());
     mac.update(&payload);
     let tag = mac.finalize().into_bytes();
@@ -230,10 +267,14 @@ fn decode_envelope(encoded: &str, expected_kind: EnvelopeKind) -> Option<Value> 
     if payload.len() > MAX_ENVELOPE_BYTES {
         return None;
     }
-    let mut mac = Hmac::<Sha256>::new_from_slice(&bridge_key()).ok()?;
-    mac.update(ENVELOPE_PREFIX.as_bytes());
-    mac.update(&payload);
-    if mac.verify_slice(&tag).is_err() {
+    if !bridge_keys().verification_keys().iter().any(|key| {
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
+            return false;
+        };
+        mac.update(ENVELOPE_PREFIX.as_bytes());
+        mac.update(&payload);
+        mac.verify_slice(&tag).is_ok()
+    }) {
         crate::metrics::record_reasoning_bridge("decode", "invalid_mac");
         return None;
     }
@@ -246,15 +287,13 @@ fn decode_envelope(encoded: &str, expected_kind: EnvelopeKind) -> Option<Value> 
     Some(envelope.value)
 }
 
-fn bridge_key() -> [u8; 32] {
-    BRIDGE_KEY
-        .get_or_init(|| {
-            let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
-            tracing::debug!("using process-local proxy reasoning bridge key");
-            BridgeKeySlot::new(key)
-        })
-        .snapshot()
+fn bridge_keys() -> &'static BridgeKeySlot {
+    BRIDGE_KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        tracing::debug!("using process-local proxy reasoning bridge key");
+        BridgeKeySlot::new(key)
+    })
 }
 
 #[cfg(test)]
@@ -262,11 +301,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bridge_key_slot_replaces_key_atomically() {
-        let slot = BridgeKeySlot::new([1; 32]);
-        assert_eq!(slot.snapshot(), [1; 32]);
+    fn bridge_key_slot_retains_only_the_configured_history() {
+        let slot = BridgeKeySlot::with_retention([1; 32], 1);
+        assert_eq!(slot.current(), [1; 32]);
         slot.replace([2; 32]);
-        assert_eq!(slot.snapshot(), [2; 32]);
+        assert_eq!(slot.verification_keys(), vec![[2; 32], [1; 32]]);
+        slot.replace([3; 32]);
+        assert_eq!(slot.verification_keys(), vec![[3; 32], [2; 32]]);
     }
 
     #[test]
@@ -276,7 +317,11 @@ mod tests {
 
         replace_bridge_key(&slot, [2; 32]);
 
-        assert_eq!(slot.get().unwrap().snapshot(), [2; 32]);
+        assert_eq!(slot.get().unwrap().current(), [2; 32]);
+        assert_eq!(
+            slot.get().unwrap().verification_keys(),
+            vec![[2; 32], [1; 32]]
+        );
     }
 
     #[test]
@@ -290,6 +335,24 @@ mod tests {
         assert_ne!(
             derive_bridge_key(&root).unwrap(),
             derive_bridge_key(&[8; 32]).unwrap()
+        );
+    }
+
+    #[test]
+    fn envelope_created_before_key_rotation_remains_decodable() {
+        replace_bridge_key(&BRIDGE_KEY, [41; 32]);
+        let item = json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "in-flight"
+        });
+        let block = anthropic_block_from_openai_reasoning_item(&item).unwrap();
+
+        replace_bridge_key(&BRIDGE_KEY, [42; 32]);
+
+        assert_eq!(
+            openai_reasoning_item_from_anthropic_block(&block),
+            Some(item)
         );
     }
 

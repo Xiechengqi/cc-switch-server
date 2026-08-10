@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 use crate::clients::oauth::codex_device::CodexDeviceError;
 use crate::clients::oauth::copilot_device::CopilotDeviceError;
 use crate::clients::oauth::grok_device::GrokDeviceError;
+use crate::clients::oauth::kimi_device::KimiDeviceError;
 use crate::clients::oauth::kiro_device::KiroDeviceError;
 use crate::clients::router::email_auth::EmailAuthError;
 use crate::proxy;
@@ -373,6 +374,17 @@ impl ApiError {
         Self::new(StatusCode::BAD_GATEWAY, error.to_string())
     }
 
+    pub(crate) fn service_unavailable_code(code: &'static str, error: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: error.into(),
+            code: Some(code),
+            error_type: Some("unavailable_error"),
+            retryable: Some(true),
+            retry_after_seconds: Some(1),
+        }
+    }
+
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!("internal api error: {error}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
@@ -599,6 +611,13 @@ pub(crate) fn map_grok_device_error(error: GrokDeviceError) -> ApiError {
     )
 }
 
+pub(crate) fn map_kimi_device_error(error: KimiDeviceError) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        super::providers::redact_provider_test_error(&error.message),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +741,21 @@ mod tests {
         assert_eq!(body["type"].as_str(), Some("upstream_tool_json_error"));
         assert_eq!(body["retryable"].as_bool(), Some(false));
         assert!(!body["error"].as_str().unwrap().starts_with('['));
+
+        let response = ApiError::proxy(crate::proxy::ProxyError::kiro_tool_json(
+            crate::proxy::kiro::KiroToolJsonError::Limit {
+                tool_use_id: "toolu_2".to_string(),
+                name: "Write".to_string(),
+                bytes: 9,
+                max: 8,
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = json_body(response).await;
+        assert_eq!(body["code"].as_str(), Some("TOOL_JSON_LIMIT"));
+        assert_eq!(body["type"].as_str(), Some("upstream_tool_json_error"));
+        assert_eq!(body["retryable"].as_bool(), Some(false));
     }
 
     #[test]

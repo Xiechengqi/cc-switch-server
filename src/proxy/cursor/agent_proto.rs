@@ -18,6 +18,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+use super::model::resolve_cursor_model;
+
 pub const CURSOR_AGENT_PROTOCOL_REVISION: &str = "cursor-agent/2026.06.02-8c11d9f";
 
 // ─── Wire types ────────────────────────────────────────────────────────────
@@ -650,57 +652,6 @@ pub fn parse_trailers(payload: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-// ─── Model id translation ──────────────────────────────────────────────────
-
-/// Canonicalize known cursor composer spelling variants. Other ids pass through
-/// untouched (case preserved).
-pub fn normalize_cursor_model_id(model: &str) -> String {
-    let id = model.trim();
-    let alias = match id.to_ascii_lowercase().as_str() {
-        "" => Some("composer-2.5"),
-        "composer-2-5" => Some("composer-2.5"),
-        "composer-2.5-sdk" => Some("composer-2.5"),
-        "composer-latest" => Some("composer-2.5"),
-        "composer-2-5-fast" => Some("composer-2.5-fast"),
-        "composer-2.5-sdk-fast" => Some("composer-2.5-fast"),
-        "composer-latest-fast" => Some("composer-2.5-fast"),
-        _ => None,
-    };
-    alias.map(str::to_string).unwrap_or_else(|| id.to_string())
-}
-
-pub struct ResolvedModel {
-    pub model_id: String,
-    pub parameters: Vec<(String, String)>,
-}
-
-/// cursor-agent rewrites a few model ids before putting them on the wire:
-///   "auto"            → RequestedModel { model_id: "default" }
-///   "composer-*-fast" → RequestedModel { model_id: "composer-*",
-///                                        parameters: [{id: "fast", value: "true"}] }
-pub fn resolve_requested_model(model: &str) -> ResolvedModel {
-    let normalized = normalize_cursor_model_id(model);
-    if normalized == "auto" {
-        return ResolvedModel {
-            model_id: "default".to_string(),
-            parameters: Vec::new(),
-        };
-    }
-    if let Some(stripped) = normalized
-        .strip_suffix("-fast")
-        .filter(|_| normalized.starts_with("composer-"))
-    {
-        return ResolvedModel {
-            model_id: stripped.to_string(),
-            parameters: vec![("fast".to_string(), "true".to_string())],
-        };
-    }
-    ResolvedModel {
-        model_id: normalized,
-        parameters: Vec::new(),
-    }
-}
-
 // ─── google.protobuf.Value ─────────────────────────────────────────────────
 
 pub fn json_to_value_bytes(value: &Value) -> Bytes {
@@ -1049,7 +1000,7 @@ fn encode_selected_image_body(img: &EncodedImage) -> Bytes {
 
 /// Encode a full `AgentClientMessage { run_request: ... }`. Caller must wrap
 /// the returned payload in a Connect-RPC frame before writing to the h2 stream.
-pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Bytes {
+pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Result<Bytes, String> {
     let conversation_id = input
         .conversation_id
         .map(str::to_string)
@@ -1061,7 +1012,7 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Bytes {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(random_uuid_like);
 
-    let resolved = resolve_requested_model(input.model_id);
+    let resolved = resolve_cursor_model(input.model_id)?;
 
     // UserMessage { text, message_id, selected_context, mode=1 }
     let mut selected_context_parts: Vec<Bytes> = Vec::new();
@@ -1077,7 +1028,7 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Bytes {
             encode_string(UM_TEXT, input.user_text),
             encode_string(UM_MESSAGE_ID, &message_id),
             encode_message(UM_SELECTED_CONTEXT, &selected_context_parts),
-            encode_uint32(UM_MODE, 1),
+            encode_uint32(UM_MODE, resolved.mode.wire_value()),
         ],
     );
     let user_message_action = encode_message(CA_USER_MESSAGE_ACTION, &[user_message]);
@@ -1099,10 +1050,13 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Bytes {
 
     // RequestedModel { model_id, [parameters...] }
     let mut rm_parts = vec![encode_string(RM_MODEL_ID, &resolved.model_id)];
-    for (id, value) in &resolved.parameters {
+    if resolved.fast {
         rm_parts.push(encode_message(
             RM_PARAMETERS,
-            &[encode_string(RMP_ID, id), encode_string(RMP_VALUE, value)],
+            &[
+                encode_string(RMP_ID, "fast"),
+                encode_string(RMP_VALUE, "true"),
+            ],
         ));
     }
     let requested_model = encode_message(ARR_REQUESTED_MODEL, &rm_parts);
@@ -1127,7 +1081,7 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Bytes {
     let mcp_tools_block = encode_message(ARR_MCP_TOOLS, &tool_parts);
 
     // AgentRunRequest body in field-number order.
-    encode_message(
+    Ok(encode_message(
         ACM_RUN_REQUEST,
         &[
             conversation_state,
@@ -1139,7 +1093,7 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Bytes {
             encode_uint32(ARR_UNKNOWN_12, 0),
             encode_string(ARR_REQUEST_ID, &conversation_id),
         ],
-    )
+    ))
 }
 
 // ─── ExecClient encoders ───────────────────────────────────────────────────
@@ -1894,13 +1848,11 @@ mod tests {
 
     #[test]
     fn resolve_known_aliases() {
-        assert_eq!(normalize_cursor_model_id("auto"), "auto");
-        assert_eq!(normalize_cursor_model_id("composer-2-5"), "composer-2.5");
-        let r = resolve_requested_model("auto");
+        let r = resolve_cursor_model("auto").unwrap();
         assert_eq!(r.model_id, "default");
-        let r = resolve_requested_model("composer-2.5-fast");
+        let r = resolve_cursor_model("composer-2.5-fast").unwrap();
         assert_eq!(r.model_id, "composer-2.5");
-        assert_eq!(r.parameters, vec![("fast".to_string(), "true".to_string())]);
+        assert!(r.fast);
     }
 
     #[test]
@@ -1947,7 +1899,7 @@ mod tests {
             blob_store: None,
             images: Vec::new(),
         };
-        let body = encode_agent_run_request(&mut input);
+        let body = encode_agent_run_request(&mut input).unwrap();
         assert!(body.len() > 30, "encoded body too short");
         // Top-level must contain ACM_RUN_REQUEST (field 1, wire LEN).
         let first = FieldIter::new(&body)
@@ -1955,6 +1907,63 @@ mod tests {
             .expect("at least one field")
             .unwrap();
         assert_eq!(first.field, ACM_RUN_REQUEST);
+    }
+
+    #[test]
+    fn agent_run_request_encodes_plan_mode_and_fast_parameter() {
+        let mut input = AgentRunInput {
+            model_id: "cursor-plan:gpt-5.5-fast",
+            user_text: "hi there",
+            conversation_id: Some("conv-plan"),
+            message_id: Some("msg-plan"),
+            tools: Vec::new(),
+            system_prompt: None,
+            blob_store: None,
+            images: Vec::new(),
+        };
+        let body = encode_agent_run_request(&mut input).unwrap();
+
+        let run_request = field_bytes(&body, ACM_RUN_REQUEST);
+        let action = field_bytes(run_request, ARR_ACTION);
+        let user_message_action = field_bytes(action, CA_USER_MESSAGE_ACTION);
+        let user_message = field_bytes(user_message_action, UMA_USER_MESSAGE);
+        assert_eq!(field_varint(user_message, UM_MODE), 3);
+
+        let requested_model = field_bytes(run_request, ARR_REQUESTED_MODEL);
+        assert_eq!(field_string(requested_model, RM_MODEL_ID), "gpt-5.5");
+        let parameter = field_bytes(requested_model, RM_PARAMETERS);
+        assert_eq!(field_string(parameter, RMP_ID), "fast");
+        assert_eq!(field_string(parameter, RMP_VALUE), "true");
+    }
+
+    fn field_bytes(source: &[u8], field: u64) -> &[u8] {
+        FieldIter::new(source)
+            .flatten()
+            .find_map(|candidate| match candidate {
+                Field {
+                    field: candidate_field,
+                    value: FieldValue::Bytes(value),
+                } if candidate_field == field => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing bytes field {field}"))
+    }
+
+    fn field_varint(source: &[u8], field: u64) -> u64 {
+        FieldIter::new(source)
+            .flatten()
+            .find_map(|candidate| match candidate {
+                Field {
+                    field: candidate_field,
+                    value: FieldValue::Varint(value),
+                } if candidate_field == field => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing varint field {field}"))
+    }
+
+    fn field_string(source: &[u8], field: u64) -> &str {
+        std::str::from_utf8(field_bytes(source, field)).unwrap()
     }
 
     #[test]

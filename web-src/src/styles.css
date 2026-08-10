@@ -351,63 +351,10 @@ to{
 }.empty-state strong{
   color: hsl(var(--foreground));
   font-size: 1rem;
-}.readiness-flag.active{
-  background: hsl(var(--success) / 0.14);
-  color: hsl(var(--foreground));
 }.icon-button.danger{
   color: hsl(var(--danger));
-}.auth-readiness-card header span:not(.status-pill){
-  color: hsl(var(--muted-foreground));
-  font-size: 0.74rem;
-}.icon-picker-grid button.active{
-  border-color: hsl(var(--ring));
-  background: hsl(var(--primary) / 0.12);
-}.share-binding-chip.muted{
-  color: hsl(var(--muted-foreground));
-}.settings-tabs button.active{
-  background: hsl(var(--background));
-  color: hsl(var(--foreground));
-  box-shadow: 0 1px 2px hsl(0 0% 0% / 0.08);
-}.settings-card.wide{
-  grid-column: 1 / -1;
-}.theme-option.active{
-  border-color: hsl(var(--primary) / 0.45);
-  background: hsl(var(--primary) / 0.1);
-  color: hsl(var(--foreground));
-}.settings-overview-card span:not(.status-pill){
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}.settings-overview-card span:not(.status-pill){
-  color: hsl(var(--muted-foreground));
-  font-size: 0.74rem;
-}.settings-readiness-item span:not(.status-pill){
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}.settings-readiness-item span:not(.status-pill){
-  color: hsl(var(--muted-foreground));
-  font-size: 0.74rem;
-}.diagnostics-card header span:not(.status-pill){
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}.diagnostics-card header span:not(.status-pill){
-  color: hsl(var(--muted-foreground));
-  font-size: 0.74rem;
 }@media (max-width: 520px){.brand{
     grid-template-columns: 1fr;
   }.brand svg{
     display: none;
-  }}.desktop-mini-toggle.active{
-  border-color: hsl(var(--success) / 0.4);
-  background: hsl(var(--success) / 0.12);
-  color: hsl(var(--foreground));
-}.desktop-app-switcher button.active{
-  background: hsl(var(--background));
-  color: hsl(var(--foreground));
-  box-shadow: 0 1px 2px hsl(0 0% 0% / 0.08);
-}
+  }}

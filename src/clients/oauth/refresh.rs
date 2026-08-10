@@ -29,6 +29,9 @@ pub struct AccountRefreshFailure {
     pub retryable: bool,
     pub retry_after_ms: Option<i64>,
     pub immediate_relogin: bool,
+    /// The token endpoint may have accepted and rotated the refresh token, but no
+    /// complete credential receipt was obtained. Reusing the old token is unsafe.
+    pub outcome_unknown: bool,
     pub(crate) endpoint_fallback_safe: bool,
 }
 
@@ -42,6 +45,7 @@ impl AccountRefreshFailure {
             retryable: false,
             retry_after_ms: None,
             immediate_relogin: false,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -55,6 +59,7 @@ impl AccountRefreshFailure {
             retryable: true,
             retry_after_ms: None,
             immediate_relogin: false,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -64,6 +69,7 @@ impl AccountRefreshFailure {
         error: crate::infra::http::BoundedResponseBodyError,
     ) -> Self {
         let endpoint_fallback_safe = error.is_connect();
+        let outcome_unknown = !endpoint_fallback_safe;
         let (kind, retryable) = match &error {
             crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
                 (OAuthErrorKind::Parse, false)
@@ -79,7 +85,8 @@ impl AccountRefreshFailure {
             kind,
             retryable,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: outcome_unknown,
+            outcome_unknown,
             endpoint_fallback_safe,
         }
     }
@@ -93,6 +100,7 @@ impl AccountRefreshFailure {
             retryable: true,
             retry_after_ms: None,
             immediate_relogin: false,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -106,6 +114,7 @@ impl AccountRefreshFailure {
             retryable: true,
             retry_after_ms: None,
             immediate_relogin: false,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -119,6 +128,7 @@ impl AccountRefreshFailure {
             retryable: false,
             retry_after_ms: None,
             immediate_relogin: false,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -143,6 +153,7 @@ impl AccountRefreshFailure {
             retryable: classification.retryable,
             retry_after_ms: None,
             immediate_relogin,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         }
     }
@@ -150,6 +161,20 @@ impl AccountRefreshFailure {
     fn with_retry_after(mut self, retry_after_ms: Option<i64>) -> Self {
         self.retry_after_ms = retry_after_ms;
         self
+    }
+
+    pub(crate) fn outcome_unknown(message: impl Into<String>) -> Self {
+        Self {
+            status_code: 502,
+            upstream_status: None,
+            message: message.into(),
+            kind: OAuthErrorKind::Unknown,
+            retryable: false,
+            retry_after_ms: None,
+            immediate_relogin: true,
+            outcome_unknown: true,
+            endpoint_fallback_safe: false,
+        }
     }
 }
 
@@ -217,6 +242,7 @@ where
             retryable: failure.retryable,
             retry_after_ms: failure.retry_after_ms,
             immediate_relogin: failure.immediate_relogin,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         });
     }
@@ -437,13 +463,13 @@ where
         }
 
         let raw: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| {
-            AccountRefreshFailure::parse(format!(
+            AccountRefreshFailure::outcome_unknown(format!(
                 "OAuth refresh response is not valid JSON: {error}"
             ))
         })?;
         let token_response: OAuthTokenResponse =
             serde_json::from_value(raw.clone()).map_err(|error| {
-                AccountRefreshFailure::parse(format!(
+                AccountRefreshFailure::outcome_unknown(format!(
                     "OAuth refresh response is missing token fields: {error}"
                 ))
             })?;
@@ -513,6 +539,57 @@ pub async fn validate_native_account_refresh_receipt(
         } else {
             require_existing_verified_grok_subject(account)?;
         }
+    } else if account.provider_type == ProviderType::KimiCode {
+        let access_token = update
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                AccountRefreshFailure::parse("Kimi refresh receipt has no access token")
+            })?;
+        let refreshed_user_id =
+            crate::domain::kimi_cli::extract_user_id(access_token).ok_or_else(|| {
+                AccountRefreshFailure::parse(
+                    "Kimi refresh access token has no stable userId identity claim",
+                )
+            })?;
+        let previous_user_id =
+            crate::domain::kimi_cli::user_id_from_profile(account.profile.as_ref()).or_else(|| {
+                account
+                    .access_token
+                    .as_deref()
+                    .and_then(crate::domain::kimi_cli::extract_user_id)
+            });
+        if previous_user_id
+            .as_deref()
+            .is_some_and(|previous| previous != refreshed_user_id)
+        {
+            return Err(AccountRefreshFailure {
+                status_code: 409,
+                upstream_status: None,
+                message: "Kimi OAuth refresh returned a different user identity; re-login as a new account"
+                    .to_string(),
+                kind: OAuthErrorKind::InvalidGrant,
+                retryable: false,
+                retry_after_ms: None,
+                immediate_relogin: true,
+                outcome_unknown: true,
+                endpoint_fallback_safe: false,
+            });
+        }
+        let device =
+            crate::domain::kimi_cli::device_identity_from_profile(account.profile.as_ref())
+                .ok_or_else(|| {
+                    AccountRefreshFailure::parse(
+                        "Kimi account is missing its account-scoped device identity",
+                    )
+                })?;
+        crate::domain::kimi_cli::enrich_profile(
+            &mut update.profile,
+            Some(&refreshed_user_id),
+            &device,
+        );
     }
     if let Some(raw) = update.raw.take() {
         update.raw = Some(merge_account_refresh_raw(account.raw.as_ref(), raw));
@@ -528,7 +605,8 @@ pub async fn validate_native_account_refresh_receipt(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: true,
+            outcome_unknown: true,
             endpoint_fallback_safe: false,
         });
     }
@@ -553,7 +631,8 @@ fn openai_jwt_refresh_failure(
         },
         retryable,
         retry_after_ms: None,
-        immediate_relogin: false,
+        immediate_relogin: !retryable,
+        outcome_unknown: !retryable,
         endpoint_fallback_safe: false,
     }
 }
@@ -577,7 +656,8 @@ fn grok_jwt_refresh_failure(
         },
         retryable,
         retry_after_ms: None,
-        immediate_relogin: false,
+        immediate_relogin: !retryable,
+        outcome_unknown: !retryable,
         endpoint_fallback_safe: false,
     }
 }
@@ -605,7 +685,8 @@ fn ensure_openai_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: true,
+            outcome_unknown: true,
             endpoint_fallback_safe: false,
         })?;
 
@@ -617,7 +698,8 @@ fn ensure_openai_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: true,
+            outcome_unknown: true,
             endpoint_fallback_safe: false,
         });
     }
@@ -635,7 +717,8 @@ fn require_existing_verified_grok_subject(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: true,
+            outcome_unknown: true,
             endpoint_fallback_safe: false,
         }
     })
@@ -658,7 +741,8 @@ fn ensure_grok_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: true,
+            outcome_unknown: true,
             endpoint_fallback_safe: false,
         })?;
     if existing_subject != refreshed_subject {
@@ -669,7 +753,8 @@ fn ensure_grok_refresh_subject_matches(
             kind: OAuthErrorKind::InvalidGrant,
             retryable: false,
             retry_after_ms: None,
-            immediate_relogin: false,
+            immediate_relogin: true,
+            outcome_unknown: true,
             endpoint_fallback_safe: false,
         });
     }
@@ -1319,11 +1404,11 @@ mod tests {
         );
 
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].url, "https://api.anthropic.com/v1/oauth/token");
         assert_eq!(
-            requests[1].url,
+            requests[0].url,
             "https://platform.claude.com/v1/oauth/token"
         );
+        assert_eq!(requests[1].url, "https://api.anthropic.com/v1/oauth/token");
     }
 
     #[test]
@@ -1343,7 +1428,7 @@ mod tests {
         assert!(requests[0]
             .headers
             .iter()
-            .any(|(name, value)| name == "User-Agent" && value == "axios/1.13.6"));
+            .any(|(name, value)| name == "User-Agent" && value == "axios/1.15.2"));
     }
 
     #[test]
@@ -1746,6 +1831,7 @@ mod tests {
                 retryable: true,
                 retry_after_ms: None,
                 immediate_relogin: false,
+                outcome_unknown: false,
                 endpoint_fallback_safe: false,
             };
             assert!(!oauth_endpoint_fallback_allowed(&error), "{kind:?}");

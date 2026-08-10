@@ -20,6 +20,11 @@ export type ProviderAuthScheme =
   | "custom_header"
   | "query";
 
+export type ProviderModelPolicy = "passthrough" | "single";
+export type ProviderModelPolicyScope = "global" | "per_app";
+export type ProviderModelPolicySource =
+  "bundle_global" | "app_independent" | "profile_fixed";
+
 export interface ProviderCustomBinding {
   upstreamProtocol: ProviderUpstreamProtocol;
   authScheme: ProviderAuthScheme;
@@ -92,6 +97,7 @@ export interface ProviderBundleView {
   notes?: string;
   icon?: string;
   iconColor?: string;
+  modelPolicyScope: ProviderModelPolicyScope;
   supportedApps: CoreProviderApp[];
   enabledApps: CoreProviderApp[];
   credentialConfigured: boolean;
@@ -103,6 +109,8 @@ export interface ProviderBundleSurfaceWriteDraft {
   app: CoreProviderApp;
   enabled: boolean;
   profileId: string;
+  modelPolicy?: ProviderModelPolicy;
+  upstreamModel?: string;
   endpoint?: string;
   testModel?: string;
   transport?: {
@@ -130,7 +138,8 @@ export interface ProviderBundleWriteDraft {
   notes?: string;
   icon?: string;
   iconColor?: string;
-  modelPolicy: "passthrough" | "single";
+  modelPolicyScope: ProviderModelPolicyScope;
+  modelPolicy?: ProviderModelPolicy;
   upstreamModel?: string;
   managedAccount?: {
     accountId: string;

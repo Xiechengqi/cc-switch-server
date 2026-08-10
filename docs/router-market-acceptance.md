@@ -39,7 +39,7 @@ export STREAM_PROBE=0
 8. Router Share URL 调 `/v1/responses`。
 9. market api URL 调 `/v1/responses`。
 10. `POST /api/usage/router-sync/retry`。
-11. 导出 shares、provider health、usage logs。
+11. 导出 shares、provider health、Usage 请求记录。
 
 推荐直接运行：
 
@@ -125,5 +125,5 @@ Router 内建 Share Market 会将单个 entitlement 的增删转换成 pending s
 - `/api/router/diagnostics`。
 - `/api/router/tunnels`。
 - `/api/shares`。
-- `/api/usage/logs?limit=20`。
+- 已登录 Server Web 会话下的 `/web-api/usage/requests?fromMs=<start>&toMs=<end>&limit=20`。
 - router/market 对应错误响应或后台日志摘要。

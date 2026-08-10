@@ -42,18 +42,19 @@ Claude / Codex / Gemini client
 - 已实现 Codex Chat Completions 与 Responses 的直接互转，保留 max/reasoning/response_format/tool/usage 等 Codex bridge 关键字段。
 - 已接入 Claude/Codex/Gemini/OpenAI-compatible/Gemini-native/Anthropic-native 之间的主要跨协议 adapter contract，并把 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset 纳入 coverage。
 - Cursor AgentService 已默认接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；Provider maturity 保持 Experimental，直到 OAuth/API key 真实验收矩阵通过。
-- GitHub Copilot 和 Kiro 已提供 device flow 静态导入路径；真实 token refresh、live models、usage 和 proxy 回归完成前仍保持 fallback/manual-import。
+- GitHub Copilot 已提供 device flow 静态导入路径，真实 token/live models/stream 回归完成前保持 fallback。Kiro 已有 server-native refresh、模型发现和 Claude/Codex 非流/流式桥，本地协议合同为 Native/fixture-verified；真实账号的模型、usage、401 rollover、tool/image 与限流验收仍为 live pending。
 - Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
 - Managed OAuth Provider Bundle 必须显式绑定账号。Codex OAuth 的 active account 仅是账号中心独立操作的目标，不重绑 Provider 或 Share，也不参与数据面路由。所有外部推理请求只能通过 Router 暴露的同一个 Share URL 进入；Server 校验 Router ingress 签名和 Share 身份后，由 Share binding 精确选择 Claude/Codex/Gemini Surface 及其绑定账号。请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
+- Provider Bundle 的模型策略默认由全局控制，可切换为按 App 独立控制；只有至少两个 App Surface 支持可配置策略时才允许独立模式。Profile 固定策略不接受覆盖，Server Web、Share descriptor 与 Router 均显式展示其为固定例外。
 - Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
 - Codex context overflow 自动压缩可通过 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 显式启用；它只在业务输出提交前使用同一账号做一次有界摘要和重试，默认关闭且摘要 usage 独立记录。
 - 支持 router installation register、client tunnel、share tunnel、share batch sync、Router Share request log sync、pending share edit pull/ack/event 监听。
 - Router ingress 新鲜度采用非对称边界:最多接受 30 秒前签发、最多接受未来 5 秒签发的上下文,边界值有效。验签失败仍返回空正文 `401`,同时用 `x-cc-switch-internal-ingress-*` 向 Router 提供稳定原因码和时间诊断；这些内部响应头必须由 Router 剥离,不得传给公网调用方。普通业务 `401` 不附该诊断头。
 - 支持 Router 内建 Share Market entitlement add/revoke 通过 pending edit 幂等应用到 Server Share，并同步 per-app 授权展示状态。
-- usage log 记录 requestId、sessionId、source、provider、model、stream status、cache/usage detail，并提供 summary/trends/provider/model stats。
+- Usage 记录完整 request lifecycle、Provider Bundle/Surface、Share/用户、实际上游模型、重试、延迟与 Token 观测状态，并通过 Server-native REST 提供聚合、筛选、明细和 cursor 分页。
 - usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。
 - JSON 写入使用 temp file fsync、atomic rename 和父目录 fsync；`/api/backup` 支持创建、列出、恢复主要 store，恢复前自动 pre-restore 快照。
-- `/api/events` 通过 SSE 推送 usage/share/tunnel 事件，Web 当前页会 debounce 刷新。
+- `/web-api/events` 通过已认证 SSE 推送 Usage/Share/tunnel 事件，Web 当前页会刷新对应查询缓存。
 - `cc-switch-server version --json` 和 `/version` 会输出版本、commit id、commit message、build time、target、profile、rustc 和 dirty 状态。
 
 ## Code Agent 反代支持
@@ -273,8 +274,9 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | 配置目录 | `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR`，默认 `~/.cc-switch-server` |
 | 静态 Web | 默认使用构建时内嵌到 binary 的 Web UI；`--web-dist-dir` / `CC_SWITCH_SERVER_WEB_DIST_DIR` 仅用于开发或调试时覆盖静态目录 |
 | 日志级别 | `--log-level` / `CC_SWITCH_SERVER_LOG`，默认 `info` |
-| 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时，允许当前 Router 通过受签名保护的 Client 控制接口按需读取当前进程最近最多 100 行脱敏日志；Server 不主动上传日志 |
+| 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时记录请求生命周期、Provider 选择、重试/切换和终态等脱敏结构化 INFO 审计事件，并通过 installation 身份签名批量上传到当前 Router；不上传请求/响应正文、凭据、邮箱或任意 tracing 文本 |
 | 持久日志 | `<config-dir>/log/cc-switch-server.log` 跨进程保留供本机诊断；单文件达到 8 MiB 后轮转，并在同目录保留最近 2 个备份，不按日志时间清理 |
+| 审计日志缓冲 | `<config-dir>/log/audit-events.jsonl` 是 Router 上传前的本地 spool；单文件达到 16 MiB 后轮转并保留最近 7 个备份，上传端按 cursor 增量读取且 batch 不跨 boot stream，cursor 通过私有临时文件写入、`fsync`、原子替换和父目录同步持久化；Router 不可用时按上限留存并指数退避重试；spool writer 遇到临时文件错误会保留待写事件并自动退避恢复，队列或 writer 不可用时新的推理请求保持 fail-closed，已接纳请求的 terminal 事件即使采集开关随后关闭或 writer 暂时降级仍会排队等待恢复，恢复后补记脱敏状态事件；规范化 Router API 地址或 installation 任一变化，以及 cursor 缺失或损坏时，都会先隔离既有 backlog，避免日志跨 Client 或跨 Router 泄露 |
 | Router 心跳 | `CC_SWITCH_SERVER_ROUTER_HEARTBEAT_INTERVAL_SECS`，默认 `60` 秒，实际发送间隔带 ±10% jitter（允许范围 `15`-`60` 秒） |
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
 | Managed OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
@@ -292,11 +294,11 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 主要本地 store：
 
 - `server.json`：owner、password hash、router、client tunnel subdomain 和 installation identity。
-- `providers.json`：Claude / Codex / Gemini 供应商配置（按应用维度管理）。
+- `providers.json`：Provider Bundle 及其 Claude / Codex / Gemini Surface 配置。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
 - `shares.json` / `tunnels.json`：Share、binding、ACL、Router 管理的 Share Market entitlement 和 tunnel runtime。
-- `usage-logs.jsonl` / `usage-rollups.json`：请求明细和统计 rollup。
+- `usage/`：`manifest.json` 描述 schema 1 存储合同，`requests.json` 保留最近 32 天请求明细，`events/YYYY-MM-DD.jsonl` 是待压缩 journal，`rollups.json` 保留 Share 用户配额所需的长期聚合。Server 不读取或迁移旧版根目录 Usage 文件。
 - `image-capabilities/`：默认的短期图片 capability payload/metadata；URL 默认跨重启有效 1 小时，内容仍属于敏感生成结果。
 - `email-auth.json` 及运行时生成的日志/备份目录。
 
@@ -336,13 +338,22 @@ cc-switch-server config migrate-provider-store --cleanup-snapshot
 - `POST /api/auth/login`
 - `GET /api/provider-coverage`
 - `GET /api/provider-matrix`
-- `GET /api/events`
+- `GET /web-api/events`
 - `GET /api/backup`
 - `GET /api/providers`
 - `GET /api/accounts`
 - `GET /api/shares`
 - `GET /api/router/tunnels`
-- `GET /api/usage/summary`
+- `GET /web-api/usage/overview`
+- `GET /web-api/usage/trends`
+- `GET /web-api/usage/facets`
+- `GET /web-api/usage/provider-bundles`
+- `GET /web-api/usage/models`
+- `GET /web-api/usage/shares`
+- `GET /web-api/usage/requests`
+- `GET /web-api/usage/requests/:id`
+
+Usage 查询使用 `[fromMs, toMs)`，明细范围最多 32 天；趋势接口单次最多返回 2,000 个时间桶。
 
 Router Share URL 下的反代入口：
 
@@ -351,7 +362,7 @@ Router Share URL 下的反代入口：
 - `POST /v1/responses`
 - `POST /v1beta/*`
 
-完整接口以 `src/http.rs` 的 router 定义为准。
+完整接口以 `src/api/mod.rs` 的 router 定义为准。
 
 ## 文档
 
@@ -359,6 +370,8 @@ Router Share URL 下的反代入口：
 - [UI 人工验收清单](docs/manual-ui-checklist.md)
 - [部署](docs/deployment.md)
 - [真实验收 runbook](docs/real-acceptance-runbook.md)
+- [Kimi Code 单账号反代](docs/kimi-code-single-account.md)
+- [Grok OAuth 单账号反代](docs/grok-oauth-single-account.md)
 - [Cursor AgentService 验收](docs/cursor-agentservice-acceptance.md)
 - [Codex OAuth 单账号反代](docs/codex-oauth-single-account.md)
 - [provider 覆盖](docs/provider-coverage.md)

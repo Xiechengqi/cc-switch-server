@@ -23,6 +23,8 @@ pub struct WebRuntimeContract {
     pub excluded_features: Vec<WebRuntimeFeature>,
     #[serde(default)]
     pub commands: Vec<WebRuntimeCommand>,
+    #[serde(default)]
+    pub rest_endpoints: Vec<WebRuntimeEndpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,18 @@ pub struct WebRuntimeCommand {
     pub feature: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebRuntimeEndpoint {
+    pub method: String,
+    pub path: String,
+    pub feature: String,
+    pub authentication: String,
+    pub response_envelope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -118,6 +132,23 @@ mod tests {
                     "excluded command cannot be implemented"
                 );
             }
+        }
+
+        let mut endpoints = BTreeSet::new();
+        for endpoint in &contract.rest_endpoints {
+            assert!(
+                endpoints.insert((endpoint.method.as_str(), endpoint.path.as_str())),
+                "duplicate REST endpoint {} {}",
+                endpoint.method,
+                endpoint.path
+            );
+            assert!(
+                features.contains(endpoint.feature.as_str()),
+                "REST endpoint {} {} references unknown feature {}",
+                endpoint.method,
+                endpoint.path,
+                endpoint.feature
+            );
         }
     }
 }

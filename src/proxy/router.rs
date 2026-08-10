@@ -169,7 +169,10 @@ pub(super) fn provider_supports_claude_count_tokens(provider: &StoredProvider) -
     provider.app == AppKind::Claude
         && matches!(
             provider.provider_type,
-            ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth
+            ProviderType::Claude
+                | ProviderType::ClaudeAuth
+                | ProviderType::ClaudeOAuth
+                | ProviderType::KiroOAuth
         )
 }
 

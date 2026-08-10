@@ -1,216 +1,86 @@
 import { useTranslation } from "react-i18next";
 import {
-  AreaChart,
   Area,
+  AreaChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  Legend,
 } from "recharts";
+
 import { useUsageTrends } from "@/lib/query/usage";
-import { Loader2 } from "lucide-react";
+import type { UsageFilters, UsageRangeSelection } from "@/types/usage";
 import { fmtInt, getLocaleFromLanguage } from "./format";
-import { resolveUsageRange } from "@/lib/usageRange";
-import type { UsageRangeSelection } from "@/types/usage";
 
 interface UsageTrendChartProps {
   range: UsageRangeSelection;
+  filters: UsageFilters;
   rangeLabel: string;
-  appType?: string;
-  providerName?: string;
-  model?: string;
   refreshIntervalMs: number;
 }
 
 export function UsageTrendChart({
   range,
+  filters,
   rangeLabel,
-  appType,
-  providerName,
-  model,
   refreshIntervalMs,
 }: UsageTrendChartProps) {
   const { t, i18n } = useTranslation();
-  const { startDate, endDate } = resolveUsageRange(range);
-  const { data: trends, isLoading } = useUsageTrends(
+  const response = useUsageTrends({
     range,
-    { appType, providerName, model },
-    {
-      refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
-    },
-  );
-
-  if (isLoading) {
-    return (
-      <div className="flex h-[350px] items-center justify-center rounded-xl bg-card/40 border border-border/50">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground/30" />
-      </div>
-    );
-  }
-
-  const durationSeconds = Math.max(endDate - startDate, 0);
-  const isHourly = durationSeconds <= 24 * 60 * 60;
-  const language = i18n.resolvedLanguage || i18n.language || "en";
-  const dateLocale = getLocaleFromLanguage(language);
-  const chartData =
-    trends?.map((stat) => {
-      const pointDate = new Date(stat.date);
-      return {
-        rawDate: stat.date,
-        label: isHourly
-          ? pointDate.toLocaleString(dateLocale, {
-              month: "2-digit",
-              day: "2-digit",
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          : pointDate.toLocaleDateString(dateLocale, {
-              month: "2-digit",
-              day: "2-digit",
-            }),
-        hour: pointDate.getHours(),
-        inputTokens: stat.totalInputTokens,
-        outputTokens: stat.totalOutputTokens,
-        cacheCreationTokens: stat.totalCacheCreationTokens,
-        cacheReadTokens: stat.totalCacheReadTokens,
-      };
-    }) || [];
-
-  const displayData = chartData;
-
-  const CustomTooltip = ({ active, payload, label }: any) => {
-    if (active && payload && payload.length) {
-      return (
-        <div className="rounded-lg border bg-background/95 p-3 shadow-lg backdrop-blur-md">
-          <p className="mb-2 font-medium">{label}</p>
-          {payload.map((entry: any, index: number) => (
-            <div
-              key={index}
-              className="flex items-center gap-2 text-sm"
-              style={{ color: entry.color }}
-            >
-              <div
-                className="h-2 w-2 rounded-full"
-                style={{ backgroundColor: entry.color }}
-              />
-              <span className="font-medium">{entry.name}:</span>
-              <span>
-                {fmtInt(entry.value, dateLocale)}
-              </span>
-            </div>
-          ))}
-        </div>
-      );
-    }
-    return null;
-  };
+    filters,
+    options: { refetchInterval: refreshIntervalMs || false },
+  });
+  const locale = getLocaleFromLanguage(i18n.resolvedLanguage || i18n.language || "en");
+  const data = (response.data?.data ?? []).map((point) => ({
+    label: new Date(point.startMs).toLocaleString(locale, {
+      month: "2-digit",
+      day: "2-digit",
+      hour: range.preset === "today" || range.preset === "1d" ? "2-digit" : undefined,
+    }),
+    input: point.metrics.freshInputTokens,
+    output: point.metrics.outputTokens,
+    cacheRead: point.metrics.cacheReadTokens,
+    cacheWrite: point.metrics.cacheCreationTokens,
+  }));
 
   return (
-    <div className="rounded-xl border border-border/50 bg-card/40 p-6 backdrop-blur-sm">
-      <div className="mb-6 flex items-center justify-between">
-        <h3 className="text-lg font-semibold">
-          {t("usage.trends", "使用趋势")}
-        </h3>
-        <p className="text-sm text-muted-foreground">{rangeLabel}</p>
+    <section className="rounded-md border bg-card p-4">
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <h3 className="text-sm font-semibold">{t("usage.trends", "使用趋势")}</h3>
+        <span className="truncate text-xs text-muted-foreground" title={rangeLabel}>
+          {rangeLabel}
+        </span>
       </div>
-
-      <div className="h-[350px] w-full">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart
-            data={displayData}
-            margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
-          >
-            <defs>
-              <linearGradient id="colorInput" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-              </linearGradient>
-              <linearGradient id="colorOutput" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#22c55e" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
-              </linearGradient>
-              <linearGradient
-                id="colorCacheCreation"
-                x1="0"
-                y1="0"
-                x2="0"
-                y2="1"
-              >
-                <stop offset="5%" stopColor="#f97316" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#f97316" stopOpacity={0} />
-              </linearGradient>
-              <linearGradient id="colorCacheRead" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#a855f7" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#a855f7" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid
-              strokeDasharray="3 3"
-              vertical={false}
-              stroke="hsl(var(--border))"
-              opacity={0.4}
-            />
-            <XAxis
-              dataKey="label"
-              axisLine={false}
-              tickLine={false}
-              tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
-              dy={10}
-            />
+      <div className="h-[300px] min-w-0">
+        {response.isLoading ? (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">{t("common.loading", "加载中")}</div>
+        ) : response.isError ? (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">{t("usage.queryFailed", "查询失败")}</div>
+        ) : data.length === 0 ? (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">{t("usage.noData", "暂无数据")}</div>
+        ) : <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} opacity={0.35} />
+            <XAxis dataKey="label" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
             <YAxis
-              yAxisId="tokens"
-              axisLine={false}
+              tick={{ fontSize: 11 }}
               tickLine={false}
-              tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
-              tickFormatter={(value) => `${(value / 1000).toFixed(0)}k`}
+              axisLine={false}
+              tickFormatter={(value) => fmtInt(Number(value), locale)}
+              width={56}
             />
-            <Tooltip content={<CustomTooltip />} />
-            <Legend />
-            <Area
-              yAxisId="tokens"
-              type="monotone"
-              dataKey="inputTokens"
-              name={t("usage.inputTokens", "输入 Tokens")}
-              stroke="#3b82f6"
-              fillOpacity={1}
-              fill="url(#colorInput)"
-              strokeWidth={2}
-            />
-            <Area
-              yAxisId="tokens"
-              type="monotone"
-              dataKey="outputTokens"
-              name={t("usage.outputTokens", "输出 Tokens")}
-              stroke="#22c55e"
-              fillOpacity={1}
-              fill="url(#colorOutput)"
-              strokeWidth={2}
-            />
-            <Area
-              yAxisId="tokens"
-              type="monotone"
-              dataKey="cacheCreationTokens"
-              name={t("usage.cacheCreationTokens", "缓存创建")}
-              stroke="#f97316"
-              fillOpacity={1}
-              fill="url(#colorCacheCreation)"
-              strokeWidth={2}
-            />
-            <Area
-              yAxisId="tokens"
-              type="monotone"
-              dataKey="cacheReadTokens"
-              name={t("usage.cacheReadTokens", "缓存命中")}
-              stroke="#a855f7"
-              fillOpacity={1}
-              fill="url(#colorCacheRead)"
-              strokeWidth={2}
-            />
+            <Tooltip formatter={(value) => fmtInt(Number(value), locale)} />
+            <Legend wrapperStyle={{ fontSize: 12 }} />
+            <Area type="monotone" dataKey="input" name={t("usage.freshInput", "新增输入")} stroke="#2563eb" fill="#2563eb" fillOpacity={0.08} />
+            <Area type="monotone" dataKey="output" name={t("usage.output", "输出")} stroke="#16a34a" fill="#16a34a" fillOpacity={0.06} />
+            <Area type="monotone" dataKey="cacheRead" name={t("usage.cacheRead", "缓存读取")} stroke="#0891b2" fill="#0891b2" fillOpacity={0.05} />
+            <Area type="monotone" dataKey="cacheWrite" name={t("usage.cacheWrite", "缓存写入")} stroke="#d97706" fill="#d97706" fillOpacity={0.05} />
           </AreaChart>
-        </ResponsiveContainer>
+        </ResponsiveContainer>}
       </div>
-    </div>
+    </section>
   );
 }

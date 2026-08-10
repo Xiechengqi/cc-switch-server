@@ -27,7 +27,7 @@ const refreshSource = process.argv.includes("--refresh-source");
 
 const expectedCounts = Object.freeze({
   upstreamProviderTypes: 16,
-  serverProviderTypes: 20,
+  serverProviderTypes: 21,
   appPresets: Object.freeze({ claude: 15, codex: 7, gemini: 4 }),
   universalRecipes: 2,
   serverPresets: Object.freeze({ claude: 16, codex: 8, gemini: 5 }),
@@ -36,8 +36,12 @@ const reviewedFirstClassProfileAdditions = Object.freeze([
   "claude.anthropic_api_key",
   "claude.bearer_relay",
   "claude.google_oauth",
+  "claude.kimi_code",
+  "codex.kiro_oauth",
+  "codex.kimi_code",
   "codex.openai_api_key",
   "gemini.google_api_key",
+  "gemini.kimi_code",
 ]);
 
 const sourceFiles = {

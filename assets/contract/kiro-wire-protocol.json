@@ -1,0 +1,157 @@
+{
+  "format": "cc-switch-kiro-wire-protocol",
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-10T00:00:00Z",
+  "provenance": {
+    "kind": "sanitized_protocol_comparison",
+    "reference": "kiro.rs external protocol implementation",
+    "containsSecrets": false,
+    "liveVerified": false,
+    "notes": "This fixture records only the Server contract derived from a read-only protocol comparison. It excludes credentials, account identifiers, raw production payloads, account-pool behavior, and external UI or storage design."
+  },
+  "accountBinding": {
+    "mode": "single_explicit_account",
+    "accountPool": false,
+    "rotation": false,
+    "crossAccountFailover": false,
+    "crossProviderFailover": false,
+    "unauthorizedRecovery": {
+      "status": 401,
+      "refreshAttempts": 1,
+      "replayAttempts": 1,
+      "maxInferenceAttempts": 2,
+      "target": "same_bound_account"
+    }
+  },
+  "endpoints": {
+    "defaultRegion": "us-east-1",
+    "productionOverrideAllowed": false,
+    "ide": {
+      "method": "POST",
+      "url": "https://q.{region}.amazonaws.com/generateAssistantResponse",
+      "contentType": "application/json",
+      "agentMode": "vibe"
+    },
+    "cli": {
+      "method": "POST",
+      "url": "https://q.{region}.amazonaws.com/",
+      "contentType": "application/x-amz-json-1.0",
+      "xAmzTarget": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+    },
+    "models": {
+      "method": "GET",
+      "url": "https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+    }
+  },
+  "downstreamSurfaces": {
+    "claudeMessages": {
+      "app": "claude",
+      "route": "/v1/messages",
+      "adapter": "claude_kiro_codewhisperer",
+      "wireFormat": "anthropic_messages",
+      "nonStream": true,
+      "stream": true,
+      "supported": true
+    },
+    "claudeCountTokens": {
+      "app": "claude",
+      "route": "/v1/messages/count_tokens",
+      "localOnly": true,
+      "supported": true
+    },
+    "codexChatCompletions": {
+      "app": "codex",
+      "route": "/v1/chat/completions",
+      "adapter": "codex_to_kiro_anthropic",
+      "wireFormat": "openai_chat",
+      "nonStream": true,
+      "stream": true,
+      "supported": true
+    },
+    "codexResponses": {
+      "app": "codex",
+      "route": "/v1/responses",
+      "adapter": "codex_to_kiro_anthropic",
+      "wireFormat": "openai_responses",
+      "nonStream": true,
+      "stream": true,
+      "supported": true
+    },
+    "gemini": {
+      "app": "gemini",
+      "route": "/v1beta/*",
+      "supported": false
+    }
+  },
+  "eventStream": {
+    "encoding": "aws_event_stream",
+    "decoderMode": "strict_fail_closed",
+    "preludeCrcRequired": true,
+    "messageCrcRequired": true,
+    "messageTypePolicy": "missing_or_event_plus_terminal_error_exception",
+    "unexpectedEof": "error",
+    "maxFrameBytes": 16777216,
+    "maxBufferedBytes": 16777228,
+    "typedEvents": [
+      "assistantResponseEvent",
+      "codeEvent",
+      "reasoningContentEvent",
+      "toolUseEvent",
+      "contextUsageEvent",
+      "metricsEvent",
+      "messageMetadataEvent",
+      "metadataEvent",
+      "meteringEvent",
+      "endEvent"
+    ],
+    "unknownEventPolicy": "require_valid_json_then_ignore",
+    "errorFramePolicy": "terminal_error_never_text"
+  },
+  "tools": {
+    "jsonRelease": "stop_true_after_complete_json",
+    "emitBeforeStop": false,
+    "maxBufferedJsonBytes": 16777216,
+    "claudeCodeBuiltinBridge": true,
+    "invalidJsonCode": "TOOL_JSON_INVALID",
+    "incompleteJsonCode": "TOOL_JSON_INCOMPLETE",
+    "limitCode": "TOOL_JSON_LIMIT"
+  },
+  "images": {
+    "maxImages": 20,
+    "maxDecodedInputBytesPerImage": 8388608,
+    "maxTotalOutputBytes": 20971520,
+    "resizeThresholdBytes": 400000,
+    "maxLongSide": 1568,
+    "maxDecodeLongSide": 16384,
+    "maxDecodePixels": 67108864,
+    "jpegQuality": 85,
+    "mimeFromMagicBytes": true,
+    "duplicatePolicy": "keep_newest"
+  },
+  "modelDiscovery": {
+    "cacheScope": ["account_id", "auth_identity_generation"],
+    "freshTtlMs": 300000,
+    "staleTtlMs": 86400000,
+    "liveCatalogPolicy": "replace_static",
+    "crossAccountUnion": false,
+    "fallbackSource": "kiro_static_fallback"
+  },
+  "promptCache": {
+    "namespaceComponents": ["provider_id", "account_id", "auth_identity_generation", "route", "session"],
+    "capacity": 4096,
+    "defaultTtlSeconds": 300,
+    "maxTtlSeconds": 3600
+  },
+  "errorCodes": {
+    "invalidEventStream": "KIRO_EVENT_STREAM_INVALID",
+    "eventStreamLimit": "KIRO_EVENT_STREAM_LIMIT",
+    "upstreamErrorFrame": "KIRO_UPSTREAM_STREAM_ERROR",
+    "invalidToolJson": "TOOL_JSON_INVALID",
+    "incompleteToolJson": "TOOL_JSON_INCOMPLETE",
+    "toolJsonLimit": "TOOL_JSON_LIMIT"
+  },
+  "acceptance": {
+    "localContract": "fixture_verified",
+    "realAccount": "live_pending"
+  }
+}

@@ -28,7 +28,7 @@ instead.
    data directory.
 2. Archive or synchronize the complete directory, including hidden files,
    permissions, `accounts.json`, `accounts.key`, `server.json`, `providers.json`,
-   Share/tunnel state, usage journals, logs, and backup snapshots.
+   Share/tunnel state, the complete `usage/` directory, logs, and backup snapshots.
 3. Verify the transfer with a checksum or an equivalent integrity check.
 4. Keep cc-switch-server stopped on the target, place the directory at the
    resolved target path, and restore ownership to the target service user.
@@ -70,6 +70,8 @@ After startup, verify all of the following before deleting the source copy:
 - Every Share URL reconnects with the same binding, owner, ShareTo ACL, limits,
   and market state.
 - Recent usage/request history is present with its Token totals and dimensions.
+- Historical Usage rollups remain present even when request detail is older than
+  the 32-day detail-retention window.
 
 For rollback, stop the target before restarting the untouched source instance.
 Do not allow both instances to reconnect to Router at the same time.

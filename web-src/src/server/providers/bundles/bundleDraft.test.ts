@@ -7,12 +7,15 @@ import type {
 } from "@/lib/api/providers";
 import { familyById, providerRegistry } from "@/server/providerRegistry";
 import {
+  changeModelPolicyScope,
   createProviderBundleDraft,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
+  perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
+  supportsPerAppModelPolicy,
   toProviderBundleWriteDraft,
   updateBundleModel,
   updateSurfaceEndpoint,
@@ -101,6 +104,7 @@ describe("Provider Bundle drafts", () => {
     draft.accountGeneration = 7;
 
     const write = toProviderBundleWriteDraft(draft);
+    expect(write.modelPolicyScope).toBe("global");
     expect(write.modelPolicy).toBe("single");
     expect(write.upstreamModel).toBe("grok-shared-model");
     expect(write.managedAccount).toEqual({
@@ -116,6 +120,53 @@ describe("Provider Bundle drafts", () => {
     );
     expect(passthrough.modelPolicy).toBe("passthrough");
     expect(passthrough.upstreamModel).toBeUndefined();
+  });
+
+  it("writes independent model policies only at configurable Surface scope", () => {
+    const family = familyById("family.grok_oauth")!;
+    let draft = changeModelPolicyScope(
+      createProviderBundleDraft(family),
+      "per_app",
+    );
+    draft.accountId = "grok-account";
+    draft.accountGeneration = 7;
+    draft.surfaces[0]!.modelPolicy = "single";
+    draft.surfaces[0]!.upstreamModel = "claude-model";
+    draft.surfaces[1]!.modelPolicy = "passthrough";
+    draft.surfaces[2]!.modelPolicy = "single";
+    draft.surfaces[2]!.upstreamModel = "gemini-model";
+
+    expect(supportsPerAppModelPolicy(family)).toBe(true);
+    expect(perAppModelPoliciesDiffer(draft)).toBe(true);
+    expect(validateProviderBundleDraft(draft)).toBeNull();
+
+    const write = toProviderBundleWriteDraft(draft);
+    expect(write).toMatchObject({
+      modelPolicyScope: "per_app",
+      modelPolicy: undefined,
+      upstreamModel: undefined,
+      surfaces: [
+        {
+          app: "claude",
+          modelPolicy: "single",
+          upstreamModel: "claude-model",
+        },
+        {
+          app: "codex",
+          modelPolicy: "passthrough",
+          upstreamModel: undefined,
+        },
+        {
+          app: "gemini",
+          modelPolicy: "single",
+          upstreamModel: "gemini-model",
+        },
+      ],
+    });
+
+    draft = changeModelPolicyScope(draft, "global");
+    expect(draft.modelPolicyScope).toBe("global");
+    expect(toProviderBundleWriteDraft(draft).modelPolicy).toBe("single");
   });
 
   it("keeps preset identity canonical while Custom HTTP remains editable", () => {
@@ -154,6 +205,7 @@ describe("Provider Bundle drafts", () => {
     );
 
     const openaiFamily = familyById("family.openai_oauth")!;
+    expect(supportsPerAppModelPolicy(openaiFamily)).toBe(false);
     const openaiDraft = createProviderBundleDraft(openaiFamily);
     expect(modelPoliciesForFamily(openaiFamily)).toEqual([
       "single",
@@ -196,6 +248,7 @@ describe("Provider Bundle drafts", () => {
       familyId: family.familyId,
       revision: 3,
       name: "OpenAI OAuth",
+      modelPolicyScope: "global",
       supportedApps: ["claude", "codex"],
       enabledApps: ["claude", "codex"],
       credentialConfigured: true,
@@ -445,6 +498,7 @@ describe("Provider Bundle drafts", () => {
       familyId: family.familyId,
       revision: 2,
       name: source.name,
+      modelPolicyScope: "global",
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: ["codex", "gemini"],
       credentialConfigured: true,
@@ -508,6 +562,7 @@ describe("Provider Bundle drafts", () => {
       revision: 4,
       name: source.name,
       websiteUrl: source.websiteUrl,
+      modelPolicyScope: "global",
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: family.surfaces.map((surface) => surface.app),
       credentialConfigured: true,

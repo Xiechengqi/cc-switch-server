@@ -1,120 +1,60 @@
-import { invokeCommand } from "@/lib/runtime";
+import { jsonFetch } from "@/lib/runtime";
 import type {
-  UsageSummary,
-  UsageSummaryByApp,
-  DailyStats,
-  ProviderStats,
-  ModelStats,
-  RequestLog,
-  LogFilters,
-  PaginatedLogs,
-  SessionSyncResult,
-  DataSourceSummary,
+  ModelUsage,
+  ProviderBundleUsage,
+  ShareUsage,
+  UsageFacets,
+  UsageFilters,
+  UsageOverview,
+  UsageRequest,
+  UsageRequestPage,
+  UsageResponse,
+  UsageTrendPoint,
 } from "@/types/usage";
-import type { AppId } from "./types";
+
+export interface UsageApiQuery extends UsageFilters {
+  fromMs: number;
+  toMs: number;
+}
+
+function queryString(query: UsageApiQuery, extra: Record<string, unknown> = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries({ ...query, ...extra })) {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, String(value));
+    }
+  }
+  return params.toString();
+}
+
+function usageGet<T>(path: string, query: UsageApiQuery, extra?: Record<string, unknown>) {
+  return jsonFetch<UsageResponse<T>>(
+    `${path}?${queryString(query, extra)}`,
+    { cache: "no-store" },
+  );
+}
 
 export const usageApi = {
-  // Proxy usage statistics methods
-  getUsageSummary: async (
-    startDate?: number,
-    endDate?: number,
-    appType?: string,
-    providerName?: string,
-    model?: string,
-  ): Promise<UsageSummary> => {
-    return invokeCommand("get_usage_summary", {
-      startDate,
-      endDate,
-      appType,
-      providerName,
-      model,
-    });
-  },
-
-  getUsageSummaryByApp: async (
-    startDate?: number,
-    endDate?: number,
-    providerName?: string,
-    model?: string,
-  ): Promise<UsageSummaryByApp[]> => {
-    return invokeCommand("get_usage_summary_by_app", {
-      startDate,
-      endDate,
-      providerName,
-      model,
-    });
-  },
-
-  getUsageTrends: async (
-    startDate?: number,
-    endDate?: number,
-    appType?: string,
-    providerName?: string,
-    model?: string,
-  ): Promise<DailyStats[]> => {
-    return invokeCommand("get_usage_trends", {
-      startDate,
-      endDate,
-      appType,
-      providerName,
-      model,
-    });
-  },
-
-  getProviderStats: async (
-    startDate?: number,
-    endDate?: number,
-    appType?: string,
-    providerName?: string,
-    model?: string,
-  ): Promise<ProviderStats[]> => {
-    return invokeCommand("get_provider_stats", {
-      startDate,
-      endDate,
-      appType,
-      providerName,
-      model,
-    });
-  },
-
-  getModelStats: async (
-    startDate?: number,
-    endDate?: number,
-    appType?: string,
-    providerName?: string,
-    model?: string,
-  ): Promise<ModelStats[]> => {
-    return invokeCommand("get_model_stats", {
-      startDate,
-      endDate,
-      appType,
-      providerName,
-      model,
-    });
-  },
-
-  getRequestLogs: async (
-    filters: LogFilters,
-    page: number = 0,
-    pageSize: number = 20,
-  ): Promise<PaginatedLogs> => {
-    return invokeCommand("get_request_logs", {
-      filters,
-      page,
-      pageSize,
-    });
-  },
-
-  getRequestDetail: async (requestId: string): Promise<RequestLog | null> => {
-    return invokeCommand("get_request_detail", { requestId });
-  },
-
-  // Session usage sync
-  syncSessionUsage: async (): Promise<SessionSyncResult> => {
-    return invokeCommand("sync_session_usage");
-  },
-
-  getDataSourceBreakdown: async (): Promise<DataSourceSummary[]> => {
-    return invokeCommand("get_usage_data_sources");
-  },
+  overview: (query: UsageApiQuery) =>
+    usageGet<UsageOverview>("/web-api/usage/overview", query),
+  trends: (query: UsageApiQuery, windowMs?: number) =>
+    usageGet<UsageTrendPoint[]>("/web-api/usage/trends", query, { windowMs }),
+  facets: (query: UsageApiQuery) =>
+    usageGet<UsageFacets>("/web-api/usage/facets", query),
+  providerBundles: (query: UsageApiQuery) =>
+    usageGet<ProviderBundleUsage[]>("/web-api/usage/provider-bundles", query),
+  models: (query: UsageApiQuery) =>
+    usageGet<ModelUsage[]>("/web-api/usage/models", query),
+  shares: (query: UsageApiQuery) =>
+    usageGet<ShareUsage[]>("/web-api/usage/shares", query),
+  requests: (query: UsageApiQuery, cursor?: string, limit = 50) =>
+    jsonFetch<UsageRequestPage>(
+      `/web-api/usage/requests?${queryString(query, { cursor, limit })}`,
+      { cache: "no-store" },
+    ),
+  request: (requestId: string) =>
+    jsonFetch<UsageResponse<UsageRequest>>(
+      `/web-api/usage/requests/${encodeURIComponent(requestId)}`,
+      { cache: "no-store" },
+    ),
 };

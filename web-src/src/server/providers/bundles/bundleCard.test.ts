@@ -83,6 +83,7 @@ function bundle(
     familyId,
     revision: 1,
     name: "Provider",
+    modelPolicyScope: "global",
     supportedApps,
     enabledApps: supportedApps,
     credentialConfigured: true,

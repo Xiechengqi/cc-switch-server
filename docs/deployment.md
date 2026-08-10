@@ -192,7 +192,7 @@ Responses JSON、SSE、WebSocket 和 WS→HTTP fallback 共享下游提交边界
 - `accounts.json`
 - `accounts.key`
 - `shares.json`
-- `usage-logs.json`
+- `usage/`（manifest、最近 32 天请求明细、按日 journal 和长期 rollup）
 - `tunnels.json`
 
 这些文件使用原子写入方式保存。`accounts.json` 中的账号 token 以及 S2 `providers.json` 中的 Provider credential slot 共用一个根密钥，但通过 HKDF 派生为不同用途的密钥。根密钥默认保存在 `accounts.key`；也可以用 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 提供 32 字节 base64 密钥，环境变量优先于文件。备份时直接备份整个 config dir，不能只备份 JSON 而漏掉匹配的 `accounts.key` 或部署环境密钥。

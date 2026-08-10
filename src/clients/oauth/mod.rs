@@ -1,3 +1,4 @@
+pub mod claude_models;
 pub mod codex_device;
 pub(crate) mod codex_referrals;
 pub(crate) mod codex_reset_credits;
@@ -6,8 +7,10 @@ pub mod cursor;
 pub mod grok_device;
 pub mod grok_jwks;
 pub mod grok_models;
+pub mod kimi_device;
 pub mod kiro;
 pub mod kiro_device;
+pub mod kiro_runtime;
 pub mod openai_jwks;
 pub mod quota;
 pub mod refresh;

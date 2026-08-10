@@ -9,7 +9,7 @@ export const requiredProviderTypes = Object.freeze([
   ["openrouter", "OpenRouter", ["claude", "codex", "gemini"]],
   ["github_copilot", "GitHub Copilot", ["claude"]],
   ["deepseek_account", "DeepSeek account", ["claude"]],
-  ["kiro_oauth", "Kiro OAuth", ["claude"]],
+  ["kiro_oauth", "Kiro OAuth", ["claude", "codex"]],
   ["cursor_oauth", "Cursor OAuth", ["claude", "codex"]],
   ["cursor_apikey", "Cursor API key", ["claude", "codex"]],
   ["antigravity_oauth", "Antigravity OAuth", ["claude", "gemini"]],
@@ -22,6 +22,7 @@ export const serverCompatibilityProviderTypes = Object.freeze([
   ["nvidia", "Nvidia OpenAI-compatible API", ["claude", "codex"]],
   ["deepseek_api", "DeepSeek API key", ["claude", "codex"]],
   ["grok_oauth", "Grok/xAI OAuth reverse proxy", ["claude", "codex", "gemini"]],
+  ["kimi_code", "Kimi Code OAuth", ["claude", "codex", "gemini"]],
 ]);
 
 export function requiredProviderProfilePairs() {

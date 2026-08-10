@@ -2048,12 +2048,13 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests[0].generation, 8);
-        assert_eq!(requests[0].expected_generation, 7);
-        assert_eq!(requests[1].generation, 9);
-        assert_eq!(requests[1].expected_generation, 7);
-        drop(requests);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0].generation, 8);
+            assert_eq!(requests[0].expected_generation, 7);
+            assert_eq!(requests[1].generation, 9);
+            assert_eq!(requests[1].expected_generation, 7);
+        }
         let slot = supervisor.slot_for("client-web").await;
         assert!(slot.lock().await.retiring_handles.is_empty());
         supervisor.stop("client-web", "stopped").await;

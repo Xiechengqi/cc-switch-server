@@ -64,6 +64,12 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
         ManagedIdentityFamily::GrokCli => {
             set_user_agent(headers, crate::domain::grok_cli::grok_cli_user_agent());
         }
+        ManagedIdentityFamily::KimiCli => {
+            set_user_agent(
+                headers,
+                crate::domain::kimi_cli::KIMI_USER_AGENT.to_string(),
+            );
+        }
         ManagedIdentityFamily::Kiro => {
             set_user_agent(headers, "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string())
         }
@@ -200,6 +206,10 @@ mod tests {
             (
                 ManagedIdentityFamily::GeminiCli,
                 crate::provider_identity::gemini_cli_user_agent(),
+            ),
+            (
+                ManagedIdentityFamily::KimiCli,
+                crate::domain::kimi_cli::KIMI_USER_AGENT.to_string(),
             ),
             (
                 ManagedIdentityFamily::Kiro,

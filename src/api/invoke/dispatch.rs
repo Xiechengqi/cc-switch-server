@@ -946,42 +946,7 @@ async fn web_invoke_dispatch(
                 .0;
             Ok(json!(response))
         }
-        "get_usage_summary" => {
-            let usage = state.usage.read().await;
-            Ok(web_usage_summary_json(&usage, &args))
-        }
-        "get_usage_summary_by_app" => {
-            let filter = web_usage_stats_filter_from_args(&args);
-            let usage = state.usage.read().await;
-            Ok(json!(usage.summary_by_app(&filter)))
-        }
         "get_installed_skills" => Ok(json!([])),
-        "get_usage_trends" => {
-            let usage = state.usage.read().await;
-            Ok(web_usage_trends_json(&usage, &args))
-        }
-        "get_provider_stats" => {
-            let usage = state.usage.read().await;
-            Ok(web_provider_stats_json(&usage, &args))
-        }
-        "get_model_stats" => {
-            let usage = state.usage.read().await;
-            Ok(web_model_stats_json(&usage, &args))
-        }
-        "get_request_logs" => {
-            let usage = state.usage.read().await;
-            Ok(web_request_logs_json(&usage, &args))
-        }
-        "get_request_detail" => {
-            let id = web_arg_string(&args, "id").or_else(|_| web_arg_string(&args, "requestId"))?;
-            let usage = state.usage.read().await;
-            Ok(usage
-                .logs
-                .iter()
-                .find(|log| log.request_id == id)
-                .map(web_request_log_json)
-                .unwrap_or(Value::Null))
-        }
         "get_proxy_status" => Ok(json!(web_proxy_status_json(state).await)),
         "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(state).await)),
         "is_proxy_running" => Ok(json!(true)),
@@ -1849,8 +1814,6 @@ async fn web_invoke_dispatch(
         "restore_env_backup" => Ok(Value::Null),
         "get_auto_launch_status" => Ok(json!(false)),
         "set_auto_launch" => Ok(Value::Null),
-        "sync_session_usage" => Ok(Value::Null),
-        "get_usage_data_sources" => Ok(json!(["server"])),
         "get_subscription_quota" => {
             let tool = web_arg_string_any(&args, &["tool"])?;
             let force = web_optional_bool(&args, &["force"]).unwrap_or(false);

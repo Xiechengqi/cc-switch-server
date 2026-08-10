@@ -80,6 +80,14 @@
     "family": "Provider タイプ",
     "firstByteTimeout": "最初のバイトのタイムアウト（ミリ秒）",
     "modelPassthrough": "透過",
+    "modelProfileFixed": "Profile 固定",
+    "modelScope": "制御範囲",
+    "modelScopeGlobal": "グローバル",
+    "modelScopeMergeConfirm": "グローバルに切り替える",
+    "modelScopeMergeMessage": "App ごとに異なるモデルポリシーが設定されています。切り替えると、設定可能なすべての App にグローバルポリシーが適用されます。",
+    "modelScopeMergeTitle": "モデルポリシーを統一",
+    "modelScopePerApp": "App ごと",
+    "modelSummarySingle": "固定：{{model}}",
     "modelSingle": "固定モデル",
     "queryParameter": "API Key クエリパラメーター名",
     "requestTimeout": "リクエストタイムアウト（ミリ秒）",
@@ -90,6 +98,7 @@
     "surfaces": "API Surface",
     "streamIdleTimeout": "ストリームアイドルタイムアウト（ミリ秒）",
     "testModel": "テストモデル",
+    "testAllModels": "すべての App のモデルをテスト",
     "title": "Providers"
   },
   "provider": {

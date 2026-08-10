@@ -80,6 +80,14 @@
     "family": "Provider type",
     "firstByteTimeout": "First-byte timeout (milliseconds)",
     "modelPassthrough": "Pass through",
+    "modelProfileFixed": "Profile fixed",
+    "modelScope": "Control scope",
+    "modelScopeGlobal": "Global",
+    "modelScopeMergeConfirm": "Use global policy",
+    "modelScopeMergeMessage": "Apps currently use different model policies. Switching applies the global policy to all configurable Apps.",
+    "modelScopeMergeTitle": "Unify model policies",
+    "modelScopePerApp": "Per App",
+    "modelSummarySingle": "Fixed: {{model}}",
     "modelSingle": "Fixed model",
     "queryParameter": "API key query parameter",
     "requestTimeout": "Request timeout (milliseconds)",
@@ -90,6 +98,7 @@
     "surfaces": "API Surfaces",
     "streamIdleTimeout": "Stream idle timeout (milliseconds)",
     "testModel": "Test model",
+    "testAllModels": "Test models for all Apps",
     "title": "Providers"
   },
   "provider": {

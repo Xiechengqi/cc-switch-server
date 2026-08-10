@@ -225,7 +225,7 @@ echo "== server capability checks =="
 if [[ -z "$API_TOKEN" ]]; then
   skip "CC_SWITCH_SERVER_TOKEN not set; skipped live server capability checks"
 else
-  for endpoint in /api/proxy/capabilities /api/accounts/capabilities /api/provider-coverage /api/usage/logs?limit=5; do
+  for endpoint in /api/proxy/capabilities /api/accounts/capabilities /api/provider-coverage /web-api/usage/requests?limit=5; do
     status="$(curl -sS -o /tmp/cc-switch-server-regression-api.out -w "%{http_code}" "${auth_header[@]}" "$SERVER_URL$endpoint" || true)"
     echo "$endpoint status=${status}"
     if [[ "$status" =~ ^2 ]]; then

@@ -11,9 +11,15 @@ use crate::domain::accounts::store::{
 };
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
+use crate::domain::providers::bundle::{
+    bundle_model_policy_scope, bundle_model_policy_source, ModelPolicyScope, ModelPolicySource,
+};
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
-use crate::domain::providers::runtime::{authoritative_managed_account, ProviderRuntimePlan};
+use crate::domain::providers::registry::profile_by_id;
+use crate::domain::providers::runtime::{
+    authoritative_managed_account, ProviderRuntimePlan, RuntimeModelPolicy,
+};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
@@ -412,6 +418,12 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_scope: Option<ModelPolicyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_source: Option<ModelPolicySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<RuntimeModelPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
@@ -430,6 +442,10 @@ pub struct ShareAppProvider {
     pub id: String,
     pub name: String,
     pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_apps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -458,6 +474,12 @@ pub struct ShareAppProvider {
     pub api_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ShareUpstreamModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_scope: Option<ModelPolicyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy_source: Option<ModelPolicySource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<RuntimeModelPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -881,7 +903,7 @@ fn static_descriptor_projection(
                 .runtime_plan(app_kind, provider_id)
                 .map(|plan| plan.runtime_fingerprint.clone())
                 .unwrap_or_else(|| "missing-runtime-plan".to_string());
-            Ok((app.clone(), fingerprint))
+            Ok((*app, fingerprint))
         })
         .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
     object.insert(
@@ -939,6 +961,8 @@ fn upstream_provider(
         .map(|health| health.healthy && quota_blocked != Some(true));
     let resolved_provider_type = provider.provider_type;
     let provider_type_id = resolved_provider_type.as_str().to_string();
+    let (model_policy_scope, model_policy_source, model_policy) =
+        provider_model_policy_metadata(provider, runtime_plan);
     ShareUpstreamProvider {
         kind: provider_type_id.clone(),
         app: app.to_string(),
@@ -953,6 +977,9 @@ fn upstream_provider(
         quota: account.and_then(|account| upstream_quota_from_account(account, share)),
         api_url: provider_api_url(provider),
         models: provider_models(provider),
+        model_policy_scope,
+        model_policy_source,
+        model_policy,
         health,
         available,
     }
@@ -977,10 +1004,19 @@ fn app_provider(
         .map(|health| health.healthy && quota_blocked != Some(true));
     let resolved_provider_type = provider.provider_type;
     let provider_type_id = resolved_provider_type.as_str().to_string();
+    let (model_policy_scope, model_policy_source, model_policy) =
+        provider_model_policy_metadata(provider, runtime_plan);
     ShareAppProvider {
         id: provider.provider.id.clone(),
         name: provider.provider.name.clone(),
         app: app.to_string(),
+        bundle_id: crate::domain::providers::bundle::bundle_id(&provider.provider)
+            .map(str::to_string),
+        supported_apps: crate::domain::providers::bundle::bundle_supported_apps(&provider.provider)
+            .unwrap_or_else(|| vec![provider.app])
+            .into_iter()
+            .map(|app| app.as_str().to_string())
+            .collect(),
         kind: Some(provider_type_id.clone()),
         provider_type: Some(provider_type_id),
         is_current,
@@ -1000,9 +1036,35 @@ fn app_provider(
         quota: account.and_then(|account| upstream_quota_from_account(account, share)),
         api_url: provider_api_url(provider),
         models: provider_models(provider),
+        model_policy_scope,
+        model_policy_source,
+        model_policy,
         health,
         available,
     }
+}
+
+fn provider_model_policy_metadata(
+    provider: &StoredProvider,
+    runtime_plan: Option<&ProviderRuntimePlan>,
+) -> (
+    Option<ModelPolicyScope>,
+    Option<ModelPolicySource>,
+    Option<RuntimeModelPolicy>,
+) {
+    let profile = provider
+        .resource
+        .profile_id
+        .as_ref()
+        .and_then(|profile_id| profile_by_id(profile_id.as_str()));
+    let model_policy_scope = match bundle_model_policy_scope(&provider.provider) {
+        Ok(Some(scope)) => Some(scope),
+        Ok(None) => Some(ModelPolicyScope::PerApp),
+        Err(_) => None,
+    };
+    let model_policy_source = bundle_model_policy_source(&provider.provider, profile).ok();
+    let model_policy = runtime_plan.map(|plan| plan.model_policy.clone());
+    (model_policy_scope, model_policy_source, model_policy)
 }
 
 fn provider_availability(
@@ -1502,6 +1564,49 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_exposes_provider_bundle_identity_and_supported_apps() {
+        let provider_type = ProviderType::GrokOAuth;
+        let mut provider = test_provider(provider_type);
+        provider
+            .provider
+            .extra
+            .insert("bundleId".to_string(), json!("p1"));
+        provider
+            .provider
+            .extra
+            .insert("familyId".to_string(), json!("family.grok_oauth"));
+        provider
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(true));
+        provider
+            .provider
+            .extra
+            .insert("modelPolicyScope".to_string(), json!("global"));
+        provider.resource.profile_id =
+            Some(crate::domain::providers::registry::ProfileId::parse("codex.grok_oauth").unwrap());
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..ProviderStore::default()
+        };
+        let share = test_share(provider_type, None);
+
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        let provider = descriptor.app_providers.codex.first().unwrap();
+
+        assert_eq!(provider.bundle_id.as_deref(), Some("p1"));
+        assert_eq!(provider.supported_apps, ["claude", "codex", "gemini"]);
+        assert_eq!(provider.model_policy_scope, Some(ModelPolicyScope::Global));
+        assert_eq!(
+            provider.model_policy_source,
+            Some(ModelPolicySource::BundleGlobal)
+        );
+        let serialized = serde_json::to_value(provider).unwrap();
+        assert_eq!(serialized["modelPolicyScope"], json!("global"));
+        assert_eq!(serialized["modelPolicySource"], json!("bundle_global"));
+    }
+
+    #[test]
     fn static_descriptor_fingerprint_tracks_execution_but_not_display_or_usage() {
         let provider_type = ProviderType::Codex;
         let base_provider = test_provider(provider_type);
@@ -1532,6 +1637,18 @@ mod tests {
         assert_eq!(
             baseline,
             static_descriptor_fingerprint(&display_descriptor, &display_providers).unwrap()
+        );
+
+        let mut scope_descriptor = descriptor.clone();
+        let upstream = scope_descriptor
+            .upstream_provider
+            .as_mut()
+            .expect("descriptor upstream provider");
+        upstream.model_policy_scope = Some(ModelPolicyScope::Global);
+        upstream.model_policy_source = Some(ModelPolicySource::BundleGlobal);
+        assert_ne!(
+            baseline,
+            static_descriptor_fingerprint(&scope_descriptor, &providers).unwrap()
         );
 
         let mut endpoint_provider = base_provider;

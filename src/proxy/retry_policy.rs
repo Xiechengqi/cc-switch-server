@@ -61,6 +61,7 @@ pub(super) fn supports_unauthorized_recovery(provider_type: ProviderType) -> boo
             | ProviderType::GitHubCopilot
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
+            | ProviderType::KimiCode
     )
 }
 
@@ -81,6 +82,7 @@ mod tests {
             ProviderType::GitHubCopilot,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,
+            ProviderType::KimiCode,
         ] {
             let mut state = AuthRecoveryState::default();
             assert_eq!(

@@ -5,11 +5,7 @@ export type ProviderModelPolicy = "passthrough" | "single";
 export type ProviderFieldScope = "bundle" | "surface";
 
 export type ProviderFormComposition =
-  | "managed_account"
-  | "static_secret"
-  | "aws"
-  | "custom"
-  | "legacy";
+  "managed_account" | "static_secret" | "aws" | "custom" | "legacy";
 
 export type ProviderUpstreamProtocol =
   | "anthropic_messages"
@@ -38,6 +34,7 @@ export type ProviderOutboundIdentityPolicy =
         | "codex_cli"
         | "gemini_cli"
         | "grok_cli"
+        | "kimi_cli"
         | "kiro"
         | "cursor"
         | "copilot"
@@ -45,11 +42,7 @@ export type ProviderOutboundIdentityPolicy =
     }
   | { kind: "managed_version"; family: "antigravity" }
   | {
-      kind:
-        | "server_identity"
-        | "omit"
-        | "custom_override"
-        | "legacy_frozen";
+      kind: "server_identity" | "omit" | "custom_override" | "legacy_frozen";
     };
 
 export type ProviderCredentialPolicy =
@@ -72,11 +65,7 @@ export interface ProviderRegistryProfile {
   compatibilityProviderType?: string;
   formComposition: ProviderFormComposition;
   endpointPolicy:
-    | "fixed"
-    | "override_allowed"
-    | "template"
-    | "custom"
-    | "frozen_legacy";
+    "fixed" | "override_allowed" | "template" | "custom" | "frozen_legacy";
   credentialPolicy: ProviderCredentialPolicy;
   modelPolicy: ProviderModelPolicy;
   allowedModelPolicies?: ProviderModelPolicy[];
@@ -166,7 +155,9 @@ export function profileIdForLegacyPreset(
     (item) => item.app === app && item.legacyName === legacyName,
   );
   if (!mapping) {
-    throw new Error(`Provider preset ${app}:${legacyName} has no registry profile`);
+    throw new Error(
+      `Provider preset ${app}:${legacyName} has no registry profile`,
+    );
   }
   return mapping.profileId;
 }
@@ -193,7 +184,9 @@ export function profileById(
 }
 
 export function familyById(familyId: string): ProviderFamilySpec | undefined {
-  return providerRegistry.families.find((family) => family.familyId === familyId);
+  return providerRegistry.families.find(
+    (family) => family.familyId === familyId,
+  );
 }
 
 export function familyForProfile(

@@ -687,6 +687,7 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::GeminiCli
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
+        | ProviderType::KimiCode
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountManagerKind::NativeOAuth,
@@ -741,7 +742,7 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 15] {
+fn account_provider_types() -> [ProviderType; 16] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
@@ -750,6 +751,7 @@ fn account_provider_types() -> [ProviderType; 15] {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::KimiCode,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -795,6 +797,7 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             | ProviderType::GitHubCopilot
             | ProviderType::DeepSeekAccount
             | ProviderType::KiroOAuth
+            | ProviderType::KimiCode
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -869,6 +872,7 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
+        | ProviderType::KimiCode
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountCredentialOwnership::ManagedAccount,
@@ -900,6 +904,7 @@ fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapabilit
         ProviderType::CodexOAuth
             | ProviderType::GitHubCopilot
             | ProviderType::KiroOAuth
+            | ProviderType::KimiCode
             | ProviderType::GrokOAuth
     ) {
         flows.push(AccountLoginFlowCapability {
@@ -908,7 +913,7 @@ fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapabilit
             supports_poll: true,
             supports_cancel: matches!(
                 provider_type,
-                ProviderType::CodexOAuth | ProviderType::GrokOAuth
+                ProviderType::CodexOAuth | ProviderType::GrokOAuth | ProviderType::KimiCode
             ),
         });
     }
@@ -1020,6 +1025,15 @@ fn account_import_template_for(provider_type: ProviderType) -> AccountImportTemp
                 "kiroUsageLimits",
             ],
             notes: "AWS Builder ID device flow import is available via /api/accounts/kiro/device/start|poll; Claude CodeWhisperer forwarding and server-native refresh are wired, with native capability still gated on real Kiro validation",
+        },
+        ProviderType::KimiCode => AccountImportTemplate {
+            provider_type,
+            credential_kind: "oauth_token",
+            required_fields: vec!["providerType", "accessToken or refreshToken"],
+            optional_fields: optional_oauth_fields.clone(),
+            profile_hints: vec!["userId", "deviceId", "deviceName", "deviceModel", "osVersion"],
+            raw_hints: vec!["Kimi OAuth token response", "deviceId", "loginMethod"],
+            notes: "Kimi Code device login is available via /api/accounts/kimi/device/start|poll|cancel; each Provider must explicitly bind one account",
         },
         ProviderType::GrokOAuth => AccountImportTemplate {
             provider_type,
@@ -1346,6 +1360,12 @@ mod tests {
                 true,
             ),
             (
+                ProviderType::KimiCode,
+                OAuthRefreshCapability::OAuthRequest,
+                OAuthQuotaCapability::Unavailable,
+                true,
+            ),
+            (
                 ProviderType::CursorOAuth,
                 OAuthRefreshCapability::OAuthRequest,
                 OAuthQuotaCapability::ImportedSnapshot,
@@ -1465,7 +1485,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            9
+            10
         );
         assert_eq!(
             registrations

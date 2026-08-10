@@ -138,6 +138,7 @@ export function isManagedOauthProvider(
     isAntigravityFamily ||
     isCursorOauthWithManagedAuth(provider) ||
     provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH ||
+    provider.meta?.providerType === PROVIDER_TYPES.KIMI_CODE ||
     provider.meta?.providerType === PROVIDER_TYPES.DEEPSEEK_ACCOUNT ||
     (appId === "codex" && isCodexOfficialWithManagedAuth(provider)) ||
     (appId === "gemini" && isGoogleGeminiOfficialWithManagedAuth(provider))
@@ -170,7 +171,8 @@ export function canTestModelProvider(
     provider.meta?.providerType === PROVIDER_TYPES.CURSOR_APIKEY ||
     isAntigravityFamily ||
     isCursorOauthWithManagedAuth(provider) ||
-    provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH
+    provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH ||
+    provider.meta?.providerType === PROVIDER_TYPES.KIMI_CODE
   ) {
     return true;
   }

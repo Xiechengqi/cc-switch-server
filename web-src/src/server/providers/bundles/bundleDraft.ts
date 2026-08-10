@@ -4,6 +4,7 @@ import type {
   ProviderBundleWriteDraft,
   ProviderCredentialPatches,
   ProviderCustomBinding,
+  ProviderModelPolicyScope,
   ProviderResource,
   ProviderRuntimePlan,
 } from "@/lib/api/providers";
@@ -91,6 +92,8 @@ export interface BundleSurfaceEditorDraft {
   app: CoreProviderApp;
   enabled: boolean;
   profileId: string;
+  modelPolicy: ProviderModelPolicy;
+  upstreamModel: string;
   endpoint: string;
   testModel: string;
   transport: {
@@ -125,6 +128,7 @@ export interface ProviderBundleEditorDraft {
   accountGeneration?: number;
   endpoint: string;
   awsRegion: string;
+  modelPolicyScope: ProviderModelPolicyScope;
   modelPolicy: ProviderModelPolicy;
   upstreamModel: string;
   secrets: Record<string, BundleSecretDraft>;
@@ -184,6 +188,25 @@ function modelControlProfilesForFamily(
   return configurable.length > 0 ? configurable : resolved;
 }
 
+function profileHasConfigurableModelPolicy(
+  profile: ProviderRegistryProfile,
+): boolean {
+  return modelPoliciesForProfile(profile).length > 1;
+}
+
+export function configurableModelSurfaceCount(
+  family: ProviderFamilySpec,
+): number {
+  return family.surfaces.filter((surface) => {
+    const profile = profileById(surface.profileId);
+    return profile ? profileHasConfigurableModelPolicy(profile) : false;
+  }).length;
+}
+
+export function supportsPerAppModelPolicy(family: ProviderFamilySpec): boolean {
+  return configurableModelSurfaceCount(family) >= 2;
+}
+
 function modelControlSurface(
   family: ProviderFamilySpec,
   surfaces: BundleSurfaceEditorDraft[],
@@ -223,20 +246,14 @@ export function defaultUpstreamModelForFamily(
 function initialBundleModel(
   family: ProviderFamilySpec,
   surfaces: BundleSurfaceEditorDraft[],
-  resources?: ProviderBundleView["surfaces"],
 ): { policy: ProviderModelPolicy; upstreamModel: string } {
   const source = modelControlSurface(family, surfaces);
-  const sourceResource = resources?.[source.app];
-  const sourceSettings = sourceResource
-    ? clone(sourceResource.provider.settingsConfig as Record<string, unknown>)
-    : undefined;
-  const sourceModel = surfaceModelState(source, sourceSettings);
   const allowedPolicies = modelPoliciesForFamily(family);
   return {
-    policy: allowedPolicies.includes(sourceModel.policy)
-      ? sourceModel.policy
-      : (allowedPolicies[0] ?? sourceModel.policy),
-    upstreamModel: sourceModel.upstreamModel,
+    policy: allowedPolicies.includes(source.modelPolicy)
+      ? source.modelPolicy
+      : (allowedPolicies[0] ?? source.modelPolicy),
+    upstreamModel: source.upstreamModel,
   };
 }
 
@@ -315,10 +332,18 @@ function surfaceFromResource(
   const configuredMeta = resource?.provider.meta ?? preset.meta ?? {};
   const configuredTransport = objectOption(settings.transport);
   const endpoint = runtime?.endpoint ?? readEndpoint(settings, app);
+  const modelPolicy =
+    runtime?.modelPolicy.mode ?? readModelPolicy(settings, profile);
+  const upstreamModel =
+    runtime?.modelPolicy.mode === "single"
+      ? runtime.modelPolicy.upstreamModel
+      : (readUpstreamModel(settings) ?? profile.defaultUpstreamModel ?? "");
   return {
     app,
     enabled,
     profileId,
+    modelPolicy,
+    upstreamModel,
     endpoint,
     testModel: runtime?.testModel ?? stringOption(settings.testModel) ?? "",
     transport: {
@@ -425,6 +450,7 @@ export function createProviderBundleDraft(
     awsRegion: readAwsRegion(
       sourcePreset.settingsConfig as Record<string, unknown>,
     ),
+    modelPolicyScope: "global",
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     secrets,
@@ -449,7 +475,7 @@ export function editProviderBundleDraft(
   const source = sourceSurface(family, surfaces);
   const sourceResource = bundle.surfaces[source.app];
   const binding = sourceResource?.provider.meta?.authBinding;
-  const model = initialBundleModel(family, surfaces, bundle.surfaces);
+  const model = initialBundleModel(family, surfaces);
   const identity = providerBundleIdentityEditable(family)
     ? { name: bundle.name, websiteUrl: bundle.websiteUrl ?? "" }
     : canonicalBundleIdentity(family);
@@ -488,6 +514,7 @@ export function editProviderBundleDraft(
           >,
         ),
       ),
+    modelPolicyScope: bundle.modelPolicyScope,
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     secrets,
@@ -534,27 +561,75 @@ export function duplicateProviderBundleDraft(
   };
 }
 
-export function surfaceModelState(
-  surface: BundleSurfaceEditorDraft,
-  settings?: Record<string, unknown>,
-): {
+export function surfaceModelState(surface: BundleSurfaceEditorDraft): {
   policy: ProviderModelPolicy;
   upstreamModel: string;
 } {
-  const profile = profileById(surface.profileId);
-  if (!profile) throw new Error(`Unknown profile ${surface.profileId}`);
-  const runtimeModel = surface.runtime?.modelPolicy;
   return {
-    policy:
-      runtimeModel?.mode ??
-      (settings ? readModelPolicy(settings, profile) : profile.modelPolicy),
-    upstreamModel:
-      runtimeModel?.mode === "single"
-        ? runtimeModel.upstreamModel
-        : ((settings ? readUpstreamModel(settings) : undefined) ??
-          profile.defaultUpstreamModel ??
-          ""),
+    policy: surface.modelPolicy,
+    upstreamModel: surface.upstreamModel,
   };
+}
+
+export function modelPoliciesForSurface(
+  surface: BundleSurfaceEditorDraft,
+): ProviderModelPolicy[] {
+  const profile = profileById(surface.profileId);
+  return profile ? modelPoliciesForProfile(profile) : [];
+}
+
+export function updateSurfaceModel(
+  surface: BundleSurfaceEditorDraft,
+  policy: ProviderModelPolicy,
+  upstreamModel: string,
+): BundleSurfaceEditorDraft {
+  return { ...surface, modelPolicy: policy, upstreamModel };
+}
+
+export function changeModelPolicyScope(
+  draft: ProviderBundleEditorDraft,
+  scope: ProviderModelPolicyScope,
+): ProviderBundleEditorDraft {
+  if (scope === draft.modelPolicyScope) return draft;
+  if (scope === "global") return { ...draft, modelPolicyScope: scope };
+  return {
+    ...draft,
+    modelPolicyScope: scope,
+    surfaces: draft.surfaces.map((surface) => {
+      const profile = profileById(surface.profileId);
+      if (!profile || !profileHasConfigurableModelPolicy(profile))
+        return surface;
+      const allowed = modelPoliciesForProfile(profile);
+      const policy = allowed.includes(draft.modelPolicy)
+        ? draft.modelPolicy
+        : (allowed[0] ?? surface.modelPolicy);
+      return updateSurfaceModel(
+        surface,
+        policy,
+        policy === "single"
+          ? draft.upstreamModel.trim() ||
+              surface.upstreamModel ||
+              profile.defaultUpstreamModel ||
+              ""
+          : surface.upstreamModel,
+      );
+    }),
+  };
+}
+
+export function perAppModelPoliciesDiffer(
+  draft: ProviderBundleEditorDraft,
+): boolean {
+  const signatures = draft.surfaces.flatMap((surface) => {
+    const profile = profileById(surface.profileId);
+    if (!profile || !profileHasConfigurableModelPolicy(profile)) return [];
+    return [
+      surface.modelPolicy === "single"
+        ? `single:${surface.upstreamModel.trim()}`
+        : "passthrough",
+    ];
+  });
+  return new Set(signatures).size > 1;
 }
 
 export function updateBundleModel(
@@ -697,6 +772,17 @@ function surfaceWriteDraft(
     app: surface.app,
     enabled: surface.enabled,
     profileId: surface.profileId,
+    modelPolicy:
+      draft.modelPolicyScope === "per_app" &&
+      profileHasConfigurableModelPolicy(profile)
+        ? surface.modelPolicy
+        : undefined,
+    upstreamModel:
+      draft.modelPolicyScope === "per_app" &&
+      profileHasConfigurableModelPolicy(profile) &&
+      surface.modelPolicy === "single"
+        ? surface.upstreamModel.trim()
+        : undefined,
     endpoint: endpoint || undefined,
     testModel: surface.testModel.trim() || undefined,
     transport: {
@@ -785,16 +871,31 @@ export function validateProviderBundleDraft(
   ) {
     return "AWS region is invalid";
   }
-  const allowedModelPolicies = modelPoliciesForFamily(family);
-  if (!allowedModelPolicies.includes(draft.modelPolicy)) {
-    return "Provider model policy is invalid";
-  }
-  if (draft.modelPolicy === "single" && !draft.upstreamModel.trim()) {
-    return "Upstream model is required";
+  if (draft.modelPolicyScope === "global") {
+    const allowedModelPolicies = modelPoliciesForFamily(family);
+    if (!allowedModelPolicies.includes(draft.modelPolicy)) {
+      return "Provider model policy is invalid";
+    }
+    if (draft.modelPolicy === "single" && !draft.upstreamModel.trim()) {
+      return "Upstream model is required";
+    }
+  } else if (!supportsPerAppModelPolicy(family)) {
+    return "This Provider does not support independent App model policies";
   }
   for (const surface of draft.surfaces) {
     const profile = profileById(surface.profileId);
     if (!profile) return `Profile ${surface.profileId} is unavailable`;
+    if (
+      draft.modelPolicyScope === "per_app" &&
+      profileHasConfigurableModelPolicy(profile)
+    ) {
+      if (!modelPoliciesForProfile(profile).includes(surface.modelPolicy)) {
+        return `${surface.app} model policy is invalid`;
+      }
+      if (surface.modelPolicy === "single" && !surface.upstreamModel.trim()) {
+        return `${surface.app} upstream model is required`;
+      }
+    }
     if (surface.testModel.trim().length > 256) {
       return `${surface.app} test model is too long`;
     }
@@ -902,9 +1003,13 @@ export function toProviderBundleWriteDraft(
     notes: draft.notes.trim() || undefined,
     icon: draft.icon,
     iconColor: draft.iconColor,
-    modelPolicy: draft.modelPolicy,
+    modelPolicyScope: draft.modelPolicyScope,
+    modelPolicy:
+      draft.modelPolicyScope === "global" ? draft.modelPolicy : undefined,
     upstreamModel:
-      draft.modelPolicy === "single" ? draft.upstreamModel.trim() : undefined,
+      draft.modelPolicyScope === "global" && draft.modelPolicy === "single"
+        ? draft.upstreamModel.trim()
+        : undefined,
     managedAccount:
       credentialProfileForFamily(family)?.credentialPolicy.mode ===
         "managed_account" && draft.accountGeneration != null

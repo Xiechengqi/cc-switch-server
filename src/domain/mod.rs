@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod claude_cli;
 pub mod grok_cli;
 pub mod health;
+pub mod kimi_cli;
 pub mod providers;
 pub mod router;
 pub mod settings;

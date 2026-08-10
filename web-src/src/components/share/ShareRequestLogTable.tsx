@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronUp } from "lucide-react";
-import { useRequestLogs } from "@/lib/query/usage";
-import { hasObservedUsage } from "@/types/usage";
+import { useUsageRequests } from "@/lib/query/usage";
+import { hasObservedUsage, requestProcessedTokens, usageToken } from "@/types/usage";
 import { formatUtcDateTime } from "@/utils/shareUtils";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -26,18 +26,20 @@ export function ShareRequestLogTable({
 }: ShareRequestLogTableProps) {
   const { t } = useTranslation();
   const [page, setPage] = useState(0);
+  const [cursors, setCursors] = useState<Array<string | undefined>>([undefined]);
   const [expanded, setExpanded] = useState(false);
   const pageSize = 10;
 
   useEffect(() => {
     setPage(0);
+    setCursors([undefined]);
   }, [shareId]);
 
-  const { data, isLoading } = useRequestLogs({
+  const { data, isLoading } = useUsageRequests({
     filters: { shareId },
     range: { preset: "7d" },
-    page,
-    pageSize,
+    cursor: cursors[page],
+    limit: pageSize,
     options: {
       refetchInterval: active ? 10000 : false,
       refetchIntervalInBackground: active,
@@ -45,10 +47,10 @@ export function ShareRequestLogTable({
   });
 
   const logs = data?.data ?? [];
-  const total = data?.total ?? 0;
+  const total = data?.meta.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const canGoPrev = page > 0;
-  const canGoNext = page + 1 < totalPages;
+  const canGoNext = Boolean(data?.meta.nextCursor);
   const rangeLabel = useMemo(() => {
     if (total === 0) {
       return t("share.requestLogsRangeEmpty");
@@ -71,7 +73,7 @@ export function ShareRequestLogTable({
     ).length;
     const failed = logs.length - success;
     const avgLatency =
-      logs.reduce((sum, log) => sum + (log.latencyMs || 0), 0) / logs.length;
+      logs.reduce((sum, log) => sum + log.endToEndDurationMs, 0) / logs.length;
     return {
       count: logs.length,
       success,
@@ -177,18 +179,18 @@ export function ShareRequestLogTable({
                       return (
                         <TableRow key={log.requestId}>
                           <TableCell className="whitespace-nowrap">
-                            {formatUtcDateTime(log.createdAt * 1000)}
+                            {formatUtcDateTime(log.startedAtMs)}
                           </TableCell>
                           <TableCell className="max-w-48 truncate">
                             {log.userEmail || "-"}
                           </TableCell>
                           <TableCell>
                             <div className="font-medium">
-                              {log.requestAgent || log.appType} ·{" "}
+                              {log.requestAgent || log.app} ·{" "}
                               {log.actualModel || log.model || "-"}
                             </div>
                             <div className="text-xs text-muted-foreground">
-                              {log.requestedModel || log.requestModel || "-"}
+                              {log.requestedModel || log.model || "-"}
                             </div>
                             {(reasoningPath || fastDecision) && (
                               <div className="mt-1 text-[10px] text-muted-foreground">
@@ -208,27 +210,24 @@ export function ShareRequestLogTable({
                             )}
                           </TableCell>
                           <TableCell title={log.streamStatus || undefined}>
-                            {usageObserved ? log.inputTokens : usageStateLabel}
+                            {usageObserved ? usageToken(log.inputTokens) : usageStateLabel}
                           </TableCell>
                           <TableCell>
-                            {usageObserved ? log.outputTokens : "-"}
+                            {usageObserved ? usageToken(log.outputTokens) : "-"}
                           </TableCell>
                           <TableCell>
-                            {usageObserved ? log.cacheReadTokens : "-"}
+                            {usageObserved ? usageToken(log.cacheReadTokens) : "-"}
                           </TableCell>
                           <TableCell>
-                            {usageObserved ? log.cacheCreationTokens : "-"}
+                            {usageObserved ? usageToken(log.cacheCreationTokens) : "-"}
                           </TableCell>
                           <TableCell>
                             {usageObserved
-                              ? log.inputTokens +
-                                log.outputTokens +
-                                log.cacheReadTokens +
-                                log.cacheCreationTokens
+                              ? requestProcessedTokens(log)
                               : "-"}
                           </TableCell>
                           <TableCell>{log.statusCode}</TableCell>
-                          <TableCell>{log.latencyMs} ms</TableCell>
+                          <TableCell>{log.endToEndDurationMs} ms</TableCell>
                         </TableRow>
                       );
                     })
@@ -267,7 +266,12 @@ export function ShareRequestLogTable({
                 variant="outline"
                 size="sm"
                 disabled={isLoading || !canGoNext}
-                onClick={() => setPage((current) => current + 1)}
+                onClick={() => {
+                  const nextCursor = data?.meta.nextCursor || undefined;
+                  if (!nextCursor) return;
+                  setCursors((current) => [...current.slice(0, page + 1), nextCursor]);
+                  setPage((current) => current + 1);
+                }}
               >
                 {t("share.requestLogsNext")}
               </Button>

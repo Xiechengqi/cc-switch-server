@@ -41,6 +41,7 @@ import { DeepSeekAccountSection } from "@/components/providers/forms/DeepSeekAcc
 import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSection";
 import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
+import { KimiOAuthSection } from "@/components/providers/forms/KimiOAuthSection";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { settingsApi } from "@/lib/api";
 import {
@@ -413,7 +414,9 @@ export function AuthCenterPanel({
                     type="button"
                     onClick={() => void handleSaveQuotaSettings()}
                     disabled={
-                      !settings || !hasQuotaSettingChanges || savingQuotaSettings
+                      !settings ||
+                      !hasQuotaSettingChanges ||
+                      savingQuotaSettings
                     }
                   >
                     {savingQuotaSettings ? (
@@ -491,6 +494,17 @@ export function AuthCenterPanel({
             })}
           >
             <KiroOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
+
+        {canShowAccountProvider("kimi_code") ? (
+          <AuthProviderAccordionItem
+            value="kimi-code"
+            icon={<ProviderIcon icon="kimi" name="Kimi Code" size={24} />}
+            title="Kimi Code"
+            description={t("kimiOauth.description")}
+          >
+            <KimiOAuthSection showLoggedInAccounts />
           </AuthProviderAccordionItem>
         ) : null}
 

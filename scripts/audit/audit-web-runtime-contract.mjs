@@ -71,6 +71,54 @@ for (const command of commands) {
   }
 }
 
+const restEndpoints = contract.restEndpoints || [];
+const endpointIds = new Set();
+for (const endpoint of restEndpoints) {
+  const id = `${endpoint.method || ""} ${endpoint.path || ""}`;
+  if (!endpoint.method || !endpoint.path) {
+    fail("REST endpoint entry must include method and path");
+    continue;
+  }
+  if (endpointIds.has(id)) fail(`duplicate REST endpoint ${id}`);
+  endpointIds.add(id);
+  if (!featureIds.has(endpoint.feature)) {
+    fail(`REST endpoint ${id} references unknown feature ${endpoint.feature}`);
+  }
+}
+
+const usageEndpointPaths = [
+  "/web-api/usage/overview",
+  "/web-api/usage/trends",
+  "/web-api/usage/facets",
+  "/web-api/usage/provider-bundles",
+  "/web-api/usage/models",
+  "/web-api/usage/shares",
+  "/web-api/usage/requests",
+  "/web-api/usage/requests/:id",
+];
+for (const endpointPath of usageEndpointPaths) {
+  const endpoint = restEndpoints.find(
+    (candidate) => candidate.method === "GET" && candidate.path === endpointPath,
+  );
+  if (!endpoint) {
+    fail(`REST contract is missing GET ${endpointPath}`);
+    continue;
+  }
+  if (endpoint.feature !== "usage" || endpoint.authentication !== "session") {
+    fail(`GET ${endpointPath} must be a session-authenticated usage endpoint`);
+  }
+  if (!["data_meta", "data_meta_cursor"].includes(endpoint.responseEnvelope)) {
+    fail(`GET ${endpointPath} has invalid response envelope`);
+  }
+}
+
+const apiRouterSource = fs.readFileSync("src/api/mod.rs", "utf8");
+for (const endpointPath of usageEndpointPaths) {
+  if (!apiRouterSource.includes(`\"${endpointPath}\"`)) {
+    fail(`src/api/mod.rs is missing contracted endpoint ${endpointPath}`);
+  }
+}
+
 const dispatchPath = "src/api/invoke/dispatch.rs";
 if (fs.existsSync(dispatchPath)) {
   const httpSource = fs.readFileSync(dispatchPath, "utf8");

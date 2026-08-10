@@ -18,6 +18,50 @@ use super::store::StoredProvider;
 const BUNDLE_ID_FIELD: &str = "bundleId";
 const FAMILY_ID_FIELD: &str = "familyId";
 const SURFACE_ENABLED_FIELD: &str = "surfaceEnabled";
+const MODEL_POLICY_SCOPE_FIELD: &str = "modelPolicyScope";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPolicyScope {
+    #[default]
+    Global,
+    PerApp,
+}
+
+impl ModelPolicyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::PerApp => "per_app",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "global" => Some(Self::Global),
+            "per_app" => Some(Self::PerApp),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPolicySource {
+    BundleGlobal,
+    AppIndependent,
+    ProfileFixed,
+}
+
+impl ModelPolicySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BundleGlobal => "bundle_global",
+            Self::AppIndependent => "app_independent",
+            Self::ProfileFixed => "profile_fixed",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +78,7 @@ pub struct ProviderBundleView {
     pub icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_color: Option<String>,
+    pub model_policy_scope: ModelPolicyScope,
     pub supported_apps: Vec<AppKind>,
     pub enabled_apps: Vec<AppKind>,
     pub credential_configured: bool,
@@ -64,7 +109,10 @@ pub struct ProviderBundleWriteDraft {
     pub icon: Option<String>,
     #[serde(default)]
     pub icon_color: Option<String>,
-    pub model_policy: ModelPolicyKind,
+    #[serde(default)]
+    pub model_policy_scope: ModelPolicyScope,
+    #[serde(default)]
+    pub model_policy: Option<ModelPolicyKind>,
     #[serde(default)]
     pub upstream_model: Option<String>,
     #[serde(default)]
@@ -119,6 +167,10 @@ pub struct ProviderBundleSurfaceWriteDraft {
     pub app: AppKind,
     pub enabled: bool,
     pub profile_id: ProfileId,
+    #[serde(default)]
+    pub model_policy: Option<ModelPolicyKind>,
+    #[serde(default)]
+    pub upstream_model: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
@@ -216,10 +268,14 @@ impl ProviderBundleWriteDraft {
             SURFACE_ENABLED_FIELD.to_string(),
             Value::Bool(surface.enabled),
         );
+        extra.insert(
+            MODEL_POLICY_SCOPE_FIELD.to_string(),
+            Value::String(self.model_policy_scope.as_str().to_string()),
+        );
         let mut settings = Map::new();
         settings.insert(
             "modelMapping".to_string(),
-            self.model_mapping_value_for_profile(profile)?,
+            self.model_mapping_value_for_surface(surface, profile)?,
         );
 
         let mut env = Map::new();
@@ -296,32 +352,7 @@ impl ProviderBundleWriteDraft {
     }
 
     fn validate_shared_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
-        match self.model_policy {
-            ModelPolicyKind::Single => {
-                if normalized_optional_string(self.upstream_model.as_deref()).is_none() {
-                    bail!("single-model Provider Bundle requires an upstream model");
-                }
-            }
-            ModelPolicyKind::Passthrough => {
-                if normalized_optional_string(self.upstream_model.as_deref()).is_some() {
-                    bail!("passthrough Provider Bundle cannot define an upstream model");
-                }
-            }
-        }
-        let has_configurable_profile = family_has_configurable_model_profile(family);
-        for surface in &family.surfaces {
-            let profile = profile_by_id(surface.profile_id.as_str())
-                .expect("Provider family profile is registry-validated");
-            if has_configurable_profile && !profile_has_configurable_model_policy(profile) {
-                continue;
-            }
-            if !profile.allows_model_policy(self.model_policy) {
-                bail!(
-                    "Provider profile {} does not allow the selected model policy",
-                    profile.profile_id
-                );
-            }
-        }
+        self.validate_model_configuration(family)?;
 
         let credential_profile = profile_by_id(family.credential_profile_id.as_str())
             .expect("Provider family credential profile is registry-validated");
@@ -351,6 +382,85 @@ impl ProviderBundleWriteDraft {
             (true, None) => bail!("AWS Provider Bundle requires a region"),
             (false, Some(_)) => bail!("awsRegion is only valid for AWS Provider Bundles"),
             (false, None) => {}
+        }
+        Ok(())
+    }
+
+    fn validate_model_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
+        match self.model_policy_scope {
+            ModelPolicyScope::Global => {
+                let policy = self
+                    .model_policy
+                    .context("global Provider Bundle requires a model policy")?;
+                validate_model_policy_fields(
+                    policy,
+                    self.upstream_model.as_deref(),
+                    "Provider Bundle",
+                )?;
+                if self.surfaces.iter().any(|surface| {
+                    surface.model_policy.is_some()
+                        || normalized_optional_string(surface.upstream_model.as_deref()).is_some()
+                }) {
+                    bail!("global Provider Bundle cannot define Surface model policies");
+                }
+                let has_configurable_profile = family_has_configurable_model_profile(family);
+                for surface in &family.surfaces {
+                    let profile = profile_by_id(surface.profile_id.as_str())
+                        .expect("Provider family profile is registry-validated");
+                    if has_configurable_profile && !profile_has_configurable_model_policy(profile) {
+                        continue;
+                    }
+                    if !profile.allows_model_policy(policy) {
+                        bail!(
+                            "Provider profile {} does not allow the selected model policy",
+                            profile.profile_id
+                        );
+                    }
+                }
+            }
+            ModelPolicyScope::PerApp => {
+                if self.model_policy.is_some()
+                    || normalized_optional_string(self.upstream_model.as_deref()).is_some()
+                {
+                    bail!("per-app Provider Bundle cannot define a global model policy");
+                }
+                if family_configurable_model_profile_count(family) < 2 {
+                    bail!(
+                        "Provider family {} does not have multiple configurable model Surfaces",
+                        family.family_id
+                    );
+                }
+                for surface in &self.surfaces {
+                    let profile = profile_by_id(surface.profile_id.as_str())
+                        .expect("Provider family profile is registry-validated");
+                    if profile_has_configurable_model_policy(profile) {
+                        let policy = surface.model_policy.with_context(|| {
+                            format!(
+                                "per-app Provider Bundle requires a model policy for {}",
+                                surface.app.as_str()
+                            )
+                        })?;
+                        if !profile.allows_model_policy(policy) {
+                            bail!(
+                                "Provider profile {} does not allow the selected model policy",
+                                profile.profile_id
+                            );
+                        }
+                        validate_model_policy_fields(
+                            policy,
+                            surface.upstream_model.as_deref(),
+                            surface.app.as_str(),
+                        )?;
+                    } else if surface.model_policy.is_some()
+                        || normalized_optional_string(surface.upstream_model.as_deref()).is_some()
+                    {
+                        bail!(
+                            "Provider profile {} has a fixed model policy",
+                            profile.profile_id
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -449,24 +559,33 @@ impl ProviderBundleWriteDraft {
         Ok(())
     }
 
-    fn model_mapping_value_for_profile(&self, profile: &ProfileSpec) -> anyhow::Result<Value> {
-        let family = family_by_id(&self.family_id)
-            .with_context(|| format!("unknown Provider family {}", self.family_id))?;
-        let use_bundle_policy = profile_has_configurable_model_policy(profile)
-            || !family_has_configurable_model_profile(family);
-        let (policy, upstream_model) = if use_bundle_policy {
-            if !profile.allows_model_policy(self.model_policy) {
-                bail!(
-                    "Provider profile {} does not allow the selected model policy",
-                    profile.profile_id
-                );
-            }
-            (self.model_policy, self.upstream_model.as_deref())
-        } else {
+    fn model_mapping_value_for_surface(
+        &self,
+        surface: &ProviderBundleSurfaceWriteDraft,
+        profile: &ProfileSpec,
+    ) -> anyhow::Result<Value> {
+        let (policy, upstream_model) = if !profile_has_configurable_model_policy(profile) {
             (
                 profile.model_policy,
                 profile.default_upstream_model.as_deref(),
             )
+        } else {
+            match self.model_policy_scope {
+                ModelPolicyScope::Global => (
+                    self.model_policy
+                        .context("global Provider Bundle requires a model policy")?,
+                    self.upstream_model.as_deref(),
+                ),
+                ModelPolicyScope::PerApp => (
+                    surface.model_policy.with_context(|| {
+                        format!(
+                            "per-app Provider Bundle requires a model policy for {}",
+                            surface.app.as_str()
+                        )
+                    })?,
+                    surface.upstream_model.as_deref(),
+                ),
+            }
         };
         Ok(match policy {
             ModelPolicyKind::Passthrough => json!({"mode": "passthrough"}),
@@ -488,6 +607,38 @@ fn family_has_configurable_model_profile(family: &ProviderFamilySpec) -> bool {
             .expect("Provider family profile is registry-validated");
         profile_has_configurable_model_policy(profile)
     })
+}
+
+fn family_configurable_model_profile_count(family: &ProviderFamilySpec) -> usize {
+    family
+        .surfaces
+        .iter()
+        .filter(|surface| {
+            let profile = profile_by_id(surface.profile_id.as_str())
+                .expect("Provider family profile is registry-validated");
+            profile_has_configurable_model_policy(profile)
+        })
+        .count()
+}
+
+fn validate_model_policy_fields(
+    policy: ModelPolicyKind,
+    upstream_model: Option<&str>,
+    scope: &str,
+) -> anyhow::Result<()> {
+    match policy {
+        ModelPolicyKind::Single => {
+            if normalized_optional_string(upstream_model).is_none() {
+                bail!("single-model {scope} requires an upstream model");
+            }
+        }
+        ModelPolicyKind::Passthrough => {
+            if normalized_optional_string(upstream_model).is_some() {
+                bail!("passthrough {scope} cannot define an upstream model");
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ProviderDriverOptionsWriteDraft {
@@ -625,6 +776,8 @@ impl ProviderBundleView {
             .to_string();
         let family_id = family_id_for_view(first)?;
         let name = first.provider.name.clone();
+        let model_policy_scope = bundle_model_policy_scope(&first.provider)?
+            .context("Provider Bundle Surface has no model policy scope")?;
         let mut revision = 0u64;
         let mut surfaces = BTreeMap::new();
         let mut enabled_apps = Vec::new();
@@ -634,6 +787,7 @@ impl ProviderBundleView {
             if bundle_id(&view.provider) != Some(id.as_str())
                 || family_id_for_view(&view)? != family_id
                 || view.provider.name != name
+                || bundle_model_policy_scope(&view.provider)? != Some(model_policy_scope)
             {
                 bail!("Provider Bundle Surface metadata is inconsistent");
             }
@@ -699,6 +853,7 @@ impl ProviderBundleView {
             notes: extra_string(provider, "notes"),
             icon: extra_string(provider, "icon"),
             icon_color: extra_string(provider, "iconColor"),
+            model_policy_scope,
             supported_apps,
             enabled_apps,
             credential_configured,
@@ -712,10 +867,49 @@ pub fn bundle_id(provider: &Provider) -> Option<&str> {
     extra_string_ref(provider, BUNDLE_ID_FIELD)
 }
 
+pub fn bundle_family_id(provider: &Provider) -> Option<&str> {
+    extra_string_ref(provider, FAMILY_ID_FIELD)
+}
+
+pub fn bundle_supported_apps(provider: &Provider) -> Option<Vec<AppKind>> {
+    let family_id = extra_string_ref(provider, FAMILY_ID_FIELD)?;
+    let family = family_by_id(family_id)?;
+    Some(family.surfaces.iter().map(|surface| surface.app).collect())
+}
+
+pub fn bundle_model_policy_scope(provider: &Provider) -> anyhow::Result<Option<ModelPolicyScope>> {
+    if bundle_id(provider).is_none() {
+        return Ok(None);
+    }
+    let value = extra_string_ref(provider, MODEL_POLICY_SCOPE_FIELD)
+        .context("Provider Bundle Surface has no model policy scope")?;
+    ModelPolicyScope::parse(value)
+        .map(Some)
+        .with_context(|| format!("invalid Provider Bundle model policy scope {value}"))
+}
+
+pub fn bundle_model_policy_source(
+    provider: &Provider,
+    profile: Option<&ProfileSpec>,
+) -> anyhow::Result<ModelPolicySource> {
+    if profile.is_some_and(|profile| !profile_has_configurable_model_policy(profile)) {
+        return Ok(ModelPolicySource::ProfileFixed);
+    }
+    Ok(match bundle_model_policy_scope(provider)? {
+        Some(ModelPolicyScope::Global) => ModelPolicySource::BundleGlobal,
+        Some(ModelPolicyScope::PerApp) | None => ModelPolicySource::AppIndependent,
+    })
+}
+
 pub fn has_bundle_managed_metadata(provider: &Provider) -> bool {
-    [BUNDLE_ID_FIELD, FAMILY_ID_FIELD, SURFACE_ENABLED_FIELD]
-        .iter()
-        .any(|field| provider.extra.contains_key(*field))
+    [
+        BUNDLE_ID_FIELD,
+        FAMILY_ID_FIELD,
+        SURFACE_ENABLED_FIELD,
+        MODEL_POLICY_SCOPE_FIELD,
+    ]
+    .iter()
+    .any(|field| provider.extra.contains_key(*field))
 }
 
 pub fn is_explicit_bundle_surface(provider: &Provider) -> bool {
@@ -826,6 +1020,8 @@ mod tests {
             app,
             enabled: true,
             profile_id: ProfileId::parse(profile_id).unwrap(),
+            model_policy: None,
+            upstream_model: None,
             endpoint: None,
             test_model: None,
             transport: ProviderTransportWriteDraft::default(),
@@ -845,7 +1041,8 @@ mod tests {
             notes: None,
             icon: None,
             icon_color: None,
-            model_policy: ModelPolicyKind::Single,
+            model_policy_scope: ModelPolicyScope::Global,
+            model_policy: Some(ModelPolicyKind::Single),
             upstream_model: Some("grok-4.5".to_string()),
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "grok-account".to_string(),
@@ -872,7 +1069,8 @@ mod tests {
             notes: None,
             icon: None,
             icon_color: None,
-            model_policy: ModelPolicyKind::Single,
+            model_policy_scope: ModelPolicyScope::Global,
+            model_policy: Some(ModelPolicyKind::Single),
             upstream_model: Some("gpt-5.6-sol".to_string()),
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "openai-account".to_string(),
@@ -904,7 +1102,7 @@ mod tests {
     #[test]
     fn passthrough_bundle_rejects_an_upstream_model() {
         let mut draft = grok_bundle();
-        draft.model_policy = ModelPolicyKind::Passthrough;
+        draft.model_policy = Some(ModelPolicyKind::Passthrough);
         let error = draft.validate().unwrap_err();
         assert!(error
             .to_string()
@@ -930,7 +1128,7 @@ mod tests {
             json!({"mode": "passthrough"})
         );
 
-        draft.model_policy = ModelPolicyKind::Passthrough;
+        draft.model_policy = Some(ModelPolicyKind::Passthrough);
         draft.upstream_model = None;
         assert!(draft.validate().is_ok());
         for surface in &draft.surfaces {
@@ -939,5 +1137,51 @@ mod tests {
                 json!({"mode": "passthrough"})
             );
         }
+    }
+
+    #[test]
+    fn per_app_bundle_materializes_each_surface_model_policy() {
+        let mut draft = grok_bundle();
+        draft.model_policy_scope = ModelPolicyScope::PerApp;
+        draft.model_policy = None;
+        draft.upstream_model = None;
+        draft.surfaces[0].model_policy = Some(ModelPolicyKind::Single);
+        draft.surfaces[0].upstream_model = Some("claude-model".to_string());
+        draft.surfaces[1].model_policy = Some(ModelPolicyKind::Passthrough);
+        draft.surfaces[2].model_policy = Some(ModelPolicyKind::Single);
+        draft.surfaces[2].upstream_model = Some("gemini-model".to_string());
+
+        assert!(draft.validate().is_ok());
+        assert_eq!(
+            draft
+                .provider_for_surface(&draft.surfaces[0])
+                .unwrap()
+                .settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "claude-model"})
+        );
+        assert_eq!(
+            draft
+                .provider_for_surface(&draft.surfaces[1])
+                .unwrap()
+                .settings_config["modelMapping"],
+            json!({"mode": "passthrough"})
+        );
+        assert_eq!(
+            draft
+                .provider_for_surface(&draft.surfaces[2])
+                .unwrap()
+                .settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "gemini-model"})
+        );
+    }
+
+    #[test]
+    fn per_app_bundle_rejects_global_model_fields() {
+        let mut draft = grok_bundle();
+        draft.model_policy_scope = ModelPolicyScope::PerApp;
+        let error = draft.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("per-app Provider Bundle cannot define a global model policy"));
     }
 }

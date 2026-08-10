@@ -412,13 +412,7 @@ async fn refresh_with_method(
             })
         }
         KiroAuthMethod::Social => {
-            let auth_region = string_from_account(account, &["/authRegion", "/auth_region"])
-                .unwrap_or_else(|| SOCIAL_AUTH_REGION.to_string());
-            let url = if auth_region == SOCIAL_AUTH_REGION {
-                format!("{SOCIAL_REFRESH_BASE}/refreshToken")
-            } else {
-                format!("https://prod.{auth_region}.auth.desktop.kiro.dev/refreshToken")
-            };
+            let url = social_refresh_url(account)?;
             let raw = post_json(http, &url, &json!({ "refreshToken": refresh_token })).await?;
             let token = parse_token_response(raw.clone(), "kiro social refresh")?;
             Ok(KiroRefreshResult {
@@ -506,12 +500,17 @@ where
         .refresh_token
         .clone()
         .or_else(|| account.refresh_token.clone());
-    let auth_region_value = string_from_value(&raw, &["/authRegion", "/auth_region"])
-        .unwrap_or_else(|| DEFAULT_REGION.to_string());
-    let api_region_value =
-        string_from_value(&raw, &["/apiRegion", "/api_region"]).unwrap_or_else(|| {
+    let auth_region_value = normalize_region(
+        &string_from_value(&raw, &["/authRegion", "/auth_region"])
+            .unwrap_or_else(|| DEFAULT_REGION.to_string()),
+    )
+    .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
+    let api_region_candidate = string_from_value(&raw, &["/apiRegion", "/api_region"])
+        .unwrap_or_else(|| {
             region_from_profile_arn(account).unwrap_or_else(|| auth_region_value.clone())
         });
+    let api_region_value = normalize_region(&api_region_candidate)
+        .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
     let profile_arn = string_from_value(
         &raw,
         &["/resolvedProfileArn", "/profileArn", "/profile_arn"],
@@ -706,6 +705,7 @@ async fn response_json(
             retry_after_ms: None,
             immediate_relogin: kind == OAuthErrorKind::InvalidGrant
                 && invalid_grant_requires_immediate_relogin(&body),
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         });
     }
@@ -783,6 +783,17 @@ fn auth_region(account: &Account) -> Result<String, AccountRefreshFailure> {
             .unwrap_or(DEFAULT_REGION),
     )
     .map_err(|error| AccountRefreshFailure::bad_request(error.message))
+}
+
+fn social_refresh_url(account: &Account) -> Result<String, AccountRefreshFailure> {
+    let region = auth_region(account)?;
+    if region == SOCIAL_AUTH_REGION {
+        Ok(format!("{SOCIAL_REFRESH_BASE}/refreshToken"))
+    } else {
+        Ok(format!(
+            "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+        ))
+    }
 }
 
 fn auth_method(account: &Account) -> KiroAuthMethod {
@@ -1043,6 +1054,7 @@ fn kiro_device_failure(
         retryable: error.status.is_server_error() || error.status == StatusCode::TOO_MANY_REQUESTS,
         retry_after_ms: None,
         immediate_relogin: false,
+        outcome_unknown: false,
         endpoint_fallback_safe: false,
     }
 }
@@ -1148,6 +1160,25 @@ mod tests {
             1000,
         )
         .is_err());
+    }
+
+    #[test]
+    fn social_refresh_url_rejects_unsafe_region_from_stored_account() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "legacy-social",
+            "providerType": "kiro_oauth",
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "profile": {
+                "authMethod": "social",
+                "authRegion": "us-east-1.attacker.invalid"
+            }
+        }))
+        .unwrap();
+
+        let error = social_refresh_url(&account).unwrap_err();
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(error.message, "invalid Kiro region");
     }
 
     #[test]

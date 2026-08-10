@@ -22,6 +22,7 @@ import type { UsageRangePreset, UsageRangeSelection } from "@/types/usage";
 type DraftField = "start" | "end";
 
 const PRESETS: UsageRangePreset[] = ["today", "1d", "7d", "14d", "30d"];
+const MAX_USAGE_RANGE_SECONDS = 32 * 24 * 60 * 60;
 
 interface UsageDateRangePickerProps {
   selection: UsageRangeSelection;
@@ -229,6 +230,10 @@ export function UsageDateRangePicker({
     setError(null);
     if (draftStart > draftEnd) {
       setError(t("usage.invalidTimeRangeOrder", "开始时间不能晚于结束时间"));
+      return;
+    }
+    if (draftEnd - draftStart >= MAX_USAGE_RANGE_SECONDS) {
+      setError(t("usage.timeRangeTooLarge", "时间范围过大，请缩小范围"));
       return;
     }
     onApply({

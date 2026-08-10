@@ -1459,7 +1459,9 @@ async fn open_agent_stream(
         blob_store: Some(&mut blob_store),
         images,
     };
-    let body = encode_agent_run_request(&mut input);
+    let body = encode_agent_run_request(&mut input).map_err(|message| {
+        ProxyError::bad_request(format!("invalid Cursor AgentService model: {message}"))
+    })?;
     let stream = CursorH2Stream::open(
         &cursor_agentservice_base_url(stored),
         cursor_agentservice_headers(&credential.account, &credential.access_token),

@@ -1,9 +1,15 @@
 //! Kiro OAuth protocol bridge for Claude-compatible proxy requests.
 
+mod endpoint;
+mod image;
+mod tool_bridge;
+mod wire;
+
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::model::ProviderType;
 use crate::proxy::ProxyError;
-use bytes::{Buf, Bytes, BytesMut};
+use base64::Engine;
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -14,8 +20,11 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use tool_bridge::ToolCompatibilityMode;
+
 const DEFAULT_SYSTEM_VERSION: &str = "macos";
 const TOOL_NAME_MAX_LEN: usize = 63;
+const MAX_TOOL_JSON_BYTES: usize = 16 * 1024 * 1024;
 const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
 const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
 const SYSTEM_CHUNKED_POLICY: &str = "When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary.";
@@ -26,7 +35,37 @@ const PROMPT_CACHE_DEFAULT_TTL_SECS: i64 = 5 * 60;
 const PROMPT_CACHE_MAX_TTL_SECS: i64 = 60 * 60;
 const THINKING_SIGNATURE_FALLBACK: &str = "cc-switch-kiro-thinking-signature";
 
-static KIRO_PROMPT_CACHE: LazyLock<KiroPromptCache> = LazyLock::new(|| KiroPromptCache::new(None));
+#[cfg(test)]
+fn crc32(bytes: &[u8]) -> u32 {
+    wire::crc32(bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_event_frame(event_type: &str, payload: &Value) -> Vec<u8> {
+    let mut headers = Vec::new();
+    headers.push(":event-type".len() as u8);
+    headers.extend_from_slice(b":event-type");
+    headers.push(7);
+    headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+    headers.extend_from_slice(event_type.as_bytes());
+    let payload = serde_json::to_vec(payload).unwrap();
+    let total_len = 12 + headers.len() + payload.len() + 4;
+    let mut frame = Vec::with_capacity(total_len);
+    frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+    frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+    frame.extend_from_slice(&headers);
+    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+    frame
+}
+
+static KIRO_PROMPT_CACHE: LazyLock<KiroPromptCache> = LazyLock::new(|| {
+    let path = std::env::var_os("CC_SWITCH_KIRO_PROMPT_CACHE_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    KiroPromptCache::new(path)
+});
 static KIRO_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -45,6 +84,8 @@ pub(crate) struct KiroAccountData {
     pub auth_method: Option<String>,
     pub provider: Option<String>,
     pub endpoint: Option<String>,
+    pub client_version: Option<String>,
+    pub cli_version: Option<String>,
     pub authenticated_at: i64,
 }
 
@@ -60,6 +101,29 @@ pub(crate) struct KiroPreparedRequest {
     pub headers: Vec<(&'static str, String)>,
     pub body: Value,
     pub tool_name_map: HashMap<String, String>,
+    pub cache_namespace: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct KiroCallContext {
+    pub ide_version: String,
+    pub claude_code_tools: bool,
+    pub cache_namespace: String,
+}
+
+impl KiroCallContext {
+    fn fallback(account: &Account, body: &Value) -> Self {
+        Self {
+            ide_version: endpoint::FALLBACK_IDE_VERSION.to_string(),
+            claude_code_tools: false,
+            cache_namespace: format!(
+                "account:{}:generation:{}:session:{}",
+                account.id,
+                account.auth_identity_generation,
+                cache_scope_seed(body)
+            ),
+        }
+    }
 }
 
 fn string_at(value: Option<&Value>, pointers: &[&str]) -> Option<String> {
@@ -109,6 +173,29 @@ impl KiroAccountData {
             .to_string();
         let profile = account.profile.as_ref();
         let raw = account.raw.as_ref();
+        let profile_arn = string_at(profile, &["/profileArn", "/profile_arn"])
+            .or_else(|| string_at(raw, &["/resolvedProfileArn", "/profileArn"]));
+        let auth_region = string_at(profile, &["/authRegion", "/auth_region"])
+            .or_else(|| string_at(raw, &["/authRegion", "/auth_region"]))
+            .unwrap_or_else(|| crate::domain::providers::kiro::DEFAULT_REGION.to_string());
+        let auth_region = crate::domain::providers::kiro::normalize_region(&auth_region)
+            .ok_or_else(|| {
+                ProxyError::bad_request(format!(
+                    "kiro account {} has an invalid auth region",
+                    account.id
+                ))
+            })?;
+        let api_region = string_at(profile, &["/apiRegion", "/api_region"])
+            .or_else(|| string_at(raw, &["/apiRegion", "/api_region"]))
+            .or_else(|| region_from_profile_arn(profile_arn.as_deref()))
+            .unwrap_or_else(|| crate::domain::providers::kiro::DEFAULT_REGION.to_string());
+        let api_region =
+            crate::domain::providers::kiro::normalize_region(&api_region).ok_or_else(|| {
+                ProxyError::bad_request(format!(
+                    "kiro account {} has an invalid API region",
+                    account.id
+                ))
+            })?;
         Ok(Self {
             account_id: account.id.clone(),
             email: account
@@ -116,19 +203,9 @@ impl KiroAccountData {
                 .clone()
                 .or_else(|| string_at(profile, &["/email"])),
             refresh_token: refresh_token.clone(),
-            profile_arn: string_at(profile, &["/profileArn", "/profile_arn"])
-                .or_else(|| string_at(raw, &["/resolvedProfileArn", "/profileArn"])),
-            auth_region: string_at(profile, &["/authRegion", "/auth_region"])
-                .or_else(|| string_at(raw, &["/authRegion", "/auth_region"]))
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            api_region: string_at(profile, &["/apiRegion", "/api_region"])
-                .or_else(|| string_at(raw, &["/apiRegion", "/api_region"]))
-                .or_else(|| {
-                    let profile_arn = string_at(profile, &["/profileArn", "/profile_arn"])
-                        .or_else(|| string_at(raw, &["/resolvedProfileArn", "/profileArn"]));
-                    region_from_profile_arn(profile_arn.as_deref())
-                })
-                .unwrap_or_else(|| "us-east-1".to_string()),
+            profile_arn,
+            auth_region,
+            api_region,
             machine_id: string_at(profile, &["/machineId", "/machine_id"])
                 .or_else(|| string_at(raw, &["/machineId", "/machine_id"]))
                 .or_else(|| Some(machine_id_from_refresh_token(&refresh_token))),
@@ -145,6 +222,28 @@ impl KiroAccountData {
             provider: string_at(profile, &["/provider"]).or_else(|| string_at(raw, &["/provider"])),
             endpoint: string_at(raw, &["/endpoint", "/runtimeEndpoint"])
                 .or_else(|| string_at(profile, &["/endpoint", "/runtimeEndpoint"])),
+            client_version: string_at(
+                raw,
+                &[
+                    "/kiroVersion",
+                    "/kiro_version",
+                    "/clientVersion",
+                    "/client_version",
+                ],
+            )
+            .or_else(|| {
+                string_at(
+                    profile,
+                    &[
+                        "/kiroVersion",
+                        "/kiro_version",
+                        "/clientVersion",
+                        "/client_version",
+                    ],
+                )
+            }),
+            cli_version: string_at(raw, &["/cliVersion", "/cli_version"])
+                .or_else(|| string_at(profile, &["/cliVersion", "/cli_version"])),
             authenticated_at: raw
                 .and_then(|value| value.pointer("/importedAtMs"))
                 .and_then(Value::as_i64)
@@ -168,107 +267,46 @@ pub(crate) fn prepare_kiro_request(
     account: &Account,
     body: &Value,
 ) -> Result<KiroPreparedRequest, ProxyError> {
+    let context = KiroCallContext::fallback(account, body);
+    prepare_kiro_request_with_context(account, body, &context)
+}
+
+pub(crate) fn prepare_kiro_request_with_context(
+    account: &Account,
+    body: &Value,
+    context: &KiroCallContext,
+) -> Result<KiroPreparedRequest, ProxyError> {
     let account_data = KiroAccountData::from_account(account)?;
     let access_token = account_data.access_token(account)?;
-    let request = anthropic_to_kiro_request(body, &account_data)?;
-    let region = (!account_data.api_region.trim().is_empty())
-        .then(|| account_data.api_region.clone())
-        .or_else(|| region_from_profile_arn(account_data.profile_arn.as_deref()))
-        .unwrap_or_else(|| "us-east-1".to_string());
-    let host = format!("q.{region}.amazonaws.com");
-    let machine_id = account_data
-        .machine_id
-        .clone()
-        .unwrap_or_else(|| machine_id_from_refresh_token(&account_data.refresh_token));
-    let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-2.3.0-{machine_id}");
-    let user_agent = format!(
-        "aws-sdk-js/1.0.34 ua/2.1 os/{DEFAULT_SYSTEM_VERSION} lang/js md/nodejs#22.22.0 api/codewhispererstreaming#1.0.34 m/E KiroIDE-2.3.0-{machine_id}"
-    );
-    let endpoint = account_data
-        .endpoint
-        .as_deref()
-        .unwrap_or("ide")
-        .trim()
-        .to_ascii_lowercase();
-    let mut headers = vec![
-        (
-            "content-type",
-            if endpoint == "cli" {
-                "application/x-amz-json-1.0".to_string()
-            } else {
-                "application/json".to_string()
-            },
-        ),
-        ("connection", "close".to_string()),
-        ("x-amzn-codewhisperer-optout", "true".to_string()),
-        ("x-amzn-kiro-agent-mode", "vibe".to_string()),
-        ("x-amz-user-agent", x_amz_user_agent),
-        ("user-agent", user_agent),
-        ("host", host.clone()),
-        ("amz-sdk-invocation-id", next_uuid_like("kiro-invocation")),
-        ("amz-sdk-request", "attempt=1; max=3".to_string()),
-        ("authorization", format!("Bearer {access_token}")),
-    ];
-    if endpoint == "cli" {
-        headers.push((
-            "x-amz-target",
-            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse".to_string(),
-        ));
-        if let Some(profile_arn) = request.body.get("profileArn").and_then(Value::as_str) {
-            headers.push(("x-amzn-kiro-profile-arn", profile_arn.to_string()));
-        }
-    }
-    if let Some(token_type) = token_type_header(&account_data) {
-        headers.push(("tokentype", token_type.to_string()));
-    }
-    let body = if endpoint == "cli" {
-        cli_request_body(request.body)
+    let mut body = body.clone();
+    image::prepare_anthropic_images(&mut body)?;
+    let tool_mode = if context.claude_code_tools {
+        ToolCompatibilityMode::ClaudeCode
     } else {
-        request.body
+        ToolCompatibilityMode::Raw
     };
+    let request = anthropic_to_kiro_request(&body, &account_data, tool_mode)?;
+    let prepared = endpoint::prepare(
+        endpoint::EndpointKind::from_account(&account_data),
+        &account_data,
+        access_token,
+        request.body,
+        &context.ide_version,
+    );
     Ok(KiroPreparedRequest {
-        url: if endpoint == "cli" {
-            format!("https://{host}/")
-        } else {
-            format!("https://{host}/generateAssistantResponse")
-        },
-        host: host.clone(),
-        headers,
-        body,
+        url: prepared.url,
+        host: prepared.host,
+        headers: prepared.headers,
+        body: prepared.body,
         tool_name_map: request.tool_name_map,
+        cache_namespace: context.cache_namespace.clone(),
     })
-}
-
-fn token_type_header(account: &KiroAccountData) -> Option<&'static str> {
-    let method = account.auth_method.as_deref()?.trim().to_ascii_lowercase();
-    match method.as_str() {
-        "api_key" | "api-key" | "apikey" => Some("API_KEY"),
-        "external_idp" | "external-idp" | "externalidp" => Some("EXTERNAL_IDP"),
-        _ => None,
-    }
-}
-
-fn cli_request_body(mut body: Value) -> Value {
-    if let Some(state) = body
-        .get_mut("conversationState")
-        .and_then(Value::as_object_mut)
-    {
-        state.remove("agentContinuationId");
-        if let Some(current) = state
-            .get_mut("currentMessage")
-            .and_then(|value| value.pointer_mut("/userInputMessage"))
-            .and_then(Value::as_object_mut)
-        {
-            current.insert("origin".to_string(), Value::String("KIRO_CLI".to_string()));
-            current.remove("modelId");
-        }
-    }
-    body
 }
 
 fn anthropic_to_kiro_request(
     body: &Value,
     account: &KiroAccountData,
+    tool_mode: ToolCompatibilityMode,
 ) -> Result<KiroRequestBuild, ProxyError> {
     let model = body
         .get("model")
@@ -291,10 +329,10 @@ fn anthropic_to_kiro_request(
     let messages = &raw_messages[..=last_user_idx];
 
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(body.get("tools"), &mut tool_name_map);
+    let mut tools = convert_tools(body.get("tools"), &mut tool_name_map, tool_mode);
     let (content, images, tool_results) =
         parse_user_content(messages[last_user_idx].get("content"));
-    let mut history = build_history(body, messages, model_id, &mut tool_name_map);
+    let mut history = build_history(body, messages, model_id, &mut tool_name_map, tool_mode);
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
@@ -314,7 +352,7 @@ fn anthropic_to_kiro_request(
         }
     });
 
-    let profile_arn = resolve_profile_arn(account);
+    let profile_arn = endpoint::profile_arn(account);
     let mut request_body = json!({
         "conversationState": {
             "agentTaskType": "vibe",
@@ -451,6 +489,26 @@ pub(super) fn map_model(model: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn resolve_model(model: &str) -> Option<String> {
+    if let Some(model) = map_model(model) {
+        return Some(model.to_string());
+    }
+    let model = model.trim();
+    (!model.is_empty()
+        && model.len() <= 128
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'[' | b']')
+        }))
+    .then(|| model.to_string())
+}
+
+pub(crate) fn supported_models() -> Vec<String> {
+    crate::domain::providers::kiro::STATIC_MODEL_IDS
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
+
 fn env_state() -> Value {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -480,6 +538,18 @@ fn conversation_id(body: &Value) -> String {
         return stable_uuid_like(user_id);
     }
     next_uuid_like("conversation")
+}
+
+fn cache_scope_seed(body: &Value) -> String {
+    let metadata = body.get("metadata");
+    metadata
+        .and_then(|value| value.get("session_id"))
+        .or_else(|| metadata.and_then(|value| value.get("user_id")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(stable_uuid_like)
+        .unwrap_or_else(|| "anonymous".to_string())
 }
 
 fn stable_uuid_like(input: &str) -> String {
@@ -533,7 +603,11 @@ fn looks_uuid_like(input: &str) -> bool {
             .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
-fn convert_tools(tools: Option<&Value>, tool_name_map: &mut HashMap<String, String>) -> Vec<Value> {
+fn convert_tools(
+    tools: Option<&Value>,
+    tool_name_map: &mut HashMap<String, String>,
+    tool_mode: ToolCompatibilityMode,
+) -> Vec<Value> {
     tools
         .and_then(|v| v.as_array())
         .map(|items| {
@@ -541,7 +615,7 @@ fn convert_tools(tools: Option<&Value>, tool_name_map: &mut HashMap<String, Stri
                 .iter()
                 .filter_map(|tool| {
                     let name = tool.get("name")?.as_str()?;
-                    let mapped_name = map_tool_name(name, tool_name_map);
+                    let mapped_name = map_tool_name(name, tool_name_map, tool_mode);
                     let mut description = tool
                         .get("description")
                         .and_then(|v| v.as_str())
@@ -566,6 +640,11 @@ fn convert_tools(tools: Option<&Value>, tool_name_map: &mut HashMap<String, Stri
                         .get("input_schema")
                         .cloned()
                         .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                    let schema = if tool_mode == ToolCompatibilityMode::ClaudeCode {
+                        tool_bridge::schema_to_kiro(name, schema)
+                    } else {
+                        schema
+                    };
                     Some(json!({
                         "toolSpecification": {
                             "name": mapped_name,
@@ -727,7 +806,14 @@ fn shorten_tool_name(name: &str) -> String {
     format!("{prefix}_{hash_suffix}")
 }
 
-fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
+fn map_tool_name(
+    name: &str,
+    tool_name_map: &mut HashMap<String, String>,
+    tool_mode: ToolCompatibilityMode,
+) -> String {
+    if let Some(mapped) = tool_bridge::map_name(name, tool_mode, tool_name_map) {
+        return mapped;
+    }
     if name.chars().count() <= TOOL_NAME_MAX_LEN {
         return name.to_string();
     }
@@ -748,6 +834,7 @@ fn build_history(
     messages: &[Value],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
+    tool_mode: ToolCompatibilityMode,
 ) -> Vec<Value> {
     let mut history = Vec::new();
     let prefix = thinking_prefix(body);
@@ -789,7 +876,11 @@ fn build_history(
         match msg.get("role").and_then(|v| v.as_str()) {
             Some("user") => {
                 if !assistant_buffer.is_empty() {
-                    history.push(merge_assistant_messages(&assistant_buffer, tool_name_map));
+                    history.push(merge_assistant_messages(
+                        &assistant_buffer,
+                        tool_name_map,
+                        tool_mode,
+                    ));
                     assistant_buffer.clear();
                 }
                 user_buffer.push(msg);
@@ -806,7 +897,11 @@ fn build_history(
     }
 
     if !assistant_buffer.is_empty() {
-        history.push(merge_assistant_messages(&assistant_buffer, tool_name_map));
+        history.push(merge_assistant_messages(
+            &assistant_buffer,
+            tool_name_map,
+            tool_mode,
+        ));
     }
     if !user_buffer.is_empty() {
         history.push(merge_user_messages(&user_buffer, model_id));
@@ -896,11 +991,13 @@ fn merge_user_messages(messages: &[&Value], model_id: &str) -> Value {
 fn merge_assistant_messages(
     messages: &[&Value],
     tool_name_map: &mut HashMap<String, String>,
+    tool_mode: ToolCompatibilityMode,
 ) -> Value {
     let mut content_parts = Vec::new();
     let mut tool_uses = Vec::new();
     for msg in messages {
-        let (content, msg_tool_uses) = parse_assistant_content(msg.get("content"), tool_name_map);
+        let (content, msg_tool_uses) =
+            parse_assistant_content(msg.get("content"), tool_name_map, tool_mode);
         if !content.trim().is_empty() {
             content_parts.push(content);
         }
@@ -1081,15 +1178,7 @@ fn parse_user_content(content: Option<&Value>) -> (String, Vec<Value>, Vec<Value
                         text.push_str(item.get("text").and_then(|v| v.as_str()).unwrap_or(""));
                     }
                     Some("image") => {
-                        if let Some(source) = item.get("source") {
-                            let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                            let media = source
-                                .get("media_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("image/png");
-                            let format = media.split('/').nth(1).unwrap_or("png");
-                            images.push(json!({"format": format, "source": {"bytes": data}}));
-                        }
+                        append_kiro_image(item, &mut images);
                     }
                     Some("tool_result") => {
                         let id = item
@@ -1101,6 +1190,13 @@ fn parse_user_content(content: Option<&Value>) -> (String, Vec<Value>, Vec<Value
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         let result_text = flatten_content_to_text(item.get("content"));
+                        if let Some(blocks) = item.get("content").and_then(Value::as_array) {
+                            for block in blocks {
+                                if block.get("type").and_then(Value::as_str) == Some("image") {
+                                    append_kiro_image(block, &mut images);
+                                }
+                            }
+                        }
                         tool_results.push(json!({
                             "toolUseId": id,
                             "content": [{"text": result_text}],
@@ -1117,9 +1213,28 @@ fn parse_user_content(content: Option<&Value>) -> (String, Vec<Value>, Vec<Value
     (text, images, tool_results)
 }
 
+fn append_kiro_image(block: &Value, images: &mut Vec<Value>) {
+    let Some(source) = block.get("source") else {
+        return;
+    };
+    let Some(data) = source.get("data").and_then(Value::as_str) else {
+        return;
+    };
+    let media = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    let format = match media.split('/').nth(1).unwrap_or("png") {
+        "jpg" => "jpeg",
+        value => value,
+    };
+    images.push(json!({"format": format, "source": {"bytes": data}}));
+}
+
 fn parse_assistant_content(
     content: Option<&Value>,
     tool_name_map: &mut HashMap<String, String>,
+    tool_mode: ToolCompatibilityMode,
 ) -> (String, Vec<Value>) {
     let mut text = String::new();
     let mut thinking = String::new();
@@ -1137,11 +1252,15 @@ fn parse_assistant_content(
                     }
                     Some("tool_use") => {
                         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let mapped_name = map_tool_name(name, tool_name_map);
+                        let mapped_name = map_tool_name(name, tool_name_map, tool_mode);
+                        let mut input = item.get("input").cloned().unwrap_or_else(|| json!({}));
+                        if tool_bridge::builtin_name(name, tool_mode).is_some() {
+                            input = tool_bridge::input_to_kiro(name, input);
+                        }
                         tool_uses.push(json!({
                             "toolUseId": item.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                             "name": mapped_name,
-                            "input": item.get("input").cloned().unwrap_or_else(|| json!({}))
+                            "input": input
                         }));
                     }
                     Some("thinking") => {
@@ -1184,122 +1303,6 @@ fn flatten_content_to_text(content: Option<&Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
-}
-
-#[derive(Debug, Clone)]
-struct KiroFrame {
-    headers: HashMap<String, String>,
-    payload: Vec<u8>,
-}
-
-fn parse_frames(buffer: &mut BytesMut) -> Vec<KiroFrame> {
-    let mut frames = Vec::new();
-    loop {
-        if buffer.len() < 12 {
-            break;
-        }
-        let total_length =
-            u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-        let header_length =
-            u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
-        if !(16..=16 * 1024 * 1024).contains(&total_length) {
-            buffer.advance(1);
-            continue;
-        }
-        let expected_prelude_crc =
-            u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
-        if crc32(&buffer[..8]) != expected_prelude_crc {
-            buffer.advance(1);
-            continue;
-        }
-        if buffer.len() < total_length {
-            break;
-        }
-        let expected_message_crc = u32::from_be_bytes([
-            buffer[total_length - 4],
-            buffer[total_length - 3],
-            buffer[total_length - 2],
-            buffer[total_length - 1],
-        ]);
-        if crc32(&buffer[..total_length - 4]) != expected_message_crc {
-            buffer.advance(1);
-            continue;
-        }
-        let frame = buffer.split_to(total_length);
-        let headers_start = 12;
-        let headers_end = headers_start + header_length;
-        if headers_end > frame.len().saturating_sub(4) {
-            continue;
-        }
-        let headers = parse_event_headers(&frame[headers_start..headers_end]);
-        let payload = frame[headers_end..frame.len() - 4].to_vec();
-        frames.push(KiroFrame { headers, payload });
-    }
-    frames
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-fn parse_event_headers(mut bytes: &[u8]) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    while !bytes.is_empty() {
-        let name_len = bytes[0] as usize;
-        bytes = &bytes[1..];
-        if bytes.len() < name_len + 1 {
-            break;
-        }
-        let name = String::from_utf8_lossy(&bytes[..name_len]).to_string();
-        bytes = &bytes[name_len..];
-        let value_type = bytes[0];
-        bytes = &bytes[1..];
-        let value = match value_type {
-            7 => {
-                if bytes.len() < 2 {
-                    break;
-                }
-                let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-                bytes = &bytes[2..];
-                if bytes.len() < len {
-                    break;
-                }
-                let value = String::from_utf8_lossy(&bytes[..len]).to_string();
-                bytes = &bytes[len..];
-                value
-            }
-            6 => {
-                if bytes.len() < 8 {
-                    break;
-                }
-                let value = i64::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                ])
-                .to_string();
-                bytes = &bytes[8..];
-                value
-            }
-            _ => break,
-        };
-        out.insert(name, value);
-    }
-    out
-}
-
-fn frame_event_type(frame: &KiroFrame) -> Option<&str> {
-    frame.headers.get(":event-type").map(String::as_str)
-}
-
-fn frame_message_type(frame: &KiroFrame) -> Option<&str> {
-    frame.headers.get(":message-type").map(String::as_str)
 }
 
 #[derive(Debug, Clone)]
@@ -1518,7 +1521,7 @@ struct SseBuilder {
     next_index: i32,
     tool_indices: HashMap<String, i32>,
     tool_names: HashMap<String, String>,
-    tool_inputs: HashMap<String, String>,
+    tool_json: ToolJsonAccumulator,
     seen_tool_signatures: HashSet<String>,
     tool_leak_filter: ToolLeakFilter,
     inline_thinking: bool,
@@ -1671,23 +1674,20 @@ impl SseBuilder {
         out
     }
 
-    fn tool_delta(&mut self, payload: &Value) -> Vec<Bytes> {
-        let id = payload
-            .get("toolUseId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("toolu_kiro");
-        let name = payload
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("tool");
-        let kiro_name = name;
-        let name = original_tool_name(kiro_name, &self.tool_name_map);
-        let input = payload.get("input").and_then(|v| v.as_str()).unwrap_or("");
-        let stop = payload
-            .get("stop")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
+    fn tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &str,
+        stop: bool,
+    ) -> Result<Vec<Bytes>, KiroToolJsonError> {
+        let Some((id, kiro_name, name, parsed_input)) =
+            self.tool_json
+                .push(id, name, input, stop, &self.tool_name_map)?
+        else {
+            return Ok(Vec::new());
+        };
+        let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
         let mut out = Vec::new();
         out.extend(self.stop_thinking_block());
         if self.text_index.is_some() && !self.text_stopped {
@@ -1699,43 +1699,43 @@ impl SseBuilder {
             ));
         }
 
-        let index = if let Some(index) = self.tool_indices.get(id).copied() {
+        let index = if let Some(index) = self.tool_indices.get(&id).copied() {
             index
         } else {
             let index = self.next_index;
             self.next_index += 1;
-            self.tool_indices.insert(id.to_string(), index);
-            self.tool_names.insert(id.to_string(), name.clone());
+            self.tool_indices.insert(id.clone(), index);
+            self.tool_names.insert(id.clone(), name.clone());
             out.push(sse(
                 "content_block_start",
                 json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
             ));
             index
         };
-
-        if !input.is_empty() {
-            self.tool_inputs
-                .entry(id.to_string())
-                .or_default()
-                .push_str(input);
+        let input =
+            serde_json::to_string(&parsed_input).map_err(|error| KiroToolJsonError::Invalid {
+                tool_use_id: id.clone(),
+                name: name.clone(),
+                message: error.to_string(),
+            })?;
+        if input != "{}" {
             out.push(sse(
                 "content_block_delta",
                 json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}),
             ));
         }
-        if stop {
-            if let (Some(name), Some(input)) = (self.tool_names.get(id), self.tool_inputs.get(id)) {
-                if let Ok(parsed_input) = serde_json::from_str::<Value>(input) {
-                    self.seen_tool_signatures
-                        .insert(tool_signature(name, &parsed_input));
-                }
-            }
-            out.push(sse(
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":index}),
-            ));
-        }
-        out
+        self.seen_tool_signatures
+            .insert(tool_signature(&name, &parsed_input));
+        out.push(sse(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":index}),
+        ));
+        Ok(out)
+    }
+
+    fn finish_events(&mut self) -> Result<Vec<Bytes>, KiroToolJsonError> {
+        self.tool_json.finish()?;
+        Ok(self.final_events())
     }
 
     fn final_events(&mut self) -> Vec<Bytes> {
@@ -1868,6 +1868,16 @@ pub(crate) enum KiroToolJsonError {
         name: String,
         bytes: usize,
     },
+    Limit {
+        tool_use_id: String,
+        name: String,
+        bytes: usize,
+        max: usize,
+    },
+    Wire {
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl KiroToolJsonError {
@@ -1875,6 +1885,8 @@ impl KiroToolJsonError {
         match self {
             Self::Invalid { .. } => "TOOL_JSON_INVALID",
             Self::Incomplete { .. } => "TOOL_JSON_INCOMPLETE",
+            Self::Limit { .. } => "TOOL_JSON_LIMIT",
+            Self::Wire { code, .. } => code,
         }
     }
 }
@@ -1898,18 +1910,56 @@ impl std::fmt::Display for KiroToolJsonError {
                 formatter,
                 "upstream ended before completing tool_use {tool_use_id} ({name}) JSON input; buffered {bytes} bytes"
             ),
+            Self::Limit {
+                tool_use_id: _,
+                name: _,
+                bytes,
+                max,
+            } => write!(
+                formatter,
+                "upstream tool JSON input reached {bytes} bytes; limit is {max} bytes"
+            ),
+            Self::Wire { message, .. } => formatter.write_str(message),
         }
     }
 }
 
 impl std::error::Error for KiroToolJsonError {}
 
-#[derive(Default)]
+impl From<wire::WireError> for KiroToolJsonError {
+    fn from(error: wire::WireError) -> Self {
+        Self::Wire {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
 struct ToolJsonAccumulator {
     pending: HashMap<String, (String, String)>,
+    buffered_bytes: usize,
+    max_buffered_bytes: usize,
+}
+
+impl Default for ToolJsonAccumulator {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            buffered_bytes: 0,
+            max_buffered_bytes: MAX_TOOL_JSON_BYTES,
+        }
+    }
 }
 
 impl ToolJsonAccumulator {
+    #[cfg(test)]
+    fn with_max_buffered_bytes(max_buffered_bytes: usize) -> Self {
+        Self {
+            max_buffered_bytes,
+            ..Self::default()
+        }
+    }
+
     fn push(
         &mut self,
         tool_use_id: &str,
@@ -1917,7 +1967,16 @@ impl ToolJsonAccumulator {
         input: &str,
         stop: bool,
         tool_name_map: &HashMap<String, String>,
-    ) -> Result<Option<(String, String, Value)>, KiroToolJsonError> {
+    ) -> Result<Option<(String, String, String, Value)>, KiroToolJsonError> {
+        let buffered_bytes = self.buffered_bytes.saturating_add(input.len());
+        if buffered_bytes > self.max_buffered_bytes {
+            return Err(KiroToolJsonError::Limit {
+                tool_use_id: tool_use_id.to_string(),
+                name: name.to_string(),
+                bytes: buffered_bytes,
+                max: self.max_buffered_bytes,
+            });
+        }
         let entry = self
             .pending
             .entry(tool_use_id.to_string())
@@ -1926,6 +1985,7 @@ impl ToolJsonAccumulator {
             entry.0 = name.to_string();
         }
         entry.1.push_str(input);
+        self.buffered_bytes = buffered_bytes;
         if !stop {
             return Ok(None);
         }
@@ -1934,6 +1994,7 @@ impl ToolJsonAccumulator {
             .pending
             .remove(tool_use_id)
             .unwrap_or_else(|| (name.to_string(), input.to_string()));
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(input.len());
         let parsed = if input.trim().is_empty() {
             json!({})
         } else {
@@ -1945,6 +2006,7 @@ impl ToolJsonAccumulator {
         };
         Ok(Some((
             tool_use_id.to_string(),
+            kiro_name.clone(),
             original_tool_name(&kiro_name, tool_name_map),
             parsed,
         )))
@@ -1960,6 +2022,7 @@ impl ToolJsonAccumulator {
             return Ok(());
         };
         self.pending.remove(&tool_use_id);
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes);
         Err(KiroToolJsonError::Incomplete {
             tool_use_id,
             name,
@@ -2017,7 +2080,17 @@ pub(crate) fn kiro_event_stream_to_claude_sse(
     tool_name_map: HashMap<String, String>,
     request_body: &Value,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body);
+    kiro_event_stream_to_claude_sse_scoped(stream, model, tool_name_map, request_body, "legacy")
+}
+
+pub(crate) fn kiro_event_stream_to_claude_sse_scoped(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    model: String,
+    tool_name_map: HashMap<String, String>,
+    request_body: &Value,
+    cache_namespace: &str,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
     kiro_event_stream_to_anthropic_sse(stream, model, tool_name_map, prompt_cache_usage)
 }
 
@@ -2028,73 +2101,80 @@ fn kiro_event_stream_to_anthropic_sse(
     prompt_cache_usage: KiroPromptCacheUsage,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = BytesMut::new();
+        let mut decoder = wire::EventStreamDecoder::strict();
         let mut builder = SseBuilder::new(model, tool_name_map);
         builder.set_prompt_cache_usage(prompt_cache_usage);
         yield Ok(builder.initial());
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
-            buffer.extend_from_slice(&chunk);
-            for frame in parse_frames(&mut buffer) {
-                for bytes in process_frame_to_sse(&mut builder, &frame) {
+            let frames = decoder
+                .feed(&chunk)
+                .map_err(|error| kiro_stream_io_error(error.into()))?;
+            for frame in frames {
+                let event = wire::parse_event(frame)
+                    .map_err(|error| kiro_stream_io_error(error.into()))?;
+                for bytes in process_event_to_sse(&mut builder, event)
+                    .map_err(kiro_stream_io_error)?
+                {
                     yield Ok(bytes);
                 }
             }
         }
-        for bytes in builder.final_events() {
+        for frame in decoder
+            .finish()
+            .map_err(|error| kiro_stream_io_error(error.into()))?
+        {
+            let event = wire::parse_event(frame)
+                .map_err(|error| kiro_stream_io_error(error.into()))?;
+            for bytes in process_event_to_sse(&mut builder, event)
+                .map_err(kiro_stream_io_error)?
+            {
+                yield Ok(bytes);
+            }
+        }
+        for bytes in builder
+            .finish_events()
+            .map_err(kiro_stream_io_error)?
+        {
             yield Ok(bytes);
         }
     }
 }
 
-fn process_frame_to_sse(builder: &mut SseBuilder, frame: &KiroFrame) -> Vec<Bytes> {
-    match frame_message_type(frame) {
-        Some("error") | Some("exception") => {
-            let text = String::from_utf8_lossy(&frame.payload).to_string();
-            builder.assistant_delta(&format!("\n[Kiro error] {text}"))
+fn kiro_stream_io_error(error: KiroToolJsonError) -> std::io::Error {
+    std::io::Error::other(format!("[{}] {error}", error.code()))
+}
+
+fn process_event_to_sse(
+    builder: &mut SseBuilder,
+    event: wire::Event,
+) -> Result<Vec<Bytes>, KiroToolJsonError> {
+    match event {
+        wire::Event::AssistantResponse { content } | wire::Event::Code { content } => {
+            Ok(builder.assistant_delta(&content))
         }
-        _ => match frame_event_type(frame) {
-            Some("assistantResponseEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                let text = payload
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                builder.assistant_delta(text)
+        wire::Event::Reasoning(payload) => {
+            let mut out = builder.reasoning_delta(&payload);
+            if let Some(redacted) = reasoning_redacted_content(&payload) {
+                out.extend(builder.redacted_thinking_block(redacted));
             }
-            Some("codeEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                let text = payload
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                builder.assistant_delta(text)
-            }
-            Some("reasoningContentEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                let mut out = builder.reasoning_delta(&payload);
-                if let Some(redacted) = reasoning_redacted_content(&payload) {
-                    out.extend(builder.redacted_thinking_block(redacted));
-                }
-                out
-            }
-            Some("toolUseEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                builder.tool_delta(&payload)
-            }
-            Some("contextUsageEvent")
-            | Some("metricsEvent")
-            | Some("messageMetadataEvent")
-            | Some("metadataEvent")
-            | Some("meteringEvent") => {
-                let event_type = frame_event_type(frame).unwrap_or_default();
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                builder.usage_event(event_type, &payload);
-                Vec::new()
-            }
-            _ => Vec::new(),
-        },
+            Ok(out)
+        }
+        wire::Event::ToolUse {
+            tool_use_id,
+            name,
+            input,
+            stop,
+        } => builder.tool_delta(&tool_use_id, &name, &input, stop),
+        wire::Event::Usage {
+            event_type,
+            payload,
+        } => {
+            builder.usage_event(&event_type, &payload);
+            Ok(Vec::new())
+        }
+        wire::Event::End | wire::Event::Unknown { .. } => Ok(Vec::new()),
     }
 }
 
@@ -2104,7 +2184,17 @@ pub(crate) fn kiro_event_bytes_to_claude_json(
     tool_name_map: &HashMap<String, String>,
     request_body: &Value,
 ) -> Result<Value, KiroToolJsonError> {
-    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body);
+    kiro_event_bytes_to_claude_json_scoped(bytes, model, tool_name_map, request_body, "legacy")
+}
+
+pub(crate) fn kiro_event_bytes_to_claude_json_scoped(
+    bytes: &[u8],
+    model: &str,
+    tool_name_map: &HashMap<String, String>,
+    request_body: &Value,
+    cache_namespace: &str,
+) -> Result<Value, KiroToolJsonError> {
+    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
     kiro_event_bytes_to_anthropic_json(bytes, model, tool_name_map, prompt_cache_usage)
 }
 
@@ -2114,7 +2204,9 @@ fn kiro_event_bytes_to_anthropic_json(
     tool_name_map: &HashMap<String, String>,
     prompt_cache_usage: KiroPromptCacheUsage,
 ) -> Result<Value, KiroToolJsonError> {
-    let mut buffer = BytesMut::from(bytes);
+    let mut decoder = wire::EventStreamDecoder::strict();
+    let mut frames = decoder.feed(bytes)?;
+    frames.extend(decoder.finish()?);
     let mut text = String::new();
     let mut thinking = String::new();
     let mut inline_thinking = false;
@@ -2126,38 +2218,21 @@ fn kiro_event_bytes_to_anthropic_json(
     let mut tool_leak_filter = ToolLeakFilter::default();
     let mut usage = KiroUsageAccumulator::default();
     usage.set_prompt_cache_usage(prompt_cache_usage);
-    for frame in parse_frames(&mut buffer) {
-        match frame_event_type(&frame) {
-            Some("assistantResponseEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                if let Some(chunk) = payload.get("content").and_then(|v| v.as_str()) {
-                    for segment in split_inline_thinking(chunk, &mut inline_thinking) {
-                        if segment.is_thinking {
-                            thinking.push_str(&segment.text);
-                        } else {
-                            for visible in tool_leak_filter.push_text(&segment.text, false) {
-                                text.push_str(&visible);
-                            }
+    for frame in frames {
+        match wire::parse_event(frame)? {
+            wire::Event::AssistantResponse { content: chunk }
+            | wire::Event::Code { content: chunk } => {
+                for segment in split_inline_thinking(&chunk, &mut inline_thinking) {
+                    if segment.is_thinking {
+                        thinking.push_str(&segment.text);
+                    } else {
+                        for visible in tool_leak_filter.push_text(&segment.text, false) {
+                            text.push_str(&visible);
                         }
                     }
                 }
             }
-            Some("codeEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                if let Some(chunk) = payload.get("content").and_then(|v| v.as_str()) {
-                    for segment in split_inline_thinking(chunk, &mut inline_thinking) {
-                        if segment.is_thinking {
-                            thinking.push_str(&segment.text);
-                        } else {
-                            for visible in tool_leak_filter.push_text(&segment.text, false) {
-                                text.push_str(&visible);
-                            }
-                        }
-                    }
-                }
-            }
-            Some("reasoningContentEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
+            wire::Event::Reasoning(payload) => {
                 if let Some(signature) = reasoning_signature(&payload) {
                     thinking_signature = Some(signature.to_string());
                 }
@@ -2168,44 +2243,27 @@ fn kiro_event_bytes_to_anthropic_json(
                     redacted_thinking.push(redacted.to_string());
                 }
             }
-            Some("toolUseEvent") => {
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                let id = payload
-                    .get("toolUseId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("toolu_kiro")
-                    .to_string();
-                let name = payload
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let input = payload
-                    .get("input")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let stop = payload
-                    .get("stop")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if let Some((id, name, parsed_input)) =
+            wire::Event::ToolUse {
+                tool_use_id: id,
+                name,
+                input,
+                stop,
+            } => {
+                if let Some((id, kiro_name, name, parsed_input)) =
                     tool_accumulator.push(&id, &name, &input, stop, tool_name_map)?
                 {
+                    let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
                     seen_tool_signatures.insert(tool_signature(&name, &parsed_input));
                     tools.push((id, name, parsed_input));
                 }
             }
-            Some("contextUsageEvent")
-            | Some("metricsEvent")
-            | Some("messageMetadataEvent")
-            | Some("metadataEvent")
-            | Some("meteringEvent") => {
-                let event_type = frame_event_type(&frame).unwrap_or_default();
-                let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                usage.apply_event(event_type, &payload, model);
+            wire::Event::Usage {
+                event_type,
+                payload,
+            } => {
+                usage.apply_event(&event_type, &payload, model);
             }
-            _ => {}
+            wire::Event::End | wire::Event::Unknown { .. } => {}
         }
     }
     tool_accumulator.finish()?;
@@ -2401,20 +2459,34 @@ impl KiroPromptCache {
     }
 }
 
-fn compute_kiro_prompt_cache_usage(body: &Value) -> KiroPromptCacheUsage {
-    compute_kiro_prompt_cache_usage_with_cache(body, &KIRO_PROMPT_CACHE)
+fn compute_kiro_prompt_cache_usage(body: &Value, cache_namespace: &str) -> KiroPromptCacheUsage {
+    compute_kiro_prompt_cache_usage_scoped_with_cache(body, cache_namespace, &KIRO_PROMPT_CACHE)
 }
 
 fn compute_kiro_prompt_cache_usage_with_cache(
     body: &Value,
     cache: &KiroPromptCache,
 ) -> KiroPromptCacheUsage {
-    let segments = extract_kiro_prompt_cache_segments(body);
+    compute_kiro_prompt_cache_usage_scoped_with_cache(body, "test", cache)
+}
+
+fn compute_kiro_prompt_cache_usage_scoped_with_cache(
+    body: &Value,
+    cache_namespace: &str,
+    cache: &KiroPromptCache,
+) -> KiroPromptCacheUsage {
+    let segments = extract_kiro_prompt_cache_segments(body, cache_namespace);
     cache.compute_usage(&segments)
 }
 
-fn extract_kiro_prompt_cache_segments(body: &Value) -> Vec<KiroPromptCacheSegment> {
+fn extract_kiro_prompt_cache_segments(
+    body: &Value,
+    cache_namespace: &str,
+) -> Vec<KiroPromptCacheSegment> {
     let mut hasher = Sha256::new();
+    hasher.update(b"cc-switch-kiro-cache-v2\0");
+    hasher.update(cache_namespace.as_bytes());
+    hasher.update(b"\0");
     let mut cumulative_tokens = 0u32;
     let mut segments = Vec::new();
 
@@ -2842,6 +2914,128 @@ fn estimate_tokens(text: &str) -> i32 {
     ((text.chars().count() as f64) / 4.0).ceil() as i32
 }
 
+pub(crate) fn count_input_tokens(body: &Value) -> Result<i32, ProxyError> {
+    if !body.get("messages").is_some_and(Value::is_array) {
+        return Err(ProxyError::bad_request(
+            "Kiro count_tokens requires an Anthropic messages array",
+        ));
+    }
+    let mut tokens = 0u64;
+    if let Some(system) = body.get("system") {
+        tokens = tokens.saturating_add(count_content_tokens(system)?);
+    }
+    if let Some(tools) = body.get("tools") {
+        tokens = tokens
+            .saturating_add(count_value_tokens(tools)?)
+            .saturating_add(12);
+    }
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        tokens = tokens
+            .saturating_add(4)
+            .saturating_add(count_content_tokens(
+                message.get("content").unwrap_or(&Value::Null),
+            )?);
+    }
+    Ok(tokens.min(i32::MAX as u64) as i32)
+}
+
+fn count_value_tokens(value: &Value) -> Result<u64, ProxyError> {
+    match value {
+        Value::Null => Ok(0),
+        Value::Bool(_) | Value::Number(_) => Ok(1),
+        Value::String(text) => Ok(estimate_tokens(text).max(0) as u64),
+        Value::Array(items) => {
+            let mut tokens = 0u64;
+            for item in items {
+                tokens = tokens
+                    .saturating_add(2)
+                    .saturating_add(count_value_tokens(item)?);
+            }
+            Ok(tokens)
+        }
+        Value::Object(object) => {
+            let mut tokens = 0u64;
+            for (key, child) in object {
+                if key == "cache_control" {
+                    continue;
+                }
+                tokens = tokens
+                    .saturating_add(estimate_tokens(key).max(0) as u64)
+                    .saturating_add(count_value_tokens(child)?);
+            }
+            Ok(tokens)
+        }
+    }
+}
+
+fn count_content_tokens(value: &Value) -> Result<u64, ProxyError> {
+    match value {
+        Value::Array(items) => {
+            let mut tokens = 0u64;
+            for item in items {
+                tokens = tokens
+                    .saturating_add(2)
+                    .saturating_add(count_content_block_tokens(item)?);
+            }
+            Ok(tokens)
+        }
+        Value::Object(_) => count_content_block_tokens(value),
+        _ => count_value_tokens(value),
+    }
+}
+
+fn count_content_block_tokens(value: &Value) -> Result<u64, ProxyError> {
+    let Some(object) = value.as_object() else {
+        return count_value_tokens(value);
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("image") => count_image_tokens(object),
+        Some("tool_result") => {
+            let mut tokens = 0u64;
+            for (key, child) in object {
+                if key == "cache_control" {
+                    continue;
+                }
+                let child_tokens = if key == "content" {
+                    count_content_tokens(child)?
+                } else {
+                    count_value_tokens(child)?
+                };
+                tokens = tokens
+                    .saturating_add(estimate_tokens(key).max(0) as u64)
+                    .saturating_add(child_tokens);
+            }
+            Ok(tokens)
+        }
+        _ => count_value_tokens(value),
+    }
+}
+
+fn count_image_tokens(object: &serde_json::Map<String, Value>) -> Result<u64, ProxyError> {
+    let data = object
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("data"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProxyError::bad_request("Anthropic image block lacks base64 data"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| ProxyError::bad_request("Anthropic image source is not valid base64"))?;
+    let dimensions = imagesize::blob_size(&bytes)
+        .map_err(|_| ProxyError::bad_request("Anthropic image dimensions could not be read"))?;
+    let tiles = dimensions
+        .width
+        .saturating_mul(dimensions.height)
+        .saturating_add(749)
+        / 750;
+    Ok((tiles as u64).max(85))
+}
+
 fn is_quota_exhausted(body: &str) -> bool {
     const REASONS: &[&str] = &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
     if !REASONS.iter().any(|reason| body.contains(reason)) {
@@ -2916,6 +3110,8 @@ fn default_profile_arn_for_auth_method(auth_method: Option<&str>, region: &str) 
 mod tests {
     use super::*;
 
+    const WIRE_PROTOCOL_JSON: &str = include_str!("../../assets/contract/kiro-wire-protocol.json");
+
     fn test_account() -> KiroAccountData {
         KiroAccountData {
             account_id: "kiro_test".to_string(),
@@ -2932,6 +3128,8 @@ mod tests {
             auth_method: Some("builder-id".to_string()),
             provider: Some("BuilderId".to_string()),
             endpoint: None,
+            client_version: None,
+            cli_version: None,
             authenticated_at: 1,
         }
     }
@@ -2985,6 +3183,120 @@ mod tests {
     }
 
     #[test]
+    fn wire_protocol_fixture_matches_surface_cache_tool_and_recovery_contracts() {
+        use crate::domain::providers::model::AppKind;
+        use crate::proxy::adapters::{capability_for, AdapterSupport};
+        use crate::proxy::retry_policy::{AuthRecoveryDecision, AuthRecoveryState};
+
+        let fixture: Value = serde_json::from_str(WIRE_PROTOCOL_JSON).unwrap();
+        assert_eq!(fixture["format"], "cc-switch-kiro-wire-protocol");
+        assert_eq!(fixture["schemaVersion"], 1);
+        assert_eq!(fixture["accountBinding"]["mode"], "single_explicit_account");
+        assert_eq!(fixture["accountBinding"]["accountPool"], false);
+        assert_eq!(fixture["accountBinding"]["rotation"], false);
+        assert_eq!(fixture["accountBinding"]["crossAccountFailover"], false);
+        assert_eq!(fixture["accountBinding"]["crossProviderFailover"], false);
+
+        let recovery = &fixture["accountBinding"]["unauthorizedRecovery"];
+        assert_eq!(recovery["refreshAttempts"], 1);
+        assert_eq!(recovery["replayAttempts"], 1);
+        assert_eq!(recovery["maxInferenceAttempts"], 2);
+        assert_eq!(recovery["target"], "same_bound_account");
+        let mut recovery_state = AuthRecoveryState::default();
+        assert_eq!(
+            recovery_state.decide(
+                axum::http::StatusCode::UNAUTHORIZED,
+                ProviderType::KiroOAuth,
+                true,
+            ),
+            Some(AuthRecoveryDecision::RefreshAndReplaySameBinding)
+        );
+        assert_eq!(
+            recovery_state.decide(
+                axum::http::StatusCode::UNAUTHORIZED,
+                ProviderType::KiroOAuth,
+                true,
+            ),
+            Some(AuthRecoveryDecision::ReturnUnauthorized)
+        );
+
+        for (app, surface, adapter) in [
+            (
+                AppKind::Claude,
+                "claudeMessages",
+                "claude_kiro_codewhisperer",
+            ),
+            (AppKind::Codex, "codexResponses", "codex_to_kiro_anthropic"),
+            (
+                AppKind::Codex,
+                "codexChatCompletions",
+                "codex_to_kiro_anthropic",
+            ),
+        ] {
+            assert_eq!(fixture["downstreamSurfaces"][surface]["supported"], true);
+            assert_eq!(fixture["downstreamSurfaces"][surface]["adapter"], adapter);
+            let capability = capability_for(app, ProviderType::KiroOAuth);
+            assert_eq!(capability.adapter, adapter);
+            assert_eq!(capability.support, AdapterSupport::Native);
+            assert!(capability.supports_stream_usage);
+            assert!(capability.supports_model_list);
+        }
+        let gemini = capability_for(AppKind::Gemini, ProviderType::KiroOAuth);
+        assert_eq!(fixture["downstreamSurfaces"]["gemini"]["supported"], false);
+        assert_eq!(gemini.support, AdapterSupport::GenericFallback);
+        assert!(!gemini.supports_stream_usage);
+        assert!(!gemini.supports_model_list);
+
+        assert_eq!(
+            fixture["tools"]["invalidJsonCode"],
+            KiroToolJsonError::Invalid {
+                tool_use_id: "id".to_string(),
+                name: "tool".to_string(),
+                message: "invalid".to_string(),
+            }
+            .code()
+        );
+        assert_eq!(
+            fixture["tools"]["incompleteJsonCode"],
+            KiroToolJsonError::Incomplete {
+                tool_use_id: "id".to_string(),
+                name: "tool".to_string(),
+                bytes: 1,
+            }
+            .code()
+        );
+        assert_eq!(fixture["tools"]["emitBeforeStop"], false);
+        assert_eq!(
+            fixture["tools"]["maxBufferedJsonBytes"],
+            MAX_TOOL_JSON_BYTES
+        );
+        assert_eq!(
+            fixture["tools"]["limitCode"],
+            KiroToolJsonError::Limit {
+                tool_use_id: "id".to_string(),
+                name: "tool".to_string(),
+                bytes: 2,
+                max: 1,
+            }
+            .code()
+        );
+        assert!(fixture["promptCache"]["namespaceComponents"]
+            .as_array()
+            .is_some_and(|components| components
+                .iter()
+                .any(|component| component == "auth_identity_generation")));
+        assert_eq!(fixture["promptCache"]["capacity"], PROMPT_CACHE_CAPACITY);
+        assert_eq!(
+            fixture["promptCache"]["defaultTtlSeconds"],
+            PROMPT_CACHE_DEFAULT_TTL_SECS
+        );
+        assert_eq!(
+            fixture["promptCache"]["maxTtlSeconds"],
+            PROMPT_CACHE_MAX_TTL_SECS
+        );
+    }
+
+    #[test]
     fn account_data_from_server_account_preserves_kiro_profile() {
         let account = server_account();
         let data = KiroAccountData::from_account(&account).unwrap();
@@ -3006,6 +3318,18 @@ mod tests {
     }
 
     #[test]
+    fn account_data_rejects_unsafe_stored_regions() {
+        for field in ["authRegion", "apiRegion"] {
+            let mut account = server_account();
+            account.profile.as_mut().unwrap()[field] = json!("us-east-1.attacker.invalid");
+            let error = KiroAccountData::from_account(&account).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("invalid"));
+            assert!(!error.message.contains("attacker"));
+        }
+    }
+
+    #[test]
     fn prepared_request_builds_codewhisperer_shape_and_headers() {
         let account = server_account();
         let body = json!({
@@ -3021,12 +3345,23 @@ mod tests {
             "https://q.us-west-2.amazonaws.com/generateAssistantResponse"
         );
         assert_eq!(request.host, "q.us-west-2.amazonaws.com");
+        assert_eq!(
+            request.cache_namespace,
+            format!(
+                "account:kiro_server:generation:1:session:{}",
+                stable_uuid_like("session-a")
+            )
+        );
         assert!(request
             .headers
             .iter()
             .any(|(name, value)| { *name == "authorization" && value == "Bearer access-token" }));
         assert!(request.headers.iter().any(|(name, value)| {
-            *name == "x-amz-user-agent" && value.contains("KiroIDE-2.3.0-machine-profile")
+            *name == "x-amz-user-agent"
+                && value.contains(&format!(
+                    "KiroIDE-{}-machine-profile",
+                    endpoint::FALLBACK_IDE_VERSION
+                ))
         }));
         assert_eq!(
             request.body.pointer("/profileArn"),
@@ -3123,7 +3458,8 @@ mod tests {
             }]
         });
 
-        let request = anthropic_to_kiro_request(&body, &test_account()).unwrap();
+        let request =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
         let state = request.body.get("conversationState").unwrap();
         assert_eq!(
             state.pointer("/currentMessage/userInputMessage/content"),
@@ -3170,7 +3506,8 @@ mod tests {
             }]
         });
 
-        let request = anthropic_to_kiro_request(&body, &test_account()).unwrap();
+        let request =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
         let history = request
             .body
             .pointer("/conversationState/history")
@@ -3190,7 +3527,8 @@ mod tests {
             "messages": [{ "role": "user", "content": "think" }]
         });
 
-        let request = anthropic_to_kiro_request(&body, &test_account()).unwrap();
+        let request =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
         assert_eq!(
             request
                 .body
@@ -3214,7 +3552,8 @@ mod tests {
             "messages": [{ "role": "user", "content": "think" }]
         });
 
-        let request = anthropic_to_kiro_request(&body, &test_account()).unwrap();
+        let request =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
         assert_eq!(
             request
                 .body
@@ -3232,7 +3571,8 @@ mod tests {
             "messages": [{ "role": "user", "content": "think" }]
         });
 
-        let request = anthropic_to_kiro_request(&body, &test_account()).unwrap();
+        let request =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
         assert!(request.body.get("additionalModelRequestFields").is_none());
     }
 
@@ -3244,13 +3584,13 @@ mod tests {
             "very_long_original_name".to_string(),
         );
         let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), tool_name_map);
+        assert!(builder
+            .tool_delta("toolu_1", "short_name", "{\"x\":", false)
+            .unwrap()
+            .is_empty());
         let bytes = builder
-            .tool_delta(&json!({
-                "toolUseId": "toolu_1",
-                "name": "short_name",
-                "input": "{\"x\":",
-                "stop": false
-            }))
+            .tool_delta("toolu_1", "short_name", "1}", true)
+            .unwrap()
             .into_iter()
             .map(|b| String::from_utf8(b.to_vec()).unwrap())
             .collect::<Vec<_>>()
@@ -3261,27 +3601,20 @@ mod tests {
     #[test]
     fn kiro_reasoning_and_code_events_emit_claude_blocks() {
         let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
-        let reasoning_frame = KiroFrame {
-            headers: HashMap::from([(
-                ":event-type".to_string(),
-                "reasoningContentEvent".to_string(),
-            )]),
-            payload: serde_json::to_vec(&json!({
-                "reasoningContentEvent": {
-                    "text": "think first",
-                    "signature": "real-signature"
-                }
-            }))
-            .unwrap(),
-        };
-        let code_frame = KiroFrame {
-            headers: HashMap::from([(":event-type".to_string(), "codeEvent".to_string())]),
-            payload: serde_json::to_vec(&json!({ "content": "visible answer" })).unwrap(),
+        let reasoning_event = wire::Event::Reasoning(json!({
+            "reasoningContentEvent": {
+                "text": "think first",
+                "signature": "real-signature"
+            }
+        }));
+        let code_event = wire::Event::Code {
+            content: "visible answer".to_string(),
         };
 
-        let bytes = process_frame_to_sse(&mut builder, &reasoning_frame)
+        let bytes = process_event_to_sse(&mut builder, reasoning_event)
+            .unwrap()
             .into_iter()
-            .chain(process_frame_to_sse(&mut builder, &code_frame))
+            .chain(process_event_to_sse(&mut builder, code_event).unwrap())
             .map(|b| String::from_utf8(b.to_vec()).unwrap())
             .collect::<Vec<_>>()
             .join("");
@@ -3324,12 +3657,14 @@ mod tests {
     #[test]
     fn sse_builder_injects_rescued_tool_and_dedupes_native_tool() {
         let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
-        let native = builder.tool_delta(&json!({
-            "toolUseId": "toolu_native",
-            "name": "Read",
-            "input": "{\"file_path\":\"Cargo.toml\"}",
-            "stop": true
-        }));
+        let native = builder
+            .tool_delta(
+                "toolu_native",
+                "Read",
+                "{\"file_path\":\"Cargo.toml\"}",
+                true,
+            )
+            .unwrap();
         assert!(!native.is_empty());
         let leaked_text = "visible <function_calls><invoke name=\"Read\"><parameter name=\"file_path\">Cargo.toml</parameter></invoke></function_calls>";
         let bytes = builder
@@ -3533,6 +3868,42 @@ mod tests {
     }
 
     #[test]
+    fn kiro_prompt_cache_isolated_by_provider_account_route_and_session_namespace() {
+        let cache = KiroPromptCache::new(None);
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "system": [{
+                "type": "text",
+                "text": "shared prompt",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let first = compute_kiro_prompt_cache_usage_scoped_with_cache(
+            &body,
+            "provider:a:account:a:route:claude:session:a",
+            &cache,
+        );
+        let isolated = compute_kiro_prompt_cache_usage_scoped_with_cache(
+            &body,
+            "provider:a:account:b:route:claude:session:a",
+            &cache,
+        );
+        let hit = compute_kiro_prompt_cache_usage_scoped_with_cache(
+            &body,
+            "provider:a:account:a:route:claude:session:a",
+            &cache,
+        );
+
+        assert!(first.cache_creation_tokens > 0);
+        assert_eq!(isolated.cache_read_tokens, 0);
+        assert_eq!(isolated.cache_creation_tokens, first.cache_creation_tokens);
+        assert_eq!(hit.cache_creation_tokens, 0);
+        assert_eq!(hit.cache_read_tokens, first.cache_creation_tokens);
+    }
+
+    #[test]
     fn kiro_prompt_cache_signature_ignores_object_key_order() {
         let cache = KiroPromptCache::new(None);
         let first = json!({
@@ -3671,6 +4042,34 @@ mod tests {
     }
 
     #[test]
+    fn local_token_count_only_treats_content_blocks_as_images() {
+        let tool_input = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "classify",
+                        "input": {"type": "image", "label": "diagram"}
+                    }]
+                },
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        assert!(count_input_tokens(&tool_input).unwrap() > 0);
+
+        let missing_image_data = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image", "source": {"type": "base64"}}]
+            }]
+        });
+        let error = count_input_tokens(&missing_image_data).unwrap_err();
+        assert!(error.message.contains("base64 data"));
+    }
+
+    #[test]
     fn schema_normalization_forces_object_and_recovers_top_level_variant() {
         let normalized = normalize_schema(json!({
             "type": "array",
@@ -3777,6 +4176,93 @@ mod tests {
     }
 
     #[test]
+    fn tool_json_accumulator_bounds_fragments_across_frames() {
+        let mut accumulator = ToolJsonAccumulator::with_max_buffered_bytes(8);
+        assert!(accumulator
+            .push("toolu_limit", "Write", "{\"x\":", false, &HashMap::new())
+            .unwrap()
+            .is_none());
+        let error = accumulator
+            .push("toolu_limit", "Write", "1234", true, &HashMap::new())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KiroToolJsonError::Limit {
+                bytes: 9,
+                max: 8,
+                ..
+            }
+        ));
+        assert_eq!(error.code(), "TOOL_JSON_LIMIT");
+        assert!(!error.to_string().contains("toolu_limit"));
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_json_emits_nothing_before_the_stop_fragment() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|bytes| (bytes, receiver))
+        })
+        .map(Ok::<Bytes, reqwest::Error>);
+        let stream = kiro_event_stream_to_claude_sse(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            HashMap::new(),
+            &json!({"model": "claude-sonnet-4-8", "messages": []}),
+        );
+        tokio::pin!(stream);
+        let initial = stream.next().await.unwrap().unwrap();
+        assert!(!String::from_utf8_lossy(&initial).contains("file_"));
+
+        sender
+            .send(Bytes::from(fixture_event_frame(
+                "toolUseEvent",
+                &json!({
+                    "toolUseId": "toolu_gate",
+                    "name": "Read",
+                    "input": "{\"file_",
+                    "stop": false
+                }),
+            )))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), stream.next())
+                .await
+                .is_err()
+        );
+
+        sender
+            .send(Bytes::from(fixture_event_frame(
+                "toolUseEvent",
+                &json!({
+                    "toolUseId": "toolu_gate",
+                    "name": "Read",
+                    "input": "path\":\"Cargo.toml\"}",
+                    "stop": true
+                }),
+            )))
+            .await
+            .unwrap();
+        let mut emitted = String::new();
+        for _ in 0..4 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await
+                .expect("completed tool JSON should emit promptly")
+                .expect("Kiro stream should remain open")
+                .expect("completed tool JSON should be valid");
+            emitted.push_str(&String::from_utf8_lossy(&chunk));
+            if emitted.contains("input_json_delta") {
+                break;
+            }
+        }
+        assert!(emitted.contains("toolu_gate"), "{emitted}");
+        assert!(emitted.contains("input_json_delta"), "{emitted}");
+        assert!(emitted.contains("Cargo.toml"), "{emitted}");
+        drop(sender);
+    }
+
+    #[test]
     fn detects_terminal_kiro_client_validation_reasons() {
         assert!(is_client_validation_error(
             br#"{"reason":"TOOL_SCHEMA_INVALID"}"#
@@ -3835,13 +4321,12 @@ mod tests {
 
     #[test]
     fn event_stream_crc_rejects_corrupt_frames() {
-        let mut bytes = BytesMut::from(
-            event_frame("assistantResponseEvent", json!({"content": "ok"})).as_slice(),
-        );
+        let mut bytes = event_frame("assistantResponseEvent", json!({"content": "ok"}));
         if let Some(last) = bytes.last_mut() {
             *last ^= 0xff;
         }
-        assert!(parse_frames(&mut bytes).is_empty());
+        let mut decoder = wire::EventStreamDecoder::strict();
+        assert!(decoder.feed(&bytes).is_err());
     }
 
     fn event_stream_bytes(events: Vec<(&str, Value)>) -> Vec<u8> {

@@ -2,6 +2,9 @@ import type { ProviderPreset } from "@/config/claudeProviderPresets";
 import type { CodexProviderPreset } from "@/config/codexProviderPresets";
 import type { GeminiProviderPreset } from "@/config/geminiProviderPresets";
 
+const KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1";
+const KIMI_CODE_MODEL = "kimi-for-coding";
+
 export const anthropicApiKeyPreset: ProviderPreset = {
   name: "Anthropic API Key",
   websiteUrl: "https://console.anthropic.com/",
@@ -85,4 +88,59 @@ export const googleGeminiApiKeyPreset: GeminiProviderPreset = {
   category: "official",
   icon: "gemini",
   iconColor: "#4285F4",
+};
+
+export const kimiCodeClaudePreset: ProviderPreset = {
+  name: "Kimi Code",
+  websiteUrl: "https://kimi.com",
+  settingsConfig: {
+    env: {
+      ANTHROPIC_BASE_URL: KIMI_CODE_BASE_URL,
+      ANTHROPIC_MODEL: KIMI_CODE_MODEL,
+    },
+    modelMapping: { mode: "single", upstreamModel: KIMI_CODE_MODEL },
+  },
+  isOfficial: true,
+  category: "official",
+  apiFormat: "openai_chat",
+  icon: "kimi",
+  iconColor: "#111827",
+};
+
+export const kimiCodeCodexPreset: CodexProviderPreset = {
+  name: "Kimi Code",
+  websiteUrl: "https://kimi.com",
+  auth: {},
+  config: `model_provider = "kimi_code"
+model = "${KIMI_CODE_MODEL}"
+disable_response_storage = true
+
+[model_providers.kimi_code]
+name = "Kimi Code"
+base_url = "${KIMI_CODE_BASE_URL}"
+wire_api = "responses"
+requires_openai_auth = true`,
+  modelMapping: { mode: "single", upstreamModel: KIMI_CODE_MODEL },
+  isOfficial: true,
+  category: "official",
+  apiFormat: "openai_chat",
+  icon: "kimi",
+  iconColor: "#111827",
+};
+
+export const kimiCodeGeminiPreset: GeminiProviderPreset = {
+  name: "Kimi Code",
+  websiteUrl: "https://kimi.com",
+  settingsConfig: {
+    env: {
+      GOOGLE_GEMINI_BASE_URL: KIMI_CODE_BASE_URL,
+      GEMINI_MODEL: KIMI_CODE_MODEL,
+    },
+  },
+  baseURL: KIMI_CODE_BASE_URL,
+  model: KIMI_CODE_MODEL,
+  description: "Kimi Code OAuth",
+  category: "official",
+  icon: "kimi",
+  iconColor: "#111827",
 };

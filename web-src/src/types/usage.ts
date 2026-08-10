@@ -1,33 +1,182 @@
-// 使用统计相关类型定义
+export type UsageApp = "claude" | "codex" | "gemini";
+export type UsageAppFilter = "all" | UsageApp;
 
-export interface TokenUsage {
-  inputTokens: number;
+export const USAGE_APPS: readonly UsageApp[] = ["claude", "codex", "gemini"];
+
+export type UsageOutcome =
+  | "pending"
+  | "success"
+  | "client_error"
+  | "rate_limited"
+  | "upstream_error"
+  | "timeout"
+  | "interrupted"
+  | "internal_error";
+
+export type UsageState =
+  | "pending"
+  | "observed"
+  | "missing"
+  | "parse_error"
+  | "interrupted";
+
+export interface UsageMetrics {
+  requestCount: number;
+  successCount: number;
+  failureCount: number;
+  pendingCount: number;
+  processedTokens: number;
+  freshInputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  supplementalTokens: number;
+  observedUsageCount: number;
+  missingUsageCount: number;
+  parseErrorUsageCount: number;
+  interruptedUsageCount: number;
+  successRate: number;
+  usageCoverage: number;
+  averageEndToEndMs?: number | null;
+  averageUpstreamMs?: number | null;
+  averageFirstTokenMs?: number | null;
+  lastRequestAtMs?: number | null;
 }
 
-export interface RequestLog {
-  requestId: string;
+export interface UsageSurface {
+  app: UsageApp;
+  metrics: UsageMetrics;
+}
+
+export interface UsageOverview {
+  metrics: UsageMetrics;
+  surfaces: UsageSurface[];
+}
+
+export interface UsageTrendPoint {
+  startMs: number;
+  endMs: number;
+  metrics: UsageMetrics;
+}
+
+export interface BundleSurfaceUsage {
+  app: UsageApp;
   providerId: string;
-  providerName?: string;
-  appType: string;
-  model: string;
-  requestModel?: string;
-  requestAgent: string;
-  requestedModel: string;
+  providerType: string;
+  metrics: UsageMetrics;
+}
+
+export interface ProviderBundleUsage {
+  bundleId: string;
+  providerName: string;
+  familyId?: string | null;
+  supportedApps: UsageApp[];
+  metrics: UsageMetrics;
+  surfaces: BundleSurfaceUsage[];
+}
+
+export interface ModelUsage {
+  app: UsageApp;
   actualModel: string;
-  actualModelSource: string;
+  requestedModels: string[];
+  metrics: UsageMetrics;
+}
+
+export interface ShareUserUsage {
+  userEmail: string;
+  metrics: UsageMetrics;
+}
+
+export interface ShareUsage {
+  shareId: string;
+  shareName?: string | null;
+  shareSlug?: string | null;
+  metrics: UsageMetrics;
+  users: ShareUserUsage[];
+}
+
+export interface ValueFacet {
+  value: string;
+  requestCount: number;
+}
+
+export interface BundleFacet {
+  bundleId: string;
+  providerName: string;
+  supportedApps: UsageApp[];
+  requestCount: number;
+}
+
+export interface ShareFacet {
+  shareId: string;
+  shareName?: string | null;
+  shareSlug?: string | null;
+  requestCount: number;
+}
+
+export interface UserFacet {
+  userEmail: string;
+  requestCount: number;
+}
+
+export interface ModelFacet {
+  app: UsageApp;
+  actualModel: string;
+  requestCount: number;
+}
+
+export interface UsageFacets {
+  surfaces: ValueFacet[];
+  bundles: BundleFacet[];
+  shares: ShareFacet[];
+  users: UserFacet[];
+  models: ModelFacet[];
+  outcomes: ValueFacet[];
+  usageStates: ValueFacet[];
+}
+
+export interface UsageRequest {
+  requestId: string;
+  recordKind: "user_inference" | "internal_supplemental" | "health_probe";
+  parentRequestId?: string | null;
+  app: UsageApp;
+  bundleId: string;
+  familyId?: string | null;
+  supportedApps: UsageApp[];
+  providerId: string;
+  providerName: string;
+  providerType: string;
+  profileId?: string | null;
+  accountRef?: string | null;
+  accountDisplay?: string | null;
+  authIdentityGeneration?: number | null;
+  model?: string | null;
+  requestAgent?: string | null;
+  sessionId?: string | null;
+  requestedModel?: string | null;
+  actualModel?: string | null;
+  actualModelSource?: string | null;
   requestedReasoningEffort?: string | null;
   effectiveReasoningEffort?: string | null;
   clientServiceTier?: string | null;
   effectiveServiceTier?: string | null;
   serviceTierDecision?: string | null;
+  statusCode: number;
+  outcome: UsageOutcome;
+  failureKind?: string | null;
+  errorMessage?: string | null;
+  durationMs: number;
+  startedAtMs: number;
+  completedAtMs: number;
+  endToEndDurationMs: number;
+  upstreamDurationMs: number;
+  attemptCount: number;
+  firstTokenMs?: number | null;
   rawInputTokens?: number | null;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
   totalTokens?: number | null;
   imageCount?: number | null;
   imageBytes?: number | null;
@@ -35,115 +184,49 @@ export interface RequestLog {
   imageWidth?: number | null;
   imageHeight?: number | null;
   imageSize?: string | null;
+  shareId?: string | null;
+  shareSlug?: string | null;
+  shareName?: string | null;
+  userEmail?: string | null;
+  dataSource?: string | null;
   isStreaming: boolean;
   streamStatus?: string | null;
-  usageState?:
-    | "pending"
-    | "observed"
-    | "missing"
-    | "parse_error"
-    | "interrupted"
-    | string;
-  usageRevision?: number;
-  latencyMs: number;
-  firstTokenMs?: number;
-  durationMs?: number;
-  statusCode: number;
-  errorMessage?: string;
-  createdAt: number;
-  shareId?: string;
-  shareName?: string;
-  userEmail?: string;
-  dataSource?: string;
+  usageState: UsageState;
+  usageRevision: number;
+  usageEstimated: boolean;
+  userCountry?: string | null;
+  userCountryIso3?: string | null;
 }
 
-export interface SessionSyncResult {
-  imported: number;
-  skipped: number;
-  filesScanned: number;
-  errors: string[];
+export interface UsageResponseMeta {
+  fromMs: number;
+  toMs: number;
+  generatedAtMs: number;
 }
 
-export interface DataSourceSummary {
-  dataSource: string;
-  requestCount: number;
-  totalTokens: number;
+export interface UsageResponse<T> {
+  data: T;
+  meta: UsageResponseMeta;
 }
 
-export interface PaginatedLogs {
-  data: RequestLog[];
+export interface UsageRequestPageMeta extends UsageResponseMeta {
   total: number;
-  page: number;
-  pageSize: number;
+  nextCursor?: string | null;
 }
 
-export interface UsageSummary {
-  totalRequests: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheCreationTokens: number;
-  totalCacheReadTokens: number;
-  successRate: number;
-  /** input + output + cache_creation + cache_read, all cache-normalized */
-  realTotalTokens: number;
-  /** cache_read / (input + cache_creation + cache_read), range 0–1 */
-  cacheHitRate: number;
+export interface UsageRequestPage {
+  data: UsageRequest[];
+  meta: UsageRequestPageMeta;
 }
 
-export interface UsageSummaryByApp {
-  appType: string;
-  summary: UsageSummary;
-}
-
-export interface DailyStats {
-  date: number;
-  requestCount: number;
-  totalTokens: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheCreationTokens: number;
-  totalCacheReadTokens: number;
-}
-
-export interface ProviderStats {
-  providerId: string;
-  providerName: string;
-  requestCount: number;
-  totalTokens: number;
-  successRate: number;
-  avgLatencyMs: number;
-}
-
-export interface ModelStats {
-  model: string;
-  requestCount: number;
-  totalTokens: number;
-  successRate: number;
-  avgLatencyMs: number;
-}
-
-export interface LogFilters {
-  appType?: string;
-  providerName?: string;
-  model?: string;
+export interface UsageFilters {
+  app?: UsageApp;
+  bundleId?: string;
   shareId?: string;
-  statusCode?: number;
-  startDate?: number;
-  endDate?: number;
-}
-
-/**
- * Dashboard 顶栏的全局筛选维度，作用于 Hero / 趋势图 / 三个统计 Tab。
- *
- * - `providerName` 按展示名精确匹配（与 Provider 统计列表同口径，含
- *   "Claude (Session)" 等会话占位名）；
- * - `model` 按实际模型优先、请求模型回落的有效模型匹配，与模型统计
- *   的分组口径一致。
- */
-export interface UsageScopeFilters {
-  appType?: string;
-  providerName?: string;
-  model?: string;
+  userEmail?: string;
+  actualModel?: string;
+  outcome?: UsageOutcome;
+  usageState?: UsageState;
 }
 
 export type UsageRangePreset = "today" | "1d" | "7d" | "14d" | "30d" | "custom";
@@ -152,80 +235,22 @@ export interface UsageRangeSelection {
   preset: UsageRangePreset;
   customStartDate?: number;
   customEndDate?: number;
-  /** When true (custom mode only), endDate resolves to "now" instead of the
-   *  fixed customEndDate snapshot, and the end-time field becomes read-only. */
   liveEndTime?: boolean;
 }
 
-/**
- * App types surfaced as dashboard filter buttons.
- *
- * `claude-desktop` is a retained legacy app identifier, not a Server dashboard
- * category. Requests carrying that identifier remain visible in request detail,
- * while aggregate queries fold them into `claude` to avoid a partial duplicate
- * category.
- * `opencode` / `openclaw` / `hermes` have no proxy handler at all - they
- * appear only as managed apps elsewhere.
- */
-export type AppType = "claude" | "codex" | "gemini" | "opencode";
-
-export type AppTypeFilter = "all" | AppType;
-
-export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
-  "claude",
-  "codex",
-  "gemini",
-  "opencode",
-];
-
-/**
- * App types whose proxy uses an OpenAI-style protocol. The protocol does not
- * report cache _creation_ separately, only cache
- *    _reads_. So `cacheCreationTokens` is always 0 for these app types and
- *    the UI should label it as N/A rather than 0.
- *
- * Mirror of the Rust `CACHE_INCLUSIVE_APP_TYPES` whitelist.
- */
-export const CACHE_INCLUSIVE_APP_TYPES: ReadonlySet<string> = new Set([
-  "codex",
-  "gemini",
-]);
-
-/** Subset of request-log fields needed to derive cache-normalized input. */
-export interface CacheNormalizableLog {
-  inputTokens: number;
-}
-
 export function hasObservedUsage(log: { usageState?: string | null }): boolean {
-  return !log.usageState || log.usageState === "observed";
+  return log.usageState === "observed";
 }
 
-/**
- * Request logs from the Server API already expose normalized fresh input.
- */
-export function getFreshInputTokens(log: CacheNormalizableLog): number {
-  return log.inputTokens;
+export function usageToken(value?: number | null): number {
+  return value ?? 0;
 }
 
-export function getTotalTokens(
-  log: CacheNormalizableLog & {
-    rawInputTokens?: number | null;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheCreationTokens: number;
-    totalTokens?: number | null;
-  },
-): number {
+export function requestProcessedTokens(log: UsageRequest): number {
   return (
-    log.totalTokens ??
-    (log.rawInputTokens ??
-      log.inputTokens + log.cacheReadTokens + log.cacheCreationTokens) +
-      log.outputTokens
+    usageToken(log.inputTokens) +
+    usageToken(log.outputTokens) +
+    usageToken(log.cacheReadTokens) +
+    usageToken(log.cacheCreationTokens)
   );
-}
-
-export interface StatsFilters {
-  timeRange: UsageRangePreset;
-  providerId?: string;
-  appType?: string;
 }

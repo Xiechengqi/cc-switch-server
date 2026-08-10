@@ -88,12 +88,12 @@ pub fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
         .with(filter_layer)
         .with(
             tracing_subscriber::fmt::layer()
-                .with_target(false)
+                .with_target(true)
                 .with_span_events(FmtSpan::NONE),
         )
         .with(
             tracing_subscriber::fmt::layer()
-                .with_target(false)
+                .with_target(true)
                 .with_ansi(false)
                 .with_span_events(FmtSpan::NONE)
                 .with_writer(CaptureMakeWriter {
@@ -104,9 +104,42 @@ pub fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
 }
 
 pub fn build_filter(log_level: &str) -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"))
+    if let Ok(directives) = std::env::var("RUST_LOG") {
+        if let Ok(filter) = EnvFilter::try_new(with_dependency_noise_floor(&directives)) {
+            return filter;
+        }
+    }
+    EnvFilter::try_new(default_filter_directives(log_level))
+        .unwrap_or_else(|_| EnvFilter::new(default_filter_directives("info")))
+}
+
+fn default_filter_directives(log_level: &str) -> String {
+    let level = log_level.trim().to_ascii_lowercase();
+    with_dependency_noise_floor(&level)
+}
+
+fn with_dependency_noise_floor(directives: &str) -> String {
+    let directives = directives.trim();
+    if explicitly_configures_russh(directives) {
+        return directives.to_string();
+    }
+    if directives.is_empty() {
+        "russh::client=warn".to_string()
+    } else {
+        format!("{directives},russh::client=warn")
+    }
+}
+
+fn explicitly_configures_russh(directives: &str) -> bool {
+    directives.split(',').any(|directive| {
+        let selector = directive
+            .trim()
+            .split(['[', '{', '='])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        selector == "russh" || selector.starts_with("russh::")
+    })
 }
 
 pub fn reload_filter(handle: &reload::Handle<EnvFilter, Registry>, level: &str) {
@@ -132,7 +165,7 @@ mod tests {
         let capture = Arc::new(LogCapture::new(2));
         let subscriber = Registry::default().with(
             tracing_subscriber::fmt::layer()
-                .with_target(false)
+                .with_target(true)
                 .with_ansi(false)
                 .with_span_events(FmtSpan::NONE)
                 .with_writer(CaptureMakeWriter {
@@ -148,6 +181,28 @@ mod tests {
         assert!(raw_line.contains(" INFO "));
         assert!(raw_line.contains("formatter output"));
         assert!(raw_line.contains("answer=42"));
+        assert!(raw_line.contains("cc_switch_server::logging::init::tests"));
         assert!(!raw_line.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn info_defaults_suppress_periodic_russh_rekey_noise() {
+        assert_eq!(default_filter_directives("info"), "info,russh::client=warn");
+        assert_eq!(
+            default_filter_directives("debug"),
+            "debug,russh::client=warn"
+        );
+        assert_eq!(
+            with_dependency_noise_floor("info,cc_switch_server=debug"),
+            "info,cc_switch_server=debug,russh::client=warn"
+        );
+        assert_eq!(
+            with_dependency_noise_floor("info,russh::client=trace"),
+            "info,russh::client=trace"
+        );
+        assert_eq!(
+            with_dependency_noise_floor("info,russh=debug"),
+            "info,russh=debug"
+        );
     }
 }

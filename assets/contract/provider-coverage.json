@@ -4,7 +4,7 @@
     "serverLegacyInventory": "assets/contract/server-provider-legacy-inventory.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "156e712aa5f1e0811d5aea51fe5cb6ababca9b698105d6eb39c4e0fbe63994b8"
+      "sha256": "41560e143020fdcde05e500d62890ccdc843db899e085d6484d47a15f9b49266"
     },
     "upstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },
@@ -128,10 +128,24 @@
       "id": "kiro_oauth",
       "label": "Kiro OAuth",
       "apps": [
-        "claude"
+        "claude",
+        "codex"
       ],
       "required": true,
       "presentInSource": true,
+      "presentInServer": true
+    },
+    {
+      "variant": "KimiCode",
+      "id": "kimi_code",
+      "label": "Kimi Code OAuth",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "presentInSource": false,
       "presentInServer": true
     },
     {

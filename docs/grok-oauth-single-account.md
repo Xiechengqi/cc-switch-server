@@ -60,6 +60,18 @@ HTTP 和 SSE 共用同一份 Grok request contract：
 
 OAuth 凭据发生轮换时，Server 先原子持久化候选账号快照，再发布内存状态。若 durable write 失败，新 token 会保留在内存并由后台退避重试，但 Grok 新数据面请求和 WebSocket 会返回 `503`，`/ready` 同时进入 degraded，避免重启后继续使用未持久化的旋转凭据。
 
+## Hosted Search 响应语义
+
+Grok Responses 的 hosted `web_search_call` 和 `custom_tool_call`/`x_search` 是服务端工具，不是需要客户端执行的普通 function tool：
+
+- 流式和非流式桥都输出 Anthropic `server_tool_use`，随后输出匹配的 `web_search_tool_result` 或 `x_search_tool_result`。
+- 事件缺失 `output_index` 时按 item id 关联 added/done/input 事件，避免把并行搜索结果附着到错误 content block。
+- `url_citation` annotation 转为 `citations_delta` 或非流式 citation content，保留 URL、标题和可用的文本位置。
+- `usage.server_tool_use.web_search_requests` 记录 hosted search 总数，`x_search_requests` 单独记录 X 搜索数。
+- Hosted search 已由上游完成，不把 Anthropic `stop_reason` 改成 `tool_use`；只有需要下游执行的普通 function call 才使用该终态。
+
+该转换只改变当前 Grok 响应的协议表示，不触发第二次搜索、不重放请求，也不进入 Provider/账号 failover。
+
 ## Turn 与会话
 
 `x-grok-turn-idx` 是纯下游输入，不是 Server 状态：

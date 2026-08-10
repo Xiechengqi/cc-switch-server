@@ -27,6 +27,7 @@ import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
 import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PROVIDER_TYPES } from "@/config/constants";
 import type { ManagedAuthAccount } from "@/lib/api/auth";
@@ -36,7 +37,11 @@ import { useModelTest } from "@/hooks/useModelTest";
 import { useStreamCheck } from "@/hooks/useStreamCheck";
 import { useProviderHealth } from "@/lib/query/providerHealth";
 import { cn } from "@/lib/utils";
-import type { CoreProviderApp } from "@/server/providerRegistry";
+import {
+  modelPoliciesForProfile,
+  profileById,
+  type CoreProviderApp,
+} from "@/server/providerRegistry";
 import { providerResourceSupportsOperation } from "@/server/providerOperations";
 import {
   canTestLinkProvider,
@@ -139,6 +144,17 @@ function operationResource(
     );
 }
 
+function operationResources(
+  bundle: ProviderBundleView,
+  supports: (resource: ProviderResource) => boolean,
+): ProviderResource[] {
+  return bundle.enabledApps
+    .map((app) => bundle.surfaces[app])
+    .filter((resource): resource is ProviderResource =>
+      Boolean(resource && supports(resource)),
+    );
+}
+
 interface ProviderBundleCardProps {
   bundle: ProviderBundleView;
   share?: ShareRecord;
@@ -171,12 +187,18 @@ export function ProviderBundleCard({
   const { t } = useTranslation();
   const primaryResource = providerBundlePrimaryResource(bundle);
   const connectivityResource = operationResource(bundle, supportsConnectivity);
-  const modelResource = operationResource(bundle, supportsModelTest);
+  const modelResources = operationResources(bundle, supportsModelTest);
   const connectivityApp =
     connectivityResource?.app ?? primaryResource?.app ?? "claude";
-  const modelApp = modelResource?.app ?? primaryResource?.app ?? "claude";
   const { checkProvider, isChecking } = useStreamCheck(connectivityApp);
-  const { testProvider, isTesting } = useModelTest(modelApp);
+  const claudeModelTest = useModelTest("claude");
+  const codexModelTest = useModelTest("codex");
+  const geminiModelTest = useModelTest("gemini");
+  const modelTests = {
+    claude: claudeModelTest,
+    codex: codexModelTest,
+    gemini: geminiModelTest,
+  };
   const { data: health } = useProviderHealth(
     primaryResource?.provider.id ?? bundle.id,
     primaryResource?.app ?? "claude",
@@ -207,7 +229,54 @@ export function ProviderBundleCard({
         ? t("provider.share.resumeShort", { defaultValue: "开启分享" })
         : t("provider.share.enable", { defaultValue: "分享" });
   const connectivityId = connectivityResource?.provider.id ?? bundle.id;
-  const modelId = modelResource?.provider.id ?? bundle.id;
+  const modelTesting = modelResources.some((resource) =>
+    modelTests[resource.app].isTesting(resource.provider.id),
+  );
+  const modelSummaries = bundle.enabledApps.flatMap((app) => {
+    const resource = bundle.surfaces[app];
+    const policy = resource?.runtime?.modelPolicy;
+    if (!policy) return [];
+    const profile = resource.profileId
+      ? profileById(resource.profileId)
+      : undefined;
+    return [
+      {
+        app,
+        fixed: profile ? modelPoliciesForProfile(profile).length === 1 : false,
+        signature:
+          policy.mode === "single"
+            ? `single:${policy.upstreamModel}`
+            : "passthrough",
+        label:
+          policy.mode === "single"
+            ? t("providerBundle.modelSummarySingle", {
+                model: policy.upstreamModel,
+              })
+            : t("providerBundle.modelPassthrough"),
+      },
+    ];
+  });
+  const globalModelSummaries = modelSummaries.filter((item) => !item.fixed);
+  const fixedModelSummaries = modelSummaries.filter((item) => item.fixed);
+  const compactModelSummary =
+    bundle.modelPolicyScope === "global" &&
+    globalModelSummaries.length > 0 &&
+    new Set(globalModelSummaries.map((item) => item.signature)).size <= 1
+      ? [
+          globalModelSummaries[0]?.label,
+          ...fixedModelSummaries.map(
+            (item) =>
+              `${APP_LABELS[item.app]} (${t("providerBundle.modelProfileFixed")}): ${item.label}`,
+          ),
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : modelSummaries
+          .map(
+            (item) =>
+              `${APP_LABELS[item.app]}${item.fixed ? ` (${t("providerBundle.modelProfileFixed")})` : ""}: ${item.label}`,
+          )
+          .join(" · ");
   const iconButtonClass = "h-8 w-8 p-1";
 
   return (
@@ -278,6 +347,11 @@ export function ProviderBundleCard({
               </div>
               {share ? <ProviderShareStatusTag share={share} /> : null}
               {health ? <ProviderHealthBadge health={health} /> : null}
+              <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                {bundle.modelPolicyScope === "global"
+                  ? t("providerBundle.modelScopeGlobal")
+                  : t("providerBundle.modelScopePerApp")}
+              </Badge>
             </div>
 
             <button
@@ -298,6 +372,14 @@ export function ProviderBundleCard({
             >
               <span className="min-w-0 truncate">{targetText}</span>
             </button>
+            {compactModelSummary ? (
+              <p
+                className="truncate text-xs text-muted-foreground"
+                title={compactModelSummary}
+              >
+                {compactModelSummary}
+              </p>
+            ) : null}
           </div>
         </div>
 
@@ -387,16 +469,24 @@ export function ProviderBundleCard({
                 variant="ghost"
                 className={cn(
                   iconButtonClass,
-                  !modelResource &&
+                  modelResources.length === 0 &&
                     "cursor-not-allowed text-muted-foreground opacity-40",
                 )}
-                disabled={!modelResource || isTesting(modelId)}
-                title={t("provider.testModel", { defaultValue: "测试模型" })}
+                disabled={modelResources.length === 0 || modelTesting}
+                title={t("providerBundle.testAllModels")}
                 onClick={() => {
-                  if (modelResource) void testProvider(modelId, bundle.name);
+                  if (modelResources.length === 0) return;
+                  void Promise.all(
+                    modelResources.map((resource) =>
+                      modelTests[resource.app].testProvider(
+                        resource.provider.id,
+                        `${bundle.name} / ${APP_LABELS[resource.app]}`,
+                      ),
+                    ),
+                  );
                 }}
               >
-                {isTesting(modelId) ? (
+                {modelTesting ? (
                   <LoaderCircle className="h-4 w-4 animate-spin" />
                 ) : (
                   <Activity className="h-4 w-4" />

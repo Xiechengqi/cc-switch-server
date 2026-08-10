@@ -1,171 +1,78 @@
 use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::usage::store::{
-    ModelUsageStats, ProviderUsageStats, UsageLog, UsageLogFilter, UsageRollup, UsageStatsFilter,
-    UsageTrendPoint,
+use crate::domain::usage::query::{
+    ModelUsage, ProviderBundleUsage, ShareUsage, UsageFacets, UsageOverview, UsageTrendPoint,
 };
+use crate::domain::usage::store::{UsageLog, UsageOutcome, UsageState};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageLogsQuery {
+pub(in crate::api) struct UsageQueryParams {
     #[serde(default)]
-    pub(in crate::api) limit: Option<usize>,
+    pub(in crate::api) from_ms: Option<u64>,
     #[serde(default)]
-    pub(in crate::api) from_ms: Option<u128>,
-    #[serde(default)]
-    pub(in crate::api) to_ms: Option<u128>,
+    pub(in crate::api) to_ms: Option<u64>,
     #[serde(default)]
     pub(in crate::api) app: Option<AppKind>,
     #[serde(default)]
-    pub(in crate::api) provider_id: Option<String>,
+    pub(in crate::api) bundle_id: Option<String>,
     #[serde(default)]
     pub(in crate::api) share_id: Option<String>,
     #[serde(default)]
     pub(in crate::api) user_email: Option<String>,
     #[serde(default)]
-    pub(in crate::api) session_id: Option<String>,
+    pub(in crate::api) actual_model: Option<String>,
     #[serde(default)]
-    pub(in crate::api) data_source: Option<String>,
+    pub(in crate::api) outcome: Option<UsageOutcome>,
     #[serde(default)]
-    pub(in crate::api) is_health_check: Option<bool>,
+    pub(in crate::api) usage_state: Option<UsageState>,
     #[serde(default)]
-    pub(in crate::api) stream_status: Option<String>,
-}
-
-impl From<UsageLogsQuery> for UsageLogFilter {
-    fn from(query: UsageLogsQuery) -> Self {
-        Self {
-            limit: query.limit,
-            from_ms: query.from_ms,
-            to_ms: query.to_ms,
-            app: query.app,
-            provider_id: query.provider_id,
-            share_id: query.share_id,
-            user_email: query.user_email,
-            session_id: query.session_id,
-            data_source: query.data_source,
-            is_health_check: query.is_health_check.or(Some(false)),
-            stream_status: query.stream_status,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageStatsQuery {
+    pub(in crate::api) window_ms: Option<u64>,
+    #[serde(default)]
+    pub(in crate::api) cursor: Option<String>,
     #[serde(default)]
     pub(in crate::api) limit: Option<usize>,
-    #[serde(default)]
-    pub(in crate::api) from_ms: Option<u128>,
-    #[serde(default)]
-    pub(in crate::api) to_ms: Option<u128>,
-    #[serde(default)]
-    pub(in crate::api) window_ms: Option<u128>,
-    #[serde(default)]
-    pub(in crate::api) app: Option<AppKind>,
-    #[serde(default)]
-    pub(in crate::api) provider_id: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) provider_name: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) model: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) share_id: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) user_email: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) session_id: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) data_source: Option<String>,
-    #[serde(default)]
-    pub(in crate::api) is_health_check: Option<bool>,
-    #[serde(default)]
-    pub(in crate::api) stream_status: Option<String>,
-}
-
-impl From<UsageStatsQuery> for UsageStatsFilter {
-    fn from(query: UsageStatsQuery) -> Self {
-        Self {
-            limit: query.limit,
-            from_ms: query.from_ms,
-            to_ms: query.to_ms,
-            window_ms: query.window_ms,
-            app: query.app,
-            provider_id: query.provider_id,
-            provider_name: query.provider_name,
-            model: query.model,
-            share_id: query.share_id,
-            user_email: query.user_email,
-            session_id: query.session_id,
-            data_source: query.data_source,
-            is_health_check: query.is_health_check.or(Some(false)),
-            stream_status: query.stream_status,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageLogsResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) logs: Vec<UsageLog>,
+pub(in crate::api) struct UsageResponseMeta {
+    pub(in crate::api) from_ms: u128,
+    pub(in crate::api) to_ms: u128,
+    pub(in crate::api) generated_at_ms: u128,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageLogDetailResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) log: UsageLog,
+pub(in crate::api) struct UsageDataResponse<T> {
+    pub(in crate::api) data: T,
+    pub(in crate::api) meta: UsageResponseMeta,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageSummaryResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) summary: UsageRollup,
+pub(in crate::api) struct UsageRequestPageMeta {
+    pub(in crate::api) from_ms: u128,
+    pub(in crate::api) to_ms: u128,
+    pub(in crate::api) generated_at_ms: u128,
+    pub(in crate::api) total: usize,
+    pub(in crate::api) next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageTrendsResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) trends: Vec<UsageTrendPoint>,
+pub(in crate::api) struct UsageRequestPageResponse {
+    pub(in crate::api) data: Vec<UsageLog>,
+    pub(in crate::api) meta: UsageRequestPageMeta,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageProviderStatsResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) providers: Vec<ProviderUsageStats>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct UsageModelStatsResponse {
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) models: Vec<ModelUsageStats>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn usage_queries_exclude_health_checks_unless_explicitly_requested() {
-        let logs: UsageLogsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
-        let logs_filter: UsageLogFilter = logs.into();
-        assert_eq!(logs_filter.is_health_check, Some(false));
-
-        let stats: UsageStatsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
-        let stats_filter: UsageStatsFilter = stats.into();
-        assert_eq!(stats_filter.is_health_check, Some(false));
-
-        let health: UsageStatsQuery =
-            serde_json::from_value(serde_json::json!({ "isHealthCheck": true })).unwrap();
-        let health_filter: UsageStatsFilter = health.into();
-        assert_eq!(health_filter.is_health_check, Some(true));
-    }
-}
+pub(in crate::api) type UsageOverviewResponse = UsageDataResponse<UsageOverview>;
+pub(in crate::api) type UsageTrendsResponse = UsageDataResponse<Vec<UsageTrendPoint>>;
+pub(in crate::api) type UsageFacetsResponse = UsageDataResponse<UsageFacets>;
+pub(in crate::api) type UsageProviderBundlesResponse = UsageDataResponse<Vec<ProviderBundleUsage>>;
+pub(in crate::api) type UsageModelsResponse = UsageDataResponse<Vec<ModelUsage>>;
+pub(in crate::api) type UsageSharesResponse = UsageDataResponse<Vec<ShareUsage>>;
+pub(in crate::api) type UsageRequestDetailResponse = UsageDataResponse<UsageLog>;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -80,6 +80,14 @@
     "family": "供應商類型",
     "firstByteTimeout": "首位元組逾時（毫秒）",
     "modelPassthrough": "模型透傳",
+    "modelProfileFixed": "Profile 固定",
+    "modelScope": "控制範圍",
+    "modelScopeGlobal": "全域",
+    "modelScopeMergeConfirm": "切換為全域",
+    "modelScopeMergeMessage": "各 App 目前使用不同的模型策略。切換後將統一套用全域策略。",
+    "modelScopeMergeTitle": "統一模型策略",
+    "modelScopePerApp": "依 App 獨立",
+    "modelSummarySingle": "固定：{{model}}",
     "modelSingle": "固定上游模型",
     "queryParameter": "API Key 查詢參數名稱",
     "requestTimeout": "請求逾時（毫秒）",
@@ -90,6 +98,7 @@
     "surfaces": "應用介面",
     "streamIdleTimeout": "串流閒置逾時（毫秒）",
     "testModel": "測試模型",
+    "testAllModels": "測試所有 App 模型",
     "title": "供應商"
   },
   "provider": {

@@ -1588,6 +1588,7 @@ impl ShareStore {
         Ok(share.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace_bundle_configuration_with_usage(
         &mut self,
         share_id: &str,
@@ -4386,6 +4387,7 @@ mod tests {
             },
         );
         summary.request_id = "anchored-summary".to_string();
+        summary.record_kind = crate::domain::usage::store::UsageRecordKind::InternalSupplemental;
         summary.share_id = Some("anchored-summary".to_string());
         summary.user_email = Some("user@example.com".to_string());
         summary.data_source = Some(

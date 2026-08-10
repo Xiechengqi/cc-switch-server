@@ -96,16 +96,21 @@ import {
   type ProviderBundleShareDraft,
 } from "./bundleShare";
 import {
+  changeModelPolicyScope,
   createProviderBundleDraft,
   defaultUpstreamModelForFamily,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
+  modelPoliciesForSurface,
+  perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
+  supportsPerAppModelPolicy,
   toProviderBundleWriteDraft,
   updateBundleModel,
   updateSurfaceEndpoint,
+  updateSurfaceModel,
   validateProviderBundleDraft,
   type BundleSurfaceEditorDraft,
   type ProviderBundleEditorDraft,
@@ -182,15 +187,19 @@ function fieldLabel(logical: string): string {
 
 function SurfaceEditor({
   surface,
+  modelPolicyScope,
   onChange,
 }: {
   surface: BundleSurfaceEditorDraft;
+  modelPolicyScope: ProviderBundleEditorDraft["modelPolicyScope"];
   onChange: (surface: BundleSurfaceEditorDraft) => void;
 }) {
   const { t } = useTranslation();
   const profile = profileById(surface.profileId);
   if (!profile) return null;
   const customPolicy = customPolicyForProfile(profile);
+  const allowedModelPolicies = modelPoliciesForSurface(surface);
+  const modelPolicyConfigurable = allowedModelPolicies.length > 1;
   const updateDriverOptions = (
     patch: Partial<BundleSurfaceEditorDraft["driverOptions"]>,
   ) =>
@@ -219,6 +228,94 @@ function SurfaceEditor({
           />
         </div>
       </div>
+
+      {modelPolicyScope === "per_app" ? (
+        <div className="space-y-4 border-b pb-6">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label>{t("serverProviderForm.model.title")}</Label>
+            <Badge variant="secondary">
+              {modelPolicyConfigurable
+                ? t("providerBundle.modelScopePerApp")
+                : t("providerBundle.modelProfileFixed")}
+            </Badge>
+          </div>
+          {modelPolicyConfigurable ? (
+            <>
+              <Tabs
+                value={surface.modelPolicy}
+                onValueChange={(value) => {
+                  if (value !== "single" && value !== "passthrough") return;
+                  if (!allowedModelPolicies.includes(value)) return;
+                  onChange(
+                    updateSurfaceModel(
+                      surface,
+                      value,
+                      value === "single" && !surface.upstreamModel.trim()
+                        ? (profile.defaultUpstreamModel ?? "")
+                        : surface.upstreamModel,
+                    ),
+                  );
+                }}
+              >
+                <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
+                  {allowedModelPolicies.map((policy) => (
+                    <TabsTrigger
+                      key={policy}
+                      value={policy}
+                      className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground"
+                    >
+                      {policy === "single" ? (
+                        <Target className="hidden h-4 w-4 shrink-0 sm:block" />
+                      ) : (
+                        <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
+                      )}
+                      {policy === "single"
+                        ? t("providerBundle.modelSingle")
+                        : t("providerBundle.modelPassthrough")}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+              {surface.modelPolicy === "single" ? (
+                <div className="space-y-2">
+                  <Label htmlFor={`surface-${surface.app}-model`}>
+                    {t("serverProviderForm.model.upstreamModel")}
+                  </Label>
+                  <Input
+                    id={`surface-${surface.app}-model`}
+                    value={surface.upstreamModel}
+                    onChange={(event) =>
+                      onChange(
+                        updateSurfaceModel(
+                          surface,
+                          surface.modelPolicy,
+                          event.target.value,
+                        ),
+                      )
+                    }
+                  />
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
+              {surface.modelPolicy === "single" ? (
+                <Target className="h-4 w-4" />
+              ) : (
+                <ArrowRightLeft className="h-4 w-4" />
+              )}
+              {surface.modelPolicy === "single"
+                ? t("providerBundle.modelSingle")
+                : t("providerBundle.modelPassthrough")}
+              {surface.modelPolicy === "single" && surface.upstreamModel ? (
+                <span className="text-muted-foreground">
+                  {surface.upstreamModel}
+                </span>
+              ) : null}
+            </div>
+          )}
+        </div>
+      ) : null}
 
       {profile.formComposition === "custom" && customPolicy ? (
         <div className="space-y-5">
@@ -966,12 +1063,8 @@ function BundleShareEditor({
             <CodexShareExecutionPolicyFields
               allowPersonalCredits={draft.allowPersonalCredits}
               autoConsumeBankedReset={draft.autoConsumeBankedReset}
-              bankedResetExpiryLeadMinutes={
-                draft.bankedResetExpiryLeadMinutes
-              }
-              previousResponseCacheEnabled={
-                draft.previousResponseCacheEnabled
-              }
+              bankedResetExpiryLeadMinutes={draft.bankedResetExpiryLeadMinutes}
+              previousResponseCacheEnabled={draft.previousResponseCacheEnabled}
               onAllowPersonalCreditsChange={(allowPersonalCredits) =>
                 onChange({ ...draft, allowPersonalCredits })
               }
@@ -1071,6 +1164,7 @@ export function ProviderBundleEditor({
     draft.surfaces[0]?.app ?? "claude",
   );
   const [saving, setSaving] = useState(false);
+  const [modelScopeConfirmOpen, setModelScopeConfirmOpen] = useState(false);
   const shareSectionRef = useRef<HTMLDivElement>(null);
   const sharesQuery = useSharesQuery();
   const clientTunnelQuery = useClientTunnelQuery();
@@ -1092,6 +1186,10 @@ export function ProviderBundleEditor({
   const credentialProfile = profileById(family.credentialProfileId);
   const allowedModelPolicies = modelPoliciesForFamily(family);
   const defaultSharedModel = defaultUpstreamModelForFamily(family);
+  const perAppModelPolicySupported = supportsPerAppModelPolicy(family);
+  const fixedModelSurfaces = draft.surfaces.filter(
+    (surface) => modelPoliciesForSurface(surface).length === 1,
+  );
   const managedProviderType =
     credentialProfile?.credentialPolicy.mode === "managed_account"
       ? credentialProfile.credentialPolicy.accountProviderType
@@ -1493,88 +1591,144 @@ export function ProviderBundleEditor({
         <Section title={t("serverProviderForm.model.title")}>
           <div className="max-w-xl space-y-4">
             <div className="space-y-2">
-              {allowedModelPolicies.length > 1 ? (
+              <Label>{t("providerBundle.modelScope")}</Label>
+              {perAppModelPolicySupported ? (
                 <Tabs
-                  value={draft.modelPolicy}
+                  value={draft.modelPolicyScope}
                   onValueChange={(value) => {
-                    if (value !== "single" && value !== "passthrough") return;
-                    if (!allowedModelPolicies.includes(value)) return;
+                    if (value !== "global" && value !== "per_app") return;
+                    if (
+                      value === "global" &&
+                      draft.modelPolicyScope === "per_app" &&
+                      perAppModelPoliciesDiffer(draft)
+                    ) {
+                      setModelScopeConfirmOpen(true);
+                      return;
+                    }
                     setDraft((current) =>
-                      updateBundleModel(
-                        current,
-                        value,
-                        value === "single" && !current.upstreamModel.trim()
-                          ? defaultSharedModel
-                          : current.upstreamModel,
-                      ),
+                      changeModelPolicyScope(current, value),
                     );
                   }}
                 >
                   <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
-                    {allowedModelPolicies.map((policy) => (
-                      <TabsTrigger
-                        key={policy}
-                        value={policy}
-                        className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground dark:data-[state=active]:bg-background"
-                      >
-                        {policy === "single" ? (
-                          <Target className="hidden h-4 w-4 shrink-0 sm:block" />
-                        ) : (
-                          <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
-                        )}
-                        {policy === "single"
-                          ? t("providerBundle.modelSingle", {
-                              defaultValue: "固定上游模型",
-                            })
-                          : t("providerBundle.modelPassthrough", {
-                              defaultValue: "模型透传",
-                            })}
-                      </TabsTrigger>
-                    ))}
+                    <TabsTrigger value="global" className="rounded-sm">
+                      {t("providerBundle.modelScopeGlobal")}
+                    </TabsTrigger>
+                    <TabsTrigger value="per_app" className="rounded-sm">
+                      {t("providerBundle.modelScopePerApp")}
+                    </TabsTrigger>
                   </TabsList>
                 </Tabs>
               ) : (
-                <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
-                  {draft.modelPolicy === "single" ? (
-                    <Target className="h-4 w-4" />
-                  ) : (
-                    <ArrowRightLeft className="h-4 w-4" />
-                  )}
-                  {draft.modelPolicy === "single"
-                    ? t("providerBundle.modelSingle", {
-                        defaultValue: "固定上游模型",
-                      })
-                    : t("providerBundle.modelPassthrough", {
-                        defaultValue: "模型透传",
-                      })}
-                </div>
+                <Badge variant="secondary">
+                  {t("providerBundle.modelScopeGlobal")}
+                </Badge>
               )}
-              <p className="text-xs leading-relaxed text-muted-foreground">
-                {draft.modelPolicy === "single"
-                  ? t("serverProviderForm.model.singleHint")
-                  : t("serverProviderForm.model.passthroughHint")}
-              </p>
             </div>
 
-            {draft.modelPolicy === "single" ? (
-              <div className="space-y-2">
-                <Label htmlFor="provider-bundle-model">
-                  {t("serverProviderForm.model.upstreamModel")}
-                </Label>
-                <Input
-                  id="provider-bundle-model"
-                  value={draft.upstreamModel}
-                  onChange={(event) =>
-                    setDraft((current) =>
-                      updateBundleModel(
-                        current,
-                        current.modelPolicy,
-                        event.target.value,
-                      ),
-                    )
-                  }
-                />
-              </div>
+            {draft.modelPolicyScope === "global" ? (
+              <>
+                <div className="space-y-2">
+                  {allowedModelPolicies.length > 1 ? (
+                    <Tabs
+                      value={draft.modelPolicy}
+                      onValueChange={(value) => {
+                        if (value !== "single" && value !== "passthrough")
+                          return;
+                        if (!allowedModelPolicies.includes(value)) return;
+                        setDraft((current) =>
+                          updateBundleModel(
+                            current,
+                            value,
+                            value === "single" && !current.upstreamModel.trim()
+                              ? defaultSharedModel
+                              : current.upstreamModel,
+                          ),
+                        );
+                      }}
+                    >
+                      <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
+                        {allowedModelPolicies.map((policy) => (
+                          <TabsTrigger
+                            key={policy}
+                            value={policy}
+                            className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground"
+                          >
+                            {policy === "single" ? (
+                              <Target className="hidden h-4 w-4 shrink-0 sm:block" />
+                            ) : (
+                              <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
+                            )}
+                            {policy === "single"
+                              ? t("providerBundle.modelSingle")
+                              : t("providerBundle.modelPassthrough")}
+                          </TabsTrigger>
+                        ))}
+                      </TabsList>
+                    </Tabs>
+                  ) : (
+                    <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
+                      {draft.modelPolicy === "single" ? (
+                        <Target className="h-4 w-4" />
+                      ) : (
+                        <ArrowRightLeft className="h-4 w-4" />
+                      )}
+                      {draft.modelPolicy === "single"
+                        ? t("providerBundle.modelSingle")
+                        : t("providerBundle.modelPassthrough")}
+                    </div>
+                  )}
+                </div>
+                {draft.modelPolicy === "single" ? (
+                  <div className="space-y-2">
+                    <Label htmlFor="provider-bundle-model">
+                      {t("serverProviderForm.model.upstreamModel")}
+                    </Label>
+                    <Input
+                      id="provider-bundle-model"
+                      value={draft.upstreamModel}
+                      onChange={(event) =>
+                        setDraft((current) =>
+                          updateBundleModel(
+                            current,
+                            current.modelPolicy,
+                            event.target.value,
+                          ),
+                        )
+                      }
+                    />
+                  </div>
+                ) : null}
+                {fixedModelSurfaces.length ? (
+                  <div className="grid gap-2 border-t pt-3 text-sm">
+                    {fixedModelSurfaces.map((surface) => (
+                      <div
+                        key={surface.app}
+                        className="flex min-w-0 items-center gap-2"
+                      >
+                        <span className="shrink-0 font-medium">
+                          {APP_LABELS[surface.app]}
+                        </span>
+                        <Badge variant="secondary">
+                          {t("providerBundle.modelProfileFixed")}
+                        </Badge>
+                        <span
+                          className="min-w-0 truncate text-muted-foreground"
+                          title={
+                            surface.modelPolicy === "single"
+                              ? surface.upstreamModel
+                              : t("providerBundle.modelPassthrough")
+                          }
+                        >
+                          {surface.modelPolicy === "single"
+                            ? surface.upstreamModel
+                            : t("providerBundle.modelPassthrough")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </>
             ) : null}
           </div>
         </Section>
@@ -1669,7 +1823,11 @@ export function ProviderBundleEditor({
             </TabsList>
             {draft.surfaces.map((surface) => (
               <TabsContent key={surface.app} value={surface.app}>
-                <SurfaceEditor surface={surface} onChange={updateSurface} />
+                <SurfaceEditor
+                  surface={surface}
+                  modelPolicyScope={draft.modelPolicyScope}
+                  onChange={updateSurface}
+                />
               </TabsContent>
             ))}
           </Tabs>
@@ -1705,6 +1863,20 @@ export function ProviderBundleEditor({
           {t("common.save")}
         </Button>
       </div>
+      <ConfirmDialog
+        isOpen={modelScopeConfirmOpen}
+        title={t("providerBundle.modelScopeMergeTitle")}
+        message={t("providerBundle.modelScopeMergeMessage")}
+        confirmText={t("providerBundle.modelScopeMergeConfirm")}
+        cancelText={t("common.cancel")}
+        variant="info"
+        zIndex="top"
+        onConfirm={() => {
+          setDraft((current) => changeModelPolicyScope(current, "global"));
+          setModelScopeConfirmOpen(false);
+        }}
+        onCancel={() => setModelScopeConfirmOpen(false)}
+      />
       <ConfirmDialog
         isOpen={closeGuard.confirmOpen}
         title={t("provider.unsavedChanges.title")}

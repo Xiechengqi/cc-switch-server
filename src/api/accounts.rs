@@ -1632,6 +1632,203 @@ pub(in crate::api) async fn cancel_grok_device_login(
     }))
 }
 
+pub(in crate::api) async fn start_kimi_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(_input): Json<StartKimiDeviceLoginRequest>,
+) -> Result<Json<StartKimiDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let http_client = state.http_client().await;
+    let now = now_ms() as i64;
+    let (device, flow) = crate::clients::oauth::kimi_device::start_device_flow(&http_client, now)
+        .await
+        .map_err(map_kimi_device_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    state
+        .insert_kimi_device_flow(device.device_code.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::KimiCode,
+            device.device_code.clone(),
+            principal.oauth_binding_id(),
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(StartKimiDeviceLoginResponse { ok: true, device }))
+}
+
+pub(in crate::api) async fn poll_kimi_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollKimiDeviceLoginRequest>,
+) -> Result<Json<PollKimiDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let principal_id = principal.oauth_binding_id();
+    require_device_flow_owner(
+        &state,
+        ProviderType::KimiCode,
+        &input.device_code,
+        &principal_id,
+        now,
+        "Kimi",
+    )
+    .await?;
+    let lease = state
+        .begin_kimi_device_poll(&input.device_code, now)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("Kimi device flow is expired or unknown"))?;
+    let result = match lease {
+        crate::clients::oauth::kimi_device::KimiDevicePollLease::Ready(flow) => {
+            let http_client = state.http_client().await;
+            match crate::clients::oauth::kimi_device::poll_device_flow(
+                &http_client,
+                &input.device_code,
+                &flow,
+                now,
+            )
+            .await
+            {
+                Ok(mut result) => {
+                    if let Some(account_input) = result.account_input.as_mut() {
+                        if let Err(error) =
+                            verify_and_mark_managed_account_input(&state, account_input, true).await
+                        {
+                            let managed_auth_operation = state.lock_managed_auth_operations().await;
+                            state
+                                .fail_kimi_device_poll(&input.device_code, true, now)
+                                .await;
+                            state
+                                .remove_device_flow_for_principal_under_managed_auth_guard(
+                                    &managed_auth_operation,
+                                    ProviderType::KimiCode,
+                                    &input.device_code,
+                                    &principal_id,
+                                    now,
+                                )
+                                .await;
+                            drop(managed_auth_operation);
+                            return Err(error);
+                        }
+                    }
+                    let completed_at = now_ms() as i64;
+                    if !state
+                        .finish_kimi_device_poll(&input.device_code, result.clone(), completed_at)
+                        .await
+                    {
+                        return Err(ApiError::unauthorized(
+                            "Kimi device flow was cancelled while polling",
+                        ));
+                    }
+                    result
+                }
+                Err(error) => {
+                    let completed_at = now_ms() as i64;
+                    let terminal = matches!(
+                        error.status,
+                        StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+                    );
+                    if terminal {
+                        let managed_auth_operation = state.lock_managed_auth_operations().await;
+                        state
+                            .fail_kimi_device_poll(&input.device_code, true, completed_at)
+                            .await;
+                        state
+                            .remove_device_flow_for_principal_under_managed_auth_guard(
+                                &managed_auth_operation,
+                                ProviderType::KimiCode,
+                                &input.device_code,
+                                &principal_id,
+                                completed_at,
+                            )
+                            .await;
+                        drop(managed_auth_operation);
+                    } else {
+                        state
+                            .fail_kimi_device_poll(&input.device_code, false, completed_at)
+                            .await;
+                    }
+                    return Err(map_kimi_device_error(error));
+                }
+            }
+        }
+        crate::clients::oauth::kimi_device::KimiDevicePollLease::InProgress => {
+            return Ok(Json(PollKimiDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_in_progress".to_string(),
+                retry_after_secs: Some(1),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::kimi_device::KimiDevicePollLease::Wait(retry_after_secs) => {
+            return Ok(Json(PollKimiDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_interval_not_elapsed".to_string(),
+                retry_after_secs: Some(retry_after_secs.max(1)),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::kimi_device::KimiDevicePollLease::Completed(result) => *result,
+    };
+    if result.pending {
+        return Ok(Json(PollKimiDeviceLoginResponse {
+            ok: true,
+            pending: true,
+            message: result.message,
+            retry_after_secs: result.retry_after_secs,
+            account: None,
+        }));
+    }
+    let account_input = result
+        .account_input
+        .clone()
+        .ok_or_else(|| ApiError::bad_gateway("Kimi device flow completed without account"))?;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::KimiCode,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
+    Ok(Json(PollKimiDeviceLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
+pub(in crate::api) async fn cancel_kimi_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelKimiDeviceLoginRequest>,
+) -> Result<Json<CancelKimiDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let now = now_ms() as i64;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancelled = state
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
+            ProviderType::KimiCode,
+            &input.device_code,
+            &principal.oauth_binding_id(),
+            now,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(CancelKimiDeviceLoginResponse {
+        ok: true,
+        cancelled,
+    }))
+}
+
 pub(in crate::api) async fn execute_account_login_token_exchange(
     state: &ServerState,
     finish: &mut OAuthLoginFinish,
@@ -1846,6 +2043,53 @@ async fn verify_and_mark_managed_account_input(
             .await
             .map_err(ApiError::bad_request)?;
             apply_verified_grok_identity(input, verified);
+        }
+        ProviderType::KimiCode => {
+            let access_token = input
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let refresh_token = input
+                .refresh_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if access_token.is_none() && refresh_token.is_none() {
+                return Err(ApiError::bad_request(
+                    "Kimi OAuth access_token or refresh_token is required",
+                ));
+            }
+            let token_user_id = access_token.and_then(crate::domain::kimi_cli::extract_user_id);
+            let profile_user_id =
+                crate::domain::kimi_cli::user_id_from_profile(input.profile.as_ref());
+            if token_user_id
+                .as_deref()
+                .zip(profile_user_id.as_deref())
+                .is_some_and(|(token, profile)| token != profile)
+            {
+                return Err(ApiError::bad_request(
+                    "Kimi access token userId does not match the imported profile",
+                ));
+            }
+            let user_id = token_user_id.or(profile_user_id);
+            let identity_seed = user_id
+                .as_deref()
+                .or(access_token)
+                .or(refresh_token)
+                .expect("Kimi credential presence was checked");
+            let account_id = crate::domain::kimi_cli::account_record_id(identity_seed);
+            let device =
+                crate::domain::kimi_cli::device_identity_from_profile(input.profile.as_ref())
+                    .unwrap_or_else(|| {
+                        crate::domain::kimi_cli::KimiDeviceIdentity::stable_for_account(&account_id)
+                    });
+            crate::domain::kimi_cli::enrich_profile(
+                &mut input.profile,
+                user_id.as_deref(),
+                &device,
+            );
+            input.id = Some(account_id);
         }
         ProviderType::CursorApiKey => {
             let api_key = input
@@ -2127,64 +2371,29 @@ pub(in crate::api) async fn refresh_account(
     Path(id): Path<String>,
 ) -> Result<Json<UpsertAccountResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let mut existing = state
+    let existing = state
         .find_account_by_id(&id)
         .await
         .ok_or_else(|| ApiError::not_found("account not found"))?;
 
     if provider_native_refresh_available(existing.provider_type) {
         ensure_managed_account_outbound_allowed(&state, &existing).await?;
-        let now = now_ms() as i64;
-        let mut refresh_guard = state
-            .account_refresh_locks
-            .try_lock(existing.provider_type, &existing.id)
-            .ok_or_else(|| ApiError::conflict("account refresh is already in progress"))?;
-        existing = state
-            .find_account_by_id(&id)
-            .await
-            .filter(|account| account.provider_type == existing.provider_type)
-            .ok_or_else(|| ApiError::not_found("account not found"))?;
-        ensure_managed_account_outbound_allowed(&state, &existing).await?;
-        let http_client = state.http_client().await;
-        let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-        let update = match state
-            .execute_native_account_refresh_with_recovery(
-                &http_client,
-                &existing,
-                now,
-                interval_ms,
-                &mut refresh_guard,
+        state
+            .refresh_active_account_now_for_generation(
+                existing.provider_type,
+                &existing.id,
+                existing.auth_identity_generation,
             )
             .await
-        {
-            Ok(update) => update,
-            Err(error) => {
-                let updated = state
-                    .commit_native_refresh_failure(
-                        &existing,
-                        error.message.clone(),
-                        error.kind,
-                        error.immediate_relogin,
-                    )
-                    .await
-                    .map_err(map_account_write_error)?;
-                if let Some(updated) = updated {
-                    state
-                        .refresh_account_runtime_metadata_if_changed(&existing, &updated)
-                        .await
-                        .map_err(ApiError::internal)?;
-                }
-                return Err(account_refresh_api_error(error));
-            }
-        };
+            .map_err(map_account_managed_refresh_error)?;
         let account = state
-            .commit_native_refresh_success(&existing, update)
+            .find_account_by_id(&id)
             .await
-            .map_err(map_native_refresh_commit_api_error)?;
-        state
-            .refresh_account_runtime_metadata_if_changed(&existing, &account)
-            .await
-            .map_err(ApiError::internal)?;
+            .filter(|account| {
+                account.provider_type == existing.provider_type
+                    && account.auth_identity_generation == existing.auth_identity_generation
+            })
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
         return Ok(Json(UpsertAccountResponse {
             ok: true,
             account: account.into(),
@@ -2217,21 +2426,51 @@ pub(in crate::api) fn account_refresh_api_error(error: AccountRefreshFailure) ->
     .with_retry_after_ms(error.retry_after_ms)
 }
 
-fn map_native_refresh_commit_api_error(error: crate::state::NativeRefreshCommitError) -> ApiError {
-    if error.is_superseded() {
-        return ApiError::conflict_code(
+fn map_account_managed_refresh_error(error: crate::state::ManagedAccountRefreshError) -> ApiError {
+    use crate::state::ManagedAccountRefreshError;
+
+    match error {
+        ManagedAccountRefreshError::Conflict { provider_type } => ApiError::conflict(format!(
+            "{} account refresh is already in progress",
+            provider_type.as_str()
+        )),
+        ManagedAccountRefreshError::InactiveCodexAccount => ApiError::conflict_code(
+            "cc_switch_codex_inactive_account",
+            "Codex OAuth account is no longer active",
+        ),
+        ManagedAccountRefreshError::IdentityChanged { .. } => ApiError::conflict_code(
             "cc_switch_account_credentials_changed",
             "account credentials changed while OAuth refresh was in progress; retry",
-        );
-    }
-    if error.is_persistence_degraded() {
-        tracing::error!(%error, "OAuth refresh persistence degraded");
-        return ApiError::new(
+        ),
+        ManagedAccountRefreshError::NotFound => ApiError::not_found("account not found"),
+        ManagedAccountRefreshError::CredentialPersistenceDegraded => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "rotated OAuth credentials are live but durable persistence is degraded",
-        );
+            "managed account credentials are waiting for durable persistence",
+        ),
+        ManagedAccountRefreshError::Refresh {
+            status_code,
+            message,
+            retry_after_ms,
+        } => {
+            let public_message = if status_code == StatusCode::SERVICE_UNAVAILABLE.as_u16()
+                && message == "rotated credentials are live but durable persistence is degraded"
+            {
+                message
+            } else {
+                match status_code {
+                    400 | 401 | 403 => "OAuth credentials were rejected; sign in again",
+                    429 => "OAuth refresh was rate limited; retry later",
+                    _ => "OAuth token refresh failed",
+                }
+                .to_string()
+            };
+            ApiError::new(
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+                public_message,
+            )
+            .with_retry_after_ms(retry_after_ms)
+        }
     }
-    ApiError::internal(error)
 }
 
 pub(in crate::api) async fn account_refresh_plan(
@@ -2331,6 +2570,16 @@ pub(in crate::api) async fn account_quota(
     }
 
     let force = query.force.unwrap_or(false);
+    let now = now_ms() as i64;
+    ensure_managed_account_outbound_allowed(&state, &existing).await?;
+    state
+        .refresh_active_account_if_needed_for_generation(
+            existing.provider_type,
+            &existing.id,
+            existing.auth_identity_generation,
+        )
+        .await
+        .map_err(map_account_managed_refresh_error)?;
     let mut waited_for_in_flight = false;
     let mut quota_refresh_guard = match state
         .account_refresh_locks
@@ -2358,7 +2607,7 @@ pub(in crate::api) async fn account_quota(
         .await
         .ok_or_else(|| ApiError::not_found("account not found"))?;
     ensure_quota_refresh_lock_matches_account(existing.provider_type, &active_account)?;
-    let mut native_refresh_attempted = active_account.auth_identity_generation
+    let native_refresh_attempted = active_account.auth_identity_generation
         != existing.auth_identity_generation
         || active_account.token_refresh_generation != existing.token_refresh_generation;
     if let Some(failure) = quota_refresh_guard.coalesced_quota_failure_for(&active_account) {
@@ -2382,7 +2631,6 @@ pub(in crate::api) async fn account_quota(
             next_refresh_at: active_account.quota_next_refresh_at,
         }));
     }
-    let now = now_ms() as i64;
     if !force {
         if let Some(next_refresh_at) = active_account.quota_next_refresh_at {
             if next_refresh_at > now {
@@ -2403,99 +2651,6 @@ pub(in crate::api) async fn account_quota(
 
     let account_before_refresh = active_account.clone();
     let interval_ms = state.oauth_quota_refresh_interval_ms().await;
-    if account_needs_native_refresh(&active_account, now) {
-        let http_client = state.http_client().await;
-        let update = match state
-            .execute_native_account_refresh_with_recovery(
-                &http_client,
-                &active_account,
-                now,
-                interval_ms,
-                &mut quota_refresh_guard,
-            )
-            .await
-        {
-            Ok(update) => update,
-            Err(error) => {
-                let updated = state
-                    .commit_native_refresh_failure(
-                        &active_account,
-                        error.message.clone(),
-                        error.kind,
-                        error.immediate_relogin,
-                    )
-                    .await
-                    .map_err(map_account_write_error)?;
-                if let Some(updated) = updated {
-                    state
-                        .refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await
-                        .map_err(ApiError::internal)?;
-                }
-                return Err(account_refresh_api_error(error));
-            }
-        };
-        active_account = match state
-            .commit_native_refresh_success(&active_account, update)
-            .await
-        {
-            Ok(account) => {
-                native_refresh_attempted = true;
-                account
-            }
-            Err(error) => {
-                if error.is_superseded() {
-                    return Err(map_native_refresh_commit_api_error(error));
-                }
-                let persistence_degraded = error.is_persistence_degraded();
-                let (status_code, public_message, retryable) = if persistence_degraded {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "rotated credentials are live but durable persistence is degraded",
-                        true,
-                    )
-                } else {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "managed OAuth credential state commit failed",
-                        false,
-                    )
-                };
-                let failure_account = if persistence_degraded {
-                    state
-                        .find_account_by_id(&active_account.id)
-                        .await
-                        .unwrap_or_else(|| active_account.clone())
-                } else {
-                    active_account.clone()
-                };
-                quota_refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
-                    &failure_account,
-                    AccountRefreshFlightStage::NativeRefresh,
-                    AccountRefreshFlightFailureDetails {
-                        status_code: status_code.as_u16(),
-                        upstream_status: None,
-                        message: error.to_string(),
-                        public_message: Some(public_message.to_string()),
-                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
-                        retryable,
-                        retry_after_ms: None,
-                        immediate_relogin: false,
-                    },
-                ));
-                if persistence_degraded {
-                    tracing::error!(account_id = %id, %error, "quota OAuth refresh persistence degraded");
-                    return Err(ApiError::new(status_code, public_message));
-                }
-                tracing::error!(account_id = %id, %error, "quota OAuth credential state commit failed");
-                return Err(ApiError::new(status_code, public_message));
-            }
-        };
-    }
-
     ensure_managed_account_outbound_allowed(&state, &active_account).await?;
     let http_client = state.http_client().await;
     let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
@@ -2512,56 +2667,43 @@ pub(in crate::api) async fn account_quota(
         && quota_result
             .as_ref()
             .is_err_and(|error| error.upstream_status == Some(StatusCode::UNAUTHORIZED.as_u16()))
+        && !active_account.needs_relogin
+        && provider_native_refresh_available(active_account.provider_type)
+        && active_account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
     {
-        match state
-            .recover_quota_unauthorized(
-                &http_client,
-                &active_account,
-                now,
-                interval_ms,
-                &mut quota_refresh_guard,
+        let recovery_auth_identity_generation = active_account.auth_identity_generation;
+        quota_refresh_guard.release();
+        state
+            .refresh_active_account_now_for_generation(
+                active_account.provider_type,
+                &active_account.id,
+                recovery_auth_identity_generation,
             )
             .await
-        {
-            Ok(refreshed) => {
-                active_account = refreshed;
-                ensure_managed_account_outbound_allowed(&state, &active_account).await?;
-                quota_result = refresh_account_quota(
-                    &http_client,
-                    &active_account,
-                    now,
-                    true,
-                    interval_ms,
-                    timeout_ms,
-                )
-                .await;
-            }
-            Err(crate::state::QuotaUnauthorizedRecoveryError::Unavailable) => {}
-            Err(crate::state::QuotaUnauthorizedRecoveryError::Refresh { failure, updated }) => {
-                if let Some(updated) = updated {
-                    state
-                        .refresh_account_runtime_metadata_if_changed(
-                            &account_before_refresh,
-                            &updated,
-                        )
-                        .await
-                        .map_err(ApiError::internal)?;
-                }
-                return Err(account_refresh_api_error(failure));
-            }
-            Err(crate::state::QuotaUnauthorizedRecoveryError::Commit(error)) => {
-                return Err(map_native_refresh_commit_api_error(error));
-            }
-            Err(crate::state::QuotaUnauthorizedRecoveryError::State(error)) => {
-                if state.credential_persistence_degraded() {
-                    return Err(ApiError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "managed account credentials are waiting for durable persistence",
-                    ));
-                }
-                return Err(ApiError::internal(error));
-            }
-        }
+            .map_err(map_account_managed_refresh_error)?;
+        quota_refresh_guard = state
+            .account_refresh_locks
+            .lock(existing.provider_type, &existing.id)
+            .await;
+        active_account = state
+            .find_account_by_id(&id)
+            .await
+            .filter(|account| account.auth_identity_generation == recovery_auth_identity_generation)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        ensure_quota_refresh_lock_matches_account(existing.provider_type, &active_account)?;
+        ensure_managed_account_outbound_allowed(&state, &active_account).await?;
+        quota_result = refresh_account_quota(
+            &http_client,
+            &active_account,
+            now,
+            true,
+            interval_ms,
+            timeout_ms,
+        )
+        .await;
     }
     match quota_result {
         Ok(QuotaRefreshResult::Updated { update, message }) => {
@@ -2830,6 +2972,7 @@ mod tests {
             retryable: false,
             retry_after_ms: None,
             immediate_relogin: false,
+            outcome_unknown: false,
             endpoint_fallback_safe: false,
         });
 

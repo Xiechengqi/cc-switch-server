@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, UpsertAccountInput};
 use crate::domain::providers::model::ProviderType;
 
-pub(crate) const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = crate::domain::providers::kiro::DEFAULT_REGION;
 pub(crate) const DEFAULT_START_URL: &str = "https://view.awsapps.com/start";
 pub(crate) const KIRO_CLIENT_NAME: &str = "kiro-oauth-client";
 pub(crate) const KIRO_CLIENT_TYPE: &str = "public";
@@ -548,6 +548,7 @@ pub(crate) async fn register_client_with_issuer(
     region: &str,
     issuer_url: &str,
 ) -> Result<RegisterClientResponse, KiroDeviceError> {
+    let region = normalize_region(region)?;
     let response = http
         .post(format!(
             "https://oidc.{region}.amazonaws.com/client/register"
@@ -813,6 +814,7 @@ pub(crate) async fn fetch_usage_limits(
     access_token: &str,
     token_type: Option<&str>,
 ) -> Result<Value, KiroDeviceError> {
+    let region = normalize_region(region)?;
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/macos lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-2.3.0-{machine_id}"
     );
@@ -1063,16 +1065,8 @@ pub fn machine_id_from_refresh_token(refresh_token: &str) -> String {
 }
 
 pub fn normalize_region(raw: &str) -> Result<String, KiroDeviceError> {
-    let region = raw.trim();
-    if region.is_empty()
-        || region.len() > 64
-        || !region
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-    {
-        return Err(KiroDeviceError::bad_request("invalid Kiro region"));
-    }
-    Ok(region.to_ascii_lowercase())
+    crate::domain::providers::kiro::normalize_region(raw)
+        .ok_or_else(|| KiroDeviceError::bad_request("invalid Kiro region"))
 }
 
 fn normalize_start_url(raw: &str) -> Result<String, KiroDeviceError> {
@@ -1326,6 +1320,29 @@ mod tests {
     fn kiro_region_validation_is_conservative() {
         assert_eq!(normalize_region("US-EAST-1").unwrap(), "us-east-1");
         assert!(normalize_region("../us-east-1").is_err());
+    }
+
+    #[tokio::test]
+    async fn network_helpers_reject_unsafe_region_before_building_hosts() {
+        let http = reqwest::Client::new();
+        let invalid = "us-east-1.attacker.invalid";
+
+        let register_error = register_client_with_issuer(&http, invalid, KIRO_ISSUER_URL)
+            .await
+            .unwrap_err();
+        assert_eq!(register_error.status, StatusCode::BAD_REQUEST);
+
+        let usage_error = fetch_usage_limits(
+            &http,
+            invalid,
+            BUILDER_ID_PROFILE_ARN,
+            "machine",
+            "access",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(usage_error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

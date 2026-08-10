@@ -28,6 +28,9 @@ export type SubscriptionExpiresKind =
 export interface SubscriptionInfo {
   planType?: string | null;
   planLabel?: string | null;
+  planSource?: string | null;
+  planStale?: boolean | null;
+  planObservedAt?: number | null;
   expiresAt?: string | null;
   expiresSource?: string | null;
   expiresKind?: SubscriptionExpiresKind | null;

@@ -823,6 +823,9 @@ pub fn openai_chat_response_to_anthropic(input: &Value) -> Result<Value, Transfo
 
 pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, TransformError> {
     let mut content = Vec::new();
+    let mut web_search_requests = 0_u64;
+    let mut x_search_requests = 0_u64;
+    let mut saw_client_tool = false;
     if let Some(output) = input.get("output").and_then(Value::as_array) {
         for item in output {
             match item.get("type").and_then(Value::as_str) {
@@ -832,8 +835,17 @@ pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, Tr
                             .extend(items.iter().filter_map(openai_response_output_to_anthropic));
                     }
                 }
+                Some("web_search_call") => {
+                    content.extend(openai_hosted_search_to_anthropic(item, "web_search"));
+                    web_search_requests = web_search_requests.saturating_add(1);
+                }
+                Some("custom_tool_call") if openai_hosted_x_search(item) => {
+                    content.extend(openai_hosted_search_to_anthropic(item, "x_search"));
+                    x_search_requests = x_search_requests.saturating_add(1);
+                }
                 Some("function_call") | Some("custom_tool_call") | Some("tool_search_call") => {
-                    content.push(openai_function_call_to_anthropic(item))
+                    saw_client_tool = true;
+                    content.push(openai_function_call_to_anthropic(item));
                 }
                 Some("reasoning") => {
                     if let Some(block) = anthropic_block_from_responses_reasoning_item(item)
@@ -851,15 +863,23 @@ pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, Tr
             content.push(json!({"type": "text", "text": text}));
         }
     }
+    let mut usage = anthropic_usage_from_openai_usage(input.get("usage"));
+    let hosted_search_requests = web_search_requests.saturating_add(x_search_requests);
+    if hosted_search_requests > 0 {
+        usage["server_tool_use"] = json!({
+            "web_search_requests": hosted_search_requests,
+            "x_search_requests": x_search_requests
+        });
+    }
     Ok(json!({
         "id": input.get("id").and_then(Value::as_str).unwrap_or("resp"),
         "type": "message",
         "role": "assistant",
         "model": input.get("model").and_then(Value::as_str).unwrap_or_default(),
         "content": content,
-        "stop_reason": openai_response_to_anthropic_stop(input),
+        "stop_reason": openai_response_to_anthropic_stop_with_tools(input, saw_client_tool),
         "stop_sequence": Value::Null,
-        "usage": anthropic_usage_from_openai_usage(input.get("usage"))
+        "usage": usage
     }))
 }
 
@@ -4487,16 +4507,97 @@ fn openai_chat_response_content_to_anthropic(content: Option<&Value>) -> Vec<Val
 
 fn openai_response_output_to_anthropic(item: &Value) -> Option<Value> {
     match item.get("type").and_then(Value::as_str) {
-        Some("output_text") | Some("text") => Some(json!({
-            "type": "text",
-            "text": item.get("text").and_then(Value::as_str).unwrap_or_default()
-        })),
+        Some("output_text") | Some("text") => {
+            let mut block = json!({
+                "type": "text",
+                "text": item.get("text").and_then(Value::as_str).unwrap_or_default()
+            });
+            let citations = item
+                .get("annotations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|annotation| {
+                    annotation.get("type").and_then(Value::as_str) == Some("url_citation")
+                })
+                .map(openai_hosted_search_citation)
+                .collect::<Vec<_>>();
+            if !citations.is_empty() {
+                block["citations"] = Value::Array(citations);
+            }
+            Some(block)
+        }
         Some("refusal") => Some(json!({
             "type": "text",
             "text": item.get("refusal").or_else(|| item.get("text")).and_then(Value::as_str).unwrap_or_default()
         })),
         _ => None,
     }
+}
+
+fn openai_hosted_x_search(item: &Value) -> bool {
+    item.get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == "x_search" || name.starts_with("x_"))
+}
+
+fn openai_hosted_search_to_anthropic(item: &Value, name: &str) -> Vec<Value> {
+    let raw_id = item
+        .get("id")
+        .or_else(|| item.get("call_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("search");
+    let tool_use_id = if raw_id.starts_with("srvtoolu_") {
+        raw_id.to_string()
+    } else {
+        format!("srvtoolu_{raw_id}")
+    };
+    let query = if name == "web_search" {
+        item.pointer("/action/query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        openai_hosted_search_query(item.get("input").cloned().unwrap_or(Value::Null))
+    };
+    vec![
+        json!({
+            "type": "server_tool_use",
+            "id": tool_use_id,
+            "name": name,
+            "input": {"query": query}
+        }),
+        json!({
+            "type": format!("{name}_tool_result"),
+            "tool_use_id": tool_use_id,
+            "content": []
+        }),
+    ]
+}
+
+fn openai_hosted_search_query(input: Value) -> String {
+    let input = match input {
+        Value::String(value) => {
+            serde_json::from_str::<Value>(&value).unwrap_or_else(|_| Value::String(value))
+        }
+        value => value,
+    };
+    input
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| input.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn openai_hosted_search_citation(annotation: &Value) -> Value {
+    json!({
+        "type": "web_search_result_location",
+        "url": annotation.get("url").and_then(Value::as_str).unwrap_or_default(),
+        "title": annotation.get("title").and_then(Value::as_str).unwrap_or_default(),
+        "cited_text": annotation.get("text").and_then(Value::as_str).unwrap_or_default()
+    })
 }
 
 fn image_url_to_anthropic(url: Option<&Value>) -> Value {
@@ -7827,6 +7928,56 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn response_snapshots_preserve_grok_hosted_search_and_citations() {
+        let output = openai_responses_response_to_anthropic(&json!({
+            "id": "resp_search",
+            "status": "completed",
+            "model": "grok-4.5",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {"query": "rust news"}
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "xs_1",
+                    "name": "x_search",
+                    "input": "{\"query\":\"release notes\"}"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Result",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.com",
+                            "title": "Example",
+                            "text": "cited"
+                        }]
+                    }]
+                }
+            ],
+            "usage": {"input_tokens": 4, "output_tokens": 3}
+        }))
+        .unwrap();
+
+        assert_eq!(output["content"][0]["type"], "server_tool_use");
+        assert_eq!(output["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(output["content"][2]["name"], "x_search");
+        assert_eq!(output["content"][3]["type"], "x_search_tool_result");
+        assert_eq!(
+            output["content"][4]["citations"][0]["url"],
+            "https://example.com"
+        );
+        assert_eq!(output["stop_reason"], "end_turn");
+        assert_eq!(output["usage"]["server_tool_use"]["web_search_requests"], 2);
+        assert_eq!(output["usage"]["server_tool_use"]["x_search_requests"], 1);
     }
 
     #[test]

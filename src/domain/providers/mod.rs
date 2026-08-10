@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod credentials;
+pub(crate) mod kiro;
 pub mod matrix;
 pub mod migrate;
 pub mod model;
