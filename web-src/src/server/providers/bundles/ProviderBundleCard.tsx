@@ -48,7 +48,7 @@ import {
   canTestModelProvider,
   getProviderQuotaSource,
 } from "@/utils/providerMetaUtils";
-import { getProviderCardShareDisplayStatus } from "@/utils/shareUtils";
+import { getProviderSharePhase } from "@/utils/shareUtils";
 import {
   providerBundleDisplayTarget,
   providerBundlePrimaryResource,
@@ -163,7 +163,8 @@ interface ProviderBundleCardProps {
   onDuplicate: () => void;
   sharePending?: boolean;
   shareActionDisabled?: boolean;
-  onEnableShare: () => void;
+  onToggleShare: () => void;
+  onDeleteShare: () => void;
   onDelete: () => void;
   dragHandleProps?: {
     attributes: DraggableAttributes;
@@ -180,7 +181,8 @@ export function ProviderBundleCard({
   onDuplicate,
   sharePending = false,
   shareActionDisabled = false,
-  onEnableShare,
+  onToggleShare,
+  onDeleteShare,
   onDelete,
   dragHandleProps,
 }: ProviderBundleCardProps) {
@@ -218,14 +220,12 @@ export function ProviderBundleCard({
         t("providerBundle.apiUrlUnavailable", {
           defaultValue: "API 地址未配置",
         }));
-  const shareDisplayStatus = share
-    ? getProviderCardShareDisplayStatus(share)
-    : "not_created";
-  const isSharing = shareDisplayStatus === "sharing";
+  const sharePhase = getProviderSharePhase(share);
+  const isSharing = sharePhase === "sharing";
   const shareButtonLabel =
-    shareDisplayStatus === "sharing"
+    sharePhase === "sharing"
       ? t("provider.share.sharing", { defaultValue: "分享中" })
-      : shareDisplayStatus === "closed"
+      : sharePhase === "stopped"
         ? t("provider.share.resumeShort", { defaultValue: "开启分享" })
         : t("provider.share.enable", { defaultValue: "分享" });
   const connectivityId = connectivityResource?.provider.id ?? bundle.id;
@@ -389,29 +389,78 @@ export function ProviderBundleCard({
           </div>
 
           <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
-            <Button
-              type="button"
-              size="sm"
-              variant={share ? "secondary" : "default"}
-              className={cn(
-                "w-[4.5rem] px-2.5",
-                share
-                  ? "bg-violet-100 text-violet-600 hover:bg-violet-200 dark:bg-violet-900/50 dark:text-violet-400 dark:hover:bg-violet-900/70"
-                  : "bg-violet-500 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700",
-              )}
-              title={t("provider.share.sectionTitle", {
-                defaultValue: "远程分享",
-              })}
-              disabled={isSharing || sharePending || shareActionDisabled}
-              onClick={onEnableShare}
-            >
-              {sharePending ? (
-                <LoaderCircle className="h-4 w-4 animate-spin" />
-              ) : (
-                <Share2 className="h-4 w-4" />
-              )}
-              {shareButtonLabel}
-            </Button>
+            {sharePhase === "stopped" ? (
+              <>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="default"
+                  className="min-w-[4.5rem] bg-violet-500 px-2.5 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700"
+                  title={t("provider.share.resume", {
+                    defaultValue: "重新开启分享",
+                  })}
+                  disabled={sharePending || shareActionDisabled}
+                  onClick={onToggleShare}
+                >
+                  {sharePending ? (
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Share2 className="h-4 w-4" />
+                  )}
+                  {shareButtonLabel}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="min-w-[4.5rem] px-2.5 text-destructive hover:text-destructive"
+                  title={t("provider.share.delete", {
+                    defaultValue: "删除分享",
+                  })}
+                  disabled={sharePending || shareActionDisabled}
+                  onClick={onDeleteShare}
+                >
+                  {sharePending ? (
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  {t("provider.share.deleteShort", {
+                    defaultValue: "删除分享",
+                  })}
+                </Button>
+              </>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                variant={isSharing ? "secondary" : "default"}
+                className={cn(
+                  "min-w-[4.5rem] px-2.5",
+                  isSharing
+                    ? "bg-violet-100 text-violet-600 hover:bg-violet-200 dark:bg-violet-900/50 dark:text-violet-400 dark:hover:bg-violet-900/70"
+                    : "bg-violet-500 hover:bg-violet-600 dark:bg-violet-600 dark:hover:bg-violet-700",
+                )}
+                title={
+                  isSharing
+                    ? t("provider.share.stop", {
+                        defaultValue: "点击停止分享",
+                      })
+                    : t("provider.share.sectionTitle", {
+                        defaultValue: "远程分享",
+                      })
+                }
+                disabled={sharePending || shareActionDisabled}
+                onClick={onToggleShare}
+              >
+                {sharePending ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Share2 className="h-4 w-4" />
+                )}
+                {shareButtonLabel}
+              </Button>
+            )}
 
             <div className="flex items-center gap-1">
               <Button

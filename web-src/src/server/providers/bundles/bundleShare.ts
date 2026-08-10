@@ -10,6 +10,7 @@ import {
   normalizeShareEmails,
 } from "@/utils/shareFormUtils";
 import {
+  getProviderSharePhase,
   PERMANENT_EXPIRES_AT,
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
@@ -130,8 +131,7 @@ export function createBundleShareDraft(
     bankedResetExpiryLeadMinutes: String(
       share?.bankedResetExpiryLeadMinutes ?? 60,
     ),
-    previousResponseCacheEnabled:
-      share?.previousResponseCacheEnabled ?? false,
+    previousResponseCacheEnabled: share?.previousResponseCacheEnabled ?? false,
   };
 }
 
@@ -183,7 +183,9 @@ export async function saveBundleShare(
     bankedResetExpiryLeadMinutes < 10 ||
     bankedResetExpiryLeadMinutes > 7 * 24 * 60
   ) {
-    throw new Error("Banked Reset lead time must be between 10 and 10080 minutes");
+    throw new Error(
+      "Banked Reset lead time must be between 10 and 10080 minutes",
+    );
   }
   return shareApi.saveProviderBundleShare({
     bundleId,
@@ -217,4 +219,21 @@ export async function enableBundleShare(
     draft.subdomain = suggestion.subdomain;
   }
   return saveBundleShare(bundleId, draft, existing);
+}
+
+export async function toggleBundleShare(
+  bundleId: string,
+  existing?: ShareRecord,
+): Promise<"enabled" | "disabled"> {
+  if (existing && getProviderSharePhase(existing) === "sharing") {
+    await shareApi.disable(existing.id);
+    return "disabled";
+  }
+
+  await enableBundleShare(bundleId, existing);
+  return "enabled";
+}
+
+export async function deleteBundleShare(share: ShareRecord): Promise<void> {
+  await shareApi.delete(share.id);
 }

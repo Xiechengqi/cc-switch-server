@@ -128,6 +128,12 @@
       "blocked": "{{count}} 件の Provider で ID または認証情報の分類が未完了のため、S2 への切り替えは保留されています。"
     },
     "share": {
+      "enable": "共有",
+      "sharing": "共有中",
+      "stop": "クリックして共有を停止",
+      "resume": "共有を再開",
+      "resumeShort": "共有を開始",
+      "delete": "Share を削除",
       "ownerNotConfigured": "先に Client Owner を設定してください",
       "ownerManagedHint": "Share Owner は常に Client Owner と一致します。「設定 → 共有」からインストール署名による Owner 変更で更新できます。",
       "reuseTitle": "同じアカウントまたは API キーの共有が見つかりました",

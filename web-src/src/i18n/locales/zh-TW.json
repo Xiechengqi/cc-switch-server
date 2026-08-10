@@ -126,6 +126,12 @@
       "blocked": "有 {{count}} 個 Provider 尚未完成身分或憑據分類，因此已阻止切換至 S2。"
     },
     "share": {
+      "enable": "分享",
+      "sharing": "分享中",
+      "stop": "點擊停止分享",
+      "resume": "重新開啟分享",
+      "resumeShort": "開啟分享",
+      "delete": "刪除 Share",
       "ownerNotConfigured": "請先設定 Client Owner",
       "ownerManagedHint": "Share Owner 與 Client Owner 保持一致。可在「設定 → 分享」透過安裝簽名的 Owner 換綁進行修改。",
       "reuseTitle": "發現同一帳號或 API key 的遠端分享",

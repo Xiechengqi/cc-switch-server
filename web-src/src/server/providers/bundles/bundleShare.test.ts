@@ -4,6 +4,8 @@ import type { ShareRecord } from "@/lib/api/share";
 import { PERMANENT_EXPIRES_AT } from "@/utils/shareUtils";
 
 const shareApiMock = vi.hoisted(() => ({
+  delete: vi.fn(),
+  disable: vi.fn(),
   saveProviderBundleShare: vi.fn(),
   suggestShareSlug: vi.fn(),
 }));
@@ -16,10 +18,12 @@ vi.mock("@/lib/api/share", async (importOriginal) => {
 import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
+  deleteBundleShare,
   enableBundleShare,
   isValidShareSlug,
   saveBundleShare,
   shareForBundle,
+  toggleBundleShare,
 } from "./bundleShare";
 
 function share(
@@ -191,6 +195,57 @@ describe("Provider Bundle sharing", () => {
         subdomain: "bundle-share",
       }),
     );
+  });
+
+  it("stops a running Bundle Share through the existing disable command", async () => {
+    const existing = {
+      ...share({ claude: "bundle-1" }, 7),
+      subdomain: "bundle-share",
+      tunnelUrl: "https://bundle-share.example.com",
+    };
+    shareApiMock.disable.mockResolvedValue(undefined);
+
+    const result = await toggleBundleShare("bundle-1", existing);
+
+    expect(result).toBe("disabled");
+    expect(shareApiMock.disable).toHaveBeenCalledWith("share-1");
+    expect(shareApiMock.saveProviderBundleShare).not.toHaveBeenCalled();
+  });
+
+  it("resumes a stopped Bundle Share through the Bundle-scoped command", async () => {
+    const existing = {
+      ...share({ claude: "bundle-1" }, 7),
+      status: "paused",
+      tunnelUrl: null,
+    };
+    shareApiMock.saveProviderBundleShare.mockResolvedValue({
+      ...existing,
+      status: "active",
+    });
+
+    const result = await toggleBundleShare("bundle-1", existing);
+
+    expect(result).toBe("enabled");
+    expect(shareApiMock.disable).not.toHaveBeenCalled();
+    expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bundleId: "bundle-1",
+        shareId: "share-1",
+        enabled: true,
+      }),
+    );
+  });
+
+  it("deletes a stopped Bundle Share through the existing delete command", async () => {
+    const existing = {
+      ...share({ claude: "bundle-1" }),
+      status: "paused",
+    };
+    shareApiMock.delete.mockResolvedValue(undefined);
+
+    await deleteBundleShare(existing);
+
+    expect(shareApiMock.delete).toHaveBeenCalledWith("share-1");
   });
 
   it("persists per-email user limits through the Bundle command", async () => {

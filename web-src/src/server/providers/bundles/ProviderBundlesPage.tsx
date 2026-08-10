@@ -33,13 +33,23 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Button } from "@/components/ui/button";
 import type { ProviderBundleView } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
+import type { ShareRecord } from "@/lib/api/share";
 import {
   shareKeys,
   useManagedAccountsQuery,
   useSharesQuery,
 } from "@/lib/query";
 import { cn } from "@/lib/utils";
-import { enableBundleShare, shareForBundle } from "./bundleShare";
+import {
+  isProviderShareDeleteConfirmSkipped,
+  setProviderShareDeleteConfirmSkipped,
+} from "@/utils/providerShareDeleteConfirm";
+import { getProviderSharePhase } from "@/utils/shareUtils";
+import {
+  deleteBundleShare,
+  shareForBundle,
+  toggleBundleShare,
+} from "./bundleShare";
 import { ProviderBundleCard } from "./ProviderBundleCard";
 import { ProviderBundleEditor } from "./ProviderBundleEditor";
 
@@ -102,6 +112,10 @@ export function ProviderBundlesPage({
   const [sharePendingBundleId, setSharePendingBundleId] = useState<
     string | null
   >(null);
+  const [shareDeleting, setShareDeleting] = useState<{
+    bundle: ProviderBundleView;
+    share: ShareRecord;
+  } | null>(null);
   const bundles = bundlesQuery.data ?? [];
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -169,26 +183,78 @@ export function ProviderBundlesPage({
     [bundles, queryClient, sortPending, t],
   );
 
-  const handleEnableShare = async (bundle: ProviderBundleView) => {
+  const handleToggleShare = async (bundle: ProviderBundleView) => {
     if (sharePendingBundleId) return;
+    const share = sharesByBundle.get(bundle.id);
+    const stopping = getProviderSharePhase(share) === "sharing";
     setSharePendingBundleId(bundle.id);
     try {
-      await enableBundleShare(bundle.id, sharesByBundle.get(bundle.id));
+      const result = await toggleBundleShare(bundle.id, share);
       await queryClient.invalidateQueries({ queryKey: shareKeys.list() });
       toast.success(
-        t("share.toast.enableSuccess", { defaultValue: "分享已开启" }),
+        result === "disabled"
+          ? t("share.toast.disableSuccess", { defaultValue: "分享已关闭" })
+          : t("share.toast.enableSuccess", { defaultValue: "分享已开启" }),
       );
     } catch (error) {
       void queryClient.invalidateQueries({ queryKey: shareKeys.list() });
       toast.error(
-        t("share.toast.enableError", {
-          defaultValue: "开启分享失败：{{error}}",
+        t(stopping ? "share.toast.disableError" : "share.toast.enableError", {
+          defaultValue: stopping
+            ? "关闭分享失败：{{error}}"
+            : "开启分享失败：{{error}}",
           error: error instanceof Error ? error.message : String(error),
         }),
       );
     } finally {
       setSharePendingBundleId(null);
     }
+  };
+
+  const handleDeleteShare = async (
+    bundle: ProviderBundleView,
+    share: ShareRecord,
+  ) => {
+    if (sharePendingBundleId) return;
+    setSharePendingBundleId(bundle.id);
+    try {
+      await deleteBundleShare(share);
+      await queryClient.invalidateQueries({ queryKey: shareKeys.list() });
+      toast.success(
+        t("share.toast.deleteSuccess", { defaultValue: "分享已删除" }),
+      );
+    } catch (error) {
+      void queryClient.invalidateQueries({ queryKey: shareKeys.list() });
+      toast.error(
+        t("share.toast.deleteError", {
+          defaultValue: "删除分享失败：{{error}}",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setSharePendingBundleId(null);
+    }
+  };
+
+  const handleShareDeleteRequest = (
+    bundle: ProviderBundleView,
+    share: ShareRecord,
+  ) => {
+    if (isProviderShareDeleteConfirmSkipped()) {
+      void handleDeleteShare(bundle, share);
+      return;
+    }
+    setShareDeleting({ bundle, share });
+  };
+
+  const confirmShareDelete = (remember: boolean) => {
+    const target = shareDeleting;
+    if (!target) return;
+    if (remember) {
+      setProviderShareDeleteConfirmSkipped(true);
+    }
+    setShareDeleting(null);
+    void handleDeleteShare(target.bundle, target.share);
   };
 
   if (editing) {
@@ -337,7 +403,11 @@ export function ProviderBundlesPage({
                     sharesQuery.isError ||
                     sharePendingBundleId !== null
                   }
-                  onEnableShare={() => void handleEnableShare(bundle)}
+                  onToggleShare={() => void handleToggleShare(bundle)}
+                  onDeleteShare={() => {
+                    const share = sharesByBundle.get(bundle.id);
+                    if (share) handleShareDeleteRequest(bundle, share);
+                  }}
                   onDelete={() => setDeleting(bundle)}
                 />
               ))}
@@ -345,6 +415,24 @@ export function ProviderBundlesPage({
           </SortableContext>
         </DndContext>
       )}
+
+      <ConfirmDialog
+        isOpen={shareDeleting !== null}
+        title={t("provider.share.deleteConfirmTitle", {
+          defaultValue: "删除分享",
+        })}
+        message={t("provider.share.deleteConfirmMessage", {
+          defaultValue: "删除后该分享将从 Share 页移除，且无法恢复。",
+        })}
+        confirmText={t("provider.share.deleteShort", {
+          defaultValue: "删除分享",
+        })}
+        checkboxLabel={t("provider.share.deleteRemember", {
+          defaultValue: "记住选择，之后不再询问",
+        })}
+        onConfirm={confirmShareDelete}
+        onCancel={() => setShareDeleting(null)}
+      />
 
       <ConfirmDialog
         isOpen={deleting !== null}
