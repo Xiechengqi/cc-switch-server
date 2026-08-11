@@ -17,6 +17,7 @@ import {
   modelPoliciesForFamily,
   perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
+  requiresPerAppModelPolicy,
   supportsPerAppModelPolicy,
   toProviderBundleWriteDraft,
   updateBundleModel,
@@ -286,21 +287,45 @@ describe("Provider Bundle drafts", () => {
     );
 
     const openaiFamily = familyById("family.openai_oauth")!;
-    expect(supportsPerAppModelPolicy(openaiFamily)).toBe(false);
+    expect(supportsPerAppModelPolicy(openaiFamily)).toBe(true);
+    expect(requiresPerAppModelPolicy(openaiFamily)).toBe(true);
     const openaiDraft = createProviderBundleDraft(openaiFamily);
-    expect(modelPoliciesForFamily(openaiFamily)).toEqual([
-      "single",
-      "passthrough",
+    expect(openaiDraft.modelPolicyScope).toBe("per_app");
+    expect(openaiDraft.surfaces).toMatchObject([
+      {
+        app: "claude",
+        modelPolicy: "single",
+        upstreamModel: "gpt-5.6-sol",
+      },
+      { app: "codex", modelPolicy: "passthrough" },
     ]);
-    expect(openaiDraft.modelPolicy).toBe("single");
-    expect(openaiDraft.upstreamModel).toBe("gpt-5.6-sol");
     openaiDraft.accountId = "official-account";
     openaiDraft.accountGeneration = 1;
     expect(validateProviderBundleDraft(openaiDraft)).toBeNull();
+    expect(toProviderBundleWriteDraft(openaiDraft)).toMatchObject({
+      modelPolicyScope: "per_app",
+      modelPolicy: undefined,
+      upstreamModel: undefined,
+      surfaces: [
+        {
+          app: "claude",
+          modelPolicy: "single",
+          upstreamModel: "gpt-5.6-sol",
+        },
+        {
+          app: "codex",
+          modelPolicy: undefined,
+          upstreamModel: undefined,
+        },
+      ],
+    });
 
-    openaiDraft.modelPolicy = "passthrough";
-    openaiDraft.upstreamModel = "";
+    openaiDraft.surfaces[0]!.modelPolicy = "passthrough";
+    openaiDraft.surfaces[0]!.upstreamModel = "";
     expect(validateProviderBundleDraft(openaiDraft)).toBeNull();
+    expect(changeModelPolicyScope(openaiDraft, "global").modelPolicyScope).toBe(
+      "per_app",
+    );
   });
 
   it("restores the OpenAI OAuth Bundle model policy from Claude", () => {
@@ -329,7 +354,7 @@ describe("Provider Bundle drafts", () => {
       familyId: family.familyId,
       revision: 3,
       name: "OpenAI OAuth",
-      modelPolicyScope: "global",
+      modelPolicyScope: "per_app",
       supportedApps: ["claude", "codex"],
       enabledApps: ["claude", "codex"],
       credentialConfigured: true,
@@ -346,6 +371,7 @@ describe("Provider Bundle drafts", () => {
     };
 
     const edited = editProviderBundleDraft(bundle);
+    expect(edited.modelPolicyScope).toBe("per_app");
     expect(edited.modelPolicy).toBe("single");
     expect(edited.upstreamModel).toBe("persisted-claude-model");
   });

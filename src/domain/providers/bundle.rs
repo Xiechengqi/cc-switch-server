@@ -389,6 +389,12 @@ impl ProviderBundleWriteDraft {
     fn validate_model_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
         match self.model_policy_scope {
             ModelPolicyScope::Global => {
+                if family_requires_per_app_model_policy(family) {
+                    bail!(
+                        "Provider family {} requires per-app model policies",
+                        family.family_id
+                    );
+                }
                 let policy = self
                     .model_policy
                     .context("global Provider Bundle requires a model policy")?;
@@ -424,9 +430,9 @@ impl ProviderBundleWriteDraft {
                 {
                     bail!("per-app Provider Bundle cannot define a global model policy");
                 }
-                if family_configurable_model_profile_count(family) < 2 {
+                if !family_supports_per_app_model_policy(family) {
                     bail!(
-                        "Provider family {} does not have multiple configurable model Surfaces",
+                        "Provider family {} does not support per-app model policies",
                         family.family_id
                     );
                 }
@@ -619,6 +625,31 @@ fn family_configurable_model_profile_count(family: &ProviderFamilySpec) -> usize
             profile_has_configurable_model_policy(profile)
         })
         .count()
+}
+
+fn profile_model_policy_set(profile: &ProfileSpec) -> BTreeSet<ModelPolicyKind> {
+    if profile.allowed_model_policies.is_empty() {
+        BTreeSet::from([profile.model_policy])
+    } else {
+        profile.allowed_model_policies.iter().copied().collect()
+    }
+}
+
+fn family_requires_per_app_model_policy(family: &ProviderFamilySpec) -> bool {
+    let mut profiles = family.surfaces.iter().map(|surface| {
+        profile_by_id(surface.profile_id.as_str())
+            .expect("Provider family profile is registry-validated")
+    });
+    let Some(first) = profiles.next() else {
+        return false;
+    };
+    let first_policies = profile_model_policy_set(first);
+    profiles.any(|profile| profile_model_policy_set(profile) != first_policies)
+}
+
+fn family_supports_per_app_model_policy(family: &ProviderFamilySpec) -> bool {
+    family_requires_per_app_model_policy(family)
+        || family_configurable_model_profile_count(family) >= 2
 }
 
 fn validate_model_policy_fields(
@@ -1061,6 +1092,9 @@ mod tests {
     }
 
     fn openai_oauth_bundle() -> ProviderBundleWriteDraft {
+        let mut claude = grok_surface(AppKind::Claude, "claude.openai_oauth");
+        claude.model_policy = Some(ModelPolicyKind::Single);
+        claude.upstream_model = Some("gpt-5.6-sol".to_string());
         ProviderBundleWriteDraft {
             id: "openai-oauth-bundle".to_string(),
             family_id: "family.openai_oauth".to_string(),
@@ -1069,18 +1103,15 @@ mod tests {
             notes: None,
             icon: None,
             icon_color: None,
-            model_policy_scope: ModelPolicyScope::Global,
-            model_policy: Some(ModelPolicyKind::Single),
-            upstream_model: Some("gpt-5.6-sol".to_string()),
+            model_policy_scope: ModelPolicyScope::PerApp,
+            model_policy: None,
+            upstream_model: None,
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "openai-account".to_string(),
                 auth_identity_generation: 1,
             }),
             aws_region: None,
-            surfaces: vec![
-                grok_surface(AppKind::Claude, "claude.openai_oauth"),
-                grok_surface(AppKind::Codex, "codex.openai_oauth"),
-            ],
+            surfaces: vec![claude, grok_surface(AppKind::Codex, "codex.openai_oauth")],
             credential_patches: BTreeMap::new(),
             expected_revision: None,
             client_request_id: None,
@@ -1128,8 +1159,8 @@ mod tests {
             json!({"mode": "passthrough"})
         );
 
-        draft.model_policy = Some(ModelPolicyKind::Passthrough);
-        draft.upstream_model = None;
+        draft.surfaces[0].model_policy = Some(ModelPolicyKind::Passthrough);
+        draft.surfaces[0].upstream_model = None;
         assert!(draft.validate().is_ok());
         for surface in &draft.surfaces {
             assert_eq!(
@@ -1137,6 +1168,14 @@ mod tests {
                 json!({"mode": "passthrough"})
             );
         }
+
+        draft.model_policy_scope = ModelPolicyScope::Global;
+        draft.model_policy = Some(ModelPolicyKind::Passthrough);
+        assert!(draft
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires per-app model policies"));
     }
 
     #[test]

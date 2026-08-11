@@ -328,6 +328,38 @@ fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_
     })
 }
 
+fn openai_oauth_provider_bundle_draft(
+    bundle_id: &str,
+    account_id: &str,
+    client_request_id: &str,
+) -> Value {
+    json!({
+        "id": bundle_id,
+        "familyId": "family.openai_oauth",
+        "name": "OpenAI OAuth",
+        "modelPolicyScope": "per_app",
+        "managedAccount": {
+            "accountId": account_id,
+            "authIdentityGeneration": 1
+        },
+        "surfaces": [
+            {
+                "app": "claude",
+                "enabled": true,
+                "profileId": "claude.openai_oauth",
+                "modelPolicy": "single",
+                "upstreamModel": "gpt-5.6-sol"
+            },
+            {
+                "app": "codex",
+                "enabled": true,
+                "profileId": "codex.openai_oauth"
+            }
+        ],
+        "clientRequestId": client_request_id
+    })
+}
+
 fn nvidia_provider_bundle_draft(bundle_id: &str, client_request_id: &str) -> Value {
     let surface = |app: &str, profile_id: &str| {
         json!({
@@ -7216,6 +7248,75 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert!(!serde_json::to_string(&resources[0]["runtime"])
         .unwrap()
         .contains("api-contract-openai-key"));
+}
+
+#[tokio::test]
+async fn openai_oauth_bundle_requires_per_app_model_policies() {
+    let state = test_state();
+    state
+        .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "bundle-openai-account",
+                ProviderType::CodexOAuth,
+            ));
+        })
+        .await
+        .unwrap();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let mut global = openai_oauth_provider_bundle_draft(
+        "bundle-openai-global",
+        "bundle-openai-account",
+        "bundle-openai-global-request",
+    );
+    global["modelPolicyScope"] = json!("global");
+    global["modelPolicy"] = json!("single");
+    global["upstreamModel"] = json!("gpt-5.6-sol");
+    global["surfaces"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("modelPolicy");
+    global["surfaces"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("upstreamModel");
+    let rejected = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            global,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let created = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            openai_oauth_provider_bundle_draft(
+                "bundle-openai",
+                "bundle-openai-account",
+                "bundle-openai-create-request",
+            ),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let bundle = json_body(created).await["bundle"].clone();
+    assert_eq!(bundle["modelPolicyScope"], "per_app");
+    assert_eq!(
+        bundle["surfaces"]["claude"]["runtime"]["modelPolicy"],
+        json!({"mode": "single", "upstreamModel": "gpt-5.6-sol"})
+    );
+    assert_eq!(
+        bundle["surfaces"]["codex"]["runtime"]["modelPolicy"],
+        json!({"mode": "passthrough"})
+    );
 }
 
 #[tokio::test]

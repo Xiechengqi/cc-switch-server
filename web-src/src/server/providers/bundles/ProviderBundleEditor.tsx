@@ -109,6 +109,7 @@ import {
   modelPoliciesForSurface,
   perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
+  requiresPerAppModelPolicy,
   supportsPerAppModelPolicy,
   toProviderBundleWriteDraft,
   updateBundleModel,
@@ -1212,6 +1213,7 @@ export function ProviderBundleEditor({
   const allowedModelPolicies = modelPoliciesForFamily(family);
   const defaultSharedModel = defaultUpstreamModelForFamily(family);
   const perAppModelPolicySupported = supportsPerAppModelPolicy(family);
+  const perAppModelPolicyRequired = requiresPerAppModelPolicy(family);
   const fixedModelSurfaces = draft.surfaces.filter(
     (surface) => modelPoliciesForSurface(surface).length === 1,
   );
@@ -1649,7 +1651,11 @@ export function ProviderBundleEditor({
           <div className="max-w-xl space-y-4">
             <div className="space-y-2">
               <Label>{t("providerBundle.modelScope")}</Label>
-              {perAppModelPolicySupported ? (
+              {perAppModelPolicyRequired ? (
+                <Badge variant="secondary">
+                  {t("providerBundle.modelScopePerApp")}
+                </Badge>
+              ) : perAppModelPolicySupported ? (
                 <Tabs
                   value={draft.modelPolicyScope}
                   onValueChange={(value) => {

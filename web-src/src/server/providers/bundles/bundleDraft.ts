@@ -204,8 +204,31 @@ export function configurableModelSurfaceCount(
   }).length;
 }
 
+function modelPolicyCapabilitySignature(
+  profile: ProviderRegistryProfile,
+): string {
+  return [...modelPoliciesForProfile(profile)].sort().join("|");
+}
+
+export function requiresPerAppModelPolicy(family: ProviderFamilySpec): boolean {
+  const profiles = family.surfaces.map((surface) =>
+    profileById(surface.profileId),
+  );
+  if (profiles.length < 2 || profiles.some((profile) => !profile)) return false;
+  const resolved = profiles as ProviderRegistryProfile[];
+  const firstSignature = modelPolicyCapabilitySignature(resolved[0]!);
+  return resolved
+    .slice(1)
+    .some(
+      (profile) => modelPolicyCapabilitySignature(profile) !== firstSignature,
+    );
+}
+
 export function supportsPerAppModelPolicy(family: ProviderFamilySpec): boolean {
-  return configurableModelSurfaceCount(family) >= 2;
+  return (
+    requiresPerAppModelPolicy(family) ||
+    configurableModelSurfaceCount(family) >= 2
+  );
 }
 
 function modelControlSurface(
@@ -451,7 +474,7 @@ export function createProviderBundleDraft(
     awsRegion: readAwsRegion(
       sourcePreset.settingsConfig as Record<string, unknown>,
     ),
-    modelPolicyScope: "global",
+    modelPolicyScope: requiresPerAppModelPolicy(family) ? "per_app" : "global",
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     secrets,
@@ -582,7 +605,9 @@ export function editProviderBundleDraft(
           >,
         ),
       ),
-    modelPolicyScope: bundle.modelPolicyScope,
+    modelPolicyScope: requiresPerAppModelPolicy(family)
+      ? "per_app"
+      : bundle.modelPolicyScope,
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     secrets,
@@ -658,11 +683,16 @@ export function changeModelPolicyScope(
   draft: ProviderBundleEditorDraft,
   scope: ProviderModelPolicyScope,
 ): ProviderBundleEditorDraft {
-  if (scope === draft.modelPolicyScope) return draft;
-  if (scope === "global") return { ...draft, modelPolicyScope: scope };
+  const family = familyById(draft.familyId);
+  const nextScope =
+    family && requiresPerAppModelPolicy(family) ? "per_app" : scope;
+  if (nextScope === draft.modelPolicyScope) return draft;
+  if (nextScope === "global") {
+    return { ...draft, modelPolicyScope: nextScope };
+  }
   return {
     ...draft,
-    modelPolicyScope: scope,
+    modelPolicyScope: nextScope,
     surfaces: draft.surfaces.map((surface) => {
       const profile = profileById(surface.profileId);
       if (!profile || !profileHasConfigurableModelPolicy(profile))
@@ -938,6 +968,12 @@ export function validateProviderBundleDraft(
     !/^[A-Za-z0-9-]{1,64}$/.test(draft.awsRegion.trim())
   ) {
     return "AWS region is invalid";
+  }
+  if (
+    requiresPerAppModelPolicy(family) &&
+    draft.modelPolicyScope !== "per_app"
+  ) {
+    return "This Provider requires independent App model policies";
   }
   if (draft.modelPolicyScope === "global") {
     const allowedModelPolicies = modelPoliciesForFamily(family);
