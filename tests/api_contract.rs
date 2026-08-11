@@ -315,6 +315,8 @@ fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_
         "icon": "grok",
         "modelPolicy": "single",
         "upstreamModel": "grok-4.5",
+        "testApp": "claude",
+        "testModel": "grok-4.5",
         "managedAccount": {
             "accountId": account_id,
             "authIdentityGeneration": 1
@@ -338,6 +340,8 @@ fn openai_oauth_provider_bundle_draft(
         "familyId": "family.openai_oauth",
         "name": "OpenAI OAuth",
         "modelPolicyScope": "per_app",
+        "testApp": "codex",
+        "testModel": "gpt-5.6-sol@low",
         "managedAccount": {
             "accountId": account_id,
             "authIdentityGeneration": 1
@@ -374,6 +378,8 @@ fn nvidia_provider_bundle_draft(bundle_id: &str, client_request_id: &str) -> Val
         "name": "NVIDIA Bundle",
         "modelPolicy": "single",
         "upstreamModel": "moonshotai/kimi-k2.5",
+        "testApp": "claude",
+        "testModel": "moonshotai/kimi-k2.5",
         "surfaces": [
             surface("claude", "claude.nvidia"),
             surface("codex", "codex.nvidia")
@@ -492,7 +498,7 @@ async fn share_router_request_logs_are_scoped_to_tunnel_share_header() {
         log.apply_context(UsageLogContext {
             request_id: Some(format!("req_{share_id}-new")),
             share_id: Some(share_id.to_string()),
-            data_source: Some("direct".to_string()),
+            data_source: Some("router_share".to_string()),
             ..Default::default()
         });
         log.created_at_ms = base_created_at_ms + if share_id == "share-a" { 2_000 } else { 3_000 };
@@ -505,6 +511,10 @@ async fn share_router_request_logs_are_scoped_to_tunnel_share_header() {
         .into_iter()
         .find(|log| log.share_id.as_deref() == Some("share-a"))
         .unwrap();
+    let mut health_share_a = older_share_a.clone();
+    health_share_a.request_id = "req_share-a-health".to_string();
+    health_share_a.is_health_check = true;
+    state.push_usage_log(health_share_a).await.unwrap();
     older_share_a.request_id = "req_share-a-old".to_string();
     older_share_a.created_at_ms = base_created_at_ms + 1_000;
     state.push_usage_log(older_share_a).await.unwrap();
@@ -550,6 +560,7 @@ async fn share_router_request_logs_are_scoped_to_tunnel_share_header() {
     assert_eq!(mismatched_query.status(), StatusCode::NOT_FOUND);
 
     let scoped = app
+        .clone()
         .oneshot(share_router_request(
             Method::GET,
             "/_share-router/request-logs",
@@ -566,6 +577,42 @@ async fn share_router_request_logs_are_scoped_to_tunnel_share_header() {
     assert_eq!(scoped["logs"][0]["shareId"], "share-a");
     assert_eq!(scoped["logs"][0]["requestId"], "req_share-a-new");
     assert_eq!(scoped["logs"][1]["requestId"], "req_share-a-old");
+    assert_eq!(scoped["hasMore"], false);
+    assert!(scoped["nextSequence"].as_u64().unwrap_or_default() > 0);
+
+    let first_page = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/request-logs?limit=1",
+            &["share-a"],
+            "nonce-logs-page-one",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page = json_body(first_page).await;
+    assert_eq!(first_page["logs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first_page["logs"][0]["requestId"], "req_share-a-new");
+    assert_eq!(first_page["hasMore"], true);
+    let after_sequence = first_page["nextSequence"].as_u64().unwrap();
+
+    let second_page = app
+        .oneshot(share_router_request(
+            Method::GET,
+            &format!("/_share-router/request-logs?limit=1&afterSequence={after_sequence}"),
+            &["share-a"],
+            "nonce-logs-page-two",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_page = json_body(second_page).await;
+    assert_eq!(second_page["logs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second_page["logs"][0]["requestId"], "req_share-a-old");
+    assert_eq!(second_page["hasMore"], false);
 }
 
 #[tokio::test]
@@ -773,6 +820,7 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
     assert!(log.error_message.is_none());
 
     let response = app
+        .clone()
         .oneshot(share_router_request(
             Method::GET,
             "/_share-router/share-runtime?shareId=share-health-probe",
@@ -789,6 +837,43 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
         "provider-health-probe"
     );
     assert_eq!(response["modelHealth"]["codex"][0]["status"], "success");
+
+    state
+        .mutate_providers_immediate(|providers| {
+            let provider = providers
+                .providers
+                .iter_mut()
+                .find(|provider| {
+                    provider.app == AppKind::Codex
+                        && provider.provider.id == "provider-health-probe"
+                })
+                .unwrap();
+            provider.provider.extra.extend([
+                ("bundleId".to_string(), json!("provider-health-probe")),
+                ("familyId".to_string(), json!("family.grok_oauth")),
+                ("surfaceEnabled".to_string(), json!(true)),
+                ("modelPolicyScope".to_string(), json!("global")),
+                ("testApp".to_string(), json!("claude")),
+            ]);
+            providers
+                .bundle_order
+                .push("provider-health-probe".to_string());
+        })
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&json!({"appType": "codex"})).unwrap();
+    let response = app
+        .oneshot(share_router_request(
+            Method::POST,
+            "/_share-router/model-health",
+            &["share-health-probe"],
+            "nonce-model-health-wrong-bundle-app",
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -5548,7 +5633,13 @@ async fn router_log_retry_syncs_canonical_uuid_request_ids() {
                     assert_eq!(body["logs"][0]["requestId"], ROUTER_REQUEST_ID);
                     assert_eq!(body["logs"][0]["shareId"], "share-request-logs");
                     batch_seen.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(json!({"ok": true}))
+                    axum::Json(json!({
+                        "ok": true,
+                        "acks": [{
+                            "requestId": body["logs"][0]["requestId"],
+                            "usageRevision": body["logs"][0]["usageRevision"],
+                        }]
+                    }))
                 },
             ),
         )
@@ -5598,7 +5689,7 @@ async fn router_log_retry_syncs_canonical_uuid_request_ids() {
     log.apply_context(UsageLogContext {
         request_id: Some(ROUTER_REQUEST_ID.to_string()),
         share_id: Some("share-request-logs".to_string()),
-        data_source: Some("direct".to_string()),
+        data_source: Some("router_share".to_string()),
         ..Default::default()
     });
     state.push_usage_log(log).await.unwrap();
@@ -7309,6 +7400,8 @@ async fn openai_oauth_bundle_requires_per_app_model_policies() {
     assert_eq!(created.status(), StatusCode::OK);
     let bundle = json_body(created).await["bundle"].clone();
     assert_eq!(bundle["modelPolicyScope"], "per_app");
+    assert_eq!(bundle["testApp"], "codex");
+    assert_eq!(bundle["testModel"], "gpt-5.6-sol@low");
     assert_eq!(
         bundle["surfaces"]["claude"]["runtime"]["modelPolicy"],
         json!({"mode": "single", "upstreamModel": "gpt-5.6-sol"})
@@ -7357,6 +7450,8 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         json!(["claude", "codex", "gemini"])
     );
     assert_eq!(created["enabledApps"], created["supportedApps"]);
+    assert_eq!(created["testApp"], "claude");
+    assert_eq!(created["testModel"], "grok-4.5");
     assert_eq!(created["credentialConfigured"], true);
     assert_eq!(
         created["surfaces"].as_object().map(|value| value.len()),
@@ -7374,6 +7469,14 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
             created["surfaces"][provider_app]["runtime"]["modelPolicy"],
             json!({"mode": "single", "upstreamModel": "grok-4.5"})
         );
+        if provider_app == "claude" {
+            assert_eq!(
+                created["surfaces"][provider_app]["runtime"]["testModel"],
+                "grok-4.5"
+            );
+        } else {
+            assert!(created["surfaces"][provider_app]["runtime"]["testModel"].is_null());
+        }
         assert!(
             !serde_json::to_string(&created["surfaces"][provider_app]["runtime"])
                 .unwrap()
@@ -7556,7 +7659,13 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     );
 
     let mut detached_surface = claude_surface["provider"].clone();
-    for field in ["bundleId", "familyId", "surfaceEnabled", "modelPolicyScope"] {
+    for field in [
+        "bundleId",
+        "familyId",
+        "surfaceEnabled",
+        "modelPolicyScope",
+        "testApp",
+    ] {
         detached_surface.as_object_mut().unwrap().remove(field);
     }
     for (provider, expected_code) in [
@@ -7921,6 +8030,8 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
         "name": "Claude-only Custom HTTP",
         "modelPolicy": "single",
         "upstreamModel": "claude-test",
+        "testApp": "claude",
+        "testModel": "claude-test",
         "surfaces": [
             {
                 "app": "claude",

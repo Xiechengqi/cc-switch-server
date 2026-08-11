@@ -6,6 +6,7 @@ use crate::domain::accounts::store::{
     AccountUsageBlock,
 };
 use crate::domain::health::ProviderHealthStatus;
+use crate::domain::providers::bundle::bundle_test_app;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::runtime::{authoritative_managed_account, ProviderRuntimePlan};
@@ -65,6 +66,20 @@ pub fn summary_for_share(
         else {
             continue;
         };
+        match bundle_test_app(&provider.provider) {
+            Ok(Some(test_app)) if test_app != app => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    share_id = %share.id,
+                    app = app.as_str(),
+                    provider_id = %provider.provider.id,
+                    error = %error,
+                    "skipped malformed Provider Bundle model health summary"
+                );
+                continue;
+            }
+        }
 
         let result = if let Some(block) = quota_block_for_share_provider(share, provider, accounts)
         {
@@ -429,6 +444,64 @@ mod tests {
         assert_eq!(summary.codex.len(), 1);
         assert_eq!(summary.codex[0].provider_id.as_deref(), Some("p-codex"));
         assert!(summary.claude.is_empty());
+        assert!(summary.gemini.is_empty());
+    }
+
+    #[test]
+    fn bundle_summary_only_projects_the_selected_test_app() {
+        let mut share = test_share(
+            "share-1",
+            AppKind::Claude,
+            "grok-bundle",
+            ProviderType::GrokOAuth,
+            None,
+        );
+        share.bindings.push(ShareBinding {
+            app: AppKind::Codex,
+            provider_id: "grok-bundle".to_string(),
+            provider_type: ProviderType::GrokOAuth,
+        });
+        let mut claude = test_provider(AppKind::Claude, "grok-bundle", ProviderType::GrokOAuth);
+        let mut codex = test_provider(AppKind::Codex, "grok-bundle", ProviderType::GrokOAuth);
+        for provider in [&mut claude, &mut codex] {
+            provider.provider.extra.extend([
+                ("bundleId".to_string(), json!("grok-bundle")),
+                ("familyId".to_string(), json!("family.grok_oauth")),
+                ("surfaceEnabled".to_string(), json!(true)),
+                ("modelPolicyScope".to_string(), json!("global")),
+                ("testApp".to_string(), json!("codex")),
+            ]);
+        }
+        let mut usage = UsageStore::default();
+        record_snapshot(
+            &mut usage,
+            &claude,
+            ProviderHealthStatus::Healthy,
+            now_ms(),
+            "cc-switch-scheduled",
+            false,
+            Some(200),
+            None,
+        );
+        record_snapshot(
+            &mut usage,
+            &codex,
+            ProviderHealthStatus::Healthy,
+            now_ms(),
+            "cc-switch-scheduled",
+            false,
+            Some(200),
+            None,
+        );
+        let providers = ProviderStore {
+            providers: vec![claude, codex],
+            ..Default::default()
+        };
+
+        let summary = summary_for_share(&share, &providers, None, Some(&usage));
+
+        assert!(summary.claude.is_empty());
+        assert_eq!(summary.codex.len(), 1);
         assert!(summary.gemini.is_empty());
     }
 

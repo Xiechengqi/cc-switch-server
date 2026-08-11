@@ -1,5 +1,5 @@
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ const RELEASE_REQUEST_ATTEMPTS: usize = 3;
 const RELEASE_RETRY_BASE_DELAY: Duration = Duration::from_millis(750);
 const RELEASE_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const RELEASE_ERROR_BODY_LIMIT: usize = 512;
+const SERVICE_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
 struct GithubLatestRelease {
@@ -67,7 +68,8 @@ pub(crate) fn release_binary_url_for_cache_key(cache_key: &str) -> String {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceManager {
-    Service,
+    Systemd,
+    OpenRc,
     Nohup,
 }
 
@@ -82,25 +84,58 @@ pub struct ServiceStatus {
 }
 
 pub fn service_cc_switch_started() -> bool {
-    Command::new("systemctl")
-        .args(["is-active", "--quiet", SERVICE_UNIT])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-        || Command::new("service")
-            .args([SERVICE_NAME, "status"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+    systemd_service_started() || openrc_service_started()
+}
+
+fn systemd_service_started() -> bool {
+    let mut command = Command::new("systemctl");
+    command.args(["is-active", "--quiet", SERVICE_UNIT]);
+    run_command_with_timeout(command, SERVICE_STATUS_TIMEOUT)
+        .is_ok_and(|output| output.status.success())
+}
+
+fn openrc_service_started() -> bool {
+    let mut command = Command::new("rc-service");
+    command.args([SERVICE_NAME, "status"]);
+    run_command_with_timeout(command, SERVICE_STATUS_TIMEOUT)
+        .is_ok_and(|output| output.status.success())
+}
+
+pub(crate) fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command timed out after {}s", timeout.as_secs_f64()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 pub fn detect_service_status() -> ServiceStatus {
-    let started = service_cc_switch_started();
-    if started {
+    if systemd_service_started() {
         ServiceStatus {
-            manager: ServiceManager::Service,
+            manager: ServiceManager::Systemd,
+            active: true,
+            unit_name: Some(SERVICE_NAME),
+            active_state: Some("started".into()),
+            unit_file_state: None,
+        }
+    } else if openrc_service_started() {
+        ServiceStatus {
+            manager: ServiceManager::OpenRc,
             active: true,
             unit_name: Some(SERVICE_NAME),
             active_state: Some("started".into()),

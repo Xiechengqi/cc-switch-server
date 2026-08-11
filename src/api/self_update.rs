@@ -265,6 +265,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
     let status = handle.status.clone();
     let restart_pending = handle.restart_pending.clone();
     let registry = state.upgrade.clone();
+    let mut shutdown = state.subscribe_shutdown();
     let stream = async_stream::stream! {
         for entry in history {
             yield Ok(sse_event_from_entry(&entry));
@@ -275,7 +276,14 @@ pub(in crate::api) async fn admin_upgrade_stream(
         }
         let mut rx = receiver;
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            let received = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                    continue;
+                }
+                received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()) => received,
+            };
+            match received {
                 Ok(Ok(entry)) => yield Ok(sse_event_from_entry(&entry)),
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {

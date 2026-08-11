@@ -295,8 +295,10 @@ pub(crate) async fn debug_upgrade_stream(
     }
     let task_id = initial.task_id;
     let registry = state.upgrade.clone();
+    let mut shutdown = state.subscribe_shutdown();
     let stream = async_stream::stream! {
         loop {
+            if *shutdown.borrow() { break; }
             registry.refresh_from_disk().await;
             let Some(snapshot) = registry.status_snapshot().await else { break; };
             if snapshot.task_id != task_id { break; }
@@ -305,7 +307,12 @@ pub(crate) async fn debug_upgrade_stream(
                 serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into())
             ));
             if finished { break; }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))

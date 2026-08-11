@@ -8,7 +8,9 @@ use crate::domain::health::{
     provider_probe_support, ProviderHealthObservation, ProviderHealthSnapshot,
     ProviderHealthStatus, ProviderProbeSupport, PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS,
 };
-use crate::domain::providers::bundle::surface_enabled;
+use crate::domain::providers::bundle::{
+    bundle_test_app, is_explicit_bundle_surface, surface_enabled,
+};
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::{
@@ -136,8 +138,11 @@ fn health_targets(
         .providers
         .iter()
         .filter(|provider| surface_enabled(&provider.provider))
-        .cloned()
     {
+        if !is_health_target_surface(provider) {
+            continue;
+        }
+        let provider = provider.clone();
         targets.insert(
             (provider.app, provider.provider.id.clone()),
             HealthTarget {
@@ -151,12 +156,12 @@ fn health_targets(
         .filter(|share| share.enabled && share.status == "active")
     {
         for (app, provider_id) in share_bindings(share) {
-            let Some(provider) = providers
+            let provider_exists = providers
                 .providers
                 .iter()
                 .find(|provider| provider.app == app && provider.provider.id == provider_id)
-                .cloned()
-            else {
+                .is_some();
+            if !provider_exists {
                 tracing::warn!(
                     share_id = %share.id,
                     app = app.as_str(),
@@ -164,13 +169,10 @@ fn health_targets(
                     "share model health binding Provider was not found"
                 );
                 continue;
+            }
+            let Some(target) = targets.get_mut(&(app, provider_id)) else {
+                continue;
             };
-            let target = targets
-                .entry((app, provider_id))
-                .or_insert_with(|| HealthTarget {
-                    provider,
-                    shares: Vec::new(),
-                });
             if !target.shares.iter().any(|existing| existing.id == share.id) {
                 target.shares.push(share.clone());
             }
@@ -178,6 +180,25 @@ fn health_targets(
     }
 
     targets
+}
+
+fn is_health_target_surface(provider: &StoredProvider) -> bool {
+    if !is_explicit_bundle_surface(&provider.provider) {
+        return true;
+    }
+    match bundle_test_app(&provider.provider) {
+        Ok(Some(test_app)) => provider.app == test_app,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                app = provider.app.as_str(),
+                provider_id = %provider.provider.id,
+                error = %error,
+                "skipped malformed Provider Bundle health target"
+            );
+            false
+        }
+    }
 }
 
 async fn process_initial_health_target(
@@ -833,6 +854,24 @@ mod tests {
         }
     }
 
+    fn bundle_provider_with(
+        app: AppKind,
+        id: &str,
+        family_id: &str,
+        test_app: AppKind,
+        enabled: bool,
+    ) -> StoredProvider {
+        let mut provider = provider_with(app, id);
+        provider.provider.extra.extend([
+            ("bundleId".to_string(), json!(id)),
+            ("familyId".to_string(), json!(family_id)),
+            ("surfaceEnabled".to_string(), json!(enabled)),
+            ("modelPolicyScope".to_string(), json!("global")),
+            ("testApp".to_string(), json!(test_app.as_str())),
+        ]);
+        provider
+    }
+
     fn share(id: &str, provider_id: &str, enabled: bool, status: &str) -> Share {
         serde_json::from_value(json!({
             "id": id,
@@ -949,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn targets_include_all_enabled_surfaces_and_exclude_disabled_surfaces() {
+    fn targets_include_all_enabled_ordinary_providers_and_exclude_disabled_surfaces() {
         let providers = ProviderStore {
             providers: vec![provider(), provider_with(AppKind::Codex, "p2"), {
                 let mut disabled = provider_with(AppKind::Claude, "p3");
@@ -972,6 +1011,99 @@ mod tests {
         assert!(targets.contains_key(&(AppKind::Codex, "p1".to_string())));
         assert!(targets.contains_key(&(AppKind::Codex, "p2".to_string())));
         assert!(!targets.contains_key(&(AppKind::Claude, "p3".to_string())));
+    }
+
+    #[test]
+    fn bundle_targets_only_include_the_selected_test_app() {
+        let providers = ProviderStore {
+            providers: vec![
+                bundle_provider_with(
+                    AppKind::Claude,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Claude,
+                    true,
+                ),
+                bundle_provider_with(
+                    AppKind::Codex,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Claude,
+                    true,
+                ),
+                bundle_provider_with(
+                    AppKind::Gemini,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Claude,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let targets = health_targets(&[], &providers);
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains_key(&(AppKind::Claude, "bundle-1".to_string())));
+    }
+
+    #[test]
+    fn openai_oauth_bundle_can_select_codex_as_its_only_health_target() {
+        let providers = ProviderStore {
+            providers: vec![
+                bundle_provider_with(
+                    AppKind::Claude,
+                    "openai-oauth",
+                    "family.openai_oauth",
+                    AppKind::Codex,
+                    true,
+                ),
+                bundle_provider_with(
+                    AppKind::Codex,
+                    "openai-oauth",
+                    "family.openai_oauth",
+                    AppKind::Codex,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let targets = health_targets(&[], &providers);
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains_key(&(AppKind::Codex, "openai-oauth".to_string())));
+    }
+
+    #[test]
+    fn share_binding_does_not_restore_a_non_selected_bundle_surface() {
+        let providers = ProviderStore {
+            providers: vec![
+                bundle_provider_with(
+                    AppKind::Claude,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Claude,
+                    true,
+                ),
+                bundle_provider_with(
+                    AppKind::Codex,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Claude,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+        let shares = [share("codex-share", "bundle-1", true, "active")];
+
+        let targets = health_targets(&shares, &providers);
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains_key(&(AppKind::Claude, "bundle-1".to_string())));
+        assert!(!targets.contains_key(&(AppKind::Codex, "bundle-1".to_string())));
     }
 
     #[test]

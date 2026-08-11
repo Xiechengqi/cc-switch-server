@@ -407,7 +407,7 @@ pub(in crate::api) async fn retry_usage_router_sync(
     headers: HeaderMap,
 ) -> Result<Json<UsageRouterSyncRetryResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let summary = crate::state::sync_pending_direct_share_logs(state, 200, true).await;
+    let summary = crate::state::sync_pending_router_share_logs(state, 200, true).await;
     Ok(Json(UsageRouterSyncRetryResponse {
         ok: true,
         attempted: summary.attempted,

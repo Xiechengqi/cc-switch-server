@@ -840,7 +840,7 @@ fn write_snapshot_atomic(
     let bytes = serde_json::to_vec_pretty(snapshot).map_err(|err| {
         SelfUpdateError::Internal(format!("serialize upgrade state failed: {err}"))
     })?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)

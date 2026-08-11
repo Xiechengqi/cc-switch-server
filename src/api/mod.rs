@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::future::IntoFuture;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod web;
@@ -142,6 +143,9 @@ pub const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain
 pub const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
 pub const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
 pub const CLIENT_LOG_TAIL_PATH: &str = "/_ctl/logs/tail";
+const HTTP_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(40);
+const MANAGED_REFRESH_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(35);
+
 pub async fn serve(state: ServerState) -> anyhow::Result<()> {
     if !state.config.read().await.is_setup_complete() {
         crate::setup::log_setup_required_hints(&state);
@@ -155,10 +159,52 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
 
     provider_health_scheduler::spawn_share_model_health_scheduler(state.clone());
     tracing::info!("cc-switch-server listening on {}", state.bind_addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(state))
-        .await
-        .context("serve http")
+    let mut shutdown = state.subscribe_shutdown();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state.clone()))
+        .into_future();
+    tokio::pin!(server);
+
+    let completed = tokio::select! {
+        result = &mut server => Some(result),
+        changed = shutdown.changed() => {
+            if changed.is_err() {
+                tracing::warn!("server shutdown coordinator closed unexpectedly");
+            }
+            None
+        }
+    };
+
+    if let Some(result) = completed {
+        if state.is_shutting_down()
+            && !state
+                .drain_managed_account_refreshes(MANAGED_REFRESH_SHUTDOWN_DEADLINE)
+                .await
+        {
+            tracing::error!(
+                "managed OAuth refresh owners did not drain before the shutdown deadline"
+            );
+        }
+        return result.context("serve http");
+    }
+
+    let (server_result, refreshes_drained) = tokio::join!(
+        tokio::time::timeout(HTTP_SHUTDOWN_DEADLINE, &mut server),
+        state.drain_managed_account_refreshes(MANAGED_REFRESH_SHUTDOWN_DEADLINE),
+    );
+    if !refreshes_drained {
+        tracing::error!("managed OAuth refresh owners did not drain before the shutdown deadline");
+    }
+    match server_result {
+        Ok(result) => result.context("serve http"),
+        Err(_) => {
+            tracing::error!(
+                deadline_secs = HTTP_SHUTDOWN_DEADLINE.as_secs(),
+                "HTTP connections did not drain before the shutdown deadline; forcing close"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn shutdown_signal(state: ServerState) {
@@ -187,13 +233,8 @@ async fn shutdown_signal(state: ServerState) {
         let _ = tokio::signal::ctrl_c().await;
     }
 
+    state.begin_shutdown();
     state.begin_managed_account_refresh_shutdown();
-    if !state
-        .drain_managed_account_refreshes(Duration::from_secs(35))
-        .await
-    {
-        tracing::error!("managed OAuth refresh owners did not drain before the shutdown deadline");
-    }
 }
 
 pub fn app_router(state: ServerState) -> Router {

@@ -29,6 +29,13 @@ export function providerBundlePrimaryResource(
   return undefined;
 }
 
+export function providerBundleTestResource(
+  bundle: ProviderBundleView,
+): ProviderResource | undefined {
+  if (!bundle.enabledApps.includes(bundle.testApp)) return undefined;
+  return bundle.surfaces[bundle.testApp];
+}
+
 function endpointFromResource(resource: ProviderResource): string | null {
   const endpoint = resource.runtime?.endpoint.trim();
   if (endpoint) return endpoint;

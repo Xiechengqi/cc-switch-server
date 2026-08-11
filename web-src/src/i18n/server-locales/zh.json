@@ -104,8 +104,8 @@
     "surfaceEnabled": "启用 API",
     "surfaces": "应用接口",
     "streamIdleTimeout": "流空闲超时（毫秒）",
+    "testApp": "测试 App",
     "testModel": "测试模型",
-    "testAllModels": "测试所有 App 模型",
     "title": "供应商"
   },
   "provider": {

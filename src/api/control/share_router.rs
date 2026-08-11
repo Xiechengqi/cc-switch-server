@@ -1,6 +1,6 @@
 use super::*;
 
-const SHARE_ROUTER_REQUEST_LOGS_LIMIT: usize = 10;
+const SHARE_ROUTER_REQUEST_LOGS_LIMIT: usize = 100;
 const SHARE_ROUTER_SHARE_ID_HEADER: &str = "x-cc-switch-share-id";
 
 pub(crate) async fn share_router_health(
@@ -32,23 +32,47 @@ pub(crate) async fn share_router_request_logs(
         return Err(ApiError::not_found("not found"));
     }
     let share_id = header_share_id.to_string();
-    let limit = query.limit.unwrap_or(SHARE_ROUTER_REQUEST_LOGS_LIMIT);
-    let usage = state.usage.read().await.clone();
-    let mut matching = usage
-        .logs
-        .iter()
-        .filter(|log| log.share_id.as_deref() == Some(share_id.as_str()))
-        .collect::<Vec<_>>();
-    matching.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+    let limit = query
+        .limit
+        .unwrap_or(SHARE_ROUTER_REQUEST_LOGS_LIMIT)
+        .clamp(1, SHARE_ROUTER_REQUEST_LOGS_LIMIT);
+    let after_sequence = query.after_sequence.unwrap_or_default();
+    let mut matching = {
+        let usage = state.usage.read().await;
+        usage
+            .logs
+            .iter()
+            .filter(|log| {
+                log.share_id.as_deref() == Some(share_id.as_str())
+                    && log.is_user_inference()
+                    && log.data_source.as_deref() == Some("router_share")
+                    && !log.is_health_check
+                    && log.router_export_sequence > after_sequence
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    matching.sort_by(|left, right| {
+        left.router_export_sequence
+            .cmp(&right.router_export_sequence)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    let has_more = matching.len() > limit;
     let mut logs = Vec::new();
     for log in matching.into_iter().take(limit) {
-        if let Some(entry) = crate::state::share_request_log_entry(&state, log).await {
+        if let Some(entry) = crate::state::share_request_log_entry(&state, &log).await {
             logs.push(entry);
         }
     }
+    let next_sequence = logs
+        .last()
+        .map(|log| log.export_sequence)
+        .unwrap_or(after_sequence);
     Ok(Json(ShareRouterRequestLogsResponse {
         share_id: Some(share_id),
         logs,
+        next_sequence,
+        has_more,
     }))
 }
 
@@ -95,6 +119,16 @@ pub(crate) async fn share_router_model_health(
         .find(|provider| provider.app == app && provider.provider.id == provider_id)
         .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "provider not found"))?;
+    if let Some(test_app) = crate::domain::providers::bundle::bundle_test_app(&provider.provider)
+        .map_err(ApiError::internal)?
+    {
+        if test_app != app {
+            return Err(ApiError::bad_request(format!(
+                "Provider Bundle health checks are configured for the {} App",
+                test_app.as_str()
+            )));
+        }
+    }
     let accounts = state.accounts_snapshot().await;
     let config = web_stream_check_config(&state).await;
     let check = crate::api::provider_health_scheduler::check_share_binding(
@@ -212,6 +246,8 @@ pub(crate) struct ShareRouterRequestLogsQuery {
     share_id: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    after_sequence: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +256,8 @@ pub(crate) struct ShareRouterRequestLogsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     share_id: Option<String>,
     logs: Vec<ShareRequestLogEntry>,
+    next_sequence: u64,
+    has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]

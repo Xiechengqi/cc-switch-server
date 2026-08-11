@@ -8,25 +8,31 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::self_update::version::{
-    is_containerized, SelfUpdateError, BINARY_INSTALL_PATH, BINARY_ROLLBACK_PATH,
-    BINARY_STAGING_PATH, SERVICE_UNIT,
+    is_containerized, run_command_with_timeout, SelfUpdateError, BINARY_INSTALL_PATH,
+    BINARY_ROLLBACK_PATH, BINARY_STAGING_PATH, SERVICE_NAME, SERVICE_UNIT,
 };
 
 const HELPER_SPEC_FILENAME: &str = "upgrade-helper.json";
 const RESTART_OPERATION_FILENAME: &str = "restart-operation.json";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(45);
+const PROCESS_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(45);
+const PROCESS_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_DETECTION_TIMEOUT: Duration = Duration::from_secs(3);
+const SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(55);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartStrategy {
-    Service,
+    Systemd,
+    OpenRc,
     Standalone,
 }
 
 impl RestartStrategy {
     pub fn label(&self) -> &'static str {
         match self {
-            RestartStrategy::Service => "service",
+            RestartStrategy::Systemd => "systemd",
+            RestartStrategy::OpenRc => "openrc",
             RestartStrategy::Standalone => "standalone",
         }
     }
@@ -114,14 +120,27 @@ fn new_operation_id() -> String {
 }
 
 pub fn detect_restart_strategy() -> RestartStrategy {
-    if current_service_unit().is_some() {
-        RestartStrategy::Service
-    } else {
-        RestartStrategy::Standalone
-    }
+    detect_restart_target().0
 }
 
-fn current_service_unit() -> Option<String> {
+fn detect_restart_target() -> (RestartStrategy, Option<String>) {
+    choose_restart_target(current_systemd_service_unit(), openrc_service_running())
+}
+
+fn choose_restart_target(
+    systemd_unit: Option<String>,
+    openrc_available: bool,
+) -> (RestartStrategy, Option<String>) {
+    if let Some(unit) = systemd_unit {
+        return (RestartStrategy::Systemd, Some(unit));
+    }
+    if openrc_available {
+        return (RestartStrategy::OpenRc, Some(SERVICE_NAME.to_string()));
+    }
+    (RestartStrategy::Standalone, None)
+}
+
+fn current_systemd_service_unit() -> Option<String> {
     std::fs::read_to_string("/proc/self/cgroup")
         .ok()
         .and_then(|cgroup| service_unit_from_cgroup(&cgroup))
@@ -130,6 +149,22 @@ fn current_service_unit() -> Option<String> {
                 .is_some_and(|pid| pid == std::process::id())
                 .then(|| SERVICE_UNIT.to_string())
         })
+}
+
+fn openrc_service_running() -> bool {
+    if !Path::new("/etc/init.d").join(SERVICE_NAME).is_file() || !command_exists("rc-service") {
+        return false;
+    }
+    let mut command = Command::new("rc-service");
+    command.args([SERVICE_NAME, "status"]);
+    run_command_with_timeout(command, SERVICE_DETECTION_TIMEOUT)
+        .is_ok_and(|output| output.status.success())
+}
+
+fn command_exists(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| directory.join(command).is_file())
+    })
 }
 
 fn service_unit_from_cgroup(cgroup: &str) -> Option<String> {
@@ -142,10 +177,9 @@ fn service_unit_from_cgroup(cgroup: &str) -> Option<String> {
 }
 
 fn service_main_pid(unit: &str) -> Option<u32> {
-    let output = Command::new("systemctl")
-        .args(["show", "--property=MainPID", "--value", unit])
-        .output()
-        .ok()?;
+    let mut command = Command::new("systemctl");
+    command.args(["show", "--property=MainPID", "--value", unit]);
+    let output = run_command_with_timeout(command, SERVICE_DETECTION_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -163,16 +197,12 @@ pub fn schedule_upgrade_restart(
     config_dir: &Path,
     health_addr: SocketAddr,
 ) -> Result<String, SelfUpdateError> {
-    let service_unit = current_service_unit();
+    let (strategy, service_unit) = detect_restart_target();
     launch_helper(UpdateHelperSpec {
         operation_id: new_operation_id(),
         task_id: Some(task_id.to_string()),
         mode: HelperMode::InstallStaged,
-        strategy: if service_unit.is_some() {
-            RestartStrategy::Service
-        } else {
-            RestartStrategy::Standalone
-        },
+        strategy,
         service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
@@ -199,7 +229,7 @@ pub fn restart_from_detected_service(
         SelfUpdateError::Internal(format!("resolve current executable failed: {error}"))
     })?;
     let install_path = restart_install_path(pending.is_some(), current_exe);
-    let service_unit = current_service_unit();
+    let (strategy, service_unit) = detect_restart_target();
     let operation_id = new_operation_id();
     let command = launch_helper(UpdateHelperSpec {
         operation_id: operation_id.clone(),
@@ -209,11 +239,7 @@ pub fn restart_from_detected_service(
         } else {
             HelperMode::RestartOnly
         },
-        strategy: if service_unit.is_some() {
-            RestartStrategy::Service
-        } else {
-            RestartStrategy::Standalone
-        },
+        strategy,
         service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
@@ -238,22 +264,6 @@ fn restart_install_path(has_pending_upgrade: bool, current_exe: PathBuf) -> Path
     } else {
         current_exe
     }
-}
-
-#[cfg(test)]
-fn systemd_restart_command(unit: &str, transient_unit: &str) -> Command {
-    let mut command = Command::new("systemd-run");
-    command
-        .arg("--quiet")
-        .arg("--collect")
-        .arg("--unit")
-        .arg(transient_unit)
-        .arg("--on-active=1s")
-        .arg("systemctl")
-        .arg("restart")
-        .arg("--no-block")
-        .arg(unit);
-    command
 }
 
 fn pending_upgrade(config_dir: &Path) -> Option<(String, String)> {
@@ -285,16 +295,12 @@ pub fn rollback_from_backup_and_restart(
             "rollback backup not found at {BINARY_ROLLBACK_PATH}"
         )));
     }
-    let service_unit = current_service_unit();
+    let (strategy, service_unit) = detect_restart_target();
     launch_helper(UpdateHelperSpec {
         operation_id: new_operation_id(),
         task_id: None,
         mode: HelperMode::Rollback,
-        strategy: if service_unit.is_some() {
-            RestartStrategy::Service
-        } else {
-            RestartStrategy::Standalone
-        },
+        strategy,
         service_unit,
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
@@ -341,14 +347,18 @@ fn launch_helper(spec: UpdateHelperSpec) -> Result<String, SelfUpdateError> {
     );
 
     if let Err(error) = spawn_detached_helper(&spec, &current_exe, &spec_path) {
-        let _ = update_restart_operation(
-            &spec.config_dir,
-            &spec.operation_id,
-            "failed",
-            "helper_spawn_failed",
-            error.to_string(),
-            None,
-        );
+        if read_restart_operation(&spec.config_dir).is_some_and(|operation| {
+            operation.operation_id == spec.operation_id && operation.status == "running"
+        }) {
+            let _ = update_restart_operation(
+                &spec.config_dir,
+                &spec.operation_id,
+                "failed",
+                "helper_spawn_failed",
+                error.to_string(),
+                None,
+            );
+        }
         return Err(error);
     }
     Ok(command_label)
@@ -360,7 +370,7 @@ fn spawn_detached_helper(
     spec_path: &Path,
 ) -> Result<(), SelfUpdateError> {
     match spec.strategy {
-        RestartStrategy::Service => {
+        RestartStrategy::Systemd => {
             let suffix = spec
                 .task_id
                 .as_deref()
@@ -368,24 +378,39 @@ fn spawn_detached_helper(
                 .chars()
                 .take(12)
                 .collect::<String>();
-            let status = Command::new("systemd-run")
+            let transient_unit = format!("cc-switch-server-update-{suffix}");
+            let mut command = Command::new("systemd-run");
+            command
                 .args(["--quiet", "--collect", "--property=Type=exec"])
-                .arg(format!("--unit=cc-switch-server-update-{suffix}"))
+                .arg(format!("--unit={transient_unit}"))
                 .arg(current_exe)
                 .arg("self-update-helper")
                 .arg("--spec")
-                .arg(spec_path)
-                .status()
-                .map_err(|err| {
-                    SelfUpdateError::Internal(format!("launch systemd update helper failed: {err}"))
-                })?;
-            if !status.success() {
-                return Err(SelfUpdateError::Internal(format!(
-                    "systemd-run update helper exited with {status}"
-                )));
+                .arg(spec_path);
+            let launch = run_command_with_timeout(command, SERVICE_COMMAND_TIMEOUT);
+            if launch.as_ref().is_ok_and(|output| output.status.success())
+                && wait_for_helper_start_confirmation(spec, Duration::from_secs(2))
+            {
+                return Ok(());
             }
+            if helper_start_confirmed(spec) {
+                return Ok(());
+            }
+            stop_transient_helper(&transient_unit);
+            return Err(match launch {
+                Ok(output) if output.status.success() => SelfUpdateError::Internal(
+                    "systemd update helper did not confirm startup within 2s".into(),
+                ),
+                Ok(output) => SelfUpdateError::Internal(format!(
+                    "systemd-run update helper exited with {}",
+                    output.status
+                )),
+                Err(error) => SelfUpdateError::Internal(format!(
+                    "launch systemd update helper failed: {error}"
+                )),
+            });
         }
-        RestartStrategy::Standalone => {
+        RestartStrategy::OpenRc | RestartStrategy::Standalone => {
             use std::os::unix::process::CommandExt;
 
             let helper_log_path = crate::logging::restart_helper_log_path(&spec.config_dir);
@@ -398,24 +423,28 @@ fn spawn_detached_helper(
             let helper_error_log = helper_log.try_clone().map_err(|err| {
                 SelfUpdateError::Internal(format!("clone restart helper log failed: {err}"))
             })?;
-            let mut child = Command::new(current_exe)
+            let mut command = Command::new(current_exe);
+            command
                 .arg("self-update-helper")
                 .arg("--spec")
                 .arg(spec_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(helper_log))
-                .stderr(Stdio::from(helper_error_log))
-                .process_group(0)
-                .spawn()
-                .map_err(|err| {
-                    SelfUpdateError::Internal(format!("spawn update helper failed: {err}"))
-                })?;
+                .stderr(Stdio::from(helper_error_log));
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().map_err(|err| {
+                SelfUpdateError::Internal(format!("spawn update helper failed: {err}"))
+            })?;
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {
-                if read_restart_operation(&spec.config_dir).is_some_and(|operation| {
-                    operation.operation_id == spec.operation_id
-                        && operation.stage != "helper_spawning"
-                }) {
+                if helper_start_confirmed(spec) {
                     return Ok(());
                 }
                 if let Some(status) = child.try_wait().map_err(|err| {
@@ -435,7 +464,31 @@ fn spawn_detached_helper(
             )));
         }
     }
-    Ok(())
+}
+
+fn helper_start_confirmed(spec: &UpdateHelperSpec) -> bool {
+    read_restart_operation(&spec.config_dir).is_some_and(|operation| {
+        operation.operation_id == spec.operation_id
+            && operation.status == "running"
+            && operation.stage != "helper_spawning"
+    })
+}
+
+fn wait_for_helper_start_confirmation(spec: &UpdateHelperSpec, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if helper_start_confirmed(spec) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    helper_start_confirmed(spec)
+}
+
+fn stop_transient_helper(unit: &str) {
+    let mut command = Command::new("systemctl");
+    command.args(["stop", "--no-block", unit]);
+    let _ = run_command_with_timeout(command, SERVICE_DETECTION_TIMEOUT);
 }
 
 pub fn run_update_helper(spec_path: &Path) -> anyhow::Result<()> {
@@ -497,10 +550,18 @@ fn run_update_helper_inner_with_timeout(
         HelperMode::RestartOnly => None,
     };
 
+    stop_process(spec)?;
     if !matches!(spec.mode, HelperMode::RestartOnly) {
-        install_staged_binary(&spec.staging_path, &spec.install_path)?;
+        if let Err(error) = install_staged_binary(&spec.staging_path, &spec.install_path) {
+            let recovery = start_process(spec)
+                .map(|_| "previous binary restarted".to_string())
+                .unwrap_or_else(|restart_error| {
+                    format!("previous binary restart also failed: {restart_error}")
+                });
+            anyhow::bail!("install staged binary failed: {error}; {recovery}");
+        }
     }
-    let (mut started_process, restart_error) = match restart_process(spec) {
+    let (mut started_process, restart_error) = match start_process(spec) {
         Ok(child) => (child, None),
         Err(error) => (None, Some(error)),
     };
@@ -535,10 +596,7 @@ fn run_update_helper_inner_with_timeout(
         return Ok(());
     }
 
-    if let Some(child) = started_process.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    stop_replacement_process(spec, started_process.as_mut());
     let replacement_error =
         replacement_result.expect_err("failed replacement must carry probe or restart diagnostics");
     update_restart_operation(
@@ -557,31 +615,48 @@ fn run_update_helper_inner_with_timeout(
             &format!("replacement failed: {replacement_error}; attempting rollback"),
         )?;
     }
-    let rollback_result = match rollback_source.as_deref().filter(|path| path.exists()) {
-        Some(source) => (|| -> anyhow::Result<()> {
-            std::fs::copy(source, &spec.staging_path)?;
-            install_staged_binary(&spec.staging_path, &spec.install_path)?;
-            let _ = restart_process(spec)?;
-            wait_for_expected_version(spec.health_addr, None, None, health_timeout)
-                .map(|_| ())
-                .map_err(anyhow::Error::msg)
-        })()
-        .map(|_| "rollback passed health checks".to_string())
-        .unwrap_or_else(|error| format!("rollback failed: {error}")),
-        None => "rollback was not available".to_string(),
-    };
+    let (rollback_stage, rollback_result) =
+        match rollback_source.as_deref().filter(|path| path.exists()) {
+            Some(source) => match (|| -> anyhow::Result<()> {
+                std::fs::copy(source, &spec.staging_path)?;
+                install_staged_binary(&spec.staging_path, &spec.install_path)?;
+                let _ = start_process(spec)?;
+                wait_for_expected_version(spec.health_addr, None, None, health_timeout)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::msg)
+            })() {
+                Ok(()) => (
+                    "rollback_succeeded",
+                    "rollback passed health checks".to_string(),
+                ),
+                Err(error) => ("rollback_failed", format!("rollback failed: {error}")),
+            },
+            None => (
+                "rollback_unavailable",
+                "rollback was not available".to_string(),
+            ),
+        };
+    let final_message = format!("replacement failed: {replacement_error}; {rollback_result}");
+    let _ = update_restart_operation(
+        &spec.config_dir,
+        &spec.operation_id,
+        "failed",
+        rollback_stage,
+        &final_message,
+        None,
+    );
     if let Some(task_id) = spec.task_id.as_deref() {
         crate::self_update::upgrade::record_helper_outcome(
             &spec.config_dir,
             task_id,
             false,
-            &format!("replacement failed: {replacement_error}; {rollback_result}"),
+            &final_message,
         )?;
     }
-    anyhow::bail!(replacement_error)
+    anyhow::bail!(final_message)
 }
 
-fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process::Child>> {
+fn stop_process(spec: &UpdateHelperSpec) -> anyhow::Result<()> {
     update_restart_operation(
         &spec.config_dir,
         &spec.operation_id,
@@ -591,42 +666,62 @@ fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::proces
         None,
     )?;
     match spec.strategy {
-        RestartStrategy::Service => {
+        RestartStrategy::Systemd => {
             let unit = spec
                 .service_unit
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("systemd restart target is missing"))?;
-            let status = Command::new("systemctl").args(["restart", unit]).status()?;
-            anyhow::ensure!(status.success(), "systemctl restart exited with {status}");
-            update_restart_operation(
-                &spec.config_dir,
-                &spec.operation_id,
-                "running",
-                "replacement_started",
-                format!("systemd restarted {unit}; waiting for health checks"),
-                None,
-            )?;
-            Ok(None)
+                .ok_or_else(|| anyhow::anyhow!("systemd stop target is missing"))?;
+            run_service_command("systemctl", &["stop", unit])?;
+        }
+        RestartStrategy::OpenRc => {
+            let service = spec
+                .service_unit
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("OpenRC stop target is missing"))?;
+            run_service_command("rc-service", &[service, "stop"])?;
         }
         RestartStrategy::Standalone => {
-            let parent_proc = PathBuf::from(format!("/proc/{}", spec.parent_pid));
-            if process_is_active(&parent_proc) {
-                let status = Command::new("kill")
-                    .args(["-TERM", &spec.parent_pid.to_string()])
-                    .status()?;
-                anyhow::ensure!(
-                    status.success(),
-                    "failed to terminate current server process"
-                );
-            }
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline && process_is_active(&parent_proc) {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            anyhow::ensure!(
-                !process_is_active(&parent_proc),
-                "current server process did not exit after SIGTERM"
-            );
+            signal_process(spec.parent_pid, libc::SIGTERM)?;
+        }
+    }
+    let forced = wait_for_process_exit(spec.parent_pid)?;
+    update_restart_operation(
+        &spec.config_dir,
+        &spec.operation_id,
+        "running",
+        "old_process_stopped",
+        if forced {
+            format!(
+                "process {} exceeded the graceful shutdown deadline and was killed",
+                spec.parent_pid
+            )
+        } else {
+            format!("process {} stopped cleanly", spec.parent_pid)
+        },
+        None,
+    )?;
+    Ok(())
+}
+
+fn start_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process::Child>> {
+    let child = match spec.strategy {
+        RestartStrategy::Systemd => {
+            let unit = spec
+                .service_unit
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("systemd start target is missing"))?;
+            run_service_command("systemctl", &["start", unit])?;
+            None
+        }
+        RestartStrategy::OpenRc => {
+            let service = spec
+                .service_unit
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("OpenRC start target is missing"))?;
+            run_service_command("rc-service", &[service, "start"])?;
+            None
+        }
+        RestartStrategy::Standalone => {
             crate::logging::ensure_log_dir(&spec.config_dir)?;
             let log_path = crate::logging::process_log_path(&spec.config_dir);
             let log = crate::logging::open_log_append(&log_path)?;
@@ -637,18 +732,119 @@ fn restart_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::proces
                 .stdout(Stdio::from(log))
                 .stderr(Stdio::from(err_log))
                 .spawn()?;
-            let child_pid = child.id();
-            update_restart_operation(
-                &spec.config_dir,
-                &spec.operation_id,
-                "running",
-                "replacement_started",
-                format!("replacement process {child_pid} started; waiting for health checks"),
-                Some(child_pid),
-            )?;
-            Ok(Some(child))
+            Some(child)
+        }
+    };
+    let child_pid = child.as_ref().map(std::process::Child::id);
+    update_restart_operation(
+        &spec.config_dir,
+        &spec.operation_id,
+        "running",
+        "replacement_started",
+        match spec.strategy {
+            RestartStrategy::Systemd => "systemd service started; waiting for health checks".into(),
+            RestartStrategy::OpenRc => "OpenRC service started; waiting for health checks".into(),
+            RestartStrategy::Standalone => format!(
+                "replacement process {} started; waiting for health checks",
+                child_pid.unwrap_or_default()
+            ),
+        },
+        child_pid,
+    )?;
+    Ok(child)
+}
+
+fn stop_replacement_process(spec: &UpdateHelperSpec, child: Option<&mut std::process::Child>) {
+    match spec.strategy {
+        RestartStrategy::Systemd => {
+            if let Some(unit) = spec.service_unit.as_deref() {
+                let _ = run_service_command("systemctl", &["stop", unit]);
+            }
+        }
+        RestartStrategy::OpenRc => {
+            if let Some(service) = spec.service_unit.as_deref() {
+                let _ = run_service_command("rc-service", &[service, "stop"]);
+            }
+        }
+        RestartStrategy::Standalone => {
+            if let Some(child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
+}
+
+fn run_service_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    let mut child = Command::new(program).args(args).spawn()?;
+    let deadline = Instant::now() + SERVICE_COMMAND_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(
+                status.success(),
+                "{program} {} exited with {status}",
+                args.join(" ")
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "{program} {} timed out after {}s",
+                args.join(" "),
+                SERVICE_COMMAND_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn signal_process(pid: u32, signal: i32) -> anyhow::Result<()> {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    if !process_is_active(&proc_dir) {
+        return Ok(());
+    }
+    let pid = i32::try_from(pid).map_err(|_| anyhow::anyhow!("process id is out of range"))?;
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error.into())
+}
+
+fn wait_for_process_exit(pid: u32) -> anyhow::Result<bool> {
+    wait_for_process_exit_with_timeouts(pid, PROCESS_GRACEFUL_TIMEOUT, PROCESS_KILL_TIMEOUT)
+}
+
+fn wait_for_process_exit_with_timeouts(
+    pid: u32,
+    graceful_timeout: Duration,
+    kill_timeout: Duration,
+) -> anyhow::Result<bool> {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let graceful_deadline = Instant::now() + graceful_timeout;
+    while Instant::now() < graceful_deadline && process_is_active(&proc_dir) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !process_is_active(&proc_dir) {
+        return Ok(false);
+    }
+
+    signal_process(pid, libc::SIGKILL)?;
+    let kill_deadline = Instant::now() + kill_timeout;
+    while Instant::now() < kill_deadline && process_is_active(&proc_dir) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        !process_is_active(&proc_dir),
+        "current server process remained active after SIGKILL"
+    );
+    Ok(true)
 }
 
 fn process_is_active(proc_dir: &Path) -> bool {
@@ -789,7 +985,7 @@ fn loopback_health_addr(addr: SocketAddr) -> SocketAddr {
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), SelfUpdateError> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| SelfUpdateError::Internal(format!("serialize helper spec failed: {err}")))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -850,27 +1046,64 @@ mod tests {
     }
 
     #[test]
-    fn systemd_restart_is_delayed_and_non_blocking() {
-        let command =
-            systemd_restart_command("cc-switch-server.service", "cc-switch-server-restart-test");
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+    fn restart_target_prefers_systemd_then_openrc() {
         assert_eq!(
-            args,
-            [
-                "--quiet",
-                "--collect",
-                "--unit",
-                "cc-switch-server-restart-test",
-                "--on-active=1s",
-                "systemctl",
-                "restart",
-                "--no-block",
-                "cc-switch-server.service",
-            ]
+            choose_restart_target(Some("custom.service".into()), true),
+            (RestartStrategy::Systemd, Some("custom.service".into()))
         );
+        assert_eq!(
+            choose_restart_target(None, true),
+            (RestartStrategy::OpenRc, Some(SERVICE_NAME.into()))
+        );
+        assert_eq!(
+            choose_restart_target(None, false),
+            (RestartStrategy::Standalone, None)
+        );
+    }
+
+    #[test]
+    fn stuck_process_is_killed_after_graceful_deadline() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(50));
+        signal_process(pid, libc::SIGTERM).unwrap();
+
+        let forced = wait_for_process_exit_with_timeouts(
+            pid,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(forced);
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn external_command_timeout_is_bounded() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 5"]);
+        let started = Instant::now();
+
+        let error = run_command_with_timeout(command, Duration::from_millis(50))
+            .expect_err("stalled command must time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn external_command_timeout_preserves_success_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf helper-ready"]);
+
+        let output = run_command_with_timeout(command, Duration::from_secs(1)).unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"helper-ready");
     }
 
     #[test]
@@ -1145,6 +1378,10 @@ mod tests {
                 .message
                 .contains("expected bbbbbbbbbbbb, got aaaaaaaaaaaa; rollback passed health checks")
         }));
+        let operation = read_restart_operation(&dir).unwrap();
+        assert_eq!(operation.status, "failed");
+        assert_eq!(operation.stage, "rollback_succeeded");
+        assert!(operation.message.contains("rollback passed health checks"));
         assert_eq!(std::fs::read(&install_path).unwrap(), executable);
 
         stop.store(true, Ordering::SeqCst);

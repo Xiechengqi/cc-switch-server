@@ -865,7 +865,7 @@ export interface AdminVersionInfo extends BuildInfo {
   restartPending: boolean;
   upgradeCapable: boolean;
   service: {
-    manager: "service" | "nohup";
+    manager: "systemd" | "openrc" | "nohup";
     active: boolean;
     unitName?: string | null;
     activeState?: string | null;

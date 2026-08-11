@@ -19,6 +19,7 @@ const BUNDLE_ID_FIELD: &str = "bundleId";
 const FAMILY_ID_FIELD: &str = "familyId";
 const SURFACE_ENABLED_FIELD: &str = "surfaceEnabled";
 const MODEL_POLICY_SCOPE_FIELD: &str = "modelPolicyScope";
+const TEST_APP_FIELD: &str = "testApp";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +80,9 @@ pub struct ProviderBundleView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_color: Option<String>,
     pub model_policy_scope: ModelPolicyScope,
+    pub test_app: AppKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_model: Option<String>,
     pub supported_apps: Vec<AppKind>,
     pub enabled_apps: Vec<AppKind>,
     pub credential_configured: bool,
@@ -115,6 +119,9 @@ pub struct ProviderBundleWriteDraft {
     pub model_policy: Option<ModelPolicyKind>,
     #[serde(default)]
     pub upstream_model: Option<String>,
+    pub test_app: AppKind,
+    #[serde(default)]
+    pub test_model: Option<String>,
     #[serde(default)]
     pub managed_account: Option<ProviderBundleManagedAccountWriteDraft>,
     #[serde(default)]
@@ -173,8 +180,6 @@ pub struct ProviderBundleSurfaceWriteDraft {
     pub upstream_model: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default)]
-    pub test_model: Option<String>,
     #[serde(default)]
     pub transport: ProviderTransportWriteDraft,
     #[serde(default)]
@@ -272,6 +277,10 @@ impl ProviderBundleWriteDraft {
             MODEL_POLICY_SCOPE_FIELD.to_string(),
             Value::String(self.model_policy_scope.as_str().to_string()),
         );
+        extra.insert(
+            TEST_APP_FIELD.to_string(),
+            Value::String(self.test_app.as_str().to_string()),
+        );
         let mut settings = Map::new();
         settings.insert(
             "modelMapping".to_string(),
@@ -291,8 +300,10 @@ impl ProviderBundleWriteDraft {
         if !env.is_empty() {
             settings.insert("env".to_string(), Value::Object(env));
         }
-        if let Some(test_model) = normalized_optional_string(surface.test_model.as_deref()) {
-            settings.insert("testModel".to_string(), Value::String(test_model));
+        if surface.app == self.test_app {
+            if let Some(test_model) = normalized_optional_string(self.test_model.as_deref()) {
+                settings.insert("testModel".to_string(), Value::String(test_model));
+            }
         }
         let transport = transport_value(&surface.transport);
         if !transport.is_empty() {
@@ -353,6 +364,7 @@ impl ProviderBundleWriteDraft {
 
     fn validate_shared_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
         self.validate_model_configuration(family)?;
+        self.validate_test_configuration(family)?;
 
         let credential_profile = profile_by_id(family.credential_profile_id.as_str())
             .expect("Provider family credential profile is registry-validated");
@@ -382,6 +394,33 @@ impl ProviderBundleWriteDraft {
             (true, None) => bail!("AWS Provider Bundle requires a region"),
             (false, Some(_)) => bail!("awsRegion is only valid for AWS Provider Bundles"),
             (false, None) => {}
+        }
+        Ok(())
+    }
+
+    fn validate_test_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
+        if !family
+            .surfaces
+            .iter()
+            .any(|surface| surface.app == self.test_app)
+        {
+            bail!(
+                "Provider family {} does not support the selected test App {}",
+                family.family_id,
+                self.test_app.as_str()
+            );
+        }
+        if !self
+            .surfaces
+            .iter()
+            .any(|surface| surface.app == self.test_app && surface.enabled)
+        {
+            bail!("Provider Bundle test App must be enabled");
+        }
+        if normalized_optional_string(self.test_model.as_deref())
+            .is_some_and(|test_model| test_model.len() > 256)
+        {
+            bail!("Provider test model must be at most 256 characters");
         }
         Ok(())
     }
@@ -494,11 +533,6 @@ impl ProviderBundleWriteDraft {
             validate_endpoint(endpoint)?;
         }
         validate_transport(&surface.transport)?;
-        if let Some(test_model) = normalized_optional_string(surface.test_model.as_deref()) {
-            if test_model.len() > 256 {
-                bail!("Provider test model must be at most 256 characters");
-            }
-        }
         if surface.extra_headers.len() > 32 {
             bail!("custom Provider cannot define more than 32 extra headers");
         }
@@ -809,6 +843,8 @@ impl ProviderBundleView {
         let name = first.provider.name.clone();
         let model_policy_scope = bundle_model_policy_scope(&first.provider)?
             .context("Provider Bundle Surface has no model policy scope")?;
+        let test_app =
+            bundle_test_app(&first.provider)?.context("Provider Bundle Surface has no test App")?;
         let mut revision = 0u64;
         let mut surfaces = BTreeMap::new();
         let mut enabled_apps = Vec::new();
@@ -819,6 +855,7 @@ impl ProviderBundleView {
                 || family_id_for_view(&view)? != family_id
                 || view.provider.name != name
                 || bundle_model_policy_scope(&view.provider)? != Some(model_policy_scope)
+                || bundle_test_app(&view.provider)? != Some(test_app)
             {
                 bail!("Provider Bundle Surface metadata is inconsistent");
             }
@@ -842,6 +879,9 @@ impl ProviderBundleView {
             .collect::<BTreeSet<_>>();
         if actual_apps != expected_apps {
             bail!("Provider Bundle does not contain its complete Surface set");
+        }
+        if !enabled_apps.contains(&test_app) {
+            bail!("Provider Bundle test App is not enabled");
         }
         let supported_apps = family.surfaces.iter().map(|surface| surface.app).collect();
         let credential_profile = profile_by_id(family.credential_profile_id.as_str())
@@ -875,6 +915,13 @@ impl ProviderBundleView {
             .next()
             .expect("surfaces is non-empty")
             .provider;
+        let test_model = surfaces
+            .get(&test_app)
+            .and_then(|view| view.provider.settings_config.get("testModel"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         Ok(Self {
             id,
             family_id,
@@ -885,6 +932,8 @@ impl ProviderBundleView {
             icon: extra_string(provider, "icon"),
             icon_color: extra_string(provider, "iconColor"),
             model_policy_scope,
+            test_app,
+            test_model,
             supported_apps,
             enabled_apps,
             credential_configured,
@@ -919,6 +968,20 @@ pub fn bundle_model_policy_scope(provider: &Provider) -> anyhow::Result<Option<M
         .with_context(|| format!("invalid Provider Bundle model policy scope {value}"))
 }
 
+pub fn bundle_test_app(provider: &Provider) -> anyhow::Result<Option<AppKind>> {
+    if bundle_id(provider).is_none() {
+        return Ok(None);
+    }
+    let value = extra_string_ref(provider, TEST_APP_FIELD)
+        .context("Provider Bundle Surface has no test App")?;
+    match value {
+        "claude" => Ok(Some(AppKind::Claude)),
+        "codex" => Ok(Some(AppKind::Codex)),
+        "gemini" => Ok(Some(AppKind::Gemini)),
+        _ => bail!("invalid Provider Bundle test App {value}"),
+    }
+}
+
 pub fn bundle_model_policy_source(
     provider: &Provider,
     profile: Option<&ProfileSpec>,
@@ -938,6 +1001,7 @@ pub fn has_bundle_managed_metadata(provider: &Provider) -> bool {
         FAMILY_ID_FIELD,
         SURFACE_ENABLED_FIELD,
         MODEL_POLICY_SCOPE_FIELD,
+        TEST_APP_FIELD,
     ]
     .iter()
     .any(|field| provider.extra.contains_key(*field))
@@ -1054,7 +1118,6 @@ mod tests {
             model_policy: None,
             upstream_model: None,
             endpoint: None,
-            test_model: None,
             transport: ProviderTransportWriteDraft::default(),
             driver_options: ProviderDriverOptionsWriteDraft::default(),
             extra_headers: Vec::new(),
@@ -1075,6 +1138,8 @@ mod tests {
             model_policy_scope: ModelPolicyScope::Global,
             model_policy: Some(ModelPolicyKind::Single),
             upstream_model: Some("grok-4.5".to_string()),
+            test_app: AppKind::Claude,
+            test_model: None,
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "grok-account".to_string(),
                 auth_identity_generation: 1,
@@ -1106,6 +1171,8 @@ mod tests {
             model_policy_scope: ModelPolicyScope::PerApp,
             model_policy: None,
             upstream_model: None,
+            test_app: AppKind::Codex,
+            test_model: None,
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "openai-account".to_string(),
                 auth_identity_generation: 1,
@@ -1128,6 +1195,36 @@ mod tests {
                 json!({"mode": "single", "upstreamModel": "grok-4.5"})
             );
         }
+    }
+
+    #[test]
+    fn bundle_materializes_the_test_model_only_for_the_selected_app() {
+        let mut draft = grok_bundle();
+        draft.test_app = AppKind::Codex;
+        draft.test_model = Some("grok-health".to_string());
+
+        assert!(draft.validate().is_ok());
+        for surface in &draft.surfaces {
+            let provider = draft.provider_for_surface(surface).unwrap();
+            if surface.app == AppKind::Codex {
+                assert_eq!(provider.settings_config["testModel"], "grok-health");
+            } else {
+                assert!(provider.settings_config.get("testModel").is_none());
+            }
+            assert_eq!(provider.extra[TEST_APP_FIELD], "codex");
+        }
+    }
+
+    #[test]
+    fn bundle_rejects_a_disabled_test_app() {
+        let mut draft = grok_bundle();
+        draft.surfaces[0].enabled = false;
+
+        assert!(draft
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("test App must be enabled"));
     }
 
     #[test]

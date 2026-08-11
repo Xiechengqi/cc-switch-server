@@ -13,12 +13,14 @@ use serde::{Deserialize, Serialize};
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{RouterIdentity, ServerConfig, UpgradePolicyConfig};
 use crate::domain::sharing::router_contract::*;
+use crate::self_update::upgrade::UpgradeStatusSnapshot;
 use crate::self_update::version::LatestReleaseMeta;
 
 const ROUTER_LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const ROUTER_TUNNEL_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ROUTER_INSTALLATION_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_INSTALLATION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTER_INSTALLATION_UPGRADE_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_AUDIT_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_SETUP_COMPLETED_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTER_CONTROL_PLANE_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,6 +32,7 @@ const INSTALLATION_HEARTBEAT_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_PROTOCOL_VERSION: u8 = 1;
 const INSTALLATION_SETUP_COMPLETED_ACTION: &str = "installation_setup_completed_v1";
 pub const INSTALLATION_AUDIT_BATCH_ACTION: &str = "installation_audit_batch_v1";
+pub const INSTALLATION_UPGRADE_TASK_REPORT_ACTION: &str = "installation_upgrade_task_report_v1";
 const CLIENT_SUBDOMAIN_TAKEOVER_AUTHORIZATION_ACTION: &str =
     "client_subdomain_takeover_authorization";
 
@@ -514,6 +517,20 @@ struct ShareRequestLogBatchSyncRequest {
     nonce: String,
     signature: String,
     logs: Vec<ShareRequestLogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRequestLogSyncAck {
+    pub request_id: String,
+    pub usage_revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareRequestLogBatchSyncResponse {
+    #[serde(default)]
+    acks: Vec<ShareRequestLogSyncAck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2296,7 +2313,7 @@ pub async fn batch_sync_share_request_logs(
     http: &reqwest::Client,
     config: &ServerConfig,
     logs: Vec<ShareRequestLogEntry>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<ShareRequestLogSyncAck>> {
     let api_base = config
         .router_api_base()
         .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
@@ -2329,7 +2346,11 @@ pub async fn batch_sync_share_request_logs(
         .await
         .context("send router share request logs batch sync")?;
     if response.status().is_success() {
-        return Ok(());
+        return response
+            .json::<ShareRequestLogBatchSyncResponse>()
+            .await
+            .map(|response| response.acks)
+            .context("parse router share request logs batch sync response");
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -2668,6 +2689,49 @@ struct ReportInstallationStatusResponse {
     ok: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationUpgradeTaskReportResponse {
+    ok: bool,
+}
+
+pub async fn report_installation_upgrade_task(
+    http: &reqwest::Client,
+    config: &ServerConfig,
+    snapshot: UpgradeStatusSnapshot,
+) -> anyhow::Result<()> {
+    let api_base = config
+        .router_api_base()
+        .ok_or_else(|| anyhow::anyhow!("router api base is not configured"))?
+        .trim_end_matches('/');
+    let identity = config
+        .registered_router_identity()
+        .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let request = signed_request(identity, INSTALLATION_UPGRADE_TASK_REPORT_ACTION, snapshot)?;
+    let response = http
+        .post(format!("{api_base}/v1/installations/upgrade-task-report"))
+        .json(&request)
+        .timeout(ROUTER_INSTALLATION_UPGRADE_REPORT_TIMEOUT)
+        .send()
+        .await
+        .context("send router installation upgrade task report")?;
+    if response.status().is_success() {
+        let response = response
+            .json::<InstallationUpgradeTaskReportResponse>()
+            .await
+            .context("parse router installation upgrade task report response")?;
+        if !response.ok {
+            bail!("router rejected installation upgrade task report");
+        }
+        return Ok(());
+    }
+    let status = response.status();
+    let body = read_bounded_router_error_body(response)
+        .await
+        .unwrap_or_else(|error| error.to_string());
+    bail!("router installation upgrade task report failed: {status}: {body}")
+}
+
 pub async fn report_installation_status(
     http: &reqwest::Client,
     config: &ServerConfig,
@@ -2728,6 +2792,16 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    const GOLDEN_PRIVATE_KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const GOLDEN_PUBLIC_KEY_B64: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
+    const GOLDEN_INSTALLATION_ID: &str = "inst-signature-golden";
+    const GOLDEN_TIMESTAMP_MS: i64 = 1_786_412_345_678;
+    const GOLDEN_NONCE: &str = "golden-nonce-01";
+    const GOLDEN_PENDING_EDITS_SIGNATURE: &str =
+        "NJzUP/o+ARIo2U+KibgynZffeQq/241v5THPz27RkaKJ0s54z7Bf6ExQ4dg4iObhu3Gpvvn1aU5Xks5VF9oNDw==";
+    const GOLDEN_EDIT_ACK_SIGNATURE: &str =
+        "Hkrch4qOQ8Of/C3JLjkqY/Y4Eo/NFJ9OaK+LoXqYBeVlLprRXpJa2OMUYFzVeabhhSeXFxeK+DIEXAQ2/dpeCw==";
 
     #[derive(Debug, Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -2971,6 +3045,59 @@ mod tests {
     }
 
     #[test]
+    fn share_control_signature_golden_fixtures_match_router_contract() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = GOLDEN_INSTALLATION_ID.to_string();
+        identity.private_key = GOLDEN_PRIVATE_KEY_B64.to_string();
+        identity.public_key = GOLDEN_PUBLIC_KEY_B64.to_string();
+
+        let pending = SharePendingEditsPayload {
+            share_ids: vec!["share-alpha".to_string(), "share-beta".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_string(&pending).unwrap(),
+            r#"{"shareIds":["share-alpha","share-beta"]}"#
+        );
+        assert_eq!(
+            sign_payload(
+                &identity,
+                "share_pending_edits",
+                &pending,
+                GOLDEN_TIMESTAMP_MS,
+                GOLDEN_NONCE,
+            )
+            .unwrap(),
+            GOLDEN_PENDING_EDITS_SIGNATURE
+        );
+
+        let edit_ack = ShareEditAckEnvelope {
+            ack: ShareEditAckPayload {
+                edit_id: "edit-42".to_string(),
+                revision: 7,
+                status: "applied".to_string(),
+                error_message: None,
+                error_code: None,
+                retryable: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&edit_ack).unwrap(),
+            r#"{"ack":{"editId":"edit-42","revision":7,"status":"applied"}}"#
+        );
+        assert_eq!(
+            sign_payload(
+                &identity,
+                "share_edit_ack",
+                &edit_ack,
+                GOLDEN_TIMESTAMP_MS,
+                GOLDEN_NONCE,
+            )
+            .unwrap(),
+            GOLDEN_EDIT_ACK_SIGNATURE
+        );
+    }
+
+    #[test]
     fn signed_payload_changes_with_nonce() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-1".to_string();
@@ -2981,6 +3108,80 @@ mod tests {
         let second = sign_payload(&identity, "share_delete", &payload, 123, "nonce-2").unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn upgrade_task_report_uses_flattened_signed_router_contract() {
+        async fn handler(
+            State(captured): State<Arc<Mutex<Option<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            *captured.lock().await = Some(request);
+            Json(json!({ "ok": true }))
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/v1/installations/upgrade-task-report", post(handler))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = ServerConfig::empty();
+        config.router.url = Some(format!("http://{address}"));
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-upgrade-report".into();
+        config.router.identity = Some(identity.clone());
+        let snapshot = UpgradeStatusSnapshot {
+            task_id: "task-upgrade-report".into(),
+            status: crate::self_update::upgrade::UpgradeStatus::Failed,
+            restart_pending: false,
+            logs: vec![crate::self_update::upgrade::UpgradeLogEntry {
+                task_id: "task-upgrade-report".into(),
+                step: 7,
+                total_steps: 7,
+                level: crate::self_update::upgrade::UpgradeLogLevel::Error,
+                message: "replacement failed health checks".into(),
+                progress: None,
+                at: "2026-08-11T10:00:00Z".into(),
+            }],
+            target_commit_id: Some("aabbccddeeff".into()),
+            restart_after: true,
+            updated_at: "2026-08-11T10:00:01Z".into(),
+        };
+
+        report_installation_upgrade_task(&reqwest::Client::new(), &config, snapshot.clone())
+            .await
+            .expect("report upgrade task to router");
+
+        let request = captured
+            .lock()
+            .await
+            .clone()
+            .expect("router should receive upgrade task report");
+        assert_eq!(request["protocolEpoch"], PROTOCOL_EPOCH);
+        assert_eq!(request["installationId"], "inst-upgrade-report");
+        assert_eq!(request["taskId"], "task-upgrade-report");
+        assert_eq!(request["status"], "failed");
+        assert_eq!(request["logs"][0]["level"], "error");
+        assert!(request.get("payload").is_none());
+        let timestamp_ms = request["timestampMs"].as_i64().unwrap();
+        let nonce = request["nonce"].as_str().unwrap();
+        let expected_signature = sign_payload(
+            &identity,
+            INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+            &snapshot,
+            timestamp_ms,
+            nonce,
+        )
+        .unwrap();
+        assert_eq!(
+            request["signature"].as_str(),
+            Some(expected_signature.as_str())
+        );
+
+        server.abort();
     }
 
     #[test]

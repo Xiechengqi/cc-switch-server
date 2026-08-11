@@ -15,6 +15,7 @@ import {
   editProviderBundleDraft,
   familyCredentialSlots,
   modelPoliciesForFamily,
+  normalizeBundleTestApp,
   perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
   requiresPerAppModelPolicy,
@@ -81,9 +82,22 @@ describe("Provider Bundle drafts", () => {
       expect(
         draft.surfaces.every((surface) => !("settingsText" in surface)),
       ).toBe(true);
+      expect(draft.testApp, family.familyId).toBe(
+        family.familyId === "family.openai_oauth" &&
+          draft.surfaces.some(
+            (surface) => surface.app === "codex" && surface.enabled,
+          )
+          ? "codex"
+          : (["claude", "codex", "gemini"] as const).find((app) =>
+              draft.surfaces.some(
+                (surface) => surface.app === app && surface.enabled,
+              ),
+            ),
+      );
       for (const surface of toProviderBundleWriteDraft(draft).surfaces) {
         expect("settingsConfig" in surface, family.familyId).toBe(false);
         expect("meta" in surface, family.familyId).toBe(false);
+        expect("testModel" in surface, family.familyId).toBe(false);
       }
     }
     for (const driver of providerRegistry.drivers) {
@@ -94,6 +108,19 @@ describe("Provider Bundle drafts", () => {
         driver.driverId,
       ).toBe(true);
     }
+  });
+
+  it("selects one enabled test App and normalizes it after Surface changes", () => {
+    const grok = createProviderBundleDraft(familyById("family.grok_oauth")!);
+    expect(grok.testApp).toBe("claude");
+
+    grok.surfaces[0]!.enabled = false;
+    expect(normalizeBundleTestApp(grok).testApp).toBe("codex");
+
+    const openai = createProviderBundleDraft(
+      familyById("family.openai_oauth")!,
+    );
+    expect(openai.testApp).toBe("codex");
   });
 
   it("writes one shared model policy without Surface settings JSON", () => {
@@ -355,6 +382,7 @@ describe("Provider Bundle drafts", () => {
       revision: 3,
       name: "OpenAI OAuth",
       modelPolicyScope: "per_app",
+      testApp: "codex",
       supportedApps: ["claude", "codex"],
       enabledApps: ["claude", "codex"],
       credentialConfigured: true,
@@ -404,7 +432,6 @@ describe("Provider Bundle drafts", () => {
         surface,
         `https://${surface.app}.example/v${index + 1}`,
       ),
-      testModel: `${surface.app}-health-model`,
       transport: {
         timeoutMs: "60000",
         streamFirstByteTimeoutMs: "15000",
@@ -416,6 +443,8 @@ describe("Provider Bundle drafts", () => {
         clear: false,
       },
     }));
+    draft.testApp = "claude";
+    draft.testModel = "claude-health-model";
     draft.surfaces[0]!.customBinding = {
       upstreamProtocol: "anthropic_messages",
       authScheme: "custom_header",
@@ -425,9 +454,12 @@ describe("Provider Bundle drafts", () => {
     expect(validateProviderBundleDraft(draft)).toBeNull();
     const write = toProviderBundleWriteDraft(draft);
     expect(write.credentialPatches).toEqual({});
+    expect(write).toMatchObject({
+      testApp: "claude",
+      testModel: "claude-health-model",
+    });
     expect(write.surfaces[0]).toMatchObject({
       endpoint: "https://claude.example/v1",
-      testModel: "claude-health-model",
       transport: {
         timeoutMs: 60000,
         streamFirstByteTimeoutMs: 15000,
@@ -561,7 +593,6 @@ describe("Provider Bundle drafts", () => {
                       mode: "single",
                       upstreamModel: "persisted-disabled-model",
                     },
-                    testModel: "persisted-health-model",
                     transport: {
                       timeoutMs: 61_000,
                       streamFirstByteTimeoutMs: 16_000,
@@ -606,6 +637,8 @@ describe("Provider Bundle drafts", () => {
       revision: 2,
       name: source.name,
       modelPolicyScope: "global",
+      testApp: "codex",
+      testModel: "persisted-health-model",
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: ["codex", "gemini"],
       credentialConfigured: true,
@@ -620,7 +653,8 @@ describe("Provider Bundle drafts", () => {
     expect(edited.modelPolicy).toBe("single");
     expect(edited.upstreamModel).toBe("persisted-disabled-model");
     expect(edited.surfaces[0]?.runtime).toBeUndefined();
-    expect(edited.surfaces[0]?.testModel).toBe("persisted-health-model");
+    expect(edited.testApp).toBe("codex");
+    expect(edited.testModel).toBe("persisted-health-model");
     expect(edited.surfaces[0]?.transport).toEqual({
       timeoutMs: "61000",
       streamFirstByteTimeoutMs: "16000",
@@ -670,6 +704,8 @@ describe("Provider Bundle drafts", () => {
       name: source.name,
       websiteUrl: source.websiteUrl,
       modelPolicyScope: "global",
+      testApp: "claude",
+      testModel: "health-model",
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: family.surfaces.map((surface) => surface.app),
       credentialConfigured: true,
@@ -679,7 +715,8 @@ describe("Provider Bundle drafts", () => {
 
     const edited = editProviderBundleDraft(view);
     expect(edited.surfaces[0]?.runtime?.runtimeFingerprint).toBe("fixture");
-    expect(edited.surfaces[0]?.testModel).toBe("health-model");
+    expect(edited.testApp).toBe("claude");
+    expect(edited.testModel).toBe("health-model");
     expect(edited.surfaces[0]?.transport.timeoutMs).toBe("45000");
 
     const duplicate = duplicateProviderBundleDraft(view);

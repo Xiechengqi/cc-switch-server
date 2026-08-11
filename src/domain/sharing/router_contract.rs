@@ -569,6 +569,8 @@ pub struct ShareSyncOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareRequestLogEntry {
+    #[serde(default)]
+    pub export_sequence: u64,
     pub request_id: String,
     pub share_id: String,
     pub share_name: String,
@@ -1583,6 +1585,10 @@ mod tests {
             .provider
             .extra
             .insert("modelPolicyScope".to_string(), json!("global"));
+        provider
+            .provider
+            .extra
+            .insert("testApp".to_string(), json!("codex"));
         provider.resource.profile_id =
             Some(crate::domain::providers::registry::ProfileId::parse("codex.grok_oauth").unwrap());
         let providers = ProviderStore {

@@ -96,7 +96,6 @@ export interface BundleSurfaceEditorDraft {
   modelPolicy: ProviderModelPolicy;
   upstreamModel: string;
   endpoint: string;
-  testModel: string;
   transport: {
     timeoutMs: string;
     streamFirstByteTimeoutMs: string;
@@ -132,6 +131,8 @@ export interface ProviderBundleEditorDraft {
   modelPolicyScope: ProviderModelPolicyScope;
   modelPolicy: ProviderModelPolicy;
   upstreamModel: string;
+  testApp: CoreProviderApp;
+  testModel: string;
   secrets: Record<string, BundleSecretDraft>;
   surfaces: BundleSurfaceEditorDraft[];
 }
@@ -145,6 +146,47 @@ const DEFAULT_CUSTOM_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+export const BUNDLE_TEST_APP_ORDER: CoreProviderApp[] = [
+  "claude",
+  "codex",
+  "gemini",
+];
+
+export function defaultBundleTestApp(
+  family: ProviderFamilySpec,
+  surfaces: BundleSurfaceEditorDraft[],
+): CoreProviderApp {
+  const enabledApps = new Set(
+    surfaces.filter((surface) => surface.enabled).map((surface) => surface.app),
+  );
+  if (family.familyId === "family.openai_oauth" && enabledApps.has("codex")) {
+    return "codex";
+  }
+  return (
+    BUNDLE_TEST_APP_ORDER.find((app) => enabledApps.has(app)) ??
+    BUNDLE_TEST_APP_ORDER.find((app) =>
+      surfaces.some((surface) => surface.app === app),
+    ) ??
+    "claude"
+  );
+}
+
+export function normalizeBundleTestApp(
+  draft: ProviderBundleEditorDraft,
+): ProviderBundleEditorDraft {
+  if (
+    draft.surfaces.some(
+      (surface) => surface.app === draft.testApp && surface.enabled,
+    )
+  ) {
+    return draft;
+  }
+  const family = familyById(draft.familyId);
+  return family
+    ? { ...draft, testApp: defaultBundleTestApp(family, draft.surfaces) }
+    : draft;
 }
 
 function sourceSurface(
@@ -369,7 +411,6 @@ function surfaceFromResource(
     modelPolicy,
     upstreamModel,
     endpoint,
-    testModel: runtime?.testModel ?? stringOption(settings.testModel) ?? "",
     transport: {
       timeoutMs: runtime
         ? String(runtime.transportPolicy.timeoutMs)
@@ -454,6 +495,16 @@ export function createProviderBundleDraft(
   const sourceProfile = profileById(source.profileId)!;
   const sourcePreset = createDraftForProfile(sourceProfile);
   const model = initialBundleModel(family, surfaces);
+  const testApp = defaultBundleTestApp(family, surfaces);
+  const testSurface = surfaces.find((surface) => surface.app === testApp);
+  const testProfile = testSurface
+    ? profileById(testSurface.profileId)
+    : undefined;
+  const testModel = testProfile
+    ? (stringOption(
+        createDraftForProfile(testProfile).settingsConfig.testModel,
+      ) ?? "")
+    : "";
   const secrets = Object.fromEntries(
     credentialSlotsForFamily(family).map(({ pointer }) => [
       pointer,
@@ -477,6 +528,8 @@ export function createProviderBundleDraft(
     modelPolicyScope: requiresPerAppModelPolicy(family) ? "per_app" : "global",
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
+    testApp,
+    testModel,
     secrets,
     surfaces,
   };
@@ -498,7 +551,7 @@ export function applyCustomRecipeToBundleDraft(
     );
   }
   const defaultModel = targetProfile.defaultUpstreamModel ?? "";
-  return {
+  return normalizeBundleTestApp({
     ...draft,
     name: recipe.label,
     websiteUrl: "",
@@ -528,7 +581,7 @@ export function applyCustomRecipeToBundleDraft(
         },
       };
     }),
-  };
+  });
 }
 
 export function customRecipeMatchesBundleDraft(
@@ -610,6 +663,8 @@ export function editProviderBundleDraft(
       : bundle.modelPolicyScope,
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
+    testApp: bundle.testApp,
+    testModel: bundle.testModel ?? "",
     secrets,
     surfaces,
   };
@@ -882,7 +937,6 @@ function surfaceWriteDraft(
         ? surface.upstreamModel.trim()
         : undefined,
     endpoint: endpoint || undefined,
-    testModel: surface.testModel.trim() || undefined,
     transport: {
       timeoutMs: optionalDuration(surface.transport.timeoutMs),
       streamFirstByteTimeoutMs: optionalDuration(
@@ -937,6 +991,16 @@ export function validateProviderBundleDraft(
   if (!draft.name.trim()) return "Provider name is required";
   if (!draft.surfaces.some((surface) => surface.enabled)) {
     return "Enable at least one API Surface";
+  }
+  if (
+    !draft.surfaces.some(
+      (surface) => surface.app === draft.testApp && surface.enabled,
+    )
+  ) {
+    return "Test App must be enabled";
+  }
+  if (draft.testModel.trim().length > 256) {
+    return "Test model is too long";
   }
   const credentialProfile = profileById(family.credentialProfileId);
   if (!credentialProfile) return "Credential profile is unavailable";
@@ -999,9 +1063,6 @@ export function validateProviderBundleDraft(
       if (surface.modelPolicy === "single" && !surface.upstreamModel.trim()) {
         return `${surface.app} upstream model is required`;
       }
-    }
-    if (surface.testModel.trim().length > 256) {
-      return `${surface.app} test model is too long`;
     }
     if (!validateDuration(surface.transport.timeoutMs, 1_000, 3_600_000)) {
       return `${surface.app} request timeout is invalid`;
@@ -1114,6 +1175,8 @@ export function toProviderBundleWriteDraft(
       draft.modelPolicyScope === "global" && draft.modelPolicy === "single"
         ? draft.upstreamModel.trim()
         : undefined,
+    testApp: draft.testApp,
+    testModel: draft.testModel.trim() || undefined,
     managedAccount:
       credentialProfileForFamily(family)?.credentialPolicy.mode ===
         "managed_account" && draft.accountGeneration != null

@@ -291,6 +291,14 @@ pub struct UsageLog {
     pub router_last_sync_error: Option<String>,
     #[serde(default)]
     pub router_sync_attempt_count: u32,
+    #[serde(default)]
+    pub router_export_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_synced_usage_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_last_sync_attempt_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_next_sync_attempt_at_ms: Option<u128>,
     pub created_at_ms: u128,
 }
 
@@ -314,6 +322,15 @@ impl UsageLog {
         } else {
             self.total_tokens.unwrap_or(0)
         }
+    }
+
+    pub fn reset_router_sync_state(&mut self) {
+        self.router_last_synced_at_ms = None;
+        self.router_last_sync_error = None;
+        self.router_sync_attempt_count = 0;
+        self.router_synced_usage_revision = None;
+        self.router_last_sync_attempt_at_ms = None;
+        self.router_next_sync_attempt_at_ms = None;
     }
 }
 
@@ -454,6 +471,11 @@ impl UsageStore {
 
     fn recover_pending_after_restart(&mut self) -> bool {
         let now = now_ms();
+        let mut export_sequence = self
+            .journal_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.through_sequence)
+            .unwrap_or_default();
         let mut replacements = Vec::new();
         for log in &mut self.logs {
             if log.record_kind != UsageRecordKind::UserInference
@@ -468,10 +490,16 @@ impl UsageStore {
             log.completed_at_ms = now;
             log.end_to_end_duration_ms = now.saturating_sub(log.started_at_ms);
             log.usage_revision = log.usage_revision.saturating_add(1);
+            log.reset_router_sync_state();
+            export_sequence = export_sequence.saturating_add(1);
+            log.router_export_sequence = export_sequence;
             replacements.push((previous, log.clone()));
         }
         for (previous, updated) in &replacements {
             self.rollups.replace_log(previous, updated);
+        }
+        if !replacements.is_empty() {
+            self.advance_journal_checkpoint(export_sequence);
         }
         !replacements.is_empty()
     }
@@ -602,12 +630,23 @@ impl UsageStore {
         self.trim_recent_window();
     }
 
-    pub(crate) fn prepare_append(&self, log: UsageLog) -> anyhow::Result<PreparedUsageAppend> {
+    pub(crate) fn prepare_append(&self, mut log: UsageLog) -> anyhow::Result<PreparedUsageAppend> {
         let checkpoint = self
             .journal_checkpoint
             .as_ref()
             .context("usage journal checkpoint is unavailable")?;
         let sequence = checkpoint.through_sequence.saturating_add(1);
+        let existing = self
+            .logs
+            .iter()
+            .find(|existing| existing.request_id == log.request_id);
+        if existing.is_none_or(|existing| {
+            existing.usage_revision != log.usage_revision || existing.router_export_sequence == 0
+        }) {
+            log.router_export_sequence = sequence;
+        } else if let Some(existing) = existing {
+            log.router_export_sequence = existing.router_export_sequence;
+        }
         Ok(PreparedUsageAppend {
             record: UsageJournalRecord {
                 version: USAGE_JOURNAL_VERSION,
@@ -811,6 +850,10 @@ impl UsageLog {
             router_last_synced_at_ms: None,
             router_last_sync_error: None,
             router_sync_attempt_count: 0,
+            router_export_sequence: 0,
+            router_synced_usage_revision: None,
+            router_last_sync_attempt_at_ms: None,
+            router_next_sync_attempt_at_ms: None,
             created_at_ms: started_at_ms,
         }
     }

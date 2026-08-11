@@ -105,7 +105,7 @@ pub(super) async fn log_usage(
             .id(request_id.clone())
             .app(stored.app),
     );
-    crate::state::sync_latest_direct_share_log(state.clone()).await;
+    crate::state::notify_router_share_log_sync(state);
     request_id
 }
 
@@ -183,9 +183,7 @@ async fn update_stream_usage_with_parse_status(
                 stream_status,
             );
             if router_visible_changed {
-                log.router_last_synced_at_ms = None;
-                log.router_last_sync_error = None;
-                log.router_sync_attempt_count = 0;
+                log.reset_router_sync_state();
             }
         })
         .await;
@@ -213,7 +211,7 @@ async fn update_stream_usage_with_parse_status(
             .app(stored.app)
             .message(stream_status.unwrap_or("stream")),
     );
-    crate::state::sync_latest_direct_share_log(state.clone()).await;
+    crate::state::notify_router_share_log_sync(state);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -258,9 +256,7 @@ pub(super) async fn update_image_stream_usage(
                 log.image_size = image.size;
             }
             if router_visible_changed {
-                log.router_last_synced_at_ms = None;
-                log.router_last_sync_error = None;
-                log.router_sync_attempt_count = 0;
+                log.reset_router_sync_state();
             }
         })
         .await;
@@ -288,7 +284,7 @@ pub(super) async fn update_image_stream_usage(
             .app(stored.app)
             .message(stream_status),
     );
-    crate::state::sync_latest_direct_share_log(state.clone()).await;
+    crate::state::notify_router_share_log_sync(state);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -318,9 +314,7 @@ pub(super) async fn update_websocket_stream_usage(
             router_visible_changed |= log.error_message != next_error;
             log.error_message = next_error;
             if router_visible_changed {
-                log.router_last_synced_at_ms = None;
-                log.router_last_sync_error = None;
-                log.router_sync_attempt_count = 0;
+                log.reset_router_sync_state();
             }
         })
         .await;
@@ -348,7 +342,7 @@ pub(super) async fn update_websocket_stream_usage(
             .app(stored.app)
             .message(stream_status),
     );
-    crate::state::sync_latest_direct_share_log(state.clone()).await;
+    crate::state::notify_router_share_log_sync(state);
 }
 
 fn apply_stream_usage_fields(
@@ -489,8 +483,19 @@ mod tests {
                         Arc<Mutex<Vec<Value>>>,
                     >,
                      Json(body): Json<Value>| async move {
+                        let acks = body["logs"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|log| {
+                                json!({
+                                    "requestId": log["requestId"],
+                                    "usageRevision": log["usageRevision"],
+                                })
+                            })
+                            .collect::<Vec<_>>();
                         payloads.lock().await.push(body);
-                        Json(json!({"ok": true}))
+                        Json(json!({"ok": true, "acks": acks}))
                     },
                 ),
             )
@@ -587,7 +592,7 @@ mod tests {
                 request_id: Some(REQUEST_ID.to_string()),
                 share_id: Some("share-stream-usage".to_string()),
                 share_name: Some("Stream Usage Share".to_string()),
-                data_source: Some("direct".to_string()),
+                data_source: Some("router_share".to_string()),
                 is_streaming: true,
                 stream_status: Some("pending".to_string()),
                 ..UsageLogContext::default()
@@ -595,6 +600,9 @@ mod tests {
         )
         .await;
         assert_eq!(logged_request_id, REQUEST_ID);
+        let initial_sync =
+            crate::state::sync_pending_router_share_logs(state.clone(), 100, true).await;
+        assert_eq!(initial_sync.synced, 1);
 
         update_stream_usage(
             &state,
@@ -614,6 +622,9 @@ mod tests {
             Some("completed"),
         )
         .await;
+        let terminal_sync =
+            crate::state::sync_pending_router_share_logs(state.clone(), 100, true).await;
+        assert_eq!(terminal_sync.synced, 1);
 
         let payloads = payloads.lock().await;
         assert_eq!(payloads.len(), 2);

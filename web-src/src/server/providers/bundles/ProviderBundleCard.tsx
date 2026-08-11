@@ -52,6 +52,7 @@ import { getProviderSharePhase } from "@/utils/shareUtils";
 import {
   providerBundleDisplayTarget,
   providerBundlePrimaryResource,
+  providerBundleTestResource,
 } from "./bundleCard";
 
 const APP_LABELS: Record<CoreProviderApp, string> = {
@@ -144,17 +145,6 @@ function operationResource(
     );
 }
 
-function operationResources(
-  bundle: ProviderBundleView,
-  supports: (resource: ProviderResource) => boolean,
-): ProviderResource[] {
-  return bundle.enabledApps
-    .map((app) => bundle.surfaces[app])
-    .filter((resource): resource is ProviderResource =>
-      Boolean(resource && supports(resource)),
-    );
-}
-
 interface ProviderBundleCardProps {
   bundle: ProviderBundleView;
   share?: ShareRecord;
@@ -189,7 +179,11 @@ export function ProviderBundleCard({
   const { t } = useTranslation();
   const primaryResource = providerBundlePrimaryResource(bundle);
   const connectivityResource = operationResource(bundle, supportsConnectivity);
-  const modelResources = operationResources(bundle, supportsModelTest);
+  const configuredModelResource = providerBundleTestResource(bundle);
+  const modelResource =
+    configuredModelResource && supportsModelTest(configuredModelResource)
+      ? configuredModelResource
+      : undefined;
   const connectivityApp =
     connectivityResource?.app ?? primaryResource?.app ?? "claude";
   const { checkProvider, isChecking } = useStreamCheck(connectivityApp);
@@ -201,9 +195,11 @@ export function ProviderBundleCard({
     codex: codexModelTest,
     gemini: geminiModelTest,
   };
+  const modelTest = modelTests[bundle.testApp];
+  const healthResource = configuredModelResource ?? primaryResource;
   const { data: health } = useProviderHealth(
-    primaryResource?.provider.id ?? bundle.id,
-    primaryResource?.app ?? "claude",
+    healthResource?.provider.id ?? bundle.id,
+    healthResource?.app ?? bundle.testApp,
   );
   const target = providerBundleDisplayTarget(bundle, accounts);
   const targetText =
@@ -229,8 +225,8 @@ export function ProviderBundleCard({
         ? t("provider.share.resumeShort", { defaultValue: "开启分享" })
         : t("provider.share.enable", { defaultValue: "分享" });
   const connectivityId = connectivityResource?.provider.id ?? bundle.id;
-  const modelTesting = modelResources.some((resource) =>
-    modelTests[resource.app].isTesting(resource.provider.id),
+  const modelTesting = Boolean(
+    modelResource && modelTest.isTesting(modelResource.provider.id),
   );
   const modelSummaries = bundle.enabledApps.flatMap((app) => {
     const resource = bundle.surfaces[app];
@@ -518,20 +514,16 @@ export function ProviderBundleCard({
                 variant="ghost"
                 className={cn(
                   iconButtonClass,
-                  modelResources.length === 0 &&
+                  !modelResource &&
                     "cursor-not-allowed text-muted-foreground opacity-40",
                 )}
-                disabled={modelResources.length === 0 || modelTesting}
-                title={t("providerBundle.testAllModels")}
+                disabled={!modelResource || modelTesting}
+                title={t("providerBundle.testModel")}
                 onClick={() => {
-                  if (modelResources.length === 0) return;
-                  void Promise.all(
-                    modelResources.map((resource) =>
-                      modelTests[resource.app].testProvider(
-                        resource.provider.id,
-                        `${bundle.name} / ${APP_LABELS[resource.app]}`,
-                      ),
-                    ),
+                  if (!modelResource) return;
+                  void modelTest.testProvider(
+                    modelResource.provider.id,
+                    `${bundle.name} / ${APP_LABELS[modelResource.app]}`,
                   );
                 }}
               >

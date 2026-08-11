@@ -98,6 +98,8 @@ export interface ProviderBundleView {
   icon?: string;
   iconColor?: string;
   modelPolicyScope: ProviderModelPolicyScope;
+  testApp: CoreProviderApp;
+  testModel?: string;
   supportedApps: CoreProviderApp[];
   enabledApps: CoreProviderApp[];
   credentialConfigured: boolean;
@@ -112,7 +114,6 @@ export interface ProviderBundleSurfaceWriteDraft {
   modelPolicy?: ProviderModelPolicy;
   upstreamModel?: string;
   endpoint?: string;
-  testModel?: string;
   transport?: {
     timeoutMs?: number;
     streamFirstByteTimeoutMs?: number;
@@ -141,6 +142,8 @@ export interface ProviderBundleWriteDraft {
   modelPolicyScope: ProviderModelPolicyScope;
   modelPolicy?: ProviderModelPolicy;
   upstreamModel?: string;
+  testApp: CoreProviderApp;
+  testModel?: string;
   managedAccount?: {
     accountId: string;
     authIdentityGeneration: number;

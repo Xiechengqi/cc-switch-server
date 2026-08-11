@@ -407,6 +407,7 @@ dependencies = [
  "image",
  "imagesize",
  "jsonwebtoken",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "multer",

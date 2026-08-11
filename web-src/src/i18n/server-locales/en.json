@@ -104,8 +104,8 @@
     "surfaceEnabled": "Enable API",
     "surfaces": "API Surfaces",
     "streamIdleTimeout": "Stream idle timeout (milliseconds)",
+    "testApp": "Test App",
     "testModel": "Test model",
-    "testAllModels": "Test models for all Apps",
     "title": "Providers"
   },
   "provider": {

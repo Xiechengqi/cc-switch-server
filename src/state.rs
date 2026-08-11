@@ -67,9 +67,9 @@ use crate::domain::accounts::store::{
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
     bundle_id as provider_bundle_id, bundle_model_policy_scope, bundle_model_policy_source,
-    credential_source_app, has_bundle_managed_metadata, is_explicit_bundle_surface,
-    surface_enabled, ModelPolicyScope, ProviderBundleReferencePreview, ProviderBundleView,
-    ProviderBundleWriteDraft,
+    bundle_test_app, credential_source_app, has_bundle_managed_metadata,
+    is_explicit_bundle_surface, surface_enabled, ModelPolicyScope, ProviderBundleReferencePreview,
+    ProviderBundleView, ProviderBundleWriteDraft,
 };
 use crate::domain::providers::credentials::{
     merge_provider_credentials, reveal_provider_credential, CredentialPatch,
@@ -714,6 +714,8 @@ pub struct ServerStateInner {
     setup_flight: AsyncMutex<()>,
     router_share_sync: AsyncMutex<()>,
     share_edit_sync: AsyncMutex<()>,
+    router_share_runtime_refreshes: Mutex<BTreeSet<String>>,
+    router_request_log_sync_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
     // Low bit marks degraded persistence; upper bits form a monotonic failure generation.
@@ -731,6 +733,7 @@ pub struct ServerStateInner {
     client_tunnel_claim_commit_failures: std::sync::atomic::AtomicU64,
     pub http_client: RwLock<reqwest::Client>,
     pub events: broadcast::Sender<ServerEvent>,
+    shutdown: watch::Sender<bool>,
     pub tunnels: Arc<TunnelSupervisor>,
     pub web_auth: crate::domain::web_auth::WebAuthStore,
     pub debounced_saves: Arc<DebouncedStoreSaves>,
@@ -3619,7 +3622,7 @@ fn provider_share_projection_signature(
     store: &ProviderStore,
     app: AppKind,
     provider_id: &str,
-) -> Option<(String, String, String)> {
+) -> Option<(String, String, String, String)> {
     let stored = store
         .providers
         .iter()
@@ -3641,7 +3644,17 @@ fn provider_share_projection_signature(
     let model_policy_source = bundle_model_policy_source(&stored.provider, profile)
         .map(|source| source.as_str().to_string())
         .unwrap_or_else(|error| format!("invalid:{error}"));
-    Some((runtime_fingerprint, model_policy_scope, model_policy_source))
+    let test_app = match bundle_test_app(&stored.provider) {
+        Ok(Some(app)) => app.as_str().to_string(),
+        Ok(None) => "none".to_string(),
+        Err(error) => format!("invalid:{error}"),
+    };
+    Some((
+        runtime_fingerprint,
+        model_policy_scope,
+        model_policy_source,
+        test_app,
+    ))
 }
 
 fn provider_share_projection_changes(
@@ -4732,6 +4745,7 @@ impl ServerStateInner {
         let bind_addr = SocketAddr::new(cli.host, cli.port);
         let http_client = build_http_client()?;
         let (events, _) = broadcast::channel(256);
+        let (shutdown, _) = watch::channel(false);
         let mut provider_import_preview_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut provider_import_preview_key);
 
@@ -4807,6 +4821,8 @@ impl ServerStateInner {
             setup_flight: AsyncMutex::new(()),
             router_share_sync: AsyncMutex::new(()),
             share_edit_sync: AsyncMutex::new(()),
+            router_share_runtime_refreshes: Mutex::new(BTreeSet::new()),
+            router_request_log_sync_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
             credential_persistence_state: std::sync::atomic::AtomicU64::new(0),
@@ -4823,6 +4839,7 @@ impl ServerStateInner {
             client_tunnel_claim_commit_failures: std::sync::atomic::AtomicU64::new(0),
             http_client: RwLock::new(http_client),
             events,
+            shutdown,
             tunnels,
             web_auth,
             debounced_saves: Arc::new(DebouncedStoreSaves::default()),
@@ -5851,6 +5868,18 @@ impl ServerStateInner {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
         self.events.subscribe()
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> bool {
+        !self.shutdown.send_replace(true)
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     pub async fn providers_snapshot(&self) -> ProviderStore {
@@ -9068,6 +9097,35 @@ impl ServerStateInner {
         self.commit_usage_append(append).await.map(Some)
     }
 
+    pub(crate) async fn update_usage_log_if(
+        &self,
+        request_id: &str,
+        update: impl FnOnce(&mut UsageLog) -> bool,
+    ) -> anyhow::Result<bool> {
+        let _commit = self.usage_persistence.gate.lock().await;
+        let append = {
+            let usage = self.usage.read().await;
+            let Some(mut updated) = usage
+                .logs
+                .iter()
+                .find(|log| log.request_id == request_id)
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            if !update(&mut updated) {
+                return Ok(false);
+            }
+            usage.prepare_append(updated)?
+        };
+        self.commit_usage_append(append).await?;
+        Ok(true)
+    }
+
+    fn notify_router_share_log_sync(&self) {
+        self.router_request_log_sync_wakeup.notify_one();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finalize_usage_request_lifecycle(
         &self,
@@ -9103,10 +9161,12 @@ impl ServerStateInner {
                     log.usage_state = UsageState::Missing;
                 }
                 log.usage_revision = log.usage_revision.saturating_add(1);
+                log.reset_router_sync_state();
             })
             .await
         {
             Ok(Some(_)) => {
+                self.notify_router_share_log_sync();
                 self.emit_event(
                     ServerEvent::new("usage.updated", "usage")
                         .id(request_id)
@@ -9176,6 +9236,7 @@ impl ServerStateInner {
             tracing::warn!(request_id, error = %error, "failed to persist unresolved Usage request");
             return;
         }
+        self.notify_router_share_log_sync();
         self.emit_event(
             ServerEvent::new("usage.created", "usage")
                 .id(request_id)
@@ -11879,6 +11940,74 @@ pub fn spawn_periodic_installation_status_report(state: ServerState) {
     });
 }
 
+const UPGRADE_TASK_REPORT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const UPGRADE_TASK_RUNNING_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+
+pub fn spawn_installation_upgrade_task_reporter(state: ServerState) {
+    tokio::spawn(async move {
+        let mut shutdown = state.subscribe_shutdown();
+        let mut last_reported_fingerprint = None::<String>;
+        let mut last_running_report = None::<Instant>;
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if let Some(snapshot) = state.upgrade.status_snapshot().await {
+                let fingerprint = installation_upgrade_task_fingerprint(&snapshot);
+                let running = matches!(
+                    snapshot.status,
+                    crate::self_update::upgrade::UpgradeStatus::Running
+                );
+                let running_report_due = running
+                    && last_running_report.is_none_or(|reported| {
+                        reported.elapsed() >= UPGRADE_TASK_RUNNING_REPORT_INTERVAL
+                    });
+                if last_reported_fingerprint.as_deref() != Some(fingerprint.as_str())
+                    || running_report_due
+                {
+                    let config = state.config_snapshot().await;
+                    if config.has_registered_router_identity() {
+                        let http = state.http_client().await;
+                        match client::report_installation_upgrade_task(&http, &config, snapshot)
+                            .await
+                        {
+                            Ok(()) => {
+                                last_reported_fingerprint = Some(fingerprint);
+                                if running {
+                                    last_running_report = Some(Instant::now());
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    %error,
+                                    "installation upgrade task report failed; retrying"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = sleep(UPGRADE_TASK_REPORT_POLL_INTERVAL) => {}
+            }
+        }
+    });
+}
+
+fn installation_upgrade_task_fingerprint(
+    snapshot: &crate::self_update::upgrade::UpgradeStatusSnapshot,
+) -> String {
+    let mut snapshot = snapshot.clone();
+    snapshot.updated_at.clear();
+    let bytes = serde_json::to_vec(&snapshot).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
+}
+
 const DEFAULT_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 const MIN_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const MAX_ROUTER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
@@ -13257,11 +13386,18 @@ fn share_tunnel_restore_ids(shares: &[crate::domain::sharing::shares::Share]) ->
         .collect()
 }
 
-pub async fn ensure_share_tunnel_running(state: ServerState, share_id: &str) {
-    ensure_share_tunnel_running_for(state, share_id, "share_state_ensure").await;
+pub async fn ensure_share_tunnel_running(
+    state: ServerState,
+    share_id: &str,
+) -> Option<tunnel::TunnelStartOutcome> {
+    ensure_share_tunnel_running_for(state, share_id, "share_state_ensure").await
 }
 
-pub async fn ensure_share_tunnel_running_for(state: ServerState, share_id: &str, reason: &str) {
+pub async fn ensure_share_tunnel_running_for(
+    state: ServerState,
+    share_id: &str,
+    reason: &str,
+) -> Option<tunnel::TunnelStartOutcome> {
     let (share, binding_error) = {
         let providers = state.providers.read().await;
         let accounts = state.accounts.read().await;
@@ -13276,7 +13412,7 @@ pub async fn ensure_share_tunnel_running_for(state: ServerState, share_id: &str,
         (share, binding_error)
     };
     let Some(share) = share else {
-        return;
+        return None;
     };
     if let Some(error) = binding_error {
         tracing::error!(
@@ -13292,12 +13428,12 @@ pub async fn ensure_share_tunnel_running_for(state: ServerState, share_id: &str,
                 "subscription_binding_invalid",
             )
             .await;
-        return;
+        return None;
     }
     if !should_restore_share_tunnel(&share) {
-        return;
+        return None;
     }
-    ensure_share_tunnel_actor(state, share.id, reason).await;
+    Some(ensure_share_tunnel_actor(state, share.id, reason).await)
 }
 
 pub async fn start_client_tunnel(state: ServerState) {
@@ -13366,7 +13502,11 @@ pub async fn start_share_tunnel(state: ServerState, share_id: String) {
     ensure_share_tunnel_running_for(state, &share_id, "share_tunnel_start").await;
 }
 
-async fn ensure_share_tunnel_actor(state: ServerState, share_id: String, reason: &str) {
+async fn ensure_share_tunnel_actor(
+    state: ServerState,
+    share_id: String,
+    reason: &str,
+) -> tunnel::TunnelStartOutcome {
     let local_addr = tunnel::local_forward_addr(state.bind_addr);
     let key = tunnel::share_tunnel_key(&share_id);
     let spec_id = share_tunnel_spec_id(&state, &share_id, &local_addr).await;
@@ -13385,7 +13525,7 @@ async fn ensure_share_tunnel_actor(state: ServerState, share_id: String, reason:
             reason,
             spec_id,
         )
-        .await;
+        .await
 }
 
 pub async fn force_reconnect_share_tunnel(state: ServerState, share_id: String, reason: &str) {
@@ -13602,8 +13742,23 @@ pub async fn stop_share_tunnel(state: &ServerState, share_id: &str) {
         .await;
 }
 
-pub async fn sync_latest_direct_share_log(state: ServerState) {
-    let _ = sync_pending_direct_share_logs(state, 1, false).await;
+pub fn notify_router_share_log_sync(state: &ServerState) {
+    state.notify_router_share_log_sync();
+}
+
+pub fn spawn_router_share_log_sync_worker(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            let summary = sync_pending_router_share_logs(state.clone(), 100, false).await;
+            if summary.synced >= 100 {
+                continue;
+            }
+            tokio::select! {
+                _ = state.router_request_log_sync_wakeup.notified() => {}
+                _ = sleep(Duration::from_secs(15)) => {}
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13613,27 +13768,30 @@ pub struct RouterLogSyncSummary {
     pub failed: usize,
 }
 
-pub async fn sync_pending_direct_share_logs(
+pub async fn sync_pending_router_share_logs(
     state: ServerState,
     limit: usize,
-    retry_failed: bool,
+    force_retry: bool,
 ) -> RouterLogSyncSummary {
-    let logs = {
+    let now_ms = crate::infra::time::now_ms();
+    let mut logs = {
         let usage = state.usage.read().await;
         usage
             .logs
             .iter()
+            .filter(|log| eligible_router_share_log(log))
             .filter(|log| {
-                log.share_id.is_some()
-                    && log.data_source.as_deref() == Some("direct")
-                    && log.router_last_synced_at_ms.is_none()
-                    && (retry_failed || log.router_sync_attempt_count < 3)
-                    && is_router_request_id(&log.request_id)
+                log.router_last_synced_at_ms.is_none()
+                    && (force_retry
+                        || log
+                            .router_next_sync_attempt_at_ms
+                            .is_none_or(|next_attempt| next_attempt <= now_ms))
             })
-            .take(limit)
             .cloned()
             .collect::<Vec<_>>()
     };
+    logs.sort_by_key(|log| log.router_export_sequence);
+    logs.truncate(limit);
     let mut summary = RouterLogSyncSummary::default();
     if logs.is_empty() {
         return summary;
@@ -13642,28 +13800,64 @@ pub async fn sync_pending_direct_share_logs(
     if !config.has_registered_router_identity() {
         return summary;
     }
+    let mut entries = Vec::with_capacity(logs.len());
+    let mut sent_logs = Vec::with_capacity(logs.len());
     for log in logs {
-        summary.attempted += 1;
         let Some(entry) = share_request_log_entry(&state, &log).await else {
-            mark_usage_router_sync(
-                &state,
-                &log.request_id,
-                Err("share not found for router request log sync".to_string()),
-            )
-            .await;
-            summary.failed += 1;
+            let _ =
+                mark_usage_router_sync_success(&state, &log.request_id, log.usage_revision).await;
             continue;
         };
-        let http_client = state.http_client().await;
-        let result = client::batch_sync_share_request_logs(&http_client, &config, vec![entry])
-            .await
-            .map_err(|error| error.to_string());
-        if result.is_ok() {
-            summary.synced += 1;
-        } else {
-            summary.failed += 1;
+        entries.push(entry);
+        sent_logs.push(log);
+    }
+    if entries.is_empty() {
+        return summary;
+    }
+    summary.attempted = entries.len();
+    let http_client = state.http_client().await;
+    match client::batch_sync_share_request_logs(&http_client, &config, entries).await {
+        Ok(acks) => {
+            let acked = acks
+                .into_iter()
+                .map(|ack| ((ack.request_id, ack.usage_revision), ()))
+                .collect::<BTreeMap<_, _>>();
+            for log in sent_logs {
+                if acked.contains_key(&(log.request_id.clone(), log.usage_revision)) {
+                    if mark_usage_router_sync_success(&state, &log.request_id, log.usage_revision)
+                        .await
+                    {
+                        summary.synced += 1;
+                    }
+                } else {
+                    if mark_usage_router_sync_failure(
+                        &state,
+                        &log.request_id,
+                        log.usage_revision,
+                        "router omitted the request log revision ACK".to_string(),
+                    )
+                    .await
+                    {
+                        summary.failed += 1;
+                    }
+                }
+            }
         }
-        mark_usage_router_sync(&state, &log.request_id, result).await;
+        Err(error) => {
+            let message = error.to_string();
+            for log in sent_logs {
+                if mark_usage_router_sync_failure(
+                    &state,
+                    &log.request_id,
+                    log.usage_revision,
+                    message.clone(),
+                )
+                .await
+                {
+                    summary.failed += 1;
+                }
+            }
+        }
     }
     summary
 }
@@ -13673,12 +13867,7 @@ pub async fn pending_router_log_count(state: &ServerState) -> usize {
     usage
         .logs
         .iter()
-        .filter(|log| {
-            log.share_id.is_some()
-                && log.data_source.as_deref() == Some("direct")
-                && log.router_last_synced_at_ms.is_none()
-                && is_router_request_id(&log.request_id)
-        })
+        .filter(|log| eligible_router_share_log(log) && log.router_last_synced_at_ms.is_none())
         .count()
 }
 
@@ -13836,40 +14025,199 @@ pub(crate) async fn sync_one_share_to_router(
     sync_one_share_to_router_locked(state, share_id).await
 }
 
+const SHARE_RUNTIME_REFRESH_INLINE_READINESS_TIMEOUT: Duration = Duration::from_secs(3);
+const SHARE_RUNTIME_REFRESH_BACKGROUND_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct RouterShareRuntimeRefreshFlight {
+    state: ServerState,
+    share_id: String,
+}
+
+impl Drop for RouterShareRuntimeRefreshFlight {
+    fn drop(&mut self) {
+        self.state
+            .router_share_runtime_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.share_id);
+    }
+}
+
+fn try_begin_router_share_runtime_refresh(
+    state: &ServerState,
+    share_id: &str,
+) -> Option<RouterShareRuntimeRefreshFlight> {
+    let inserted = state
+        .router_share_runtime_refreshes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(share_id.to_string());
+    inserted.then(|| RouterShareRuntimeRefreshFlight {
+        state: state.clone(),
+        share_id: share_id.to_string(),
+    })
+}
+
 pub(crate) async fn sync_share_to_router_with_runtime_refresh(
     state: &ServerState,
     share_id: &str,
 ) -> anyhow::Result<()> {
-    let _sync = state.lock_router_share_sync().await;
-    sync_one_share_to_router_locked(state, share_id).await?;
-    let Some((share_id, subdomain)) = state.shares.read().await.get(share_id).and_then(|share| {
-        share
-            .tunnel_subdomain
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|subdomain| (share.id.clone(), subdomain.to_string()))
-    }) else {
+    {
+        let _sync = state.lock_router_share_sync().await;
+        sync_one_share_to_router_locked(state, share_id).await?;
+    }
+    let Some(flight) = try_begin_router_share_runtime_refresh(state, share_id) else {
         return Ok(());
     };
-    let config = state.config_snapshot().await;
-    let http_client = state.http_client().await;
-    if let Err(error) =
-        client::notify_runtime_refresh(&http_client, &config, share_id.clone(), subdomain).await
+
+    match refresh_router_share_runtime_when_ready(
+        state,
+        share_id,
+        SHARE_RUNTIME_REFRESH_INLINE_READINESS_TIMEOUT,
+    )
+    .await
     {
-        let message = error.to_string();
-        state
-            .mutate_shares_immediate(|store| {
-                store.last_router_error = Some(message.clone());
-                if let Some(share) = store.shares.iter_mut().find(|share| share.id == share_id) {
-                    share.router_last_sync_error = Some(message.clone());
+        Ok(()) => Ok(()),
+        Err(error) if router_share_runtime_readiness_timed_out(&error) => {
+            tracing::info!(
+                share_id,
+                timeout_seconds = SHARE_RUNTIME_REFRESH_INLINE_READINESS_TIMEOUT.as_secs(),
+                "Router Share runtime refresh is waiting for the tunnel in the background"
+            );
+            let background_state = state.clone();
+            let background_share_id = share_id.to_string();
+            tokio::spawn(async move {
+                let _flight = flight;
+                if let Err(error) = refresh_router_share_runtime_when_ready(
+                    &background_state,
+                    &background_share_id,
+                    SHARE_RUNTIME_REFRESH_BACKGROUND_READINESS_TIMEOUT,
+                )
+                .await
+                {
+                    let message = error.to_string();
+                    if let Err(persist_error) = record_router_share_runtime_refresh_failure(
+                        &background_state,
+                        &background_share_id,
+                        message,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            share_id = %background_share_id,
+                            error = %persist_error,
+                            "persist background Router Share runtime refresh failure failed"
+                        );
+                    }
+                    tracing::warn!(
+                        share_id = %background_share_id,
+                        error = %error,
+                        "Router Share runtime refresh failed after the tunnel readiness window"
+                    );
                 }
-            })
-            .await
-            .context("persist Router Share runtime refresh failure")?;
-        return Err(error);
+            });
+            Ok(())
+        }
+        Err(error) => {
+            record_router_share_runtime_refresh_failure(state, share_id, error.to_string()).await?;
+            Err(error)
+        }
     }
-    Ok(())
+}
+
+async fn refresh_router_share_runtime_when_ready(
+    state: &ServerState,
+    share_id: &str,
+    readiness_timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + readiness_timeout;
+    loop {
+        let Some(subdomain) = router_share_runtime_refresh_target(state, share_id).await else {
+            return Ok(());
+        };
+        let Some(start) =
+            ensure_share_tunnel_running_for(state.clone(), share_id, "share_runtime_refresh").await
+        else {
+            return Ok(());
+        };
+        let generation = start.generation();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let status = match state
+            .tunnels
+            .wait_for_active_generation(&tunnel::share_tunnel_key(share_id), generation, remaining)
+            .await
+        {
+            Ok(status) => status,
+            Err(tunnel::TunnelReadinessError::Superseded { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+
+        let current_subdomain = router_share_runtime_refresh_target(state, share_id).await;
+        let descriptor_pending = {
+            let shares = state.shares.read().await;
+            shares
+                .get(share_id)
+                .is_some_and(|share| shares.descriptor_projection_pending(share))
+        };
+        if current_subdomain.as_deref() != Some(subdomain.as_str()) || descriptor_pending {
+            sync_one_share_to_router(state, share_id).await?;
+            continue;
+        }
+
+        let config = state.config_snapshot().await;
+        let canonical_subdomain = client::canonicalize_share_subdomain(&config, &subdomain)?;
+        if status.subdomain.as_deref() != Some(canonical_subdomain.as_str()) {
+            anyhow::bail!(
+                "active Share tunnel generation {generation} reported subdomain {:?}, expected {canonical_subdomain}",
+                status.subdomain
+            );
+        }
+        let http_client = state.http_client().await;
+        return client::notify_runtime_refresh(
+            &http_client,
+            &config,
+            share_id.to_string(),
+            canonical_subdomain,
+        )
+        .await;
+    }
+}
+
+async fn router_share_runtime_refresh_target(
+    state: &ServerState,
+    share_id: &str,
+) -> Option<String> {
+    state.shares.read().await.get(share_id).and_then(|share| {
+        should_restore_share_tunnel(share)
+            .then_some(share.tunnel_subdomain.as_deref())
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn router_share_runtime_readiness_timed_out(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<tunnel::TunnelReadinessError>(),
+        Some(tunnel::TunnelReadinessError::Timeout { .. })
+    )
+}
+
+async fn record_router_share_runtime_refresh_failure(
+    state: &ServerState,
+    share_id: &str,
+    message: String,
+) -> anyhow::Result<()> {
+    state
+        .mutate_shares_immediate(|store| {
+            store.last_router_error = Some(message.clone());
+            if let Some(share) = store.shares.iter_mut().find(|share| share.id == share_id) {
+                share.router_last_sync_error = Some(message.clone());
+            }
+        })
+        .await
+        .context("persist Router Share runtime refresh failure")
 }
 
 async fn push_router_share_operations(
@@ -14708,6 +15056,7 @@ pub(crate) async fn share_request_log_entry(
         .or_else(|| log.actual_model.clone())
         .unwrap_or_default();
     Some(ShareRequestLogEntry {
+        export_sequence: log.router_export_sequence,
         request_id: log.request_id.clone(),
         share_id,
         share_name,
@@ -14749,24 +15098,86 @@ pub(crate) async fn share_request_log_entry(
     })
 }
 
-async fn mark_usage_router_sync(state: &ServerState, request_id: &str, result: Result<(), String>) {
+async fn mark_usage_router_sync_success(
+    state: &ServerState,
+    request_id: &str,
+    usage_revision: u64,
+) -> bool {
+    let now_ms = crate::infra::time::now_ms();
     let persisted = state
-        .update_usage_log(request_id, |log| {
-            log.router_sync_attempt_count = log.router_sync_attempt_count.saturating_add(1);
-            match &result {
-                Ok(()) => {
-                    log.router_last_synced_at_ms = Some(crate::infra::time::now_ms());
-                    log.router_last_sync_error = None;
-                }
-                Err(error) => {
-                    log.router_last_sync_error = Some(error.clone());
-                }
+        .update_usage_log_if(request_id, |log| {
+            if log.usage_revision != usage_revision {
+                return false;
             }
+            log.router_sync_attempt_count = log.router_sync_attempt_count.saturating_add(1);
+            log.router_last_sync_attempt_at_ms = Some(now_ms);
+            log.router_last_synced_at_ms = Some(now_ms);
+            log.router_synced_usage_revision = Some(usage_revision);
+            log.router_last_sync_error = None;
+            log.router_next_sync_attempt_at_ms = None;
+            true
         })
         .await;
-    if let Err(error) = persisted {
-        tracing::warn!(error = %error, "persist usage after router request log sync failed");
+    match persisted {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::warn!(error = %error, "persist usage after router request log sync failed");
+            false
+        }
     }
+}
+
+async fn mark_usage_router_sync_failure(
+    state: &ServerState,
+    request_id: &str,
+    usage_revision: u64,
+    error_message: String,
+) -> bool {
+    let now_ms = crate::infra::time::now_ms();
+    let request_id_for_backoff = request_id.to_string();
+    let persisted = state
+        .update_usage_log_if(request_id, |log| {
+            if log.usage_revision != usage_revision {
+                return false;
+            }
+            log.router_sync_attempt_count = log.router_sync_attempt_count.saturating_add(1);
+            log.router_last_sync_attempt_at_ms = Some(now_ms);
+            log.router_last_sync_error = Some(error_message);
+            log.router_next_sync_attempt_at_ms = Some(now_ms.saturating_add(
+                router_log_sync_backoff_ms(log.router_sync_attempt_count, &request_id_for_backoff),
+            ));
+            true
+        })
+        .await;
+    match persisted {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::warn!(error = %error, "persist usage after router request log sync failure failed");
+            false
+        }
+    }
+}
+
+fn router_log_sync_backoff_ms(attempt_count: u32, request_id: &str) -> u128 {
+    let exponent = attempt_count.saturating_sub(1).min(7);
+    let base_secs = (2_u64.saturating_pow(exponent)).min(300);
+    let jitter_window_ms = base_secs.saturating_mul(250);
+    let jitter_ms = if jitter_window_ms == 0 {
+        0
+    } else {
+        request_id.bytes().fold(0_u64, |hash, byte| {
+            hash.wrapping_mul(131).wrapping_add(u64::from(byte))
+        }) % jitter_window_ms
+    };
+    u128::from(base_secs.saturating_mul(1_000).saturating_add(jitter_ms))
+}
+
+fn eligible_router_share_log(log: &UsageLog) -> bool {
+    log.is_user_inference()
+        && log.share_id.is_some()
+        && log.data_source.as_deref() == Some("router_share")
+        && !log.is_health_check
+        && is_router_request_id(&log.request_id)
 }
 
 fn is_router_request_id(value: &str) -> bool {
@@ -15016,6 +15427,41 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn upgrade_task_report_fingerprint_ignores_poll_timestamp_only() {
+        let snapshot = crate::self_update::upgrade::UpgradeStatusSnapshot {
+            task_id: "task-fingerprint".into(),
+            status: crate::self_update::upgrade::UpgradeStatus::Running,
+            restart_pending: false,
+            logs: vec![crate::self_update::upgrade::UpgradeLogEntry {
+                task_id: "task-fingerprint".into(),
+                step: 2,
+                total_steps: 7,
+                level: crate::self_update::upgrade::UpgradeLogLevel::Progress,
+                message: "downloading release".into(),
+                progress: Some(20),
+                at: "2026-08-11T10:00:00Z".into(),
+            }],
+            target_commit_id: Some("aabbccddeeff".into()),
+            restart_after: true,
+            updated_at: "2026-08-11T10:00:01Z".into(),
+        };
+        let fingerprint = installation_upgrade_task_fingerprint(&snapshot);
+
+        let mut later_poll = snapshot.clone();
+        later_poll.updated_at = "2026-08-11T10:00:15Z".into();
+        assert_eq!(
+            fingerprint,
+            installation_upgrade_task_fingerprint(&later_poll)
+        );
+
+        later_poll.logs[0].progress = Some(40);
+        assert_ne!(
+            fingerprint,
+            installation_upgrade_task_fingerprint(&later_poll)
+        );
+    }
+
     fn router_sync_share_input(share_id: &str, provider_id: &str) -> UpsertShareInput {
         UpsertShareInput {
             id: Some(share_id.to_string()),
@@ -15100,6 +15546,36 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    fn router_share_usage_log(request_id: &str, share_id: &str) -> UsageLog {
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            format!("provider-{share_id}"),
+            "Router log provider".to_string(),
+            ProviderType::Codex,
+            200,
+            25,
+            UsageModelMetadata {
+                model: Some("gpt-5.5".to_string()),
+                requested_model: Some("gpt-5.5".to_string()),
+                ..UsageModelMetadata::default()
+            },
+            TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
+                ..TokenUsage::default()
+            },
+        );
+        log.apply_context(UsageLogContext {
+            request_id: Some(request_id.to_string()),
+            share_id: Some(share_id.to_string()),
+            share_name: Some("Router log Share".to_string()),
+            data_source: Some("router_share".to_string()),
+            ..UsageLogContext::default()
+        });
+        log
     }
 
     #[derive(Clone)]
@@ -15468,7 +15944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_share_sync_retries_error_only_state_and_clears_it_durably() {
+    async fn periodic_share_sync_retries_error_only_descriptor_state_durably() {
         let (router_url, router, server) =
             spawn_share_prune_mock_router(Vec::<String>::new(), StatusCode::OK).await;
         let state = test_state();
@@ -15506,7 +15982,7 @@ mod tests {
         run_periodic_share_sync_retry_once(&state).await;
 
         assert_eq!(router.batch_sizes.lock().await.as_slice(), &[1, 1]);
-        assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 0);
         assert!(state
             .shares
             .read()
@@ -15969,7 +16445,7 @@ mod tests {
             share_id: Some("share-1".to_string()),
             share_name: Some("Codex Share".to_string()),
             user_email: Some("user@example.com".to_string()),
-            data_source: Some("direct".to_string()),
+            data_source: Some("router_share".to_string()),
             user_country: Some("Japan".to_string()),
             user_country_iso3: Some("JPN".to_string()),
             is_health_check: true,
@@ -16006,6 +16482,283 @@ mod tests {
         assert!(entry.is_health_check);
         assert_eq!(entry.cache_read_tokens, 30);
         assert_eq!(entry.cache_creation_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn finalized_usage_lifecycle_wakes_router_log_sync_for_updates_and_fallbacks() {
+        let state = test_state();
+        let now_ms = crate::infra::time::now_ms();
+        state
+            .push_usage_log(router_share_usage_log(
+                "req_lifecycle_existing",
+                "lifecycle-share",
+            ))
+            .await
+            .unwrap();
+
+        state
+            .finalize_usage_request_lifecycle(
+                AppKind::Codex,
+                "req_lifecycle_existing".to_string(),
+                Some("lifecycle-share".to_string()),
+                Some("buyer@example.com".to_string()),
+                200,
+                now_ms,
+                now_ms.saturating_add(250),
+                1,
+                false,
+                None,
+            )
+            .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.router_request_log_sync_wakeup.notified(),
+        )
+        .await
+        .expect("finalizing an existing log should wake Router sync");
+
+        state
+            .finalize_usage_request_lifecycle(
+                AppKind::Codex,
+                "req_lifecycle_fallback".to_string(),
+                Some("lifecycle-share".to_string()),
+                Some("buyer@example.com".to_string()),
+                502,
+                now_ms.saturating_add(1_000),
+                now_ms.saturating_add(1_400),
+                2,
+                false,
+                Some("upstream".to_string()),
+            )
+            .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.router_request_log_sync_wakeup.notified(),
+        )
+        .await
+        .expect("persisting an unresolved log should wake Router sync");
+        let fallback = state
+            .usage_snapshot()
+            .await
+            .logs
+            .into_iter()
+            .find(|log| log.request_id == "req_lifecycle_fallback")
+            .expect("fallback log should be persisted");
+        assert_eq!(fallback.data_source.as_deref(), Some("router_share"));
+        assert_eq!(fallback.status_code, 502);
+        assert_eq!(fallback.attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn router_log_outbox_batches_in_export_sequence_order() {
+        async fn handler(
+            AxumState(payloads): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let acks = body["logs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|log| {
+                    json!({
+                        "requestId": log["requestId"],
+                        "usageRevision": log["usageRevision"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            payloads.lock().await.push(body);
+            Json(json!({"ok": true, "acks": acks}))
+        }
+
+        let payloads = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/share-request-logs/batch-sync", post(handler))
+            .with_state(payloads.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(&state, &format!("http://{address}"), "inst-log-batch")
+            .await;
+        create_router_shares(&state, "outbox", 1).await;
+        for index in 0..3 {
+            state
+                .push_usage_log(router_share_usage_log(
+                    &format!("req_outbox_{index}"),
+                    "outbox0",
+                ))
+                .await
+                .unwrap();
+        }
+        let mut health = router_share_usage_log("req_outbox_health", "outbox0");
+        health.is_health_check = true;
+        state.push_usage_log(health).await.unwrap();
+
+        let first = sync_pending_router_share_logs(state.clone(), 2, true).await;
+        assert_eq!(first.attempted, 2);
+        assert_eq!(first.synced, 2);
+        assert_eq!(first.failed, 0);
+        assert_eq!(pending_router_log_count(&state).await, 1);
+        let second = sync_pending_router_share_logs(state.clone(), 2, true).await;
+        assert_eq!(second.attempted, 1);
+        assert_eq!(second.synced, 1);
+        assert_eq!(pending_router_log_count(&state).await, 0);
+
+        let payloads = payloads.lock().await;
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["logs"].as_array().map(Vec::len), Some(2));
+        let first_sequence = payloads[0]["logs"][0]["exportSequence"].as_u64().unwrap();
+        let second_sequence = payloads[0]["logs"][1]["exportSequence"].as_u64().unwrap();
+        assert!(first_sequence > 0);
+        assert!(second_sequence > first_sequence);
+        assert_eq!(payloads[1]["logs"][0]["requestId"], "req_outbox_2");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_router_log_ack_does_not_commit_over_a_new_usage_revision() {
+        #[derive(Clone)]
+        struct AckRace {
+            received: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        async fn handler(
+            AxumState(race): AxumState<AckRace>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            race.received.notify_one();
+            race.release.notified().await;
+            Json(json!({
+                "ok": true,
+                "acks": [{
+                    "requestId": body["logs"][0]["requestId"],
+                    "usageRevision": body["logs"][0]["usageRevision"],
+                }]
+            }))
+        }
+
+        let race = AckRace {
+            received: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/v1/share-request-logs/batch-sync", post(handler))
+            .with_state(race.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(&state, &format!("http://{address}"), "inst-log-race")
+            .await;
+        create_router_shares(&state, "race", 1).await;
+        state
+            .push_usage_log(router_share_usage_log("req_outbox_race", "race0"))
+            .await
+            .unwrap();
+        let before = state
+            .usage_snapshot()
+            .await
+            .logs
+            .into_iter()
+            .find(|log| log.request_id == "req_outbox_race")
+            .unwrap();
+
+        let sync_state = state.clone();
+        let sync =
+            tokio::spawn(
+                async move { sync_pending_router_share_logs(sync_state, 100, true).await },
+            );
+        race.received.notified().await;
+        state
+            .update_usage_log("req_outbox_race", |log| {
+                log.output_tokens = Some(9);
+                log.usage_revision = log.usage_revision.saturating_add(1);
+                log.reset_router_sync_state();
+            })
+            .await
+            .unwrap();
+        race.release.notify_one();
+
+        let summary = sync.await.unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.synced, 0);
+        assert_eq!(summary.failed, 0);
+        let after = state
+            .usage_snapshot()
+            .await
+            .logs
+            .into_iter()
+            .find(|log| log.request_id == "req_outbox_race")
+            .unwrap();
+        assert_eq!(after.usage_revision, before.usage_revision + 1);
+        assert!(after.router_export_sequence > before.router_export_sequence);
+        assert!(after.router_last_synced_at_ms.is_none());
+        assert_eq!(pending_router_log_count(&state).await, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn router_log_retry_backoff_is_persisted_and_defers_immediate_retry() {
+        async fn handler(
+            AxumState(calls): AxumState<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<Value>) {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"message": "temporarily unavailable"})),
+            )
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/share-request-logs/batch-sync", post(handler))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(&state, &format!("http://{address}"), "inst-log-retry")
+            .await;
+        create_router_shares(&state, "retrylog", 1).await;
+        state
+            .push_usage_log(router_share_usage_log("req_outbox_retry", "retrylog0"))
+            .await
+            .unwrap();
+
+        let failed = sync_pending_router_share_logs(state.clone(), 100, true).await;
+        assert_eq!(failed.attempted, 1);
+        assert_eq!(failed.failed, 1);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        let current = state
+            .usage_snapshot()
+            .await
+            .logs
+            .into_iter()
+            .find(|log| log.request_id == "req_outbox_retry")
+            .unwrap();
+        assert_eq!(current.router_sync_attempt_count, 1);
+        assert!(current.router_last_sync_error.is_some());
+        assert!(current.router_next_sync_attempt_at_ms > current.router_last_sync_attempt_at_ms);
+
+        let deferred = sync_pending_router_share_logs(state.clone(), 100, false).await;
+        assert_eq!(deferred.attempted, 0);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let reloaded = UsageStore::load_or_default(&state.config_dir).unwrap();
+        let persisted = reloaded
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_outbox_retry")
+            .unwrap();
+        assert_eq!(persisted.router_sync_attempt_count, 1);
+        assert_eq!(
+            persisted.router_next_sync_attempt_at_ms,
+            current.router_next_sync_attempt_at_ms
+        );
+        server.abort();
     }
 
     #[test]
@@ -18271,6 +19024,7 @@ mod tests {
                         ("familyId".to_string(), json!("family.nvidia")),
                         ("surfaceEnabled".to_string(), json!(true)),
                         ("modelPolicyScope".to_string(), json!("global")),
+                        ("testApp".to_string(), json!("claude")),
                     ]),
                 },
                 provider_resource(profile_id, 1),
@@ -18295,7 +19049,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_share_projection_changes_track_model_policy_scope_only() {
+    fn provider_share_projection_changes_track_bundle_runtime_metadata() {
         let before = colliding_bundle_store("scope-change-bundle");
         let mut after = before.clone();
         for stored in &mut after.providers {
@@ -18311,6 +19065,25 @@ mod tests {
 
         assert_eq!(
             provider_share_projection_changes(&before, &after),
+            BTreeSet::from([
+                (AppKind::Claude, "scope-change-bundle".to_string()),
+                (AppKind::Codex, "scope-change-bundle".to_string()),
+            ])
+        );
+
+        let mut test_app_changed = before.clone();
+        for stored in &mut test_app_changed.providers {
+            if crate::domain::providers::bundle::bundle_id(&stored.provider)
+                == Some("scope-change-bundle")
+            {
+                stored
+                    .provider
+                    .extra
+                    .insert("testApp".to_string(), json!("codex"));
+            }
+        }
+        assert_eq!(
+            provider_share_projection_changes(&before, &test_app_changed),
             BTreeSet::from([
                 (AppKind::Claude, "scope-change-bundle".to_string()),
                 (AppKind::Codex, "scope-change-bundle".to_string()),

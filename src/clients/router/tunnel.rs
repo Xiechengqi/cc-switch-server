@@ -61,6 +61,7 @@ const SSH_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 const STABLE_CONNECTION_WINDOW: Duration = Duration::from_secs(60);
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TunnelRenewalError {
@@ -117,6 +118,32 @@ impl TunnelStartOutcome {
     pub fn started(self) -> bool {
         matches!(self, Self::Started { .. })
     }
+
+    pub fn generation(self) -> u64 {
+        match self {
+            Self::Started { generation } | Self::AlreadyRunning { generation } => generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TunnelReadinessError {
+    #[error(
+        "tunnel {key} generation {generation} was superseded by desired generation {desired_generation}"
+    )]
+    Superseded {
+        key: String,
+        generation: u64,
+        desired_generation: u64,
+    },
+    #[error(
+        "tunnel {key} generation {generation} did not become active before the readiness timeout (last status: {last_status})"
+    )]
+    Timeout {
+        key: String,
+        generation: u64,
+        last_status: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +488,43 @@ impl TunnelSupervisor {
         self.statuses.read().await.values().cloned().collect()
     }
 
+    pub async fn wait_for_active_generation(
+        &self,
+        key: &str,
+        generation: u64,
+        timeout: Duration,
+    ) -> Result<TunnelRuntimeStatus, TunnelReadinessError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let status = self.status(key).await;
+            if let Some(status) = status.as_ref() {
+                if status.desired_generation != generation {
+                    return Err(TunnelReadinessError::Superseded {
+                        key: key.to_string(),
+                        generation,
+                        desired_generation: status.desired_generation,
+                    });
+                }
+                if status.generation == generation
+                    && status.status == "connected"
+                    && status.transport_state.as_deref() == Some(TransportState::Active.as_str())
+                {
+                    return Ok(status.clone());
+                }
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(TunnelReadinessError::Timeout {
+                    key: key.to_string(),
+                    generation,
+                    last_status: readiness_status_label(status.as_ref()),
+                });
+            }
+            tokio::time::sleep(READINESS_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
     async fn set_status(&self, status: TunnelRuntimeStatus) {
         set_status(&self.statuses, &self.store_path, status).await;
     }
@@ -589,6 +653,19 @@ impl TunnelSupervisor {
             .await;
         })
     }
+}
+
+fn readiness_status_label(status: Option<&TunnelRuntimeStatus>) -> String {
+    status
+        .map(|status| {
+            format!(
+                "{} / {} / generation {}",
+                status.status,
+                status.transport_state.as_deref().unwrap_or("unknown"),
+                status.generation
+            )
+        })
+        .unwrap_or_else(|| "missing".to_string())
 }
 
 pub fn client_tunnel_key() -> String {
@@ -1845,6 +1922,105 @@ mod tests {
 
         assert_eq!(status.status, "connected");
         assert_eq!(status.tunnel_url.as_deref(), Some("https://example.test"));
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_is_generation_aware() {
+        let dir = temp_config_dir("tunnel-readiness-generation");
+        let supervisor = TunnelSupervisor::load_or_default(&dir).unwrap();
+        supervisor
+            .set_status(TunnelRuntimeStatus {
+                key: "share:ready".to_string(),
+                kind: "share-http".to_string(),
+                status: "starting".to_string(),
+                generation: 3,
+                desired_generation: 3,
+                transport_state: Some("candidate".to_string()),
+                updated_at_ms: now_ms(),
+                ..TunnelRuntimeStatus::default()
+            })
+            .await;
+        let activate = supervisor.clone();
+        let activation = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            activate
+                .set_status(TunnelRuntimeStatus {
+                    key: "share:ready".to_string(),
+                    kind: "share-http".to_string(),
+                    status: "connected".to_string(),
+                    generation: 3,
+                    desired_generation: 3,
+                    transport_state: Some("active".to_string()),
+                    updated_at_ms: now_ms(),
+                    ..TunnelRuntimeStatus::default()
+                })
+                .await;
+        });
+
+        let ready = supervisor
+            .wait_for_active_generation("share:ready", 3, Duration::from_millis(100))
+            .await
+            .expect("matching generation should become ready");
+        activation.await.unwrap();
+        assert_eq!(ready.generation, 3);
+
+        supervisor
+            .set_status(TunnelRuntimeStatus {
+                key: "share:ready".to_string(),
+                kind: "share-http".to_string(),
+                status: "starting".to_string(),
+                generation: 4,
+                desired_generation: 4,
+                transport_state: Some("candidate".to_string()),
+                updated_at_ms: now_ms(),
+                ..TunnelRuntimeStatus::default()
+            })
+            .await;
+        assert_eq!(
+            supervisor
+                .wait_for_active_generation("share:ready", 3, Duration::from_millis(100))
+                .await
+                .unwrap_err(),
+            TunnelReadinessError::Superseded {
+                key: "share:ready".to_string(),
+                generation: 3,
+                desired_generation: 4,
+            }
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_reports_the_last_status_on_timeout() {
+        let dir = temp_config_dir("tunnel-readiness-timeout");
+        let supervisor = TunnelSupervisor::load_or_default(&dir).unwrap();
+        supervisor
+            .set_status(TunnelRuntimeStatus {
+                key: "share:pending".to_string(),
+                kind: "share-http".to_string(),
+                status: "retrying".to_string(),
+                generation: 7,
+                desired_generation: 7,
+                transport_state: Some("candidate".to_string()),
+                updated_at_ms: now_ms(),
+                ..TunnelRuntimeStatus::default()
+            })
+            .await;
+
+        assert_eq!(
+            supervisor
+                .wait_for_active_generation("share:pending", 7, Duration::from_millis(1))
+                .await
+                .unwrap_err(),
+            TunnelReadinessError::Timeout {
+                key: "share:pending".to_string(),
+                generation: 7,
+                last_status: "retrying / candidate / generation 7".to_string(),
+            }
+        );
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

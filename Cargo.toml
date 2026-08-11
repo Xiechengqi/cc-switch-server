@@ -34,6 +34,7 @@ hkdf = "0.12"
 imagesize = "0.13"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jsonwebtoken = "9"
+libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 multer = "3"

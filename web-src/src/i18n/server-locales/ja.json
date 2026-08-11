@@ -104,8 +104,8 @@
     "surfaceEnabled": "API を有効化",
     "surfaces": "API Surface",
     "streamIdleTimeout": "ストリームアイドルタイムアウト（ミリ秒）",
+    "testApp": "テスト App",
     "testModel": "テストモデル",
-    "testAllModels": "すべての App のモデルをテスト",
     "title": "Providers"
   },
   "provider": {

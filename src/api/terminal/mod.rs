@@ -66,6 +66,7 @@ pub(crate) async fn terminal_stream(
     let replay = replay_rx
         .await
         .map_err(|_| ApiError::conflict("terminal session closed during attach"))?;
+    let mut shutdown = state.subscribe_shutdown();
 
     let stream = async_stream::stream! {
         let _attachment = attachment;
@@ -75,8 +76,16 @@ pub(crate) async fn terminal_stream(
         }
         yield Ok(terminal_event(ServerMessage::ReplayEnd));
 
-        while let Some(chunk) = output_rx.recv().await {
-            yield Ok(terminal_event(ServerMessage::output_bytes(&chunk)));
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+                chunk = output_rx.recv() => match chunk {
+                    Some(chunk) => yield Ok(terminal_event(ServerMessage::output_bytes(&chunk))),
+                    None => break,
+                }
+            }
         }
         yield Ok(terminal_event(ServerMessage::Exit { c: None }));
     };

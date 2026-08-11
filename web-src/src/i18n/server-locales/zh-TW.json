@@ -104,8 +104,8 @@
     "surfaceEnabled": "啟用 API",
     "surfaces": "應用介面",
     "streamIdleTimeout": "串流閒置逾時（毫秒）",
+    "testApp": "測試 App",
     "testModel": "測試模型",
-    "testAllModels": "測試所有 App 模型",
     "title": "供應商"
   },
   "provider": {

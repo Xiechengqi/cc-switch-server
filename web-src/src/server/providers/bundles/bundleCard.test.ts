@@ -11,6 +11,7 @@ import type { ProviderMeta } from "@/types";
 import {
   providerBundleDisplayTarget,
   providerBundlePrimaryResource,
+  providerBundleTestResource,
 } from "./bundleCard";
 
 function runtime(
@@ -84,6 +85,10 @@ function bundle(
     revision: 1,
     name: "Provider",
     modelPolicyScope: "global",
+    testApp:
+      familyId === "family.openai_oauth" && supportedApps.includes("codex")
+        ? "codex"
+        : (supportedApps[0] ?? "claude"),
     supportedApps,
     enabledApps: supportedApps,
     credentialConfigured: true,
@@ -161,6 +166,19 @@ describe("Provider Bundle card data", () => {
       kind: "api_url",
       value: "https://codex.gateway.example/v1",
     });
+  });
+
+  it("selects only the configured test Surface", () => {
+    const view = bundle("family.grok_oauth", {
+      claude: resource("claude", "claude.grok_oauth", {}),
+      codex: resource("codex", "codex.grok_oauth", {}),
+      gemini: resource("gemini", "gemini.grok_oauth", {}),
+    });
+    view.testApp = "gemini";
+
+    expect(providerBundleTestResource(view)?.app).toBe("gemini");
+    view.enabledApps = ["claude", "codex"];
+    expect(providerBundleTestResource(view)).toBeUndefined();
   });
 
   it("shows the bound OAuth subscription account instead of the Server route", () => {

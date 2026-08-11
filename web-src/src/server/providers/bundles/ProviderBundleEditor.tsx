@@ -98,6 +98,7 @@ import {
 } from "./bundleShare";
 import {
   applyCustomRecipeToBundleDraft,
+  BUNDLE_TEST_APP_ORDER,
   changeModelPolicyScope,
   createProviderBundleDraft,
   customRecipeMatchesBundleDraft,
@@ -107,6 +108,7 @@ import {
   familyCredentialSlots,
   modelPoliciesForFamily,
   modelPoliciesForSurface,
+  normalizeBundleTestApp,
   perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
   requiresPerAppModelPolicy,
@@ -569,17 +571,6 @@ function SurfaceEditor({
       ) : null}
 
       <div className="grid gap-4 md:grid-cols-2">
-        <div className="space-y-2 md:col-span-2">
-          <Label>
-            {t("providerBundle.testModel", { defaultValue: "测试模型" })}
-          </Label>
-          <Input
-            value={surface.testModel}
-            onChange={(event) =>
-              onChange({ ...surface, testModel: event.target.value })
-            }
-          />
-        </div>
         {[
           {
             key: "timeoutMs" as const,
@@ -1217,6 +1208,9 @@ export function ProviderBundleEditor({
   const fixedModelSurfaces = draft.surfaces.filter(
     (surface) => modelPoliciesForSurface(surface).length === 1,
   );
+  const enabledTestApps = BUNDLE_TEST_APP_ORDER.filter((app) =>
+    draft.surfaces.some((surface) => surface.app === app && surface.enabled),
+  );
   const managedProviderType =
     credentialProfile?.credentialPolicy.mode === "managed_account"
       ? credentialProfile.credentialPolicy.accountProviderType
@@ -1317,12 +1311,14 @@ export function ProviderBundleEditor({
   };
 
   const updateSurface = (next: BundleSurfaceEditorDraft) =>
-    setDraft((current) => ({
-      ...current,
-      surfaces: current.surfaces.map((surface) =>
-        surface.app === next.app ? next : surface,
-      ),
-    }));
+    setDraft((current) =>
+      normalizeBundleTestApp({
+        ...current,
+        surfaces: current.surfaces.map((surface) =>
+          surface.app === next.app ? next : surface,
+        ),
+      }),
+    );
 
   const setDriverOption = (key: string, checked: boolean) =>
     setDraft((current) => ({
@@ -1793,6 +1789,58 @@ export function ProviderBundleEditor({
                 ) : null}
               </>
             ) : null}
+          </div>
+        </Section>
+
+        <Section
+          title={t("providerBundle.testModel", {
+            defaultValue: "测试模型",
+          })}
+        >
+          <div className="grid max-w-xl gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label>{t("providerBundle.testApp")}</Label>
+              <Select
+                value={draft.testApp}
+                onValueChange={(value) =>
+                  setDraft((current) => ({
+                    ...current,
+                    testApp: value as CoreProviderApp,
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {enabledTestApps.map((app) => (
+                    <SelectItem key={app} value={app}>
+                      <span className="flex items-center gap-2">
+                        <AppLogo app={app} />
+                        {APP_LABELS[app]}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="provider-bundle-test-model">
+                {t("providerBundle.testModel", {
+                  defaultValue: "测试模型",
+                })}
+              </Label>
+              <Input
+                id="provider-bundle-test-model"
+                value={draft.testModel}
+                onChange={(event) =>
+                  setDraft((current) => ({
+                    ...current,
+                    testModel: event.target.value,
+                  }))
+                }
+              />
+            </div>
           </div>
         </Section>
 
