@@ -85,6 +85,12 @@ Note: server compatibility provider types are explicit cc-switch-server classifi
 | codex | 7 |
 | gemini | 4 |
 
+## Server Custom HTTP recipes
+
+| Name | ProviderType | Profile | Protocol | Auth | Model policy |
+| --- | --- | --- | --- | --- | --- |
+| Anthropic Bearer Relay | `claude_auth` | `claude.custom_http` | `anthropic_messages` | `bearer` | `passthrough` |
+
 ## Universal recipes
 
 | Name | providerType | Apps |
@@ -104,7 +110,7 @@ Note: server compatibility provider types are explicit cc-switch-server classifi
 
 ### Provider control plane and storage
 
-- Rust `ProfileSpec` is the product identity authority, `DriverSpec` owns protocol operations, and each committed Provider compiles one canonical `RuntimePlan` shared by forwarding, manual test, and model discovery. Custom Profiles derive compatibility type deterministically from their explicit upstream protocol.
+- Rust `ProfileSpec` is the product identity authority, `DriverSpec` owns protocol operations, and each committed Provider compiles one canonical `RuntimePlan` shared by forwarding, manual test, and model discovery. Custom Profiles derive compatibility type deterministically from their explicit upstream protocol and authentication scheme; Anthropic Messages with Bearer authentication is classified as `claude_auth`. Named Custom HTTP recipes remain convenience configuration, not separate Provider families.
 - Every Driver declares an `outboundIdentityPolicy`, and the compiled RuntimePlan applies it as the last header step after protocol authentication and managed-account overrides. Claude/Codex/Grok/Kimi and Google Code Assist OAuth use their official CLI identity families; Kiro, Cursor, Copilot, and DeepSeek account drivers use their protocol-specific identities; Antigravity/agy use one background-refreshed client version and matching platform metadata; ordinary HTTP/API-key drivers use `cc-switch-server/<version>`; Bedrock omits User-Agent; frozen legacy Profiles retain their existing contract.
 - Only Custom HTTP Profiles can persist `customUserAgent`. Their empty value falls back to the Server identity, invalid header values are rejected, and `extraHeaders` cannot smuggle a second `User-Agent`. Preset Providers ignore historical values at runtime and clear a carried historical value on their next valid save; a new preset write containing a custom User-Agent is rejected.
 - The same final identity pass covers normal HTTP forwarding, Claude prepared requests, Codex/Grok WebSocket handshakes, Codex HTTP fallback and image generation, Grok media, Provider network tests, model discovery, and scheduled Share health checks. Dedicated Kiro, Cursor AgentService, and DeepSeek transports continue to construct the same protocol-owned identities inside their native clients.

@@ -14,7 +14,6 @@ import type { ProviderCategory, ProviderMeta } from "@/types";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   anthropicApiKeyPreset,
-  claudeBearerRelayPreset,
   claudeGoogleOAuthPreset,
   googleGeminiApiKeyPreset,
   kimiCodeClaudePreset,
@@ -128,9 +127,6 @@ export function providerPresetForProfile(
 ): ProviderPreset | CodexProviderPreset | GeminiProviderPreset | undefined {
   if (profile.profileId === "claude.anthropic_api_key") {
     return anthropicApiKeyPreset;
-  }
-  if (profile.profileId === "claude.bearer_relay") {
-    return claudeBearerRelayPreset;
   }
   if (profile.profileId === "claude.google_oauth") {
     return claudeGoogleOAuthPreset;

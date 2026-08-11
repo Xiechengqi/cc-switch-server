@@ -7081,7 +7081,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
-    assert_eq!(registry["registry"]["schemaVersion"], 5);
+    assert_eq!(registry["registry"]["schemaVersion"], 6);
     assert_eq!(
         registry["registry"]["optionSchemas"]
             .as_array()
@@ -7090,7 +7090,34 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        44
+        43
+    );
+    assert!(registry["registry"]["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|family| family["familyId"] != "family.claude_bearer_relay"));
+    assert!(registry["registry"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|profile| profile["profileId"] != "claude.bearer_relay"));
+    assert_eq!(
+        registry["registry"]["customRecipes"],
+        json!([{
+            "recipeId": "claude.anthropic_bearer_relay",
+            "label": "Anthropic Bearer Relay",
+            "labelKey": "providerBundle.recipeAnthropicBearerRelay",
+            "profileId": "claude.custom_http",
+            "compatibilityProviderType": "claude_auth",
+            "binding": {
+                "upstreamProtocol": "anthropic_messages",
+                "authScheme": "bearer"
+            },
+            "modelPolicy": "passthrough",
+            "icon": "anthropic",
+            "iconColor": "#D4915D"
+        }])
     );
     let profiles = registry["registry"]["profiles"].as_array().unwrap();
     let official = profiles

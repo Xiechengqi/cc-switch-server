@@ -1626,6 +1626,38 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_bearer_custom_profile_compiles_a_native_relay_plan() {
+        let mut stored = provider("claude.custom_http", ProviderType::ClaudeAuth);
+        stored.app = AppKind::Claude;
+        stored.resource.custom_binding = Some(super::super::registry::CustomBindingInput {
+            upstream_protocol: UpstreamProtocol::AnthropicMessages,
+            auth_scheme: AuthScheme::Bearer,
+        });
+        stored.provider.settings_config = json!({
+            "apiKey": "relay-secret",
+            "env": {"ANTHROPIC_BASE_URL": "https://relay.example.test/v1"},
+            "modelMapping": {"mode": "passthrough"}
+        });
+
+        let plan = compile_runtime_plan(&stored, &AccountStore::default()).unwrap();
+
+        assert_eq!(plan.profile_id.as_str(), "claude.custom_http");
+        assert_eq!(plan.driver_id.as_str(), "http.anthropic_messages");
+        assert_eq!(plan.upstream_protocol, UpstreamProtocol::AnthropicMessages);
+        assert_eq!(plan.endpoint, "https://relay.example.test/v1");
+        assert_eq!(plan.model_policy, RuntimeModelPolicy::Passthrough);
+        assert_eq!(plan.configuration_state, RuntimeConfigurationState::Ready);
+        assert_eq!(
+            plan.auth_ref,
+            RuntimeAuthRef::CustomCredential {
+                auth_scheme: AuthScheme::Bearer,
+                slots: vec!["/settingsConfig/apiKey".to_string()],
+                credential_generation: 0,
+            }
+        );
+    }
+
+    #[test]
     fn fixed_endpoint_policy_ignores_configured_override() {
         let accounts = AccountStore::default();
         let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);

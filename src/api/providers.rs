@@ -1629,13 +1629,6 @@ fn s1_provider_for_profile(
                 "modelMapping": {"mode": "passthrough"}
             }),
         ),
-        "claude.bearer_relay" => (
-            "Claude Bearer Relay",
-            json!({
-                "env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
-                "modelMapping": {"mode": "passthrough"}
-            }),
-        ),
         "claude.google_oauth" => (
             "Google Gemini OAuth",
             json!({

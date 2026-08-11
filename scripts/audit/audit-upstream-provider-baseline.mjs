@@ -34,7 +34,6 @@ const expectedCounts = Object.freeze({
 });
 const reviewedFirstClassProfileAdditions = Object.freeze([
   "claude.anthropic_api_key",
-  "claude.bearer_relay",
   "claude.google_oauth",
   "claude.kimi_code",
   "codex.kiro_oauth",
@@ -42,6 +41,9 @@ const reviewedFirstClassProfileAdditions = Object.freeze([
   "codex.openai_api_key",
   "gemini.google_api_key",
   "gemini.kimi_code",
+]);
+const reviewedCustomRecipeAdditions = Object.freeze([
+  "claude.anthropic_bearer_relay",
 ]);
 
 const sourceFiles = {
@@ -521,6 +523,7 @@ function buildCoverageMappings(baseline, serverInventory) {
       "gemini.legacy_compat",
     ],
     firstClassProfileAdditions: [...reviewedFirstClassProfileAdditions],
+    customRecipeAdditions: [...reviewedCustomRecipeAdditions],
   };
 }
 
@@ -689,6 +692,13 @@ export function validateBaselineContracts(baseline, serverInventory) {
     "directApiCandidates" in mappings
   ) {
     throw new Error("reviewed first-class Server Profile additions are incomplete");
+  }
+  if (
+    !Array.isArray(mappings.customRecipeAdditions) ||
+    JSON.stringify(mappings.customRecipeAdditions) !==
+      JSON.stringify(reviewedCustomRecipeAdditions)
+  ) {
+    throw new Error("reviewed Server Custom HTTP recipe additions are incomplete");
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "format": "cc-switch-provider-registry",
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "optionSchemas": [
     {"optionSchemaId":"oauth.claude.v1","fields":[]},
     {"optionSchemaId":"http.anthropic.v1","fields":["apiKeyField","customUserAgent"]},
@@ -25,7 +25,6 @@
   "families": [
     {"familyId":"family.claude_oauth","label":"Claude OAuth","credentialProfileId":"claude.official_oauth","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","credentialSourceScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.official_oauth","defaultEnabled":true}]},
     {"familyId":"family.anthropic_api_key","label":"Anthropic API Key","credentialProfileId":"claude.anthropic_api_key","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","credentialSourceScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.anthropic_api_key","defaultEnabled":true}]},
-    {"familyId":"family.claude_bearer_relay","label":"Claude Bearer Relay","credentialProfileId":"claude.bearer_relay","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","credentialSourceScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.bearer_relay","defaultEnabled":true}]},
     {"familyId":"family.openai_oauth","label":"OpenAI OAuth","credentialProfileId":"codex.openai_oauth","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","credentialSourceScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.openai_oauth","defaultEnabled":true},{"app":"codex","profileId":"codex.openai_oauth","defaultEnabled":true}]},
     {"familyId":"family.google_oauth","label":"Google OAuth","credentialProfileId":"gemini.google_oauth","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","credentialSourceScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.google_oauth","defaultEnabled":true},{"app":"gemini","profileId":"gemini.google_oauth","defaultEnabled":true}]},
     {"familyId":"family.grok_oauth","label":"Grok OAuth","credentialProfileId":"codex.grok_oauth","endpointScope":"bundle","headersScope":"bundle","driverOptionsScope":"bundle","credentialSourceScope":"bundle","surfaces":[{"app":"claude","profileId":"claude.grok_oauth","defaultEnabled":true},{"app":"codex","profileId":"codex.grok_oauth","defaultEnabled":true},{"app":"gemini","profileId":"gemini.grok_oauth","defaultEnabled":true}]},
@@ -50,7 +49,6 @@
   "profiles": [
     {"profileId":"claude.official_oauth","profileSchemaRevision":1,"app":"claude","label":"Claude Official","driverBinding":{"kind":"fixed","driverId":"oauth.claude_messages"},"compatibilityProviderType":"claude_oauth","formComposition":"managed_account","endpointPolicy":"fixed","credentialPolicy":{"mode":"managed_account","accountProviderType":"claude_oauth"},"modelPolicy":"passthrough","visibility":"visible","creationPolicy":"create_allowed","maturity":"stable"},
     {"profileId":"claude.anthropic_api_key","profileSchemaRevision":1,"app":"claude","label":"Anthropic API Key","driverBinding":{"kind":"fixed","driverId":"http.anthropic_messages"},"compatibilityProviderType":"claude","formComposition":"static_secret","endpointPolicy":"fixed","credentialPolicy":{"mode":"static_secret","slots":["api_key"],"authScheme":"api_key"},"modelPolicy":"passthrough","visibility":"visible","creationPolicy":"create_allowed","maturity":"stable"},
-    {"profileId":"claude.bearer_relay","profileSchemaRevision":1,"app":"claude","label":"Claude Bearer Relay","driverBinding":{"kind":"fixed","driverId":"http.anthropic_messages"},"compatibilityProviderType":"claude_auth","formComposition":"static_secret","endpointPolicy":"override_allowed","credentialPolicy":{"mode":"static_secret","slots":["api_key"],"authScheme":"bearer"},"modelPolicy":"passthrough","visibility":"visible","creationPolicy":"create_allowed","maturity":"stable"},
     {"profileId":"claude.openai_oauth","profileSchemaRevision":1,"app":"claude","label":"OpenAI OAuth","driverBinding":{"kind":"fixed","driverId":"oauth.openai_codex"},"compatibilityProviderType":"codex_oauth","formComposition":"managed_account","endpointPolicy":"fixed","credentialPolicy":{"mode":"managed_account","accountProviderType":"codex_oauth"},"modelPolicy":"single","allowedModelPolicies":["single","passthrough"],"defaultUpstreamModel":"gpt-5.6-sol","visibility":"visible","creationPolicy":"create_allowed","maturity":"stable"},
     {"profileId":"claude.google_oauth","profileSchemaRevision":1,"app":"claude","label":"Google Gemini OAuth","driverBinding":{"kind":"fixed","driverId":"oauth.gemini_code_assist"},"compatibilityProviderType":"gemini_cli","formComposition":"managed_account","endpointPolicy":"fixed","credentialPolicy":{"mode":"managed_account","accountProviderType":"gemini_cli"},"modelPolicy":"single","allowedModelPolicies":["single","passthrough"],"defaultUpstreamModel":"gemini-3.1-pro-preview","visibility":"visible","creationPolicy":"create_allowed","maturity":"stable"},
     {"profileId":"claude.grok_oauth","profileSchemaRevision":1,"app":"claude","label":"Grok OAuth","driverBinding":{"kind":"fixed","driverId":"oauth.grok_responses"},"compatibilityProviderType":"grok_oauth","formComposition":"managed_account","endpointPolicy":"fixed","credentialPolicy":{"mode":"managed_account","accountProviderType":"grok_oauth"},"modelPolicy":"single","allowedModelPolicies":["single","passthrough"],"defaultUpstreamModel":"grok-4.5","visibility":"visible","creationPolicy":"create_allowed","maturity":"stable"},
@@ -117,6 +115,9 @@
     {"driverId":"http.gemini_native","driverContractRevision":2,"upstreamProtocol":"gemini_native","acceptedAuthSchemes":["api_key","query"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"server_identity"},"optionSchemaId":"http.gemini_native.v1"},
     {"driverId":"legacy.frozen","driverContractRevision":1,"upstreamProtocol":"legacy","acceptedAuthSchemes":["none","api_key","bearer","oauth","aws_sig_v4","custom_header","query"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"legacy_frozen"},"optionSchemaId":"legacy.frozen.v1"}
   ],
+  "customRecipes": [
+    {"recipeId":"claude.anthropic_bearer_relay","label":"Anthropic Bearer Relay","labelKey":"providerBundle.recipeAnthropicBearerRelay","profileId":"claude.custom_http","compatibilityProviderType":"claude_auth","binding":{"upstreamProtocol":"anthropic_messages","authScheme":"bearer"},"modelPolicy":"passthrough","icon":"anthropic","iconColor":"#D4915D"}
+  ],
   "customPolicies": [
     {"customPolicyId":"claude.custom_http.v1","app":"claude","protocols":["anthropic_messages","open_ai_chat","open_ai_responses","gemini_native"],"authSchemes":["api_key","bearer","custom_header","query"],"allowedDriverIds":["http.anthropic_messages","http.openai_chat","http.openai_responses","http.gemini_native"],"outboundIdentityPolicy":{"kind":"custom_override"}},
     {"customPolicyId":"codex.custom_http.v1","app":"codex","protocols":["open_ai_chat","open_ai_responses","anthropic_messages"],"authSchemes":["api_key","bearer","custom_header"],"allowedDriverIds":["http.openai_chat","http.openai_responses","http.anthropic_messages"],"outboundIdentityPolicy":{"kind":"custom_override"}},
@@ -153,7 +154,9 @@
     {"app":"gemini","legacyName":"Grok OAuth","profileId":"gemini.grok_oauth"},
     {"app":"gemini","legacyName":"OpenRouter","profileId":"gemini.openrouter"}
   ],
-  "publishedIdTombstones": [],
+  "publishedIdTombstones": [
+    {"id":"claude.bearer_relay","kind":"profile","reason":"Replaced by the claude.anthropic_bearer_relay Custom HTTP recipe"}
+  ],
   "conformance": [
     {"driverId":"oauth.claude_messages","forward":"fixture_verified","test":"live_pending","discovery":"fixture_verified"},
     {"driverId":"http.anthropic_messages","forward":"fixture_verified","test":"fixture_verified","discovery":"live_pending"},

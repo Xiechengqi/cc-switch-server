@@ -1630,6 +1630,19 @@
       ]
     }
   ],
+  "customRecipes": [
+    {
+      "recipeId": "claude.anthropic_bearer_relay",
+      "label": "Anthropic Bearer Relay",
+      "profileId": "claude.custom_http",
+      "compatibilityProviderType": "claude_auth",
+      "binding": {
+        "upstreamProtocol": "anthropic_messages",
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough"
+    }
+  ],
   "fixtures": {
     "claude": [
       {

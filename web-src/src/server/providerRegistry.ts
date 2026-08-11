@@ -17,6 +17,11 @@ export type ProviderUpstreamProtocol =
   | "custom"
   | "legacy";
 
+export type ProviderCustomRecipeProtocol = Extract<
+  ProviderUpstreamProtocol,
+  "anthropic_messages" | "open_ai_chat" | "open_ai_responses" | "gemini_native"
+>;
+
 export type ProviderAuthScheme =
   | "none"
   | "api_key"
@@ -126,6 +131,21 @@ export interface ProviderCustomPolicy {
   outboundIdentityPolicy: ProviderOutboundIdentityPolicy;
 }
 
+export interface ProviderCustomRecipe {
+  recipeId: string;
+  label: string;
+  labelKey: string;
+  profileId: string;
+  compatibilityProviderType: string;
+  binding: {
+    upstreamProtocol: ProviderCustomRecipeProtocol;
+    authScheme: ProviderAuthScheme;
+  };
+  modelPolicy: ProviderModelPolicy;
+  icon: string;
+  iconColor: string;
+}
+
 export interface ProviderRegistrySnapshot {
   format: "cc-switch-provider-registry";
   schemaVersion: number;
@@ -134,6 +154,7 @@ export interface ProviderRegistrySnapshot {
   drivers: ProviderRegistryDriver[];
   optionSchemas: ProviderDriverOptionSchema[];
   customPolicies: ProviderCustomPolicy[];
+  customRecipes: ProviderCustomRecipe[];
   legacyPresetMappings: Array<{
     app: CoreProviderApp;
     legacyName: string;
@@ -230,5 +251,24 @@ export function customPolicyForProfile(
   if (binding.kind !== "custom") return undefined;
   return providerRegistry.customPolicies.find(
     (policy) => policy.customPolicyId === binding.customPolicyId,
+  );
+}
+
+export function customRecipeById(
+  recipeId: string,
+): ProviderCustomRecipe | undefined {
+  return providerRegistry.customRecipes.find(
+    (recipe) => recipe.recipeId === recipeId,
+  );
+}
+
+export function customRecipesForFamily(
+  family: ProviderFamilySpec,
+): ProviderCustomRecipe[] {
+  const profileIds = new Set(
+    family.surfaces.map((surface) => surface.profileId),
+  );
+  return providerRegistry.customRecipes.filter((recipe) =>
+    profileIds.has(recipe.profileId),
   );
 }

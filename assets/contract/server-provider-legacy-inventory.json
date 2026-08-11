@@ -1588,7 +1588,6 @@
     ],
     "firstClassProfileAdditions": [
       "claude.anthropic_api_key",
-      "claude.bearer_relay",
       "claude.google_oauth",
       "claude.kimi_code",
       "codex.kiro_oauth",
@@ -1596,6 +1595,9 @@
       "codex.openai_api_key",
       "gemini.google_api_key",
       "gemini.kimi_code"
+    ],
+    "customRecipeAdditions": [
+      "claude.anthropic_bearer_relay"
     ]
   }
 }

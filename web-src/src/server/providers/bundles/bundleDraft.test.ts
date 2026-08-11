@@ -7,8 +7,10 @@ import type {
 } from "@/lib/api/providers";
 import { familyById, providerRegistry } from "@/server/providerRegistry";
 import {
+  applyCustomRecipeToBundleDraft,
   changeModelPolicyScope,
   createProviderBundleDraft,
+  customRecipeMatchesBundleDraft,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
@@ -189,6 +191,85 @@ describe("Provider Bundle drafts", () => {
     expect(toProviderBundleWriteDraft(custom)).toMatchObject({
       name: "Private gateway",
       websiteUrl: "https://gateway.example",
+    });
+  });
+
+  it("materializes the Anthropic bearer relay as a Custom HTTP recipe", () => {
+    expect(familyById("family.claude_bearer_relay")).toBeUndefined();
+    expect(
+      providerRegistry.profiles.some(
+        (profile) => profile.profileId === "claude.bearer_relay",
+      ),
+    ).toBe(false);
+    const recipe = providerRegistry.customRecipes.find(
+      (candidate) => candidate.recipeId === "claude.anthropic_bearer_relay",
+    )!;
+    const family = familyById("family.custom_http")!;
+    const draft = applyCustomRecipeToBundleDraft(
+      createProviderBundleDraft(family),
+      recipe,
+    );
+
+    expect(customRecipeMatchesBundleDraft(draft, recipe)).toBe(true);
+    expect(draft).toMatchObject({
+      name: "Anthropic Bearer Relay",
+      websiteUrl: "",
+      icon: "anthropic",
+      iconColor: "#D4915D",
+      modelPolicyScope: "global",
+      modelPolicy: "passthrough",
+    });
+    expect(
+      draft.surfaces.map((surface) => ({
+        app: surface.app,
+        enabled: surface.enabled,
+        customBinding: surface.customBinding,
+      })),
+    ).toEqual([
+      {
+        app: "claude",
+        enabled: true,
+        customBinding: {
+          upstreamProtocol: "anthropic_messages",
+          authScheme: "bearer",
+        },
+      },
+      {
+        app: "codex",
+        enabled: false,
+        customBinding: {
+          upstreamProtocol: "open_ai_responses",
+          authScheme: "bearer",
+        },
+      },
+      {
+        app: "gemini",
+        enabled: false,
+        customBinding: {
+          upstreamProtocol: "gemini_native",
+          authScheme: "api_key",
+        },
+      },
+    ]);
+
+    const claude = draft.surfaces[0]!;
+    claude.endpoint = "https://relay.example/v1";
+    claude.secret.value = "relay-token";
+    expect(validateProviderBundleDraft(draft)).toBeNull();
+    expect(toProviderBundleWriteDraft(draft).surfaces[0]).toMatchObject({
+      app: "claude",
+      enabled: true,
+      endpoint: "https://relay.example/v1",
+      customBinding: {
+        upstreamProtocol: "anthropic_messages",
+        authScheme: "bearer",
+      },
+      credentialPatches: {
+        "/settingsConfig/apiKey": {
+          action: "replace",
+          value: "relay-token",
+        },
+      },
     });
   });
 

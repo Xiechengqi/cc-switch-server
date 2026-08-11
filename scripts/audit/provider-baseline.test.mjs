@@ -12,7 +12,7 @@ import {
   validateBaselineContracts,
 } from "./audit-upstream-provider-baseline.mjs";
 import {
-  assertRequiredProviderProfileCoverage,
+  assertRequiredProviderCoverage,
   requiredProviderProfilePairs,
 } from "./provider-profile-coverage.mjs";
 
@@ -52,7 +52,6 @@ test("first-class Server Profiles are committed additions, not candidates", () =
   const registry = contract("provider-registry.json");
   assert.deepEqual(mappings.firstClassProfileAdditions, [
     "claude.anthropic_api_key",
-    "claude.bearer_relay",
     "claude.google_oauth",
     "claude.kimi_code",
     "codex.kiro_oauth",
@@ -62,6 +61,9 @@ test("first-class Server Profiles are committed additions, not candidates", () =
     "gemini.kimi_code",
   ]);
   assert.equal("directApiCandidates" in mappings, false);
+  assert.deepEqual(mappings.customRecipeAdditions, [
+    "claude.anthropic_bearer_relay",
+  ]);
 
   const mappedProfileIds = new Set(
     registry.legacyPresetMappings.map((mapping) => mapping.profileId),
@@ -98,18 +100,44 @@ test("inventory validation rejects altered first-class Profile additions", () =>
   );
 });
 
-test("every required Provider type/app pair has a creatable visible Profile", () => {
+test("inventory validation rejects altered Custom HTTP recipe additions", () => {
+  const baseline = contract("upstream-provider-source-baseline.json");
+  const server = contract("server-provider-legacy-inventory.json");
+  server.coverageMappings.customRecipeAdditions = [];
+  assert.throws(
+    () => validateBaselineContracts(baseline, server),
+    /Server Custom HTTP recipe additions are incomplete/,
+  );
+});
+
+test("every required Provider type/app pair has a creatable Profile or recipe", () => {
   const registry = contract("provider-registry.json");
   assert.equal(requiredProviderProfilePairs().length, 37);
-  assert.doesNotThrow(() => assertRequiredProviderProfileCoverage(registry));
+  assert.doesNotThrow(() => assertRequiredProviderCoverage(registry));
 
   const missing = structuredClone(registry);
   missing.profiles = missing.profiles.filter(
     (profile) => profile.profileId !== "claude.google_oauth",
   );
   assert.throws(
-    () => assertRequiredProviderProfileCoverage(missing),
-    /Missing visible create_allowed Provider Profile for claude:gemini_cli/,
+    () => assertRequiredProviderCoverage(missing),
+    /Missing visible create_allowed Provider Profile or Custom HTTP recipe for claude:gemini_cli/,
+  );
+
+  const missingRecipe = structuredClone(registry);
+  missingRecipe.customRecipes = missingRecipe.customRecipes.filter(
+    (recipe) => recipe.recipeId !== "claude.anthropic_bearer_relay",
+  );
+  assert.throws(
+    () => assertRequiredProviderCoverage(missingRecipe),
+    /Missing visible create_allowed Provider Profile or Custom HTTP recipe for claude:claude_auth/,
+  );
+
+  const mistypedRecipe = structuredClone(registry);
+  mistypedRecipe.customRecipes[0].binding.authScheme = "api_key";
+  assert.throws(
+    () => assertRequiredProviderCoverage(mistypedRecipe),
+    /declares claude_auth, resolved claude/,
   );
 
   const mismatched = structuredClone(registry);
@@ -117,7 +145,7 @@ test("every required Provider type/app pair has a creatable visible Profile", ()
     (profile) => profile.profileId === "gemini.google_oauth",
   ).credentialPolicy.accountProviderType = "antigravity_oauth";
   assert.throws(
-    () => assertRequiredProviderProfileCoverage(mismatched),
+    () => assertRequiredProviderCoverage(mismatched),
     /gemini\.google_oauth binds antigravity_oauth, expected gemini_cli/,
   );
 });

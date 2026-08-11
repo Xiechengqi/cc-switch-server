@@ -12,8 +12,8 @@ use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{classify_provider, AppKind, Provider, ProviderType};
 use crate::domain::providers::model_routing::normalize_provider_model_routing;
 use crate::domain::providers::registry::{
-    profile_by_id, resolve_custom_binding, CustomBindingInput, DriverBinding, ProfileId,
-    UpstreamProtocol,
+    custom_binding_compatibility_provider_type, profile_by_id, resolve_custom_binding,
+    CustomBindingInput, DriverBinding, ProfileId,
 };
 use crate::domain::providers::runtime::{ProviderRuntimeIndex, ProviderRuntimePlan};
 
@@ -757,19 +757,8 @@ pub fn canonical_provider_type(
                 format!("custom Provider profile {profile_id} has no customBinding")
             })?;
             resolve_custom_binding(profile, binding)?;
-            Ok(match binding.upstream_protocol {
-                UpstreamProtocol::AnthropicMessages => ProviderType::Claude,
-                UpstreamProtocol::OpenAiChat | UpstreamProtocol::OpenAiResponses => {
-                    ProviderType::Codex
-                }
-                UpstreamProtocol::GeminiNative => ProviderType::Gemini,
-                UpstreamProtocol::Bedrock => ProviderType::AwsBedrock,
-                UpstreamProtocol::Special | UpstreamProtocol::Custom | UpstreamProtocol::Legacy => {
-                    anyhow::bail!(
-                        "custom Provider profile {profile_id} has no compatibility type for {:?}",
-                        binding.upstream_protocol
-                    )
-                }
+            custom_binding_compatibility_provider_type(binding).with_context(|| {
+                format!("custom Provider profile {profile_id} has no compatibility type")
             })
         }
         DriverBinding::Fixed { driver_id } if driver_id.as_str() == "legacy.frozen" => {
@@ -821,6 +810,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::domain::providers::registry::UpstreamProtocol;
 
     #[test]
     fn upsert_classifies_and_replaces_provider() {
@@ -907,17 +897,34 @@ mod tests {
             extra: Default::default(),
         };
 
-        for (protocol, expected) in [
-            (UpstreamProtocol::AnthropicMessages, ProviderType::Claude),
-            (UpstreamProtocol::OpenAiResponses, ProviderType::Codex),
-            (UpstreamProtocol::GeminiNative, ProviderType::Gemini),
+        for (protocol, auth_scheme, expected) in [
+            (
+                UpstreamProtocol::AnthropicMessages,
+                crate::domain::providers::registry::AuthScheme::ApiKey,
+                ProviderType::Claude,
+            ),
+            (
+                UpstreamProtocol::AnthropicMessages,
+                crate::domain::providers::registry::AuthScheme::Bearer,
+                ProviderType::ClaudeAuth,
+            ),
+            (
+                UpstreamProtocol::OpenAiResponses,
+                crate::domain::providers::registry::AuthScheme::ApiKey,
+                ProviderType::Codex,
+            ),
+            (
+                UpstreamProtocol::GeminiNative,
+                crate::domain::providers::registry::AuthScheme::ApiKey,
+                ProviderType::Gemini,
+            ),
         ] {
             let resource = ProviderResourceMetadata {
                 profile_id: Some(ProfileId::parse("claude.custom_http").unwrap()),
                 profile_schema_revision: Some(1),
                 custom_binding: Some(CustomBindingInput {
                     upstream_protocol: protocol,
-                    auth_scheme: crate::domain::providers::registry::AuthScheme::ApiKey,
+                    auth_scheme,
                 }),
                 ..Default::default()
             };

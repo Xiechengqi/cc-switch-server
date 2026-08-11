@@ -67,6 +67,7 @@ import {
 } from "@/lib/query";
 import {
   customPolicyForProfile,
+  customRecipesForFamily,
   driverForProfile,
   familyById,
   profileById,
@@ -96,8 +97,10 @@ import {
   type ProviderBundleShareDraft,
 } from "./bundleShare";
 import {
+  applyCustomRecipeToBundleDraft,
   changeModelPolicyScope,
   createProviderBundleDraft,
+  customRecipeMatchesBundleDraft,
   defaultUpstreamModelForFamily,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
@@ -198,6 +201,28 @@ function SurfaceEditor({
   const profile = profileById(surface.profileId);
   if (!profile) return null;
   const customPolicy = customPolicyForProfile(profile);
+  const customCredentialLabel = (() => {
+    switch (surface.customBinding?.authScheme) {
+      case "bearer":
+        return t("providerBundle.bearerToken", {
+          defaultValue: "Bearer Token",
+        });
+      case "api_key":
+        return t("providerBundle.apiKey", { defaultValue: "API Key" });
+      case "custom_header":
+        return t("providerBundle.headerCredential", {
+          defaultValue: "Header value",
+        });
+      case "query":
+        return t("providerBundle.queryCredential", {
+          defaultValue: "Query value",
+        });
+      default:
+        return t("providerBundle.surfaceCredential", {
+          defaultValue: "Authentication credential",
+        });
+    }
+  })();
   const allowedModelPolicies = modelPoliciesForSurface(surface);
   const modelPolicyConfigurable = allowedModelPolicies.length > 1;
   const updateDriverOptions = (
@@ -429,11 +454,7 @@ function SurfaceEditor({
           </div>
 
           <div className="space-y-2">
-            <Label>
-              {t("providerBundle.surfaceCredential", {
-                defaultValue: "认证密钥",
-              })}
-            </Label>
+            <Label>{customCredentialLabel}</Label>
             <SecretInput
               value={surface.secret.value}
               placeholder={surface.secret.configured ? "••••••••" : undefined}
@@ -1159,6 +1180,10 @@ export function ProviderBundleEditor({
   const persisted =
     (Boolean(bundle) && !duplicate) || draft.expectedRevision !== undefined;
   const family = familyById(draft.familyId) ?? initialFamily;
+  const customRecipes = customRecipesForFamily(family);
+  const activeCustomRecipe = customRecipes.find((recipe) =>
+    customRecipeMatchesBundleDraft(draft, recipe),
+  );
   const identityEditable = providerBundleIdentityEditable(family);
   const [activeApp, setActiveApp] = useState<CoreProviderApp>(
     draft.surfaces[0]?.app ?? "claude",
@@ -1466,6 +1491,38 @@ export function ProviderBundleEditor({
                 </div>
               )}
             </div>
+            {customRecipes.length ? (
+              <div className="space-y-2 md:col-span-2">
+                <Label>{t("providerBundle.quickPreset")}</Label>
+                <Select
+                  value={activeCustomRecipe?.recipeId ?? ""}
+                  onValueChange={(recipeId) => {
+                    const recipe = customRecipes.find(
+                      (candidate) => candidate.recipeId === recipeId,
+                    );
+                    if (!recipe) return;
+                    setDraft((current) =>
+                      applyCustomRecipeToBundleDraft(current, recipe),
+                    );
+                    const recipeProfile = profileById(recipe.profileId);
+                    if (recipeProfile) setActiveApp(recipeProfile.app);
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue
+                      placeholder={t("providerBundle.manualConfiguration")}
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {customRecipes.map((recipe) => (
+                      <SelectItem key={recipe.recipeId} value={recipe.recipeId}>
+                        {t(recipe.labelKey, { defaultValue: recipe.label })}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
             <div className="space-y-2">
               <Label>{t("serverProviderForm.basic.name")}</Label>
               <Input

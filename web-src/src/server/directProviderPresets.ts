@@ -23,22 +23,6 @@ export const anthropicApiKeyPreset: ProviderPreset = {
   iconColor: "#D4915D",
 };
 
-export const claudeBearerRelayPreset: ProviderPreset = {
-  name: "Claude Bearer Relay",
-  websiteUrl: "https://www.anthropic.com/",
-  settingsConfig: {
-    env: {
-      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
-    },
-    modelMapping: { mode: "passthrough" },
-  },
-  category: "official",
-  apiKeyField: "ANTHROPIC_AUTH_TOKEN",
-  apiFormat: "anthropic",
-  icon: "anthropic",
-  iconColor: "#D4915D",
-};
-
 export const claudeGoogleOAuthPreset: ProviderPreset = {
   name: "Google Gemini OAuth",
   websiteUrl: "https://codeassist.google/",

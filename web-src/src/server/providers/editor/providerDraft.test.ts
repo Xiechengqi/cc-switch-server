@@ -75,28 +75,6 @@ describe("Server Provider profile drafts", () => {
     }
   });
 
-  it("materializes the Claude bearer relay draft with bearer metadata", () => {
-    const profile = providerRegistry.profiles.find(
-      (item) => item.profileId === "claude.bearer_relay",
-    );
-    expect(profile).toBeDefined();
-
-    const draft = createDraftForProfile(profile!);
-    expect(draft.name).toBe("Claude Bearer Relay");
-    expect(readEndpoint(draft.settingsConfig, "claude")).toBe(
-      "https://api.anthropic.com",
-    );
-    expect(draft.settingsConfig.modelMapping).toEqual({
-      mode: "passthrough",
-    });
-    expect(draft.meta).toMatchObject({
-      providerType: "claude_auth",
-      apiFormat: "anthropic",
-      apiKeyField: "ANTHROPIC_AUTH_TOKEN",
-    });
-    expect(profileAllowsEndpointEditing(profile!)).toBe(true);
-  });
-
   it("materializes the Claude Google OAuth draft for Code Assist", () => {
     const profile = providerRegistry.profiles.find(
       (item) => item.profileId === "claude.google_oauth",

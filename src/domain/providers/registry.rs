@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 5;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 6;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -81,6 +81,8 @@ pub struct ProviderRegistry {
     pub option_schemas: Vec<DriverOptionSchemaSpec>,
     #[serde(default)]
     pub custom_policies: Vec<CustomPolicySpec>,
+    #[serde(default)]
+    pub custom_recipes: Vec<CustomRecipeSpec>,
     #[serde(default)]
     pub legacy_preset_mappings: Vec<LegacyPresetMapping>,
     #[serde(default)]
@@ -379,6 +381,20 @@ pub struct CustomPolicySpec {
     pub outbound_identity_policy: OutboundIdentityPolicy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustomRecipeSpec {
+    pub recipe_id: String,
+    pub label: String,
+    pub label_key: String,
+    pub profile_id: ProfileId,
+    pub compatibility_provider_type: ProviderType,
+    pub binding: CustomBindingInput,
+    pub model_policy: ModelPolicyKind,
+    pub icon: String,
+    pub icon_color: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CustomBindingInput {
@@ -512,14 +528,28 @@ pub fn profile_for_legacy_preset(app: AppKind, legacy_name: &str) -> Option<&'st
     profile_by_id(mapping.profile_id.as_str())
 }
 
+pub fn custom_recipe_by_id(recipe_id: &str) -> Option<&'static CustomRecipeSpec> {
+    provider_registry()
+        .custom_recipes
+        .iter()
+        .find(|recipe| recipe.recipe_id == recipe_id)
+}
+
 pub fn resolve_custom_binding(
+    profile: &ProfileSpec,
+    input: &CustomBindingInput,
+) -> anyhow::Result<ResolvedCustomBinding> {
+    resolve_custom_binding_in_registry(provider_registry(), profile, input)
+}
+
+fn resolve_custom_binding_in_registry(
+    registry: &ProviderRegistry,
     profile: &ProfileSpec,
     input: &CustomBindingInput,
 ) -> anyhow::Result<ResolvedCustomBinding> {
     let DriverBinding::Custom { custom_policy_id } = &profile.driver_binding else {
         bail!("profile {} is not a custom Profile", profile.profile_id);
     };
-    let registry = provider_registry();
     let policy = registry
         .custom_policies
         .iter()
@@ -568,6 +598,26 @@ pub fn resolve_custom_binding(
     })
 }
 
+pub fn custom_binding_compatibility_provider_type(
+    input: &CustomBindingInput,
+) -> anyhow::Result<ProviderType> {
+    Ok(match (input.upstream_protocol, input.auth_scheme) {
+        (UpstreamProtocol::AnthropicMessages, AuthScheme::Bearer) => ProviderType::ClaudeAuth,
+        (UpstreamProtocol::AnthropicMessages, _) => ProviderType::Claude,
+        (UpstreamProtocol::OpenAiChat | UpstreamProtocol::OpenAiResponses, _) => {
+            ProviderType::Codex
+        }
+        (UpstreamProtocol::GeminiNative, _) => ProviderType::Gemini,
+        (UpstreamProtocol::Bedrock, _) => ProviderType::AwsBedrock,
+        (UpstreamProtocol::Special | UpstreamProtocol::Custom | UpstreamProtocol::Legacy, _) => {
+            bail!(
+                "custom Provider binding has no compatibility type for {:?}",
+                input.upstream_protocol
+            )
+        }
+    })
+}
+
 pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     if registry.format != PROVIDER_REGISTRY_FORMAT {
         bail!("unexpected Provider registry format {}", registry.format);
@@ -582,6 +632,7 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     let mut profile_ids = BTreeSet::new();
     let mut driver_ids = BTreeSet::new();
     let mut custom_policy_ids = BTreeSet::new();
+    let mut custom_recipe_ids = BTreeSet::new();
     let mut option_schema_ids = BTreeSet::new();
     for schema in &registry.option_schemas {
         validate_registry_id(&schema.option_schema_id, "Driver option schema")?;
@@ -714,6 +765,77 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         )?;
     }
 
+    for recipe in &registry.custom_recipes {
+        validate_registry_id(&recipe.recipe_id, "custom recipe")?;
+        if !custom_recipe_ids.insert(recipe.recipe_id.as_str()) {
+            bail!("duplicate custom recipe id {}", recipe.recipe_id);
+        }
+        if recipe.label.trim().is_empty() || recipe.label != recipe.label.trim() {
+            bail!("custom recipe {} has an invalid label", recipe.recipe_id);
+        }
+        if recipe.label_key.trim().is_empty() || recipe.label_key != recipe.label_key.trim() {
+            bail!(
+                "custom recipe {} has an invalid label key",
+                recipe.recipe_id
+            );
+        }
+        if recipe.icon.trim().is_empty() || recipe.icon != recipe.icon.trim() {
+            bail!("custom recipe {} has an invalid icon", recipe.recipe_id);
+        }
+        let color = recipe.icon_color.strip_prefix('#').unwrap_or_default();
+        if color.len() != 6 || !color.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!(
+                "custom recipe {} has an invalid icon color",
+                recipe.recipe_id
+            );
+        }
+        let profile = registry
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == recipe.profile_id)
+            .with_context(|| {
+                format!(
+                    "custom recipe {} references unknown profile {}",
+                    recipe.recipe_id, recipe.profile_id
+                )
+            })?;
+        if profile.form_composition != FormComposition::Custom
+            || profile.visibility != ProfileVisibility::Visible
+            || profile.creation_policy != CreationPolicy::CreateAllowed
+        {
+            bail!(
+                "custom recipe {} must reference a creatable Custom HTTP profile",
+                recipe.recipe_id
+            );
+        }
+        if !recipe.recipe_id.starts_with(profile.app.as_str())
+            || !recipe.recipe_id[profile.app.as_str().len()..].starts_with('.')
+        {
+            bail!(
+                "custom recipe {} is not namespaced for {}",
+                recipe.recipe_id,
+                profile.app.as_str()
+            );
+        }
+        resolve_custom_binding_in_registry(registry, profile, &recipe.binding)?;
+        let compatibility_type = custom_binding_compatibility_provider_type(&recipe.binding)?;
+        if compatibility_type != recipe.compatibility_provider_type {
+            bail!(
+                "custom recipe {} declares compatibility type {}, resolved {}",
+                recipe.recipe_id,
+                recipe.compatibility_provider_type.as_str(),
+                compatibility_type.as_str()
+            );
+        }
+        if !profile.allows_model_policy(recipe.model_policy) {
+            bail!(
+                "custom recipe {} uses a model policy rejected by {}",
+                recipe.recipe_id,
+                profile.profile_id
+            );
+        }
+    }
+
     let creatable_profile_ids = registry
         .profiles
         .iter()
@@ -825,7 +947,7 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     }
 
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 20usize),
+        (AppKind::Claude, 19usize),
         (AppKind::Codex, 11usize),
         (AppKind::Gemini, 7usize),
     ]);
@@ -848,10 +970,16 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 44 {
+    if registry.profiles.len() != 43 {
         bail!(
-            "Provider registry contains {} profiles, expected 44",
+            "Provider registry contains {} profiles, expected 43",
             registry.profiles.len()
+        );
+    }
+    if registry.custom_recipes.len() != 1 {
+        bail!(
+            "Provider registry contains {} custom recipes, expected 1",
+            registry.custom_recipes.len()
         );
     }
     if registry.legacy_preset_mappings.len() != 29 {
@@ -898,7 +1026,6 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
 
     let reviewed_first_class_additions = BTreeSet::from([
         "claude.anthropic_api_key",
-        "claude.bearer_relay",
         "claude.google_oauth",
         "claude.kimi_code",
         "codex.kiro_oauth",
@@ -1213,8 +1340,9 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.profiles.len(), 44);
+        assert_eq!(registry.profiles.len(), 43);
         assert_eq!(registry.legacy_preset_mappings.len(), 29);
+        assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(
             registry
                 .profiles
@@ -1243,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn required_provider_type_app_pairs_have_a_creatable_visible_profile() {
+    fn required_provider_type_app_pairs_have_a_creatable_profile_or_recipe() {
         let required = [
             (ProviderType::Claude, AppKind::Claude),
             (ProviderType::ClaudeAuth, AppKind::Claude),
@@ -1279,7 +1407,12 @@ mod tests {
             (ProviderType::GrokOAuth, AppKind::Claude),
             (ProviderType::GrokOAuth, AppKind::Codex),
             (ProviderType::GrokOAuth, AppKind::Gemini),
+            (ProviderType::KimiCode, AppKind::Claude),
+            (ProviderType::KimiCode, AppKind::Codex),
+            (ProviderType::KimiCode, AppKind::Gemini),
         ];
+
+        assert_eq!(required.len(), 37);
 
         for (provider_type, app) in required {
             let profiles = provider_registry()
@@ -1292,9 +1425,18 @@ mod tests {
                         && profile.creation_policy == CreationPolicy::CreateAllowed
                 })
                 .collect::<Vec<_>>();
+            let recipes = provider_registry()
+                .custom_recipes
+                .iter()
+                .filter(|recipe| {
+                    recipe.compatibility_provider_type == provider_type
+                        && profile_by_id(recipe.profile_id.as_str())
+                            .is_some_and(|profile| profile.app == app)
+                })
+                .collect::<Vec<_>>();
             assert!(
-                !profiles.is_empty(),
-                "missing visible create_allowed Profile for {}:{}",
+                !profiles.is_empty() || !recipes.is_empty(),
+                "missing visible create_allowed Profile or Custom HTTP recipe for {}:{}",
                 app.as_str(),
                 provider_type.as_str()
             );
@@ -1311,6 +1453,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn anthropic_bearer_recipe_is_typed_as_claude_auth() {
+        let recipe = custom_recipe_by_id("claude.anthropic_bearer_relay").unwrap();
+        assert_eq!(recipe.profile_id.as_str(), "claude.custom_http");
+        assert_eq!(
+            recipe.binding.upstream_protocol,
+            UpstreamProtocol::AnthropicMessages
+        );
+        assert_eq!(recipe.binding.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(recipe.compatibility_provider_type, ProviderType::ClaudeAuth);
+        assert_eq!(
+            custom_binding_compatibility_provider_type(&recipe.binding).unwrap(),
+            ProviderType::ClaudeAuth
+        );
+    }
+
+    #[test]
+    fn registry_rejects_a_mistyped_custom_recipe() {
+        let mut registry = provider_registry().clone();
+        registry.custom_recipes[0].compatibility_provider_type = ProviderType::Claude;
+
+        let error = validate_registry(&registry).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("declares compatibility type claude, resolved claude_auth"));
     }
 
     #[test]

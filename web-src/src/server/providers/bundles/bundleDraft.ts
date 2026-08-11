@@ -17,6 +17,7 @@ import {
   profileById,
   providerRegistry,
   type CoreProviderApp,
+  type ProviderCustomRecipe,
   type ProviderFamilySpec,
   type ProviderModelPolicy,
   type ProviderRegistryProfile,
@@ -456,6 +457,73 @@ export function createProviderBundleDraft(
     secrets,
     surfaces,
   };
+}
+
+export function applyCustomRecipeToBundleDraft(
+  draft: ProviderBundleEditorDraft,
+  recipe: ProviderCustomRecipe,
+): ProviderBundleEditorDraft {
+  const targetProfile = profileById(recipe.profileId);
+  if (!targetProfile || targetProfile.formComposition !== "custom") {
+    throw new Error(`Unknown Custom HTTP recipe profile ${recipe.profileId}`);
+  }
+  if (
+    !draft.surfaces.some((surface) => surface.profileId === recipe.profileId)
+  ) {
+    throw new Error(
+      `Recipe ${recipe.recipeId} does not belong to ${draft.familyId}`,
+    );
+  }
+  const defaultModel = targetProfile.defaultUpstreamModel ?? "";
+  return {
+    ...draft,
+    name: recipe.label,
+    websiteUrl: "",
+    icon: recipe.icon,
+    iconColor: recipe.iconColor,
+    modelPolicyScope: "global",
+    modelPolicy: recipe.modelPolicy,
+    upstreamModel:
+      recipe.modelPolicy === "single" && !draft.upstreamModel.trim()
+        ? defaultModel
+        : draft.upstreamModel,
+    surfaces: draft.surfaces.map((surface) => {
+      const selected = surface.profileId === recipe.profileId;
+      if (!selected) return { ...surface, enabled: false };
+      return {
+        ...surface,
+        enabled: true,
+        modelPolicy: recipe.modelPolicy,
+        upstreamModel:
+          recipe.modelPolicy === "single" && !surface.upstreamModel.trim()
+            ? defaultModel
+            : surface.upstreamModel,
+        customBinding: { ...recipe.binding },
+        driverOptions: {
+          ...surface.driverOptions,
+          apiKeyField: undefined,
+        },
+      };
+    }),
+  };
+}
+
+export function customRecipeMatchesBundleDraft(
+  draft: ProviderBundleEditorDraft,
+  recipe: ProviderCustomRecipe,
+): boolean {
+  const target = draft.surfaces.find(
+    (surface) => surface.profileId === recipe.profileId,
+  );
+  return Boolean(
+    target?.enabled &&
+    draft.surfaces.every((surface) => surface === target || !surface.enabled) &&
+    draft.modelPolicyScope === "global" &&
+    draft.modelPolicy === recipe.modelPolicy &&
+    target.customBinding?.upstreamProtocol ===
+      recipe.binding.upstreamProtocol &&
+    target.customBinding.authScheme === recipe.binding.authScheme,
+  );
 }
 
 export function editProviderBundleDraft(

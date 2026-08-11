@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 
 import {
-  assertRequiredProviderProfileCoverage,
+  assertRequiredProviderCoverage,
   requiredProviderTypes,
   serverCompatibilityProviderTypes,
 } from "./provider-profile-coverage.mjs";
@@ -89,6 +89,14 @@ function buildCoverage() {
       ]),
     ),
     universalRecipes: upstreamBaseline.universalRecipes,
+    customRecipes: providerRegistry.customRecipes.map((recipe) => ({
+      recipeId: recipe.recipeId,
+      label: recipe.label,
+      profileId: recipe.profileId,
+      compatibilityProviderType: recipe.compatibilityProviderType,
+      binding: recipe.binding,
+      modelPolicy: recipe.modelPolicy,
+    })),
   };
 }
 
@@ -216,6 +224,18 @@ function toMarkdown(coverage) {
     lines.push(`| ${key} | ${coverage.upstreamPresets[key].length} |`);
   }
   lines.push("");
+  lines.push("## Server Custom HTTP recipes");
+  lines.push("");
+  lines.push(
+    "| Name | ProviderType | Profile | Protocol | Auth | Model policy |",
+  );
+  lines.push("| --- | --- | --- | --- | --- | --- |");
+  for (const recipe of coverage.customRecipes) {
+    lines.push(
+      `| ${recipe.label} | \`${recipe.compatibilityProviderType}\` | \`${recipe.profileId}\` | \`${recipe.binding.upstreamProtocol}\` | \`${recipe.binding.authScheme}\` | \`${recipe.modelPolicy}\` |`,
+    );
+  }
+  lines.push("");
   lines.push("## Universal recipes");
   lines.push("");
   lines.push("| Name | providerType | Apps |");
@@ -246,7 +266,7 @@ function serverEvidenceNotes() {
     "",
     "### Provider control plane and storage",
     "",
-    "- Rust `ProfileSpec` is the product identity authority, `DriverSpec` owns protocol operations, and each committed Provider compiles one canonical `RuntimePlan` shared by forwarding, manual test, and model discovery. Custom Profiles derive compatibility type deterministically from their explicit upstream protocol.",
+    "- Rust `ProfileSpec` is the product identity authority, `DriverSpec` owns protocol operations, and each committed Provider compiles one canonical `RuntimePlan` shared by forwarding, manual test, and model discovery. Custom Profiles derive compatibility type deterministically from their explicit upstream protocol and authentication scheme; Anthropic Messages with Bearer authentication is classified as `claude_auth`. Named Custom HTTP recipes remain convenience configuration, not separate Provider families.",
     "- Every Driver declares an `outboundIdentityPolicy`, and the compiled RuntimePlan applies it as the last header step after protocol authentication and managed-account overrides. Claude/Codex/Grok/Kimi and Google Code Assist OAuth use their official CLI identity families; Kiro, Cursor, Copilot, and DeepSeek account drivers use their protocol-specific identities; Antigravity/agy use one background-refreshed client version and matching platform metadata; ordinary HTTP/API-key drivers use `cc-switch-server/<version>`; Bedrock omits User-Agent; frozen legacy Profiles retain their existing contract.",
     "- Only Custom HTTP Profiles can persist `customUserAgent`. Their empty value falls back to the Server identity, invalid header values are rejected, and `extraHeaders` cannot smuggle a second `User-Agent`. Preset Providers ignore historical values at runtime and clear a carried historical value on their next valid save; a new preset write containing a custom User-Agent is rejected.",
     "- The same final identity pass covers normal HTTP forwarding, Claude prepared requests, Codex/Grok WebSocket handshakes, Codex HTTP fallback and image generation, Grok media, Provider network tests, model discovery, and scheduled Share health checks. Dedicated Kiro, Cursor AgentService, and DeepSeek transports continue to construct the same protocol-owned identities inside their native clients.",
@@ -410,7 +430,7 @@ function assertCoverage(coverage) {
       throw new Error(`No ${key} presets extracted`);
     }
   }
-  assertRequiredProviderProfileCoverage(providerRegistry);
+  assertRequiredProviderCoverage(providerRegistry);
 }
 
 function writeIfChanged(file, content) {
