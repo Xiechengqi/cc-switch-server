@@ -267,6 +267,7 @@ export const CodexReferralPanel: React.FC<CodexReferralPanelProps> = ({
                 disabled={sendMutation.isPending}
                 invalid={emails.length > 10}
                 placeholder={t("codexReferrals.recipientPlaceholder")}
+                hidePlaceholderOnFocus
               />
               <div className="flex items-center justify-between gap-3">
                 <span className="text-xs text-muted-foreground">

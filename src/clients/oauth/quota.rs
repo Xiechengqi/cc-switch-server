@@ -6837,10 +6837,12 @@ mod tests {
             "accountId": "workspace-profile-default",
             "selectedChatgptAccountId": "workspace-selected",
             "verifiedOpenAiClaims": {
-                "chatgpt_account_id": "workspace-profile-default",
-                "organizations": [
-                    {"id": "workspace-selected", "name": "Selected"}
-                ]
+                "chatgpt_account_id": "workspace-profile-default"
+            },
+            "codexWorkspaceProvenance": {
+                "workspaceId": "workspace-selected",
+                "source": "authenticated_discovery",
+                "verifiedAt": 123
             }
         }));
 

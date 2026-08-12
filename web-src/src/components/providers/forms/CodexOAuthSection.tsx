@@ -563,7 +563,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           <p className="text-xs text-muted-foreground">
             {t("codexOauth.workspaceDescription", {
               defaultValue:
-                "Only workspaces present in the verified OpenAI token claims can be selected.",
+                "Only workspaces verified through OpenAI identity claims or authenticated account discovery can be selected.",
             })}
           </p>
         </div>

@@ -7,6 +7,7 @@ export interface EmailTagsInputProps {
   onChange: (next: string[]) => void;
   disabled?: boolean;
   placeholder?: string;
+  hidePlaceholderOnFocus?: boolean;
   invalid?: boolean;
   inputId?: string;
   onPromote?: (email: string) => void;
@@ -26,6 +27,7 @@ export function EmailTagsInput({
   onChange,
   disabled,
   placeholder,
+  hidePlaceholderOnFocus = false,
   invalid,
   inputId,
   onPromote,
@@ -33,6 +35,7 @@ export function EmailTagsInput({
   promoteLabel,
 }: EmailTagsInputProps) {
   const [draft, setDraft] = React.useState("");
+  const [focused, setFocused] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const promotableSet = React.useMemo(
     () => new Set(promotableEmails ?? []),
@@ -117,11 +120,20 @@ export function EmailTagsInput({
         id={inputId}
         value={draft}
         disabled={disabled}
-        className="h-6 min-w-[8rem] flex-1 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed"
-        placeholder={value.length ? "" : placeholder}
+        className={cn(
+          "h-6 min-w-[8rem] flex-1 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed",
+          hidePlaceholderOnFocus && "placeholder:text-muted-foreground/60",
+        )}
+        placeholder={
+          value.length || (hidePlaceholderOnFocus && focused) ? "" : placeholder
+        }
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={handleKeyDown}
-        onBlur={() => commit(draft)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => {
+          setFocused(false);
+          commit(draft);
+        }}
         onPaste={(event) => {
           const text = event.clipboardData.getData("text");
           if (/[\s,;]/.test(text)) {

@@ -20074,22 +20074,20 @@ mod tests {
 
     fn switch_codex_test_workspace(accounts: &mut AccountStore, account_id: &str) {
         let next_workspace_id = format!("{account_id}-next-workspace");
-        let account = accounts
-            .accounts
-            .iter_mut()
-            .find(|account| account.id == account_id)
-            .unwrap();
-        account
-            .profile
-            .as_mut()
-            .and_then(|profile| profile.pointer_mut("/verifiedOpenAiClaims"))
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert(
-                "organizations".to_string(),
-                json!([{ "id": next_workspace_id, "name": "Next workspace" }]),
+        let previous_generation = {
+            let account = accounts
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == account_id)
+                .unwrap();
+            crate::domain::accounts::store::set_codex_workspace_provenance(
+                &mut account.profile,
+                &next_workspace_id,
+                "authenticated_discovery",
+                123,
             );
-        let previous_generation = account.auth_identity_generation;
+            account.auth_identity_generation
+        };
         let updated = accounts
             .select_codex_workspace(account_id, &next_workspace_id)
             .unwrap();

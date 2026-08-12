@@ -4181,8 +4181,12 @@ mod tests {
         let mut workspace_a = quota_success;
         workspace_a.profile = Some(json!({
             "verifiedOpenAiClaims": {
-                "chatgpt_account_id": "workspace-a",
-                "organizations": [{"id": "workspace-b"}]
+                "chatgpt_account_id": "workspace-a"
+            },
+            "codexWorkspaceProvenance": {
+                "workspaceId": "workspace-b",
+                "source": "authenticated_discovery",
+                "verifiedAt": 123
             },
             "selectedChatgptAccountId": "workspace-a"
         }));

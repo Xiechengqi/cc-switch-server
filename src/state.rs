@@ -20345,11 +20345,12 @@ mod tests {
                         "profile": {
                             "verifiedOpenAiClaims": {
                                 "subject": "workspace-cancel-subject",
-                                "chatgpt_account_id": "workspace-default",
-                                "organizations": [{
-                                    "id": "workspace-team",
-                                    "name": "Workspace Team"
-                                }]
+                                "chatgpt_account_id": "workspace-default"
+                            },
+                            "codexWorkspaceProvenance": {
+                                "workspaceId": "workspace-team",
+                                "source": "authenticated_discovery",
+                                "verifiedAt": 123
                             },
                             "selectedChatgptAccountId": "workspace-default"
                         }
@@ -20551,11 +20552,12 @@ mod tests {
                         "profile": {
                             "verifiedOpenAiClaims": {
                                 "subject": "workspace-shared-subject",
-                                "chatgpt_account_id": "workspace-default",
-                                "organizations": [{
-                                    "id": "workspace-team",
-                                    "name": "Workspace Team"
-                                }]
+                                "chatgpt_account_id": "workspace-default"
+                            },
+                            "codexWorkspaceProvenance": {
+                                "workspaceId": "workspace-team",
+                                "source": "authenticated_discovery",
+                                "verifiedAt": 123
                             },
                             "selectedChatgptAccountId": "workspace-default"
                         }
@@ -20669,11 +20671,12 @@ mod tests {
                         "profile": {
                             "verifiedOpenAiClaims": {
                                 "subject": "workspace-unshared-cancel-subject",
-                                "chatgpt_account_id": "workspace-default",
-                                "organizations": [{
-                                    "id": "workspace-team",
-                                    "name": "Workspace Team"
-                                }]
+                                "chatgpt_account_id": "workspace-default"
+                            },
+                            "codexWorkspaceProvenance": {
+                                "workspaceId": "workspace-team",
+                                "source": "authenticated_discovery",
+                                "verifiedAt": 123
                             },
                             "selectedChatgptAccountId": "workspace-default"
                         }
@@ -21948,11 +21951,12 @@ mod tests {
                         "profile": {
                             "verifiedOpenAiClaims": {
                                 "subject": "workspace-lock-order-subject",
-                                "chatgpt_account_id": "workspace-default",
-                                "organizations": [{
-                                    "id": "workspace-team",
-                                    "name": "Workspace Team"
-                                }]
+                                "chatgpt_account_id": "workspace-default"
+                            },
+                            "codexWorkspaceProvenance": {
+                                "workspaceId": "workspace-team",
+                                "source": "authenticated_discovery",
+                                "verifiedAt": 123
                             },
                             "selectedChatgptAccountId": "workspace-default"
                         }

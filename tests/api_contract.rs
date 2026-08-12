@@ -11345,10 +11345,12 @@ async fn unshared_codex_workspace_selection_repins_every_bound_provider() {
             input.profile = Some(json!({
                 "verifiedOpenAiClaims": {
                     "subject": "codex-workspace-unshared-owner",
-                    "chatgpt_account_id": "workspace-default",
-                    "organizations": [
-                        {"id": "workspace-team", "name": "Team"}
-                    ]
+                    "chatgpt_account_id": "workspace-default"
+                },
+                "codexWorkspaceProvenance": {
+                    "workspaceId": "workspace-team",
+                    "source": "authenticated_discovery",
+                    "verifiedAt": 123
                 },
                 "selectedChatgptAccountId": "workspace-default"
             }));
@@ -11477,10 +11479,12 @@ async fn paused_share_codex_workspace_rebind_updates_identity_and_history() {
             input.profile = Some(json!({
                 "verifiedOpenAiClaims": {
                     "subject": "codex-workspace-owner",
-                    "chatgpt_account_id": "workspace-default",
-                    "organizations": [
-                        {"id": "workspace-team", "name": "Team"}
-                    ]
+                    "chatgpt_account_id": "workspace-default"
+                },
+                "codexWorkspaceProvenance": {
+                    "workspaceId": "workspace-team",
+                    "source": "authenticated_discovery",
+                    "verifiedAt": 123
                 },
                 "selectedChatgptAccountId": "workspace-default"
             }));
@@ -11960,10 +11964,7 @@ async fn oauth_share_write_contracts_allow_independent_urls_and_control_rebindin
                 ("share-account-unverified", None, "workspace-unverified"),
             ] {
                 let mut input = test_account_input(account_id, ProviderType::CodexOAuth);
-                let mut claims = json!({
-                    "chatgpt_account_id": workspace_id,
-                    "organizations": [{"id": workspace_id, "name": workspace_id}]
-                });
+                let mut claims = json!({"chatgpt_account_id": workspace_id});
                 if let Some(subject) = subject {
                     claims["subject"] = json!(subject);
                 }

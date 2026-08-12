@@ -860,7 +860,7 @@ impl AccountStore {
             .iter()
             .find(|workspace| workspace.id == workspace_id)
             .ok_or_else(|| {
-                "workspace is not present in the verified OpenAI account claims".to_string()
+                "workspace is not present in verified OpenAI workspace evidence".to_string()
             })?;
         let selection_changed =
             effective_codex_workspace_id(account).as_deref() != Some(selected.id.as_str());
@@ -1790,45 +1790,8 @@ pub fn codex_workspace_options(account: &Account) -> Vec<CodexWorkspace> {
         if let Some(id) = codex_account_id_from_value(value) {
             workspaces.entry(id.clone()).or_insert(id);
         }
-        for organizations in [
-            value.get("organizations"),
-            value
-                .get("https://api.openai.com/auth")
-                .and_then(|auth| auth.get("organizations")),
-            value
-                .get("openai_auth")
-                .and_then(|auth| auth.get("organizations")),
-            value
-                .get("openaiAuth")
-                .and_then(|auth| auth.get("organizations")),
-        ] {
-            if let Some(items) = organizations.and_then(Value::as_array) {
-                for item in items {
-                    let Some(id) = [
-                        "id",
-                        "account_id",
-                        "accountId",
-                        "organization_id",
-                        "organizationId",
-                    ]
-                    .into_iter()
-                    .find_map(|key| item.get(key).and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty()) else {
-                        continue;
-                    };
-                    let name = ["name", "title", "display_name", "displayName"]
-                        .into_iter()
-                        .find_map(|key| item.get(key).and_then(Value::as_str))
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or(id);
-                    workspaces
-                        .entry(id.to_string())
-                        .or_insert_with(|| name.to_string());
-                }
-            }
-        }
+        // OpenAI `organizations` are API Platform organizations (`org-*`),
+        // not values accepted by the ChatGPT-Account-Id header.
     }
     workspaces
         .into_iter()
@@ -3614,7 +3577,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_workspace_selection_only_accepts_verified_claim_options() {
+    fn codex_workspace_selection_rejects_openai_platform_organizations() {
         let mut store = AccountStore::default();
         store.upsert(UpsertAccountInput {
             id: Some("acct-1".to_string()),
@@ -3628,18 +3591,17 @@ mod tests {
             extra_headers: None,
             scopes: Vec::new(),
             profile: Some(json!({
-                "chatgpt_account_id": "account-default",
+                "chatgpt_account_id": "d07622d1-6efc-439e-b6ca-357788e472d5",
                 "verifiedOpenAiClaims": {
-                    "chatgpt_account_id": "account-default",
+                    "chatgpt_account_id": "d07622d1-6efc-439e-b6ca-357788e472d5",
                     "organizations": [
-                        {"id": "account-team", "name": "Team"},
-                        {"id": "account-enterprise", "name": "Enterprise"}
+                        {"id": "org-7g10IS0HCyw57L2eUZEZmR8t", "name": "Personal"}
                     ]
                 },
                 "organizations": [
-                    {"id": "account-team", "name": "Team"},
-                    {"id": "account-enterprise", "name": "Enterprise"}
-                ]
+                    {"id": "org-7g10IS0HCyw57L2eUZEZmR8t", "name": "Personal"}
+                ],
+                "selectedChatgptAccountId": "org-7g10IS0HCyw57L2eUZEZmR8t"
             })),
             raw: None,
             subscription_level: None,
@@ -3654,15 +3616,25 @@ mod tests {
         });
 
         let account = store
-            .select_codex_workspace("acct-1", "account-team")
+            .accounts
+            .iter()
+            .find(|account| account.id == "acct-1")
+            .unwrap();
+        assert_eq!(
+            effective_codex_workspace_id(account).as_deref(),
+            Some("d07622d1-6efc-439e-b6ca-357788e472d5")
+        );
+
+        let account = store
+            .select_codex_workspace("acct-1", "d07622d1-6efc-439e-b6ca-357788e472d5")
             .unwrap();
         assert_eq!(
             selected_codex_workspace_id(&account).as_deref(),
-            Some("account-team")
+            Some("d07622d1-6efc-439e-b6ca-357788e472d5")
         );
-        assert_eq!(codex_workspace_options(&account).len(), 3);
+        assert_eq!(codex_workspace_options(&account).len(), 1);
         assert!(store
-            .select_codex_workspace("acct-1", "attacker-account")
+            .select_codex_workspace("acct-1", "org-7g10IS0HCyw57L2eUZEZmR8t")
             .is_err());
     }
 
@@ -3670,14 +3642,15 @@ mod tests {
     fn codex_effective_workspace_prefers_verified_default_over_sorted_options() {
         let mut store = AccountStore::default();
         let mut profile = Some(json!({}));
+        set_codex_workspace_provenance(
+            &mut profile,
+            "workspace-a-team",
+            "authenticated_discovery",
+            123,
+        );
         set_verified_openai_claims(
             &mut profile,
-            Some(json!({
-                "chatgpt_account_id": "workspace-z-default",
-                "organizations": [
-                    {"id": "workspace-a-team", "name": "A Team"}
-                ]
-            })),
+            Some(json!({"chatgpt_account_id": "workspace-z-default"})),
         );
         let account = store.upsert(UpsertAccountInput {
             id: Some("acct-effective-workspace".to_string()),
@@ -3772,13 +3745,19 @@ mod tests {
         let mut store = AccountStore::default();
         let mut input = fixture_input(ProviderType::CodexOAuth);
         input.id = Some("acct-workspace-cache".to_string());
-        input.profile = Some(json!({
+        let mut profile = Some(json!({
             "verifiedOpenAiClaims": {
-                "chatgpt_account_id": "account-default",
-                "organizations": [{"id": "account-team", "name": "Team"}]
+                "chatgpt_account_id": "account-default"
             },
             "selectedChatgptAccountId": "account-default"
         }));
+        set_codex_workspace_provenance(
+            &mut profile,
+            "account-team",
+            "authenticated_discovery",
+            123,
+        );
+        input.profile = profile;
         input.raw = Some(json!({
             "bankedReset": {"availableCount": 2},
             "rate_limit_reset_credits": {"available_count": 2},
@@ -3847,12 +3826,15 @@ mod tests {
     fn codex_refresh_preserves_verified_workspace_state_without_new_id_token() {
         let mut store = AccountStore::default();
         let mut profile = Some(json!({"chatgpt_account_id": "account-default"}));
+        set_codex_workspace_provenance(
+            &mut profile,
+            "account-team",
+            "authenticated_discovery",
+            123,
+        );
         set_verified_openai_claims(
             &mut profile,
-            Some(json!({
-                "chatgpt_account_id": "account-default",
-                "organizations": [{"id": "account-team"}]
-            })),
+            Some(json!({"chatgpt_account_id": "account-default"})),
         );
         store.upsert(UpsertAccountInput {
             id: Some("acct-refresh".to_string()),
