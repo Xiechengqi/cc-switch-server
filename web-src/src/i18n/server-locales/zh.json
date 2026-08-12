@@ -61,6 +61,15 @@
   "providers": {
     "addProvider": "添加供应商"
   },
+  "codexOauth": {
+    "featureOptionsTitle": "Codex 功能设置",
+    "fastMode": "FAST 优先模式",
+    "fastModeDescription": "仅对明确支持的模型强制使用 priority 服务层，可能降低延迟，但也可能更快消耗 ChatGPT 配额。",
+    "imageGeneration": "图片生成接口",
+    "imageGenerationDescription": "通过 ChatGPT Codex 后端开放 OpenAI 兼容的 /v1/images/generations 接口。",
+    "websocket": "Responses WebSocket（推荐）",
+    "websocketDescription": "支持该传输的客户端可优先使用并复用 WebSocket 连接，其他请求仍走 HTTP；关闭后会要求客户端改走 POST /v1/responses 流式传输。"
+  },
   "providerBundle": {
     "account": "OAuth 账号",
     "advancedSettings": "高级设置 JSON",

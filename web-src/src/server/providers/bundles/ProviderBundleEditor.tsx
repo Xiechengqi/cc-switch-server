@@ -76,6 +76,10 @@ import {
   type ProviderFamilySpec,
 } from "@/server/providerRegistry";
 import {
+  CodexFeatureOptions,
+  type CodexFeatureOptionKey,
+} from "@/server/providers/CodexFeatureOptions";
+import {
   createDraftForProfile,
   profileAllowsEndpointEditing,
 } from "@/server/providers/editor/providerDraft";
@@ -1320,7 +1324,7 @@ export function ProviderBundleEditor({
       }),
     );
 
-  const setDriverOption = (key: string, checked: boolean) =>
+  const setDriverOption = (key: CodexFeatureOptionKey, checked: boolean) =>
     setDraft((current) => ({
       ...current,
       surfaces: current.surfaces.map((surface) => {
@@ -1857,41 +1861,23 @@ export function ProviderBundleEditor({
         ) : null}
 
         {codexDriverOptions ? (
-          <Section
-            title={t("providerBundle.driverOptions", {
-              defaultValue: "运行选项",
-            })}
-          >
-            <div className="grid gap-3 sm:grid-cols-3">
-              {[
-                ["FAST", "codexFastMode"],
-                [
-                  t("serverProviderForm.codex.imageGeneration"),
-                  "codexImageGenerationEnabled",
-                ],
-                ["WebSocket", "codexWebsocketEnabled"],
-              ].map(([label, key]) => {
-                const checked = draft.surfaces.some((surface) =>
-                  Boolean(
-                    surface.driverOptions[
-                      key as keyof BundleSurfaceEditorDraft["driverOptions"]
-                    ],
-                  ),
-                );
-                return (
-                  <div
-                    key={key}
-                    className="flex items-center justify-between rounded-md border px-3 py-2"
-                  >
-                    <Label>{label}</Label>
-                    <Switch
-                      checked={checked}
-                      onCheckedChange={(value) => setDriverOption(key, value)}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+          <Section title={t("codexOauth.featureOptionsTitle")}>
+            <CodexFeatureOptions
+              values={{
+                codexFastMode: draft.surfaces.some(
+                  (surface) => surface.driverOptions.codexFastMode === true,
+                ),
+                codexImageGenerationEnabled: draft.surfaces.some(
+                  (surface) =>
+                    surface.driverOptions.codexImageGenerationEnabled === true,
+                ),
+                codexWebsocketEnabled: draft.surfaces.some(
+                  (surface) =>
+                    surface.driverOptions.codexWebsocketEnabled === true,
+                ),
+              }}
+              onChange={setDriverOption}
+            />
           </Section>
         ) : null}
 

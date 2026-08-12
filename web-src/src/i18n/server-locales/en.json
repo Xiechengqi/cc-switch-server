@@ -61,6 +61,15 @@
   "providers": {
     "addProvider": "Add provider"
   },
+  "codexOauth": {
+    "featureOptionsTitle": "Codex feature settings",
+    "fastMode": "FAST priority mode",
+    "fastModeDescription": "Force the priority service tier only for models that explicitly support it. This can reduce latency but may consume ChatGPT quota faster.",
+    "imageGeneration": "Image generation API",
+    "imageGenerationDescription": "Expose the OpenAI-compatible /v1/images/generations endpoint through the ChatGPT Codex backend.",
+    "websocket": "Responses WebSocket (recommended)",
+    "websocketDescription": "Clients that support this transport can prefer and reuse a WebSocket connection; other requests remain HTTP. When disabled, clients are asked to use POST /v1/responses streaming instead."
+  },
   "providerBundle": {
     "account": "OAuth account",
     "advancedSettings": "Advanced settings JSON",

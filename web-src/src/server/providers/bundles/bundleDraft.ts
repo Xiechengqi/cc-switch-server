@@ -396,6 +396,12 @@ function surfaceFromResource(
   });
   const runtimeOptions = runtime?.driverOptions ?? {};
   const configuredMeta = resource?.provider.meta ?? preset.meta ?? {};
+  const codexWebsocketEnabled =
+    booleanOption(runtimeOptions.codexWebsocketEnabled) ??
+    configuredMeta.codexWebsocketEnabled ??
+    (driverForProfile(profile)?.driverId === "oauth.openai_codex"
+      ? true
+      : undefined);
   const configuredTransport = objectOption(settings.transport);
   const endpoint = runtime?.endpoint ?? readEndpoint(settings, app);
   const modelPolicy =
@@ -436,9 +442,7 @@ function surfaceFromResource(
       codexImageGenerationEnabled:
         booleanOption(runtimeOptions.codexImageGenerationEnabled) ??
         configuredMeta.codexImageGenerationEnabled,
-      codexWebsocketEnabled:
-        booleanOption(runtimeOptions.codexWebsocketEnabled) ??
-        configuredMeta.codexWebsocketEnabled,
+      codexWebsocketEnabled,
     },
     customBinding:
       resource?.customBinding ??

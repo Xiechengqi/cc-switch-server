@@ -38,7 +38,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import type {
@@ -65,6 +64,7 @@ import {
   type ProviderRegistryProfile,
   type ProviderUpstreamProtocol,
 } from "@/server/providerRegistry";
+import { CodexFeatureOptions } from "@/server/providers/CodexFeatureOptions";
 import { SecretInput } from "@/server/ui/SecretInput";
 import type { ProviderMeta } from "@/types";
 import { setCodexBaseUrl } from "@/utils/providerConfigUtils";
@@ -2381,30 +2381,17 @@ export function ServerProviderForm({
       ) : null}
 
       {showCodexOptions ? (
-        <Section title={t("serverProviderForm.codex.title")}>
-          <div className="grid gap-3 md:grid-cols-3">
-            {[
-              ["FAST", "codexFastMode"],
-              [
-                t("serverProviderForm.codex.imageGeneration"),
-                "codexImageGenerationEnabled",
-              ],
-              ["WebSocket", "codexWebsocketEnabled"],
-            ].map(([label, key]) => (
-              <div
-                key={key}
-                className="flex items-center justify-between rounded-md border border-border/50 px-3 py-2"
-              >
-                <Label>{label}</Label>
-                <Switch
-                  checked={state[key as keyof EditorState] as boolean}
-                  onCheckedChange={(checked) =>
-                    setState((current) => ({ ...current, [key]: checked }))
-                  }
-                />
-              </div>
-            ))}
-          </div>
+        <Section title={t("codexOauth.featureOptionsTitle")}>
+          <CodexFeatureOptions
+            values={{
+              codexFastMode: state.codexFastMode,
+              codexImageGenerationEnabled: state.codexImageGenerationEnabled,
+              codexWebsocketEnabled: state.codexWebsocketEnabled,
+            }}
+            onChange={(key, enabled) =>
+              setState((current) => ({ ...current, [key]: enabled }))
+            }
+          />
         </Section>
       ) : null}
 

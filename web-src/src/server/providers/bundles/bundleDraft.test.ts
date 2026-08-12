@@ -58,6 +58,52 @@ function runtime(
   };
 }
 
+function openAiOAuthBundle(
+  codexWebsocketEnabled?: boolean,
+): ProviderBundleView {
+  const family = familyById("family.openai_oauth")!;
+  const id = "openai-oauth-bundle";
+  const surfaces = Object.fromEntries(
+    family.surfaces.map((surface) => [
+      surface.app,
+      {
+        app: surface.app,
+        provider: {
+          id,
+          name: family.label,
+          settingsConfig: {},
+          meta: {
+            providerType: "codex_oauth",
+            ...(codexWebsocketEnabled === undefined
+              ? {}
+              : { codexWebsocketEnabled }),
+          },
+        },
+        providerType: "codex_oauth",
+        providerTypeId: "codex_oauth",
+        revision: 1,
+        profileId: surface.profileId,
+        identity: { status: "bound" as const },
+        credentialConfigured: false,
+        credentialSlots: [],
+      } satisfies ProviderResource,
+    ]),
+  ) as ProviderBundleView["surfaces"];
+  return {
+    id,
+    familyId: family.familyId,
+    revision: 1,
+    name: family.label,
+    modelPolicyScope: "global",
+    testApp: "codex",
+    supportedApps: family.surfaces.map((surface) => surface.app),
+    enabledApps: family.surfaces.map((surface) => surface.app),
+    credentialConfigured: false,
+    credentialSlots: [],
+    surfaces,
+  };
+}
+
 describe("Provider Bundle drafts", () => {
   it("materializes every family and every Driver option schema", () => {
     for (const family of providerRegistry.families) {
@@ -122,6 +168,52 @@ describe("Provider Bundle drafts", () => {
     );
     expect(openai.testApp).toBe("codex");
   });
+
+  it("defaults new OpenAI OAuth WebSocket options on without affecting other drivers", () => {
+    const openai = createProviderBundleDraft(
+      familyById("family.openai_oauth")!,
+    );
+    expect(
+      openai.surfaces.map(
+        (surface) => surface.driverOptions.codexWebsocketEnabled,
+      ),
+    ).toEqual([true, true]);
+    expect(
+      toProviderBundleWriteDraft(openai).surfaces.map(
+        (surface) => surface.driverOptions?.codexWebsocketEnabled,
+      ),
+    ).toEqual([true, true]);
+
+    const openrouter = createProviderBundleDraft(
+      familyById("family.openrouter")!,
+    );
+    expect(
+      openrouter.surfaces.every(
+        (surface) => surface.driverOptions.codexWebsocketEnabled === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["missing", undefined, true],
+    ["enabled", true, true],
+    ["disabled", false, false],
+  ] as const)(
+    "preserves the %s OpenAI OAuth WebSocket setting while editing",
+    (_label, configured, expected) => {
+      const edited = editProviderBundleDraft(openAiOAuthBundle(configured));
+      expect(
+        edited.surfaces.map(
+          (surface) => surface.driverOptions.codexWebsocketEnabled,
+        ),
+      ).toEqual([expected, expected]);
+      expect(
+        toProviderBundleWriteDraft(edited).surfaces.map(
+          (surface) => surface.driverOptions?.codexWebsocketEnabled,
+        ),
+      ).toEqual([expected, expected]);
+    },
+  );
 
   it("writes one shared model policy without Surface settings JSON", () => {
     const family = familyById("family.grok_oauth")!;

@@ -61,6 +61,15 @@
   "providers": {
     "addProvider": "プロバイダーを追加"
   },
+  "codexOauth": {
+    "featureOptionsTitle": "Codex 機能設定",
+    "fastMode": "FAST 優先モード",
+    "fastModeDescription": "明示的に対応しているモデルにだけ priority サービス階層を強制します。遅延を短縮できる一方、ChatGPT クォータをより速く消費する可能性があります。",
+    "imageGeneration": "画像生成 API",
+    "imageGenerationDescription": "ChatGPT Codex バックエンド経由で OpenAI 互換の /v1/images/generations エンドポイントを公開します。",
+    "websocket": "Responses WebSocket（推奨）",
+    "websocketDescription": "この転送方式に対応するクライアントは WebSocket 接続を優先して再利用できます。その他のリクエストは引き続き HTTP を使用します。無効にすると、POST /v1/responses のストリーミングを使用するようクライアントへ要求します。"
+  },
   "providerBundle": {
     "account": "OAuth アカウント",
     "advancedSettings": "詳細設定 JSON",

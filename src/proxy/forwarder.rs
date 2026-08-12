@@ -3579,12 +3579,7 @@ pub async fn forward_codex_responses_ws(
         ensure_grok_account_capability(&state, &execution, GrokAccountCapability::Websocket)
             .await?;
     }
-    if !codex_websocket_enabled(&stored) {
-        return Err(ProxyError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Codex Responses WebSocket is disabled for this provider; use POST /v1/responses (SSE) until the incident rollback is cleared".to_string(),
-        });
-    }
+    ensure_codex_websocket_enabled(&stored)?;
     validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
     let mut session_id = codex_oauth_session_id_from_request(&headers, b"").or_else(|| {
@@ -3667,6 +3662,16 @@ fn codex_websocket_enabled(stored: &StoredProvider) -> bool {
             .as_ref()
             .and_then(|meta| meta.codex_websocket_enabled)
             .unwrap_or(true)
+}
+
+fn ensure_codex_websocket_enabled(stored: &StoredProvider) -> Result<(), ProxyError> {
+    if codex_websocket_enabled(stored) {
+        return Ok(());
+    }
+    Err(ProxyError {
+        status: StatusCode::UPGRADE_REQUIRED,
+        message: "Codex Responses WebSocket is disabled for this provider; retry with POST /v1/responses (SSE)".to_string(),
+    })
 }
 
 fn codex_fast_mode_enabled(execution: &ProviderExecution) -> bool {
@@ -28696,22 +28701,31 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[test]
-    fn codex_websocket_toggle_defaults_on_and_supports_incident_rollback() {
-        let enabled = stored_provider(
+    fn codex_websocket_toggle_defaults_on_and_returns_protocol_fallback() {
+        let default_enabled = stored_provider(
             AppKind::Codex,
             ProviderType::CodexOAuth,
             json!({}),
             Some("acct-1"),
         );
-        assert!(codex_websocket_enabled(&enabled));
+        assert!(ensure_codex_websocket_enabled(&default_enabled).is_ok());
 
-        let mut disabled = enabled;
+        let mut explicitly_enabled = default_enabled.clone();
+        explicitly_enabled
+            .provider
+            .meta
+            .get_or_insert_default()
+            .codex_websocket_enabled = Some(true);
+        assert!(ensure_codex_websocket_enabled(&explicitly_enabled).is_ok());
+
+        let mut disabled = default_enabled;
         disabled
             .provider
             .meta
             .get_or_insert_default()
             .codex_websocket_enabled = Some(false);
-        assert!(!codex_websocket_enabled(&disabled));
+        let error = ensure_codex_websocket_enabled(&disabled).unwrap_err();
+        assert_eq!(error.status, StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]

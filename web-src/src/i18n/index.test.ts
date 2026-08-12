@@ -45,6 +45,16 @@ const criticalKeys = [
   "share.freeConfirm",
 ] as const;
 
+const codexFeatureKeys = [
+  "featureOptionsTitle",
+  "fastMode",
+  "fastModeDescription",
+  "imageGeneration",
+  "imageGenerationDescription",
+  "websocket",
+  "websocketDescription",
+] as const;
+
 describe("language normalization", () => {
   it.each([
     ["zh", "zh"],
@@ -84,6 +94,16 @@ describe("i18n resources", () => {
       expect(i18n.t("provider.name", { lng: language })).toBe(
         locales[language].provider.name,
       );
+    }
+  });
+
+  it("provides Server Codex feature copy in every supported language", () => {
+    for (const language of languages) {
+      for (const key of codexFeatureKeys) {
+        expect(i18n.t(`codexOauth.${key}`, { lng: language })).toBe(
+          serverLocales[language].codexOauth[key],
+        );
+      }
     }
   });
 
