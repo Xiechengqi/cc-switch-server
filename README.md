@@ -200,6 +200,11 @@ RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 
 `RUN_TESTS=0` 仅用于负向审计：脚本会记录 `local-contracts-unverified`，输出 `decision=blocked` 并以状态码 `1` 退出；不得将其作为本地合同或发布验收通过证据。
 
+升级任务向 Router 回报状态时，`/metrics` 暴露以下低基数指标，用于发现 Client 已完成升级但 Router 状态未收敛的问题：
+
+- `cc_switch_router_upgrade_task_reports_total{outcome="success|failure"}`：升级任务回执尝试次数。
+- `cc_switch_router_upgrade_task_report_last_success_timestamp_seconds`：最近一次成功回执的 Unix 时间戳；尚未成功回执前不会输出该时间序列。
+
 有真实 router、market、provider、OAuth 或 Router 内建 Share Market 端到端环境时，把变量写入私有 env 文件后运行：
 
 ```bash

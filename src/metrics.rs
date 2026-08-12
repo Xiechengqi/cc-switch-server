@@ -317,6 +317,22 @@ pub fn record_stream_client_cancelled(app: &str) {
     .increment(1);
 }
 
+pub fn record_router_upgrade_task_report(outcome: &'static str) {
+    metrics::counter!(
+        "cc_switch_router_upgrade_task_reports_total",
+        "outcome" => outcome
+    )
+    .increment(1);
+    if outcome == "success" {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        metrics::gauge!("cc_switch_router_upgrade_task_report_last_success_timestamp_seconds")
+            .set(timestamp);
+    }
+}
+
 pub fn record_reasoning_bridge(direction: &'static str, outcome: &'static str) {
     metrics::counter!(
         "cc_switch_reasoning_bridge_total",
@@ -471,6 +487,14 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_stream_client_cancelled_total",
         "Downstream cancellations that stopped an upstream stream"
+    );
+    metrics::describe_counter!(
+        "cc_switch_router_upgrade_task_reports_total",
+        "Router upgrade task report attempts grouped by outcome"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_router_upgrade_task_report_last_success_timestamp_seconds",
+        "Unix timestamp of the last successful Router upgrade task report"
     );
     metrics::describe_counter!(
         "cc_switch_reasoning_bridge_total",

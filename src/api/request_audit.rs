@@ -277,6 +277,7 @@ fn attach_audited_response_body(response: Response, lifecycle: RequestAuditLifec
         Response::from_parts(
             parts,
             Body::new(AuditedResponseBody {
+                remaining_exact: body.size_hint().exact().filter(|remaining| *remaining > 0),
                 inner: body,
                 lifecycle: Some(lifecycle),
             }),
@@ -524,6 +525,7 @@ fn request_terminal_event_name(status: StatusCode, interrupted: bool) -> &'stati
 struct AuditedResponseBody {
     inner: Body,
     lifecycle: Option<RequestAuditLifecycle>,
+    remaining_exact: Option<u64>,
 }
 
 impl HttpBody for AuditedResponseBody {
@@ -546,6 +548,29 @@ impl HttpBody for AuditedResponseBody {
                     lifecycle.finish(RequestFinish::StreamError);
                 }
                 Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                let exact_body_consumed = frame.data_ref().is_some_and(|data| {
+                    let Some(remaining) = self.remaining_exact else {
+                        return false;
+                    };
+                    let Ok(data_len) = u64::try_from(data.len()) else {
+                        self.remaining_exact = None;
+                        return false;
+                    };
+                    let Some(next) = remaining.checked_sub(data_len) else {
+                        self.remaining_exact = None;
+                        return false;
+                    };
+                    self.remaining_exact = Some(next);
+                    next == 0
+                });
+                if exact_body_consumed || self.inner.is_end_stream() {
+                    if let Some(lifecycle) = self.lifecycle.take() {
+                        lifecycle.finish(RequestFinish::Completed);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
             }
             other => other,
         }
@@ -903,6 +928,130 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].event, "inference.request.completed");
         assert_eq!(events[1].outcome.as_deref(), Some("completed"));
+        drop(audit);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_data_frame_completes_without_an_extra_eof_poll() {
+        use http_body_util::BodyExt;
+
+        let directory = test_dir("single-frame-response");
+        std::fs::create_dir_all(&directory).unwrap();
+        let audit = crate::logging::AuditLog::new(&directory, "boot-a".to_string()).unwrap();
+        let mut accepted = AuditEvent::new("inference.request.accepted");
+        accepted.request_id = Some("request-a".to_string());
+        audit.emit(accepted).unwrap().unwrap();
+        audit.register_request("request-a");
+        let (state, state_directory) = test_state("single-frame-response");
+
+        let response = attach_audited_response_body(
+            Response::new(Body::from(Bytes::from_static(b"{\"ok\":true}"))),
+            RequestAuditLifecycle {
+                state: state.clone(),
+                audit: audit.clone(),
+                audit_admitted: true,
+                request_id: Some("request-a".to_string()),
+                share_id: None,
+                user_email: None,
+                transport_request_id: "transport-a".to_string(),
+                app: "codex",
+                surface: "openai",
+                operation: "chat_completions",
+                route: "/v1/chat/completions".to_string(),
+                method: "POST".to_string(),
+                status: StatusCode::OK,
+                error_code: None,
+                retryable: false,
+                streaming: false,
+                started: Instant::now(),
+                started_at_ms: crate::infra::time::now_ms(),
+                finished: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut body = response.into_body();
+        let frame = body
+            .frame()
+            .await
+            .expect("one data frame")
+            .expect("successful data frame");
+        assert_eq!(
+            frame.into_data().unwrap(),
+            Bytes::from_static(b"{\"ok\":true}")
+        );
+        drop(body);
+
+        let events = audit.read_batch(None, 10).unwrap().events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event, "inference.request.completed");
+        assert_eq!(events[1].outcome.as_deref(), Some("completed"));
+        drop(audit);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_before_the_final_frame_remains_downstream_cancelled() {
+        use http_body_util::BodyExt;
+
+        let directory = test_dir("partial-response");
+        std::fs::create_dir_all(&directory).unwrap();
+        let audit = crate::logging::AuditLog::new(&directory, "boot-a".to_string()).unwrap();
+        let mut accepted = AuditEvent::new("inference.request.accepted");
+        accepted.request_id = Some("request-a".to_string());
+        audit.emit(accepted).unwrap().unwrap();
+        audit.register_request("request-a");
+        let (state, state_directory) = test_state("partial-response");
+        let stream = futures_util::stream::iter([
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"first")),
+            Ok(Bytes::from_static(b"second")),
+        ]);
+
+        let response = attach_audited_response_body(
+            Response::new(Body::from_stream(stream)),
+            RequestAuditLifecycle {
+                state: state.clone(),
+                audit: audit.clone(),
+                audit_admitted: true,
+                request_id: Some("request-a".to_string()),
+                share_id: None,
+                user_email: None,
+                transport_request_id: "transport-a".to_string(),
+                app: "codex",
+                surface: "openai",
+                operation: "responses",
+                route: "/v1/responses".to_string(),
+                method: "POST".to_string(),
+                status: StatusCode::OK,
+                error_code: None,
+                retryable: false,
+                streaming: true,
+                started: Instant::now(),
+                started_at_ms: crate::infra::time::now_ms(),
+                finished: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("first data frame")
+            .expect("successful first frame")
+            .into_data()
+            .unwrap();
+        assert_eq!(first, Bytes::from_static(b"first"));
+        drop(body);
+
+        let events = audit.read_batch(None, 10).unwrap().events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event, "inference.request.interrupted");
+        assert_eq!(
+            events[1].error_code.as_deref(),
+            Some("downstream_cancelled")
+        );
         drop(audit);
         drop(state);
         std::fs::remove_dir_all(directory).unwrap();

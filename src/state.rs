@@ -11942,12 +11942,15 @@ pub fn spawn_periodic_installation_status_report(state: ServerState) {
 
 const UPGRADE_TASK_REPORT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const UPGRADE_TASK_RUNNING_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+const UPGRADE_TASK_REPORT_WARNING_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 pub fn spawn_installation_upgrade_task_reporter(state: ServerState) {
     tokio::spawn(async move {
         let mut shutdown = state.subscribe_shutdown();
         let mut last_reported_fingerprint = None::<String>;
         let mut last_running_report = None::<Instant>;
+        let mut consecutive_failures = 0_u64;
+        let mut last_failure_warning = None::<Instant>;
         loop {
             if *shutdown.borrow() {
                 return;
@@ -11965,6 +11968,8 @@ pub fn spawn_installation_upgrade_task_reporter(state: ServerState) {
                 if last_reported_fingerprint.as_deref() != Some(fingerprint.as_str())
                     || running_report_due
                 {
+                    let report_task_id = snapshot.task_id.clone();
+                    let report_status = snapshot.status;
                     let config = state.config_snapshot().await;
                     if config.has_registered_router_identity() {
                         let http = state.http_client().await;
@@ -11972,16 +11977,36 @@ pub fn spawn_installation_upgrade_task_reporter(state: ServerState) {
                             .await
                         {
                             Ok(()) => {
+                                crate::metrics::record_router_upgrade_task_report("success");
                                 last_reported_fingerprint = Some(fingerprint);
+                                consecutive_failures = 0;
+                                last_failure_warning = None;
                                 if running {
                                     last_running_report = Some(Instant::now());
                                 }
                             }
                             Err(error) => {
-                                tracing::debug!(
-                                    %error,
-                                    "installation upgrade task report failed; retrying"
-                                );
+                                crate::metrics::record_router_upgrade_task_report("failure");
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                let warning_due = last_failure_warning.is_none_or(|warning| {
+                                    warning.elapsed() >= UPGRADE_TASK_REPORT_WARNING_INTERVAL
+                                });
+                                if warning_due {
+                                    tracing::warn!(
+                                        %error,
+                                        consecutive_failures,
+                                        task_id = %report_task_id,
+                                        status = ?report_status,
+                                        "installation upgrade task report failed; retrying"
+                                    );
+                                    last_failure_warning = Some(Instant::now());
+                                } else {
+                                    tracing::debug!(
+                                        %error,
+                                        consecutive_failures,
+                                        "installation upgrade task report failed; retrying"
+                                    );
+                                }
                             }
                         }
                     }

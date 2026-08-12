@@ -8,6 +8,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
@@ -222,6 +223,32 @@ pub struct SignedRequest<T> {
     pub signature: String,
     #[serde(flatten)]
     pub payload: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationUpgradeTaskReportPayload {
+    pub task_id: String,
+    pub status: crate::self_update::upgrade::UpgradeStatus,
+    pub restart_pending: bool,
+    pub logs: Vec<crate::self_update::upgrade::UpgradeLogEntry>,
+    pub target_commit_id: Option<String>,
+    pub restart_after: bool,
+    pub updated_at: String,
+}
+
+impl From<UpgradeStatusSnapshot> for InstallationUpgradeTaskReportPayload {
+    fn from(snapshot: UpgradeStatusSnapshot) -> Self {
+        Self {
+            task_id: snapshot.task_id,
+            status: snapshot.status,
+            restart_pending: snapshot.restart_pending,
+            logs: snapshot.logs,
+            target_commit_id: snapshot.target_commit_id,
+            restart_after: snapshot.restart_after,
+            updated_at: snapshot.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2540,6 +2567,17 @@ pub fn sign_payload<T: Serialize>(
     timestamp_ms: i64,
     nonce: &str,
 ) -> anyhow::Result<String> {
+    let payload_json = serde_json::to_string(payload).context("serialize signed payload")?;
+    sign_payload_json(identity, action, &payload_json, timestamp_ms, nonce)
+}
+
+fn sign_payload_json(
+    identity: &RouterIdentity,
+    action: &str,
+    payload_json: &str,
+    timestamp_ms: i64,
+    nonce: &str,
+) -> anyhow::Result<String> {
     if identity.installation_id.trim().is_empty() {
         bail!("router installation id is missing");
     }
@@ -2550,12 +2588,62 @@ pub fn sign_payload<T: Serialize>(
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid router private key length"))?;
     let signing_key = SigningKey::from_bytes(&secret);
-    let payload_json = serde_json::to_string(payload).context("serialize signed payload")?;
     let canonical = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         PROTOCOL_EPOCH, identity.installation_id, action, payload_json, timestamp_ms, nonce
     );
     Ok(STANDARD.encode(signing_key.sign(canonical.as_bytes()).to_bytes()))
+}
+
+fn installation_upgrade_task_report_payload_json(
+    payload: &InstallationUpgradeTaskReportPayload,
+) -> anyhow::Result<String> {
+    serde_json::to_string(&CanonicalInstallationUpgradeTaskReportPayload(payload))
+        .context("serialize canonical installation upgrade task report")
+}
+
+struct CanonicalInstallationUpgradeTaskReportPayload<'a>(&'a InstallationUpgradeTaskReportPayload);
+
+impl Serialize for CanonicalInstallationUpgradeTaskReportPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let payload = self.0;
+        let mut state = serializer.serialize_struct("InstallationUpgradeTaskReportPayload", 7)?;
+        state.serialize_field("taskId", &payload.task_id)?;
+        state.serialize_field("status", &payload.status)?;
+        state.serialize_field("restartPending", &payload.restart_pending)?;
+        state.serialize_field("logs", &payload.logs)?;
+        state.serialize_field("targetCommitId", &payload.target_commit_id)?;
+        state.serialize_field("restartAfter", &payload.restart_after)?;
+        state.serialize_field("updatedAt", &payload.updated_at)?;
+        state.end()
+    }
+}
+
+fn signed_installation_upgrade_task_report_request(
+    identity: &RouterIdentity,
+    payload: InstallationUpgradeTaskReportPayload,
+) -> anyhow::Result<SignedRequest<InstallationUpgradeTaskReportPayload>> {
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let payload_json = installation_upgrade_task_report_payload_json(&payload)?;
+    let signature = sign_payload_json(
+        identity,
+        INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+        &payload_json,
+        timestamp_ms,
+        &nonce,
+    )?;
+    Ok(SignedRequest {
+        protocol_epoch: PROTOCOL_EPOCH.to_string(),
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        payload,
+    })
 }
 
 pub fn sign_lease_request(
@@ -2707,7 +2795,8 @@ pub async fn report_installation_upgrade_task(
     let identity = config
         .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
-    let request = signed_request(identity, INSTALLATION_UPGRADE_TASK_REPORT_ACTION, snapshot)?;
+    let payload = InstallationUpgradeTaskReportPayload::from(snapshot);
+    let request = signed_installation_upgrade_task_report_request(identity, payload)?;
     let response = http
         .post(format!("{api_base}/v1/installations/upgrade-task-report"))
         .json(&request)
@@ -2798,6 +2887,8 @@ mod tests {
     const GOLDEN_INSTALLATION_ID: &str = "inst-signature-golden";
     const GOLDEN_TIMESTAMP_MS: i64 = 1_786_412_345_678;
     const GOLDEN_NONCE: &str = "golden-nonce-01";
+    const GOLDEN_UPGRADE_REPORT_SIGNATURE: &str =
+        "iRQAxdFnKRhGFSa0/bWVvp7q7kOZmY1t1tm2i5yjSQf29XUdtOpxRQF3zYTzxwt0kEoC6vsOLcYaxctqAWSwCA==";
     const GOLDEN_PENDING_EDITS_SIGNATURE: &str =
         "NJzUP/o+ARIo2U+KibgynZffeQq/241v5THPz27RkaKJ0s54z7Bf6ExQ4dg4iObhu3Gpvvn1aU5Xks5VF9oNDw==";
     const GOLDEN_EDIT_ACK_SIGNATURE: &str =
@@ -3094,6 +3185,47 @@ mod tests {
             )
             .unwrap(),
             GOLDEN_EDIT_ACK_SIGNATURE
+        );
+    }
+
+    #[test]
+    fn upgrade_task_report_signature_golden_fixture_matches_router_contract() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = GOLDEN_INSTALLATION_ID.to_string();
+        identity.private_key = GOLDEN_PRIVATE_KEY_B64.to_string();
+        identity.public_key = GOLDEN_PUBLIC_KEY_B64.to_string();
+        let payload = InstallationUpgradeTaskReportPayload {
+            task_id: "task-upgrade-golden".into(),
+            status: crate::self_update::upgrade::UpgradeStatus::Success,
+            restart_pending: false,
+            logs: vec![crate::self_update::upgrade::UpgradeLogEntry {
+                task_id: "task-upgrade-golden".into(),
+                step: 7,
+                total_steps: 7,
+                level: crate::self_update::upgrade::UpgradeLogLevel::Success,
+                message: "replacement process passed health checks".into(),
+                progress: Some(100),
+                at: "2026-08-11T10:00:00Z".into(),
+            }],
+            target_commit_id: Some("7b5e172c9cb4".into()),
+            restart_after: true,
+            updated_at: "2026-08-11T10:00:01Z".into(),
+        };
+        let payload_json = installation_upgrade_task_report_payload_json(&payload).unwrap();
+        assert_eq!(
+            payload_json,
+            r#"{"taskId":"task-upgrade-golden","status":"success","restartPending":false,"logs":[{"taskId":"task-upgrade-golden","step":7,"totalSteps":7,"level":"success","message":"replacement process passed health checks","progress":100,"at":"2026-08-11T10:00:00Z"}],"targetCommitId":"7b5e172c9cb4","restartAfter":true,"updatedAt":"2026-08-11T10:00:01Z"}"#
+        );
+        assert_eq!(
+            sign_payload_json(
+                &identity,
+                INSTALLATION_UPGRADE_TASK_REPORT_ACTION,
+                &payload_json,
+                GOLDEN_TIMESTAMP_MS,
+                GOLDEN_NONCE,
+            )
+            .unwrap(),
+            GOLDEN_UPGRADE_REPORT_SIGNATURE
         );
     }
 
