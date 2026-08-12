@@ -17,6 +17,7 @@ use super::tool_schema::normalize_function_parameters;
 
 const DEFAULT_OPENAI_TO_ANTHROPIC_MAX_TOKENS: u64 = 8192;
 const DEFAULT_UPSTREAM_REFUSAL_MESSAGE: &str = "The upstream model refused to provide a response.";
+const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 
@@ -2134,6 +2135,19 @@ pub fn anthropic_to_openai_chat(input: &Value) -> Result<Value, TransformError> 
 }
 
 pub fn anthropic_to_openai_responses(input: &Value) -> Result<Value, TransformError> {
+    anthropic_to_openai_responses_with_system_mode(input, false)
+}
+
+pub(crate) fn anthropic_to_openai_responses_with_instructions(
+    input: &Value,
+) -> Result<Value, TransformError> {
+    anthropic_to_openai_responses_with_system_mode(input, true)
+}
+
+fn anthropic_to_openai_responses_with_system_mode(
+    input: &Value,
+    system_as_instructions: bool,
+) -> Result<Value, TransformError> {
     let messages = input
         .get("messages")
         .and_then(Value::as_array)
@@ -2150,7 +2164,11 @@ pub fn anthropic_to_openai_responses(input: &Value) -> Result<Value, TransformEr
     }
     apply_anthropic_request_controls_to_openai_responses(input, &mut output);
     let mut response_input = Vec::new();
-    if let Some(system) = anthropic_system_to_openai_responses(input.get("system")) {
+    if system_as_instructions {
+        if let Some(instructions) = anthropic_system_to_openai_instructions(input.get("system")) {
+            output.insert("instructions".to_string(), Value::String(instructions));
+        }
+    } else if let Some(system) = anthropic_system_to_openai_responses(input.get("system")) {
         response_input.push(system);
     }
     response_input.extend(
@@ -3931,6 +3949,21 @@ fn anthropic_system_to_openai_chat(system: Option<&Value>) -> Option<Value> {
     }
 }
 
+fn anthropic_system_to_openai_instructions(system: Option<&Value>) -> Option<String> {
+    let instructions = match system? {
+        Value::String(text) => strip_leading_anthropic_billing_header(text).to_string(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(anthropic_text_from_block)
+            .map(strip_leading_anthropic_billing_header)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => return None,
+    };
+    (!instructions.is_empty()).then_some(instructions)
+}
+
 fn anthropic_system_to_openai_responses(system: Option<&Value>) -> Option<Value> {
     match system? {
         Value::String(text) => Some(json!({"role": "system", "content": text})),
@@ -3944,6 +3977,30 @@ fn anthropic_system_to_openai_responses(system: Option<&Value>) -> Option<Value>
         }
         _ => None,
     }
+}
+
+fn strip_leading_anthropic_billing_header(text: &str) -> &str {
+    if !text.starts_with(ANTHROPIC_BILLING_HEADER_PREFIX) {
+        return text;
+    }
+
+    let Some(line_end) = text
+        .as_bytes()
+        .iter()
+        .position(|byte| matches!(*byte, b'\n' | b'\r'))
+    else {
+        return "";
+    };
+    let bytes = text.as_bytes();
+    let mut rest_start = line_end + 1;
+    if bytes[line_end] == b'\r' && bytes.get(rest_start) == Some(&b'\n') {
+        rest_start += 1;
+    }
+    let rest = &text[rest_start..];
+    rest.strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))
+        .or_else(|| rest.strip_prefix('\r'))
+        .unwrap_or(rest)
 }
 
 fn anthropic_system_to_gemini(system: Option<&Value>) -> Option<Value> {
@@ -7422,6 +7479,43 @@ mod tests {
             "system string"
         );
         assert_eq!(gemini["contents"][0]["parts"][0]["text"], "user string");
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_strips_only_leading_billing_header() {
+        for (system, expected) in [
+            (
+                "x-anthropic-billing-header: dynamic\n\nStable policy",
+                "Stable policy",
+            ),
+            (
+                "x-anthropic-billing-header: dynamic\r\n\r\nStable policy",
+                "Stable policy",
+            ),
+            (
+                "Keep literal:\nx-anthropic-billing-header: user text",
+                "Keep literal:\nx-anthropic-billing-header: user text",
+            ),
+        ] {
+            let responses = anthropic_to_openai_responses_with_instructions(&json!({
+                "model": "gpt-5.5",
+                "system": system,
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .unwrap();
+            assert_eq!(responses["instructions"], expected);
+        }
+
+        let responses = anthropic_to_openai_responses_with_instructions(&json!({
+            "model": "gpt-5.5",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: dynamic\n"},
+                {"type": "text", "text": "Stable policy"}
+            ],
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .unwrap();
+        assert_eq!(responses["instructions"], "Stable policy");
     }
 
     #[test]

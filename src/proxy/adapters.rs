@@ -1013,7 +1013,11 @@ fn transform_body_for_upstream(
     })?;
     let output = match (stored.app, upstream_format) {
         (AppKind::Claude, UpstreamFormat::OpenAiResponses) => {
-            transforms::anthropic_to_openai_responses(&input)
+            if stored.provider_type == ProviderType::CodexOAuth {
+                transforms::anthropic_to_openai_responses_with_instructions(&input)
+            } else {
+                transforms::anthropic_to_openai_responses(&input)
+            }
         }
         (AppKind::Claude, UpstreamFormat::OpenAiChat) => {
             transforms::anthropic_to_openai_chat(&input)
@@ -1057,8 +1061,13 @@ fn transform_body_for_upstream(
             transforms::gemini_native_to_anthropic(&input)
         }
         (AppKind::Gemini, UpstreamFormat::OpenAiResponses) => {
-            transforms::gemini_native_to_anthropic(&input)
-                .and_then(|value| transforms::anthropic_to_openai_responses(&value))
+            transforms::gemini_native_to_anthropic(&input).and_then(|value| {
+                if stored.provider_type == ProviderType::CodexOAuth {
+                    transforms::anthropic_to_openai_responses_with_instructions(&value)
+                } else {
+                    transforms::anthropic_to_openai_responses(&value)
+                }
+            })
         }
         (AppKind::Gemini, UpstreamFormat::OpenAiChat) => {
             transforms::gemini_native_to_anthropic(&input)
@@ -5160,6 +5169,15 @@ mod tests {
         assert_eq!(endpoint, "https://api.example/v1/responses");
         assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(value.get("model").and_then(Value::as_str), Some("gpt-5.5"));
+        assert!(value.get("instructions").is_none());
+        assert_eq!(
+            value.pointer("/input/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            value.pointer("/input/0/content").and_then(Value::as_str),
+            Some("s")
+        );
         assert_eq!(
             value
                 .pointer("/input/1/content/0/type")
@@ -5277,7 +5295,7 @@ mod tests {
         let request = adapter
             .transform_request(
                 Bytes::from_static(
-                    br#"{"model":"gemini-2.5-pro","contents":[{"role":"user","parts":[{"text":"hello"}]}],"stream":false}"#,
+                    br#"{"model":"gemini-2.5-pro","systemInstruction":{"parts":[{"text":"system"}]},"contents":[{"role":"user","parts":[{"text":"hello"}]}],"stream":false}"#,
                 ),
                 &stored,
             )
@@ -5294,9 +5312,18 @@ mod tests {
 
         assert_eq!(endpoint, "https://api.example/v1/responses");
         assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
+        assert!(value.get("instructions").is_none());
+        assert_eq!(
+            value.pointer("/input/0/role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            value.pointer("/input/0/content").and_then(Value::as_str),
+            Some("system")
+        );
         assert_eq!(
             value
-                .pointer("/input/0/content/0/text")
+                .pointer("/input/1/content/0/text")
                 .and_then(Value::as_str),
             Some("hello")
         );

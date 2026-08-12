@@ -5,7 +5,6 @@ pub mod adapters;
 mod anthropic_semantics;
 mod cache_injector;
 pub(crate) mod claude_oauth;
-mod codex_instructions;
 pub(crate) mod codex_models;
 mod codex_request_policy;
 mod copilot_model_map;

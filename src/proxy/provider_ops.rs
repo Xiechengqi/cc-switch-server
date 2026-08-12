@@ -1507,7 +1507,7 @@ mod tests {
 
         let mut request = AdapterRequest {
             body: bytes::Bytes::from_static(
-                br#"{"model":"gpt-5.4","input":"ping","reasoning":{"effort":"ultra"},"service_tier":"default"}"#,
+                b"{\"model\":\"gpt-5.4\",\"instructions\":\"  Keep caller policy.\\n\\nKeep spacing.  \",\"input\":\"ping\",\"reasoning\":{\"effort\":\"ultra\"},\"service_tier\":\"default\"}",
             ),
             upstream_endpoint: None,
             upstream_headers: vec![],
@@ -1537,6 +1537,10 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["service_tier"], "priority");
+        assert_eq!(
+            body["instructions"],
+            "  Keep caller policy.\n\nKeep spacing.  "
+        );
         assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("max")));
         assert!(!request.stream_requested);
         assert!(request.upstream_stream_requested);
@@ -1549,32 +1553,35 @@ mod tests {
                 AppKind::Claude,
                 ProxyRoute::ClaudeMessages,
                 bytes::Bytes::from_static(
-                    br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}],"output_config":{"effort":"max"},"stream":false}"#,
+                    br#"{"model":"claude-sonnet-4-6","system":"Claude policy","max_tokens":16,"messages":[{"role":"user","content":"ping"}],"output_config":{"effort":"max"},"stream":false}"#,
                 ),
                 None,
                 "max",
+                "Claude policy",
             ),
             (
                 AppKind::Codex,
                 ProxyRoute::CodexResponses,
                 bytes::Bytes::from_static(
-                    br#"{"model":"gpt-5.4","input":"ping","reasoning":{"effort":"high"},"stream":false}"#,
+                    br#"{"model":"gpt-5.4","instructions":"Codex policy","input":"ping","reasoning":{"effort":"high"},"stream":false}"#,
                 ),
                 None,
                 "high",
+                "Codex policy",
             ),
             (
                 AppKind::Gemini,
                 ProxyRoute::Gemini,
                 bytes::Bytes::from_static(
-                    br#"{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16,"thinkingConfig":{"thinkingLevel":"xhigh"}}}"#,
+                    br#"{"systemInstruction":{"parts":[{"text":"Gemini policy"}]},"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16,"thinkingConfig":{"thinkingLevel":"xhigh"}}}"#,
                 ),
                 Some("models/gpt-5.4:generateContent"),
                 "xhigh",
+                "Gemini policy",
             ),
         ];
 
-        for (app, route, body, gemini_path, expected_effort) in cases {
+        for (app, route, body, gemini_path, expected_effort, expected_instructions) in cases {
             let mut execution = execution_with_auth(
                 RuntimeAuthRef::ManagedAccount {
                     account_id: "codex-account".to_string(),
@@ -1611,6 +1618,12 @@ mod tests {
             assert_eq!(body["model"], "gpt-5.4", "app={}", app.as_str());
             assert_eq!(body["store"], false, "app={}", app.as_str());
             assert_eq!(body["stream"], true, "app={}", app.as_str());
+            assert_eq!(
+                body["instructions"],
+                expected_instructions,
+                "app={}",
+                app.as_str()
+            );
             assert_eq!(
                 body.pointer("/reasoning/effort").and_then(Value::as_str),
                 Some(expected_effort),

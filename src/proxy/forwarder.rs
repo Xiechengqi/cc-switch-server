@@ -14697,10 +14697,6 @@ fn normalize_codex_oauth_responses_body(
     prompt_cache_key: Option<&str>,
     image_tool_strip_policy: CodexImageToolStripPolicy,
 ) -> Value {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     body["store"] = Value::Bool(false);
     body["stream"] = Value::Bool(true);
     sanitize_codex_oauth_request_body(&mut body);
@@ -14744,13 +14740,11 @@ fn normalize_codex_oauth_responses_body(
         }
     }
 
-    let existing_instructions = body
-        .get("instructions")
-        .and_then(response_instruction_text_for_codex);
-    body["instructions"] = Value::String(crate::proxy::codex_instructions::merged_instructions(
-        model.as_deref(),
-        existing_instructions.as_deref(),
-    ));
+    if let Some(object) = body.as_object_mut() {
+        object
+            .entry("instructions".to_string())
+            .or_insert_with(|| Value::String(String::new()));
+    }
     if body.get("tools").is_none() {
         body["tools"] = Value::Array(Vec::new());
     }
@@ -15155,21 +15149,6 @@ fn codex_image_tool_rejection_body(body: &[u8]) -> bool {
         ]
         .iter()
         .any(|marker| text.contains(marker))
-}
-
-fn response_instruction_text_for_codex(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => {
-            let text = items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.trim().is_empty()).then_some(text)
-        }
-        _ => None,
-    }
 }
 
 struct StreamForwardState {
@@ -22542,9 +22521,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
         assert_eq!(normalized["store"], json!(false));
         assert_eq!(normalized["stream"], json!(true));
-        assert!(normalized["instructions"]
-            .as_str()
-            .is_some_and(|instructions| !instructions.trim().is_empty()));
+        assert_eq!(normalized["instructions"], json!(""));
         assert_eq!(normalized["tools"], json!([]));
         assert_eq!(normalized["parallel_tool_calls"], json!(false));
         assert!(normalized["include"]
@@ -23032,6 +23009,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(value.get("stream").is_none());
         assert!(value.get("store").is_none());
         assert!(value.get("prompt_cache_key").is_none());
+        assert!(value.get("instructions").is_none());
         assert!(value.get("temperature").is_none());
         assert!(value.get("max_output_tokens").is_none());
         assert_eq!(
@@ -23165,17 +23143,33 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
-    fn normalize_codex_oauth_responses_body_preserves_existing_instructions() {
-        let body = json!({
-            "model": "gpt-5.5",
-            "instructions": "Keep this local policy.",
-            "input": []
-        });
-        let normalized =
-            normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
-        let instructions = normalized["instructions"].as_str().unwrap();
-        assert!(instructions.contains("Keep this local policy."));
-        assert!(instructions.len() > "Keep this local policy.".len());
+    fn normalize_codex_oauth_responses_body_preserves_existing_instructions_exactly() {
+        for instructions in [
+            "Keep this local policy.",
+            "",
+            "  Preserve leading whitespace.\n\nPreserve trailing whitespace.  ",
+        ] {
+            let body = json!({
+                "model": "gpt-5.5",
+                "instructions": instructions,
+                "input": []
+            });
+            let normalized =
+                normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
+            assert_eq!(normalized["instructions"], json!(instructions));
+        }
+
+        let instructions = json!(["system text", {"type": "message", "content": "policy"}]);
+        let normalized = normalize_codex_oauth_responses_body(
+            json!({
+                "model": "gpt-5.5",
+                "instructions": instructions,
+                "input": []
+            }),
+            None,
+            CodexImageToolStripPolicy::Never,
+        );
+        assert_eq!(normalized["instructions"], instructions);
     }
 
     #[test]
