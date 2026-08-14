@@ -11,6 +11,7 @@ use url::Url;
 use crate::domain::accounts::managers::{account_credential_ownership, AccountCredentialOwnership};
 use crate::domain::accounts::store::{Account, AccountStore};
 
+use super::coding_plan::{compile_profile_contract, RuntimeCodingPlan};
 use super::credentials::redact_provider;
 use super::model::{AppKind, Provider, ProviderType};
 use super::model_routing::{policy_from_settings, ModelRoutingMode};
@@ -119,6 +120,8 @@ pub struct ProviderRuntimePlan {
     pub auth_ref: RuntimeAuthRef,
     pub model_policy: RuntimeModelPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_plan: Option<RuntimeCodingPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_region: Option<String>,
@@ -222,6 +225,10 @@ pub fn compile_runtime_plan(
         .iter()
         .find(|driver| driver.driver_id == driver_id)
         .with_context(|| format!("runtime Driver {driver_id} is not registered"))?;
+    let coding_plan = profile_policy
+        .and_then(|profile| profile.coding_plan.as_ref())
+        .map(|contract| compile_profile_contract(stored.app, contract))
+        .transpose()?;
     let configured_endpoint = configured_base_url(&stored.provider, stored.app);
     let default_endpoint = default_base_url(stored.provider_type).map(str::to_string);
     let endpoint_policy = profile_policy
@@ -233,26 +240,41 @@ pub fn compile_runtime_plan(
                 EndpointPolicy::FrozenLegacy
             }
         });
-    let endpoint = match endpoint_policy {
-        EndpointPolicy::Fixed => {
-            if configured_endpoint.as_deref().is_some_and(|configured| {
-                default_endpoint
-                    .as_deref()
-                    .is_none_or(|default| !endpoints_equivalent(configured, default))
-            }) {
-                warnings.push(
-                    "fixed endpoint policy ignored a configured endpoint override".to_string(),
-                );
-            }
-            default_endpoint
+    let endpoint = if let Some(contract) = coding_plan.as_ref() {
+        if configured_endpoint
+            .as_deref()
+            .is_some_and(|configured| !endpoints_equivalent(configured, &contract.fixed_origin))
+        {
+            warnings
+                .push("coding-plan contract ignored a configured endpoint override".to_string());
         }
-        EndpointPolicy::OverrideAllowed
-        | EndpointPolicy::Template
-        | EndpointPolicy::FrozenLegacy => configured_endpoint.or(default_endpoint),
-        EndpointPolicy::Custom => configured_endpoint,
+        Some(contract.fixed_origin.clone())
+    } else {
+        match endpoint_policy {
+            EndpointPolicy::Fixed => {
+                if configured_endpoint.as_deref().is_some_and(|configured| {
+                    default_endpoint
+                        .as_deref()
+                        .is_none_or(|default| !endpoints_equivalent(configured, default))
+                }) {
+                    warnings.push(
+                        "fixed endpoint policy ignored a configured endpoint override".to_string(),
+                    );
+                }
+                default_endpoint
+            }
+            EndpointPolicy::OverrideAllowed
+            | EndpointPolicy::Template
+            | EndpointPolicy::FrozenLegacy => configured_endpoint.or(default_endpoint),
+            EndpointPolicy::Custom => configured_endpoint,
+        }
     };
     #[cfg(test)]
-    let endpoint = configured_setting(&stored.provider, "testRuntimeEndpoint").or(endpoint);
+    let endpoint = if coding_plan.is_some() {
+        endpoint
+    } else {
+        configured_setting(&stored.provider, "testRuntimeEndpoint").or(endpoint)
+    };
     let endpoint = match endpoint {
         Some(endpoint) => match validate_endpoint(&endpoint, stored) {
             Ok(endpoint) => endpoint,
@@ -317,6 +339,7 @@ pub fn compile_runtime_plan(
         "outboundIdentityPolicy": outbound_identity_policy,
         "authRef": &auth_ref,
         "modelPolicy": &model_policy,
+        "codingPlan": &coding_plan,
         "testModel": &test_model,
         "awsRegion": &aws_region,
         "mediaPolicy": &media_policy,
@@ -337,6 +360,7 @@ pub fn compile_runtime_plan(
         outbound_identity_policy,
         auth_ref,
         model_policy,
+        coding_plan,
         test_model,
         aws_region,
         media_policy,
@@ -483,13 +507,30 @@ fn runtime_auth_ref(
         } => managed_account_auth_ref(stored, accounts, *account_provider_type, warnings),
         CredentialPolicy::StaticSecret { slots, auth_scheme } => {
             let summary = redact_provider(&stored.provider).1;
-            if !summary.configured {
+            let (slots, auth_scheme, credential_configured) =
+                if let Some(contract) = profile.coding_plan.as_ref() {
+                    (
+                        vec![contract.inference.credential_slot.clone()],
+                        contract.inference.auth_scheme,
+                        summary
+                            .slots
+                            .iter()
+                            .any(|configured| configured == &contract.inference.credential_slot),
+                    )
+                } else {
+                    (
+                        normalized_slots(slots, &summary.slots),
+                        *auth_scheme,
+                        summary.configured,
+                    )
+                };
+            if !credential_configured {
                 warnings.push("Provider credential is not configured".to_string());
                 return RuntimeAuthRef::Missing;
             }
             RuntimeAuthRef::StaticCredential {
-                auth_scheme: *auth_scheme,
-                slots: normalized_slots(slots, &summary.slots),
+                auth_scheme,
+                slots,
                 credential_generation: stored.resource.credential_generation,
             }
         }
@@ -721,6 +762,8 @@ fn runtime_driver_options(
         "testGrokWebsocketUrl",
         "testGrokModelsUrl",
         "testKiroModelsUrl",
+        "testCopilotModelsUrl",
+        "testCopilotInferenceUrl",
     ] {
         if let Some(value) = provider
             .settings_config
@@ -935,6 +978,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::DeepSeekAccount => Some("https://chat.deepseek.com"),
         ProviderType::KiroOAuth => Some("https://q.us-east-1.amazonaws.com"),
         ProviderType::KimiCode => Some("https://api.kimi.com/coding/v1"),
+        ProviderType::QoderCosy => Some("https://api1.qoder.sh"),
         ProviderType::CursorOAuth => Some("https://api2.cursor.sh"),
         ProviderType::CursorApiKey => Some("https://api.cursor.com"),
         ProviderType::OllamaCloud => Some("https://ollama.com"),
@@ -952,6 +996,7 @@ fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
             | ProviderType::CodexOAuth
             | ProviderType::GrokOAuth
             | ProviderType::KimiCode
+            | ProviderType::QoderCosy
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
     )
@@ -1116,6 +1161,7 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
         ProviderType::DeepSeekAccount => "special.deepseek_account",
         ProviderType::KiroOAuth => "special.kiro",
         ProviderType::KimiCode => "oauth.kimi_code",
+        ProviderType::QoderCosy => "special.qoder_cosy",
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => "special.cursor",
         ProviderType::AntigravityOAuth => "special.antigravity",
         ProviderType::AgyOAuth => "special.agy",
@@ -1191,6 +1237,40 @@ mod tests {
         stored.provider.name = "Renamed".to_string();
         let second = compile_runtime_plan(&stored, &accounts).unwrap();
         assert_eq!(first.runtime_fingerprint, second.runtime_fingerprint);
+    }
+
+    #[test]
+    fn logical_static_secret_slot_accepts_a_canonical_provider_credential() {
+        let mut stored = provider("codex.cursor_api_key", ProviderType::CursorApiKey);
+        stored.provider.settings_config["apiKey"] = json!("cursor-secret");
+
+        let plan = compile_runtime_plan(&stored, &AccountStore::default()).unwrap();
+
+        assert_eq!(plan.configuration_state, RuntimeConfigurationState::Ready);
+        assert!(matches!(
+            plan.auth_ref,
+            RuntimeAuthRef::StaticCredential { ref slots, .. }
+                if slots.iter().any(|slot| slot == "/settingsConfig/apiKey")
+        ));
+    }
+
+    #[test]
+    fn coding_plan_quota_credentials_do_not_satisfy_the_inference_slot() {
+        let mut stored = provider("codex.volcengine_coding_plan", ProviderType::Codex);
+        stored.provider.settings_config["env"]["VOLC_ACCESS_KEY_ID"] = json!("access-key");
+        stored.provider.settings_config["env"]["VOLC_SECRET_ACCESS_KEY"] = json!("secret-key");
+
+        let plan = compile_runtime_plan(&stored, &AccountStore::default()).unwrap();
+
+        assert_eq!(plan.auth_ref, RuntimeAuthRef::Missing);
+        assert_eq!(
+            plan.configuration_state,
+            RuntimeConfigurationState::NeedsAttention
+        );
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("credential is not configured")));
     }
 
     #[test]

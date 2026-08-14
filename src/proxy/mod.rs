@@ -3,6 +3,7 @@
 mod account_headers;
 pub mod adapters;
 mod anthropic_semantics;
+mod antigravity_retry;
 mod cache_injector;
 pub(crate) mod claude_oauth;
 pub(crate) mod codex_models;
@@ -14,11 +15,14 @@ mod deepseek;
 mod forwarder;
 mod grok;
 pub(crate) mod kimi;
+pub(crate) mod kimi_runtime;
 pub(crate) mod kiro;
 mod outbound_identity;
 pub(crate) mod outbound_request;
 mod overflow_compact;
 pub(crate) mod provider_ops;
+pub(crate) mod qoder;
+pub(crate) mod qoder_runtime;
 pub(crate) mod reasoning_bridge;
 mod remote_image;
 mod request_governance;
@@ -28,6 +32,7 @@ mod retry_policy;
 mod router;
 mod stream_transforms;
 mod streaming;
+mod terminal_detector;
 mod thinking;
 mod tool_media;
 mod tool_schema;
@@ -41,6 +46,10 @@ pub use forwarder::forward_codex_alpha_search;
 pub use forwarder::forward_codex_models_manifest;
 pub use forwarder::forward_codex_responses_ws;
 pub use forwarder::forward_grok_media;
+
+pub(crate) fn grok_fixed_api_base_url() -> &'static str {
+    grok::default_base_url()
+}
 pub use forwarder::forward_images_edits;
 pub use forwarder::forward_images_generations;
 pub(crate) use forwarder::validate_and_acquire_share_invocation;
@@ -125,6 +134,7 @@ impl ProxyError {
     const TOOL_JSON_LIMIT_PREFIX: &'static str = "[TOOL_JSON_LIMIT] ";
     const KIRO_EVENT_STREAM_INVALID_PREFIX: &'static str = "[KIRO_EVENT_STREAM_INVALID] ";
     const KIRO_EVENT_STREAM_LIMIT_PREFIX: &'static str = "[KIRO_EVENT_STREAM_LIMIT] ";
+    const KIRO_EVENT_STREAM_TIMEOUT_PREFIX: &'static str = "[KIRO_EVENT_STREAM_TIMEOUT] ";
     const KIRO_UPSTREAM_STREAM_ERROR_PREFIX: &'static str = "[KIRO_UPSTREAM_STREAM_ERROR] ";
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
@@ -226,6 +236,7 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::TOOL_JSON_LIMIT_PREFIX))
             .or_else(|| message.strip_prefix(Self::KIRO_EVENT_STREAM_INVALID_PREFIX))
             .or_else(|| message.strip_prefix(Self::KIRO_EVENT_STREAM_LIMIT_PREFIX))
+            .or_else(|| message.strip_prefix(Self::KIRO_EVENT_STREAM_TIMEOUT_PREFIX))
             .or_else(|| message.strip_prefix(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
@@ -300,6 +311,9 @@ impl ProxyError {
         if message.starts_with(Self::KIRO_EVENT_STREAM_LIMIT_PREFIX) {
             return "KIRO_EVENT_STREAM_LIMIT";
         }
+        if message.starts_with(Self::KIRO_EVENT_STREAM_TIMEOUT_PREFIX) {
+            return "KIRO_EVENT_STREAM_TIMEOUT";
+        }
         if message.starts_with(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX) {
             return "KIRO_UPSTREAM_STREAM_ERROR";
         }
@@ -337,6 +351,7 @@ impl ProxyError {
         }
         if message.starts_with(Self::KIRO_EVENT_STREAM_INVALID_PREFIX)
             || message.starts_with(Self::KIRO_EVENT_STREAM_LIMIT_PREFIX)
+            || message.starts_with(Self::KIRO_EVENT_STREAM_TIMEOUT_PREFIX)
             || message.starts_with(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX)
         {
             return "upstream_protocol_error";

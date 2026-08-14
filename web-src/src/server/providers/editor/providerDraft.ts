@@ -15,11 +15,17 @@ import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import {
   anthropicApiKeyPreset,
   claudeGoogleOAuthPreset,
+  directProfileVisualPreset,
   googleGeminiApiKeyPreset,
+  githubCopilotCodexPreset,
+  kiroCodexPreset,
   kimiCodeClaudePreset,
   kimiCodeCodexPreset,
   kimiCodeGeminiPreset,
   openAiApiKeyPreset,
+  qoderClaudePreset,
+  qoderCodexPreset,
+  qoderGeminiPreset,
 } from "@/server/directProviderPresets";
 import {
   driverForProfile,
@@ -134,6 +140,12 @@ export function providerPresetForProfile(
   if (profile.profileId === "codex.openai_api_key") {
     return openAiApiKeyPreset;
   }
+  if (profile.profileId === "codex.github_copilot") {
+    return githubCopilotCodexPreset;
+  }
+  if (profile.profileId === "codex.kiro_oauth") {
+    return kiroCodexPreset;
+  }
   if (profile.profileId === "gemini.google_api_key") {
     return googleGeminiApiKeyPreset;
   }
@@ -146,6 +158,17 @@ export function providerPresetForProfile(
   if (profile.profileId === "gemini.kimi_code") {
     return kimiCodeGeminiPreset;
   }
+  if (profile.profileId === "claude.qoder_cosy") {
+    return qoderClaudePreset;
+  }
+  if (profile.profileId === "codex.qoder_cosy") {
+    return qoderCodexPreset;
+  }
+  if (profile.profileId === "gemini.qoder_cosy") {
+    return qoderGeminiPreset;
+  }
+  const directVisual = directProfileVisualPreset(profile.profileId, profile.app);
+  if (directVisual) return directVisual;
   const legacyName = legacyPresetNameForProfile(profile.app, profile.profileId);
   if (!legacyName) return undefined;
   if (profile.app === "claude") {

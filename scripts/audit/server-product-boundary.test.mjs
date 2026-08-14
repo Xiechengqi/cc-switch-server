@@ -28,6 +28,26 @@ mod tests {
   );
 });
 
+test("test module stripping handles Rust raw strings and leaves cfg test fields intact", () => {
+  const source = String.raw`
+pub struct Runtime {
+  #[cfg(test)]
+  test_url: Option<String>,
+}
+#[cfg(test)]
+mod tests {
+  const BODY: &str = br##"{"nested":{"brace":"}"}}"##;
+  /* nested comment { /* } */ } */
+  fn local_http() { let _ = reqwest::Client::new(); }
+}
+pub fn production() {}
+`;
+  const stripped = stripCfgTestModules(source);
+  assert.match(stripped, /test_url: Option<String>/);
+  assert.match(stripped, /pub fn production/);
+  assert.doesNotMatch(stripped, /reqwest::Client::new/);
+});
+
 test("only the shared HTTP transport may construct an outbound proxy", () => {
   assert.deepEqual(
     sourceBoundaryViolations(

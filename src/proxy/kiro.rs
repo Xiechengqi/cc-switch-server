@@ -18,6 +18,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     sync::{LazyLock, Mutex},
+    time::Duration,
 };
 
 use tool_bridge::ToolCompatibilityMode;
@@ -173,8 +174,11 @@ impl KiroAccountData {
             .to_string();
         let profile = account.profile.as_ref();
         let raw = account.raw.as_ref();
-        let profile_arn = string_at(profile, &["/profileArn", "/profile_arn"])
-            .or_else(|| string_at(raw, &["/resolvedProfileArn", "/profileArn"]));
+        let runtime =
+            crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
+                .map_err(|error| {
+                    ProxyError::bad_request(format!("kiro account {} has {error}", account.id))
+                })?;
         let auth_region = string_at(profile, &["/authRegion", "/auth_region"])
             .or_else(|| string_at(raw, &["/authRegion", "/auth_region"]))
             .unwrap_or_else(|| crate::domain::providers::kiro::DEFAULT_REGION.to_string());
@@ -185,17 +189,6 @@ impl KiroAccountData {
                     account.id
                 ))
             })?;
-        let api_region = string_at(profile, &["/apiRegion", "/api_region"])
-            .or_else(|| string_at(raw, &["/apiRegion", "/api_region"]))
-            .or_else(|| region_from_profile_arn(profile_arn.as_deref()))
-            .unwrap_or_else(|| crate::domain::providers::kiro::DEFAULT_REGION.to_string());
-        let api_region =
-            crate::domain::providers::kiro::normalize_region(&api_region).ok_or_else(|| {
-                ProxyError::bad_request(format!(
-                    "kiro account {} has an invalid API region",
-                    account.id
-                ))
-            })?;
         Ok(Self {
             account_id: account.id.clone(),
             email: account
@@ -203,9 +196,9 @@ impl KiroAccountData {
                 .clone()
                 .or_else(|| string_at(profile, &["/email"])),
             refresh_token: refresh_token.clone(),
-            profile_arn,
+            profile_arn: runtime.profile_arn,
             auth_region,
-            api_region,
+            api_region: runtime.runtime_region,
             machine_id: string_at(profile, &["/machineId", "/machine_id"])
                 .or_else(|| string_at(raw, &["/machineId", "/machine_id"]))
                 .or_else(|| Some(machine_id_from_refresh_token(&refresh_token))),
@@ -352,7 +345,6 @@ fn anthropic_to_kiro_request(
         }
     });
 
-    let profile_arn = endpoint::profile_arn(account);
     let mut request_body = json!({
         "conversationState": {
             "agentTaskType": "vibe",
@@ -361,9 +353,11 @@ fn anthropic_to_kiro_request(
             "conversationId": conversation_id(body),
             "agentContinuationId": next_uuid_like("agent-continuation"),
             "history": history
-        },
-        "profileArn": profile_arn
+        }
     });
+    if let Some(profile_arn) = endpoint::profile_arn(account)? {
+        request_body["profileArn"] = json!(profile_arn);
+    }
     if let Some(additional_model_request_fields) = additional_model_request_fields(body, model_id) {
         request_body["additionalModelRequestFields"] = additional_model_request_fields;
     }
@@ -405,33 +399,6 @@ fn additional_model_request_fields(body: &Value, model_id: &str) -> Option<Value
             "effort": effort
         }
     }))
-}
-
-fn resolve_profile_arn(account: &KiroAccountData) -> String {
-    if let Some(profile_arn) = account
-        .profile_arn
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return profile_arn.to_string();
-    }
-    default_profile_arn_for_auth_method(
-        account
-            .auth_method
-            .as_deref()
-            .or(account.provider.as_deref()),
-        &account.api_region,
-    )
-    .to_string()
-}
-
-fn region_from_profile_arn(profile_arn: Option<&str>) -> Option<String> {
-    let arn = profile_arn?;
-    let mut parts = arn.split(':');
-    (parts.next() == Some("arn")).then_some(())?;
-    (parts.next() == Some("aws")).then_some(())?;
-    (parts.next() == Some("codewhisperer")).then_some(())?;
-    parts.next().map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2090,8 +2057,35 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped(
     request_body: &Value,
     cache_namespace: &str,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    kiro_event_stream_to_claude_sse_scoped_with_timeouts(
+        stream,
+        model,
+        tool_name_map,
+        request_body,
+        cache_namespace,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    model: String,
+    tool_name_map: HashMap<String, String>,
+    request_body: &Value,
+    cache_namespace: &str,
+    first_frame_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Option<Duration>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
-    kiro_event_stream_to_anthropic_sse(stream, model, tool_name_map, prompt_cache_usage)
+    kiro_event_stream_to_anthropic_sse(
+        stream,
+        model,
+        tool_name_map,
+        prompt_cache_usage,
+        first_frame_deadline,
+        idle_timeout,
+    )
 }
 
 fn kiro_event_stream_to_anthropic_sse(
@@ -2099,6 +2093,8 @@ fn kiro_event_stream_to_anthropic_sse(
     model: String,
     tool_name_map: HashMap<String, String>,
     prompt_cache_usage: KiroPromptCacheUsage,
+    first_frame_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Option<Duration>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut decoder = wire::EventStreamDecoder::strict();
@@ -2106,14 +2102,71 @@ fn kiro_event_stream_to_anthropic_sse(
         builder.set_prompt_cache_usage(prompt_cache_usage);
         yield Ok(builder.initial());
         tokio::pin!(stream);
-        while let Some(chunk) = stream.next().await {
+        let mut read_deadline = first_frame_deadline;
+        let mut saw_complete_frame = false;
+        let mut saw_end = false;
+        loop {
+            let next = if let Some(deadline) = read_deadline {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        Err(kiro_event_stream_timeout(saw_complete_frame))
+                    }
+                    next = stream.next() => Ok(next),
+                }
+            } else {
+                Ok(stream.next().await)
+            }?;
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
             let frames = decoder
                 .feed(&chunk)
                 .map_err(|error| kiro_stream_io_error(error.into()))?;
+            if !frames.is_empty() {
+                saw_complete_frame = true;
+                read_deadline = idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+            }
             for frame in frames {
+                if saw_end {
+                    Err(kiro_stream_io_error(kiro_wire_contract_error(
+                        "Kiro EventStream contained a frame after endEvent",
+                    )))?;
+                }
                 let event = wire::parse_event(frame)
                     .map_err(|error| kiro_stream_io_error(error.into()))?;
+                if matches!(&event, wire::Event::End) {
+                    saw_end = true;
+                } else {
+                    for bytes in process_event_to_sse(&mut builder, event)
+                        .map_err(kiro_stream_io_error)?
+                    {
+                        yield Ok(bytes);
+                    }
+                }
+            }
+            if saw_end {
+                decoder
+                    .finish()
+                    .map_err(|error| kiro_stream_io_error(error.into()))?;
+                break;
+            }
+        }
+        for frame in decoder
+            .finish()
+            .map_err(|error| kiro_stream_io_error(error.into()))?
+        {
+            if saw_end {
+                Err(kiro_stream_io_error(kiro_wire_contract_error(
+                    "Kiro EventStream contained a frame after endEvent",
+                )))?;
+            }
+            let event = wire::parse_event(frame)
+                .map_err(|error| kiro_stream_io_error(error.into()))?;
+            if matches!(&event, wire::Event::End) {
+                saw_end = true;
+            } else {
                 for bytes in process_event_to_sse(&mut builder, event)
                     .map_err(kiro_stream_io_error)?
                 {
@@ -2121,17 +2174,10 @@ fn kiro_event_stream_to_anthropic_sse(
                 }
             }
         }
-        for frame in decoder
-            .finish()
-            .map_err(|error| kiro_stream_io_error(error.into()))?
-        {
-            let event = wire::parse_event(frame)
-                .map_err(|error| kiro_stream_io_error(error.into()))?;
-            for bytes in process_event_to_sse(&mut builder, event)
-                .map_err(kiro_stream_io_error)?
-            {
-                yield Ok(bytes);
-            }
+        if !saw_end {
+            Err(kiro_stream_io_error(kiro_wire_contract_error(
+                "Kiro EventStream ended before endEvent",
+            )))?;
         }
         for bytes in builder
             .finish_events()
@@ -2139,6 +2185,22 @@ fn kiro_event_stream_to_anthropic_sse(
         {
             yield Ok(bytes);
         }
+    }
+}
+
+fn kiro_event_stream_timeout(after_first_frame: bool) -> std::io::Error {
+    let message = if after_first_frame {
+        "Kiro EventStream timed out between complete frames"
+    } else {
+        "Kiro EventStream timed out before the first complete frame"
+    };
+    std::io::Error::other(format!("[KIRO_EVENT_STREAM_TIMEOUT] {message}"))
+}
+
+fn kiro_wire_contract_error(message: impl Into<String>) -> KiroToolJsonError {
+    KiroToolJsonError::Wire {
+        code: "KIRO_EVENT_STREAM_INVALID",
+        message: message.into(),
     }
 }
 
@@ -2218,7 +2280,13 @@ fn kiro_event_bytes_to_anthropic_json(
     let mut tool_leak_filter = ToolLeakFilter::default();
     let mut usage = KiroUsageAccumulator::default();
     usage.set_prompt_cache_usage(prompt_cache_usage);
+    let mut saw_end = false;
     for frame in frames {
+        if saw_end {
+            return Err(kiro_wire_contract_error(
+                "Kiro EventStream contained a frame after endEvent",
+            ));
+        }
         match wire::parse_event(frame)? {
             wire::Event::AssistantResponse { content: chunk }
             | wire::Event::Code { content: chunk } => {
@@ -2263,8 +2331,14 @@ fn kiro_event_bytes_to_anthropic_json(
             } => {
                 usage.apply_event(&event_type, &payload, model);
             }
-            wire::Event::End | wire::Event::Unknown { .. } => {}
+            wire::Event::End => saw_end = true,
+            wire::Event::Unknown { .. } => {}
         }
+    }
+    if !saw_end {
+        return Err(kiro_wire_contract_error(
+            "Kiro EventStream ended before endEvent",
+        ));
     }
     tool_accumulator.finish()?;
     for visible in tool_leak_filter.push_text("", true) {
@@ -3082,30 +3156,6 @@ pub(crate) fn is_client_validation_error(body: &[u8]) -> bool {
     MESSAGE_MARKERS.iter().any(|marker| body.contains(marker))
 }
 
-#[allow(dead_code)]
-fn default_profile_arn_for_builder_id() -> &'static str {
-    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
-}
-
-fn default_profile_arn_for_auth_method(auth_method: Option<&str>, region: &str) -> String {
-    let method = auth_method.unwrap_or_default().trim().to_ascii_lowercase();
-    match method.as_str() {
-        "social" | "google" | "github" => {
-            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK".to_string()
-        }
-        "enterprise" | "idc" | "iam_sso" | "iam-sso" | "external_idp" | "external-idp"
-        | "externalidp" => {
-            let region = if region.starts_with("eu-") {
-                "eu-central-1"
-            } else {
-                "us-east-1"
-            };
-            format!("arn:aws:codewhisperer:{region}:610548660232:profile/VNECVYCYYAWN")
-        }
-        _ => default_profile_arn_for_builder_id().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3151,7 +3201,7 @@ mod tests {
             profile: Some(json!({
                 "profileArn": "arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id",
                 "authRegion": "us-east-1",
-                "apiRegion": "us-west-2",
+                "apiRegion": "us-east-1",
                 "machineId": "machine-profile",
                 "startUrl": "https://view.awsapps.com/start",
                 "authMethod": "builder-id",
@@ -3179,6 +3229,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: Default::default(),
         }
     }
 
@@ -3312,21 +3363,96 @@ mod tests {
         assert_eq!(data.client_secret_expires_at, Some(123456));
         assert_eq!(data.authenticated_at, 1000);
         assert_eq!(
-            resolve_profile_arn(&data),
-            "arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id"
+            endpoint::profile_arn(&data).unwrap().as_deref(),
+            Some("arn:aws:codewhisperer:us-west-2:123456789012:profile/profile-id")
         );
     }
 
     #[test]
     fn account_data_rejects_unsafe_stored_regions() {
-        for field in ["authRegion", "apiRegion"] {
-            let mut account = server_account();
-            account.profile.as_mut().unwrap()[field] = json!("us-east-1.attacker.invalid");
-            let error = KiroAccountData::from_account(&account).unwrap_err();
-            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
-            assert!(error.message.contains("invalid"));
-            assert!(!error.message.contains("attacker"));
-        }
+        let mut account = server_account();
+        account.profile.as_mut().unwrap()["authRegion"] = json!("us-east-1.attacker.invalid");
+        let error = KiroAccountData::from_account(&account).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("invalid"));
+        assert!(!error.message.contains("attacker"));
+
+        let mut account = server_account();
+        account.profile.as_mut().unwrap()["apiRegion"] = json!("us-east-1.attacker.invalid");
+        let data = KiroAccountData::from_account(&account).unwrap();
+        assert_eq!(data.api_region, "us-west-2");
+    }
+
+    #[test]
+    fn profileless_api_key_omits_profile_arn_and_external_idp_fails_closed() {
+        let mut api_key = server_account();
+        api_key.access_token = Some("ksk_fixture".to_string());
+        api_key.refresh_token = None;
+        api_key.profile = Some(json!({
+            "runtimeRegion": "us-east-1",
+            "authMethod": "api_key"
+        }));
+        api_key.raw = Some(json!({"authMethod": "api_key"}));
+        let data = KiroAccountData::from_account(&api_key).unwrap();
+        assert_eq!(endpoint::profile_arn(&data).unwrap(), None);
+
+        let mut external = api_key;
+        external.profile.as_mut().unwrap()["authMethod"] = json!("external_idp");
+        external.raw.as_mut().unwrap()["authMethod"] = json!("external_idp");
+        let error = KiroAccountData::from_account(&external).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("organization profile ARN"));
+
+        let mut legacy_idc = server_account();
+        legacy_idc.profile = Some(json!({
+            "authMethod": "idc",
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN",
+            "profileProvenance": "auth_method_default"
+        }));
+        legacy_idc.raw = Some(json!({"authMethod": "idc"}));
+        let error = KiroAccountData::from_account(&legacy_idc).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("legacy shared fallback"));
+    }
+
+    #[test]
+    fn profile_arn_region_drives_inference_across_idc_auth_and_legacy_regions() {
+        let mut account = server_account();
+        account.profile = Some(json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "runtimeRegion": "us-east-1",
+            "apiRegion": "us-east-1",
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/org-profile",
+            "profileProvenance": "list_available_profiles"
+        }));
+        account.raw = Some(json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "apiRegion": "us-east-1"
+        }));
+        let data = KiroAccountData::from_account(&account).unwrap();
+        assert_eq!(data.auth_region, "eu-north-1");
+        assert_eq!(data.api_region, "eu-central-1");
+
+        let request = prepare_kiro_request(
+            &account,
+            &json!({
+                "model": "claude-sonnet-4-8",
+                "messages": [{"role": "user", "content": "ping"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            request.url,
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            request.body.pointer("/profileArn"),
+            Some(&json!(
+                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/org-profile"
+            ))
+        );
     }
 
     #[test]
@@ -4262,6 +4388,75 @@ mod tests {
         drop(sender);
     }
 
+    #[tokio::test]
+    async fn local_message_start_and_partial_bytes_do_not_satisfy_first_frame_deadline() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|bytes| (bytes, receiver))
+        })
+        .map(Ok::<Bytes, reqwest::Error>);
+        let frame = fixture_event_frame("assistantResponseEvent", &json!({"content": "too late"}));
+        let stream = kiro_event_stream_to_claude_sse_scoped_with_timeouts(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            HashMap::new(),
+            &json!({"model": "claude-sonnet-4-8", "messages": []}),
+            "timeout-test",
+            Some(tokio::time::Instant::now() + Duration::from_millis(30)),
+            Some(Duration::from_secs(1)),
+        );
+        tokio::pin!(stream);
+
+        let initial = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&initial).contains("message_start"));
+        sender
+            .send(Bytes::copy_from_slice(&frame[..frame.len() / 2]))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .expect("the absolute first-frame deadline must fire")
+            .expect("the stream must emit a terminal error")
+            .unwrap_err();
+        assert!(error.to_string().contains("KIRO_EVENT_STREAM_TIMEOUT"));
+        assert!(error.to_string().contains("first complete frame"));
+    }
+
+    #[tokio::test]
+    async fn complete_frame_arms_idle_timeout_until_end_event() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|bytes| (bytes, receiver))
+        })
+        .map(Ok::<Bytes, reqwest::Error>);
+        let stream = kiro_event_stream_to_claude_sse_scoped_with_timeouts(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            HashMap::new(),
+            &json!({"model": "claude-sonnet-4-8", "messages": []}),
+            "idle-timeout-test",
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            Some(Duration::from_millis(30)),
+        );
+        tokio::pin!(stream);
+
+        let _initial = stream.next().await.unwrap().unwrap();
+        sender
+            .send(Bytes::from(fixture_event_frame(
+                "contextUsageEvent",
+                &json!({"contextUsagePercentage": 1.0}),
+            )))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .expect("the inter-frame idle deadline must fire")
+            .expect("the stream must emit a terminal error")
+            .unwrap_err();
+        assert!(error.to_string().contains("KIRO_EVENT_STREAM_TIMEOUT"));
+        assert!(error.to_string().contains("between complete frames"));
+    }
+
     #[test]
     fn detects_terminal_kiro_client_validation_reasons() {
         assert!(is_client_validation_error(
@@ -4329,11 +4524,47 @@ mod tests {
         assert!(decoder.feed(&bytes).is_err());
     }
 
-    fn event_stream_bytes(events: Vec<(&str, Value)>) -> Vec<u8> {
+    fn event_stream_bytes(mut events: Vec<(&str, Value)>) -> Vec<u8> {
+        if events
+            .last()
+            .is_none_or(|(event_type, _)| *event_type != "endEvent")
+        {
+            events.push(("endEvent", json!({})));
+        }
         events
             .into_iter()
             .flat_map(|(event_type, payload)| event_frame(event_type, payload))
             .collect()
+    }
+
+    #[test]
+    fn non_streaming_requires_end_event_and_rejects_frames_after_it() {
+        let missing_terminal =
+            event_frame("assistantResponseEvent", json!({"content": "unterminated"}));
+        let error = kiro_event_bytes_to_anthropic_json(
+            &missing_terminal,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+        assert!(error.to_string().contains("before endEvent"));
+
+        let after_terminal = [
+            event_frame("endEvent", json!({})),
+            event_frame("assistantResponseEvent", json!({"content": "late"})),
+        ]
+        .concat();
+        let error = kiro_event_bytes_to_anthropic_json(
+            &after_terminal,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+        assert!(error.to_string().contains("after endEvent"));
     }
 
     fn event_frame(event_type: &str, payload: Value) -> Vec<u8> {

@@ -6,3 +6,4 @@ export * from "./share";
 export * from "./emailAuth";
 export * from "./upgradePolicy";
 export * from "./accounts";
+export * from "./codingPlanQuota";

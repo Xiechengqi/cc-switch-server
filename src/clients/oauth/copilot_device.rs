@@ -6,14 +6,13 @@ use serde_json::{json, Value};
 
 use crate::domain::accounts::store::UpsertAccountInput;
 use crate::domain::providers::model::ProviderType;
-pub use crate::provider_identity::COPILOT_USER_AGENT;
+pub use crate::provider_identity::{
+    COPILOT_API_VERSION, COPILOT_EDITOR_VERSION, COPILOT_PLUGIN_VERSION, COPILOT_USER_AGENT,
+};
 
 const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_CLIENT_ID_GHES: &str = "Ov23li8tweQw6odWQebz";
 const DEFAULT_GITHUB_DOMAIN: &str = "github.com";
-pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.110.1";
-pub const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.38.2";
-pub const COPILOT_API_VERSION: &str = "2025-10-01";
 
 fn default_github_domain() -> String {
     DEFAULT_GITHUB_DOMAIN.to_string()
@@ -82,11 +81,16 @@ pub struct CopilotTokenResponse {
     pub expires_at: i64,
     #[serde(default, alias = "refresh_in")]
     pub refresh_in: Option<i64>,
+    #[serde(default)]
+    pub endpoints: Option<CopilotEndpoints>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopilotEndpoints {
-    pub api: String,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
     #[serde(default)]
     pub telemetry: Option<String>,
 }
@@ -101,6 +105,7 @@ struct CopilotUserResponse {
 pub struct CopilotDeviceError {
     pub status: StatusCode,
     pub message: String,
+    pub endpoint_validation: bool,
 }
 
 impl CopilotDeviceError {
@@ -108,6 +113,7 @@ impl CopilotDeviceError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            endpoint_validation: false,
         }
     }
 
@@ -115,6 +121,7 @@ impl CopilotDeviceError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            endpoint_validation: false,
         }
     }
 
@@ -122,6 +129,7 @@ impl CopilotDeviceError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
+            endpoint_validation: false,
         }
     }
 
@@ -129,6 +137,15 @@ impl CopilotDeviceError {
         Self {
             status,
             message: message.into(),
+            endpoint_validation: false,
+        }
+    }
+
+    fn invalid_endpoint(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+            endpoint_validation: true,
         }
     }
 }
@@ -224,11 +241,7 @@ pub async fn poll_device_flow(
         CopilotDeviceError::bad_gateway("github token response lacks access_token")
     })?;
     let github_user = fetch_github_user(http, &domain, &github_token).await?;
-    let copilot_token = if is_ghes(&domain) {
-        None
-    } else {
-        Some(fetch_copilot_token(http, &domain, &github_token).await?)
-    };
+    let copilot_token = Some(fetch_copilot_token(http, &domain, &github_token).await?);
     let copilot_usage = fetch_copilot_usage(http, &domain, &github_token).await.ok();
     let account_input = account_input_from_device_flow(
         &domain,
@@ -260,7 +273,11 @@ fn account_input_from_device_flow(
     let access_token = copilot_token
         .as_ref()
         .map(|token| token.token.clone())
-        .unwrap_or_else(|| github_token.clone());
+        .ok_or_else(|| {
+            CopilotDeviceError::unauthorized(
+                "GitHub account did not return a short-lived Copilot token",
+            )
+        })?;
     let refresh_token = github_token.clone();
     let scope = oauth.scope.clone();
     let expires_at = copilot_token
@@ -275,6 +292,20 @@ fn account_input_from_device_flow(
         "githubDomain": domain,
         "ghes": is_ghes(domain),
     });
+    let discovered_endpoint = copilot_token
+        .as_ref()
+        .and_then(|token| token.endpoints.as_ref())
+        .and_then(|endpoints| endpoints.api.as_deref())
+        .or_else(|| {
+            copilot_usage
+                .as_ref()
+                .and_then(|usage| usage.pointer("/endpoints/api"))
+                .and_then(Value::as_str)
+        });
+    let copilot_api_base = match discovered_endpoint {
+        Some(endpoint) => validate_copilot_api_endpoint(endpoint, domain)?,
+        None => validated_default_copilot_api_base(domain)?,
+    };
     let raw = json!({
         "githubDomain": domain,
         "githubToken": github_token.as_str(),
@@ -282,7 +313,7 @@ fn account_input_from_device_flow(
         "githubScopes": scope.as_deref(),
         "copilotToken": copilot_token.as_ref(),
         "copilotUsage": copilot_usage.as_ref(),
-        "copilotApiBase": copilot_api_base(domain),
+        "copilotApiBase": copilot_api_base,
         "importedBy": "github_copilot_device_flow",
         "importedAtMs": now_ms,
     });
@@ -345,7 +376,7 @@ async fn fetch_copilot_token(
     fetch_copilot_token_from_url(http, &copilot_token_url(domain), github_token).await
 }
 
-async fn fetch_copilot_token_from_url(
+pub(crate) async fn fetch_copilot_token_from_url(
     http: &reqwest::Client,
     url: &str,
     github_token: &str,
@@ -409,31 +440,60 @@ async fn fetch_copilot_api_endpoint_from_url(
             CopilotDeviceError::bad_gateway(format!("copilot endpoint request failed: {error}"))
         })?;
     let user: CopilotUserResponse = handle_json_response(response).await?;
-    Ok(user
+    match user
         .endpoints
-        .map(|endpoints| endpoints.api)
+        .and_then(|endpoints| endpoints.api)
         .filter(|endpoint| !endpoint.trim().is_empty())
-        .unwrap_or_else(|| copilot_api_base(fallback_domain)))
+    {
+        Some(endpoint) => validate_copilot_api_endpoint(&endpoint, fallback_domain),
+        None => validated_default_copilot_api_base(fallback_domain),
+    }
 }
 
-async fn fetch_copilot_usage(
+pub async fn fetch_copilot_usage(
     http: &reqwest::Client,
     domain: &str,
     github_token: &str,
 ) -> Result<Value, CopilotDeviceError> {
-    let response = http
-        .get(copilot_usage_url(domain))
+    fetch_copilot_usage_with_timeout(http, domain, github_token, None).await
+}
+
+pub async fn fetch_copilot_usage_with_timeout(
+    http: &reqwest::Client,
+    domain: &str,
+    github_token: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value, CopilotDeviceError> {
+    let domain = normalize_github_domain(domain)?;
+    fetch_copilot_usage_from_url_with_timeout(
+        http,
+        &copilot_usage_url(&domain),
+        github_token,
+        timeout,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_copilot_usage_from_url_with_timeout(
+    http: &reqwest::Client,
+    url: &str,
+    github_token: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value, CopilotDeviceError> {
+    let mut request = http
+        .get(url)
         .header("Authorization", format!("token {github_token}"))
         .header("Content-Type", "application/json")
         .header("editor-version", COPILOT_EDITOR_VERSION)
         .header("editor-plugin-version", COPILOT_PLUGIN_VERSION)
         .header("user-agent", COPILOT_USER_AGENT)
-        .header("x-github-api-version", COPILOT_API_VERSION)
-        .send()
-        .await
-        .map_err(|error| {
-            CopilotDeviceError::bad_gateway(format!("copilot usage request failed: {error}"))
-        })?;
+        .header("x-github-api-version", COPILOT_API_VERSION);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request.send().await.map_err(|error| {
+        CopilotDeviceError::bad_gateway(format!("copilot usage request failed: {error}"))
+    })?;
     handle_json_response(response).await
 }
 
@@ -475,10 +535,64 @@ pub fn normalize_github_domain(raw: &str) -> Result<String, CopilotDeviceError> 
         return Err(CopilotDeviceError::bad_request("invalid GitHub domain"));
     }
     let normalized = host.to_ascii_lowercase();
-    if normalized.is_empty() {
+    if normalized.is_empty()
+        || normalized.chars().any(char::is_whitespace)
+        || reqwest::Url::parse(&format!("https://{normalized}/"))
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .is_none()
+    {
         return Err(CopilotDeviceError::bad_request("invalid GitHub domain"));
     }
     Ok(normalized)
+}
+
+pub fn validate_copilot_api_endpoint(
+    raw: &str,
+    github_domain: &str,
+) -> Result<String, CopilotDeviceError> {
+    let domain = normalize_github_domain(github_domain)?;
+    let endpoint = reqwest::Url::parse(raw.trim()).map_err(|_| {
+        CopilotDeviceError::invalid_endpoint("Copilot API endpoint is not a valid absolute URL")
+    })?;
+    if endpoint.scheme() != "https"
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.path() != "/"
+        || endpoint.port_or_known_default() != Some(443)
+    {
+        return Err(CopilotDeviceError::invalid_endpoint(
+            "Copilot API endpoint must be an HTTPS origin without credentials, path, query, fragment, or custom port",
+        ));
+    }
+    let host = endpoint
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| CopilotDeviceError::invalid_endpoint("Copilot API endpoint lacks a host"))?;
+    let domain_url = reqwest::Url::parse(&format!("https://{domain}/"))
+        .map_err(|_| CopilotDeviceError::bad_request("invalid GitHub domain"))?;
+    let domain_host = domain_url
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| CopilotDeviceError::bad_request("invalid GitHub domain"))?;
+    let allowed = if domain_host == DEFAULT_GITHUB_DOMAIN {
+        host == "api.githubcopilot.com"
+            || (host.starts_with("api.") && host.ends_with(".githubcopilot.com"))
+    } else {
+        host == domain_host || host == format!("copilot-api.{domain_host}")
+    };
+    if !allowed {
+        return Err(CopilotDeviceError::invalid_endpoint(format!(
+            "Copilot API endpoint host is not trusted for GitHub domain {domain_host}"
+        )));
+    }
+    Ok(format!("https://{host}"))
+}
+
+fn validated_default_copilot_api_base(github_domain: &str) -> Result<String, CopilotDeviceError> {
+    validate_copilot_api_endpoint(&copilot_api_base(github_domain), github_domain)
 }
 
 fn github_client_id(domain: &str) -> &'static str {
@@ -556,6 +670,52 @@ mod tests {
             "github.com"
         );
         assert!(normalize_github_domain("https://user@example.com").is_err());
+        assert!(normalize_github_domain("https://example.com:bad").is_err());
+    }
+
+    #[test]
+    fn validates_public_and_ghes_copilot_origins() {
+        assert_eq!(
+            validate_copilot_api_endpoint("https://api.githubcopilot.com", "github.com").unwrap(),
+            "https://api.githubcopilot.com"
+        );
+        assert_eq!(
+            validate_copilot_api_endpoint(
+                "https://api.individual.githubcopilot.com/",
+                "github.com"
+            )
+            .unwrap(),
+            "https://api.individual.githubcopilot.com"
+        );
+        assert_eq!(
+            validate_copilot_api_endpoint("https://copilot-api.ghe.example.com", "ghe.example.com")
+                .unwrap(),
+            "https://copilot-api.ghe.example.com"
+        );
+        assert_eq!(
+            validate_copilot_api_endpoint("https://ghe.example.com", "ghe.example.com").unwrap(),
+            "https://ghe.example.com"
+        );
+    }
+
+    #[test]
+    fn rejects_untrusted_copilot_origins() {
+        for endpoint in [
+            "http://api.githubcopilot.com",
+            "https://api.githubcopilot.com/models",
+            "https://api.githubcopilot.com?target=evil",
+            "https://user@api.githubcopilot.com",
+            "https://api.githubcopilot.com:444",
+            "https://githubcopilot.com.evil.example",
+            "https://copilot-api.other.example.com",
+        ] {
+            assert!(validate_copilot_api_endpoint(endpoint, "github.com").is_err());
+        }
+        assert!(validate_copilot_api_endpoint(
+            "https://copilot-api.other.example.com",
+            "ghe.example.com"
+        )
+        .is_err());
     }
 
     #[test]
@@ -652,7 +812,7 @@ mod tests {
                 );
                 axum::Json(json!({
                     "endpoints": {
-                        "api": "https://copilot-api.enterprise.example.com"
+                        "api": "https://api.enterprise.githubcopilot.com"
                     }
                 }))
             }),
@@ -664,13 +824,13 @@ mod tests {
         let endpoint = fetch_copilot_api_endpoint_from_url(
             &reqwest::Client::new(),
             &format!("http://{addr}/api/v3/copilot_internal/user"),
-            &addr.to_string(),
+            "github.com",
             "github-token",
         )
         .await
         .unwrap();
 
-        assert_eq!(endpoint, "https://copilot-api.enterprise.example.com");
+        assert_eq!(endpoint, "https://api.enterprise.githubcopilot.com");
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -687,12 +847,12 @@ mod tests {
         let endpoint = fetch_copilot_api_endpoint_from_url(
             &reqwest::Client::new(),
             &format!("http://{addr}/api/v3/copilot_internal/user"),
-            &addr.to_string(),
+            "github.com",
             "github-token",
         )
         .await
         .unwrap();
 
-        assert_eq!(endpoint, copilot_api_base(&addr.to_string()));
+        assert_eq!(endpoint, copilot_api_base("github.com"));
     }
 }

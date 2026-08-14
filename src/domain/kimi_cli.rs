@@ -13,7 +13,14 @@ pub const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
 pub const KIMI_DEVICE_AUTHORIZATION_URL: &str =
     "https://auth.kimi.com/api/oauth/device_authorization";
 pub const KIMI_API_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+pub const KIMI_MODELS_URL: &str = "https://api.kimi.com/coding/v1/models";
+pub const KIMI_USAGES_URL: &str = "https://api.kimi.com/coding/v1/usages";
 pub const KIMI_DEFAULT_MODEL: &str = "kimi-for-coding";
+pub const KIMI_HIGHSPEED_MODEL: &str = "kimi-for-coding-highspeed";
+pub const KIMI_K3_MODEL: &str = "k3";
+
+pub const KIMI_REVIEWED_WIRE_MODELS: &[&str] =
+    &[KIMI_K3_MODEL, KIMI_DEFAULT_MODEL, KIMI_HIGHSPEED_MODEL];
 
 const KIMI_DEVICE_PROFILE_KEY: &str = "kimiDevice";
 

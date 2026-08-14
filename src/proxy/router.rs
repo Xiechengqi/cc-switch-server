@@ -173,6 +173,7 @@ pub(super) fn provider_supports_claude_count_tokens(provider: &StoredProvider) -
                 | ProviderType::ClaudeAuth
                 | ProviderType::ClaudeOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::KimiCode
         )
 }
 

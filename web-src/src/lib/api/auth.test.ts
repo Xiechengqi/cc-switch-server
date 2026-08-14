@@ -9,7 +9,13 @@ vi.mock("@/lib/runtime", () => ({
   isTauriRuntime: () => false,
 }));
 
-import { deepseekAccountAdd, isOpenAiCliOAuthOriginAllowed } from "./auth";
+import {
+  authPollForAccount,
+  authStartLogin,
+  deepseekAccountAdd,
+  importQoderPat,
+  isOpenAiCliOAuthOriginAllowed,
+} from "./auth";
 
 beforeEach(() => {
   runtimeMocks.invokeCommand.mockReset();
@@ -91,6 +97,54 @@ describe("isOpenAiCliOAuthOriginAllowed", () => {
     );
     expect(runtimeMocks.invokeCommand.mock.calls[0]?.[1]).not.toHaveProperty(
       "password",
+    );
+  });
+
+  it("keeps Qoder site and device-flow state in the managed auth contract", async () => {
+    runtimeMocks.invokeCommand.mockResolvedValue(null);
+
+    await authStartLogin("qoder_cosy", undefined, "device", undefined, "cn");
+    await authPollForAccount(
+      "qoder_cosy",
+      "device-code",
+      undefined,
+      "flow-state",
+    );
+
+    expect(runtimeMocks.invokeCommand).toHaveBeenNthCalledWith(
+      1,
+      "auth_start_login",
+      {
+        authProvider: "qoder_cosy",
+        githubDomain: null,
+        oauthFlowMode: "device",
+        kiroLoginProvider: null,
+        qoderSite: "cn",
+      },
+    );
+    expect(runtimeMocks.invokeCommand).toHaveBeenNthCalledWith(
+      2,
+      "auth_poll_for_account",
+      {
+        authProvider: "qoder_cosy",
+        deviceCode: "device-code",
+        githubDomain: null,
+        flowState: "flow-state",
+      },
+    );
+  });
+
+  it("imports Qoder PAT through the dedicated secret-bearing command", async () => {
+    runtimeMocks.invokeCommand.mockResolvedValue({
+      ok: true,
+      account: { id: "qoder-account" },
+    });
+
+    await importQoderPat("pt-secret");
+
+    expect(runtimeMocks.invokeCommand).toHaveBeenCalledWith(
+      "qoder_import_pat",
+      { personalToken: "pt-secret" },
     );
   });
 });

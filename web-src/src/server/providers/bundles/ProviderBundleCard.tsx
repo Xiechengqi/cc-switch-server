@@ -25,6 +25,7 @@ import GrokOauthQuotaFooter from "@/components/GrokOauthQuotaFooter";
 import KiroOauthQuotaFooter from "@/components/KiroOauthQuotaFooter";
 import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import CodingPlanQuotaFooter from "@/components/providers/CodingPlanQuotaFooter";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
 import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
 import { Badge } from "@/components/ui/badge";
@@ -69,6 +70,9 @@ function AppLogo({ app }: { app: CoreProviderApp }) {
 
 function BundleQuotaSummary({ resource }: { resource?: ProviderResource }) {
   if (!resource) return null;
+  if (resource.runtime?.codingPlan) {
+    return <CodingPlanQuotaFooter resource={resource} inline />;
+  }
   const provider = resource.provider;
   const app = resource.app;
   const quotaSource = getProviderQuotaSource(provider, app);

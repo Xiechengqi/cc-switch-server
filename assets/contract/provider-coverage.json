@@ -4,7 +4,7 @@
     "serverLegacyInventory": "assets/contract/server-provider-legacy-inventory.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "41560e143020fdcde05e500d62890ccdc843db899e085d6484d47a15f9b49266"
+      "sha256": "43dcb55985927aa8cf05a55ce07d6fbd6b2e2e067394ccab5f7ddddfe71e430d"
     },
     "upstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },
@@ -106,7 +106,8 @@
       "id": "github_copilot",
       "label": "GitHub Copilot",
       "apps": [
-        "claude"
+        "claude",
+        "codex"
       ],
       "required": true,
       "presentInSource": true,
@@ -149,12 +150,26 @@
       "presentInServer": true
     },
     {
+      "variant": "QoderCosy",
+      "id": "qoder_cosy",
+      "label": "Qoder COSY",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "presentInSource": false,
+      "presentInServer": true
+    },
+    {
       "variant": "CursorOAuth",
       "id": "cursor_oauth",
       "label": "Cursor OAuth",
       "apps": [
         "claude",
-        "codex"
+        "codex",
+        "gemini"
       ],
       "required": true,
       "presentInSource": true,
@@ -166,7 +181,8 @@
       "label": "Cursor API key",
       "apps": [
         "claude",
-        "codex"
+        "codex",
+        "gemini"
       ],
       "required": true,
       "presentInSource": true,

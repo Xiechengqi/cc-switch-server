@@ -375,6 +375,11 @@ impl ResponsesSseInspector {
         max_pending_bytes: usize,
         max_event_bytes: usize,
     ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
+        if trim_ascii_whitespace(&self.buffer) == b"[DONE]" {
+            self.buffer.clear();
+            self.observe_done()?;
+            return Ok(Vec::new());
+        }
         match serde_json::from_slice::<Value>(&self.buffer) {
             Ok(value) => {
                 ensure_event_bounded(self.buffer.len(), max_event_bytes)?;
@@ -403,7 +408,7 @@ impl ResponsesSseInspector {
                         continue;
                     }
                     if line == b"[DONE]" {
-                        self.done_seen = true;
+                        self.observe_done()?;
                         consumed = line_end + 1;
                         continue;
                     }
@@ -441,8 +446,8 @@ impl ResponsesSseInspector {
                     return Ok(observations);
                 }
                 if remaining == b"[DONE]" {
-                    self.done_seen = true;
                     self.buffer.clear();
+                    self.observe_done()?;
                     return Ok(observations);
                 }
                 if self.terminal.is_some() {
@@ -519,7 +524,7 @@ impl ResponsesSseInspector {
             return Ok(None);
         }
         if payload == "[DONE]" {
-            self.done_seen = true;
+            self.observe_done()?;
             return Ok(None);
         }
         if self.terminal.is_some() {
@@ -531,6 +536,16 @@ impl ResponsesSseInspector {
         let observation = classify_value(&value);
         self.record(&observation);
         Ok(Some(observation))
+    }
+
+    fn observe_done(&mut self) -> Result<(), SemanticProtocolError> {
+        self.done_seen = true;
+        if self.terminal.is_none() {
+            return Err(SemanticProtocolError::new(
+                "Responses stream emitted [DONE] before a terminal response event",
+            ));
+        }
+        Ok(())
     }
 
     fn record(&mut self, observation: &SemanticObservation) {
@@ -717,16 +732,27 @@ mod tests {
     #[test]
     fn sse_inspector_requires_a_semantic_terminal() {
         let mut inspector = ResponsesSseInspector::default();
-        let observations = inspector
+        let error = inspector
             .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: [DONE]\n\n")
-            .unwrap();
+            .unwrap_err();
         assert!(inspector.saw_business());
-        assert_eq!(observations, vec![SemanticObservation::Business]);
-        assert!(inspector
-            .finish()
-            .unwrap_err()
-            .to_string()
-            .contains("[DONE]"));
+        assert!(error.to_string().contains("[DONE]"));
+    }
+
+    #[test]
+    fn sse_inspector_accepts_done_only_after_a_semantic_terminal() {
+        let mut inspector = ResponsesSseInspector::default();
+        let observations = inspector
+            .push(
+                concat!(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(observations, vec![SemanticObservation::SuccessTerminal]);
+        inspector.finish().unwrap();
     }
 
     #[test]

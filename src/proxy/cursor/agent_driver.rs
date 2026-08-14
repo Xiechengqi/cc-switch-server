@@ -48,6 +48,7 @@ use super::agent_proto::{
     encode_rich_request_context_response, wrap_connect_frame, AgentRunInput, ConnectFrame,
     ExecServerEvent, InteractionDelta, KvServerEvent,
 };
+use super::credential_cache::CursorApiKeyCredentialScope;
 use super::event_emitter::{
     AgentEvent, AgentSseWriter, CapturedToolCall, ComposerMarkerFilter, MarkerEvent,
 };
@@ -60,7 +61,10 @@ use super::image::load_images;
 use super::request_builder::{
     build_plan, estimate_input_tokens, validate_tool_result_context, AgentRunPlan,
 };
-use super::session::{CursorSession, PendingToolCall, SessionState};
+use super::session::{
+    CursorSession, CursorSessionKey, CursorSessionReference, CursorSessionScope,
+    CursorSessionScopeInput, PendingToolCall, SessionState,
+};
 use super::tool_bridge::{
     bridge_builtin_tool, bridge_grep_tool, bridge_ls_or_glob_tool, bridge_mcp_exec_tool,
     bridge_read_lints_tool, bridge_read_tool, bridge_write_or_edit_tool,
@@ -81,6 +85,7 @@ pub struct AgentServiceForwardOptions {
     pub request_context: UsageLogContext,
     pub account_in_flight_guard: Option<AccountInFlightGuard>,
     pub share_invocation_guard: Option<ShareInFlightGuard>,
+    pub runtime_fingerprint: String,
     pub timeouts: CursorH2Timeouts,
 }
 
@@ -98,6 +103,7 @@ enum CursorAgentServiceAuthAction {
 async fn cursor_agentservice_auth_action(
     state: &ServerState,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     rejected_access_token: Option<&str>,
     auth_recovery: &mut AuthRecoveryState,
     status: StatusCode,
@@ -112,6 +118,7 @@ async fn cursor_agentservice_auth_action(
                 mark_cursor_agentservice_auth_cooldown(
                     state,
                     stored,
+                    runtime_fingerprint,
                     rejected_access_token,
                     "cursor_agentservice_unauthorized_after_refresh",
                 )
@@ -165,6 +172,7 @@ pub async fn forward_agentservice(
         request_context,
         account_in_flight_guard,
         share_invocation_guard,
+        runtime_fingerprint,
         timeouts,
     } = options;
     let mut request_context = request_context;
@@ -186,16 +194,19 @@ pub async fn forward_agentservice(
         ProxyError::bad_request(format!("invalid cursor tool result context: {message}"))
     })?;
 
-    let session_identity = cursor_session_identity(&state, &stored).await?;
-    let session_key = resolve_session_key(&state, &plan).await?;
+    let session_scope =
+        cursor_session_scope(&state, &stored, &runtime_fingerprint, &request_context).await?;
+    let resolved_session = resolve_session_key(&state, &plan, &session_scope).await?;
+    let mut session_key = resolved_session.key.clone();
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_input_tokens(&plan.user_text);
     let (mut session_entry, mut session_access_token) = acquire_or_open_session(
         &state,
         &stored,
+        &runtime_fingerprint,
         &plan,
         &session_key,
-        &session_identity,
+        resolved_session.parked.as_ref(),
         timeouts,
     )
     .await?;
@@ -205,6 +216,7 @@ pub async fn forward_agentservice(
         match cursor_agentservice_auth_action(
             &state,
             &stored,
+            &runtime_fingerprint,
             session_access_token.as_deref(),
             &mut auth_recovery,
             status,
@@ -218,18 +230,31 @@ pub async fn forward_agentservice(
                     .cursor_sessions
                     .release(session_entry, SessionState::Closed)
                     .await;
-                recover_cursor_unauthorized(&state, &stored, session_access_token.as_deref())
-                    .await?;
-                let refreshed_identity = cursor_session_identity(&state, &stored).await?;
+                recover_cursor_unauthorized(
+                    &state,
+                    &stored,
+                    &runtime_fingerprint,
+                    session_access_token.as_deref(),
+                )
+                .await?;
+                let refreshed_scope =
+                    cursor_session_scope(&state, &stored, &runtime_fingerprint, &request_context)
+                        .await?;
+                let refreshed_key = CursorSessionKey::new(
+                    refreshed_scope,
+                    session_key.conversation_id().to_string(),
+                );
                 (session_entry, session_access_token) = acquire_or_open_session(
                     &state,
                     &stored,
+                    &runtime_fingerprint,
                     &plan,
-                    &session_key,
-                    &refreshed_identity,
+                    &refreshed_key,
+                    None,
                     timeouts,
                 )
                 .await?;
+                session_key = refreshed_key;
             }
         }
     };
@@ -359,7 +384,7 @@ async fn stream_response(
     state: ServerState,
     stored: StoredProvider,
     session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
-    session_key: String,
+    session_key: CursorSessionKey,
     response_format: super::protocol::CursorResponseFormat,
     response_model: String,
     input_tokens: u32,
@@ -372,7 +397,7 @@ async fn stream_response(
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
     state
         .cursor_sessions
-        .bind_response_id(writer.message_id(), &session_key)
+        .bind_response_id(&session_key, &session_entry, writer.message_id())
         .await;
     let request_id = log_usage(
         &state,
@@ -449,6 +474,14 @@ async fn stream_response(
             {
                 Ok(ExecHandling::Continue) => {}
                 Ok(ExecHandling::ToolCall(tool_call)) => {
+                    if let Err(error) = mark_session_business_output(&session_entry).await {
+                        final_status = error.status.as_u16();
+                        final_stream_status = "failed";
+                        for event in writer.error_events(&error.message) {
+                            yield Ok::<_, std::io::Error>(Bytes::from(event));
+                        }
+                        break;
+                    }
                     let events = writer.event(&AgentEvent::ToolCall(tool_call));
                     if first_token_ms.is_none() && !events.is_empty() {
                         let elapsed = started.elapsed().as_millis();
@@ -483,6 +516,7 @@ async fn stream_response(
             }
             let mut ended = false;
             for delta in decode_agent_server_message(&frame.payload) {
+                let business_output = cursor_delta_is_business_output(&delta);
                 let events = match cursor_delta_events(delta, &mut writer, &mut filter) {
                     Ok(CursorDeltaOutcome::Events(events)) => events,
                     Ok(CursorDeltaOutcome::TurnEnded(events)) => {
@@ -495,6 +529,17 @@ async fn stream_response(
                         writer.error_events(&error.message)
                     }
                 };
+                if business_output {
+                    if let Err(error) = mark_session_business_output(&session_entry).await {
+                        final_status = error.status.as_u16();
+                        final_stream_status = "failed";
+                        ended = true;
+                        for event in writer.error_events(&error.message) {
+                            yield Ok::<_, std::io::Error>(Bytes::from(event));
+                        }
+                        break;
+                    }
+                }
                 if first_token_ms.is_none() && !events.is_empty() {
                     let elapsed = started.elapsed().as_millis();
                     first_token_ms = Some(elapsed);
@@ -566,7 +611,7 @@ async fn stream_response(
 async fn drive_non_stream(
     state: &ServerState,
     session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
-    session_key: &str,
+    session_key: &CursorSessionKey,
     response_format: super::protocol::CursorResponseFormat,
     response_model: String,
     input_tokens: u32,
@@ -574,7 +619,7 @@ async fn drive_non_stream(
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
     state
         .cursor_sessions
-        .bind_response_id(writer.message_id(), session_key)
+        .bind_response_id(session_key, &session_entry, writer.message_id())
         .await;
     let _ = writer.start_events();
     let mut filter = ComposerMarkerFilter::default();
@@ -594,6 +639,7 @@ async fn drive_non_stream(
         {
             ExecHandling::Continue => {}
             ExecHandling::ToolCall(tool_call) => {
+                mark_session_business_output(&session_entry).await?;
                 let _ = writer.event(&AgentEvent::ToolCall(tool_call));
                 let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
                     ProxyError::bad_request(format!(
@@ -607,9 +653,15 @@ async fn drive_non_stream(
             }
         }
         for delta in decode_agent_server_message(&frame.payload) {
+            let business_output = cursor_delta_is_business_output(&delta);
             match cursor_delta_events(delta, &mut writer, &mut filter)? {
-                CursorDeltaOutcome::Events(_) => {}
+                CursorDeltaOutcome::Events(_) => {
+                    if business_output {
+                        mark_session_business_output(&session_entry).await?;
+                    }
+                }
                 CursorDeltaOutcome::TurnEnded(_) => {
+                    mark_session_business_output(&session_entry).await?;
                     let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
                         ProxyError::bad_request(format!(
                             "Cursor AgentService JSON response encode failed: {error}"
@@ -632,6 +684,20 @@ async fn drive_non_stream(
         Bytes::from(body),
         writer_usage(&writer),
     ))
+}
+
+fn cursor_delta_is_business_output(delta: &InteractionDelta) -> bool {
+    match delta {
+        InteractionDelta::Text(text) | InteractionDelta::Thinking(text) => !text.is_empty(),
+        InteractionDelta::ThinkingComplete
+        | InteractionDelta::TokenDelta(_)
+        | InteractionDelta::TurnEnded => true,
+        InteractionDelta::Heartbeat
+        | InteractionDelta::ToolCallStarted
+        | InteractionDelta::ToolCallCompleted
+        | InteractionDelta::KvServerMessage
+        | InteractionDelta::Unknown(_) => false,
+    }
 }
 
 enum CursorDeltaOutcome {
@@ -1044,37 +1110,43 @@ async fn declared_tool_names(
 async fn acquire_or_open_session(
     state: &ServerState,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     plan: &AgentRunPlan,
-    session_key: &str,
-    session_identity: &str,
+    session_key: &CursorSessionKey,
+    parked: Option<&CursorSessionReference>,
     timeouts: CursorH2Timeouts,
 ) -> Result<(Arc<tokio::sync::Mutex<CursorSession>>, Option<String>), ProxyError> {
     if !plan.tool_results.is_empty() {
+        let parked = parked.ok_or_else(|| {
+            ProxyError::cursor_session_lost(format!(
+                "Cursor session `{}` no longer matches its indexed tool context",
+                session_key.conversation_id()
+            ))
+        })?;
         let entry = state
             .cursor_sessions
-            .acquire(session_key, session_identity)
+            .acquire_resolved(parked)
             .await
             .ok_or_else(|| {
                 ProxyError::cursor_session_lost(format!(
-                    "Cursor session `{session_key}` is unavailable, expired, or bound to a different credential"
+                    "Cursor session `{}` is unavailable, expired, or bound to a different credential",
+                    session_key.conversation_id()
                 ))
             })?;
-        resume_tool_results(&entry, &plan.tool_results).await?;
+        if let Err(error) = resume_tool_results(&entry, &plan.tool_results).await {
+            state
+                .cursor_sessions
+                .release(entry.clone(), SessionState::Closed)
+                .await;
+            return Err(error);
+        }
         return Ok((entry, None));
     }
 
-    let credential = resolve_cursor_credential(state, stored, timeouts.request).await?;
+    let credential =
+        resolve_cursor_credential(state, stored, runtime_fingerprint, timeouts.request).await?;
     let access_token = credential.access_token.clone();
-    let entry = open_agent_stream(
-        state,
-        &credential,
-        stored,
-        plan,
-        session_key,
-        session_identity,
-        timeouts,
-    )
-    .await?;
+    let entry = open_agent_stream(state, &credential, stored, plan, session_key, timeouts).await?;
     Ok((entry, Some(access_token)))
 }
 
@@ -1094,6 +1166,7 @@ async fn resume_tool_results(
         ));
     }
 
+    let mut resumed = false;
     for result in tool_results {
         let Some(pending) = session.pending_tool_calls.remove(&result.tool_call_id) else {
             continue;
@@ -1108,6 +1181,13 @@ async fn resume_tool_results(
             ProxyError::conflict("Cursor AgentService parked session has no live h2 stream")
         })?;
         stream.send_frame(frame)?;
+        resumed = true;
+    }
+    if resumed {
+        let stream = session.stream.as_mut().ok_or_else(|| {
+            ProxyError::conflict("Cursor AgentService parked session has no live h2 stream")
+        })?;
+        stream.rearm_business_output_phase();
     }
     Ok(())
 }
@@ -1324,6 +1404,18 @@ async fn next_session_frame(
     stream.next_frame().await
 }
 
+async fn mark_session_business_output(
+    session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
+) -> Result<(), ProxyError> {
+    let mut session = session_entry.lock().await;
+    let stream = session
+        .stream
+        .as_mut()
+        .ok_or_else(|| ProxyError::conflict("Cursor AgentService session has no live h2 stream"))?;
+    stream.mark_business_output();
+    Ok(())
+}
+
 async fn send_session_frame(
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
     frame: Bytes,
@@ -1345,12 +1437,9 @@ async fn surface_mcp_tool_call(
     tool_call_id: &str,
     args: Value,
 ) -> Result<ExecHandling, ProxyError> {
-    let (declared_tools, conversation_id) = {
+    let (declared_tools, session_key) = {
         let session = session_entry.lock().await;
-        (
-            session.declared_tools.clone(),
-            session.conversation_id.clone(),
-        )
+        (session.declared_tools.clone(), session.key.clone())
     };
     let resolved = match resolve_tool_call(&declared_tools, tool_name, args) {
         Ok(resolved) => resolved,
@@ -1383,7 +1472,7 @@ async fn surface_mcp_tool_call(
     }
     state
         .cursor_sessions
-        .bind_tool_call_id(&client_call_id, &conversation_id)
+        .bind_tool_call_id(&session_key, session_entry, &client_call_id)
         .await;
 
     let arguments_json = serde_json::to_string(&resolved.args).unwrap_or_else(|_| "{}".to_string());
@@ -1397,24 +1486,25 @@ async fn surface_mcp_tool_call(
 async fn resolve_session_key(
     state: &ServerState,
     plan: &AgentRunPlan,
-) -> Result<String, ProxyError> {
+    scope: &CursorSessionScope,
+) -> Result<ResolvedCursorSession, ProxyError> {
     if !plan.tool_results.is_empty() {
         for result in &plan.tool_results {
-            if let Some(conversation_id) = state
+            if let Some(reference) = state
                 .cursor_sessions
-                .resolve_tool_call_id(&result.tool_call_id)
+                .resolve_tool_call_id(scope, &result.tool_call_id)
                 .await
             {
-                return Ok(conversation_id);
+                return Ok(ResolvedCursorSession::parked(reference));
             }
         }
         if let Some(previous_response_id) = plan.previous_response_id.as_deref() {
-            if let Some(conversation_id) = state
+            if let Some(reference) = state
                 .cursor_sessions
-                .resolve_response_id(previous_response_id)
+                .resolve_response_id(scope, previous_response_id)
                 .await
             {
-                return Ok(conversation_id);
+                return Ok(ResolvedCursorSession::parked(reference));
             }
         }
         return Err(ProxyError::conflict(
@@ -1423,19 +1513,43 @@ async fn resolve_session_key(
     }
 
     if let Some(previous_response_id) = plan.previous_response_id.as_deref() {
-        if let Some(conversation_id) = state
+        if let Some(reference) = state
             .cursor_sessions
-            .resolve_response_id(previous_response_id)
+            .resolve_response_id(scope, previous_response_id)
             .await
         {
-            return Ok(conversation_id);
+            return Ok(ResolvedCursorSession::new(reference.key().clone()));
         }
         if !previous_response_id.trim().is_empty() {
-            return Ok(previous_response_id.to_string());
+            return Ok(ResolvedCursorSession::new(CursorSessionKey::new(
+                scope.clone(),
+                previous_response_id.to_string(),
+            )));
         }
     }
 
-    Ok(random_uuid_like())
+    Ok(ResolvedCursorSession::new(CursorSessionKey::new(
+        scope.clone(),
+        random_uuid_like(),
+    )))
+}
+
+struct ResolvedCursorSession {
+    key: CursorSessionKey,
+    parked: Option<CursorSessionReference>,
+}
+
+impl ResolvedCursorSession {
+    fn new(key: CursorSessionKey) -> Self {
+        Self { key, parked: None }
+    }
+
+    fn parked(reference: CursorSessionReference) -> Self {
+        Self {
+            key: reference.key().clone(),
+            parked: Some(reference),
+        }
+    }
 }
 
 async fn open_agent_stream(
@@ -1443,8 +1557,7 @@ async fn open_agent_stream(
     credential: &CursorCredential,
     stored: &StoredProvider,
     plan: &super::request_builder::AgentRunPlan,
-    session_key: &str,
-    session_identity: &str,
+    session_key: &CursorSessionKey,
     timeouts: CursorH2Timeouts,
 ) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
     let images = load_images(plan.images.clone()).await?;
@@ -1452,7 +1565,7 @@ async fn open_agent_stream(
     let mut input = AgentRunInput {
         model_id: &plan.model_id,
         user_text: &plan.user_text,
-        conversation_id: Some(session_key),
+        conversation_id: Some(session_key.conversation_id()),
         message_id: None,
         tools: plan.tools.clone(),
         system_prompt: plan.system_prompt.as_deref(),
@@ -1472,8 +1585,7 @@ async fn open_agent_stream(
     Ok(state
         .cursor_sessions
         .open(
-            session_key.to_string(),
-            session_identity.to_string(),
+            session_key.clone(),
             stream,
             blob_store,
             plan.tools.clone(),
@@ -1482,10 +1594,12 @@ async fn open_agent_stream(
         .await)
 }
 
-async fn cursor_session_identity(
+async fn cursor_session_scope(
     state: &ServerState,
     stored: &StoredProvider,
-) -> Result<String, ProxyError> {
+    runtime_fingerprint: &str,
+    request_context: &UsageLogContext,
+) -> Result<CursorSessionScope, ProxyError> {
     let principal = match stored.provider_type {
         ProviderType::CursorOAuth => {
             let accounts = managed_credential_accounts_snapshot(state).await?;
@@ -1511,12 +1625,15 @@ async fn cursor_session_identity(
             ));
         }
     };
-    Ok(format!(
-        "{}:{}:{}:{principal}",
-        stored.app.as_str(),
-        stored.provider.id,
-        stored.resource.revision
-    ))
+    Ok(CursorSessionScope::derive(CursorSessionScopeInput {
+        app: stored.app.as_str(),
+        provider_id: &stored.provider.id,
+        provider_revision: stored.resource.revision,
+        runtime_fingerprint,
+        principal: &principal,
+        share_id: request_context.share_id.as_deref(),
+        user_email: request_context.user_email.as_deref(),
+    }))
 }
 
 fn random_uuid_like() -> String {
@@ -1659,6 +1776,44 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn cursor_business_output_classifier_excludes_all_control_frames() {
+        assert!(!cursor_delta_is_business_output(
+            &InteractionDelta::Heartbeat
+        ));
+        assert!(!cursor_delta_is_business_output(
+            &InteractionDelta::ToolCallStarted
+        ));
+        assert!(!cursor_delta_is_business_output(
+            &InteractionDelta::ToolCallCompleted
+        ));
+        assert!(!cursor_delta_is_business_output(
+            &InteractionDelta::KvServerMessage
+        ));
+        assert!(!cursor_delta_is_business_output(
+            &InteractionDelta::Unknown(99)
+        ));
+        assert!(!cursor_delta_is_business_output(&InteractionDelta::Text(
+            String::new()
+        )));
+
+        assert!(cursor_delta_is_business_output(&InteractionDelta::Text(
+            "answer".to_string()
+        )));
+        assert!(cursor_delta_is_business_output(
+            &InteractionDelta::Thinking("reason".to_string())
+        ));
+        assert!(cursor_delta_is_business_output(
+            &InteractionDelta::ThinkingComplete
+        ));
+        assert!(cursor_delta_is_business_output(
+            &InteractionDelta::TokenDelta(0)
+        ));
+        assert!(cursor_delta_is_business_output(
+            &InteractionDelta::TurnEnded
+        ));
+    }
+
     #[tokio::test]
     async fn cursor_stream_holds_account_lease_until_response_body_is_dropped() {
         let state = cursor_stream_test_state("stream-account-lease");
@@ -1682,8 +1837,10 @@ mod tests {
             resource: Default::default(),
         };
         let session_entry = Arc::new(tokio::sync::Mutex::new(CursorSession {
-            conversation_id: "cursor-stream-session".to_string(),
-            identity_key: "cursor-test-identity".to_string(),
+            key: CursorSessionKey::new(
+                CursorSessionScope::fixture("cursor-stream-share"),
+                "cursor-stream-session",
+            ),
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
@@ -1697,7 +1854,10 @@ mod tests {
             state.clone(),
             stored,
             session_entry,
-            "cursor-stream-session".to_string(),
+            CursorSessionKey::new(
+                CursorSessionScope::fixture("cursor-stream-share"),
+                "cursor-stream-session",
+            ),
             super::super::protocol::CursorResponseFormat::AnthropicMessages,
             "claude-sonnet-4-6".to_string(),
             1,
@@ -1802,6 +1962,7 @@ mod tests {
             cursor_agentservice_auth_action(
                 &state,
                 &stored,
+                "cursor-auth-runtime",
                 Some("cursor-old-access-token"),
                 &mut auth_recovery,
                 StatusCode::UNAUTHORIZED,
@@ -1818,6 +1979,7 @@ mod tests {
             cursor_agentservice_auth_action(
                 &state,
                 &stored,
+                "cursor-auth-runtime",
                 Some("cursor-old-access-token"),
                 &mut auth_recovery,
                 StatusCode::UNAUTHORIZED,
@@ -1891,10 +2053,14 @@ mod tests {
         };
 
         let before_cooldown = crate::infra::time::now_ms() as i64;
-        let error =
-            recover_cursor_unauthorized(&state, &stored, Some("cursor-rejected-access-token"))
-                .await
-                .unwrap_err();
+        let error = recover_cursor_unauthorized(
+            &state,
+            &stored,
+            "cursor-auth-runtime",
+            Some("cursor-rejected-access-token"),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         let account = state.find_account_by_id(account_id).await.unwrap();
         assert!(account
@@ -1933,6 +2099,7 @@ mod tests {
             cursor_agentservice_auth_action(
                 &state,
                 &stored,
+                "cursor-api-key-runtime",
                 None,
                 &mut auth_recovery,
                 StatusCode::UNAUTHORIZED,
@@ -1945,6 +2112,7 @@ mod tests {
             cursor_agentservice_auth_action(
                 &state,
                 &stored,
+                "cursor-api-key-runtime",
                 None,
                 &mut auth_recovery,
                 StatusCode::UNAUTHORIZED,
@@ -1953,16 +2121,17 @@ mod tests {
             .await,
             CursorAgentServiceAuthAction::UseResponse
         );
-        let key_hash = cursor_api_key_hash(api_key);
+        let scope = cursor_api_key_credential_scope(&stored, "cursor-api-key-runtime", api_key);
         let now = crate::infra::time::now_ms() as i64;
         assert!(state
             .cursor_api_key_tokens
-            .auth_cooldown_until(&key_hash, now)
+            .auth_cooldown_until(&scope, now)
             .await
             .is_some_and(|until| until > now));
         let error = cached_cursor_api_key_token(
             &state,
             &stored,
+            "cursor-api-key-runtime",
             api_key,
             std::time::Duration::from_secs(1),
         )
@@ -2210,6 +2379,7 @@ mod tests {
 async fn resolve_cursor_credential(
     state: &ServerState,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     request_timeout: std::time::Duration,
 ) -> Result<CursorCredential, ProxyError> {
     match stored.provider_type {
@@ -2234,8 +2404,14 @@ async fn resolve_cursor_credential(
         }
         ProviderType::CursorApiKey => {
             let api_key = cursor_api_key(stored)?;
-            let access_token =
-                cached_cursor_api_key_token(state, stored, &api_key, request_timeout).await?;
+            let access_token = cached_cursor_api_key_token(
+                state,
+                stored,
+                runtime_fingerprint,
+                &api_key,
+                request_timeout,
+            )
+            .await?;
             Ok(CursorCredential {
                 account: cursor_account_for_api_key(&api_key),
                 access_token,
@@ -2250,6 +2426,7 @@ async fn resolve_cursor_credential(
 async fn recover_cursor_unauthorized(
     state: &ServerState,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     rejected_access_token: Option<&str>,
 ) -> Result<(), ProxyError> {
     let result = async {
@@ -2272,10 +2449,8 @@ async fn recover_cursor_unauthorized(
             }
             ProviderType::CursorApiKey => {
                 let api_key = cursor_api_key(stored)?;
-                state
-                    .cursor_api_key_tokens
-                    .invalidate(&cursor_api_key_hash(&api_key))
-                    .await;
+                let scope = cursor_api_key_credential_scope(stored, runtime_fingerprint, &api_key);
+                state.cursor_api_key_tokens.invalidate(&scope).await;
                 Ok(())
             }
             _ => Err(ProxyError::bad_request(
@@ -2288,6 +2463,7 @@ async fn recover_cursor_unauthorized(
         mark_cursor_agentservice_auth_cooldown(
             state,
             stored,
+            runtime_fingerprint,
             rejected_access_token,
             "cursor_agentservice_refresh_failed",
         )
@@ -2299,6 +2475,7 @@ async fn recover_cursor_unauthorized(
 async fn mark_cursor_agentservice_auth_cooldown(
     state: &ServerState,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     rejected_access_token: Option<&str>,
     source: &'static str,
 ) {
@@ -2311,13 +2488,11 @@ async fn mark_cursor_agentservice_auth_cooldown(
     let Some(api_key) = api_key else {
         return;
     };
+    let scope = cursor_api_key_credential_scope(stored, runtime_fingerprint, &api_key);
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     state
         .cursor_api_key_tokens
-        .mark_auth_cooldown(
-            &cursor_api_key_hash(&api_key),
-            now.saturating_add(CURSOR_AUTH_FAILURE_COOLDOWN_MS),
-        )
+        .mark_auth_cooldown(&scope, now.saturating_add(CURSOR_AUTH_FAILURE_COOLDOWN_MS))
         .await;
 }
 
@@ -2410,38 +2585,39 @@ async fn exchange_cursor_api_key(
 async fn cached_cursor_api_key_token(
     state: &ServerState,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     api_key: &str,
     request_timeout: std::time::Duration,
 ) -> Result<String, ProxyError> {
-    let key_hash = cursor_api_key_hash(api_key);
+    let scope = cursor_api_key_credential_scope(stored, runtime_fingerprint, api_key);
     let now = crate::infra::time::now_ms() as i64;
-    ensure_cursor_api_key_auth_cooldown_elapsed(state, &key_hash, now).await?;
-    if let Some(token) = state.cursor_api_key_tokens.get(&key_hash, now).await {
+    ensure_cursor_api_key_auth_cooldown_elapsed(state, &scope, now).await?;
+    if let Some(token) = state.cursor_api_key_tokens.get(&scope, now).await {
         return Ok(token);
     }
-    let _flight = state.cursor_api_key_tokens.lock(&key_hash).await;
+    let _flight = state.cursor_api_key_tokens.lock(&scope).await;
     let now = crate::infra::time::now_ms() as i64;
-    ensure_cursor_api_key_auth_cooldown_elapsed(state, &key_hash, now).await?;
-    if let Some(token) = state.cursor_api_key_tokens.get(&key_hash, now).await {
+    ensure_cursor_api_key_auth_cooldown_elapsed(state, &scope, now).await?;
+    if let Some(token) = state.cursor_api_key_tokens.get(&scope, now).await {
         return Ok(token);
     }
     let (token, expires_at_ms) =
         exchange_cursor_api_key(state, stored, api_key, request_timeout).await?;
     state
         .cursor_api_key_tokens
-        .insert(key_hash, token.clone(), expires_at_ms)
+        .insert(scope, token.clone(), expires_at_ms)
         .await;
     Ok(token)
 }
 
 async fn ensure_cursor_api_key_auth_cooldown_elapsed(
     state: &ServerState,
-    key_hash: &str,
+    scope: &CursorApiKeyCredentialScope,
     now_ms: i64,
 ) -> Result<(), ProxyError> {
     let Some(until_ms) = state
         .cursor_api_key_tokens
-        .auth_cooldown_until(key_hash, now_ms)
+        .auth_cooldown_until(scope, now_ms)
         .await
     else {
         return Ok(());
@@ -2454,6 +2630,21 @@ async fn ensure_cursor_api_key_auth_cooldown_elapsed(
         "Cursor API key is cooling down after repeated upstream authentication failures",
         retry_after_seconds.max(1),
     ))
+}
+
+fn cursor_api_key_credential_scope(
+    stored: &StoredProvider,
+    runtime_fingerprint: &str,
+    api_key: &str,
+) -> CursorApiKeyCredentialScope {
+    CursorApiKeyCredentialScope::derive(
+        stored.app.as_str(),
+        &stored.provider.id,
+        stored.resource.revision,
+        stored.resource.credential_generation,
+        runtime_fingerprint,
+        &cursor_api_key_hash(api_key),
+    )
 }
 
 async fn read_reqwest_body_limited(

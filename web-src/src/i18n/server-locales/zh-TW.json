@@ -118,6 +118,26 @@
     "title": "供應商"
   },
   "provider": {
+    "codingPlanQuota": {
+      "supported": "即時額度",
+      "stale": "快取額度",
+      "unknown": "額度未知",
+      "unavailable": "額度無法使用",
+      "loading": "正在載入額度",
+      "queryFailed": "無法讀取額度",
+      "refresh": "強制重新整理 Coding Plan 額度",
+      "fiveHour": "5 小時",
+      "weekly": "每週",
+      "monthly": "每月",
+      "resetsIn": "{{time}} 後重設",
+      "quotaAvailable": "額度可用",
+      "source": {
+        "live": "即時回應",
+        "fresh_cache": "新鮮快取",
+        "stale_cache": "過期快取",
+        "contract": "供應商合約"
+      }
+    },
     "clickToClearCurrent": "點擊即可停用",
     "share": {
       "sectionTitle": "遠端分享",
@@ -181,6 +201,13 @@
       "hint": "Share 總限制永遠生效；每位使用者也會受到各自限制。",
       "add": "新增使用者",
       "edit": "編輯使用者限制",
+      "selectAll": "選取所有可編輯的使用者",
+      "selectUser": "選取 {{email}}",
+      "batchEdit": "批次編輯（{{count}}）",
+      "batchTitle": "批次編輯使用者限制",
+      "batchHint": "已選取 {{count}} 位使用者。只會覆寫勾選的參數，其他參數保持不變；空白限制表示無限制，空白到期時間表示永久。",
+      "batchApply": "套用至 {{count}} 位使用者",
+      "invalidPolicy": "限制必須是正整數，且時間必須有效。",
       "period": "Token 週期"
     },
     "boundProviderHint": "此應用程式的請求固定使用綁定的 Provider，不參與故障轉移。",

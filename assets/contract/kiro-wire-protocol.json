@@ -105,7 +105,12 @@
       "endEvent"
     ],
     "unknownEventPolicy": "require_valid_json_then_ignore",
-    "errorFramePolicy": "terminal_error_never_text"
+    "errorFramePolicy": "terminal_error_never_text",
+    "successTerminalEvidence": "endEvent_required",
+    "framesAfterTerminal": "error",
+    "firstFrameDeadline": "absolute_from_request_send_through_first_complete_valid_frame",
+    "partialBytesExtendFirstFrameDeadline": false,
+    "idleDeadline": "reset_only_by_complete_valid_frame"
   },
   "tools": {
     "jsonRelease": "stop_true_after_complete_json",
@@ -129,12 +134,39 @@
     "duplicatePolicy": "keep_newest"
   },
   "modelDiscovery": {
-    "cacheScope": ["account_id", "auth_identity_generation"],
+    "cacheScope": [
+      "account_id",
+      "auth_identity_generation",
+      "token_refresh_generation",
+      "authoritative_profile_arn_or_profileless_api_key",
+      "runtime_region"
+    ],
     "freshTtlMs": 300000,
     "staleTtlMs": 86400000,
     "liveCatalogPolicy": "replace_static",
     "crossAccountUnion": false,
-    "fallbackSource": "kiro_static_fallback"
+    "fallbackSource": "kiro_static_fallback",
+    "fallbackEligibility": "validated_identity_and_credential_after_upstream_failure_only",
+    "unresolvedIdentityPolicy": {
+      "catalog": "empty",
+      "source": "kiro_identity_unresolved",
+      "stale": false,
+      "fallbackAllowed": false
+    },
+    "unavailableCredentialPolicy": {
+      "catalog": "empty",
+      "source": "kiro_credential_unavailable",
+      "stale": false,
+      "fallbackAllowed": false
+    },
+    "upstreamDenialPolicy": {
+      "statusClass": "non_retryable_4xx_except_408_429",
+      "catalog": "empty",
+      "source": "kiro_model_access_unavailable",
+      "stale": false,
+      "fallbackAllowed": false
+    },
+    "successfulEmptyCatalogPolicy": "authoritative_empty"
   },
   "promptCache": {
     "namespaceComponents": ["provider_id", "account_id", "auth_identity_generation", "route", "session"],
@@ -146,6 +178,7 @@
     "invalidEventStream": "KIRO_EVENT_STREAM_INVALID",
     "eventStreamLimit": "KIRO_EVENT_STREAM_LIMIT",
     "upstreamErrorFrame": "KIRO_UPSTREAM_STREAM_ERROR",
+    "eventStreamTimeout": "KIRO_EVENT_STREAM_TIMEOUT",
     "invalidToolJson": "TOOL_JSON_INVALID",
     "incompleteToolJson": "TOOL_JSON_INCOMPLETE",
     "toolJsonLimit": "TOOL_JSON_LIMIT"

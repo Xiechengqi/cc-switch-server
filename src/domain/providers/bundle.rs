@@ -297,7 +297,14 @@ impl ProviderBundleWriteDraft {
         if let Some(region) = normalized_optional_string(self.aws_region.as_deref()) {
             env.insert("AWS_REGION".to_string(), Value::String(region));
         }
-        if !env.is_empty() {
+        let needs_env_credential_parent = matches!(
+            &profile.credential_policy,
+            CredentialPolicy::StaticSecret { slots, .. }
+                if slots
+                    .iter()
+                    .any(|slot| slot.starts_with("/settingsConfig/env/"))
+        );
+        if !env.is_empty() || needs_env_credential_parent {
             settings.insert("env".to_string(), Value::Object(env));
         }
         if surface.app == self.test_app {

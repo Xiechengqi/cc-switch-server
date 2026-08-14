@@ -118,6 +118,7 @@ pub fn all_provider_types() -> &'static [ProviderType] {
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
         ProviderType::KimiCode,
+        ProviderType::QoderCosy,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -143,6 +144,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::DeepSeekAccount,
             ProviderType::KiroOAuth,
             ProviderType::KimiCode,
+            ProviderType::QoderCosy,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,
             ProviderType::AntigravityOAuth,
@@ -156,6 +158,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
         AppKind::Codex => &[
             ProviderType::Codex,
             ProviderType::CodexOAuth,
+            ProviderType::GitHubCopilot,
             ProviderType::OpenRouter,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,
@@ -164,6 +167,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::DeepSeekApi,
             ProviderType::GrokOAuth,
             ProviderType::KimiCode,
+            ProviderType::QoderCosy,
             ProviderType::KiroOAuth,
             ProviderType::Claude,
             ProviderType::ClaudeAuth,
@@ -175,6 +179,8 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::Gemini,
             ProviderType::GeminiCli,
             ProviderType::OpenRouter,
+            ProviderType::CursorOAuth,
+            ProviderType::CursorApiKey,
             ProviderType::AntigravityOAuth,
             ProviderType::AgyOAuth,
             ProviderType::Claude,
@@ -186,6 +192,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::Nvidia,
             ProviderType::DeepSeekApi,
             ProviderType::KimiCode,
+            ProviderType::QoderCosy,
         ],
     }
 }
@@ -252,6 +259,7 @@ fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
         | ProviderType::KimiCode
+        | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth
@@ -273,6 +281,7 @@ fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
         }
         ProviderType::KiroOAuth => Some("https://kiro.dev"),
         ProviderType::KimiCode => Some("https://kimi.com"),
+        ProviderType::QoderCosy => Some("https://qoder.com"),
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => Some("https://cursor.com"),
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
             Some("https://antigravity.google")
@@ -298,6 +307,7 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::DeepSeekAccount => "DeepSeek Account",
         ProviderType::KiroOAuth => "Kiro OAuth",
         ProviderType::KimiCode => "Kimi Code",
+        ProviderType::QoderCosy => "Qoder COSY",
         ProviderType::CursorOAuth => "Cursor OAuth",
         ProviderType::CursorApiKey => "Cursor API Key",
         ProviderType::AntigravityOAuth => "Antigravity OAuth",
@@ -396,6 +406,13 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
             key: "OPENAI_API_KEY",
             aws_region: None,
         },
+        ProviderType::QoderCosy => ProviderDefaults {
+            base_url: "https://api1.qoder.sh",
+            api_format: "openai_chat",
+            model: "auto",
+            key: "ANTHROPIC_AUTH_TOKEN",
+            aws_region: None,
+        },
         ProviderType::CursorOAuth => ProviderDefaults {
             base_url: "https://api2.cursor.sh",
             api_format: "openai_chat",
@@ -482,6 +499,7 @@ fn provider_template_env(provider_type: ProviderType) -> &'static [&'static str]
             &["ANTHROPIC_AUTH_TOKEN"]
         }
         ProviderType::KimiCode => &["OPENAI_BASE_URL"],
+        ProviderType::QoderCosy => &[],
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             &["OPENAI_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]
         }
@@ -520,6 +538,7 @@ fn credential_mode(provider_type: ProviderType) -> &'static str {
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
         | ProviderType::KimiCode
+        | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth
@@ -537,6 +556,7 @@ fn account_supported(provider_type: ProviderType) -> bool {
             | ProviderType::DeepSeekAccount
             | ProviderType::KiroOAuth
             | ProviderType::KimiCode
+            | ProviderType::QoderCosy
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
             | ProviderType::AntigravityOAuth
@@ -563,6 +583,7 @@ fn managed_account_recommended(provider_type: ProviderType) -> bool {
             | ProviderType::DeepSeekAccount
             | ProviderType::KiroOAuth
             | ProviderType::KimiCode
+            | ProviderType::QoderCosy
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -579,7 +600,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
             "SigV4 converse request generation is wired; real AWS Bedrock forwarding remains unvalidated"
         }
         (_, ProviderType::GitHubCopilot) => {
-            "managed-account token exchange and endpoint discovery are wired; capability remains fallback until real Copilot non-stream/stream validation"
+            "Claude and Codex forwarding plus model discovery are fixture-verified with one managed account; real github.com and GHES acceptance remains external"
         }
         (AppKind::Claude | AppKind::Codex, ProviderType::KiroOAuth) => {
             "single-account CodeWhisperer forwarder supports Anthropic Messages, OpenAI Chat, and OpenAI Responses; real Kiro account validation remains external"
@@ -589,6 +610,9 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
         }
         (_, ProviderType::KimiCode) => {
             "Kimi Code device OAuth, same-account refresh, official CLI identity, and OpenAI Chat protocol bridging are server-native; real-account acceptance remains external"
+        }
+        (_, ProviderType::QoderCosy) => {
+            "Qoder COSY uses one explicitly bound managed account and a site-frozen signed driver; real-account acceptance remains external"
         }
         (AppKind::Gemini, ProviderType::KiroOAuth) => {
             "diagnostic capability only; Kiro forwarding does not expose a Gemini surface"

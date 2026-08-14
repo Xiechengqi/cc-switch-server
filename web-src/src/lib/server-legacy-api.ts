@@ -100,6 +100,8 @@ export interface ProviderHealth {
 export interface AccountRecord {
   id: string;
   providerType: string;
+  authIdentityGeneration?: number;
+  tokenRefreshGeneration?: number;
   email?: string | null;
   tokenType?: string | null;
   scopes?: string[];
@@ -120,6 +122,37 @@ export interface AccountRecord {
   hasRefreshError: boolean;
   refreshConsecutiveFailures?: number;
   needsRelogin?: boolean;
+  capabilityEvidence?: AccountCapabilityProjection[];
+}
+
+export type AccountCapabilityState =
+  | "supported"
+  | "unsupported"
+  | "unknown"
+  | "stale";
+
+export type AccountCapabilityFreshness =
+  | "fresh"
+  | "unknown"
+  | "stale"
+  | "superseded";
+
+export interface AccountCapabilityEvidenceProjection {
+  state: AccountCapabilityState;
+  freshness: AccountCapabilityFreshness;
+  source: string;
+  reason?: string | null;
+  observedAtMs?: number | null;
+  expiresAtMs?: number | null;
+  evidenceAuthIdentityGeneration?: number | null;
+}
+
+export interface AccountCapabilityProjection {
+  capability: string;
+  rail: string;
+  state: AccountCapabilityState;
+  authIdentityGeneration: number;
+  dimensions: Record<string, AccountCapabilityEvidenceProjection>;
 }
 
 export interface AccountQuota {
@@ -951,6 +984,47 @@ export interface ProviderTestResult {
   networkLatencyMs?: number | null;
   networkStreamCompleted?: boolean | null;
   networkError?: string | null;
+  reconciliation?: {
+    readOnly: boolean;
+    bindingStatusBefore:
+      | "current"
+      | "missing_binding"
+      | "missing_account"
+      | "provider_type_mismatch"
+      | "stale_identity";
+    bindingStatusAfter:
+      | "current"
+      | "missing_binding"
+      | "missing_account"
+      | "provider_type_mismatch"
+      | "stale_identity";
+    plannedCredentialAction: "none" | "refresh" | "relogin";
+    plannedCredentialReason: string;
+    remainingCredentialAction: "none" | "refresh" | "relogin";
+    remainingCredentialReason: string;
+    expectedAuthIdentityGeneration?: number | null;
+    observedAuthIdentityGenerationBefore?: number | null;
+    observedAuthIdentityGenerationAfter?: number | null;
+    tokenRefreshGenerationBefore?: number | null;
+    tokenRefreshGenerationAfter?: number | null;
+    refreshPerformed: boolean;
+    identityStable: boolean;
+    endpointPolicyStatus:
+      | "expected"
+      | "configured_override_ignored"
+      | "unexpected_runtime_endpoint";
+    responsesEndpointStatus:
+      | "not_checked"
+      | "supported"
+      | "unsupported"
+      | "inconclusive";
+    modelStatus:
+      | "not_checked"
+      | "supported"
+      | "unsupported"
+      | "inconclusive";
+    capabilityEvidence?: AccountCapabilityProjection | null;
+  };
   message: string;
 }
 

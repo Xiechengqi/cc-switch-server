@@ -29,6 +29,8 @@ const KNOWN_JSON_SECRET_POINTERS: &[&str] = &[
     "/settingsConfig/env/GOOGLE_API_KEY",
     "/settingsConfig/env/GROK_API_KEY",
     "/settingsConfig/env/OPENAI_API_KEY",
+    "/settingsConfig/env/VOLC_ACCESS_KEY_ID",
+    "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY",
     "/settingsConfig/env/XAI_API_KEY",
 ];
 

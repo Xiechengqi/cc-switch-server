@@ -21,7 +21,7 @@
 - 授权请求使用固定 loopback callback `http://127.0.0.1:56121/callback`、96 字节 PKCE verifier、nonce，以及 `openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write` scopes。
 - Device start/poll 使用与数据面相同的 Grok CLI version，并发送 `x-grok-client-surface: ui`；poll 与普通 code exchange/refresh 复用受策略约束的 token URL。
 - Device start 的 2xx 响应只有在 `device_code`、`user_code` 和 `verification_uri` 去除首尾空白后均非空时才被接受；空的 `verification_uri_complete` 会被省略。缺失或为零的 poll interval/expires-in 分别按 5 秒/30 分钟归一化，并限制在 5 分钟/30 分钟上限内。
-- 新登录、device flow 和 auth.json 导入都必须提供已签名 ID token。Server 通过 xAI OIDC discovery/JWKS 校验 RS256、`kid`、issuer、audience、expiry/nbf 和登录 nonce。
+- 新登录、device flow 和 auth.json 导入都必须提供已签名 ID token。Server 通过 xAI OIDC discovery/JWKS 严格校验 ES256、EC P-256 JWK、`kid`、issuer、audience、expiry/nbf 和登录 nonce。
 - 本地账号 ID 从已验证的 `sub` 稳定派生。email、display name、token 文本和未验证 profile 字段都不是 principal。
 - Refresh 可不返回新 ID token，但仅限账号已保存 verified subject；若返回新 ID token则必须重新验签，且 subject 必须与原账号一致。
 - Device flow 完成结果中的 token 只保留到账号成功 durable 写入；写入成功后立即删除 flow 与 principal binding，写入失败则保留完成结果供同一 principal 重试。

@@ -118,6 +118,26 @@
     "title": "Providers"
   },
   "provider": {
+    "codingPlanQuota": {
+      "supported": "Live quota",
+      "stale": "Cached quota",
+      "unknown": "Quota unknown",
+      "unavailable": "Quota unavailable",
+      "loading": "Loading quota",
+      "queryFailed": "Quota could not be loaded",
+      "refresh": "Refresh coding plan quota",
+      "fiveHour": "5h",
+      "weekly": "Weekly",
+      "monthly": "Monthly",
+      "resetsIn": "resets in {{time}}",
+      "quotaAvailable": "Quota available",
+      "source": {
+        "live": "Live response",
+        "fresh_cache": "Fresh cache",
+        "stale_cache": "Stale cache",
+        "contract": "Provider contract"
+      }
+    },
     "share": {
       "sectionTitle": "Remote Share",
       "addPageBadge": "Available after saving",
@@ -180,6 +200,13 @@
       "hint": "The overall Share limits always apply; each user is also constrained by their own limits.",
       "add": "Add user",
       "edit": "Edit user limits",
+      "selectAll": "Select all editable users",
+      "selectUser": "Select {{email}}",
+      "batchEdit": "Batch edit ({{count}})",
+      "batchTitle": "Batch edit user limits",
+      "batchHint": "{{count}} users selected. Only checked parameters are overwritten; all other parameters stay unchanged. Blank limits mean unlimited, and a blank expiration means permanent.",
+      "batchApply": "Apply to {{count}} users",
+      "invalidPolicy": "Limits must be positive integers and times must be valid.",
       "period": "Token period"
     },
     "boundProviderHint": "Requests for this app always use the bound Provider and do not participate in failover.",

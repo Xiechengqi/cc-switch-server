@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::domain::providers::model::{AppKind, ProviderType};
+use crate::domain::providers::registry::profile_by_id;
 use crate::domain::providers::store::StoredProvider;
 use crate::proxy::ProxyError;
 use crate::state::ServerState;
@@ -21,15 +22,15 @@ pub(in crate::api) async fn gemini_models_response(
     }
     let (provider_id, _share_guard) =
         super::validate_router_share_surface(state, headers, AppKind::Gemini).await?;
-    let providers = state.providers.read().await;
-    let models = openai_model_list(
-        &providers.providers,
-        Some(AppKind::Gemini),
-        Some(&provider_id),
-    )
-    .into_iter()
-    .map(gemini_model_from_openai)
-    .collect::<Vec<_>>();
+    let openai_models =
+        super::proxy_models_for_selection(state, Some(AppKind::Gemini), Some(&provider_id))
+            .await
+            .0
+            .data;
+    let models = openai_models
+        .into_iter()
+        .map(gemini_model_from_openai)
+        .collect::<Vec<_>>();
     if path == "models" {
         return Ok(Some(Json(GeminiModelsResponse { models }).into_response()));
     }
@@ -77,7 +78,24 @@ pub(in crate::api) fn openai_model_list(
             && provider_id.is_none_or(|id| provider.provider.id == id)
     }) {
         let owned_by = model_owner(provider);
-        let mut provider_models = if provider.app == AppKind::Claude
+        let coding_plan = provider
+            .resource
+            .profile_id
+            .as_ref()
+            .and_then(|profile_id| profile_by_id(profile_id.as_str()))
+            .and_then(|profile| profile.coding_plan.as_ref());
+        let mut provider_models = if let Some(contract) = coding_plan {
+            contract
+                .models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect()
+        } else if provider.provider_type == ProviderType::CursorApiKey {
+            // Cursor API-key entitlement is authoritative only after exact-scope
+            // public model discovery; configured/static aliases must not
+            // survive authentication or capability failures.
+            Vec::new()
+        } else if provider.app == AppKind::Claude
             && provider.provider_type == ProviderType::ClaudeOAuth
         {
             crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS
@@ -95,16 +113,10 @@ pub(in crate::api) fn openai_model_list(
             );
             provider_models.extend(crate::proxy::codex_models::manifest_model_ids(provider));
         }
-        if provider.provider_type == ProviderType::KimiCode {
-            provider_models.extend(crate::proxy::kimi::supported_models());
-        }
         if provider.provider_type == ProviderType::KiroOAuth {
             provider_models.extend(crate::proxy::kiro::supported_models());
         }
-        if matches!(
-            provider.provider_type,
-            ProviderType::CursorOAuth | ProviderType::CursorApiKey
-        ) {
+        if provider.provider_type == ProviderType::CursorOAuth {
             provider_models.extend(crate::proxy::cursor::model::cursor_supported_models());
         }
         for model_id in dedupe_non_empty(provider_models) {
@@ -113,6 +125,22 @@ pub(in crate::api) fn openai_model_list(
                     crate::proxy::codex_models::resolved_capability_for_model(provider, &model_id)
                 })
                 .flatten();
+            let coding_plan_modalities = coding_plan
+                .and_then(|contract| contract.models.iter().find(|model| model.id == model_id))
+                .map(|model| {
+                    model
+                        .input_modalities
+                        .iter()
+                        .map(|modality| match modality {
+                            crate::domain::providers::coding_plan::CodingPlanModality::Text => {
+                                "text".to_string()
+                            }
+                            crate::domain::providers::coding_plan::CodingPlanModality::Image => {
+                                "image".to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                });
             let key = format!("{model_id}\u{0}{owned_by}");
             models.entry(key).or_insert(OpenAiModel {
                 id: model_id,
@@ -121,9 +149,11 @@ pub(in crate::api) fn openai_model_list(
                 reasoning_efforts: capability
                     .as_ref()
                     .and_then(|capability| capability.reasoning_efforts.clone()),
-                input_modalities: capability
-                    .as_ref()
-                    .and_then(|capability| capability.input_modalities.clone()),
+                input_modalities: coding_plan_modalities.or_else(|| {
+                    capability
+                        .as_ref()
+                        .and_then(|capability| capability.input_modalities.clone())
+                }),
             });
         }
     }

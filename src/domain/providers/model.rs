@@ -47,6 +47,8 @@ pub enum ProviderType {
     KiroOAuth,
     #[serde(rename = "kimi_code")]
     KimiCode,
+    #[serde(rename = "qoder_cosy")]
+    QoderCosy,
     #[serde(rename = "cursor_oauth")]
     CursorOAuth,
     #[serde(rename = "cursor_apikey")]
@@ -82,6 +84,7 @@ impl ProviderType {
             Self::DeepSeekAccount => "deepseek_account",
             Self::KiroOAuth => "kiro_oauth",
             Self::KimiCode => "kimi_code",
+            Self::QoderCosy => "qoder_cosy",
             Self::CursorOAuth => "cursor_oauth",
             Self::CursorApiKey => "cursor_apikey",
             Self::AntigravityOAuth => "antigravity_oauth",
@@ -250,6 +253,7 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
         Some("ollama_cloud") => return ProviderType::OllamaCloud,
         Some("kiro_oauth") => return ProviderType::KiroOAuth,
         Some("kimi_code") => return ProviderType::KimiCode,
+        Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("cursor_oauth") => return ProviderType::CursorOAuth,
         Some("cursor_apikey") => return ProviderType::CursorApiKey,
         _ => {}
@@ -297,6 +301,7 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("deepseek_api") => ProviderType::DeepSeekApi,
         Some("grok_oauth") => ProviderType::GrokOAuth,
         Some("kimi_code") => ProviderType::KimiCode,
+        Some("qoder_cosy") => ProviderType::QoderCosy,
         Some("kiro_oauth") => ProviderType::KiroOAuth,
         _ => {
             if provider_base_url(provider).is_some_and(|url| url.contains("githubcopilot.com")) {
@@ -329,10 +334,13 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("gemini_cli") => return ProviderType::GeminiCli,
         Some("openrouter") => return ProviderType::OpenRouter,
         Some("github_copilot") => return ProviderType::GitHubCopilot,
+        Some("cursor_oauth") => return ProviderType::CursorOAuth,
+        Some("cursor_apikey") => return ProviderType::CursorApiKey,
         Some("nvidia") => return ProviderType::Nvidia,
         Some("deepseek_api") => return ProviderType::DeepSeekApi,
         Some("grok_oauth") => return ProviderType::GrokOAuth,
         Some("kimi_code") => return ProviderType::KimiCode,
+        Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("antigravity_oauth") => return ProviderType::AntigravityOAuth,
         Some("agy_oauth") => return ProviderType::AgyOAuth,
         Some("google_gemini_oauth") => return ProviderType::GeminiCli,
@@ -516,6 +524,7 @@ mod tests {
             ("deepseek_api", ProviderType::DeepSeekApi),
             ("ollama_cloud", ProviderType::OllamaCloud),
             ("kiro_oauth", ProviderType::KiroOAuth),
+            ("qoder_cosy", ProviderType::QoderCosy),
             ("cursor_oauth", ProviderType::CursorOAuth),
             ("cursor_apikey", ProviderType::CursorApiKey),
             ("antigravity_oauth", ProviderType::AntigravityOAuth),
@@ -689,6 +698,8 @@ mod tests {
             ("gemini_cli", ProviderType::GeminiCli),
             ("openrouter", ProviderType::OpenRouter),
             ("github_copilot", ProviderType::GitHubCopilot),
+            ("cursor_oauth", ProviderType::CursorOAuth),
+            ("cursor_apikey", ProviderType::CursorApiKey),
             ("nvidia", ProviderType::Nvidia),
             ("deepseek_api", ProviderType::DeepSeekApi),
         ];

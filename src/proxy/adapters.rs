@@ -435,7 +435,9 @@ pub(super) fn resolve_runtime_endpoint_for_request(
             plan.driver_id
         ))
     })?;
-    let path = if plan.driver_id.as_str() == "special.copilot"
+    let path = if plan.driver_id.as_str() == "oauth.kimi_code" {
+        kimi_upstream_path(upstream_format, route)
+    } else if plan.driver_id.as_str() == "special.copilot"
         && upstream_format == UpstreamFormat::OpenAiChat
     {
         "/chat/completions".to_string()
@@ -446,6 +448,12 @@ pub(super) fn resolve_runtime_endpoint_for_request(
 }
 
 pub(super) fn runtime_model_list_url(plan: &ProviderRuntimePlan) -> Option<String> {
+    if plan.coding_plan.is_some() {
+        return None;
+    }
+    if plan.driver_id.as_str() == "oauth.kimi_code" {
+        return Some(join_upstream_url(&plan.endpoint, "/v1/models"));
+    }
     let path = match plan.upstream_protocol {
         UpstreamProtocol::AnthropicMessages
         | UpstreamProtocol::OpenAiChat
@@ -463,8 +471,14 @@ fn runtime_upstream_format(plan: &ProviderRuntimePlan) -> Option<UpstreamFormat>
         UpstreamProtocol::OpenAiResponses => Some(UpstreamFormat::OpenAiResponses),
         UpstreamProtocol::GeminiNative => Some(UpstreamFormat::GeminiNative),
         UpstreamProtocol::Special => match plan.driver_id.as_str() {
-            "special.cursor" | "special.copilot" => Some(UpstreamFormat::OpenAiChat),
+            "special.cursor" | "special.copilot" | "special.qoder_cosy" => {
+                Some(UpstreamFormat::OpenAiChat)
+            }
             "special.antigravity" | "special.agy" => Some(UpstreamFormat::GeminiNative),
+            "oauth.kimi_code" => Some(match plan.provider_key.app {
+                AppKind::Claude => UpstreamFormat::AnthropicMessages,
+                AppKind::Codex | AppKind::Gemini => UpstreamFormat::OpenAiChat,
+            }),
             _ => None,
         },
         UpstreamProtocol::Bedrock | UpstreamProtocol::Custom | UpstreamProtocol::Legacy => None,
@@ -597,6 +611,7 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
         ProviderType::KimiCode,
+        ProviderType::QoderCosy,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -649,7 +664,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::OpenRouter) => {
             ("claude_openrouter_compatible", AdapterSupport::Native)
         }
-        (AppKind::Claude, ProviderType::GitHubCopilot) => fallback("claude_copilot_skeleton"),
+        (AppKind::Claude, ProviderType::GitHubCopilot) => {
+            ("claude_to_copilot_chat", AdapterSupport::Native)
+        }
         (AppKind::Claude, ProviderType::DeepSeekAccount) => {
             planned("claude_deepseek_account_planned")
         }
@@ -681,6 +698,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::KimiCode) => {
             ("claude_to_kimi_chat", AdapterSupport::Native)
         }
+        (AppKind::Claude, ProviderType::QoderCosy) => {
+            ("claude_to_qoder_cosy", AdapterSupport::Native)
+        }
 
         (AppKind::Codex, ProviderType::Codex) => {
             ("codex_openai_compatible", AdapterSupport::Native)
@@ -707,7 +727,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::Gemini | ProviderType::GeminiCli) => {
             ("codex_to_gemini_native", AdapterSupport::Native)
         }
-        (AppKind::Codex, ProviderType::GitHubCopilot) => fallback("codex_copilot_skeleton"),
+        (AppKind::Codex, ProviderType::GitHubCopilot) => {
+            ("codex_to_copilot_chat", AdapterSupport::Native)
+        }
         (AppKind::Codex, ProviderType::DeepSeekAccount) => fallback("codex_deepseek_skeleton"),
         (AppKind::Codex, ProviderType::KiroOAuth) => {
             ("codex_to_kiro_anthropic", AdapterSupport::Native)
@@ -723,6 +745,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
             ("codex_grok_responses", AdapterSupport::Native)
         }
         (AppKind::Codex, ProviderType::KimiCode) => ("codex_to_kimi_chat", AdapterSupport::Native),
+        (AppKind::Codex, ProviderType::QoderCosy) => {
+            ("codex_to_qoder_cosy", AdapterSupport::Native)
+        }
 
         (AppKind::Gemini, ProviderType::Gemini) => ("gemini_api_key", AdapterSupport::Native),
         (AppKind::Gemini, ProviderType::GeminiCli) => {
@@ -762,6 +787,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Gemini, ProviderType::KimiCode) => {
             ("gemini_to_kimi_chat", AdapterSupport::Native)
+        }
+        (AppKind::Gemini, ProviderType::QoderCosy) => {
+            ("gemini_to_qoder_cosy", AdapterSupport::Native)
         }
     };
 
@@ -863,6 +891,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::KiroOAuth
                 | ProviderType::DeepSeekAccount
+                | ProviderType::GitHubCopilot
                 | ProviderType::GrokOAuth
                 | ProviderType::KimiCode
         ) | (
@@ -882,6 +911,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::GitHubCopilot
                 | ProviderType::KimiCode
         ) | (
             AppKind::Gemini,
@@ -916,6 +946,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::GitHubCopilot
         ) | (
             AppKind::Codex,
             ProviderType::Codex
@@ -925,6 +956,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::GitHubCopilot
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -954,7 +986,7 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         | ProviderType::CodexOAuth
         | ProviderType::OllamaCloud
         | ProviderType::GrokOAuth => AppKind::Codex,
-        ProviderType::KimiCode => AppKind::Codex,
+        ProviderType::KimiCode | ProviderType::QoderCosy => app,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {
@@ -1422,7 +1454,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::OllamaCloud => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Nvidia => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
-            ProviderType::KimiCode => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::KimiCode | ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Gemini | ProviderType::GeminiCli => Some(UpstreamFormat::GeminiNative),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1438,7 +1470,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             }
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
-            ProviderType::KimiCode => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::KimiCode | ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
             ProviderType::KiroOAuth => Some(UpstreamFormat::AnthropicMessages),
             ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
                 Some(UpstreamFormat::AnthropicMessages)
@@ -1460,7 +1492,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             }
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
-            ProviderType::KimiCode => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::KimiCode | ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1664,6 +1696,17 @@ fn upstream_path(
             };
             format!("/v1beta/models/{model}:{method}")
         }
+    }
+}
+
+fn kimi_upstream_path(upstream_format: UpstreamFormat, route: ProxyRoute) -> String {
+    match (upstream_format, route) {
+        (UpstreamFormat::AnthropicMessages, ProxyRoute::ClaudeCountTokens) => {
+            "/v1/messages/count_tokens?beta=true".to_string()
+        }
+        (UpstreamFormat::AnthropicMessages, _) => "/v1/messages?beta=true".to_string(),
+        (UpstreamFormat::OpenAiChat, _) => "/v1/chat/completions".to_string(),
+        _ => unreachable!("Kimi driver selected an unsupported upstream format"),
     }
 }
 
@@ -1887,6 +1930,7 @@ pub(super) fn finalize_runtime_request(
     stored: &StoredProvider,
     request: &mut AdapterRequest,
 ) -> Result<(), ProxyError> {
+    normalize_coding_plan_request(plan, request)?;
     if stored.provider_type == ProviderType::KimiCode {
         super::kimi::finalize_request(plan, request)?;
     }
@@ -1898,6 +1942,51 @@ pub(super) fn finalize_runtime_request(
         request.stream_requested &= !count_tokens;
         request.upstream_stream_requested = !count_tokens;
     }
+    Ok(())
+}
+
+fn normalize_coding_plan_request(
+    plan: &ProviderRuntimePlan,
+    request: &mut AdapterRequest,
+) -> Result<(), ProxyError> {
+    if plan.coding_plan.is_none()
+        || plan.upstream_protocol != UpstreamProtocol::AnthropicMessages
+        || !matches!(
+            plan.profile_id.as_str(),
+            "claude.minimax_cn" | "claude.minimax_global"
+        )
+    {
+        return Ok(());
+    }
+
+    let model = request
+        .actual_model
+        .as_deref()
+        .or(request.model.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !model.starts_with("minimax-m") {
+        return Ok(());
+    }
+
+    let Ok(mut body) = serde_json::from_slice::<Value>(&request.body) else {
+        return Ok(());
+    };
+    if body.pointer("/thinking/type").and_then(Value::as_str) != Some("enabled") {
+        return Ok(());
+    }
+    let Some(thinking) = body.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
+    request.body = serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .map_err(|error| {
+            ProxyError::bad_request(format!(
+                "MiniMax coding-plan thinking normalization encode failed: {error}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -4025,6 +4114,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qoder_profiles_canonicalize_all_three_app_surfaces_to_openai_chat() {
+        let cases = [
+            (
+                AppKind::Claude,
+                ProxyRoute::ClaudeMessages,
+                None,
+                br#"{"model":"auto","system":"claude-system","messages":[{"role":"user","content":"claude-user"}],"stream":false}"#.as_slice(),
+                "claude-user",
+            ),
+            (
+                AppKind::Codex,
+                ProxyRoute::CodexResponses,
+                None,
+                br#"{"model":"auto","instructions":"codex-system","input":"codex-user","stream":false,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}"#.as_slice(),
+                "codex-user",
+            ),
+            (
+                AppKind::Gemini,
+                ProxyRoute::Gemini,
+                Some("models/auto:generateContent"),
+                br#"{"systemInstruction":{"parts":[{"text":"gemini-system"}]},"contents":[{"role":"user","parts":[{"text":"gemini-user"}]}]}"#.as_slice(),
+                "gemini-user",
+            ),
+        ];
+
+        for (app, route, gemini_path, body, expected_user) in cases {
+            let mut stored = stored_provider(app, ProviderType::QoderCosy, json!({}));
+            stored.resource.profile_id = Some(
+                crate::domain::providers::registry::ProfileId::parse(match app {
+                    AppKind::Claude => "claude.qoder_cosy",
+                    AppKind::Codex => "codex.qoder_cosy",
+                    AppKind::Gemini => "gemini.qoder_cosy",
+                })
+                .unwrap(),
+            );
+            let request = adapter_for(app, ProviderType::QoderCosy)
+                .transform_request_for_route(
+                    Bytes::copy_from_slice(body),
+                    &stored,
+                    route,
+                    gemini_path,
+                )
+                .unwrap();
+            let canonical: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(canonical["model"], "auto", "app={app:?}");
+            assert!(canonical["messages"].is_array(), "app={app:?}");
+            assert!(
+                canonical["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "user"
+                        && value_contains_text(&message["content"], expected_user)),
+                "app={app:?} canonical={canonical}"
+            );
+            assert!(canonical.get("contents").is_none(), "app={app:?}");
+            assert!(canonical.get("input").is_none(), "app={app:?}");
+            assert!(!request.stream_requested, "app={app:?}");
+        }
+    }
+
+    fn value_contains_text(value: &Value, expected: &str) -> bool {
+        match value {
+            Value::String(value) => value == expected,
+            Value::Array(values) => values
+                .iter()
+                .any(|value| value_contains_text(value, expected)),
+            Value::Object(values) => values
+                .values()
+                .any(|value| value_contains_text(value, expected)),
+            _ => false,
+        }
+    }
+
     struct AdapterContract<'a> {
         app: AppKind,
         provider_type: ProviderType,
@@ -4056,6 +4220,73 @@ mod tests {
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
             resource: Default::default(),
+        }
+    }
+
+    #[test]
+    fn minimax_coding_plan_normalizes_only_enabled_thinking_on_minimax_models() {
+        let cases = [
+            ("claude.minimax_cn", "MiniMax-M3", "enabled", "adaptive"),
+            (
+                "claude.minimax_global",
+                "MiniMax-M2.7-highspeed",
+                "enabled",
+                "adaptive",
+            ),
+            ("claude.minimax_cn", "MiniMax-M2.7", "adaptive", "adaptive"),
+            ("claude.minimax_cn", "glm-5", "enabled", "enabled"),
+            ("claude.zhipu_glm_cn", "MiniMax-M3", "enabled", "enabled"),
+        ];
+
+        for (profile_id, model, input_type, expected_type) in cases {
+            let mut stored = stored_provider(
+                AppKind::Claude,
+                ProviderType::Claude,
+                json!({"apiKey": "fixture-secret"}),
+            );
+            stored.resource.profile_id =
+                Some(crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap());
+            let plan = crate::domain::providers::runtime::compile_runtime_plan(
+                &stored,
+                &AccountStore::default(),
+            )
+            .unwrap();
+            let body = serde_json::to_vec(&json!({
+                "model": model,
+                "max_tokens": 16_384,
+                "thinking": {
+                    "type": input_type,
+                    "budget_tokens": 8_192,
+                    "vendor_field": "preserve"
+                },
+                "messages": [{"role": "user", "content": "ping"}]
+            }))
+            .unwrap();
+            let mut request = adapter_for(AppKind::Claude, ProviderType::Claude)
+                .transform_request_for_route(
+                    Bytes::from(body),
+                    &stored,
+                    ProxyRoute::ClaudeMessages,
+                    None,
+                )
+                .unwrap();
+
+            finalize_runtime_request(&plan, &stored, &mut request).unwrap();
+
+            let normalized: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                normalized.pointer("/thinking/type"),
+                Some(&json!(expected_type)),
+                "profile={profile_id} model={model}"
+            );
+            assert_eq!(
+                normalized.pointer("/thinking/budget_tokens"),
+                Some(&json!(8_192))
+            );
+            assert_eq!(
+                normalized.pointer("/thinking/vendor_field"),
+                Some(&json!("preserve"))
+            );
         }
     }
 
@@ -4107,6 +4338,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: Default::default(),
         }
     }
 
@@ -4189,11 +4421,24 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_mark_generic_fallback_as_incomplete() {
-        let capability = capability_for(AppKind::Claude, ProviderType::GitHubCopilot);
-        assert_eq!(capability.support, AdapterSupport::GenericFallback);
-        assert!(!capability.supports_stream_usage);
-        assert!(!capability.supports_oauth_refresh);
+    fn copilot_capabilities_are_native_for_fixture_verified_surfaces() {
+        for (app, adapter) in [
+            (AppKind::Claude, "claude_to_copilot_chat"),
+            (AppKind::Codex, "codex_to_copilot_chat"),
+        ] {
+            let capability = capability_for(app, ProviderType::GitHubCopilot);
+            assert_eq!(capability.adapter, adapter);
+            assert_eq!(capability.support, AdapterSupport::Native);
+            assert!(capability.requires_transform);
+            assert!(capability.supports_stream_usage);
+            assert!(capability.supports_model_list);
+        }
+
+        let gemini = capability_for(AppKind::Gemini, ProviderType::GitHubCopilot);
+        assert_eq!(gemini.adapter, "gemini_copilot_skeleton");
+        assert_eq!(gemini.support, AdapterSupport::GenericFallback);
+        assert!(!gemini.supports_stream_usage);
+        assert!(!gemini.supports_model_list);
     }
 
     #[test]
@@ -4343,18 +4588,8 @@ mod tests {
     }
 
     #[test]
-    fn account_and_cross_protocol_skeletons_remain_explicit_generic_fallbacks() {
+    fn unverified_account_and_cross_protocol_skeletons_remain_fallbacks() {
         let cases = [
-            (
-                AppKind::Claude,
-                ProviderType::GitHubCopilot,
-                "claude_copilot_skeleton",
-            ),
-            (
-                AppKind::Codex,
-                ProviderType::GitHubCopilot,
-                "codex_copilot_skeleton",
-            ),
             (
                 AppKind::Codex,
                 ProviderType::DeepSeekAccount,
@@ -4643,6 +4878,7 @@ mod tests {
                 auth_identity_generation: 1,
             },
             model_policy: crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough,
+            coding_plan: None,
             test_model: None,
             aws_region: None,
             media_policy: None,
@@ -5119,13 +5355,20 @@ mod tests {
     #[test]
     fn exposes_all_provider_type_capabilities_for_each_app() {
         let capabilities = all_capabilities();
-        assert_eq!(capabilities.len(), 63);
+        assert_eq!(capabilities.len(), 66);
         assert!(capabilities.iter().any(|item| {
             item.app == AppKind::Gemini && item.provider_type == ProviderType::AntigravityOAuth
         }));
         assert!(capabilities.iter().any(|item| {
             item.app == AppKind::Codex && item.provider_type == ProviderType::GrokOAuth
         }));
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            assert!(capabilities.iter().any(|item| {
+                item.app == app
+                    && item.provider_type == ProviderType::QoderCosy
+                    && item.support == AdapterSupport::Native
+            }));
+        }
     }
 
     #[test]

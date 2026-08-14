@@ -2,10 +2,10 @@ use reqwest::StatusCode;
 use serde_json::{json, Map, Value};
 
 use crate::clients::oauth::kiro_device::{
-    default_profile_arn, fetch_available_profile_arn, fetch_usage_limits, find_email_in_value,
-    machine_id_from_refresh_token, normalize_region, quota_from_usage_limits, register_client,
-    register_client_with_issuer, sha256_hex, string_at, DEFAULT_REGION, DEFAULT_START_URL,
-    KIRO_AUTH_METHOD_API_KEY, KIRO_AUTH_METHOD_BUILDER_ID, KIRO_ISSUER_URL,
+    agentic_quota_percent, default_profile_arn, discover_profile_arn, fetch_usage_limits,
+    find_email_in_value, machine_id_from_refresh_token, normalize_region, quota_from_usage_limits,
+    register_client, register_client_with_issuer, sha256_hex, string_at, DEFAULT_REGION,
+    DEFAULT_START_URL, KIRO_AUTH_METHOD_API_KEY, KIRO_AUTH_METHOD_BUILDER_ID, KIRO_ISSUER_URL,
 };
 use crate::clients::oauth::refresh::AccountRefreshFailure;
 use crate::domain::accounts::oauth::{
@@ -131,8 +131,6 @@ pub fn import_api_key(
     }
     let region = normalize_region(region.unwrap_or(DEFAULT_REGION))
         .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
-    let profile_arn =
-        default_profile_arn(&json!({"authMethod": KIRO_AUTH_METHOD_API_KEY}), &region);
     let account_id = format!("kiro_key_{}", &sha256_hex(key)[..24]);
     Ok(UpsertAccountInput {
         id: Some(account_id.clone()),
@@ -150,18 +148,20 @@ pub fn import_api_key(
             .collect(),
         profile: Some(json!({
             "accountId": account_id,
-            "profileArn": profile_arn,
             "authRegion": region,
+            "runtimeRegion": region,
             "apiRegion": region,
             "authMethod": KIRO_AUTH_METHOD_API_KEY,
             "provider": "ApiKey",
+            "profileProvenance": "profileless_api_key",
         })),
         raw: Some(json!({
             "provider": "ApiKey",
             "authMethod": KIRO_AUTH_METHOD_API_KEY,
+            "runtimeRegion": region,
             "apiRegion": region,
             "authRegion": region,
-            "resolvedProfileArn": profile_arn,
+            "profileProvenance": "profileless_api_key",
             "importedBy": "kiro_api_key",
             "importedAtMs": now_ms,
         })),
@@ -186,19 +186,21 @@ pub async fn import_validated_api_key(
     let mut input = import_api_key(key, region, now_ms)?;
     let region = normalize_region(region.unwrap_or(DEFAULT_REGION))
         .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
-    let profile_arn = fetch_available_profile_arn(http, &region, key.trim(), Some("API_KEY"))
-        .await
-        .map_err(kiro_device_failure)?
-        .ok_or_else(|| {
-            AccountRefreshFailure::bad_gateway(
-                "kiro API key validation returned no available profile",
-            )
-        })?;
-    if let Some(profile) = input.profile.as_mut().and_then(Value::as_object_mut) {
-        profile.insert("profileArn".to_string(), json!(profile_arn));
+    let models = crate::clients::oauth::kiro_runtime::fetch_models_for_api_key(
+        http,
+        &region,
+        key.trim(),
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(AccountRefreshFailure::bad_gateway)?;
+    if models.is_empty() {
+        return Err(AccountRefreshFailure::bad_gateway(
+            "kiro API key validation returned no available models",
+        ));
     }
     if let Some(raw) = input.raw.as_mut().and_then(Value::as_object_mut) {
-        raw.insert("resolvedProfileArn".to_string(), json!(profile_arn));
+        raw.insert("validatedModelCount".to_string(), json!(models.len()));
         raw.insert("validatedAtMs".to_string(), json!(now_ms));
     }
     Ok(input)
@@ -246,12 +248,12 @@ fn upsert_from_credentials_entry(
             .unwrap_or(DEFAULT_REGION),
     )
     .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
-    let api_region = normalize_region(
-        string_at(entry, &["/apiRegion", "/api_region", "/region"])
-            .as_deref()
-            .unwrap_or(&auth_region),
-    )
-    .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
+    let supplied_profile_arn = string_at(
+        entry,
+        &["/profileArn", "/profile_arn", "/resolvedProfileArn"],
+    );
+    let runtime_region = string_at(entry, &["/runtimeRegion", "/runtime_region"]);
+    let api_region = string_at(entry, &["/apiRegion", "/api_region", "/region"]);
     let token_endpoint = string_at(entry, &["/tokenEndpoint", "/token_endpoint"]);
     let client_id = string_at(entry, &["/clientId", "/client_id"]);
     let client_secret = string_at(entry, &["/clientSecret", "/client_secret"]);
@@ -274,11 +276,40 @@ fn upsert_from_credentials_entry(
             ));
         }
     }
-    let profile_arn = string_at(
-        entry,
-        &["/profileArn", "/profile_arn", "/resolvedProfileArn"],
+    if crate::domain::providers::kiro::is_enterprise_auth_method(&auth_method)
+        && supplied_profile_arn.is_none()
+    {
+        return Err(AccountRefreshFailure::bad_request(
+            "kiro enterprise credentials require a discovered organization profileArn",
+        ));
+    }
+    if crate::domain::providers::kiro::is_enterprise_auth_method(&auth_method)
+        && supplied_profile_arn
+            .as_deref()
+            .is_some_and(crate::domain::providers::kiro::is_legacy_enterprise_fallback_profile)
+    {
+        return Err(AccountRefreshFailure::bad_request(
+            "kiro enterprise credentials contain a legacy shared fallback profileArn; discover the organization profile first",
+        ));
+    }
+    let (profile_arn, profile_provenance) = if let Some(profile_arn) = supplied_profile_arn {
+        (profile_arn, "credentials_import")
+    } else {
+        let profile_arn =
+            default_profile_arn(&json!({"authMethod": auth_method})).ok_or_else(|| {
+                AccountRefreshFailure::bad_request(
+                    "kiro enterprise credentials require a discovered organization profileArn",
+                )
+            })?;
+        (profile_arn, "auth_method_default")
+    };
+    let runtime = crate::domain::providers::kiro::resolve_runtime_identity(
+        Some(&profile_arn),
+        runtime_region.as_deref(),
+        api_region.as_deref(),
     )
-    .unwrap_or_else(|| default_profile_arn(&json!({"authMethod": auth_method}), &api_region));
+    .map_err(|error| AccountRefreshFailure::bad_request(error.to_string()))?;
+    let profile_arn = runtime.profile_arn.expect("profile ARN was supplied");
     let machine_id = string_at(entry, &["/machineId", "/machine_id"])
         .unwrap_or_else(|| machine_id_from_refresh_token(&refresh_token));
     let account_id = string_at(entry, &["/accountId", "/account_id"])
@@ -312,7 +343,10 @@ fn upsert_from_credentials_entry(
             "email": email,
             "profileArn": profile_arn,
             "authRegion": auth_region,
-            "apiRegion": api_region,
+            "runtimeRegion": runtime.runtime_region,
+            "apiRegion": runtime.runtime_region,
+            "runtimeRegionSource": runtime.region_source.as_str(),
+            "profileProvenance": profile_provenance,
             "machineId": machine_id,
             "startUrl": start_url,
             "authMethod": auth_method,
@@ -327,8 +361,11 @@ fn upsert_from_credentials_entry(
             "tokenEndpoint": token_endpoint,
             "startUrl": start_url,
             "authRegion": auth_region,
-            "apiRegion": api_region,
+            "runtimeRegion": runtime.runtime_region,
+            "apiRegion": runtime.runtime_region,
+            "runtimeRegionSource": runtime.region_source.as_str(),
             "resolvedProfileArn": profile_arn,
+            "profileProvenance": profile_provenance,
             "machineId": machine_id,
             "importedBy": "kiro_credentials_json",
             "importedAtMs": now_ms,
@@ -501,27 +538,53 @@ where
         .clone()
         .or_else(|| account.refresh_token.clone());
     let auth_region_value = normalize_region(
-        &string_from_value(&raw, &["/authRegion", "/auth_region"])
+        &string_from_account(account, &["/authRegion", "/auth_region", "/region"])
             .unwrap_or_else(|| DEFAULT_REGION.to_string()),
     )
     .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
-    let api_region_candidate = string_from_value(&raw, &["/apiRegion", "/api_region"])
-        .unwrap_or_else(|| {
-            region_from_profile_arn(account).unwrap_or_else(|| auth_region_value.clone())
-        });
-    let api_region_value = normalize_region(&api_region_candidate)
-        .map_err(|error| AccountRefreshFailure::bad_request(error.message))?;
-    let profile_arn = string_from_value(
-        &raw,
-        &["/resolvedProfileArn", "/profileArn", "/profile_arn"],
+    let token_profile_arn = string_at(
+        &result.token.extra,
+        &["/profileArn", "/profile_arn", "/resolvedProfileArn"],
+    );
+    let existing_runtime =
+        crate::domain::providers::kiro::runtime_identity_from_account(account)
+            .map_err(|error| AccountRefreshFailure::bad_request(error.to_string()))?;
+    let existing_operational =
+        crate::domain::providers::kiro::operational_runtime_identity_from_account(account).ok();
+    let method = auth_method(account);
+    let enterprise = matches!(method, KiroAuthMethod::Idc | KiroAuthMethod::ExternalIdp);
+    let (mut profile_arn, mut profile_provenance) = if let Some(profile_arn) = token_profile_arn {
+        let parsed =
+            crate::domain::providers::kiro::parse_profile_arn(&profile_arn).ok_or_else(|| {
+                AccountRefreshFailure::bad_gateway("kiro refresh returned invalid profile ARN")
+            })?;
+        (Some(parsed.arn), "refresh_token_response".to_string())
+    } else if let Some(profile_arn) = existing_operational
+        .as_ref()
+        .and_then(|identity| identity.profile_arn.clone())
+    {
+        (
+            Some(profile_arn),
+            string_from_account(account, &["/profileProvenance", "/profile_provenance"])
+                .unwrap_or_else(|| "stored_profile_arn".to_string()),
+        )
+    } else {
+        (
+            default_profile_arn(&raw),
+            if enterprise {
+                "profile_resolution_required".to_string()
+            } else {
+                "auth_method_default".to_string()
+            },
+        )
+    };
+    let mut runtime = crate::domain::providers::kiro::resolve_runtime_identity(
+        profile_arn.as_deref(),
+        Some(&existing_runtime.runtime_region),
+        None,
     )
-    .or_else(|| {
-        account
-            .profile
-            .as_ref()
-            .and_then(|profile| string_at(profile, &["/profileArn", "/profile_arn"]))
-    })
-    .unwrap_or_else(|| default_profile_arn(&raw, &api_region_value));
+    .map_err(|error| AccountRefreshFailure::bad_request(error.to_string()))?;
+    let mut runtime_region = runtime.runtime_region.clone();
     let machine_id = string_from_value(&raw, &["/machineId", "/machine_id"])
         .or_else(|| refresh_token.as_deref().map(machine_id_from_refresh_token));
     let token_email = result
@@ -538,9 +601,30 @@ where
         "email",
         email.clone().map(Value::from).unwrap_or(Value::Null),
     );
-    insert_value(&mut profile, "profileArn", json!(profile_arn));
+    let profile_arn_value = profile_arn.clone().map(Value::from).unwrap_or(Value::Null);
+    insert_value(&mut profile, "profileArn", profile_arn_value.clone());
+    insert_value(&mut profile, "profile_arn", Value::Null);
     insert_value(&mut profile, "authRegion", json!(auth_region_value));
-    insert_value(&mut profile, "apiRegion", json!(api_region_value));
+    insert_value(&mut profile, "runtimeRegion", json!(runtime_region));
+    insert_value(&mut profile, "apiRegion", json!(runtime_region));
+    insert_value(
+        &mut profile,
+        "runtimeRegionSource",
+        json!(runtime.region_source.as_str()),
+    );
+    insert_value(&mut profile, "profileProvenance", json!(profile_provenance));
+    insert_value(&mut raw, "authRegion", json!(auth_region_value));
+    insert_value(&mut raw, "runtimeRegion", json!(runtime_region));
+    insert_value(&mut raw, "apiRegion", json!(runtime_region));
+    insert_value(
+        &mut raw,
+        "runtimeRegionSource",
+        json!(runtime.region_source.as_str()),
+    );
+    insert_value(&mut raw, "resolvedProfileArn", profile_arn_value.clone());
+    insert_value(&mut raw, "profileArn", profile_arn_value);
+    insert_value(&mut raw, "profile_arn", Value::Null);
+    insert_value(&mut raw, "profileProvenance", json!(profile_provenance));
     if let Some(machine_id) = machine_id.as_deref() {
         insert_value(&mut profile, "machineId", json!(machine_id));
     }
@@ -571,12 +655,66 @@ where
 
     receipt_hook(&update)?;
 
-    let usage = if let Some(machine_id) = machine_id.as_deref() {
+    if profile_arn.is_none() && enterprise {
+        if let Some(discovered_arn) = discover_refresh_profile_arn(
+            http,
+            account,
+            &auth_region_value,
+            &access_token,
+            kiro_token_type_header(account),
+        )
+        .await
+        {
+            let discovered = crate::domain::providers::kiro::parse_profile_arn(&discovered_arn)
+                .ok_or_else(|| {
+                    AccountRefreshFailure::bad_gateway(
+                        "kiro profile discovery returned invalid organization profile ARN",
+                    )
+                })?;
+            profile_arn = Some(discovered.arn.clone());
+            profile_provenance = "refresh_list_available_profiles".to_string();
+            runtime = crate::domain::providers::kiro::resolve_runtime_identity(
+                Some(&discovered.arn),
+                None,
+                None,
+            )
+            .map_err(|error| AccountRefreshFailure::bad_gateway(error.to_string()))?;
+            runtime_region = runtime.runtime_region.clone();
+            if let Some(profile) = update.profile.as_mut() {
+                insert_value(profile, "profileArn", json!(discovered.arn));
+                insert_value(profile, "runtimeRegion", json!(runtime_region));
+                insert_value(profile, "apiRegion", json!(runtime_region));
+                insert_value(
+                    profile,
+                    "runtimeRegionSource",
+                    json!(runtime.region_source.as_str()),
+                );
+                insert_value(profile, "profileProvenance", json!(profile_provenance));
+            }
+            if let Some(raw) = update.raw.as_mut() {
+                insert_value(raw, "resolvedProfileArn", json!(discovered.arn));
+                insert_value(raw, "profileArn", json!(discovered.arn));
+                insert_value(raw, "runtimeRegion", json!(runtime_region));
+                insert_value(raw, "apiRegion", json!(runtime_region));
+                insert_value(
+                    raw,
+                    "runtimeRegionSource",
+                    json!(runtime.region_source.as_str()),
+                );
+                insert_value(raw, "profileProvenance", json!(profile_provenance));
+            }
+            receipt_hook(&update)?;
+        }
+    }
+
+    let usage = if let (Some(machine_id), Some(profile_arn)) =
+        (machine_id.as_deref(), profile_arn.as_deref())
+    {
         fetch_refresh_usage(
             http,
             account,
-            &api_region_value,
-            &profile_arn,
+            &runtime_region,
+            Some(profile_arn),
             machine_id,
             &access_token,
         )
@@ -612,11 +750,7 @@ where
     }
     update.email = email;
     update.subscription_level = subscription_level;
-    update.quota_percent = quota
-        .tiers
-        .first()
-        .and_then(|tier| tier.utilization)
-        .map(|value| value * 100.0);
+    update.quota_percent = agentic_quota_percent(&quota);
     update.quota = Some(quota);
     update.quota_refreshed_at = Some(now_ms);
     update.quota_next_refresh_at = Some(now_ms.saturating_add(quota_refresh_interval_ms));
@@ -626,8 +760,8 @@ where
 async fn fetch_refresh_usage(
     http: &reqwest::Client,
     account: &Account,
-    api_region: &str,
-    profile_arn: &str,
+    runtime_region: &str,
+    profile_arn: Option<&str>,
     machine_id: &str,
     access_token: &str,
 ) -> Option<Value> {
@@ -652,7 +786,7 @@ async fn fetch_refresh_usage(
 
     fetch_usage_limits(
         http,
-        api_region,
+        runtime_region,
         profile_arn,
         machine_id,
         access_token,
@@ -660,6 +794,49 @@ async fn fetch_refresh_usage(
     )
     .await
     .ok()
+}
+
+async fn discover_refresh_profile_arn(
+    http: &reqwest::Client,
+    _account: &Account,
+    auth_region: &str,
+    access_token: &str,
+    token_type: Option<&str>,
+) -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(url) = _account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("testKiroProfileDiscoveryUrl"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let response = http
+                .get(url)
+                .bearer_auth(access_token)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json::<Value>()
+                .await
+                .ok()?;
+            return string_at(&response, &["/profileArn", "/profile_arn"])
+                .filter(|arn| crate::domain::providers::kiro::parse_profile_arn(arn).is_some());
+        }
+        if test_oauth_token_url(_account).is_some() {
+            return None;
+        }
+    }
+
+    discover_profile_arn(http, Some(auth_region), access_token, token_type)
+        .await
+        .ok()
+        .flatten()
+        .map(|(profile_arn, _)| profile_arn)
 }
 
 async fn post_json(
@@ -972,24 +1149,6 @@ fn string_from_value(value: &Value, pointers: &[&str]) -> Option<String> {
     string_at(value, pointers)
 }
 
-fn region_from_profile_arn(account: &Account) -> Option<String> {
-    let arn = account
-        .profile
-        .as_ref()
-        .and_then(|value| string_at(value, &["/profileArn", "/profile_arn"]))
-        .or_else(|| {
-            account
-                .raw
-                .as_ref()
-                .and_then(|value| string_at(value, &["/resolvedProfileArn", "/profileArn"]))
-        })?;
-    let mut parts = arn.split(':');
-    (parts.next() == Some("arn")).then_some(())?;
-    (parts.next() == Some("aws")).then_some(())?;
-    (parts.next() == Some("codewhisperer")).then_some(())?;
-    parts.next().map(str::to_string)
-}
-
 fn object_value(value: Option<Value>) -> Value {
     value
         .filter(Value::is_object)
@@ -1095,6 +1254,19 @@ mod tests {
         assert_eq!(account.provider_type, ProviderType::KiroOAuth);
         assert_eq!(account.api_key.as_deref(), Some("ksk_fixture"));
         assert_eq!(account.refresh_token, None);
+        assert!(account
+            .profile
+            .as_ref()
+            .and_then(|value| value.pointer("/profileArn"))
+            .is_none());
+        assert_eq!(
+            account
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/runtimeRegion"))
+                .and_then(Value::as_str),
+            Some("us-east-1")
+        );
         assert_eq!(
             account
                 .profile
@@ -1133,6 +1305,67 @@ mod tests {
                 .and_then(Value::as_str),
             Some("social")
         );
+    }
+
+    #[test]
+    fn imported_profile_arn_is_authoritative_over_legacy_api_region() {
+        let account = import_credentials_json(
+            json!({
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "authMethod": "idc",
+                "authRegion": "eu-north-1",
+                "apiRegion": "us-east-1.attacker.invalid",
+                "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/profile-id"
+            }),
+            1000,
+        )
+        .unwrap();
+
+        let profile = account.profile.as_ref().unwrap();
+        assert_eq!(profile["authRegion"], "eu-north-1");
+        assert_eq!(profile["runtimeRegion"], "eu-central-1");
+        assert_eq!(profile["apiRegion"], "eu-central-1");
+        assert_eq!(profile["runtimeRegionSource"], "profile_arn");
+        assert_eq!(profile["profileProvenance"], "credentials_import");
+    }
+
+    #[test]
+    fn imported_invalid_profile_arn_fails_closed() {
+        let error = import_credentials_json(
+            json!({
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "authMethod": "idc",
+                "profileArn": "arn:aws:codewhisperer:us-east-1.attacker.invalid:123456789012:profile/id"
+            }),
+            1000,
+        )
+        .unwrap_err();
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(error.message, "invalid Kiro profile ARN");
+    }
+
+    #[test]
+    fn imported_idc_requires_real_organization_profile_arn() {
+        for credentials in [
+            json!({
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "authMethod": "idc",
+                "authRegion": "eu-north-1"
+            }),
+            json!({
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "authMethod": "idc",
+                "profileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN"
+            }),
+        ] {
+            let error = import_credentials_json(credentials, 1_000).unwrap_err();
+            assert_eq!(error.status_code, StatusCode::BAD_REQUEST.as_u16());
+            assert!(error.message.contains("organization profile"));
+        }
     }
 
     #[test]

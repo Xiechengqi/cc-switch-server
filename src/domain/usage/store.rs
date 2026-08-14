@@ -407,8 +407,10 @@ impl UsageStore {
         let provider_health = ProviderHealthStore::load_rebuildable(config_dir);
         let usage_dir = usage_directory(config_dir);
         if !usage_dir.exists() {
-            let mut store = Self::default();
-            store.provider_health = provider_health;
+            let store = Self {
+                provider_health,
+                ..Self::default()
+            };
             store.save(config_dir)?;
             return Ok(store);
         }

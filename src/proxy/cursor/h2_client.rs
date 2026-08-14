@@ -29,6 +29,7 @@ use hyper_util::rt::TokioExecutor;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::time::Instant as TokioInstant;
 
 pub const DEFAULT_AGENTSERVICE_BASE_URL: &str = "https://agentn.global.api5.cursor.sh";
 const AGENT_PATH: &str = "/agent.v1.AgentService/Run";
@@ -49,7 +50,7 @@ pub struct CursorH2Stream {
     pending: std::collections::VecDeque<ConnectFrame>,
     closed: bool,
     received_any_frame: bool,
-    timeouts: CursorH2Timeouts,
+    output_phase: CursorOutputPhase,
     connect_grpc_status: Option<u32>,
     connect_grpc_message: Option<String>,
 }
@@ -70,6 +71,71 @@ impl Default for CursorH2Timeouts {
             first_frame: Some(Duration::from_secs(120)),
             inter_frame: Some(Duration::from_secs(300)),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorOutputDeadlineKind {
+    FirstBusinessOutput,
+    Idle,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorOutputPhase {
+    first_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    first_deadline: Option<TokioInstant>,
+    idle_deadline: Option<TokioInstant>,
+    awaiting_business_output: bool,
+}
+
+impl CursorOutputPhase {
+    fn new(timeouts: CursorH2Timeouts, started_at: TokioInstant) -> Self {
+        Self {
+            first_timeout: timeouts.first_frame,
+            idle_timeout: timeouts.inter_frame,
+            first_deadline: timeouts.first_frame.map(|timeout| started_at + timeout),
+            idle_deadline: None,
+            awaiting_business_output: true,
+        }
+    }
+
+    fn deadline(&self) -> Option<(TokioInstant, CursorOutputDeadlineKind, Duration)> {
+        if self.awaiting_business_output {
+            self.first_deadline
+                .zip(self.first_timeout)
+                .map(|(deadline, timeout)| {
+                    (
+                        deadline,
+                        CursorOutputDeadlineKind::FirstBusinessOutput,
+                        timeout,
+                    )
+                })
+        } else {
+            self.idle_deadline
+                .zip(self.idle_timeout)
+                .map(|(deadline, timeout)| (deadline, CursorOutputDeadlineKind::Idle, timeout))
+        }
+    }
+
+    fn on_complete_protocol_frame(&mut self, now: TokioInstant) {
+        if !self.awaiting_business_output {
+            self.idle_deadline = self.idle_timeout.map(|timeout| now + timeout);
+        }
+    }
+
+    fn mark_business_output(&mut self, now: TokioInstant) {
+        if self.awaiting_business_output {
+            self.awaiting_business_output = false;
+            self.first_deadline = None;
+        }
+        self.idle_deadline = self.idle_timeout.map(|timeout| now + timeout);
+    }
+
+    fn rearm(&mut self, now: TokioInstant) {
+        self.awaiting_business_output = true;
+        self.first_deadline = self.first_timeout.map(|timeout| now + timeout);
+        self.idle_deadline = None;
     }
 }
 
@@ -133,9 +199,29 @@ impl CursorH2Stream {
         let client: Client<_, http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>> =
             builder.build(https);
 
-        let response = tokio::time::timeout(timeouts.request, client.request(req))
+        let sent_at = TokioInstant::now();
+        let output_phase = CursorOutputPhase::new(timeouts, sent_at);
+        let request_deadline = sent_at + timeouts.request;
+        let (header_deadline, header_timeout_kind, header_timeout) = output_phase
+            .deadline()
+            .filter(|(deadline, _, _)| *deadline <= request_deadline)
+            .unwrap_or((
+                request_deadline,
+                CursorOutputDeadlineKind::Idle,
+                timeouts.request,
+            ));
+        let response = tokio::time::timeout_at(header_deadline, client.request(req))
             .await
-            .map_err(|_| cursor_forward_error("Cursor AgentService 请求超时"))?
+            .map_err(|_| {
+                if header_timeout_kind == CursorOutputDeadlineKind::FirstBusinessOutput {
+                    cursor_output_timeout(header_timeout_kind, header_timeout, "response headers")
+                } else {
+                    cursor_timeout_error(format!(
+                        "Cursor AgentService request timed out after {}ms",
+                        header_timeout.as_millis()
+                    ))
+                }
+            })?
             .map_err(|e| cursor_forward_error(format!("Cursor AgentService 请求失败: {e}")))?;
 
         Ok(Self {
@@ -146,7 +232,7 @@ impl CursorH2Stream {
             pending: std::collections::VecDeque::new(),
             closed: false,
             received_any_frame: false,
-            timeouts,
+            output_phase,
             connect_grpc_status: None,
             connect_grpc_message: None,
         })
@@ -175,6 +261,18 @@ impl CursorH2Stream {
     /// H2 END_STREAM on the request body. After this, [`send_frame`] fails fast.
     pub fn close_writer(&mut self) {
         self.writer = None;
+    }
+
+    /// Confirm that the driver decoded a client-visible/business event.
+    /// Protocol/control frames alone never call this method.
+    pub fn mark_business_output(&mut self) {
+        self.output_phase.mark_business_output(TokioInstant::now());
+    }
+
+    /// Start a fresh first-business-output phase after MCP results are written
+    /// to the same parked h2 stream.
+    pub fn rearm_business_output_phase(&mut self) {
+        self.output_phase.rearm(TokioInstant::now());
     }
 
     pub async fn read_body_limited(&mut self, max_bytes: usize) -> Result<Bytes, ProxyError> {
@@ -211,7 +309,7 @@ impl CursorH2Stream {
     /// captured into `self.trailers` and don't surface as frames.
     pub async fn next_frame(&mut self) -> Result<Option<ConnectFrame>, ProxyError> {
         if let Some(frame) = self.pending.pop_front() {
-            self.received_any_frame = true;
+            self.note_complete_protocol_frame();
             return Ok(Some(frame));
         }
         if self.closed {
@@ -219,26 +317,13 @@ impl CursorH2Stream {
         }
 
         loop {
-            let timeout = if self.received_any_frame {
-                self.timeouts.inter_frame
-            } else {
-                self.timeouts.first_frame
-            };
-            let frame_result = match timeout {
-                Some(timeout) => tokio::time::timeout(timeout, self.response.body_mut().frame())
-                    .await
-                    .map_err(|_| {
-                        let timeout_ms = timeout.as_millis();
-                        if !self.received_any_frame {
-                            cursor_forward_error(format!(
-                                "Cursor AgentService first frame timed out after {timeout_ms}ms"
-                            ))
-                        } else {
-                            cursor_forward_error(format!(
-                                "Cursor AgentService stream idled for {timeout_ms}ms"
-                            ))
-                        }
-                    })?,
+            let deadline = self.output_phase.deadline();
+            let frame_result = match deadline {
+                Some((deadline, kind, timeout)) => {
+                    tokio::time::timeout_at(deadline, self.response.body_mut().frame())
+                        .await
+                        .map_err(|_| cursor_output_timeout(kind, timeout, "response body"))?
+                }
                 None => self.response.body_mut().frame().await,
             };
 
@@ -270,7 +355,7 @@ impl CursorH2Stream {
                     }
                 }
                 if let Some(f) = self.pending.pop_front() {
-                    self.received_any_frame = true;
+                    self.note_complete_protocol_frame();
                     return Ok(Some(f));
                 }
                 if self.closed {
@@ -285,6 +370,12 @@ impl CursorH2Stream {
     /// Whether we have received at least one server frame on this stream.
     pub fn received_any_frame(&self) -> bool {
         self.received_any_frame
+    }
+
+    fn note_complete_protocol_frame(&mut self) {
+        self.received_any_frame = true;
+        self.output_phase
+            .on_complete_protocol_frame(TokioInstant::now());
     }
 
     /// Trailers captured after the response body ended. `grpc-status` /
@@ -371,6 +462,29 @@ fn cursor_forward_error(message: impl Into<String>) -> ProxyError {
     }
 }
 
+fn cursor_timeout_error(message: impl Into<String>) -> ProxyError {
+    ProxyError {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        message: message.into(),
+    }
+}
+
+fn cursor_output_timeout(
+    kind: CursorOutputDeadlineKind,
+    timeout: Duration,
+    stage: &str,
+) -> ProxyError {
+    let timeout_ms = timeout.as_millis();
+    match kind {
+        CursorOutputDeadlineKind::FirstBusinessOutput => cursor_timeout_error(format!(
+            "Cursor AgentService first business output timed out after {timeout_ms}ms while waiting for {stage}"
+        )),
+        CursorOutputDeadlineKind::Idle => cursor_timeout_error(format!(
+            "Cursor AgentService stream idled for {timeout_ms}ms while waiting for {stage}"
+        )),
+    }
+}
+
 /// Drain whatever frames are already in the response body without blocking
 /// for more. Returns immediately if no whole frame is currently available.
 /// Useful for tests and for non-blocking polling.
@@ -437,5 +551,90 @@ mod tests {
             agentservice_url(""),
             "https://agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
         );
+    }
+
+    #[test]
+    fn control_frames_and_partial_progress_do_not_extend_first_output_deadline() {
+        let started = TokioInstant::now();
+        let timeout = Duration::from_millis(80);
+        let mut phase = CursorOutputPhase::new(
+            CursorH2Timeouts {
+                request: Duration::from_secs(1),
+                first_frame: Some(timeout),
+                inter_frame: Some(Duration::from_millis(200)),
+            },
+            started,
+        );
+        let initial_deadline = phase.deadline().unwrap();
+        assert_eq!(
+            initial_deadline.1,
+            CursorOutputDeadlineKind::FirstBusinessOutput
+        );
+
+        // A complete heartbeat/KV/request-context frame calls this hook. Raw
+        // partial bytes do not call any hook at all. Neither may move the
+        // first-business-output deadline.
+        phase.on_complete_protocol_frame(started + Duration::from_millis(30));
+        phase.on_complete_protocol_frame(started + Duration::from_millis(60));
+        assert_eq!(phase.deadline().unwrap().0, initial_deadline.0);
+        assert!(started + Duration::from_millis(81) > phase.deadline().unwrap().0);
+
+        let error = cursor_output_timeout(
+            phase.deadline().unwrap().1,
+            phase.deadline().unwrap().2,
+            "response body",
+        );
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(error.message.contains("first business output"));
+    }
+
+    #[test]
+    fn business_output_starts_idle_phase_and_complete_frames_reset_idle_only() {
+        let started = TokioInstant::now();
+        let mut phase = CursorOutputPhase::new(
+            CursorH2Timeouts {
+                request: Duration::from_secs(1),
+                first_frame: Some(Duration::from_millis(80)),
+                inter_frame: Some(Duration::from_millis(200)),
+            },
+            started,
+        );
+        phase.mark_business_output(started + Duration::from_millis(25));
+        let first_idle_deadline = phase.deadline().unwrap();
+        assert_eq!(first_idle_deadline.1, CursorOutputDeadlineKind::Idle);
+        assert_eq!(first_idle_deadline.0, started + Duration::from_millis(225));
+
+        phase.on_complete_protocol_frame(started + Duration::from_millis(90));
+        assert_eq!(
+            phase.deadline().unwrap().0,
+            started + Duration::from_millis(290)
+        );
+    }
+
+    #[test]
+    fn resumed_tool_phase_gets_new_absolute_first_output_deadline() {
+        let started = TokioInstant::now();
+        let timeout = Duration::from_millis(80);
+        let mut phase = CursorOutputPhase::new(
+            CursorH2Timeouts {
+                request: Duration::from_secs(1),
+                first_frame: Some(timeout),
+                inter_frame: Some(Duration::from_millis(200)),
+            },
+            started,
+        );
+        phase.mark_business_output(started + Duration::from_millis(20));
+        let resumed_at = started + Duration::from_secs(2);
+        phase.rearm(resumed_at);
+        let resumed_deadline = phase.deadline().unwrap();
+        assert_eq!(
+            resumed_deadline.1,
+            CursorOutputDeadlineKind::FirstBusinessOutput
+        );
+        assert_eq!(resumed_deadline.0, resumed_at + timeout);
+
+        phase.on_complete_protocol_frame(resumed_at + Duration::from_millis(60));
+        assert_eq!(phase.deadline().unwrap().0, resumed_at + timeout);
+        assert!(resumed_at + Duration::from_millis(81) > phase.deadline().unwrap().0);
     }
 }

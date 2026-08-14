@@ -10,7 +10,14 @@ use crate::clients::oauth::codex_reset_credits::{
     normalize_imported_snapshot, parse_usage_available_count,
 };
 use crate::clients::oauth::kiro_device::{
-    default_profile_arn, fetch_usage_limits, machine_id_from_refresh_token, quota_from_usage_limits,
+    agentic_quota_percent, fetch_usage_limits, machine_id_from_refresh_token,
+    quota_from_usage_limits,
+};
+use crate::domain::accounts::capability_evidence::{
+    AccountCapabilityObservationDraft, AccountCapabilityObservationState,
+    CLAUDE_QUOTA_FAMILY_DIMENSION, GEMINI_QUOTA_FAMILY_DIMENSION, MEDIA_ENTITLEMENT_DIMENSION,
+    MODEL_CAPACITY_DIMENSION, MODEL_ENTITLEMENT_DIMENSION, PRIVACY_DIMENSION,
+    PROJECT_BOOTSTRAP_DIMENSION, TIER_ENTITLEMENT_DIMENSION,
 };
 use crate::domain::accounts::claude_subscription::{
     parse_claude_subscription_plan, resolve_claude_subscription, ClaudeSubscriptionCandidate,
@@ -51,6 +58,8 @@ const GEMINI_LOAD_CODE_ASSIST_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const GEMINI_RETRIEVE_USER_QUOTA_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const ANTIGRAVITY_FETCH_USER_INFO_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo";
 const OLLAMA_ME_URL: &str = "https://ollama.com/api/me";
 
 #[derive(Debug, Clone)]
@@ -242,7 +251,17 @@ pub async fn refresh_account_quota(
         ProviderType::GrokOAuth => {
             refresh_grok_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
-        ProviderType::GitHubCopilot | ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
+        ProviderType::GitHubCopilot => {
+            refresh_copilot_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
+        }
+        ProviderType::KimiCode => {
+            refresh_kimi_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
+        }
+        ProviderType::QoderCosy => {
+            refresh_qoder_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
+        }
+        ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             refresh_imported_snapshot_quota(account, now_ms, success_cooldown_ms)?
         }
         ProviderType::OllamaCloud => {
@@ -268,6 +287,613 @@ pub async fn refresh_account_quota(
         update,
         message: "quota refreshed from upstream provider".to_string(),
     })
+}
+
+async fn refresh_qoder_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let body = crate::clients::oauth::qoder::fetch_quota_usage(http, account, request_timeout)
+        .await
+        .map_err(|error| qoder_quota_failure(error, now_ms))?;
+    parse_qoder_quota_update(account, &body, now_ms, success_cooldown_ms)
+}
+
+fn qoder_quota_failure(
+    error: crate::clients::oauth::qoder::QoderClientError,
+    now_ms: i64,
+) -> QuotaRefreshFailure {
+    let upstream_status = error.upstream_status.map(|status| status.as_u16());
+    let retryable = upstream_status.is_none_or(|status| status == 429 || status >= 500);
+    QuotaRefreshFailure {
+        status_code: error.status.as_u16(),
+        upstream_status,
+        message: crate::logging::redact_sensitive_text(&error.message),
+        retryable,
+        next_refresh_at: retryable.then_some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+        partial_update: None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QoderQuotaBucket {
+    name: &'static str,
+    label: &'static str,
+    source: &'static str,
+    total: Option<f64>,
+    used: Option<f64>,
+    remaining: Option<f64>,
+    utilization: Option<f64>,
+    unit: Option<String>,
+    available: Option<bool>,
+}
+
+impl QoderQuotaBucket {
+    fn capacity(&self) -> Option<f64> {
+        self.total
+    }
+
+    fn tier(&self, resets_at: Option<i64>) -> AccountQuotaTier {
+        AccountQuotaTier {
+            name: self.name.to_string(),
+            label: Some(self.label.to_string()),
+            utilization: self.utilization,
+            used: self.used,
+            limit: self.total,
+            unit: self.unit.clone().or_else(|| Some("credits".to_string())),
+            resets_at,
+        }
+    }
+
+    fn projection(&self) -> Value {
+        json!({
+            "source": self.source,
+            "total": self.total,
+            "used": self.used,
+            "remaining": self.remaining,
+            "utilization": self.utilization,
+            "unit": self.unit,
+            "available": self.available,
+        })
+    }
+}
+
+fn parse_qoder_quota_update(
+    account: &Account,
+    body: &Value,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let object = body.as_object().ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::QoderCosy,
+            "top-level value must be an object",
+            now_ms,
+        )
+    })?;
+    let user_type = qoder_optional_string(object, "userType", now_ms)?;
+    let usage_type = qoder_optional_string(object, "usageType", now_ms)?;
+    let exceeded = qoder_optional_bool(object, "isQuotaExceeded", now_ms)?;
+    let total_usage_percentage =
+        qoder_optional_nonnegative_number(object, "totalUsagePercentage", now_ms)?
+            .map(qoder_percentage_fraction);
+    let expires_at = qoder_optional_timestamp(object, "expiresAt", now_ms)?;
+
+    let mut buckets = Vec::new();
+    if let Some((source, value)) = qoder_alias_value(object, &["userQuota"], now_ms)? {
+        buckets.push(parse_qoder_quota_bucket(
+            "qoder_user",
+            "Qoder personal credits",
+            source,
+            value,
+            now_ms,
+        )?);
+    }
+    if let Some((source, value)) =
+        qoder_alias_value(object, &["addOnQuota", "add_on_quota"], now_ms)?
+    {
+        buckets.push(parse_qoder_quota_bucket(
+            "qoder_add_on",
+            "Qoder add-on credits",
+            source,
+            value,
+            now_ms,
+        )?);
+    }
+    if let Some((source, value)) = qoder_alias_value(
+        object,
+        &[
+            "orgResourcePackage",
+            "org_resource_package",
+            "sharedQuota",
+            "shared_quota",
+        ],
+        now_ms,
+    )? {
+        buckets.push(parse_qoder_quota_bucket(
+            "qoder_organization",
+            "Qoder organization/shared credits",
+            source,
+            value,
+            now_ms,
+        )?);
+    }
+    if buckets.is_empty() {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::QoderCosy,
+            "response contains no recognized quota bucket",
+            now_ms,
+        ));
+    }
+
+    let positive_remaining = buckets
+        .iter()
+        .filter_map(|bucket| bucket.remaining)
+        .any(|remaining| remaining > 0.0);
+    let all_remaining_known = buckets.iter().all(|bucket| bucket.remaining.is_some());
+    let total_remaining = all_remaining_known.then(|| {
+        buckets
+            .iter()
+            .filter_map(|bucket| bucket.remaining)
+            .sum::<f64>()
+    });
+    let total_capacity = buckets
+        .iter()
+        .filter_map(QoderQuotaBucket::capacity)
+        .sum::<f64>();
+    let personal_zero_unknown = user_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("personal_standard"))
+        && buckets
+            .iter()
+            .find(|bucket| bucket.name == "qoder_user")
+            .is_some_and(|bucket| {
+                bucket.total == Some(0.0)
+                    && bucket.remaining == Some(0.0)
+                    && total_capacity <= 0.0
+                    && !positive_remaining
+            });
+    let exhausted = if positive_remaining || personal_zero_unknown || !all_remaining_known {
+        false
+    } else {
+        total_remaining == Some(0.0) && (exceeded == Some(true) || total_capacity > 0.0)
+    };
+    let availability = if exhausted {
+        "exhausted"
+    } else if positive_remaining {
+        "available"
+    } else {
+        "unknown"
+    };
+    let tiers = buckets
+        .iter()
+        .map(|bucket| bucket.tier(expires_at))
+        .collect::<Vec<_>>();
+    let aggregate_utilization = if total_capacity > 0.0 && all_remaining_known {
+        total_remaining.map(|remaining| (1.0 - remaining / total_capacity).clamp(0.0, 1.0))
+    } else {
+        total_usage_percentage
+    };
+    let plan = user_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("Qoder {}", value.replace('_', " ")))
+        .or_else(|| account.subscription_level.clone())
+        .or_else(|| Some("Qoder".to_string()));
+    let bucket_projection = buckets
+        .iter()
+        .map(|bucket| (bucket.name.to_string(), bucket.projection()))
+        .collect::<serde_json::Map<String, Value>>();
+    let quota = AccountQuota {
+        success: true,
+        credential_message: plan.clone(),
+        tiers,
+        extra_usage: Some(json!({
+            "source": "qoder_cosy_quota_usage",
+            "qoderQuota": {
+                "userType": user_type,
+                "usageType": usage_type,
+                "totalUsagePercentage": total_usage_percentage,
+                "isQuotaExceeded": exceeded,
+                "expiresAt": expires_at,
+                "availability": availability,
+                "exhausted": exhausted,
+                "personalZeroUnknown": personal_zero_unknown,
+                "totalCapacity": (total_capacity > 0.0).then_some(total_capacity),
+                "totalRemaining": total_remaining,
+                "buckets": bucket_projection,
+            }
+        })),
+    };
+    let mut update = update_from_quota(quota, plan, None, now_ms, success_cooldown_ms);
+    update.quota_percent = aggregate_utilization.map(|value| value * 100.0);
+    if let Some(reset_at) = expires_at.filter(|reset_at| *reset_at > now_ms) {
+        if exhausted {
+            update.rate_limited_until = Some(reset_at);
+        } else {
+            update.clear_rate_limited_until_if = Some(reset_at);
+        }
+    }
+    Ok(update)
+}
+
+fn parse_qoder_quota_bucket(
+    name: &'static str,
+    label: &'static str,
+    source: &'static str,
+    value: &Value,
+    now_ms: i64,
+) -> Result<QoderQuotaBucket, QuotaRefreshFailure> {
+    let object = value.as_object().ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::QoderCosy,
+            format!("{source} must be an object"),
+            now_ms,
+        )
+    })?;
+    let explicit_total = qoder_optional_nonnegative_number(object, "total", now_ms)?;
+    let cap = qoder_optional_nonnegative_number(object, "cap", now_ms)?;
+    let mut used = qoder_optional_nonnegative_number(object, "used", now_ms)?;
+    let mut remaining = qoder_optional_nonnegative_number(object, "remaining", now_ms)?;
+    let total = explicit_total.or(cap).or(match (used, remaining) {
+        (Some(used), Some(remaining)) => Some(used + remaining),
+        _ => None,
+    });
+    if used.is_none() {
+        used = match (total, remaining) {
+            (Some(total), Some(remaining)) if remaining <= total => Some(total - remaining),
+            _ => None,
+        };
+    }
+    if remaining.is_none() {
+        remaining = match (total, used) {
+            (Some(total), Some(used)) if used <= total => Some(total - used),
+            _ => None,
+        };
+    }
+    if matches!((total, used), (Some(total), Some(used)) if used > total)
+        || matches!((total, remaining), (Some(total), Some(remaining)) if remaining > total)
+    {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::QoderCosy,
+            format!("{source} contains usage greater than its capacity"),
+            now_ms,
+        ));
+    }
+    let percentage = qoder_optional_nonnegative_number(object, "percentage", now_ms)?;
+    let utilization = percentage
+        .map(qoder_percentage_fraction)
+        .or_else(|| match (used, total) {
+            (Some(used), Some(total)) if total > 0.0 => Some((used / total).clamp(0.0, 1.0)),
+            _ => None,
+        });
+    let unit = qoder_optional_string(object, "unit", now_ms)?;
+    let available = qoder_optional_bool(object, "available", now_ms)?;
+    Ok(QoderQuotaBucket {
+        name,
+        label,
+        source,
+        total,
+        used,
+        remaining,
+        utilization,
+        unit,
+        available,
+    })
+}
+
+fn qoder_alias_value<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    aliases: &[&'static str],
+    now_ms: i64,
+) -> Result<Option<(&'static str, &'a Value)>, QuotaRefreshFailure> {
+    let mut selected: Option<(&'static str, &Value)> = None;
+    for alias in aliases {
+        let Some(value) = object.get(*alias).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if let Some((selected_alias, selected_value)) = selected {
+            if selected_value != value {
+                return Err(QuotaRefreshFailure::parse(
+                    ProviderType::QoderCosy,
+                    format!("conflicting {selected_alias} and {alias} quota aliases"),
+                    now_ms,
+                ));
+            }
+        } else {
+            selected = Some((*alias, value));
+        }
+    }
+    Ok(selected)
+}
+
+fn qoder_optional_nonnegative_number(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    now_ms: i64,
+) -> Result<Option<f64>, QuotaRefreshFailure> {
+    let Some(value) = object.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        .filter(|value: &f64| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| {
+            QuotaRefreshFailure::parse(
+                ProviderType::QoderCosy,
+                format!("{field} must be a finite non-negative number"),
+                now_ms,
+            )
+        })?;
+    Ok(Some(parsed))
+}
+
+fn qoder_optional_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    now_ms: i64,
+) -> Result<Option<String>, QuotaRefreshFailure> {
+    let Some(value) = object.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let value = value.as_str().ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::QoderCosy,
+            format!("{field} must be a string"),
+            now_ms,
+        )
+    })?;
+    Ok(Some(value.trim().to_string()))
+}
+
+fn qoder_optional_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    now_ms: i64,
+) -> Result<Option<bool>, QuotaRefreshFailure> {
+    let Some(value) = object.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::QoderCosy,
+            format!("{field} must be a boolean"),
+            now_ms,
+        )
+    })
+}
+
+fn qoder_optional_timestamp(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    now_ms: i64,
+) -> Result<Option<i64>, QuotaRefreshFailure> {
+    let Some(value) = object.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+        .and_then(timestamp_number_to_unix_ms)
+        .ok_or_else(|| {
+            QuotaRefreshFailure::parse(
+                ProviderType::QoderCosy,
+                format!("{field} must be a positive Unix timestamp"),
+                now_ms,
+            )
+        })?;
+    Ok(Some(parsed))
+}
+
+fn qoder_percentage_fraction(value: f64) -> f64 {
+    if value <= 1.0 {
+        value.clamp(0.0, 1.0)
+    } else {
+        (value / 100.0).clamp(0.0, 1.0)
+    }
+}
+
+async fn refresh_kimi_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let access_token = required_access_token(account)?;
+    let identity = crate::domain::kimi_cli::device_identity_from_profile(account.profile.as_ref())
+        .ok_or_else(|| {
+            QuotaRefreshFailure::bad_request(
+                "kimi_code account is missing its account-scoped device identity",
+            )
+        })?;
+    #[cfg(test)]
+    let usage_url = account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testKimiUsagesUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or(crate::domain::kimi_cli::KIMI_USAGES_URL);
+    #[cfg(not(test))]
+    let usage_url = crate::domain::kimi_cli::KIMI_USAGES_URL;
+    let mut request = http
+        .get(usage_url)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/json")
+        .timeout(request_timeout);
+    for (name, value) in identity.headers() {
+        request = request.header(name, value);
+    }
+    let body = request_json(ProviderType::KimiCode, request, now_ms).await?;
+    let quota = parse_kimi_usage_quota(&body, now_ms)?;
+    let subscription_level = quota.credential_message.clone();
+    let has_quota = !quota.tiers.is_empty();
+    let mut update =
+        update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms);
+    update
+        .capability_observations
+        .push(AccountCapabilityObservationDraft::kimi_feature(
+            MODEL_ENTITLEMENT_DIMENSION,
+            if has_quota {
+                AccountCapabilityObservationState::Supported
+            } else {
+                AccountCapabilityObservationState::Unknown
+            },
+            "coding_v1_usages",
+            (!has_quota).then_some("usage_response_has_no_quota_windows"),
+            now_ms,
+        ));
+    Ok(update)
+}
+
+fn parse_kimi_usage_quota(body: &Value, now_ms: i64) -> Result<AccountQuota, QuotaRefreshFailure> {
+    let mut tiers = Vec::new();
+    if let Some(usage) = body.get("usage") {
+        push_kimi_count_tier(&mut tiers, "weekly", "Weekly", usage);
+    }
+    if let Some(limits) = body.get("limits").and_then(Value::as_array) {
+        for (index, limit) in limits.iter().enumerate() {
+            let detail = limit.get("detail").unwrap_or(limit);
+            let label = string_at(limit, &["/window/name", "/window/type", "/name", "/type"])
+                .unwrap_or_else(|| format!("Rate limit {}", index.saturating_add(1)));
+            push_kimi_count_tier(
+                &mut tiers,
+                &format!("rate_limit_{}", index.saturating_add(1)),
+                &label,
+                detail,
+            );
+        }
+    }
+    for (name, label) in [("five_hour", "Session (5h)"), ("seven_day", "Weekly (7d)")] {
+        if let Some(window) = body.get(name) {
+            push_kimi_utilization_tier(&mut tiers, name, label, window);
+        }
+    }
+    if let Some(object) = body.as_object() {
+        for (name, value) in object {
+            let Some(model) = name.strip_prefix("seven_day_") else {
+                continue;
+            };
+            if model.is_empty() {
+                continue;
+            }
+            push_kimi_utilization_tier(&mut tiers, name, &format!("Weekly {model} (7d)"), value);
+        }
+    }
+    tiers.sort_by(|left, right| left.name.cmp(&right.name));
+    tiers.dedup_by(|left, right| left.name == right.name);
+    let membership = string_at(
+        body,
+        &["/user/membership/level", "/membership/level", "/plan"],
+    );
+    let plan = membership
+        .as_deref()
+        .map(kimi_plan_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Kimi Coding".to_string());
+    Ok(AccountQuota {
+        success: true,
+        credential_message: Some(plan.clone()),
+        tiers,
+        extra_usage: Some(json!({
+            "source": "coding_v1_usages",
+            "plan": plan,
+            "queriedAt": now_ms,
+        })),
+    })
+}
+
+fn push_kimi_count_tier(tiers: &mut Vec<AccountQuotaTier>, name: &str, label: &str, value: &Value) {
+    let Some(limit) = number_at(value, &["/limit", "/Limit"]).filter(|value| *value > 0.0) else {
+        return;
+    };
+    let used = number_at(value, &["/used", "/Used"])
+        .or_else(|| {
+            number_at(value, &["/remaining", "/Remaining"])
+                .map(|remaining| (limit - remaining).max(0.0))
+        })
+        .unwrap_or(0.0)
+        .clamp(0.0, limit);
+    tiers.push(AccountQuotaTier {
+        name: name.to_string(),
+        label: Some(label.to_string()),
+        utilization: Some((used / limit).clamp(0.0, 1.0)),
+        used: Some(used),
+        limit: Some(limit),
+        unit: Some("requests".to_string()),
+        resets_at: kimi_reset_at(value),
+    });
+}
+
+fn push_kimi_utilization_tier(
+    tiers: &mut Vec<AccountQuotaTier>,
+    name: &str,
+    label: &str,
+    value: &Value,
+) {
+    let Some(raw) = number_at(value, &["/utilization"]) else {
+        return;
+    };
+    let utilization = if raw > 1.0 {
+        percent_to_fraction(raw)
+    } else {
+        raw.clamp(0.0, 1.0)
+    };
+    tiers.push(AccountQuotaTier {
+        name: name.to_string(),
+        label: Some(label.to_string()),
+        utilization: Some(utilization),
+        used: None,
+        limit: None,
+        unit: Some("percent".to_string()),
+        resets_at: kimi_reset_at(value),
+    });
+}
+
+fn kimi_reset_at(value: &Value) -> Option<i64> {
+    string_at(
+        value,
+        &[
+            "/resetTime",
+            "/ResetTime",
+            "/reset_at",
+            "/resetAt",
+            "/resets_at",
+        ],
+    )
+    .as_deref()
+    .and_then(rfc3339_to_unix_ms)
+    .or_else(|| {
+        number_at(
+            value,
+            &[
+                "/resetTime",
+                "/ResetTime",
+                "/reset_at",
+                "/resetAt",
+                "/resets_at",
+            ],
+        )
+        .and_then(timestamp_number_to_unix_ms)
+    })
+}
+
+fn kimi_plan_name(level: &str) -> String {
+    match level.trim().to_ascii_uppercase().as_str() {
+        "LEVEL_BASIC" => "Moderato".to_string(),
+        "LEVEL_INTERMEDIATE" => "Allegretto".to_string(),
+        "LEVEL_ADVANCED" => "Allegro".to_string(),
+        "LEVEL_STANDARD" => "Vivace".to_string(),
+        value => value
+            .strip_prefix("LEVEL_")
+            .unwrap_or(value)
+            .to_ascii_lowercase(),
+    }
 }
 
 async fn refresh_codex_quota(
@@ -765,15 +1391,58 @@ struct GeminiV1InternalLoadResult {
     project_id: Option<String>,
     subscription_level: Option<String>,
     profile: Option<Value>,
+    observed_at_ms: i64,
 }
 
 impl GeminiV1InternalLoadResult {
-    fn account_update(&self) -> AccountRefreshUpdate {
-        AccountRefreshUpdate {
+    fn account_update(&self, provider_type: ProviderType) -> AccountRefreshUpdate {
+        let mut update = AccountRefreshUpdate {
             profile: self.profile.clone(),
             subscription_level: self.subscription_level.clone(),
+            capability_observations: vec![
+                crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::gemini_project(
+                    self.project_id.is_some(),
+                    self.observed_at_ms,
+                    self.project_id
+                        .is_none()
+                        .then_some("load_code_assist_returned_no_project"),
+                ),
+            ],
             ..Default::default()
+        };
+        if is_antigravity_provider_type(provider_type) {
+            update.capability_observations.extend([
+                AccountCapabilityObservationDraft::antigravity_feature(
+                    PROJECT_BOOTSTRAP_DIMENSION,
+                    if self.project_id.is_some() {
+                        AccountCapabilityObservationState::Supported
+                    } else {
+                        AccountCapabilityObservationState::Unknown
+                    },
+                    "load_code_assist",
+                    self.project_id
+                        .is_none()
+                        .then_some("load_code_assist_returned_no_project"),
+                    self.observed_at_ms,
+                    None,
+                ),
+                AccountCapabilityObservationDraft::antigravity_feature(
+                    TIER_ENTITLEMENT_DIMENSION,
+                    if self.subscription_level.is_some() {
+                        AccountCapabilityObservationState::Supported
+                    } else {
+                        AccountCapabilityObservationState::Unknown
+                    },
+                    "load_code_assist",
+                    self.subscription_level
+                        .is_none()
+                        .then_some("load_code_assist_returned_no_tier"),
+                    self.observed_at_ms,
+                    None,
+                ),
+            ]);
         }
+        update
     }
 }
 
@@ -799,11 +1468,11 @@ pub async fn load_gemini_v1internal_project(
     .await
     .and_then(|loaded| {
         if loaded.project_id.is_some() {
-            Ok(loaded.account_update())
+            Ok(loaded.account_update(account.provider_type))
         } else {
             Err(
                 QuotaRefreshFailure::missing_gemini_project(account.provider_type, now_ms)
-                    .with_partial_update(loaded.account_update()),
+                    .with_partial_update(loaded.account_update(account.provider_type)),
             )
         }
     })
@@ -844,6 +1513,7 @@ async fn load_gemini_v1internal_project_with_timeout(
         project_id,
         subscription_level,
         profile,
+        observed_at_ms: now_ms,
     })
 }
 
@@ -856,7 +1526,7 @@ async fn refresh_gemini_v1internal_quota(
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let loaded =
         load_gemini_v1internal_project_with_timeout(http, account, now_ms, request_timeout).await?;
-    let partial_update = loaded.account_update();
+    let partial_update = loaded.account_update(account.provider_type);
     let access_token = required_access_token(account)?;
     let mut quota_body = json!({});
     if let Some(project_id) = loaded.project_id.as_deref() {
@@ -880,8 +1550,16 @@ async fn refresh_gemini_v1internal_quota(
     let quota_response: GeminiQuotaResponse =
         serde_json::from_value(body.clone()).map_err(|error| {
             QuotaRefreshFailure::parse(account.provider_type, error, now_ms)
-                .with_partial_update(partial_update)
+                .with_partial_update(partial_update.clone())
         })?;
+    let has_model_entitlement = quota_response.buckets.as_ref().is_some_and(|buckets| {
+        buckets.iter().any(|bucket| {
+            bucket
+                .model_id
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty())
+        })
+    });
     let quota = parse_gemini_quota(
         &quota_response,
         loaded.subscription_level.clone(),
@@ -889,13 +1567,209 @@ async fn refresh_gemini_v1internal_quota(
         body,
         now_ms,
     );
-    Ok(update_from_quota(
+    let mut update = update_from_quota(
         quota,
         loaded.subscription_level,
         loaded.profile,
         now_ms,
         success_cooldown_ms,
-    ))
+    );
+    update
+        .capability_observations
+        .extend(partial_update.capability_observations);
+    update.capability_observations.push(
+        crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::gemini_model_entitlement(
+            has_model_entitlement,
+            now_ms,
+            now_ms.saturating_add(success_cooldown_ms.saturating_mul(2).max(60_000)),
+        ),
+    );
+    if is_antigravity_provider_type(account.provider_type) {
+        update
+            .capability_observations
+            .extend(antigravity_quota_observations(
+                &quota_response,
+                now_ms,
+                now_ms.saturating_add(success_cooldown_ms.saturating_mul(2).max(60_000)),
+            ));
+        update.capability_observations.push(
+            observe_antigravity_privacy(
+                http,
+                account,
+                loaded.project_id.as_deref(),
+                access_token,
+                now_ms,
+                request_timeout,
+            )
+            .await,
+        );
+    }
+    Ok(update)
+}
+
+fn is_antigravity_provider_type(provider_type: ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    )
+}
+
+fn antigravity_quota_observations(
+    quota: &GeminiQuotaResponse,
+    observed_at_ms: i64,
+    expires_at_ms: i64,
+) -> Vec<AccountCapabilityObservationDraft> {
+    let buckets = quota.buckets.as_deref().unwrap_or_default();
+    let explicit_buckets = buckets
+        .iter()
+        .filter(|bucket| {
+            bucket
+                .model_id
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    let family_observation = |dimension, family: &str| {
+        let supported = explicit_buckets.iter().any(|bucket| {
+            bucket
+                .model_id
+                .as_deref()
+                .is_some_and(|model| model.trim().to_ascii_lowercase().starts_with(family))
+        });
+        AccountCapabilityObservationDraft::antigravity_feature(
+            dimension,
+            if supported {
+                AccountCapabilityObservationState::Supported
+            } else {
+                AccountCapabilityObservationState::Unknown
+            },
+            "retrieve_user_quota",
+            (!supported).then_some("quota_has_no_explicit_family_bucket"),
+            observed_at_ms,
+            Some(expires_at_ms),
+        )
+    };
+    let remaining = explicit_buckets
+        .iter()
+        .filter_map(|bucket| bucket.remaining_fraction)
+        .filter(|remaining| remaining.is_finite())
+        .collect::<Vec<_>>();
+    let (capacity_state, capacity_reason) = if remaining.iter().any(|remaining| *remaining > 0.0) {
+        (AccountCapabilityObservationState::Supported, None)
+    } else if !explicit_buckets.is_empty() && remaining.len() == explicit_buckets.len() {
+        (
+            AccountCapabilityObservationState::Unsupported,
+            Some("all_explicit_model_buckets_exhausted"),
+        )
+    } else {
+        (
+            AccountCapabilityObservationState::Unknown,
+            Some("quota_has_no_explicit_capacity"),
+        )
+    };
+
+    vec![
+        family_observation(GEMINI_QUOTA_FAMILY_DIMENSION, "gemini"),
+        family_observation(CLAUDE_QUOTA_FAMILY_DIMENSION, "claude"),
+        AccountCapabilityObservationDraft::antigravity_feature(
+            MODEL_CAPACITY_DIMENSION,
+            capacity_state,
+            "retrieve_user_quota",
+            capacity_reason,
+            observed_at_ms,
+            Some(expires_at_ms),
+        ),
+    ]
+}
+
+async fn observe_antigravity_privacy(
+    http: &reqwest::Client,
+    account: &Account,
+    project_id: Option<&str>,
+    access_token: &str,
+    observed_at_ms: i64,
+    request_timeout: Duration,
+) -> AccountCapabilityObservationDraft {
+    let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return antigravity_privacy_observation(
+            AccountCapabilityObservationState::Unknown,
+            "project_not_available",
+            observed_at_ms,
+        );
+    };
+    let url = match antigravity_fetch_user_info_url(account) {
+        Ok(url) => url,
+        Err(_) => {
+            return antigravity_privacy_observation(
+                AccountCapabilityObservationState::Unknown,
+                "privacy_endpoint_invalid",
+                observed_at_ms,
+            )
+        }
+    };
+    let request = http
+        .post(url)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "application/json")
+        .header(
+            USER_AGENT,
+            crate::provider_identity::antigravity_user_agent(),
+        )
+        .timeout(request_timeout)
+        .json(&json!({"project": project_id}));
+    let body = match request_json(account.provider_type, request, observed_at_ms).await {
+        Ok(body) => body,
+        Err(error) => {
+            let reason = match error.upstream_status {
+                Some(401) => "privacy_probe_unauthorized",
+                Some(403) => "privacy_probe_forbidden",
+                Some(429) => "privacy_probe_rate_limited",
+                Some(_) => "privacy_probe_upstream_error",
+                None => "privacy_probe_unavailable",
+            };
+            return antigravity_privacy_observation(
+                AccountCapabilityObservationState::Unknown,
+                reason,
+                observed_at_ms,
+            );
+        }
+    };
+    let Some(settings) = body.get("userSettings").and_then(Value::as_object) else {
+        return antigravity_privacy_observation(
+            AccountCapabilityObservationState::Unknown,
+            "privacy_response_missing_user_settings",
+            observed_at_ms,
+        );
+    };
+    if settings.contains_key("telemetryEnabled") {
+        antigravity_privacy_observation(
+            AccountCapabilityObservationState::Unsupported,
+            "telemetry_setting_present",
+            observed_at_ms,
+        )
+    } else {
+        antigravity_privacy_observation(
+            AccountCapabilityObservationState::Supported,
+            "telemetry_setting_absent",
+            observed_at_ms,
+        )
+    }
+}
+
+fn antigravity_privacy_observation(
+    state: AccountCapabilityObservationState,
+    reason: &'static str,
+    observed_at_ms: i64,
+) -> AccountCapabilityObservationDraft {
+    AccountCapabilityObservationDraft::antigravity_feature(
+        PRIVACY_DIMENSION,
+        state,
+        "fetch_user_info_read_only",
+        Some(reason),
+        observed_at_ms,
+        None,
+    )
 }
 
 fn gemini_code_assist_metadata(provider_type: ProviderType) -> Result<Value, QuotaRefreshFailure> {
@@ -1001,6 +1875,39 @@ fn gemini_code_assist_url(
             "unsupported Gemini Code Assist operation: {operation}"
         ))),
     }
+}
+
+fn antigravity_fetch_user_info_url(account: &Account) -> Result<String, QuotaRefreshFailure> {
+    #[cfg(test)]
+    if let Some(raw) = account.raw.as_ref() {
+        let configured = raw
+            .get("testAntigravityFetchUserInfoUrl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                raw.get("testGeminiCodeAssistBaseUrl")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|base| format!("{}/v1internal:fetchUserInfo", base.trim_end_matches('/')))
+            });
+        if let Some(configured) = configured {
+            let mut url = reqwest::Url::parse(&configured).map_err(|error| {
+                QuotaRefreshFailure::bad_request(format!(
+                    "{} test Antigravity fetchUserInfo URL is invalid: {error}",
+                    account.provider_type.as_str()
+                ))
+            })?;
+            url.set_fragment(None);
+            return Ok(url.to_string());
+        }
+    }
+
+    #[cfg(not(test))]
+    let _ = account;
+    Ok(ANTIGRAVITY_FETCH_USER_INFO_URL.to_string())
 }
 
 #[cfg(test)]
@@ -1256,6 +2163,15 @@ async fn refresh_grok_quota(
         now_ms,
         success_cooldown_ms,
     );
+    update
+        .capability_observations
+        .push(grok_media_entitlement_observation(
+            &user_probe,
+            &weekly_probe,
+            &monthly_probe,
+            &subscription_probe,
+            now_ms,
+        ));
     update.email = grok_email(&user_probe);
     update.entitlement_status = grok_entitlement_status(&user_probe);
     let issues = [
@@ -1337,7 +2253,7 @@ fn grok_optional_probe(
             skipped_reason: None,
         },
         Err(error) => {
-            let status_code = error.status_code;
+            let status_code = error.upstream_status.unwrap_or(error.status_code);
             GrokProbe {
                 body: None,
                 issue: Some(GrokProbeIssue {
@@ -1351,6 +2267,137 @@ fn grok_optional_probe(
             }
         }
     }
+}
+
+fn grok_media_entitlement_observation(
+    user: &Value,
+    weekly: &GrokProbe,
+    monthly: &GrokProbe,
+    subscriptions: &GrokProbe,
+    now_ms: i64,
+) -> AccountCapabilityObservationDraft {
+    use AccountCapabilityObservationState::{Supported, Unknown, Unsupported};
+
+    let (state, reason) = if [weekly, monthly]
+        .into_iter()
+        .any(|probe| probe.status_code == Some(403))
+    {
+        (Unsupported, "billing_probe_forbidden")
+    } else {
+        let current_values = [
+            Some(user),
+            weekly.body.as_ref(),
+            monthly.body.as_ref(),
+            subscriptions.body.as_ref(),
+        ];
+        let paid_access = current_values
+            .into_iter()
+            .flatten()
+            .any(grok_value_reports_paid_access);
+        let explicit_free = current_values
+            .into_iter()
+            .flatten()
+            .any(grok_value_reports_free_plan);
+        let spending_exhausted = user
+            .pointer("/spendingLimitReached")
+            .or_else(|| user.pointer("/spending_limit_reached"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || weekly.spending_limited
+            || monthly.spending_limited
+            || weekly
+                .body
+                .as_ref()
+                .is_some_and(|body| grok_billing_reports_exhausted(body, paid_access))
+            || monthly
+                .body
+                .as_ref()
+                .is_some_and(|body| grok_billing_reports_exhausted(body, paid_access));
+        let authoritative_quota = [weekly.body.as_ref(), monthly.body.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(grok_has_authoritative_media_quota_shape);
+        let complete_billing = weekly.status_code == Some(200)
+            && weekly.body.is_some()
+            && monthly.status_code == Some(200)
+            && monthly.body.is_some();
+
+        if paid_access && authoritative_quota {
+            (Supported, "paid_access_with_authoritative_quota")
+        } else if spending_exhausted && !paid_access {
+            (Unsupported, "spending_exhausted_without_subscription")
+        } else if explicit_free && complete_billing {
+            (Unsupported, "free_plan_with_complete_billing")
+        } else if paid_access {
+            (Unknown, "paid_access_without_authoritative_quota")
+        } else if weekly.issue.is_some()
+            || monthly.issue.is_some()
+            || weekly.body.is_none()
+            || monthly.body.is_none()
+        {
+            (Unknown, "billing_probe_incomplete")
+        } else {
+            (Unknown, "no_authoritative_media_entitlement")
+        }
+    };
+
+    AccountCapabilityObservationDraft::grok_feature(
+        MEDIA_ENTITLEMENT_DIMENSION,
+        state,
+        "grok_quota_probes",
+        Some(reason),
+        now_ms,
+    )
+}
+
+fn grok_value_reports_paid_access(value: &Value) -> bool {
+    let explicit_access = [
+        "/hasGrokCodeAccess",
+        "/has_grok_code_access",
+        "/hasGrokBuildAccess",
+        "/has_grok_build_access",
+        "/entitlement/hasGrokCodeAccess",
+        "/entitlement/has_grok_code_access",
+        "/config/isUnifiedBillingUser",
+        "/config/is_unified_billing_user",
+        "/isUnifiedBillingUser",
+    ]
+    .into_iter()
+    .any(|pointer| value.pointer(pointer).and_then(Value::as_bool) == Some(true));
+    explicit_access
+        || grok_subscription_level(value)
+            .as_deref()
+            .is_some_and(grok_plan_name_is_paid)
+}
+
+fn grok_value_reports_free_plan(value: &Value) -> bool {
+    grok_subscription_level(value)
+        .as_deref()
+        .is_some_and(grok_plan_name_is_free)
+}
+
+fn grok_plan_name_is_paid(plan: &str) -> bool {
+    let normalized = plan.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "free" | "none" | "null" | "unknown" | "unsubscribed" | "no_subscription"
+        )
+}
+
+fn grok_plan_name_is_free(plan: &str) -> bool {
+    let normalized = plan.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(
+        normalized.as_str(),
+        "free" | "none" | "null" | "unsubscribed" | "no_subscription"
+    )
+}
+
+fn grok_has_authoritative_media_quota_shape(body: &Value) -> bool {
+    grok_weekly_billing_tiers(body, true)
+        .into_iter()
+        .chain(grok_monthly_billing_tiers(body))
+        .any(|tier| tier.name != "grok_spending_limit")
 }
 
 async fn grok_probe_json(
@@ -2300,7 +3347,6 @@ fn refresh_imported_snapshot_quota(
     success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let quota = match account.provider_type {
-        ProviderType::GitHubCopilot => parse_copilot_imported_quota(account, now_ms),
         ProviderType::KiroOAuth => parse_kiro_imported_quota(account, now_ms),
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             parse_cursor_imported_quota(account, now_ms)
@@ -2313,13 +3359,12 @@ fn refresh_imported_snapshot_quota(
         }
     }?;
     let subscription_level = quota.credential_message.clone();
-    Ok(update_from_quota(
-        quota,
-        subscription_level,
-        None,
-        now_ms,
-        success_cooldown_ms,
-    ))
+    let mut update =
+        update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms);
+    if account.provider_type == ProviderType::KiroOAuth {
+        update.quota_percent = update.quota.as_ref().and_then(agentic_quota_percent);
+    }
+    Ok(update)
 }
 
 async fn refresh_ollama_cloud_quota(
@@ -2365,15 +3410,7 @@ async fn refresh_kiro_quota(
         })?;
     let raw = account.raw.as_ref();
     let profile = account.profile.as_ref();
-    let api_region = raw
-        .and_then(|value| string_at(value, &["/apiRegion", "/api_region"]))
-        .or_else(|| profile.and_then(|value| string_at(value, &["/apiRegion", "/api_region"])))
-        .or_else(|| profile.and_then(region_from_profile_value))
-        .unwrap_or_else(|| "us-east-1".to_string());
-    let profile_arn = profile
-        .and_then(|value| string_at(value, &["/profileArn", "/profile_arn"]))
-        .or_else(|| raw.and_then(|value| string_at(value, &["/resolvedProfileArn", "/profileArn"])))
-        .unwrap_or_else(|| default_profile_arn(raw.unwrap_or(&Value::Null), &api_region));
+    let runtime = kiro_quota_runtime_identity(account)?;
     let machine_id = raw
         .and_then(|value| string_at(value, &["/machineId", "/machine_id"]))
         .or_else(|| profile.and_then(|value| string_at(value, &["/machineId", "/machine_id"])))
@@ -2389,8 +3426,8 @@ async fn refresh_kiro_quota(
         request_timeout,
         fetch_usage_limits(
             &http,
-            &api_region,
-            &profile_arn,
+            &runtime.runtime_region,
+            runtime.profile_arn.as_deref(),
             &machine_id,
             access_token,
             kiro_quota_token_type(account),
@@ -2433,10 +3470,19 @@ async fn refresh_kiro_quota(
         object.insert("kiroUsageLimits".to_string(), usage);
         object.insert("quotaRefreshedAtMs".to_string(), Value::from(now_ms));
     }
-    Ok(
+    let quota_percent = agentic_quota_percent(&quota);
+    let mut update =
         update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms)
-            .with_raw(raw),
-    )
+            .with_raw(raw);
+    update.quota_percent = quota_percent;
+    Ok(update)
+}
+
+fn kiro_quota_runtime_identity(
+    account: &Account,
+) -> Result<crate::domain::providers::kiro::KiroRuntimeIdentity, QuotaRefreshFailure> {
+    crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
+        .map_err(|error| QuotaRefreshFailure::bad_request(error.to_string()))
 }
 
 fn kiro_quota_token_type(account: &Account) -> Option<&'static str> {
@@ -2457,15 +3503,6 @@ fn kiro_quota_token_type(account: &Account) -> Option<&'static str> {
         "external_idp" | "external-idp" | "externalidp" => Some("EXTERNAL_IDP"),
         _ => None,
     }
-}
-
-fn region_from_profile_value(value: &Value) -> Option<String> {
-    let arn = string_at(value, &["/profileArn", "/profile_arn"])?;
-    let mut parts = arn.split(':');
-    (parts.next() == Some("arn")).then_some(())?;
-    (parts.next() == Some("aws")).then_some(())?;
-    (parts.next() == Some("codewhisperer")).then_some(())?;
-    parts.next().map(str::to_string)
 }
 
 trait AccountRefreshUpdateExt {
@@ -3232,30 +4269,155 @@ fn parse_ollama_me_update(
     }
 }
 
-fn parse_copilot_imported_quota(
+async fn refresh_copilot_quota(
+    http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let domain = copilot_account_domain_for_quota(account)?;
+    let github_token = copilot_github_token_for_quota(account).ok_or_else(|| {
+        QuotaRefreshFailure::bad_request(
+            "github_copilot account requires the GitHub OAuth token used for device login",
+        )
+    })?;
+    #[cfg(test)]
+    let usage_url_override = account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testCopilotUsageUrl"))
+        .and_then(Value::as_str);
+    #[cfg(test)]
+    let usage = match usage_url_override {
+        Some(url) => {
+            crate::clients::oauth::copilot_device::fetch_copilot_usage_from_url_with_timeout(
+                http,
+                url,
+                &github_token,
+                Some(request_timeout),
+            )
+            .await
+        }
+        None => {
+            crate::clients::oauth::copilot_device::fetch_copilot_usage_with_timeout(
+                http,
+                &domain,
+                &github_token,
+                Some(request_timeout),
+            )
+            .await
+        }
+    };
+    #[cfg(not(test))]
+    let usage = crate::clients::oauth::copilot_device::fetch_copilot_usage_with_timeout(
+        http,
+        &domain,
+        &github_token,
+        Some(request_timeout),
+    )
+    .await;
+    let usage = usage.map_err(|error| {
+        if error.status.is_client_error() || error.status.is_server_error() {
+            QuotaRefreshFailure::upstream(
+                account.provider_type,
+                error.status,
+                error.message,
+                None,
+                now_ms,
+            )
+        } else {
+            QuotaRefreshFailure {
+                status_code: 502,
+                upstream_status: None,
+                message: error.message,
+                retryable: true,
+                next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+                partial_update: None,
+            }
+        }
+    })?;
+    let quota = parse_copilot_usage_quota(&usage, now_ms)?;
+    let subscription_level = quota.credential_message.clone();
+    let mut raw = account
+        .raw
+        .clone()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("copilotUsage".to_string(), usage);
+        object.insert("quotaRefreshedAtMs".to_string(), Value::from(now_ms));
+    }
+    let mut update =
+        update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms);
+    update.raw = Some(raw);
+    update
+        .capability_observations
+        .push(AccountCapabilityObservationDraft::copilot_feature(
+            crate::domain::accounts::capability_evidence::PREMIUM_INTERACTIONS_DIMENSION,
+            AccountCapabilityObservationState::Supported,
+            "copilot_internal_user",
+            None,
+            now_ms,
+        ));
+    Ok(update)
+}
+
+fn copilot_account_domain_for_quota(account: &Account) -> Result<String, QuotaRefreshFailure> {
+    let domain = [&account.raw, &account.profile]
+        .into_iter()
+        .filter_map(|value| value.as_ref())
+        .find_map(|value| string_at(value, &["/githubDomain", "/github_domain"]))
+        .unwrap_or_else(|| "github.com".to_string());
+    crate::clients::oauth::copilot_device::normalize_github_domain(&domain)
+        .map_err(|error| QuotaRefreshFailure::bad_request(error.message))
+}
+
+fn copilot_github_token_for_quota(account: &Account) -> Option<String> {
+    account
+        .raw
+        .as_ref()
+        .and_then(|raw| string_at(raw, &["/githubToken", "/github_token"]))
+        .or_else(|| account.refresh_token.clone())
+        .or_else(|| account.api_key.clone())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn parse_copilot_usage_quota(
+    snapshot: &Value,
+    now_ms: i64,
 ) -> Result<AccountQuota, QuotaRefreshFailure> {
-    let snapshot = require_imported_snapshot(
-        account,
-        &[
-            "/copilotUsage",
-            "/copilot_usage",
-            "/usage",
-            "/quota",
-            "/billingOrQuotaSnapshot",
-            "",
-        ],
-        "Copilot usage response",
-    )?;
     let usage = serde_json::from_value::<CopilotImportedUsage>(snapshot.clone()).ok();
-    let premium = usage
+    let plan = usage
+        .as_ref()
+        .and_then(|usage| usage.copilot_plan.clone())
+        .or_else(|| string_at(snapshot, &["/copilotPlan", "/copilot_plan", "/plan"]));
+    let paid_reset = usage
+        .as_ref()
+        .and_then(|usage| usage.quota_reset_date.clone())
+        .or_else(|| {
+            string_at(
+                snapshot,
+                &["/quotaResetDate", "/quota_reset_date", "/resetAt"],
+            )
+        });
+    let limited_reset = string_at(
+        snapshot,
+        &[
+            "/limited_user_reset_date",
+            "/limitedUserResetDate",
+            "/monthly_reset_date",
+            "/monthlyResetDate",
+        ],
+    );
+    let paid = usage
         .as_ref()
         .and_then(|usage| usage.quota_snapshots.as_ref())
         .and_then(|snapshots| snapshots.premium_interactions.clone())
         .or_else(|| {
             value_at(
-                &snapshot,
+                snapshot,
                 &[
                     "/quota_snapshots/premium_interactions",
                     "/quotaSnapshots/premiumInteractions",
@@ -3265,58 +4427,147 @@ fn parse_copilot_imported_quota(
             )
             .and_then(|value| serde_json::from_value::<CopilotQuotaDetail>(value).ok())
         })
-        .ok_or_else(|| {
-            QuotaRefreshFailure::bad_request(
-                "github_copilot raw snapshot is missing premium_interactions quota",
-            )
-        })?;
-    let plan = usage
-        .as_ref()
-        .and_then(|usage| usage.copilot_plan.clone())
-        .or_else(|| string_at(&snapshot, &["/copilotPlan", "/copilot_plan", "/plan"]));
-    let reset = usage
-        .as_ref()
-        .and_then(|usage| usage.quota_reset_date.clone())
-        .or_else(|| {
-            string_at(
-                &snapshot,
-                &["/quotaResetDate", "/quota_reset_date", "/resetAt"],
-            )
-        });
-    let utilization = if premium.unlimited.unwrap_or(false) {
-        0.0
-    } else if let Some(percent_remaining) = premium.percent_remaining {
-        percent_to_fraction(100.0 - percent_remaining)
+        .filter(CopilotQuotaDetail::has_evidence);
+    let limited_total = number_at(
+        snapshot,
+        &[
+            "/monthly_quotas/premium_interactions",
+            "/monthlyQuotas/premiumInteractions",
+        ],
+    );
+    let limited_remaining = number_at(
+        snapshot,
+        &[
+            "/limited_user_quotas/premium_interactions",
+            "/limitedUserQuotas/premiumInteractions",
+        ],
+    );
+
+    let (tier, reset, source_shape) = if let Some(premium) = paid {
+        (
+            copilot_tier_from_detail(&premium, paid_reset.as_deref()),
+            paid_reset,
+            "quota_snapshots",
+        )
+    } else if let Some(total) = limited_total.filter(|value| *value > 0.0) {
+        let remaining = limited_remaining.unwrap_or(0.0).clamp(0.0, total);
+        (
+            AccountQuotaTier {
+                name: "premium".to_string(),
+                label: None,
+                utilization: Some(((total - remaining) / total).clamp(0.0, 1.0)),
+                used: Some((total - remaining).max(0.0)),
+                limit: Some(total),
+                unit: Some("premium_interactions".to_string()),
+                resets_at: limited_reset.as_deref().and_then(dateish_to_unix_ms),
+            },
+            limited_reset,
+            "monthly_quotas",
+        )
     } else {
-        match (premium.entitlement, premium.remaining) {
-            (Some(entitlement), Some(remaining)) if entitlement > 0.0 => {
-                ((entitlement - remaining).max(0.0) / entitlement).clamp(0.0, 1.0)
-            }
-            _ => 0.0,
-        }
-    };
-    let used = match (premium.entitlement, premium.remaining) {
-        (Some(entitlement), Some(remaining)) => Some((entitlement - remaining).max(0.0)),
-        _ => None,
+        return Err(QuotaRefreshFailure::bad_request(
+            "github_copilot usage response is missing premium_interactions quota",
+        ));
     };
     Ok(AccountQuota {
         success: true,
-        credential_message: plan.as_deref().map(format_copilot_plan_label),
-        tiers: vec![AccountQuotaTier {
-            name: "premium".to_string(),
-            label: None,
-            utilization: Some(utilization),
-            used,
-            limit: premium.entitlement,
-            unit: Some("premium_interactions".to_string()),
-            resets_at: reset.as_deref().and_then(dateish_to_unix_ms),
-        }],
+        credential_message: Some(copilot_plan_label(
+            snapshot,
+            plan.as_deref(),
+            tier.limit,
+            source_shape,
+        )),
+        tiers: vec![tier],
         extra_usage: Some(json!({
             "raw": snapshot,
-            "source": "imported_snapshot",
+            "source": "copilot_internal_user",
+            "shape": source_shape,
+            "resetAt": reset,
             "queriedAt": now_ms,
         })),
     })
+}
+
+fn copilot_tier_from_detail(premium: &CopilotQuotaDetail, reset: Option<&str>) -> AccountQuotaTier {
+    let unlimited = premium.unlimited.unwrap_or(false);
+    let limit = premium
+        .entitlement
+        .or(premium.total)
+        .map(|value| value.max(0.0));
+    let remaining = premium.remaining.map(|value| {
+        let value = value.max(0.0);
+        limit.map_or(value, |limit| value.min(limit))
+    });
+    let used = premium
+        .used
+        .map(|value| {
+            let value = value.max(0.0);
+            limit.map_or(value, |limit| value.min(limit))
+        })
+        .or_else(|| {
+            limit
+                .zip(remaining)
+                .map(|(limit, remaining)| (limit - remaining).max(0.0))
+        });
+    let utilization = if unlimited {
+        0.0
+    } else if let Some(percent_remaining) = premium.percent_remaining {
+        percent_to_fraction(100.0 - percent_remaining.clamp(0.0, 100.0))
+    } else if let Some((limit, remaining)) = limit.zip(remaining).filter(|(limit, _)| *limit > 0.0)
+    {
+        ((limit - remaining) / limit).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    AccountQuotaTier {
+        name: "premium".to_string(),
+        label: unlimited.then(|| "Unlimited".to_string()),
+        utilization: Some(utilization),
+        used: unlimited.then_some(0.0).or(used),
+        limit: if unlimited { None } else { limit },
+        unit: Some("premium_interactions".to_string()),
+        resets_at: reset.and_then(dateish_to_unix_ms),
+    }
+}
+
+impl CopilotQuotaDetail {
+    fn has_evidence(&self) -> bool {
+        self.unlimited == Some(true)
+            || self.entitlement.is_some()
+            || self.total.is_some()
+            || self.remaining.is_some()
+            || self.used.is_some()
+            || self.percent_remaining.is_some()
+    }
+}
+
+fn copilot_plan_label(
+    snapshot: &Value,
+    plan: Option<&str>,
+    premium_limit: Option<f64>,
+    source_shape: &str,
+) -> String {
+    let sku = string_at(snapshot, &["/access_type_sku", "/accessTypeSku"]).unwrap_or_default();
+    let combined = format!("{} {}", sku, plan.unwrap_or_default()).to_ascii_uppercase();
+    if combined.contains("PRO+") || combined.contains("PRO_PLUS") || combined.contains("PROPLUS") {
+        "Copilot Pro+".to_string()
+    } else if combined.contains("ENTERPRISE") {
+        "Copilot Enterprise".to_string()
+    } else if combined.contains("BUSINESS") {
+        "Copilot Business".to_string()
+    } else if combined.contains("STUDENT") {
+        "Copilot Student".to_string()
+    } else if combined.contains("FREE") || source_shape == "monthly_quotas" {
+        "Copilot Free".to_string()
+    } else if combined.contains("PRO") {
+        "Copilot Pro".to_string()
+    } else if premium_limit.is_some_and(|limit| limit >= 1_400.0) {
+        "Copilot Pro+".to_string()
+    } else if let Some(plan) = plan {
+        format_copilot_plan_label(plan)
+    } else {
+        "GitHub Copilot".to_string()
+    }
 }
 
 fn parse_kiro_imported_quota(
@@ -3337,43 +4588,24 @@ fn parse_kiro_imported_quota(
         ],
         "Kiro getUsageLimits response",
     )?;
-    let usage: KiroImportedUsageLimitsResponse =
-        serde_json::from_value(snapshot.clone()).map_err(|error| {
-            QuotaRefreshFailure::bad_request(format!(
-                "kiro_oauth imported usage limits snapshot is invalid: {error}"
-            ))
-        })?;
-    let current_usage = usage.current_usage();
-    let usage_limit = usage.usage_limit();
-    let utilization = if usage_limit > 0.0 {
-        (current_usage / usage_limit).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    Ok(AccountQuota {
-        success: true,
-        credential_message: usage
-            .subscription_title()
-            .map(str::to_string)
-            .or_else(|| Some("Kiro OAuth".to_string())),
-        tiers: vec![AccountQuotaTier {
-            name: "kiro_agentic_requests".to_string(),
-            label: None,
-            utilization: Some(utilization),
-            used: Some(current_usage),
-            limit: Some(usage_limit),
-            unit: Some("credits".to_string()),
-            resets_at: usage
-                .next_reset_timestamp()
-                .and_then(timestamp_number_to_unix_ms),
-        }],
-        extra_usage: Some(json!({
-            "raw": snapshot,
-            "source": "imported_snapshot",
-            "overageEnabled": usage.overage_enabled(),
-            "queriedAt": now_ms,
-        })),
-    })
+    if !snapshot.is_object() {
+        return Err(QuotaRefreshFailure::bad_request(
+            "kiro_oauth imported usage limits snapshot must be a JSON object",
+        ));
+    }
+    let plan = string_at(
+        &snapshot,
+        &[
+            "/subscriptionInfo/subscriptionTitle",
+            "/subscription_info/subscription_title",
+        ],
+    )
+    .or_else(|| Some("Kiro OAuth".to_string()));
+    let mut quota = quota_from_usage_limits(snapshot, plan, now_ms);
+    if let Some(extra_usage) = quota.extra_usage.as_mut().and_then(Value::as_object_mut) {
+        extra_usage.insert("source".to_string(), json!("imported_snapshot"));
+    }
+    Ok(quota)
 }
 
 fn parse_cursor_imported_quota(
@@ -4628,157 +5860,15 @@ struct CopilotQuotaDetail {
     #[serde(default)]
     entitlement: Option<f64>,
     #[serde(default)]
+    total: Option<f64>,
+    #[serde(default)]
     remaining: Option<f64>,
+    #[serde(default)]
+    used: Option<f64>,
     #[serde(default, alias = "percentRemaining")]
     percent_remaining: Option<f64>,
     #[serde(default)]
     unlimited: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroImportedUsageLimitsResponse {
-    #[serde(default, alias = "next_date_reset")]
-    next_date_reset: Option<f64>,
-    #[serde(default, alias = "subscription_info")]
-    subscription_info: Option<KiroImportedSubscriptionInfo>,
-    #[serde(default, alias = "usage_breakdown_list")]
-    usage_breakdown_list: Vec<KiroImportedUsageBreakdown>,
-    #[serde(default, alias = "overage_configuration")]
-    overage_configuration: Option<KiroImportedOverageConfiguration>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroImportedSubscriptionInfo {
-    #[serde(default, alias = "subscription_title")]
-    subscription_title: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroImportedOverageConfiguration {
-    #[serde(default, alias = "overage_enabled")]
-    overage_enabled: Option<bool>,
-    #[serde(default, alias = "overage_status")]
-    overage_status: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroImportedUsageBreakdown {
-    #[serde(default, alias = "current_usage_with_precision")]
-    current_usage_with_precision: f64,
-    #[serde(default)]
-    bonuses: Vec<KiroImportedBonus>,
-    #[serde(default, alias = "free_trial_info")]
-    free_trial_info: Option<KiroImportedFreeTrialInfo>,
-    #[serde(default, alias = "next_date_reset")]
-    next_date_reset: Option<f64>,
-    #[serde(default, alias = "usage_limit_with_precision")]
-    usage_limit_with_precision: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroImportedBonus {
-    #[serde(default, alias = "current_usage")]
-    current_usage: f64,
-    #[serde(default, alias = "usage_limit")]
-    usage_limit: f64,
-    #[serde(default)]
-    status: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KiroImportedFreeTrialInfo {
-    #[serde(default, alias = "current_usage_with_precision")]
-    current_usage_with_precision: f64,
-    #[serde(default, alias = "free_trial_status")]
-    free_trial_status: Option<String>,
-    #[serde(default, alias = "usage_limit_with_precision")]
-    usage_limit_with_precision: f64,
-}
-
-impl KiroImportedBonus {
-    fn is_active(&self) -> bool {
-        self.status
-            .as_deref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("ACTIVE"))
-    }
-}
-
-impl KiroImportedFreeTrialInfo {
-    fn is_active(&self) -> bool {
-        self.free_trial_status
-            .as_deref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("ACTIVE"))
-    }
-}
-
-impl KiroImportedUsageLimitsResponse {
-    fn subscription_title(&self) -> Option<&str> {
-        self.subscription_info
-            .as_ref()
-            .and_then(|info| info.subscription_title.as_deref())
-    }
-
-    fn overage_enabled(&self) -> Option<bool> {
-        let config = self.overage_configuration.as_ref()?;
-        config.overage_enabled.or_else(|| {
-            config
-                .overage_status
-                .as_deref()
-                .map(|status| status.eq_ignore_ascii_case("ENABLED"))
-        })
-    }
-
-    fn primary_breakdown(&self) -> Option<&KiroImportedUsageBreakdown> {
-        self.usage_breakdown_list.first()
-    }
-
-    fn current_usage(&self) -> f64 {
-        let Some(breakdown) = self.primary_breakdown() else {
-            return 0.0;
-        };
-        let mut total = breakdown.current_usage_with_precision;
-        if let Some(trial) = &breakdown.free_trial_info {
-            if trial.is_active() {
-                total += trial.current_usage_with_precision;
-            }
-        }
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.current_usage;
-            }
-        }
-        total
-    }
-
-    fn usage_limit(&self) -> f64 {
-        let Some(breakdown) = self.primary_breakdown() else {
-            return 0.0;
-        };
-        let mut total = breakdown.usage_limit_with_precision;
-        if let Some(trial) = &breakdown.free_trial_info {
-            if trial.is_active() {
-                total += trial.usage_limit_with_precision;
-            }
-        }
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.usage_limit;
-            }
-        }
-        total
-    }
-
-    fn next_reset_timestamp(&self) -> Option<f64> {
-        self.primary_breakdown()
-            .and_then(|breakdown| breakdown.next_date_reset)
-            .or(self.next_date_reset)
-    }
 }
 
 fn normalize_claude_tier_name(name: &str) -> &str {
@@ -5155,6 +6245,60 @@ mod tests {
         (format!("http://{address}"), observations, server)
     }
 
+    async fn serve_antigravity_code_assist(
+        quota_body: Value,
+        privacy_status: axum::http::StatusCode,
+        privacy_body: Value,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<GeminiCodeAssistObservation>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                let (operation, status, response_body) = match uri.path() {
+                    "/v1internal:loadCodeAssist" => (
+                        "loadCodeAssist",
+                        axum::http::StatusCode::OK,
+                        json!({
+                            "cloudaicompanionProject": {"id": "antigravity-project"},
+                            "currentTier": {"name": "PRO"}
+                        }),
+                    ),
+                    "/v1internal:retrieveUserQuota" => (
+                        "retrieveUserQuota",
+                        axum::http::StatusCode::OK,
+                        quota_body.clone(),
+                    ),
+                    "/v1internal:fetchUserInfo" => {
+                        ("fetchUserInfo", privacy_status, privacy_body.clone())
+                    }
+                    _ => (
+                        "unknown",
+                        axum::http::StatusCode::NOT_FOUND,
+                        json!({"error": "not found"}),
+                    ),
+                };
+                async move {
+                    observations
+                        .lock()
+                        .unwrap()
+                        .push(gemini_observation(operation, &headers, &body));
+                    gemini_test_response(status, response_body)
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), observations, server)
+    }
+
     fn gemini_observation(
         operation: &'static str,
         headers: &axum::http::HeaderMap,
@@ -5241,6 +6385,147 @@ mod tests {
         assert!(failure.partial_update.is_none());
     }
 
+    #[test]
+    fn qoder_quota_preserves_add_on_and_org_balances_before_limiting() {
+        let now_ms = 1_700_000_000_000;
+        let reset_at = now_ms + 3_600_000;
+        let account = imported_account(ProviderType::QoderCosy, json!({}));
+        let update = parse_qoder_quota_update(
+            &account,
+            &json!({
+                "userType": "teams",
+                "usageType": "credits",
+                "isQuotaExceeded": true,
+                "expiresAt": reset_at,
+                "userQuota": {"total": 100, "used": 100, "remaining": 0, "percentage": 100},
+                "add_on_quota": {"cap": 50, "used": 10, "remaining": 40},
+                "sharedQuota": {"used": 25, "remaining": 75, "unit": "credits"}
+            }),
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+
+        assert_eq!(update.rate_limited_until, None);
+        assert_eq!(update.clear_rate_limited_until_if, Some(reset_at));
+        assert_eq!(update.quota_percent, Some(54.0));
+        let quota = update.quota.unwrap();
+        assert_eq!(quota.tiers.len(), 3);
+        assert_eq!(quota.tiers[0].name, "qoder_user");
+        assert_eq!(quota.tiers[1].name, "qoder_add_on");
+        assert_eq!(quota.tiers[1].limit, Some(50.0));
+        assert_eq!(quota.tiers[2].name, "qoder_organization");
+        assert_eq!(quota.tiers[2].limit, Some(100.0));
+        let extra = quota.extra_usage.unwrap();
+        assert_eq!(extra["qoderQuota"]["availability"], "available");
+        assert_eq!(extra["qoderQuota"]["exhausted"], false);
+        assert_eq!(
+            extra["qoderQuota"]["buckets"]["qoder_add_on"]["source"],
+            "add_on_quota"
+        );
+        assert_eq!(
+            extra["qoderQuota"]["buckets"]["qoder_organization"]["source"],
+            "sharedQuota"
+        );
+    }
+
+    #[test]
+    fn qoder_quota_limits_only_when_every_present_bucket_is_exhausted() {
+        let now_ms = 1_700_000_000_000;
+        let reset_at = now_ms + 3_600_000;
+        let account = imported_account(ProviderType::QoderCosy, json!({}));
+        let update = parse_qoder_quota_update(
+            &account,
+            &json!({
+                "userType": "teams",
+                "isQuotaExceeded": true,
+                "expiresAt": reset_at,
+                "userQuota": {"total": 100, "used": 100},
+                "addOnQuota": {"total": 50, "used": 50, "remaining": 0},
+                "orgResourcePackage": {"cap": 25, "used": 25, "remaining": 0}
+            }),
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+
+        assert_eq!(update.rate_limited_until, Some(reset_at));
+        assert_eq!(update.clear_rate_limited_until_if, None);
+        assert_eq!(update.quota_percent, Some(100.0));
+        assert_eq!(
+            update.quota.unwrap().extra_usage.unwrap()["qoderQuota"]["exhausted"],
+            true
+        );
+    }
+
+    #[test]
+    fn qoder_quota_missing_balance_and_personal_zero_are_unknown_not_exhausted() {
+        let now_ms = 1_700_000_000_000;
+        let reset_at = now_ms + 3_600_000;
+        let account = imported_account(ProviderType::QoderCosy, json!({}));
+
+        let incomplete = parse_qoder_quota_update(
+            &account,
+            &json!({
+                "userType": "teams",
+                "isQuotaExceeded": true,
+                "expiresAt": reset_at,
+                "userQuota": {"total": 100, "used": 100},
+                "orgResourcePackage": {"available": true}
+            }),
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+        assert_eq!(incomplete.rate_limited_until, None);
+        assert_eq!(
+            incomplete.quota.unwrap().extra_usage.unwrap()["qoderQuota"]["availability"],
+            "unknown"
+        );
+
+        let personal_zero = parse_qoder_quota_update(
+            &account,
+            &json!({
+                "userType": "personal_standard",
+                "isQuotaExceeded": true,
+                "expiresAt": 253402214400000_i64,
+                "userQuota": {"total": 0, "used": 0, "remaining": 0, "percentage": 0}
+            }),
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+        assert_eq!(personal_zero.rate_limited_until, None);
+        let extra = personal_zero.quota.unwrap().extra_usage.unwrap();
+        assert_eq!(extra["qoderQuota"]["personalZeroUnknown"], true);
+        assert_eq!(extra["qoderQuota"]["availability"], "unknown");
+    }
+
+    #[test]
+    fn qoder_quota_rejects_conflicting_aliases_and_invalid_numbers() {
+        let account = imported_account(ProviderType::QoderCosy, json!({}));
+        let aliases = parse_qoder_quota_update(
+            &account,
+            &json!({
+                "addOnQuota": {"total": 1, "remaining": 1},
+                "add_on_quota": {"total": 2, "remaining": 2}
+            }),
+            1_000,
+            300_000,
+        )
+        .unwrap_err();
+        assert!(aliases.message.contains("conflicting"));
+
+        let negative = parse_qoder_quota_update(
+            &account,
+            &json!({"userQuota": {"total": -1, "remaining": 0}}),
+            1_000,
+            300_000,
+        )
+        .unwrap_err();
+        assert!(negative.message.contains("non-negative"));
+    }
+
     #[tokio::test]
     async fn gemini_cli_project_load_uses_official_identity_and_merges_tier() {
         let (base_url, observations, server) = serve_gemini_code_assist(
@@ -5268,6 +6553,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(update.subscription_level.as_deref(), Some("PAID_ID"));
+        assert_eq!(update.capability_observations.len(), 1);
+        assert_eq!(
+            update.capability_observations[0].dimension,
+            crate::domain::accounts::capability_evidence::PROJECT_PROVISIONING_DIMENSION
+        );
+        assert_eq!(
+            update.capability_observations[0].state,
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported
+        );
         let profile = update.profile.unwrap();
         assert_eq!(profile["projectId"], "discovered-project");
         assert_eq!(profile["tier"], "PAID_ID");
@@ -5301,6 +6595,110 @@ mod tests {
             json!({"metadata": {"ideType": "GEMINI_CLI", "pluginType": "GEMINI"}})
         );
         drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_quota_records_current_project_and_model_entitlement_evidence() {
+        let (base_url, observations, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::OK,
+            json!({
+                "cloudaicompanionProject": {"id": "entitled-project"},
+                "currentTier": {"name": "STANDARD"}
+            }),
+            axum::http::StatusCode::OK,
+            json!({
+                "buckets": [{
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.75,
+                    "resetTime": "2026-08-13T00:00:00Z"
+                }]
+            }),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::GeminiCli,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            None,
+        );
+
+        let update = refresh_gemini_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_000,
+            30_000,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(update.capability_observations.len(), 2);
+        assert!(update.capability_observations.iter().any(|observation| {
+            observation.dimension
+                == crate::domain::accounts::capability_evidence::PROJECT_PROVISIONING_DIMENSION
+                && observation.state
+                    == crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported
+        }));
+        assert!(update.capability_observations.iter().any(|observation| {
+            observation.dimension
+                == crate::domain::accounts::capability_evidence::MODEL_ENTITLEMENT_DIMENSION
+                && observation.state
+                    == crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported
+                && observation.expires_at_ms == 61_000
+        }));
+        assert_eq!(update.quota.as_ref().unwrap().tiers.len(), 1);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].operation, "loadCodeAssist");
+        assert_eq!(observations[1].operation, "retrieveUserQuota");
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_empty_model_quota_records_unknown_not_unsupported_entitlement() {
+        let (base_url, _, server) = serve_gemini_code_assist(
+            axum::http::StatusCode::OK,
+            json!({
+                "cloudaicompanionProject": "empty-quota-project",
+                "currentTier": "FREE"
+            }),
+            axum::http::StatusCode::OK,
+            json!({"buckets": []}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::GeminiCli,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            None,
+        );
+
+        let update = refresh_gemini_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_000,
+            30_000,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        let entitlement = update
+            .capability_observations
+            .iter()
+            .find(|observation| {
+                observation.dimension
+                    == crate::domain::accounts::capability_evidence::MODEL_ENTITLEMENT_DIMENSION
+            })
+            .unwrap();
+        assert_eq!(
+            entitlement.state,
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unknown
+        );
+        assert_eq!(
+            entitlement.reason.as_deref(),
+            Some("quota_has_no_model_buckets")
+        );
         server.abort();
     }
 
@@ -5360,6 +6758,190 @@ mod tests {
         }
         drop(observations);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_quota_emits_project_tier_families_capacity_and_read_only_privacy() {
+        let (base_url, observations, server) = serve_antigravity_code_assist(
+            json!({
+                "buckets": [
+                    {"modelId": "gemini-2.5-pro", "remainingFraction": 0.75},
+                    {"modelId": "claude-sonnet-4-5", "remainingFraction": 0.25}
+                ]
+            }),
+            axum::http::StatusCode::OK,
+            json!({"userSettings": {}}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::AntigravityOAuth,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            None,
+        );
+
+        let update = refresh_antigravity_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_000,
+            30_000,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let state_for = |dimension: &str| {
+            update
+                .capability_observations
+                .iter()
+                .find(|observation| {
+                    observation.capability
+                        == crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY
+                        && observation.dimension == dimension
+                })
+                .map(|observation| observation.state)
+        };
+        for dimension in [
+            PROJECT_BOOTSTRAP_DIMENSION,
+            TIER_ENTITLEMENT_DIMENSION,
+            GEMINI_QUOTA_FAMILY_DIMENSION,
+            CLAUDE_QUOTA_FAMILY_DIMENSION,
+            MODEL_CAPACITY_DIMENSION,
+            PRIVACY_DIMENSION,
+        ] {
+            assert_eq!(
+                state_for(dimension),
+                Some(AccountCapabilityObservationState::Supported),
+                "{dimension} must be supported"
+            );
+        }
+        let evidence_json = serde_json::to_string(&update.capability_observations).unwrap();
+        assert!(!evidence_json.contains("antigravity-project"));
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.operation)
+                .collect::<Vec<_>>(),
+            ["loadCodeAssist", "retrieveUserQuota", "fetchUserInfo"]
+        );
+        assert!(observations
+            .iter()
+            .all(|observation| observation.operation != "setUserSettings"));
+        assert_eq!(
+            observations[2].body,
+            json!({"project": "antigravity-project"})
+        );
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_missing_family_and_non_model_capacity_remain_unknown() {
+        let (base_url, _, server) = serve_antigravity_code_assist(
+            json!({
+                "buckets": [
+                    {"modelId": "gemini-2.5-pro", "remainingFraction": 0.5},
+                    {"remainingFraction": 0.0}
+                ]
+            }),
+            axum::http::StatusCode::OK,
+            json!({"userSettings": {}}),
+        )
+        .await;
+        let account = gemini_code_assist_account(
+            ProviderType::AgyOAuth,
+            json!({"testGeminiCodeAssistBaseUrl": base_url}),
+            None,
+        );
+        let update = refresh_antigravity_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_000,
+            30_000,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let observation = |dimension: &str| {
+            update
+                .capability_observations
+                .iter()
+                .find(|observation| {
+                    observation.capability
+                        == crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY
+                        && observation.dimension == dimension
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            observation(CLAUDE_QUOTA_FAMILY_DIMENSION).state,
+            AccountCapabilityObservationState::Unknown
+        );
+        assert_eq!(
+            observation(CLAUDE_QUOTA_FAMILY_DIMENSION).reason.as_deref(),
+            Some("quota_has_no_explicit_family_bucket")
+        );
+        assert_eq!(
+            observation(MODEL_CAPACITY_DIMENSION).state,
+            AccountCapabilityObservationState::Supported
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_privacy_negative_and_probe_failure_are_observations_not_mutations() {
+        for (status, body, expected_state, expected_reason) in [
+            (
+                axum::http::StatusCode::OK,
+                json!({"userSettings": {"telemetryEnabled": false}}),
+                AccountCapabilityObservationState::Unsupported,
+                "telemetry_setting_present",
+            ),
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": {"message": "slow down"}}),
+                AccountCapabilityObservationState::Unknown,
+                "privacy_probe_rate_limited",
+            ),
+        ] {
+            let (base_url, observations, server) = serve_antigravity_code_assist(
+                json!({"buckets": [{
+                    "modelId": "claude-sonnet-4-5",
+                    "remainingFraction": 0.5
+                }]}),
+                status,
+                body,
+            )
+            .await;
+            let account = gemini_code_assist_account(
+                ProviderType::AntigravityOAuth,
+                json!({"testGeminiCodeAssistBaseUrl": base_url}),
+                None,
+            );
+            let update = refresh_antigravity_quota(
+                &reqwest::Client::new(),
+                &account,
+                1_000,
+                30_000,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("privacy probing must not block quota refresh");
+            let privacy = update
+                .capability_observations
+                .iter()
+                .find(|observation| observation.dimension == PRIVACY_DIMENSION)
+                .unwrap();
+            assert_eq!(privacy.state, expected_state);
+            assert_eq!(privacy.reason.as_deref(), Some(expected_reason));
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 3);
+            assert!(observations
+                .iter()
+                .all(|observation| observation.operation != "setUserSettings"));
+            drop(observations);
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -6603,7 +8185,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_imported_snapshot_parses_premium_quota() {
+    fn copilot_usage_parses_paid_premium_quota_and_reset() {
         let account = imported_account(
             ProviderType::GitHubCopilot,
             json!({
@@ -6620,7 +8202,7 @@ mod tests {
             }),
         );
 
-        let quota = parse_copilot_imported_quota(&account, 1_000).unwrap();
+        let quota = parse_copilot_usage_quota(account.raw.as_ref().unwrap(), 1_000).unwrap();
 
         assert_eq!(
             quota.credential_message.as_deref(),
@@ -6629,6 +8211,201 @@ mod tests {
         assert_eq!(quota.tiers[0].name, "premium");
         assert_eq!(quota.tiers[0].utilization, Some(0.75));
         assert_eq!(quota.tiers[0].used, Some(75.0));
+        assert_eq!(quota.tiers[0].limit, Some(100.0));
+        assert_eq!(
+            quota.tiers[0].resets_at,
+            dateish_to_unix_ms("2026-07-31T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn copilot_usage_preserves_unlimited_premium_quota() {
+        let quota = parse_copilot_usage_quota(
+            &json!({
+                "copilot_plan": "business",
+                "quota_reset_date": "2026-08-01",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "unlimited": true,
+                        "entitlement": 9999,
+                        "remaining": 1,
+                        "percent_remaining": 0
+                    }
+                }
+            }),
+            1_000,
+        )
+        .unwrap();
+
+        let tier = &quota.tiers[0];
+        assert_eq!(
+            quota.credential_message.as_deref(),
+            Some("Copilot Business")
+        );
+        assert_eq!(tier.label.as_deref(), Some("Unlimited"));
+        assert_eq!(tier.utilization, Some(0.0));
+        assert_eq!(tier.used, Some(0.0));
+        assert_eq!(tier.limit, None);
+        assert_eq!(tier.resets_at, dateish_to_unix_ms("2026-08-01"));
+    }
+
+    #[test]
+    fn copilot_usage_parses_free_monthly_remaining_and_clamps_overflow() {
+        for (remaining, expected_used, expected_utilization) in
+            [(20.0, 30.0, 0.6), (75.0, 0.0, 0.0)]
+        {
+            let quota = parse_copilot_usage_quota(
+                &json!({
+                    "copilot_plan": "free",
+                    "monthly_quotas": {"premium_interactions": 50},
+                    "limited_user_quotas": {"premium_interactions": remaining},
+                    "limited_user_reset_date": "2026-08-15T12:00:00Z"
+                }),
+                1_000,
+            )
+            .unwrap();
+
+            let tier = &quota.tiers[0];
+            assert_eq!(quota.credential_message.as_deref(), Some("Copilot Free"));
+            assert_eq!(tier.used, Some(expected_used));
+            assert_eq!(tier.limit, Some(50.0));
+            assert_eq!(tier.utilization, Some(expected_utilization));
+            assert_eq!(tier.resets_at, dateish_to_unix_ms("2026-08-15T12:00:00Z"));
+        }
+    }
+
+    #[tokio::test]
+    async fn copilot_live_quota_uses_github_oauth_token_with_expired_subtoken() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/copilot_internal/user",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("token github-oauth-live-token")
+                );
+                assert_ne!(
+                    headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer expired-copilot-subtoken")
+                );
+                axum::Json(json!({
+                    "copilot_plan": "individual",
+                    "quota_reset_date": "2026-08-31T00:00:00Z",
+                    "quota_snapshots": {
+                        "premium_interactions": {
+                            "entitlement": 300,
+                            "remaining": 240,
+                            "unlimited": false
+                        }
+                    }
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut account = imported_account(
+            ProviderType::GitHubCopilot,
+            json!({
+                "githubDomain": "github.com",
+                "githubToken": "github-oauth-live-token",
+                "copilotToken": {"token": "expired-copilot-subtoken"},
+                "copilotUsage": {
+                    "quota_snapshots": {
+                        "premium_interactions": {"entitlement": 1, "remaining": 0}
+                    }
+                },
+                "testCopilotUsageUrl": format!("http://{address}/copilot_internal/user")
+            }),
+        );
+        account.access_token = Some("expired-copilot-subtoken".to_string());
+        account.refresh_token = Some("github-oauth-live-token".to_string());
+        account.expires_at = Some(1);
+
+        let result = refresh_account_quota(
+            &reqwest::Client::new(),
+            &account,
+            2_000,
+            true,
+            60_000,
+            5_000,
+        )
+        .await
+        .unwrap();
+        let QuotaRefreshResult::Updated { update, .. } = result else {
+            panic!("expected live Copilot quota update");
+        };
+        let quota = update.quota.unwrap();
+        assert_eq!(quota.tiers[0].used, Some(60.0));
+        assert_eq!(quota.tiers[0].limit, Some(300.0));
+        assert_eq!(quota.tiers[0].utilization, Some(0.2));
+        assert_eq!(update.capability_observations.len(), 1);
+        assert_eq!(
+            update.capability_observations[0].dimension,
+            crate::domain::accounts::capability_evidence::PREMIUM_INTERACTIONS_DIMENSION
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copilot_live_quota_unauthorized_does_not_fallback_to_imported_snapshot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/copilot_internal/user",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(json!({"message": "expired GitHub OAuth credential"})),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut account = imported_account(
+            ProviderType::GitHubCopilot,
+            json!({
+                "githubToken": "github-oauth-rejected-token",
+                "copilotUsage": {
+                    "quota_snapshots": {
+                        "premium_interactions": {"entitlement": 100, "remaining": 99}
+                    }
+                },
+                "testCopilotUsageUrl": format!("http://{address}/copilot_internal/user")
+            }),
+        );
+        account.refresh_token = Some("github-oauth-rejected-token".to_string());
+        account.quota = Some(
+            parse_copilot_usage_quota(
+                account.raw.as_ref().unwrap().get("copilotUsage").unwrap(),
+                1_000,
+            )
+            .unwrap(),
+        );
+
+        let error = refresh_account_quota(
+            &reqwest::Client::new(),
+            &account,
+            2_000,
+            true,
+            60_000,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        // Public quota errors normalize rejected credentials to 400, while
+        // retaining the authoritative upstream status for same-account auth
+        // recovery and diagnostics.
+        assert_eq!(error.status_code, 400);
+        assert_eq!(error.upstream_status, Some(401));
+        assert!(error.partial_update.is_none());
+        server.abort();
     }
 
     #[test]
@@ -6693,6 +8470,50 @@ mod tests {
         assert_eq!(quota.tiers[0].used, Some(4.0));
         assert_eq!(quota.tiers[0].limit, Some(40.0));
         assert_eq!(quota.tiers[0].utilization, Some(0.1));
+    }
+
+    #[test]
+    fn kiro_quota_uses_profile_region_and_rejects_unresolved_idc_identity() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "kiro-cross-region-quota",
+            "providerType": "kiro_oauth",
+            "profile": {
+                "authMethod": "idc",
+                "authRegion": "eu-north-1",
+                "runtimeRegion": "us-east-1",
+                "apiRegion": "us-east-1",
+                "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/org-profile",
+                "profileProvenance": "list_available_profiles"
+            },
+            "raw": {"authMethod": "idc"}
+        }))
+        .unwrap();
+        let runtime = kiro_quota_runtime_identity(&account).unwrap();
+        assert_eq!(runtime.runtime_region, "eu-central-1");
+        assert_eq!(
+            runtime.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/org-profile")
+        );
+
+        for profile in [
+            json!({"authMethod": "idc", "runtimeRegion": "eu-central-1"}),
+            json!({
+                "authMethod": "idc",
+                "profileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN",
+                "profileProvenance": "auth_method_default"
+            }),
+        ] {
+            let unresolved: Account = serde_json::from_value(json!({
+                "id": "kiro-unresolved-quota",
+                "providerType": "kiro_oauth",
+                "profile": profile,
+                "raw": {"authMethod": "idc"}
+            }))
+            .unwrap();
+            let error = kiro_quota_runtime_identity(&unresolved).unwrap_err();
+            assert_eq!(error.status_code, 400);
+            assert!(!error.retryable);
+        }
     }
 
     #[test]
@@ -7219,6 +9040,145 @@ mod tests {
     }
 
     #[test]
+    fn grok_media_entitlement_requires_paid_access_and_authoritative_quota() {
+        let weekly = grok_test_probe(json!({
+            "config": {
+                "subscriptionTier": "SuperGrok",
+                "creditUsagePercent": 12.5
+            }
+        }));
+        let monthly = grok_test_probe(json!({"config": {}}));
+        let skipped = GrokProbe::skipped("not needed");
+
+        let observation = grok_media_entitlement_observation(
+            &json!({"subscriptionTier": "SuperGrok"}),
+            &weekly,
+            &monthly,
+            &skipped,
+            1_000,
+        );
+
+        assert_eq!(observation.dimension, MEDIA_ENTITLEMENT_DIMENSION);
+        assert_eq!(
+            observation.state,
+            AccountCapabilityObservationState::Supported
+        );
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some("paid_access_with_authoritative_quota")
+        );
+    }
+
+    #[test]
+    fn grok_media_entitlement_rejects_complete_free_billing() {
+        let weekly = grok_test_probe(json!({"config": {"subscriptionTier": "Free"}}));
+        let monthly = grok_test_probe(json!({"config": {}}));
+        let skipped = GrokProbe::skipped("not needed");
+
+        let observation = grok_media_entitlement_observation(
+            &json!({"subscriptionTier": "Free"}),
+            &weekly,
+            &monthly,
+            &skipped,
+            1_000,
+        );
+
+        assert_eq!(
+            observation.state,
+            AccountCapabilityObservationState::Unsupported
+        );
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some("free_plan_with_complete_billing")
+        );
+    }
+
+    #[test]
+    fn grok_media_entitlement_rejects_forbidden_billing_probe() {
+        let forbidden = GrokProbe {
+            body: None,
+            issue: Some(GrokProbeIssue {
+                probe: "weekly_billing",
+                message: "forbidden".to_string(),
+                next_refresh_at: None,
+            }),
+            spending_limited: false,
+            status_code: Some(403),
+            skipped_reason: None,
+        };
+        let monthly = grok_test_probe(json!({"config": {}}));
+        let skipped = GrokProbe::skipped("not needed");
+
+        let observation = grok_media_entitlement_observation(
+            &json!({"subscriptionTier": "SuperGrok"}),
+            &forbidden,
+            &monthly,
+            &skipped,
+            1_000,
+        );
+
+        assert_eq!(
+            observation.state,
+            AccountCapabilityObservationState::Unsupported
+        );
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some("billing_probe_forbidden")
+        );
+    }
+
+    #[test]
+    fn grok_media_entitlement_is_unknown_for_partial_or_shape_drifted_probes() {
+        let failed = grok_test_failed_probe("weekly_billing", "temporarily unavailable");
+        let monthly = grok_test_probe(json!({"config": {}}));
+        let skipped = GrokProbe::skipped("not needed");
+        let partial =
+            grok_media_entitlement_observation(&json!({}), &failed, &monthly, &skipped, 1_000);
+        assert_eq!(partial.state, AccountCapabilityObservationState::Unknown);
+        assert_eq!(partial.reason.as_deref(), Some("billing_probe_incomplete"));
+
+        let weekly = grok_test_probe(json!({
+            "config": {"subscriptionTier": "SuperGrok"}
+        }));
+        let drifted = grok_media_entitlement_observation(
+            &json!({"subscriptionTier": "SuperGrok"}),
+            &weekly,
+            &monthly,
+            &skipped,
+            2_000,
+        );
+        assert_eq!(drifted.state, AccountCapabilityObservationState::Unknown);
+        assert_eq!(
+            drifted.reason.as_deref(),
+            Some("paid_access_without_authoritative_quota")
+        );
+    }
+
+    #[test]
+    fn grok_media_entitlement_does_not_use_stale_account_plan_fields() {
+        let account = Account {
+            subscription_level: Some("SuperGrok".to_string()),
+            entitlement_status: Some("active".to_string()),
+            ..imported_account(ProviderType::GrokOAuth, json!({}))
+        };
+        let failed = grok_test_failed_probe("weekly_billing", "temporarily unavailable");
+        let skipped = GrokProbe::skipped("not needed");
+
+        let observation =
+            grok_media_entitlement_observation(&json!({}), &failed, &skipped, &skipped, 1_000);
+
+        assert_eq!(account.subscription_level.as_deref(), Some("SuperGrok"));
+        assert_eq!(
+            observation.state,
+            AccountCapabilityObservationState::Unknown
+        );
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some("billing_probe_incomplete")
+        );
+    }
+
+    #[test]
     fn grok_billing_failure_preserves_the_previous_credit_tier() {
         let previous = AccountQuotaTier {
             name: "grok_credits".to_string(),
@@ -7471,6 +9431,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: Default::default(),
         }
     }
 }

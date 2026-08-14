@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use futures_util::{FutureExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify, RwLock};
@@ -17,6 +17,9 @@ use tokio::time::{sleep, timeout_at, Duration, Instant};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
+use crate::clients::coding_plan_quota::{
+    build_coding_plan_quota_client, fetch_coding_plan_quota, CodingPlanQuotaCredentials,
+};
 use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
@@ -33,6 +36,9 @@ use crate::clients::oauth::kimi_device::{
 };
 use crate::clients::oauth::kiro_device::{
     KiroDeviceFlowStore, PendingKiroDeviceFlow, PendingKiroSocialDeviceFlow,
+};
+use crate::clients::oauth::qoder::{
+    PendingQoderDeviceFlow, QoderDeviceFlowStore, QoderDevicePollLease, QoderDevicePollResult,
 };
 use crate::clients::oauth::quota::{
     load_gemini_v1internal_project, refresh_account_quota, QuotaRefreshResult,
@@ -70,6 +76,11 @@ use crate::domain::providers::bundle::{
     bundle_test_app, credential_source_app, has_bundle_managed_metadata,
     is_explicit_bundle_surface, surface_enabled, ModelPolicyScope, ProviderBundleReferencePreview,
     ProviderBundleView, ProviderBundleWriteDraft,
+};
+use crate::domain::providers::coding_plan::{
+    CodingPlanQuotaAdapter, CodingPlanQuotaCache, CodingPlanQuotaCacheKey,
+    CodingPlanQuotaCredentialRole, CodingPlanQuotaSnapshot, CodingPlanQuotaSource,
+    CodingPlanQuotaSpec, CodingPlanQuotaView,
 };
 use crate::domain::providers::credentials::{
     merge_provider_credentials, reveal_provider_credential, CredentialPatch,
@@ -139,6 +150,16 @@ struct ShareModelCooldownKey {
     share_id: String,
     runtime_fingerprint: String,
     model: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CurrentAccountCapabilityObservation {
+    pub provider_type: ProviderType,
+    pub auth_identity_generation: u64,
+    pub state: crate::domain::accounts::capability_evidence::AccountCapabilityObservationState,
+    pub source: &'static str,
+    pub reason: Option<&'static str>,
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -686,16 +707,28 @@ pub struct ServerStateInner {
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
-    grok_media_sessions: Mutex<BTreeMap<String, GrokMediaSessionBinding>>,
+    copilot_token_exchange_generation: std::sync::atomic::AtomicU64,
+    pub(crate) copilot_model_catalogs:
+        crate::clients::oauth::copilot_models::CopilotModelCatalogCache,
+    coding_plan_quota_cache: Mutex<CodingPlanQuotaCache>,
+    coding_plan_quota_refreshes:
+        Mutex<BTreeMap<CodingPlanQuotaCacheKey, Weak<CodingPlanQuotaRefreshFlight>>>,
+    coding_plan_quota_http_client: reqwest::Client,
+    grok_media_tasks: Mutex<GrokMediaTaskStore>,
+    grok_media_task_persistence: AsyncMutex<()>,
     image_capabilities: Arc<crate::image_store::ImageCapabilityStore>,
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
     kimi_device_flows: RwLock<KimiDeviceFlowStore>,
+    qoder_device_flows: RwLock<QoderDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
     pub cursor_api_key_tokens: crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache,
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
+    pub(crate) kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache,
+    pub(crate) kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache,
+    pub(crate) qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache,
     cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
     managed_account_refreshes: ManagedAccountRefreshCoordinator,
     pub account_refresh_locks: AccountRefreshLocks,
@@ -835,6 +868,28 @@ pub enum ManagedAccountRefreshError {
         message: String,
         retry_after_ms: Option<i64>,
     },
+}
+
+fn kimi_refresh_error_is_retryable(error: &ManagedAccountRefreshError) -> bool {
+    matches!(
+        error,
+        ManagedAccountRefreshError::CredentialPersistenceDegraded
+            | ManagedAccountRefreshError::Refresh {
+                status_code: 429 | 500..=599,
+                ..
+            }
+    )
+}
+
+fn qoder_client_runtime_error(
+    error: crate::clients::oauth::qoder::QoderClientError,
+) -> QoderRuntimeError {
+    let status_code = error.upstream_status.unwrap_or(error.status).as_u16();
+    QoderRuntimeError::Upstream {
+        status_code,
+        message: error.message,
+        retryable: status_code == 429 || status_code >= 500,
+    }
 }
 
 fn record_managed_refresh_terminal_audit(
@@ -1212,9 +1267,63 @@ fn native_refresh_recovery_candidate(
 #[derive(Debug)]
 pub enum CopilotUpstreamAuthError {
     NotFound,
+    IdentityChanged {
+        account_id: String,
+        expected: u64,
+        observed: u64,
+    },
     CredentialPersistenceDegraded,
-    MissingGitHubToken { account_id: String },
-    TokenExchange { status_code: u16, message: String },
+    MissingGitHubToken {
+        account_id: String,
+    },
+    TokenExchange {
+        status_code: u16,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum CopilotModelCatalogError {
+    Auth(CopilotUpstreamAuthError),
+    Discovery { status_code: u16, message: String },
+}
+
+#[derive(Debug)]
+pub(crate) enum QoderRuntimeError {
+    NotFound,
+    IdentityChanged,
+    CredentialPersistenceDegraded,
+    InvalidAccount(String),
+    Refresh(ManagedAccountRefreshError),
+    Upstream {
+        status_code: u16,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl QoderRuntimeError {
+    pub(crate) fn is_authentication_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Upstream {
+                status_code: 401 | 403,
+                ..
+            }
+        ) || matches!(
+            self,
+            Self::Refresh(ManagedAccountRefreshError::Refresh {
+                status_code: 400 | 401 | 403,
+                ..
+            })
+        )
+    }
+}
+
+impl From<CopilotUpstreamAuthError> for CopilotModelCatalogError {
+    fn from(error: CopilotUpstreamAuthError) -> Self {
+        Self::Auth(error)
+    }
 }
 
 #[derive(Debug)]
@@ -1232,6 +1341,8 @@ pub struct CopilotUpstreamAuth {
     pub token: String,
     pub api_endpoint: String,
     pub expires_at_ms: Option<i64>,
+    pub account_token_refresh_generation: u64,
+    pub token_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1242,18 +1353,350 @@ pub(crate) struct CachedCopilotUpstreamAuth {
     rejected: bool,
     auth_identity_generation: u64,
     token_refresh_generation: u64,
+    token_generation: u64,
     domain: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct GrokMediaSessionBinding {
+struct CodingPlanQuotaTarget {
+    cache_key: CodingPlanQuotaCacheKey,
+    profile_id: ProfileId,
+    quota: CodingPlanQuotaSpec,
+}
+
+#[derive(Debug, Clone)]
+struct CodingPlanQuotaRefreshResult {
+    source: CodingPlanQuotaSource,
+    quota: CodingPlanQuotaView,
+}
+
+#[derive(Debug, Default)]
+struct CodingPlanQuotaRefreshFlight {
+    gate: Arc<AsyncMutex<()>>,
+    result: Mutex<Option<CodingPlanQuotaRefreshResult>>,
+}
+
+impl CodingPlanQuotaRefreshFlight {
+    fn clear_result(&self) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn complete(&self, source: CodingPlanQuotaSource, quota: CodingPlanQuotaView) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(CodingPlanQuotaRefreshResult { source, quota });
+    }
+
+    fn completed_result(&self) -> Option<CodingPlanQuotaRefreshResult> {
+        self.result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn coding_plan_quota_target_from_store(
+    providers: &ProviderStore,
+    key: &ProviderKey,
+) -> Result<CodingPlanQuotaTarget, ProviderCommandError> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|stored| stored.app == key.app && stored.provider.id == key.provider_id)
+        .ok_or(ProviderCommandError::NotFound)?;
+    let plan = providers
+        .runtime_plan(key.app, &key.provider_id)
+        .ok_or_else(|| {
+            ProviderCommandError::Invalid(
+                "Provider does not have an enabled runtime plan".to_string(),
+            )
+        })?;
+    let quota = plan
+        .coding_plan
+        .as_ref()
+        .map(|coding_plan| coding_plan.quota.clone())
+        .ok_or_else(|| {
+            ProviderCommandError::Invalid(
+                "Provider profile does not declare a coding-plan quota contract".to_string(),
+            )
+        })?;
+    if plan.provider_key != *key || plan.provider_revision != stored.resource.revision {
+        return Err(ProviderCommandError::Conflict {
+            code: "provider_runtime_stale",
+            message: "Provider runtime plan is stale; retry after the Provider update completes"
+                .to_string(),
+        });
+    }
+    Ok(CodingPlanQuotaTarget {
+        cache_key: CodingPlanQuotaCacheKey {
+            provider_key: plan.provider_key.clone(),
+            provider_revision: plan.provider_revision,
+            credential_generation: stored.resource.credential_generation,
+            runtime_fingerprint: plan.runtime_fingerprint.clone(),
+        },
+        profile_id: plan.profile_id.clone(),
+        quota,
+    })
+}
+
+fn coding_plan_quota_credentials_from_store(
+    providers: &ProviderStore,
+    key: &ProviderKey,
+    target: &CodingPlanQuotaTarget,
+) -> anyhow::Result<Result<CodingPlanQuotaCredentials, String>> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|stored| stored.app == key.app && stored.provider.id == key.provider_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Provider disappeared while materializing quota credentials")
+        })?;
+    let mut materialized = providers.materialize_provider_record(stored)?;
+    let result = (|| {
+        let credential = |role, label: &'static str| {
+            let slots = target
+                .quota
+                .credential_slots
+                .iter()
+                .filter(|credential| credential.role == role)
+                .collect::<Vec<_>>();
+            let [slot] = slots.as_slice() else {
+                return Err(format!(
+                    "{label} is not declared exactly once by the quota contract"
+                ));
+            };
+            reveal_provider_credential(&materialized.provider, &slot.slot)
+                .map_err(|_| format!("{label} is not configured"))
+        };
+
+        match target.quota.adapter {
+            CodingPlanQuotaAdapter::Kimi
+            | CodingPlanQuotaAdapter::Zhipu
+            | CodingPlanQuotaAdapter::Minimax => credential(
+                CodingPlanQuotaCredentialRole::InferenceCredential,
+                "coding-plan API key",
+            )
+            .map(CodingPlanQuotaCredentials::inference),
+            CodingPlanQuotaAdapter::Volcengine => {
+                let access_key_id = credential(
+                    CodingPlanQuotaCredentialRole::AccessKeyId,
+                    "Volcengine Access Key ID",
+                )?;
+                let secret_access_key = credential(
+                    CodingPlanQuotaCredentialRole::SecretAccessKey,
+                    "Volcengine Secret Access Key",
+                )?;
+                Ok(CodingPlanQuotaCredentials::volcengine(
+                    access_key_id,
+                    secret_access_key,
+                ))
+            }
+            CodingPlanQuotaAdapter::Unavailable => {
+                Err("this coding plan does not declare quota credentials".to_string())
+            }
+        }
+    })();
+    crate::domain::providers::credentials::zeroize_materialized_provider(
+        &mut materialized.provider,
+    );
+    Ok(result)
+}
+
+fn coding_plan_quota_snapshot(
+    target: &CodingPlanQuotaTarget,
+    source: CodingPlanQuotaSource,
+    quota: CodingPlanQuotaView,
+) -> CodingPlanQuotaSnapshot {
+    CodingPlanQuotaSnapshot {
+        provider_key: target.cache_key.provider_key.clone(),
+        provider_revision: target.cache_key.provider_revision,
+        credential_generation: target.cache_key.credential_generation,
+        runtime_fingerprint: target.cache_key.runtime_fingerprint.clone(),
+        profile_id: target.profile_id.clone(),
+        source,
+        quota,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrokMediaTaskBinding {
+    pub task_id: String,
     pub provider_id: String,
     pub account_id: String,
     pub auth_identity_generation: u64,
+    pub share_id: String,
+    pub runtime_fingerprint: String,
+    pub user_namespace: String,
+    pub created_at_ms: i64,
     pub expires_at_ms: i64,
 }
 
-const GROK_MEDIA_SESSION_MAX_BINDINGS: usize = 4_096;
+#[derive(Debug, thiserror::Error)]
+pub enum GrokMediaTaskCommitError {
+    #[error("Grok Provider or bound account changed before task ownership was committed")]
+    BindingChanged,
+    #[error("Grok media task ownership store write failed: {0}")]
+    Store(#[source] anyhow::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrokMediaTaskStore {
+    #[serde(default = "grok_media_task_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    bindings: BTreeMap<String, GrokMediaTaskBinding>,
+}
+
+impl Default for GrokMediaTaskStore {
+    fn default() -> Self {
+        Self {
+            schema_version: grok_media_task_schema_version(),
+            bindings: BTreeMap::new(),
+        }
+    }
+}
+
+impl GrokMediaTaskStore {
+    fn load_or_default(config_dir: &Path, now_ms: i64) -> anyhow::Result<Self> {
+        let path = grok_media_tasks_path(config_dir);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read Grok media task store {}", path.display()))
+            }
+        };
+        let mut store: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse Grok media task store {}", path.display()))?;
+        if store.schema_version != grok_media_task_schema_version() {
+            anyhow::bail!(
+                "unsupported Grok media task store schema version {}",
+                store.schema_version
+            );
+        }
+        for (key, binding) in &store.bindings {
+            validate_grok_media_task_binding(key, binding)?;
+        }
+        store.cleanup(now_ms);
+        store.enforce_capacity();
+        Ok(store)
+    }
+
+    fn cleanup(&mut self, now_ms: i64) {
+        self.bindings
+            .retain(|_, binding| binding.expires_at_ms > now_ms);
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self.bindings.len() > GROK_MEDIA_TASK_MAX_BINDINGS {
+            let earliest = self
+                .bindings
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.expires_at_ms
+                        .cmp(&right.expires_at_ms)
+                        .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(earliest) = earliest else {
+                break;
+            };
+            self.bindings.remove(&earliest);
+        }
+    }
+}
+
+impl PersistedStateSnapshot for GrokMediaTaskStore {
+    const NAME: &'static str = "Grok media task store";
+
+    fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        crate::infra::storage::write_json_pretty(&grok_media_tasks_path(config_dir), self)
+    }
+
+    fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_or_default(config_dir, crate::infra::time::now_ms() as i64)
+    }
+
+    fn reconciliation_value(&self) -> Option<Value> {
+        serde_json::to_value(self).ok()
+    }
+}
+
+const GROK_MEDIA_TASK_STORE_FILE: &str = "grok-media-tasks.json";
+const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 1;
+const GROK_MEDIA_TASK_MAX_BINDINGS: usize = 4_096;
+const GROK_MEDIA_TASK_MAX_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+const fn grok_media_task_schema_version() -> u32 {
+    GROK_MEDIA_TASK_STORE_SCHEMA_VERSION
+}
+
+fn grok_media_tasks_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(GROK_MEDIA_TASK_STORE_FILE)
+}
+
+fn grok_media_task_user_namespace(user_identity: Option<&str>) -> String {
+    let normalized = user_identity
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "anonymous".to_string());
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!("principal_{}", hex::encode(&digest[..16]))
+}
+
+fn grok_media_task_owner_key(share_id: &str, user_namespace: &str, task_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(share_id.trim().as_bytes());
+    digest.update(b"\0");
+    digest.update(user_namespace.as_bytes());
+    digest.update(b"\0");
+    digest.update(task_id.as_bytes());
+    format!("task_{}", hex::encode(&digest.finalize()[..20]))
+}
+
+fn validate_grok_media_task_binding(
+    key: &str,
+    binding: &GrokMediaTaskBinding,
+) -> anyhow::Result<()> {
+    let non_empty = [
+        ("task id", binding.task_id.as_str()),
+        ("provider id", binding.provider_id.as_str()),
+        ("account id", binding.account_id.as_str()),
+        ("share id", binding.share_id.as_str()),
+        ("runtime fingerprint", binding.runtime_fingerprint.as_str()),
+        ("user namespace", binding.user_namespace.as_str()),
+    ];
+    if let Some((field, _)) = non_empty
+        .into_iter()
+        .find(|(_, value)| value.trim().is_empty())
+    {
+        anyhow::bail!("Grok media task binding has an empty {field}");
+    }
+    if binding.created_at_ms < 0 || binding.expires_at_ms <= binding.created_at_ms {
+        anyhow::bail!("Grok media task binding has an invalid lifetime");
+    }
+    if binding.expires_at_ms.saturating_sub(binding.created_at_ms) > GROK_MEDIA_TASK_MAX_TTL_MS {
+        anyhow::bail!("Grok media task binding exceeds the maximum lifetime");
+    }
+    let expected_key =
+        grok_media_task_owner_key(&binding.share_id, &binding.user_namespace, &binding.task_id);
+    if key != expected_key {
+        anyhow::bail!("Grok media task binding owner key does not match its scope");
+    }
+    Ok(())
+}
 const NATIVE_REFRESH_RECOVERY_DIR: &str = "oauth-refresh-recovery";
 const NATIVE_REFRESH_PENDING_DIR: &str = "oauth-refresh-pending";
 const NATIVE_REFRESH_QUARANTINE_DIR: &str = "oauth-refresh-quarantine";
@@ -1295,6 +1738,7 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::health::provider_health_path(config_dir),
         crate::domain::sharing::shares::shares_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
+        grok_media_tasks_path(config_dir),
     ]
 }
 
@@ -1585,8 +2029,10 @@ fn refresh_update_from_recovery_account(account: &Account) -> AccountRefreshUpda
         quota_refreshed_at: account.quota_refreshed_at,
         quota_next_refresh_at: account.quota_next_refresh_at,
         expires_at: account.expires_at,
+        clear_rate_limited_until_if: None,
         rate_limited_until: account.rate_limited_until,
         last_refresh_error: None,
+        capability_observations: Vec::new(),
     }
 }
 
@@ -2018,6 +2464,10 @@ fn validate_server_backup_restore_stage(
     if includes("email-auth.json") {
         crate::clients::router::email_auth::load_state(stage_dir)
             .context("validate staged email-auth.json")?;
+    }
+    if includes(GROK_MEDIA_TASK_STORE_FILE) {
+        GrokMediaTaskStore::load_or_default(stage_dir, crate::infra::time::now_ms() as i64)
+            .context("validate staged Grok media task store")?;
     }
     let staged_providers = if validates_subscription_references {
         let mut providers =
@@ -2498,6 +2948,8 @@ impl CachedCopilotUpstreamAuth {
             token: self.token,
             api_endpoint: self.api_endpoint,
             expires_at_ms: self.expires_at_ms,
+            account_token_refresh_generation: self.token_refresh_generation,
+            token_generation: self.token_generation,
         }
     }
 
@@ -2516,22 +2968,38 @@ fn cached_copilot_auth_from_account(
     account: &Account,
     domain: &str,
     now_ms: i64,
-) -> Option<CachedCopilotUpstreamAuth> {
+) -> Result<Option<CachedCopilotUpstreamAuth>, CopilotUpstreamAuthError> {
+    if !copilot_account_has_exchanged_token(account) {
+        return Ok(None);
+    }
     let token = account
         .access_token
         .as_deref()
         .map(str::trim)
-        .filter(|token| !token.is_empty())?;
+        .filter(|token| !token.is_empty());
+    let Some(token) = token else {
+        return Ok(None);
+    };
     let cached = CachedCopilotUpstreamAuth {
         token: token.to_string(),
-        api_endpoint: copilot_account_api_endpoint(account, domain),
+        api_endpoint: copilot_account_api_endpoint(account, domain)?,
         expires_at_ms: account.expires_at,
         rejected: false,
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
+        token_generation: account.token_refresh_generation,
         domain: domain.to_string(),
     };
-    cached.is_valid(now_ms).then_some(cached)
+    Ok(cached.is_valid(now_ms).then_some(cached))
+}
+
+fn copilot_account_has_exchanged_token(account: &Account) -> bool {
+    let access_token = account.access_token.as_deref().map(str::trim);
+    let raw_token = account
+        .raw
+        .as_ref()
+        .and_then(|raw| json_string(raw, &["/copilotToken/token", "/copilot_token/token"]));
+    access_token.is_some_and(|access_token| raw_token.as_deref() == Some(access_token))
 }
 
 fn copilot_account_domain(account: &Account) -> Result<String, CopilotUpstreamAuthError> {
@@ -2574,8 +3042,11 @@ fn copilot_github_token(account: &Account) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn copilot_account_api_endpoint(account: &Account, domain: &str) -> String {
-    account
+fn copilot_account_api_endpoint(
+    account: &Account,
+    domain: &str,
+) -> Result<String, CopilotUpstreamAuthError> {
+    let endpoint = account
         .raw
         .as_ref()
         .and_then(|value| {
@@ -2590,7 +3061,39 @@ fn copilot_account_api_endpoint(account: &Account, domain: &str) -> String {
             )
         })
         .filter(|endpoint| !endpoint.trim().is_empty())
-        .unwrap_or_else(|| copilot_device::copilot_api_base(domain))
+        .unwrap_or_else(|| copilot_device::copilot_api_base(domain));
+    copilot_device::validate_copilot_api_endpoint(&endpoint, domain).map_err(|error| {
+        CopilotUpstreamAuthError::TokenExchange {
+            status_code: error.status.as_u16(),
+            message: error.message,
+        }
+    })
+}
+
+fn ensure_copilot_identity_generation(
+    account: &Account,
+    expected: u64,
+) -> Result<(), CopilotUpstreamAuthError> {
+    if account.auth_identity_generation == expected {
+        return Ok(());
+    }
+    Err(CopilotUpstreamAuthError::IdentityChanged {
+        account_id: account.id.clone(),
+        expected,
+        observed: account.auth_identity_generation,
+    })
+}
+
+fn copilot_model_fetch_error(
+    error: crate::clients::oauth::copilot_models::CopilotModelFetchError,
+) -> CopilotModelCatalogError {
+    CopilotModelCatalogError::Discovery {
+        status_code: error
+            .status
+            .unwrap_or(reqwest::StatusCode::BAD_GATEWAY)
+            .as_u16(),
+        message: error.message,
+    }
 }
 
 fn json_string(value: &Value, pointers: &[&str]) -> Option<String> {
@@ -4661,6 +5164,9 @@ impl ServerStateInner {
             .context("compile Provider runtime index")?;
         let usage = UsageStore::load_or_default(&config_dir)?;
         remove_obsolete_model_pricing_file(&config_dir)?;
+        let grok_media_tasks =
+            GrokMediaTaskStore::load_or_default(&config_dir, crate::infra::time::now_ms() as i64)
+                .context("load Grok media task store")?;
         let mut shares = ShareStore::load_or_default(&config_dir)?;
         let integrity_outcomes =
             shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
@@ -4744,6 +5250,8 @@ impl ServerStateInner {
         );
         let bind_addr = SocketAddr::new(cli.host, cli.port);
         let http_client = build_http_client()?;
+        let coding_plan_quota_http_client =
+            build_coding_plan_quota_client().context("build coding-plan quota HTTP client")?;
         let (events, _) = broadcast::channel(256);
         let (shutdown, _) = watch::channel(false);
         let mut provider_import_preview_key = [0u8; 32];
@@ -4789,11 +5297,19 @@ impl ServerStateInner {
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
-            grok_media_sessions: Mutex::new(BTreeMap::new()),
+            copilot_token_exchange_generation: std::sync::atomic::AtomicU64::new(1),
+            copilot_model_catalogs:
+                crate::clients::oauth::copilot_models::CopilotModelCatalogCache::default(),
+            coding_plan_quota_cache: Mutex::new(CodingPlanQuotaCache::default()),
+            coding_plan_quota_refreshes: Mutex::new(BTreeMap::new()),
+            coding_plan_quota_http_client,
+            grok_media_tasks: Mutex::new(grok_media_tasks),
+            grok_media_task_persistence: AsyncMutex::new(()),
             image_capabilities,
             grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
             kimi_device_flows: RwLock::new(KimiDeviceFlowStore::default()),
+            qoder_device_flows: RwLock::new(QoderDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
@@ -4801,6 +5317,9 @@ impl ServerStateInner {
                 crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache::default(),
             cursor_model_catalogs:
                 crate::proxy::cursor::credential_cache::CursorModelCatalogCache::default(),
+            kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache::default(),
+            kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache::default(),
+            qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache::default(),
             cursor_api_key_verifier,
             managed_account_refreshes: ManagedAccountRefreshCoordinator::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
@@ -5725,6 +6244,7 @@ impl ServerStateInner {
         let _usage_commit = self.usage_persistence.gate.lock().await;
         let _shares_commit = self.shares_persistence.gate.lock().await;
         let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
+        let _grok_media_task_commit = self.grok_media_task_persistence.lock().await;
         self.reload_persistent_stores_under_provider_commit().await
     }
 
@@ -5746,6 +6266,10 @@ impl ServerStateInner {
             .context("compile Provider runtime index")?;
         let usage = UsageStore::load_or_default(&self.config_dir)?;
         remove_obsolete_model_pricing_file(&self.config_dir)?;
+        let grok_media_tasks = GrokMediaTaskStore::load_or_default(
+            &self.config_dir,
+            crate::infra::time::now_ms() as i64,
+        )?;
         let mut shares = ShareStore::load_or_default(&self.config_dir)?;
         let (preserved_client_state, rebased_client_share_subdomains) =
             reconcile_client_subdomain_adoption_on_reload(
@@ -5778,6 +6302,10 @@ impl ServerStateInner {
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
         *self.ui_settings.write().await = ui_settings;
+        *self
+            .grok_media_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = grok_media_tasks;
         self.config_persistence.mark_published();
         self.accounts_persistence.mark_published();
         self.usage_persistence.mark_published();
@@ -5892,6 +6420,235 @@ impl ServerStateInner {
         provider_id: &str,
     ) -> Option<Arc<crate::domain::providers::runtime::ProviderRuntimePlan>> {
         self.providers.read().await.runtime_plan(app, provider_id)
+    }
+
+    pub async fn coding_plan_quota_snapshot(
+        &self,
+        provider_key: ProviderKey,
+        force_refresh: bool,
+    ) -> anyhow::Result<Result<CodingPlanQuotaSnapshot, ProviderCommandError>> {
+        for _ in 0..3 {
+            let target = {
+                let providers = self.providers.read().await;
+                match coding_plan_quota_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            self.retain_current_coding_plan_quota_cache(&target.cache_key);
+
+            if target.quota.adapter == CodingPlanQuotaAdapter::Unavailable {
+                return Ok(Ok(coding_plan_quota_snapshot(
+                    &target,
+                    CodingPlanQuotaSource::Contract,
+                    CodingPlanQuotaView::unavailable(
+                        "this coding plan does not publish an authoritative quota API",
+                    ),
+                )));
+            }
+
+            let now_ms = now_ms_i64();
+            if !force_refresh {
+                if let Some(view) = self.fresh_coding_plan_quota_cache(&target, now_ms) {
+                    return Ok(Ok(coding_plan_quota_snapshot(
+                        &target,
+                        CodingPlanQuotaSource::FreshCache,
+                        view,
+                    )));
+                }
+            }
+
+            let refresh_flight = self.coding_plan_quota_refresh_flight(&target.cache_key);
+            let (refresh_guard, waited) = match Arc::clone(&refresh_flight.gate).try_lock_owned() {
+                Ok(guard) => (guard, false),
+                Err(_) => (Arc::clone(&refresh_flight.gate).lock_owned().await, true),
+            };
+            if waited {
+                let current = {
+                    let providers = self.providers.read().await;
+                    match coding_plan_quota_target_from_store(&providers, &provider_key) {
+                        Ok(target) => target,
+                        Err(error) => return Ok(Err(error)),
+                    }
+                };
+                if current.cache_key != target.cache_key {
+                    drop(refresh_guard);
+                    continue;
+                }
+                if let Some(result) = refresh_flight.completed_result() {
+                    return Ok(Ok(coding_plan_quota_snapshot(
+                        &target,
+                        result.source,
+                        result.quota,
+                    )));
+                }
+            } else {
+                refresh_flight.clear_result();
+            }
+
+            let credentials = {
+                let providers = self.providers.read().await;
+                let current = match coding_plan_quota_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if current.cache_key != target.cache_key {
+                    drop(refresh_guard);
+                    continue;
+                }
+                match coding_plan_quota_credentials_from_store(&providers, &provider_key, &current)?
+                {
+                    Ok(credentials) => credentials,
+                    Err(reason) => {
+                        self.invalidate_coding_plan_quota_cache(&target.cache_key);
+                        let view = CodingPlanQuotaView::unknown(reason);
+                        refresh_flight.complete(CodingPlanQuotaSource::Contract, view.clone());
+                        return Ok(Ok(coding_plan_quota_snapshot(
+                            &target,
+                            CodingPlanQuotaSource::Contract,
+                            view,
+                        )));
+                    }
+                }
+            };
+
+            if !force_refresh || waited {
+                if let Some(view) = self.fresh_coding_plan_quota_cache(&target, now_ms_i64()) {
+                    return Ok(Ok(coding_plan_quota_snapshot(
+                        &target,
+                        CodingPlanQuotaSource::FreshCache,
+                        view,
+                    )));
+                }
+            }
+
+            let observed_at_ms = now_ms_i64();
+            let result = fetch_coding_plan_quota(
+                &self.coding_plan_quota_http_client,
+                &target.quota,
+                &credentials,
+                observed_at_ms,
+            )
+            .await;
+
+            let current = {
+                let providers = self.providers.read().await;
+                match coding_plan_quota_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            if current.cache_key != target.cache_key {
+                drop(refresh_guard);
+                continue;
+            }
+
+            let (source, view) = match result {
+                Ok(view) => {
+                    self.cache_supported_coding_plan_quota(target.cache_key.clone(), view.clone())?;
+                    (CodingPlanQuotaSource::Live, view)
+                }
+                Err(error) if error.is_transient() => {
+                    let now_ms = now_ms_i64();
+                    if let Some(view) =
+                        self.stale_coding_plan_quota_cache(&target, now_ms, error.public_message())
+                    {
+                        (CodingPlanQuotaSource::StaleCache, view)
+                    } else {
+                        (
+                            CodingPlanQuotaSource::Live,
+                            CodingPlanQuotaView::unknown(error.public_message()),
+                        )
+                    }
+                }
+                Err(error) => {
+                    self.invalidate_coding_plan_quota_cache(&target.cache_key);
+                    (
+                        CodingPlanQuotaSource::Live,
+                        CodingPlanQuotaView::unknown(error.public_message()),
+                    )
+                }
+            };
+            refresh_flight.complete(source, view.clone());
+            return Ok(Ok(coding_plan_quota_snapshot(&target, source, view)));
+        }
+
+        Ok(Err(ProviderCommandError::Conflict {
+            code: "provider_runtime_changed",
+            message: "Provider runtime changed repeatedly while refreshing coding-plan quota"
+                .to_string(),
+        }))
+    }
+
+    fn coding_plan_quota_refresh_flight(
+        &self,
+        key: &CodingPlanQuotaCacheKey,
+    ) -> Arc<CodingPlanQuotaRefreshFlight> {
+        let mut refreshes = self
+            .coding_plan_quota_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        refreshes.retain(|_, refresh| refresh.strong_count() > 0);
+        if let Some(refresh) = refreshes.get(key).and_then(Weak::upgrade) {
+            return refresh;
+        }
+        let refresh = Arc::new(CodingPlanQuotaRefreshFlight::default());
+        refreshes.insert(key.clone(), Arc::downgrade(&refresh));
+        refresh
+    }
+
+    fn retain_current_coding_plan_quota_cache(&self, key: &CodingPlanQuotaCacheKey) {
+        self.coding_plan_quota_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_current(key);
+    }
+
+    fn fresh_coding_plan_quota_cache(
+        &self,
+        target: &CodingPlanQuotaTarget,
+        now_ms: i64,
+    ) -> Option<CodingPlanQuotaView> {
+        self.coding_plan_quota_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fresh(&target.cache_key, now_ms, target.quota.cache_ttl_ms)
+    }
+
+    fn stale_coding_plan_quota_cache(
+        &self,
+        target: &CodingPlanQuotaTarget,
+        now_ms: i64,
+        reason: &str,
+    ) -> Option<CodingPlanQuotaView> {
+        self.coding_plan_quota_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stale(
+                &target.cache_key,
+                now_ms,
+                target.quota.cache_ttl_ms,
+                target.quota.stale_ttl_ms,
+                reason,
+            )
+    }
+
+    fn cache_supported_coding_plan_quota(
+        &self,
+        key: CodingPlanQuotaCacheKey,
+        view: CodingPlanQuotaView,
+    ) -> anyhow::Result<()> {
+        self.coding_plan_quota_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert_supported(key, view)
+    }
+
+    fn invalidate_coding_plan_quota_cache(&self, key: &CodingPlanQuotaCacheKey) {
+        self.coding_plan_quota_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate(key);
     }
 
     pub async fn provider_views(&self, app: Option<AppKind>) -> Vec<ProviderView> {
@@ -6872,6 +7629,11 @@ impl ServerStateInner {
     #[cfg(test)]
     pub(crate) async fn replace_provider_store_for_test(&self, providers: ProviderStore) {
         *self.providers.write().await = providers;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_account_store_for_test(&self, accounts: AccountStore) {
+        *self.accounts.write().await = accounts;
     }
 
     #[cfg(test)]
@@ -10412,8 +11174,15 @@ impl ServerStateInner {
         capability: crate::domain::accounts::store::GrokAccountCapability,
         source: &'static str,
     ) -> anyhow::Result<bool> {
-        self.record_grok_capability_evidence_matching(account_id, capability, source, None)
-            .await
+        self.record_grok_capability_observation_matching(
+            account_id,
+            capability,
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+            source,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn record_grok_capability_evidence_if_current(
@@ -10424,20 +11193,44 @@ impl ServerStateInner {
         capability: crate::domain::accounts::store::GrokAccountCapability,
         source: &'static str,
     ) -> anyhow::Result<bool> {
-        self.record_grok_capability_evidence_matching(
+        self.record_grok_capability_observation_matching(
             account_id,
             capability,
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
             source,
+            None,
             Some((provider_type, auth_identity_generation)),
         )
         .await
     }
 
-    async fn record_grok_capability_evidence_matching(
+    pub(crate) async fn record_grok_capability_observation_if_current(
         &self,
         account_id: &str,
         capability: crate::domain::accounts::store::GrokAccountCapability,
+        observation: CurrentAccountCapabilityObservation,
+    ) -> anyhow::Result<bool> {
+        self.record_grok_capability_observation_matching(
+            account_id,
+            capability,
+            observation.state,
+            observation.source,
+            observation.reason,
+            Some((
+                observation.provider_type,
+                observation.auth_identity_generation,
+            )),
+        )
+        .await
+    }
+
+    async fn record_grok_capability_observation_matching(
+        &self,
+        account_id: &str,
+        capability: crate::domain::accounts::store::GrokAccountCapability,
+        state: crate::domain::accounts::capability_evidence::AccountCapabilityObservationState,
         source: &'static str,
+        reason: Option<&'static str>,
         expected_identity: Option<(ProviderType, u64)>,
     ) -> anyhow::Result<bool> {
         let Some(account) = self.find_account_by_id(account_id).await else {
@@ -10446,13 +11239,30 @@ impl ServerStateInner {
         if expected_identity.is_some_and(|(provider_type, auth_identity_generation)| {
             account.provider_type != provider_type
                 || account.auth_identity_generation != auth_identity_generation
-        }) || crate::domain::accounts::store::grok_account_capability_evidence_present(
-            &account, capability,
-        ) {
+        }) {
+            return Ok(false);
+        }
+        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let observation_key = crate::domain::accounts::capability_evidence::observation_key(
+            crate::domain::accounts::capability_evidence::GROK_CODE_PLAN_CAPABILITY,
+            capability.as_str(),
+        );
+        let renew_after_ms =
+            crate::domain::accounts::capability_evidence::GROK_CAPABILITY_EVIDENCE_TTL_MS / 2;
+        if account
+            .capability_observations
+            .get(&observation_key)
+            .is_some_and(|observation| {
+                observation.auth_identity_generation == account.auth_identity_generation
+                    && observation.state == state
+                    && observation.source == source
+                    && observation.reason.as_deref() == reason
+                    && observation.expires_at_ms.saturating_sub(observed_at_ms) > renew_after_ms
+            })
+        {
             return Ok(false);
         }
         let account_id = account_id.to_string();
-        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         self.mutate_accounts_immediate(move |accounts| {
             if expected_identity.is_some_and(|(provider_type, auth_identity_generation)| {
                 accounts
@@ -10463,64 +11273,225 @@ impl ServerStateInner {
             }) {
                 return false;
             }
-            accounts.record_grok_capability_evidence(
+            accounts.record_grok_capability_observation(
                 &account_id,
                 capability,
+                state,
                 source,
+                reason,
                 observed_at_ms,
             )
         })
         .await
     }
 
-    pub fn remember_grok_media_session(
+    pub(crate) async fn record_antigravity_capability_observation_if_current(
         &self,
-        session_key: String,
+        account_id: &str,
+        dimension: &'static str,
+        observation: CurrentAccountCapabilityObservation,
+    ) -> anyhow::Result<bool> {
+        let provider_type = observation.provider_type;
+        if !matches!(
+            provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ) {
+            return Ok(false);
+        }
+        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let account_id = account_id.to_string();
+        self.mutate_accounts_immediate(move |accounts| {
+            let current = accounts.find_for_provider(provider_type, Some(&account_id));
+            if current.is_none_or(|account| {
+                account.auth_identity_generation != observation.auth_identity_generation
+            }) {
+                return false;
+            }
+            accounts.record_account_capability_observations(
+                &account_id,
+                [crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::antigravity_feature(
+                    dimension,
+                    observation.state,
+                    observation.source,
+                    observation.reason,
+                    observed_at_ms,
+                    observation.expires_at_ms,
+                )],
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_grok_media_task(
+        &self,
+        task_id: String,
         provider_id: String,
         account_id: String,
         auth_identity_generation: u64,
+        share_id: String,
+        runtime_fingerprint: String,
+        user_identity: Option<&str>,
         ttl_ms: i64,
-    ) {
-        let now = crate::infra::time::now_ms() as i64;
-        let expires_at_ms = now.saturating_add(ttl_ms);
-        let mut sessions = self
-            .grok_media_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        sessions.retain(|_, binding| binding.expires_at_ms > now);
-        if !sessions.contains_key(&session_key) && sessions.len() >= GROK_MEDIA_SESSION_MAX_BINDINGS
-        {
-            let earliest = sessions
-                .iter()
-                .min_by(|(left_key, left), (right_key, right)| {
-                    left.expires_at_ms
-                        .cmp(&right.expires_at_ms)
-                        .then_with(|| left_key.cmp(right_key))
-                })
-                .map(|(key, _)| key.clone());
-            if let Some(earliest) = earliest {
-                sessions.remove(&earliest);
-            }
-        }
-        sessions.insert(
-            session_key,
-            GrokMediaSessionBinding {
-                provider_id,
-                account_id,
-                auth_identity_generation,
-                expires_at_ms,
-            },
-        );
+    ) -> anyhow::Result<GrokMediaTaskBinding> {
+        let _persistence = self.grok_media_task_persistence.lock().await;
+        self.remember_grok_media_task_under_persistence(
+            task_id,
+            provider_id,
+            account_id,
+            auth_identity_generation,
+            share_id,
+            runtime_fingerprint,
+            user_identity,
+            ttl_ms,
+        )
+        .await
     }
 
-    pub fn grok_media_session_binding(&self, session_key: &str) -> Option<GrokMediaSessionBinding> {
-        let now = crate::infra::time::now_ms() as i64;
-        let mut sessions = self
-            .grok_media_sessions
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_grok_media_task_if_current(
+        &self,
+        app: AppKind,
+        provider_id: String,
+        provider_revision: u64,
+        runtime_fingerprint: String,
+        account_id: String,
+        auth_identity_generation: u64,
+        task_id: String,
+        share_id: String,
+        user_identity: Option<&str>,
+        ttl_ms: i64,
+    ) -> Result<GrokMediaTaskBinding, GrokMediaTaskCommitError> {
+        let _persistence = self.grok_media_task_persistence.lock().await;
+        let providers = self.providers.read().await;
+        let binding_is_current = providers.providers.iter().any(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::GrokOAuth
+                && stored.resource.revision == provider_revision
+        }) && providers.runtime_plan(app, &provider_id).is_some_and(
+            |plan| {
+                plan.provider_revision == provider_revision
+                    && plan.runtime_fingerprint == runtime_fingerprint
+                    && plan.driver_id.as_str() == "oauth.grok_responses"
+                    && matches!(
+                        &plan.auth_ref,
+                        crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                            account_id: bound_account_id,
+                            expected_provider_type: ProviderType::GrokOAuth,
+                            auth_identity_generation: bound_generation,
+                        } if bound_account_id == &account_id
+                            && *bound_generation == auth_identity_generation
+                    )
+            },
+        );
+        if !binding_is_current {
+            return Err(GrokMediaTaskCommitError::BindingChanged);
+        }
+        let accounts = self.accounts.read().await;
+        if accounts
+            .find_for_provider(ProviderType::GrokOAuth, Some(&account_id))
+            .is_none_or(|account| account.auth_identity_generation != auth_identity_generation)
+        {
+            return Err(GrokMediaTaskCommitError::BindingChanged);
+        }
+        self.remember_grok_media_task_under_persistence(
+            task_id,
+            provider_id,
+            account_id,
+            auth_identity_generation,
+            share_id,
+            runtime_fingerprint,
+            user_identity,
+            ttl_ms,
+        )
+        .await
+        .map_err(GrokMediaTaskCommitError::Store)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn remember_grok_media_task_under_persistence(
+        &self,
+        task_id: String,
+        provider_id: String,
+        account_id: String,
+        auth_identity_generation: u64,
+        share_id: String,
+        runtime_fingerprint: String,
+        user_identity: Option<&str>,
+        ttl_ms: i64,
+    ) -> anyhow::Result<GrokMediaTaskBinding> {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let task_id = task_id.trim().to_string();
+        let share_id = share_id.trim().to_string();
+        let user_namespace = grok_media_task_user_namespace(user_identity);
+        let key = grok_media_task_owner_key(&share_id, &user_namespace, &task_id);
+        let expires_at_ms = now_ms.saturating_add(ttl_ms.clamp(1, GROK_MEDIA_TASK_MAX_TTL_MS));
+        let binding = GrokMediaTaskBinding {
+            task_id,
+            provider_id,
+            account_id,
+            auth_identity_generation,
+            share_id,
+            runtime_fingerprint,
+            user_namespace,
+            created_at_ms: now_ms,
+            expires_at_ms,
+        };
+        validate_grok_media_task_binding(&key, &binding)?;
+
+        let mut candidate = self
+            .grok_media_tasks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        sessions.retain(|_, binding| binding.expires_at_ms > now);
-        sessions.get(session_key).cloned()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        candidate.cleanup(now_ms);
+        if let Some(existing) = candidate.bindings.get(&key) {
+            if existing.provider_id != binding.provider_id
+                || existing.account_id != binding.account_id
+                || existing.auth_identity_generation != binding.auth_identity_generation
+                || existing.runtime_fingerprint != binding.runtime_fingerprint
+            {
+                anyhow::bail!(
+                    "Grok media task is already owned by a different Provider/account identity"
+                );
+            }
+        }
+        candidate.bindings.insert(key, binding.clone());
+        candidate.enforce_capacity();
+        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        *self
+            .grok_media_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+        Ok(binding)
+    }
+
+    pub async fn grok_media_task_binding(
+        &self,
+        share_id: &str,
+        user_identity: Option<&str>,
+        task_id: &str,
+    ) -> anyhow::Result<Option<GrokMediaTaskBinding>> {
+        let _persistence = self.grok_media_task_persistence.lock().await;
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let user_namespace = grok_media_task_user_namespace(user_identity);
+        let key = grok_media_task_owner_key(share_id, &user_namespace, task_id);
+        let mut candidate = self
+            .grok_media_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let previous_len = candidate.bindings.len();
+        candidate.cleanup(now_ms);
+        if candidate.bindings.len() != previous_len {
+            persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+            *self
+                .grok_media_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate.clone();
+        }
+        Ok(candidate.bindings.get(&key).cloned())
     }
 
     pub async fn bind_device_flow_principal(
@@ -10596,6 +11567,9 @@ impl ServerStateInner {
             ProviderType::KimiCode => {
                 self.cancel_kimi_device_flow(device_code).await;
             }
+            ProviderType::QoderCosy => {
+                self.cancel_qoder_device_flow(device_code).await;
+            }
             _ => {}
         }
         true
@@ -10627,6 +11601,9 @@ impl ServerStateInner {
                 }
                 ProviderType::KimiCode => {
                     self.cancel_kimi_device_flow(device_code).await;
+                }
+                ProviderType::QoderCosy => {
+                    self.cancel_qoder_device_flow(device_code).await;
                 }
                 _ => {}
             }
@@ -10792,6 +11769,64 @@ impl ServerStateInner {
         self.kimi_device_flows.write().await.cancel(device_code)
     }
 
+    pub async fn insert_qoder_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingQoderDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.qoder_device_flows
+            .write()
+            .await
+            .insert(device_code, flow, now_ms);
+    }
+
+    pub async fn begin_qoder_device_poll(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<QoderDevicePollLease> {
+        self.qoder_device_flows
+            .write()
+            .await
+            .begin_poll(device_code, now_ms)
+    }
+
+    pub async fn qoder_device_flow_state_matches(
+        &self,
+        device_code: &str,
+        state: &str,
+        now_ms: i64,
+    ) -> bool {
+        self.qoder_device_flows
+            .write()
+            .await
+            .state_matches(device_code, state, now_ms)
+    }
+
+    pub async fn finish_qoder_device_poll(
+        &self,
+        device_code: &str,
+        result: QoderDevicePollResult,
+        now_ms: i64,
+    ) -> bool {
+        self.qoder_device_flows
+            .write()
+            .await
+            .finish_poll(device_code, result, now_ms)
+    }
+
+    pub async fn fail_qoder_device_poll(&self, device_code: &str, terminal: bool, now_ms: i64) {
+        self.qoder_device_flows
+            .write()
+            .await
+            .fail_poll(device_code, terminal, now_ms);
+    }
+
+    pub async fn cancel_qoder_device_flow(&self, device_code: &str) -> bool {
+        self.qoder_device_flows.write().await.cancel(device_code)
+    }
+
     pub async fn insert_codex_device_flow(
         &self,
         device_code: String,
@@ -10840,6 +11875,7 @@ impl ServerStateInner {
     pub async fn prepare_copilot_upstream_auth(
         self: &Arc<Self>,
         account_id: &str,
+        expected_auth_identity_generation: u64,
     ) -> Result<CopilotUpstreamAuth, CopilotUpstreamAuthError> {
         let accounts = self
             .accounts_snapshot_if_credentials_persisted()
@@ -10849,6 +11885,7 @@ impl ServerStateInner {
             .find_for_provider(ProviderType::GitHubCopilot, Some(account_id))
             .cloned()
             .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, expected_auth_identity_generation)?;
         let account_id = account.id.clone();
         let _refresh_guard = self
             .account_refresh_locks
@@ -10862,6 +11899,7 @@ impl ServerStateInner {
             .find_for_provider(ProviderType::GitHubCopilot, Some(&account_id))
             .cloned()
             .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, expected_auth_identity_generation)?;
         let domain = copilot_account_domain(&account)?;
         let now_ms = crate::infra::time::now_ms() as i64;
 
@@ -10883,19 +11921,17 @@ impl ServerStateInner {
             return Ok(cached.into_auth(account_id));
         }
 
-        if !copilot_device::is_ghes(&domain) {
-            if let Some(cached) = cached_copilot_auth_from_account(&account, &domain, now_ms) {
-                let rejected_token = cached_state
-                    .as_ref()
-                    .filter(|cached| cached.rejected && cached.binding_matches(&account, &domain))
-                    .map(|cached| cached.token.as_str());
-                if rejected_token != Some(cached.token.as_str()) {
-                    self.copilot_upstream_auth
-                        .write()
-                        .await
-                        .insert(account_id.clone(), cached.clone());
-                    return Ok(cached.into_auth(account_id));
-                }
+        if let Some(cached) = cached_copilot_auth_from_account(&account, &domain, now_ms)? {
+            let rejected_token = cached_state
+                .as_ref()
+                .filter(|cached| cached.rejected && cached.binding_matches(&account, &domain))
+                .map(|cached| cached.token.as_str());
+            if rejected_token != Some(cached.token.as_str()) {
+                self.copilot_upstream_auth
+                    .write()
+                    .await
+                    .insert(account_id.clone(), cached.clone());
+                return Ok(cached.into_auth(account_id));
             }
         }
 
@@ -10912,6 +11948,7 @@ impl ServerStateInner {
     pub async fn refresh_copilot_upstream_auth_now(
         self: &Arc<Self>,
         account_id: &str,
+        expected_auth_identity_generation: u64,
         rejected_token: Option<&str>,
     ) -> Result<CopilotUpstreamAuth, CopilotUpstreamAuthError> {
         let accounts = self
@@ -10922,6 +11959,7 @@ impl ServerStateInner {
             .find_for_provider(ProviderType::GitHubCopilot, Some(account_id))
             .cloned()
             .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, expected_auth_identity_generation)?;
         let account_id = account.id.clone();
         let _refresh_guard = self
             .account_refresh_locks
@@ -10935,6 +11973,7 @@ impl ServerStateInner {
             .find_for_provider(ProviderType::GitHubCopilot, Some(&account_id))
             .cloned()
             .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, expected_auth_identity_generation)?;
         let domain = copilot_account_domain(&account)?;
         let now_ms = crate::infra::time::now_ms() as i64;
         let cached = {
@@ -10968,7 +12007,8 @@ impl ServerStateInner {
             let api_endpoint = cached
                 .as_ref()
                 .map(|cached| cached.api_endpoint.clone())
-                .unwrap_or_else(|| copilot_account_api_endpoint(&account, &domain));
+                .map(Ok)
+                .unwrap_or_else(|| copilot_account_api_endpoint(&account, &domain))?;
             self.copilot_upstream_auth.write().await.insert(
                 account_id.clone(),
                 CachedCopilotUpstreamAuth {
@@ -10978,6 +12018,10 @@ impl ServerStateInner {
                     rejected: true,
                     auth_identity_generation: account.auth_identity_generation,
                     token_refresh_generation: account.token_refresh_generation,
+                    token_generation: cached
+                        .as_ref()
+                        .map(|cached| cached.token_generation)
+                        .unwrap_or(account.token_refresh_generation),
                     domain: domain.clone(),
                 },
             );
@@ -10994,6 +12038,946 @@ impl ServerStateInner {
         Ok(cached.into_auth(account_id))
     }
 
+    pub async fn copilot_model_catalog(
+        self: &Arc<Self>,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        timeout: Duration,
+        #[cfg(test)] models_url_override: Option<&str>,
+    ) -> Result<crate::clients::oauth::copilot_models::CopilotModelCatalog, CopilotModelCatalogError>
+    {
+        use crate::clients::oauth::copilot_models::CopilotModelCatalogKey;
+
+        let account = self
+            .accounts_snapshot_if_credentials_persisted()
+            .await
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?
+            .find_for_provider(ProviderType::GitHubCopilot, Some(account_id))
+            .cloned()
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, expected_auth_identity_generation)?;
+        let domain = copilot_account_domain(&account)?;
+        let auth = self
+            .prepare_copilot_upstream_auth(account_id, expected_auth_identity_generation)
+            .await?;
+        let mut api_origin =
+            copilot_device::validate_copilot_api_endpoint(&auth.api_endpoint, &domain).map_err(
+                |error| CopilotModelCatalogError::Discovery {
+                    status_code: error.status.as_u16(),
+                    message: error.message,
+                },
+            )?;
+        let mut key = CopilotModelCatalogKey {
+            account_id: account.id.clone(),
+            auth_identity_generation: account.auth_identity_generation,
+            account_token_refresh_generation: auth.account_token_refresh_generation,
+            copilot_token_generation: auth.token_generation,
+            github_domain: domain.clone(),
+            api_origin: api_origin.clone(),
+        };
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if let Some(catalog) = self.copilot_model_catalogs.fresh(&key, now_ms).await {
+            self.ensure_copilot_model_catalog_key_current(&key).await?;
+            return Ok(catalog);
+        }
+        let mut _catalog_guard = self.copilot_model_catalogs.lock(&key).await;
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if let Some(catalog) = self.copilot_model_catalogs.fresh(&key, now_ms).await {
+            self.ensure_copilot_model_catalog_key_current(&key).await?;
+            return Ok(catalog);
+        }
+
+        #[cfg(test)]
+        let mut models_url = models_url_override
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{api_origin}/models"));
+        #[cfg(not(test))]
+        let mut models_url = format!("{api_origin}/models");
+        let http = self.http_client().await;
+        let mut token = auth.token;
+        let mut fetched = crate::clients::oauth::copilot_models::fetch_copilot_models(
+            &http,
+            &models_url,
+            &token,
+            timeout,
+        )
+        .await;
+        if fetched
+            .as_ref()
+            .is_err_and(|error| error.status == Some(reqwest::StatusCode::UNAUTHORIZED))
+        {
+            let refreshed = self
+                .refresh_copilot_upstream_auth_now(
+                    account_id,
+                    expected_auth_identity_generation,
+                    Some(&token),
+                )
+                .await?;
+            let refreshed_origin =
+                copilot_device::validate_copilot_api_endpoint(&refreshed.api_endpoint, &domain)
+                    .map_err(|error| CopilotModelCatalogError::Discovery {
+                        status_code: error.status.as_u16(),
+                        message: error.message,
+                    })?;
+            drop(_catalog_guard);
+            api_origin = refreshed_origin;
+            key.api_origin = api_origin.clone();
+            key.account_token_refresh_generation = refreshed.account_token_refresh_generation;
+            key.copilot_token_generation = refreshed.token_generation;
+            _catalog_guard = self.copilot_model_catalogs.lock(&key).await;
+            let refreshed_now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(catalog) = self
+                .copilot_model_catalogs
+                .fresh(&key, refreshed_now_ms)
+                .await
+            {
+                self.ensure_copilot_model_catalog_key_current(&key).await?;
+                return Ok(catalog);
+            }
+            #[cfg(test)]
+            if models_url_override.is_none() {
+                models_url = format!("{api_origin}/models");
+            }
+            #[cfg(not(test))]
+            {
+                models_url = format!("{api_origin}/models");
+            }
+            token = refreshed.token;
+            fetched = crate::clients::oauth::copilot_models::fetch_copilot_models(
+                &http,
+                &models_url,
+                &token,
+                timeout,
+            )
+            .await;
+        }
+
+        self.ensure_copilot_model_catalog_key_current(&key).await?;
+
+        match fetched {
+            Ok(models) => {
+                let fetched_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                let catalog = self
+                    .copilot_model_catalogs
+                    .insert(key, models, fetched_at_ms)
+                    .await;
+                if let Err(error) = self
+                    .record_copilot_capability_observation_if_current(
+                        account_id,
+                        expected_auth_identity_generation,
+                        crate::domain::accounts::capability_evidence::MODEL_CATALOG_DIMENSION,
+                        crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+                        "copilot_models_api",
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(account_id, error = %error, "failed to persist Copilot model capability evidence");
+                }
+                Ok(catalog)
+            }
+            Err(error) => {
+                tracing::warn!(account_id, error = %error, "GitHub Copilot model discovery failed");
+                if let Some(catalog) = self.copilot_model_catalogs.stale(&key, now_ms).await {
+                    return Ok(catalog);
+                }
+                if !copilot_device::is_ghes(&domain) {
+                    return Ok(crate::clients::oauth::copilot_models::public_static_catalog());
+                }
+                Err(copilot_model_fetch_error(error))
+            }
+        }
+    }
+
+    async fn ensure_copilot_model_catalog_key_current(
+        &self,
+        key: &crate::clients::oauth::copilot_models::CopilotModelCatalogKey,
+    ) -> Result<(), CopilotModelCatalogError> {
+        let account = self
+            .accounts_snapshot_if_credentials_persisted()
+            .await
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?
+            .find_for_provider(ProviderType::GitHubCopilot, Some(&key.account_id))
+            .cloned()
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, key.auth_identity_generation)?;
+        let domain = copilot_account_domain(&account)?;
+        if account.token_refresh_generation != key.account_token_refresh_generation
+            || domain != key.github_domain
+        {
+            return Err(CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message: "bound account credentials changed during model discovery; retry"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn record_copilot_capability_observation_if_current(
+        &self,
+        account_id: &str,
+        auth_identity_generation: u64,
+        dimension: &'static str,
+        state: crate::domain::accounts::capability_evidence::AccountCapabilityObservationState,
+        source: &'static str,
+        reason: Option<&'static str>,
+    ) -> anyhow::Result<bool> {
+        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let account_id = account_id.to_string();
+        self.mutate_accounts_immediate(move |accounts| {
+            let current = accounts.find_for_provider(
+                ProviderType::GitHubCopilot,
+                Some(&account_id),
+            );
+            if current.is_none_or(|account| {
+                account.auth_identity_generation != auth_identity_generation
+            }) {
+                return false;
+            }
+            accounts.record_account_capability_observations(
+                &account_id,
+                [crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::copilot_feature(
+                    dimension,
+                    state,
+                    source,
+                    reason,
+                    observed_at_ms,
+                )],
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn kimi_model_catalog(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        request_timeout: Duration,
+        #[cfg(test)] models_url_override: Option<&str>,
+    ) -> crate::proxy::kimi_runtime::KimiModelCatalog {
+        use crate::proxy::kimi_runtime::{
+            fetch_kimi_models, reviewed_fallback_catalog, unavailable_catalog,
+            KimiModelCatalogScope,
+        };
+
+        if self.credential_persistence_degraded()
+            || !self
+                .kimi_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+        {
+            return unavailable_catalog();
+        }
+        if let Err(error) = self
+            .refresh_managed_account_if_needed_for_generation(
+                ProviderType::KimiCode,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            tracing::warn!(account_id, error = ?error, "Kimi model discovery token refresh failed");
+            return if kimi_refresh_error_is_retryable(&error) {
+                reviewed_fallback_catalog()
+            } else {
+                unavailable_catalog()
+            };
+        }
+
+        let Some(mut account) = self
+            .find_account_for_provider(ProviderType::KimiCode, account_id)
+            .await
+            .filter(|account| {
+                account.auth_identity_generation == expected_auth_identity_generation
+            })
+        else {
+            return unavailable_catalog();
+        };
+        let Some(mut access_token) = account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+        else {
+            return unavailable_catalog();
+        };
+        let Some(mut identity) =
+            crate::domain::kimi_cli::device_identity_from_profile(account.profile.as_ref())
+        else {
+            return unavailable_catalog();
+        };
+        let mut scope = KimiModelCatalogScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            expected_auth_identity_generation,
+            account.token_refresh_generation,
+        );
+        let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if let Some(catalog) = self.kimi_model_catalogs.fresh(&scope, now_ms).await {
+            return catalog;
+        }
+        let mut catalog_guard = self.kimi_model_catalogs.lock(&scope).await;
+        now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if let Some(catalog) = self.kimi_model_catalogs.fresh(&scope, now_ms).await {
+            return catalog;
+        }
+
+        #[cfg(test)]
+        let models_url = models_url_override.unwrap_or(crate::domain::kimi_cli::KIMI_MODELS_URL);
+        #[cfg(not(test))]
+        let models_url = crate::domain::kimi_cli::KIMI_MODELS_URL;
+        let http = self.http_client().await;
+        let mut fetched =
+            fetch_kimi_models(&http, models_url, &access_token, &identity, request_timeout).await;
+        if fetched
+            .as_ref()
+            .is_err_and(|error| error.status == Some(reqwest::StatusCode::UNAUTHORIZED))
+        {
+            if let Err(error) = self
+                .refresh_managed_account_now_for_generation(
+                    ProviderType::KimiCode,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+            {
+                tracing::warn!(account_id, error = ?error, "Kimi model discovery same-account refresh failed");
+                return if kimi_refresh_error_is_retryable(&error) {
+                    self.kimi_model_catalogs
+                        .stale(&scope, now_ms)
+                        .await
+                        .unwrap_or_else(reviewed_fallback_catalog)
+                } else {
+                    unavailable_catalog()
+                };
+            }
+            let Some(refreshed) = self
+                .find_account_for_provider(ProviderType::KimiCode, account_id)
+                .await
+                .filter(|current| {
+                    current.auth_identity_generation == expected_auth_identity_generation
+                })
+            else {
+                return unavailable_catalog();
+            };
+            if !self
+                .kimi_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+            {
+                return unavailable_catalog();
+            }
+            drop(catalog_guard);
+            account = refreshed;
+            let Some(token) = account
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            else {
+                return unavailable_catalog();
+            };
+            access_token = token.to_string();
+            let Some(refreshed_identity) =
+                crate::domain::kimi_cli::device_identity_from_profile(account.profile.as_ref())
+            else {
+                return unavailable_catalog();
+            };
+            identity = refreshed_identity;
+            scope = KimiModelCatalogScope::derive(
+                app.as_str(),
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+                account.token_refresh_generation,
+            );
+            catalog_guard = self.kimi_model_catalogs.lock(&scope).await;
+            now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(catalog) = self.kimi_model_catalogs.fresh(&scope, now_ms).await {
+                return catalog;
+            }
+            fetched =
+                fetch_kimi_models(&http, models_url, &access_token, &identity, request_timeout)
+                    .await;
+        }
+
+        match fetched {
+            Ok(fetched_catalog) => {
+                let current = self
+                    .find_account_for_provider(ProviderType::KimiCode, account_id)
+                    .await;
+                if current.as_ref().is_none_or(|current| {
+                    current.auth_identity_generation != expected_auth_identity_generation
+                        || current.token_refresh_generation != account.token_refresh_generation
+                }) || !self
+                    .kimi_catalog_runtime_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        account_id,
+                        expected_auth_identity_generation,
+                    )
+                    .await
+                {
+                    return unavailable_catalog();
+                }
+                let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                let has_entitlement = fetched_catalog.upstream_non_empty;
+                let catalog = self
+                    .kimi_model_catalogs
+                    .insert(scope, fetched_catalog.models, observed_at_ms)
+                    .await;
+                drop(catalog_guard);
+                if let Err(error) = self
+                    .record_kimi_catalog_observations_if_current(
+                        account_id,
+                        expected_auth_identity_generation,
+                        has_entitlement,
+                    )
+                    .await
+                {
+                    tracing::warn!(account_id, error = %error, "failed to persist Kimi model capability evidence");
+                }
+                catalog
+            }
+            Err(error) => {
+                tracing::warn!(account_id, error = %error, "Kimi model discovery failed");
+                if error.retryable() {
+                    self.kimi_model_catalogs
+                        .stale(&scope, now_ms)
+                        .await
+                        .unwrap_or_else(reviewed_fallback_catalog)
+                } else {
+                    self.kimi_model_catalogs.invalidate(&scope).await;
+                    unavailable_catalog()
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn kimi_catalog_runtime_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> bool {
+        let providers = self.providers.read().await;
+        let Some(_stored) = providers.providers.iter().find(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::KimiCode
+                && stored.resource.revision == provider_revision
+        }) else {
+            return false;
+        };
+        let Some(plan) = providers.runtime_plan(app, provider_id) else {
+            return false;
+        };
+        plan.provider_revision == provider_revision
+            && plan.runtime_fingerprint == runtime_fingerprint
+            && plan.configuration_state
+                != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            && plan.driver_id.as_str() == "oauth.kimi_code"
+            && matches!(
+                &plan.auth_ref,
+                crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                    account_id: bound_account_id,
+                    expected_provider_type: ProviderType::KimiCode,
+                    auth_identity_generation,
+                } if bound_account_id == account_id
+                    && *auth_identity_generation == expected_auth_identity_generation
+            )
+    }
+
+    async fn record_kimi_catalog_observations_if_current(
+        &self,
+        account_id: &str,
+        auth_identity_generation: u64,
+        has_entitlement: bool,
+    ) -> anyhow::Result<bool> {
+        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let account_id = account_id.to_string();
+        self.mutate_accounts_immediate(move |accounts| {
+            let current = accounts.find_for_provider(ProviderType::KimiCode, Some(&account_id));
+            if current.is_none_or(|account| {
+                account.auth_identity_generation != auth_identity_generation
+            }) {
+                return false;
+            }
+            accounts.record_account_capability_observations(
+                &account_id,
+                [
+                    crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::kimi_feature(
+                        crate::domain::accounts::capability_evidence::MODEL_CATALOG_DIMENSION,
+                        crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+                        "coding_v1_models",
+                        None,
+                        observed_at_ms,
+                    ),
+                    crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::kimi_feature(
+                        crate::domain::accounts::capability_evidence::MODEL_ENTITLEMENT_DIMENSION,
+                        if has_entitlement {
+                            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported
+                        } else {
+                            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported
+                        },
+                        "coding_v1_models",
+                        (!has_entitlement).then_some("authoritative_empty_catalog"),
+                        observed_at_ms,
+                    ),
+                ],
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_qoder_runtime(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        request_timeout: Duration,
+    ) -> Result<crate::proxy::qoder_runtime::PreparedQoderRuntime, QoderRuntimeError> {
+        use crate::domain::qoder::{
+            machine_token_from_raw, QoderAccountProfile, QoderCosySession, QoderCredentialRail,
+        };
+        use crate::proxy::qoder_runtime::{
+            parse_qoder_model_catalog, PreparedQoderRuntime, QoderCachedSession, QoderRuntimeScope,
+        };
+
+        if self.credential_persistence_degraded() {
+            return Err(QoderRuntimeError::CredentialPersistenceDegraded);
+        }
+        if !self
+            .qoder_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            return Err(QoderRuntimeError::IdentityChanged);
+        }
+
+        let mut account = self
+            .find_account_for_provider(ProviderType::QoderCosy, account_id)
+            .await
+            .ok_or(QoderRuntimeError::NotFound)?;
+        if account.auth_identity_generation != expected_auth_identity_generation {
+            return Err(QoderRuntimeError::IdentityChanged);
+        }
+        let mut profile = QoderAccountProfile::parse(account.profile.as_ref())
+            .map_err(QoderRuntimeError::InvalidAccount)?;
+        if profile.credential_rail != QoderCredentialRail::PatJobToken {
+            self.refresh_managed_account_if_needed_for_generation(
+                ProviderType::QoderCosy,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+            .map_err(QoderRuntimeError::Refresh)?;
+            account = self
+                .find_account_for_provider(ProviderType::QoderCosy, account_id)
+                .await
+                .filter(|current| {
+                    current.auth_identity_generation == expected_auth_identity_generation
+                })
+                .ok_or(QoderRuntimeError::IdentityChanged)?;
+            profile = QoderAccountProfile::parse(account.profile.as_ref())
+                .map_err(QoderRuntimeError::InvalidAccount)?;
+        }
+        if account.needs_relogin {
+            return Err(QoderRuntimeError::Upstream {
+                status_code: 401,
+                message: "Qoder account requires login".to_string(),
+                retryable: false,
+            });
+        }
+
+        let scope = QoderRuntimeScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            profile.site,
+            profile.credential_rail,
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        )
+        .map_err(QoderRuntimeError::InvalidAccount)?;
+        let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let session = if let Some(session) = self.qoder_runtime.session(&scope, now_ms).await {
+            session
+        } else {
+            let _session_guard = self.qoder_runtime.session_lock(&scope).await;
+            now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(session) = self.qoder_runtime.session(&scope, now_ms).await {
+                session
+            } else {
+                if !self
+                    .qoder_runtime_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        account_id,
+                        expected_auth_identity_generation,
+                    )
+                    .await
+                {
+                    return Err(QoderRuntimeError::IdentityChanged);
+                }
+                let endpoints = crate::clients::oauth::qoder::QoderEndpoints::from_account(
+                    &account,
+                    profile.site,
+                );
+                let machine_token =
+                    machine_token_from_raw(account.raw.as_ref()).unwrap_or_default();
+                let machine = profile.machine(&machine_token);
+                machine
+                    .validate()
+                    .map_err(QoderRuntimeError::InvalidAccount)?;
+                let (access_token, refresh_token, expires_at_ms, gateway_base_url) =
+                    if profile.credential_rail == QoderCredentialRail::PatJobToken {
+                        let pat = account
+                            .api_key
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| value.starts_with("pt-") && value.len() > 3)
+                            .ok_or_else(|| {
+                                QoderRuntimeError::InvalidAccount(
+                                    "Qoder PAT account is missing a pt-* credential".to_string(),
+                                )
+                            })?;
+                        let exchanged = crate::clients::oauth::qoder::exchange_pat_job_token(
+                            &self.http_client().await,
+                            &endpoints,
+                            pat,
+                            now_ms,
+                        )
+                        .await
+                        .map_err(qoder_client_runtime_error)?;
+                        let token = exchanged.access_token().ok_or_else(|| {
+                            QoderRuntimeError::Upstream {
+                                status_code: 502,
+                                message: "Qoder PAT exchange returned no job token".to_string(),
+                                retryable: false,
+                            }
+                        })?;
+                        let expires_at_ms = exchanged
+                            .expires_at_ms()
+                            .unwrap_or_else(|| now_ms.saturating_add(24 * 60 * 60 * 1_000));
+                        (
+                            token.to_string(),
+                            exchanged.refresh_token().unwrap_or_default().to_string(),
+                            Some(expires_at_ms),
+                            endpoints.job_gateway_base_url.clone(),
+                        )
+                    } else {
+                        let token = account
+                            .access_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                QoderRuntimeError::InvalidAccount(
+                                    "Qoder OAuth account is missing an access token".to_string(),
+                                )
+                            })?;
+                        (
+                            token.to_string(),
+                            account
+                                .refresh_token
+                                .as_deref()
+                                .map(str::trim)
+                                .unwrap_or_default()
+                                .to_string(),
+                            account.expires_at,
+                            endpoints.gateway_base_url.clone(),
+                        )
+                    };
+                let identity = profile.identity(&access_token, &refresh_token);
+                let session = QoderCosySession::new(profile.site, identity, machine)
+                    .map_err(QoderRuntimeError::InvalidAccount)?;
+                let cached =
+                    QoderCachedSession::new(session, gateway_base_url, expires_at_ms, now_ms)
+                        .map_err(QoderRuntimeError::InvalidAccount)?;
+                if !self
+                    .qoder_runtime_snapshot_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        &account,
+                    )
+                    .await
+                {
+                    return Err(QoderRuntimeError::IdentityChanged);
+                }
+                self.qoder_runtime
+                    .insert_session(scope.clone(), cached.clone())
+                    .await;
+                cached
+            }
+        };
+
+        let catalog = if let Some(catalog) = self.qoder_runtime.catalog(&scope, now_ms).await {
+            catalog
+        } else {
+            let _catalog_guard = self.qoder_runtime.catalog_lock(&scope).await;
+            now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(catalog) = self.qoder_runtime.catalog(&scope, now_ms).await {
+                catalog
+            } else {
+                if !self
+                    .qoder_runtime_snapshot_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        &account,
+                    )
+                    .await
+                {
+                    return Err(QoderRuntimeError::IdentityChanged);
+                }
+                let value = crate::clients::oauth::qoder::fetch_model_catalog(
+                    &self.http_client().await,
+                    &session.gateway_base_url,
+                    &session.session,
+                    request_timeout,
+                )
+                .await;
+                let value = match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let runtime_error = qoder_client_runtime_error(error);
+                        if runtime_error.is_authentication_failure() {
+                            self.invalidate_qoder_runtime_scope(&scope).await;
+                        }
+                        return Err(runtime_error);
+                    }
+                };
+                let fetched = parse_qoder_model_catalog(&value).map_err(|message| {
+                    QoderRuntimeError::Upstream {
+                        status_code: 502,
+                        message,
+                        retryable: false,
+                    }
+                })?;
+                if !self
+                    .qoder_runtime_snapshot_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        &account,
+                    )
+                    .await
+                {
+                    return Err(QoderRuntimeError::IdentityChanged);
+                }
+                self.qoder_runtime
+                    .insert_catalog(scope.clone(), fetched, now_ms)
+                    .await
+            }
+        };
+
+        Ok(PreparedQoderRuntime {
+            scope,
+            session,
+            catalog,
+            credential_rail: profile.credential_rail,
+            account_id: account.id,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn qoder_runtime_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> bool {
+        let providers = self.providers.read().await;
+        let Some(stored) = providers.providers.iter().find(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::QoderCosy
+                && stored.resource.revision == provider_revision
+        }) else {
+            return false;
+        };
+        let Some(plan) = providers.runtime_plan(app, provider_id) else {
+            return false;
+        };
+        stored.resource.revision == plan.provider_revision
+            && plan.runtime_fingerprint == runtime_fingerprint
+            && plan.configuration_state
+                != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            && plan.driver_id.as_str() == "special.qoder_cosy"
+            && matches!(
+                &plan.auth_ref,
+                crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                    account_id: bound_account_id,
+                    expected_provider_type: ProviderType::QoderCosy,
+                    auth_identity_generation,
+                } if bound_account_id == account_id
+                    && *auth_identity_generation == expected_auth_identity_generation
+            )
+    }
+
+    async fn qoder_runtime_snapshot_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        expected: &Account,
+    ) -> bool {
+        if !self
+            .qoder_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &expected.id,
+                expected.auth_identity_generation,
+            )
+            .await
+        {
+            return false;
+        }
+        self.find_account_for_provider(ProviderType::QoderCosy, &expected.id)
+            .await
+            .is_some_and(|current| {
+                current.auth_identity_generation == expected.auth_identity_generation
+                    && current.token_refresh_generation == expected.token_refresh_generation
+            })
+    }
+
+    pub(crate) async fn invalidate_qoder_runtime_scope(
+        &self,
+        scope: &crate::proxy::qoder_runtime::QoderRuntimeScope,
+    ) {
+        self.qoder_runtime.invalidate_scope(scope).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn qoder_runtime_generation_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        auth_identity_generation: u64,
+        token_refresh_generation: u64,
+    ) -> bool {
+        if !self
+            .qoder_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                auth_identity_generation,
+            )
+            .await
+        {
+            return false;
+        }
+        self.find_account_for_provider(ProviderType::QoderCosy, account_id)
+            .await
+            .is_some_and(|account| {
+                account.auth_identity_generation == auth_identity_generation
+                    && account.token_refresh_generation == token_refresh_generation
+            })
+    }
+
+    pub async fn record_copilot_auth_evidence_if_current(
+        &self,
+        account_id: &str,
+        auth_identity_generation: u64,
+        source: &'static str,
+    ) -> anyhow::Result<bool> {
+        let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let account_id = account_id.to_string();
+        self.mutate_accounts_immediate(move |accounts| {
+            let current = accounts.find_for_provider(
+                ProviderType::GitHubCopilot,
+                Some(&account_id),
+            );
+            if current.is_none_or(|account| {
+                account.auth_identity_generation != auth_identity_generation
+            }) {
+                return false;
+            }
+            accounts.record_account_capability_observations(
+                &account_id,
+                [
+                    crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::copilot_feature(
+                        crate::domain::accounts::capability_evidence::TOKEN_EXCHANGE_DIMENSION,
+                        crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+                        source,
+                        None,
+                        observed_at_ms,
+                    ),
+                    crate::domain::accounts::capability_evidence::AccountCapabilityObservationDraft::copilot_feature(
+                        crate::domain::accounts::capability_evidence::ENDPOINT_PROVENANCE_DIMENSION,
+                        crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+                        source,
+                        None,
+                        observed_at_ms,
+                    ),
+                ],
+            )
+        })
+        .await
+    }
+
     async fn exchange_copilot_upstream_auth(
         &self,
         account: &Account,
@@ -11008,46 +12992,101 @@ impl ServerStateInner {
         })?;
         let http_client = self.http_client().await;
 
-        let (token, expires_at_ms) = if copilot_device::is_ghes(domain) {
-            (github_token.clone(), None)
-        } else {
-            let token =
+        #[cfg(test)]
+        let token_url_override = account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("testCopilotTokenUrl"))
+            .and_then(Value::as_str);
+        #[cfg(test)]
+        let token = match token_url_override {
+            Some(url) => {
+                copilot_device::fetch_copilot_token_from_url(&http_client, url, &github_token).await
+            }
+            None => {
                 copilot_device::fetch_copilot_internal_token(&http_client, domain, &github_token)
                     .await
-                    .map_err(|error| CopilotUpstreamAuthError::TokenExchange {
+            }
+        };
+        #[cfg(not(test))]
+        let token =
+            copilot_device::fetch_copilot_internal_token(&http_client, domain, &github_token).await;
+        let token = token.map_err(|error| CopilotUpstreamAuthError::TokenExchange {
+            status_code: error.status.as_u16(),
+            message: error.message,
+        })?;
+        let token_endpoint = token
+            .endpoints
+            .as_ref()
+            .and_then(|endpoints| endpoints.api.as_deref())
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty());
+        let api_endpoint = if let Some(endpoint) = token_endpoint {
+            copilot_device::validate_copilot_api_endpoint(endpoint, domain).map_err(|error| {
+                CopilotUpstreamAuthError::TokenExchange {
+                    status_code: error.status.as_u16(),
+                    message: error.message,
+                }
+            })?
+        } else {
+            match copilot_device::fetch_copilot_api_endpoint(&http_client, domain, &github_token)
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(error) if error.endpoint_validation => {
+                    return Err(CopilotUpstreamAuthError::TokenExchange {
                         status_code: error.status.as_u16(),
                         message: error.message,
-                    })?;
-            (token.token, Some(token.expires_at.saturating_mul(1000)))
-        };
-
-        let api_endpoint = match copilot_device::fetch_copilot_api_endpoint(
-            &http_client,
-            domain,
-            &github_token,
-        )
-        .await
-        {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                tracing::debug!(
+                    });
+                }
+                Err(error) => {
+                    tracing::debug!(
                     "failed to discover GitHub Copilot API endpoint for account {}: {}; falling back",
                     account_id,
                     error
                 );
-                copilot_device::copilot_api_base(domain)
+                    copilot_device::validate_copilot_api_endpoint(
+                        &copilot_device::copilot_api_base(domain),
+                        domain,
+                    )
+                    .map_err(|error| {
+                        CopilotUpstreamAuthError::TokenExchange {
+                            status_code: error.status.as_u16(),
+                            message: error.message,
+                        }
+                    })?
+                }
             }
         };
 
-        Ok(CachedCopilotUpstreamAuth {
-            token,
+        let cached = CachedCopilotUpstreamAuth {
+            token: token.token,
             api_endpoint,
-            expires_at_ms,
+            expires_at_ms: Some(token.expires_at.saturating_mul(1000)),
             rejected: false,
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
+            token_generation: (1_u64 << 63)
+                | self
+                    .copilot_token_exchange_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             domain: domain.to_string(),
-        })
+        };
+        if let Err(error) = self
+            .record_copilot_auth_evidence_if_current(
+                &account.id,
+                account.auth_identity_generation,
+                "copilot_runtime_token_exchange",
+            )
+            .await
+        {
+            tracing::warn!(
+                account_id = %account.id,
+                error = %error,
+                "failed to persist Copilot token-exchange capability evidence"
+            );
+        }
+        Ok(cached)
     }
 
     pub async fn start_deepseek_chat_completion(
@@ -13063,6 +15102,7 @@ fn account_quota_refresh_candidate(accounts: &AccountStore, account: &Account) -
         | ProviderType::CursorOAuth
         | ProviderType::CursorApiKey
         | ProviderType::GrokOAuth
+        | ProviderType::QoderCosy
         | ProviderType::OllamaCloud => {
             account
                 .access_token
@@ -13436,9 +15476,7 @@ pub async fn ensure_share_tunnel_running_for(
         });
         (share, binding_error)
     };
-    let Some(share) = share else {
-        return None;
-    };
+    let share = share?;
     if let Some(error) = binding_error {
         tracing::error!(
             share_id,
@@ -16046,9 +18084,10 @@ mod tests {
             raw: Some(json!({
                 "githubDomain": "GitHub.COM",
                 "githubToken": "github-raw-token",
+                "copilotToken": {"token": "cached-copilot-token"},
                 "copilotUsage": {
                     "endpoints": {
-                        "api": "https://copilot-api.enterprise.example.com"
+                        "api": "https://api.enterprise.githubcopilot.com"
                     }
                 }
             })),
@@ -16066,6 +18105,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: Default::default(),
         }
     }
 
@@ -16074,18 +18114,326 @@ mod tests {
         let now_ms = 10_000;
         let account = copilot_account_fixture(Some(now_ms + 120_000));
         let domain = copilot_account_domain(&account).unwrap();
-        let cached = cached_copilot_auth_from_account(&account, &domain, now_ms).unwrap();
+        let cached = cached_copilot_auth_from_account(&account, &domain, now_ms)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(domain, "github.com");
         assert_eq!(cached.token, "cached-copilot-token");
         assert_eq!(
             cached.api_endpoint,
-            "https://copilot-api.enterprise.example.com"
+            "https://api.enterprise.githubcopilot.com"
         );
         assert_eq!(cached.expires_at_ms, Some(now_ms + 120_000));
 
         let expiring = copilot_account_fixture(Some(now_ms + 59_000));
-        assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms).is_none());
+        assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn copilot_model_discovery_replays_one_401_with_same_account_generation() {
+        #[derive(Clone)]
+        struct Probe {
+            model_calls: Arc<AtomicUsize>,
+            token_calls: Arc<AtomicUsize>,
+            authorizations: Arc<TokioMutex<Vec<String>>>,
+        }
+
+        async fn models(
+            AxumState(probe): AxumState<Probe>,
+            headers: axum::http::HeaderMap,
+        ) -> (StatusCode, Json<Value>) {
+            probe.model_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let authorization = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            probe
+                .authorizations
+                .lock()
+                .await
+                .push(authorization.clone());
+            if authorization == "Bearer old-copilot-token" {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"message": "expired"})),
+                );
+            }
+            assert_eq!(authorization, "Bearer refreshed-copilot-token");
+            (
+                StatusCode::OK,
+                Json(json!({"data": [{"id": "account-model"}]})),
+            )
+        }
+
+        async fn token(
+            AxumState(probe): AxumState<Probe>,
+            headers: axum::http::HeaderMap,
+        ) -> Json<Value> {
+            probe.token_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            assert_eq!(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("token github-oauth-token")
+            );
+            Json(json!({
+                "token": "refreshed-copilot-token",
+                "expires_at": i64::MAX / 2,
+                "endpoints": {"api": "https://api.githubcopilot.com"}
+            }))
+        }
+
+        let probe = Probe {
+            model_calls: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+            authorizations: Arc::new(TokioMutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/models", get(models))
+            .route("/token", get(token))
+            .with_state(probe.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-model-401-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "old-copilot-token",
+                        "refreshToken": "github-oauth-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "github-oauth-token",
+                            "copilotToken": {"token": "old-copilot-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com",
+                            "testCopilotTokenUrl": token_url
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let catalog = state
+            .copilot_model_catalog(
+                "copilot-model-401-account",
+                1,
+                Duration::from_secs(2),
+                Some(&format!("http://{address}/models")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog.models, ["account-model"]);
+        assert_eq!(catalog.source, "copilot_models_api");
+        assert!(!catalog.stale);
+        assert_eq!(probe.model_calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(probe.token_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            probe.authorizations.lock().await.as_slice(),
+            ["Bearer old-copilot-token", "Bearer refreshed-copilot-token"]
+        );
+        let account = state
+            .find_account_by_id("copilot-model-401-account")
+            .await
+            .unwrap();
+        for dimension in [
+            crate::domain::accounts::capability_evidence::TOKEN_EXCHANGE_DIMENSION,
+            crate::domain::accounts::capability_evidence::ENDPOINT_PROVENANCE_DIMENSION,
+            crate::domain::accounts::capability_evidence::MODEL_CATALOG_DIMENSION,
+        ] {
+            assert_eq!(
+                account.capability_observations[&format!("github_copilot_code_plan:{dimension}")]
+                    .auth_identity_generation,
+                1
+            );
+        }
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copilot_model_discovery_rejects_a_concurrent_account_token_generation() {
+        #[derive(Clone)]
+        struct Probe {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        async fn models(AxumState(probe): AxumState<Probe>) -> Json<Value> {
+            probe.entered.notify_one();
+            probe.release.notified().await;
+            Json(json!({"data": [{"id": "superseded-model"}]}))
+        }
+
+        let probe = Probe {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route("/models", get(models))
+            .with_state(probe.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-model-generation-account",
+                        "providerType": "github_copilot",
+                        "email": "octo@example.com",
+                        "accessToken": "old-copilot-token",
+                        "refreshToken": "github-oauth-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "github-oauth-token",
+                            "copilotToken": {"token": "old-copilot-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com"
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let before = state
+            .find_account_by_id("copilot-model-generation-account")
+            .await
+            .unwrap();
+
+        let request_state = state.clone();
+        let models_url = format!("http://{address}/models");
+        let request = tokio::spawn(async move {
+            request_state
+                .copilot_model_catalog(
+                    "copilot-model-generation-account",
+                    before.auth_identity_generation,
+                    Duration::from_secs(2),
+                    Some(&models_url),
+                )
+                .await
+        });
+        probe.entered.notified().await;
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .mark_native_refresh_success(
+                        "copilot-model-generation-account",
+                        crate::domain::accounts::store::AccountRefreshUpdate {
+                            access_token: Some("new-copilot-token".to_string()),
+                            raw: Some(json!({
+                                "githubDomain": "github.com",
+                                "githubToken": "github-oauth-token",
+                                "copilotToken": {"token": "new-copilot-token"},
+                                "copilotApiBase": "https://api.githubcopilot.com"
+                            })),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        let after = state
+            .find_account_by_id("copilot-model-generation-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            after.auth_identity_generation,
+            before.auth_identity_generation
+        );
+        assert!(after.token_refresh_generation > before.token_refresh_generation);
+        probe.release.notify_one();
+
+        let result = request.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                ..
+            })
+        ));
+        assert!(!after
+            .capability_observations
+            .contains_key("github_copilot_code_plan:model_catalog"));
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copilot_ghes_model_discovery_never_uses_public_static_fallback() {
+        async fn unavailable() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"message": "unavailable"})),
+            )
+        }
+        let app = Router::new().route("/models", get(unavailable));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-ghes-model-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "ghe-copilot-token",
+                        "refreshToken": "ghe-github-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "ghe.example.com", "ghes": true},
+                        "raw": {
+                            "githubDomain": "ghe.example.com",
+                            "githubToken": "ghe-github-token",
+                            "copilotToken": {"token": "ghe-copilot-token"},
+                            "copilotApiBase": "https://copilot-api.ghe.example.com"
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let result = state
+            .copilot_model_catalog(
+                "copilot-ghes-model-account",
+                1,
+                Duration::from_secs(2),
+                Some(&format!("http://{address}/models")),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CopilotModelCatalogError::Discovery {
+                status_code: 502,
+                ..
+            })
+        ));
+        server.abort();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]
@@ -16101,7 +18449,10 @@ mod tests {
                         "accessToken": "copilot-rejected-seed-token",
                         "expiresAt": i64::MAX / 2,
                         "profile": {"githubDomain": "github.com", "ghes": false},
-                        "raw": {"githubDomain": "github.com"}
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "copilotToken": {"token": "copilot-rejected-seed-token"}
+                        }
                     }))
                     .unwrap(),
                 )
@@ -16110,7 +18461,7 @@ mod tests {
             .unwrap();
 
         let seeded = state
-            .prepare_copilot_upstream_auth("copilot-rejected-seed-account")
+            .prepare_copilot_upstream_auth("copilot-rejected-seed-account", 1)
             .await
             .unwrap();
         assert_eq!(seeded.token, "copilot-rejected-seed-token");
@@ -16118,6 +18469,7 @@ mod tests {
             state
                 .refresh_copilot_upstream_auth_now(
                     "copilot-rejected-seed-account",
+                    1,
                     Some("copilot-rejected-seed-token"),
                 )
                 .await,
@@ -16125,7 +18477,7 @@ mod tests {
         ));
         assert!(matches!(
             state
-                .prepare_copilot_upstream_auth("copilot-rejected-seed-account")
+                .prepare_copilot_upstream_auth("copilot-rejected-seed-account", 1)
                 .await,
             Err(CopilotUpstreamAuthError::MissingGitHubToken { .. })
         ));
@@ -16150,7 +18502,8 @@ mod tests {
                         "profile": {"githubDomain": "github.com", "ghes": false},
                         "raw": {
                             "githubDomain": "github.com",
-                            "copilotApiBase": "https://old.example.com"
+                            "copilotToken": {"token": "copilot-cache-old-token"},
+                            "copilotApiBase": "https://api.individual.githubcopilot.com"
                         }
                     }))
                     .unwrap(),
@@ -16159,11 +18512,11 @@ mod tests {
             .await
             .unwrap();
         let old = state
-            .prepare_copilot_upstream_auth("copilot-cache-binding-account")
+            .prepare_copilot_upstream_auth("copilot-cache-binding-account", 1)
             .await
             .unwrap();
         assert_eq!(old.token, "copilot-cache-old-token");
-        assert_eq!(old.api_endpoint, "https://old.example.com");
+        assert_eq!(old.api_endpoint, "https://api.individual.githubcopilot.com");
 
         state
             .mutate_accounts_immediate(|accounts| {
@@ -16177,7 +18530,8 @@ mod tests {
                         "profile": {"githubDomain": "github.com", "ghes": false},
                         "raw": {
                             "githubDomain": "github.com",
-                            "copilotApiBase": "https://new.example.com"
+                            "copilotToken": {"token": "copilot-cache-new-token"},
+                            "copilotApiBase": "https://api.business.githubcopilot.com"
                         }
                     }))
                     .unwrap(),
@@ -16186,11 +18540,14 @@ mod tests {
             .await
             .unwrap();
         let refreshed = state
-            .prepare_copilot_upstream_auth("copilot-cache-binding-account")
+            .prepare_copilot_upstream_auth("copilot-cache-binding-account", 2)
             .await
             .unwrap();
         assert_eq!(refreshed.token, "copilot-cache-new-token");
-        assert_eq!(refreshed.api_endpoint, "https://new.example.com");
+        assert_eq!(
+            refreshed.api_endpoint,
+            "https://api.business.githubcopilot.com"
+        );
 
         {
             let mut cache = state.copilot_upstream_auth.write().await;
@@ -16199,11 +18556,53 @@ mod tests {
             cached.domain = "ghe.old.example.com".to_string();
         }
         let domain_rebound = state
-            .prepare_copilot_upstream_auth("copilot-cache-binding-account")
+            .prepare_copilot_upstream_auth("copilot-cache-binding-account", 2)
             .await
             .unwrap();
         assert_eq!(domain_rebound.token, "copilot-cache-new-token");
-        assert_eq!(domain_rebound.api_endpoint, "https://new.example.com");
+        assert_eq!(
+            domain_rebound.api_endpoint,
+            "https://api.business.githubcopilot.com"
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copilot_auth_rejects_stale_runtime_identity_before_exchange() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-stale-runtime-account",
+                        "providerType": "github_copilot",
+                        "email": "current@example.com",
+                        "accessToken": "cached-current-token",
+                        "refreshToken": "github-token-that-must-not-be-used",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {"githubDomain": "github.com"}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+
+        let result = state
+            .prepare_copilot_upstream_auth("copilot-stale-runtime-account", 0)
+            .await;
+        assert!(matches!(
+            result,
+            Err(CopilotUpstreamAuthError::IdentityChanged {
+                expected: 0,
+                observed: 1,
+                ..
+            })
+        ));
 
         drop(state);
         fs::remove_dir_all(config_dir).unwrap();
@@ -16221,6 +18620,22 @@ mod tests {
         account.refresh_token = None;
         account.api_key = None;
         assert!(!account_quota_refresh_candidate(&accounts, &account));
+    }
+
+    #[test]
+    fn qoder_accounts_are_background_quota_refresh_candidates_for_oauth_and_pat() {
+        let accounts = AccountStore::default();
+        let mut oauth = copilot_account_fixture(None);
+        oauth.provider_type = ProviderType::QoderCosy;
+        assert!(account_quota_refresh_candidate(&accounts, &oauth));
+
+        oauth.access_token = None;
+        oauth.refresh_token = None;
+        oauth.api_key = Some("pt-qoder".to_string());
+        assert!(account_quota_refresh_candidate(&accounts, &oauth));
+
+        oauth.api_key = None;
+        assert!(!account_quota_refresh_candidate(&accounts, &oauth));
     }
 
     #[test]
@@ -19022,6 +21437,141 @@ mod tests {
             credential_generation: 1,
             ..ProviderResourceMetadata::default()
         }
+    }
+
+    #[tokio::test]
+    async fn coding_plan_quota_reports_mimo_as_contract_unavailable_without_network() {
+        let state = test_state();
+        let provider_id = "mimo-quota-unavailable";
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider(provider_id, "MiMo Token Plan"),
+                Some(ProfileId::parse("codex.xiaomi_mimo_token_plan").unwrap()),
+                None,
+                Some("mimo-quota-unavailable-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let snapshot = state
+            .coding_plan_quota_snapshot(
+                ProviderKey::new(AppKind::Codex, provider_id).unwrap(),
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.source, CodingPlanQuotaSource::Contract);
+        assert_eq!(
+            snapshot.quota.state,
+            crate::domain::providers::coding_plan::CodingPlanQuotaState::Unavailable
+        );
+        assert!(snapshot.quota.windows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coding_plan_quota_missing_credential_is_unknown_and_never_stale() {
+        let state = test_state();
+        let provider_id = "kimi-quota-missing-key";
+        let provider_id_for_write = provider_id.to_string();
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert_with_resource(
+                    AppKind::Codex,
+                    test_provider(&provider_id_for_write, "Kimi Coding"),
+                    provider_resource("codex.kimi_coding_api_key", 1),
+                );
+            })
+            .await
+            .unwrap();
+
+        let snapshot = state
+            .coding_plan_quota_snapshot(
+                ProviderKey::new(AppKind::Codex, provider_id).unwrap(),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.source, CodingPlanQuotaSource::Contract);
+        assert_eq!(
+            snapshot.quota.state,
+            crate::domain::providers::coding_plan::CodingPlanQuotaState::Unknown
+        );
+        assert!(snapshot.quota.stale_since_ms.is_none());
+        assert_eq!(
+            snapshot.quota.reason.as_deref(),
+            Some("coding-plan API key is not configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn coding_plan_quota_waiter_revalidates_provider_generation_after_flight() {
+        let state = test_state();
+        let provider_id = "kimi-quota-waiter-generation";
+        let provider_id_for_write = provider_id.to_string();
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert_with_resource(
+                    AppKind::Codex,
+                    test_provider(&provider_id_for_write, "Kimi Coding"),
+                    provider_resource("codex.kimi_coding_api_key", 1),
+                );
+            })
+            .await
+            .unwrap();
+
+        let provider_key = ProviderKey::new(AppKind::Codex, provider_id).unwrap();
+        let old_target = {
+            let providers = state.providers.read().await;
+            coding_plan_quota_target_from_store(&providers, &provider_key).unwrap()
+        };
+        let old_flight = state.coding_plan_quota_refresh_flight(&old_target.cache_key);
+        let old_guard = Arc::clone(&old_flight.gate).lock_owned().await;
+        let waiter_state = state.clone();
+        let waiter_key = provider_key.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_state
+                .coding_plan_quota_snapshot(waiter_key, true)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&old_flight.gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quota waiter did not join the old generation flight");
+
+        let provider_id_for_write = provider_id.to_string();
+        state
+            .mutate_providers_immediate(move |providers| {
+                let mut resource = provider_resource("codex.kimi_coding_api_key", 2);
+                resource.credential_generation = 2;
+                providers.upsert_with_resource(
+                    AppKind::Codex,
+                    test_provider(&provider_id_for_write, "Kimi Coding Updated"),
+                    resource,
+                );
+            })
+            .await
+            .unwrap();
+        old_flight.complete(
+            CodingPlanQuotaSource::Live,
+            CodingPlanQuotaView::unknown("superseded quota result"),
+        );
+        drop(old_guard);
+
+        let snapshot = waiter.await.unwrap().unwrap().unwrap();
+        assert_eq!(snapshot.provider_revision, 2);
+        assert_eq!(snapshot.credential_generation, 2);
+        assert_eq!(
+            snapshot.quota.reason.as_deref(),
+            Some("coding-plan API key is not configured")
+        );
     }
 
     fn colliding_bundle_store(provider_id: &str) -> ProviderStore {
@@ -22859,6 +25409,10 @@ mod tests {
     }
 
     fn test_state_at(config_dir: PathBuf) -> ServerState {
+        try_test_state_at(config_dir).unwrap()
+    }
+
+    fn try_test_state_at(config_dir: PathBuf) -> anyhow::Result<ServerState> {
         let log_capture = Arc::new(crate::logging::LogCapture::new(
             crate::logging::RING_BUFFER_CAPACITY,
         ));
@@ -22873,51 +25427,155 @@ mod tests {
             },
             log_capture,
         )
-        .unwrap()
+    }
+
+    fn grok_media_task_binding_for_test(
+        task_id: &str,
+        created_at_ms: i64,
+    ) -> (String, GrokMediaTaskBinding) {
+        let share_id = "share-a".to_string();
+        let user_namespace = grok_media_task_user_namespace(Some("owner@example.com"));
+        let binding = GrokMediaTaskBinding {
+            task_id: task_id.to_string(),
+            provider_id: "grok-provider".to_string(),
+            account_id: "grok-account".to_string(),
+            auth_identity_generation: 1,
+            share_id: share_id.clone(),
+            runtime_fingerprint: "runtime-a".to_string(),
+            user_namespace: user_namespace.clone(),
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(120_000),
+        };
+        let key = grok_media_task_owner_key(&share_id, &user_namespace, task_id);
+        (key, binding)
     }
 
     #[test]
-    fn grok_media_sessions_are_bounded_and_evict_the_earliest_expiry() {
-        let state = test_state();
-        state.remember_grok_media_session(
-            "grok-video:earliest".to_string(),
-            "grok-provider".to_string(),
-            "grok-account".to_string(),
-            1,
-            60_000,
-        );
-        for index in 0..GROK_MEDIA_SESSION_MAX_BINDINGS - 1 {
-            state.remember_grok_media_session(
-                format!("grok-video:retained-{index}"),
-                "grok-provider".to_string(),
-                "grok-account".to_string(),
-                1,
-                120_000,
-            );
+    fn grok_media_tasks_are_bounded_and_evict_the_earliest_expiry() {
+        let mut store = GrokMediaTaskStore::default();
+        for index in 0..=GROK_MEDIA_TASK_MAX_BINDINGS {
+            let (key, mut binding) =
+                grok_media_task_binding_for_test(&format!("task-{index}"), index as i64);
+            binding.expires_at_ms = if index == 0 {
+                1
+            } else {
+                120_000 + index as i64
+            };
+            store.bindings.insert(key, binding);
+        }
+        store.enforce_capacity();
+
+        assert_eq!(store.bindings.len(), GROK_MEDIA_TASK_MAX_BINDINGS);
+        let earliest = grok_media_task_binding_for_test("task-0", 0).0;
+        let newest = grok_media_task_binding_for_test(
+            &format!("task-{GROK_MEDIA_TASK_MAX_BINDINGS}"),
+            GROK_MEDIA_TASK_MAX_BINDINGS as i64,
+        )
+        .0;
+        assert!(!store.bindings.contains_key(&earliest));
+        assert!(store.bindings.contains_key(&newest));
+    }
+
+    #[test]
+    fn grok_media_task_store_fails_closed_on_corruption_schema_and_excessive_ttl() {
+        let cases = [
+            (
+                "corrupt",
+                b"{not-json".to_vec(),
+                "parse Grok media task store",
+            ),
+            (
+                "schema",
+                serde_json::to_vec(&json!({"schemaVersion": 99, "bindings": {}})).unwrap(),
+                "unsupported Grok media task store schema version",
+            ),
+        ];
+        for (name, contents, expected) in cases {
+            let config_dir = provider_restore_test_dir(&format!("grok-media-task-{name}"));
+            std::fs::write(grok_media_tasks_path(&config_dir), contents).unwrap();
+            let error = match try_test_state_at(config_dir.clone()) {
+                Ok(_) => panic!("invalid Grok media task store must fail startup"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("load Grok media task store"));
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            std::fs::remove_dir_all(config_dir).unwrap();
         }
 
-        state.remember_grok_media_session(
-            "grok-video:newest".to_string(),
-            "grok-provider".to_string(),
-            "grok-account".to_string(),
-            1,
-            120_000,
+        let config_dir = provider_restore_test_dir("grok-media-task-excessive-ttl");
+        let (key, mut binding) = grok_media_task_binding_for_test("video-long", 1_000);
+        binding.expires_at_ms = binding
+            .created_at_ms
+            .saturating_add(GROK_MEDIA_TASK_MAX_TTL_MS)
+            .saturating_add(1);
+        let store = GrokMediaTaskStore {
+            bindings: [(key, binding)].into_iter().collect(),
+            ..GrokMediaTaskStore::default()
+        };
+        std::fs::write(
+            grok_media_tasks_path(&config_dir),
+            serde_json::to_vec(&store).unwrap(),
+        )
+        .unwrap();
+        let error = match try_test_state_at(config_dir.clone()) {
+            Ok(_) => panic!("overlong Grok media task lifetime must fail startup"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("exceeds the maximum lifetime"),
+            "{error:#}"
         );
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
 
-        assert!(state
-            .grok_media_session_binding("grok-video:earliest")
-            .is_none());
-        assert!(state
-            .grok_media_session_binding("grok-video:newest")
-            .is_some());
+    #[tokio::test]
+    async fn grok_media_tasks_persist_across_restart_and_isolate_share_and_user_scope() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_dir =
+            std::env::temp_dir().join(format!("cc-switch-server-grok-media-task-{nanos}"));
+        let state = test_state_at(config_dir.clone());
+        let binding = state
+            .remember_grok_media_task(
+                "video-1".to_string(),
+                "provider-a".to_string(),
+                "account-a".to_string(),
+                7,
+                "share-a".to_string(),
+                "runtime-a".to_string(),
+                Some("Owner@Example.com"),
+                60_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(binding.task_id, "video-1");
+        assert_eq!(binding.share_id, "share-a");
+        let persisted = std::fs::read_to_string(grok_media_tasks_path(&config_dir)).unwrap();
+        assert!(!persisted.contains("Owner@Example.com"));
+        assert!(!persisted.contains("owner@example.com"));
+        drop(state);
+
+        let restored = test_state_at(config_dir.clone());
         assert_eq!(
-            state
-                .grok_media_sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
-            GROK_MEDIA_SESSION_MAX_BINDINGS
+            restored
+                .grok_media_task_binding("share-a", Some("owner@example.com"), "video-1")
+                .await
+                .unwrap(),
+            Some(binding)
         );
+        assert!(restored
+            .grok_media_task_binding("share-b", Some("owner@example.com"), "video-1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(restored
+            .grok_media_task_binding("share-a", Some("other@example.com"), "video-1")
+            .await
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     fn refresh_test_account_input(
@@ -23456,6 +26114,21 @@ mod tests {
             )
             .await
             .unwrap());
+        assert!(!state
+            .record_grok_capability_observation_if_current(
+                &stale.id,
+                crate::domain::accounts::store::GrokAccountCapability::VideoGeneration,
+                CurrentAccountCapabilityObservation {
+                    provider_type: stale.provider_type,
+                    auth_identity_generation: stale.auth_identity_generation,
+                    state: crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported,
+                    source: "stale_response",
+                    reason: Some("endpoint_not_supported"),
+                    expires_at_ms: None,
+                },
+            )
+            .await
+            .unwrap());
 
         let unchanged = state.find_account_by_id(&stale.id).await.unwrap();
         assert!(unchanged.rate_limited_until.is_none());
@@ -23500,6 +26173,80 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn grok_capability_observation_throttles_identical_state_but_commits_transitions() {
+        let state = test_state();
+        let account = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(refresh_test_account_input(
+                    "grok-capability-state-transition",
+                    ProviderType::GrokOAuth,
+                    Some("owner@example.com"),
+                    "access",
+                    "refresh",
+                    i64::MAX,
+                ))
+            })
+            .await
+            .unwrap();
+        let capability = crate::domain::accounts::store::GrokAccountCapability::VideoGeneration;
+        let unsupported =
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported;
+
+        assert!(state
+            .record_grok_capability_observation_if_current(
+                &account.id,
+                capability,
+                CurrentAccountCapabilityObservation {
+                    provider_type: account.provider_type,
+                    auth_identity_generation: account.auth_identity_generation,
+                    state: unsupported,
+                    source: "media_response",
+                    reason: Some("endpoint_not_supported"),
+                    expires_at_ms: None,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(!state
+            .record_grok_capability_observation_if_current(
+                &account.id,
+                capability,
+                CurrentAccountCapabilityObservation {
+                    provider_type: account.provider_type,
+                    auth_identity_generation: account.auth_identity_generation,
+                    state: unsupported,
+                    source: "media_response",
+                    reason: Some("endpoint_not_supported"),
+                    expires_at_ms: None,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(state
+            .record_grok_capability_evidence_if_current(
+                &account.id,
+                account.provider_type,
+                account.auth_identity_generation,
+                capability,
+                "upstream_success",
+            )
+            .await
+            .unwrap());
+
+        let current = state.find_account_by_id(&account.id).await.unwrap();
+        let observation = current
+            .capability_observations
+            .get("grok_code_plan:video_generation")
+            .unwrap();
+        assert_eq!(
+            observation.state,
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported
+        );
+        assert_eq!(observation.source, "upstream_success");
+        assert!(observation.reason.is_none());
     }
 
     #[tokio::test]

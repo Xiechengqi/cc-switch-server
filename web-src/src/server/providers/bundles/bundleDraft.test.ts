@@ -169,6 +169,54 @@ describe("Provider Bundle drafts", () => {
     expect(openai.testApp).toBe("codex");
   });
 
+  it("creates both Copilot surfaces with one managed-account binding", () => {
+    const family = familyById("family.github_copilot")!;
+    const draft = createProviderBundleDraft(family);
+    expect(
+      draft.surfaces.map(({ app, profileId, enabled }) => ({
+        app,
+        profileId,
+        enabled,
+      })),
+    ).toEqual([
+      {
+        app: "claude",
+        profileId: "claude.github_copilot",
+        enabled: true,
+      },
+      {
+        app: "codex",
+        profileId: "codex.github_copilot",
+        enabled: true,
+      },
+    ]);
+    expect(supportsPerAppModelPolicy(family)).toBe(true);
+    expect(requiresPerAppModelPolicy(family)).toBe(false);
+    expect(draft.modelPolicyScope).toBe("per_app");
+    expect(
+      draft.surfaces.map(({ app, upstreamModel }) => ({ app, upstreamModel })),
+    ).toEqual([
+      { app: "claude", upstreamModel: "claude-sonnet-5" },
+      { app: "codex", upstreamModel: "gpt-5.5" },
+    ]);
+
+    draft.accountId = "copilot-account";
+    draft.accountGeneration = 4;
+    const write = toProviderBundleWriteDraft(draft);
+    expect(write.managedAccount).toEqual({
+      accountId: "copilot-account",
+      authIdentityGeneration: 4,
+    });
+    expect(write.modelPolicyScope).toBe("per_app");
+    expect(write.modelPolicy).toBeUndefined();
+    expect(write.surfaces).toHaveLength(2);
+    expect(write.surfaces.every((surface) => surface.enabled)).toBe(true);
+
+    const global = changeModelPolicyScope(draft, "global");
+    expect(global.modelPolicyScope).toBe("global");
+    expect(validateProviderBundleDraft(global)).toBeNull();
+  });
+
   it("defaults new OpenAI OAuth WebSocket options on without affecting other drivers", () => {
     const openai = createProviderBundleDraft(
       familyById("family.openai_oauth")!,

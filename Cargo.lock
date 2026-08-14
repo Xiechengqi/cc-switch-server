@@ -378,6 +378,7 @@ dependencies = [
 name = "cc-switch-server"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "argon2",
  "async-stream",
@@ -385,6 +386,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "cbc",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -408,12 +410,14 @@ dependencies = [
  "imagesize",
  "jsonwebtoken",
  "libc",
+ "md5",
  "metrics",
  "metrics-exporter-prometheus",
  "multer",
  "portable-pty",
  "rand 0.8.6",
  "reqwest",
+ "rsa",
  "rusqlite",
  "russh",
  "serde",

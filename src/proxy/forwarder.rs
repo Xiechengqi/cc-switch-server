@@ -34,7 +34,7 @@ use crate::domain::accounts::store::{
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
-use crate::domain::providers::runtime::managed_account_binding_with_generation;
+use crate::domain::providers::runtime::{managed_account_binding_with_generation, RuntimeAuthRef};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::previous_response_cache::PreviousResponseCacheScope;
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
@@ -48,7 +48,8 @@ use crate::logging::{
 };
 use crate::state::{
     AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
-    GrokMediaSessionBinding, ManagedAccountRefreshError, ServerState, ShareInFlightGuard,
+    GrokMediaTaskBinding, GrokMediaTaskCommitError, ManagedAccountRefreshError, QoderRuntimeError,
+    ServerState, ShareInFlightGuard,
 };
 
 #[cfg(test)]
@@ -61,6 +62,11 @@ use super::anthropic_semantics::{
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::cursor;
 use super::deepseek;
+use super::kimi_runtime::{
+    kimi_thinking_replay_model_family, kimi_thinking_replay_user_namespace,
+    restore_kimi_thinking_replay_content, KimiThinkingReplayScope, KimiThinkingReplaySnapshot,
+    KimiThinkingReplayStreamAccumulator, KimiThinkingReplayStreamOutcome,
+};
 use super::kiro;
 use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
@@ -85,6 +91,7 @@ use super::streaming::{
     ResponsesSseAggregationError, ResponsesSseAggregationErrorKind, ResponsesSseAggregator,
     StreamUsageAccumulator,
 };
+use super::terminal_detector::{UpstreamTerminal, UpstreamTerminalDetector};
 use super::usage::{
     log_usage, update_image_stream_usage, update_stream_usage, update_stream_usage_result,
     update_websocket_stream_usage,
@@ -129,6 +136,10 @@ struct ImageTransportMetrics {
     max_silence: Duration,
     emitted: bool,
 }
+
+#[cfg(test)]
+#[path = "forwarder/qoder_http_tests.rs"]
+mod qoder_http_tests;
 
 impl ImageTransportMetrics {
     fn new(surface: &'static str, mode: &'static str, started: Instant) -> Self {
@@ -390,6 +401,7 @@ struct ForwardAttemptContext {
     body_retry_stage: Option<ClaudeBodyRetryStage>,
     execution: Option<ProviderExecution>,
     auth_refresh_attempted: bool,
+    antigravity_retry_attempted: bool,
     codex_overflow_compact_attempted: bool,
     codex_body_override: Option<Bytes>,
     excluded_provider_ids: BTreeSet<String>,
@@ -414,6 +426,7 @@ impl Default for ForwardAttemptContext {
             body_retry_stage: None,
             execution: None,
             auth_refresh_attempted: false,
+            antigravity_retry_attempted: false,
             codex_overflow_compact_attempted: false,
             codex_body_override: None,
             excluded_provider_ids: BTreeSet::new(),
@@ -452,6 +465,12 @@ impl ForwardAttemptContext {
     fn after_auth_refresh(&self, execution: &ProviderExecution) -> Self {
         let mut next = self.next(execution, self.body_retry_stage, "auth", "unauthorized");
         next.auth_refresh_attempted = true;
+        next
+    }
+
+    fn after_antigravity_retry(&self, execution: &ProviderExecution, source: &'static str) -> Self {
+        let mut next = self.next(execution, self.body_retry_stage, "capacity", source);
+        next.antigravity_retry_attempted = true;
         next
     }
 
@@ -1334,6 +1353,7 @@ async fn forward_with_attempt(
                 request_context,
                 account_in_flight_guard,
                 share_invocation_guard,
+                runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
                 timeouts: cursor::h2_client::CursorH2Timeouts {
                     request: execution.request_timeout(),
                     first_frame: execution.stream_first_byte_timeout(),
@@ -1433,6 +1453,32 @@ async fn forward_with_attempt(
             }
         }
         execution.enforce_model_policy(&mut adapter_request)?;
+        if execution.driver_is("special.qoder_cosy") {
+            if !matches!(
+                route,
+                ProxyRoute::ClaudeMessages
+                    | ProxyRoute::CodexChatCompletions
+                    | ProxyRoute::CodexResponses
+                    | ProxyRoute::Gemini
+            ) {
+                return Err(ProxyError::bad_request(
+                    "Qoder COSY supports Messages, Chat Completions, Responses, and Gemini generation routes only",
+                ));
+            }
+            return forward_qoder(QoderForwardOptions {
+                state,
+                execution,
+                stored,
+                adapter,
+                adapter_request,
+                route,
+                request_context,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+            })
+            .await;
+        }
         if execution.driver_is("oauth.openai_codex")
             && route != ProxyRoute::CodexResponsesCompact
             && !codex_responses_body_has_compaction_trigger(&adapter_request.body)
@@ -1530,14 +1576,15 @@ async fn forward_with_attempt(
                 ensure_execution_gemini_v1internal_project(&state, &execution).await?;
             }
             let copilot_upstream_auth = if execution.driver_is("special.copilot") {
-                let account_id = execution.managed_account_id().ok_or_else(|| {
-                    ProxyError::bad_request(
-                        "github_copilot provider must bind one explicit managed account",
-                    )
-                })?;
+                let (_, account_id, expected_generation) =
+                    execution.managed_account_identity_target().ok_or_else(|| {
+                        ProxyError::bad_request(
+                            "github_copilot provider must bind one explicit managed account",
+                        )
+                    })?;
                 Some(
                     state
-                        .prepare_copilot_upstream_auth(account_id)
+                        .prepare_copilot_upstream_auth(account_id, expected_generation)
                         .await
                         .map_err(copilot_upstream_auth_error_to_proxy_error)?,
                 )
@@ -1574,7 +1621,8 @@ async fn forward_with_attempt(
                 );
             }
             if let Some(auth) = copilot_upstream_auth {
-                url = super::join_url(&auth.api_endpoint, "/chat/completions");
+                let inference_origin = copilot_inference_origin(&execution, &auth.api_endpoint)?;
+                url = super::join_url(&inference_origin, "/chat/completions");
                 replace_or_push_header(
                     &mut target_headers,
                     "authorization",
@@ -1602,8 +1650,18 @@ async fn forward_with_attempt(
                 &mut url,
                 &mut target_headers,
             )?;
+            execution.guard_coding_plan_request(route, &adapter_request, &url)?;
             (adapter_request, url, target_headers)
         };
+
+        let kimi_thinking_replay = prepare_kimi_thinking_replay(
+            &state,
+            &execution,
+            route,
+            &request_context,
+            &mut adapter_request.body,
+        )
+        .await;
 
         let final_model = adapter_request
             .actual_model
@@ -1699,6 +1757,12 @@ async fn forward_with_attempt(
         let mut status_code = status.as_u16();
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
+        if matches!(
+            status,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            clear_rejected_kimi_thinking_replay(&state, kimi_thinking_replay.as_ref()).await;
+        }
         if status == StatusCode::UNAUTHORIZED {
             let releases_account_lease = execution
                 .managed_account_identity_target()
@@ -1977,16 +2041,38 @@ async fn forward_with_attempt(
                 bytes,
                 PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
             )?;
-            maybe_mark_upstream_rate_limited(
-                &state,
-                &execution,
-                status,
-                &response_headers,
-                &decoded.body,
-                request_context.share_id.as_deref(),
-                final_model.as_deref(),
-            )
-            .await;
+            let antigravity_limit = antigravity_limit_info(&execution, status, &decoded.body);
+            if let Some(limit) = antigravity_limit.as_ref() {
+                record_antigravity_limit_evidence(&state, &execution, limit).await;
+                if let Some(next_attempt) =
+                    next_antigravity_limit_attempt(route, &attempt_context, &execution, limit)
+                {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        provider_outcome_from_status(status_code),
+                    )
+                    .await;
+                    attempt_context = next_attempt;
+                    drop(upstream);
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    tokio::time::sleep(Duration::from_millis(limit.retry_delay_ms)).await;
+                    continue 'attempt;
+                }
+                mark_antigravity_limit_cooldown(&state, &execution, &request_context, limit);
+            } else {
+                maybe_mark_upstream_rate_limited(
+                    &state,
+                    &execution,
+                    status,
+                    &response_headers,
+                    &decoded.body,
+                    request_context.share_id.as_deref(),
+                    final_model.as_deref(),
+                )
+                .await;
+            }
             if !request_is_provider_pinned(&attempt_context, &request_context) {
                 if let Some(next_attempt) =
                     next_provider_failover(&state, route, &attempt_context, &execution, "http_429")
@@ -2257,17 +2343,36 @@ async fn forward_with_attempt(
             let upstream_format =
                 adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
                     .unwrap_or_else(|| adapters::downstream_format_for_route(route));
+            let mut terminal_detector = UpstreamTerminalDetector::new(upstream_format);
             let responses_image_transport = upstream_format == UpstreamFormat::OpenAiResponses
                 && responses_body_requests_image_generation(route, &adapter_request.body);
+            let grok_responses_sse = (status.is_success()
+                && stored.provider_type == ProviderType::GrokOAuth
+                && upstream_format == UpstreamFormat::OpenAiResponses)
+                .then(|| {
+                    super::grok::GrokResponsesSseInspector::new(route == ProxyRoute::CodexResponses)
+                });
+            let grok_search_identity = execution.managed_account_identity_target().and_then(
+                |(provider_type, account_id, auth_identity_generation)| {
+                    (provider_type == ProviderType::GrokOAuth)
+                        .then(|| (account_id.to_string(), auth_identity_generation))
+                },
+            );
+            let mandatory_semantic_contract = execution.plan.coding_plan.is_some()
+                || matches!(
+                    stored.provider_type,
+                    ProviderType::KimiCode | ProviderType::GrokOAuth
+                );
             let inspect_responses_semantics = status.is_success()
                 && upstream_format == UpstreamFormat::OpenAiResponses
                 && responses_semantic_inspection_required(
                     response_semantics::semantic_guard_enabled(),
                     codex_overflow_compact_eligible(route, &execution, &attempt_context),
                     responses_image_transport,
+                    mandatory_semantic_contract,
                 );
             let inspect_anthropic_semantics = status.is_success()
-                && response_semantics::semantic_guard_enabled()
+                && (response_semantics::semantic_guard_enabled() || mandatory_semantic_contract)
                 && route == ProxyRoute::ClaudeMessages
                 && upstream_format == UpstreamFormat::AnthropicMessages;
             let mut responses_semantics =
@@ -2332,6 +2437,12 @@ async fn forward_with_attempt(
                     match next {
                         Ok(Some(chunk)) => {
                             prelude.extend_from_slice(&chunk);
+                            if terminal_detector.push(&chunk).is_err() {
+                                semantic_protocol_error = Some(format!(
+                                    "Upstream terminal event exceeded the {} byte limit",
+                                    terminal_detector.max_event_bytes()
+                                ));
+                            }
                             detected_error = sse_error_detector
                                 .as_mut()
                                 .and_then(|detector| detector.push(&chunk));
@@ -2359,6 +2470,32 @@ async fn forward_with_attempt(
                                             "protocol_error",
                                         );
                                         semantic_protocol_error = Some(error.to_string());
+                                    }
+                                }
+                            }
+                            if terminal_detector.terminal().is_some()
+                                && semantic_decision.is_none()
+                                && semantic_protocol_error.is_none()
+                            {
+                                if let Some(inspector) = responses_semantics.as_mut() {
+                                    match inspector.finish() {
+                                        Ok(observations) => {
+                                            for observation in &observations {
+                                                crate::metrics::record_proxy_semantic_guard(
+                                                    "http_stream_prime",
+                                                    observation.metric_kind(),
+                                                );
+                                            }
+                                            semantic_decision =
+                                                semantic_prelude_decision(&observations);
+                                        }
+                                        Err(error) => {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "http_stream_prime",
+                                                "protocol_error",
+                                            );
+                                            semantic_protocol_error = Some(error.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -2415,6 +2552,7 @@ async fn forward_with_attempt(
                                 || semantic_decision.is_some()
                                 || anthropic_event_ready
                                 || semantic_protocol_error.is_some()
+                                || terminal_detector.terminal().is_some()
                                 || (!inspect_responses_semantics
                                     && (sse_error_detector
                                         .as_ref()
@@ -2703,11 +2841,21 @@ async fn forward_with_attempt(
                     &stored, route,
                 ),
                 codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher::default(),
+                grok_responses_sse,
+                grok_search_identity,
+                grok_search_evidence_recorded: false,
+                kimi_thinking_replay: kimi_thinking_replay.clone().map(|context| {
+                    KimiThinkingReplayStreamWrite {
+                        context,
+                        accumulator: KimiThinkingReplayStreamAccumulator::default(),
+                    }
+                }),
                 stream_transform: super::stream_transforms::StreamEventTransformer::new(
                     &stored,
                     route,
                     adapter_request.responses_tool_context.clone(),
                 ),
+                terminal_detector,
                 claude_tool_name_stream_patcher:
                     super::claude_oauth::ClaudeToolNameStreamPatcher::new(
                         adapter_request.claude_tool_name_map.clone(),
@@ -2759,7 +2907,8 @@ async fn forward_with_attempt(
                         .anthropic_semantics
                         .as_ref()
                         .and_then(AnthropicSseInspector::terminal)
-                        .is_some();
+                        .is_some()
+                    || stream_state.terminal_detector.terminal().is_some();
                 let mut chunk_already_inspected = false;
                 let mut image_heartbeat = false;
                 let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
@@ -2831,6 +2980,17 @@ async fn forward_with_attempt(
 
                 match next_chunk {
                     Ok(Some(chunk)) => {
+                        if !chunk_already_inspected
+                            && stream_state.terminal_detector.push(&chunk).is_err()
+                        {
+                            let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
+                            return stream_state
+                                .terminate_transform_error(ProxyError::bad_gateway(format!(
+                                    "Upstream terminal event exceeded the {max_event_bytes} byte limit"
+                                )))
+                                .await;
+                        }
+                        stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
                         let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
                         stream_state.usage.push(&chunk);
@@ -2963,6 +3123,7 @@ async fn forward_with_attempt(
                             )
                             .await;
                         }
+                        let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
                         let transformed = match stream_state.stream_transform.push(chunk) {
                             Ok(transformed) => transformed,
                             Err(error) => {
@@ -2976,6 +3137,7 @@ async fn forward_with_attempt(
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
                         stream_state.record_image_transport_emit(&transformed, false);
+                        stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(false).await;
                         Ok(Some((transformed, stream_state)))
                     }
@@ -3049,6 +3211,9 @@ async fn forward_with_attempt(
                                 )
                                 .await;
                             }
+                            let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
+                            let grok_tail = stream_state.finish_grok_responses_inspection().await;
+                            let chunk = join_bytes(chunk, grok_tail);
                             let transformed = match stream_state.stream_transform.push(chunk) {
                                 Ok(transformed) => transformed,
                                 Err(error) => {
@@ -3069,6 +3234,7 @@ async fn forward_with_attempt(
                                 .codex_custom_tool_stream_patcher
                                 .push(transformed);
                             stream_state.record_image_transport_emit(&transformed, false);
+                            stream_state.commit_kimi_thinking_replay_stream().await;
                             stream_state.finalize_terminal_usage(true).await;
                             return Ok(Some((transformed, stream_state)));
                         }
@@ -3108,12 +3274,21 @@ async fn forward_with_attempt(
                                     .await;
                             }
                         }
+                        let grok_tail = stream_state.finish_grok_responses_inspection().await;
+                        let transformed_grok_tail =
+                            match stream_state.stream_transform.push(grok_tail) {
+                                Ok(tail) => tail,
+                                Err(error) => {
+                                    return stream_state.terminate_transform_error(error).await
+                                }
+                            };
                         let transform_tail = match stream_state.stream_transform.finish() {
                             Ok(tail) => tail,
                             Err(error) => {
                                 return stream_state.terminate_transform_error(error).await
                             }
                         };
+                        let transform_tail = join_bytes(transformed_grok_tail, transform_tail);
                         let claude_tail = stream_state
                             .claude_tool_name_stream_patcher
                             .push(transform_tail);
@@ -3128,6 +3303,7 @@ async fn forward_with_attempt(
                             transformed_tail,
                             stream_state.codex_custom_tool_stream_patcher.finish(),
                         );
+                        stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(true).await;
                         if !custom_tail.is_empty() {
                             return Ok(Some((custom_tail, stream_state)));
@@ -3249,6 +3425,21 @@ async fn forward_with_attempt(
         };
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
+        if let Some(limit) = antigravity_limit_info(&execution, status, &bytes) {
+            record_antigravity_limit_evidence(&state, &execution, &limit).await;
+            if let Some(next_attempt) =
+                next_antigravity_limit_attempt(route, &attempt_context, &execution, &limit)
+            {
+                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                    .await;
+                attempt_context = next_attempt;
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                tokio::time::sleep(Duration::from_millis(limit.retry_delay_ms)).await;
+                continue 'attempt;
+            }
+            mark_antigravity_limit_cooldown(&state, &execution, &request_context, &limit);
+        }
         if status.is_success()
             && adapters::is_gemini_v1internal_provider_type(stored.provider_type)
             && serde_json::from_slice::<Value>(&bytes)
@@ -3431,11 +3622,23 @@ async fn forward_with_attempt(
         };
         let is_count_tokens_request =
             route == ProxyRoute::ClaudeCountTokens || adapter_request.is_gemini_count_tokens();
+        let kimi_thinking_replay_content = status
+            .is_success()
+            .then(|| kimi_thinking_replay_content_from_response(&bytes))
+            .flatten();
         let usage = if is_count_tokens_request {
             TokenUsage::default()
         } else {
             adapter.parse_usage(&bytes, &stored, route)
         };
+        if status.is_success()
+            && stored.provider_type == ProviderType::GrokOAuth
+            && semantic_upstream_format == UpstreamFormat::OpenAiResponses
+            && super::grok::grok_response_has_completed_search(&bytes)
+        {
+            record_grok_capability_evidence(&state, &execution, GrokAccountCapability::Search)
+                .await;
+        }
         let bytes = if status.is_success() {
             match adapter.transform_response_for_request(bytes, &stored, route, &adapter_request) {
                 Ok(bytes) => bytes,
@@ -3458,6 +3661,14 @@ async fn forward_with_attempt(
             bytes,
             &adapter_request.claude_tool_name_map,
         );
+        if status.is_success() {
+            commit_kimi_thinking_replay(
+                &state,
+                kimi_thinking_replay.as_ref(),
+                kimi_thinking_replay_content,
+            )
+            .await;
+        }
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
             crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
@@ -3787,7 +3998,10 @@ async fn codex_previous_response_cache_scope(
     execution: &ProviderExecution,
     request_context: &UsageLogContext,
 ) -> Option<PreviousResponseCacheScope> {
-    if execution.stored.provider_type != ProviderType::CodexOAuth {
+    if !matches!(
+        execution.stored.provider_type,
+        ProviderType::CodexOAuth | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    ) {
         return None;
     }
     let share_id = request_context.share_id.as_deref()?.trim();
@@ -3972,7 +4186,10 @@ fn ensure_share_model_available(
     share_id: Option<&str>,
     model: Option<&str>,
 ) -> Result<(), ProxyError> {
-    if execution.stored.provider_type != ProviderType::CodexOAuth {
+    if !matches!(
+        execution.stored.provider_type,
+        ProviderType::CodexOAuth | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    ) {
         return Ok(());
     }
     let (Some(share_id), Some(model)) = (
@@ -4023,8 +4240,26 @@ async fn forward_grok_media_for_test_surface(
         super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
     )?;
     let request_context = request_context_from_headers(&headers);
-    let sticky_media_binding = super::grok::sticky_media_session_key(&upstream_path, &body)
-        .and_then(|session_key| state.grok_media_session_binding(&session_key));
+    let test_share_id = request_context
+        .share_id
+        .clone()
+        .unwrap_or_else(|| format!("test-share:{provider_id}"));
+    let sticky_media_binding =
+        if let Some(task_id) = super::grok::video_task_id_from_request(&upstream_path, &body) {
+            Some(
+                state
+                    .grok_media_task_binding(
+                        &test_share_id,
+                        request_context.user_email.as_deref(),
+                        &task_id,
+                    )
+                    .await
+                    .map_err(grok_media_task_store_error)?
+                    .ok_or_else(|| grok_media_task_not_found(&task_id))?,
+            )
+        } else {
+            None
+        };
     let accounts = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
     let snapshot = state.account_in_flight.snapshot();
@@ -4086,8 +4321,22 @@ pub async fn forward_grok_media(
     } else {
         None
     };
-    let sticky_media_binding = super::grok::sticky_media_session_key(&upstream_path, &body)
-        .and_then(|session_key| state.grok_media_session_binding(&session_key));
+    let share_id = request_context.share_id.as_deref().ok_or_else(|| {
+        ProxyError::bad_request("Grok media requests require a Router Share binding")
+    })?;
+    let sticky_media_binding = if let Some(task_id) =
+        super::grok::video_task_id_from_request(&upstream_path, &body)
+    {
+        Some(
+            state
+                .grok_media_task_binding(share_id, request_context.user_email.as_deref(), &task_id)
+                .await
+                .map_err(grok_media_task_store_error)?
+                .ok_or_else(|| grok_media_task_not_found(&task_id))?,
+        )
+    } else {
+        None
+    };
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
@@ -4333,7 +4582,7 @@ async fn forward_grok_media_with_execution(
     upstream_path: String,
     headers: HeaderMap,
     body: Bytes,
-    sticky_media_binding: Option<GrokMediaSessionBinding>,
+    sticky_media_binding: Option<GrokMediaTaskBinding>,
     request_context: UsageLogContext,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
@@ -4350,7 +4599,7 @@ async fn forward_grok_media_with_execution(
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     if let Some(binding) = sticky_media_binding.as_ref() {
-        ensure_grok_media_session_binding(&execution, binding)?;
+        ensure_grok_media_task_binding(&execution, binding)?;
     }
     ensure_managed_credential_persistence_available(&state, &execution)?;
     let capability = grok_media_capability(&method, &upstream_path);
@@ -4625,19 +4874,75 @@ async fn forward_grok_media_with_execution(
         None,
     )
     .await;
+    record_grok_media_capability_observation(
+        &state,
+        &execution,
+        capability,
+        status,
+        &response_body,
+    )
+    .await;
     if status.is_success() && upstream_path.contains("/videos/generations") {
-        if let Some(session_key) = super::grok::video_session_key_from_response(&response_body) {
-            if let Some((ProviderType::GrokOAuth, account_id, auth_identity_generation)) =
-                execution.managed_account_identity_target()
-            {
-                state.remember_grok_media_session(
-                    session_key,
-                    stored.provider.id.clone(),
-                    account_id.to_string(),
-                    auth_identity_generation,
-                    24 * 60 * 60 * 1000,
+        let task_id = match super::grok::video_task_id_from_response(&response_body) {
+            Some(task_id) => task_id,
+            None => {
+                let error = ProxyError::bad_gateway(
+                    "Grok video generation response did not contain a valid task id",
                 );
+                record_grok_media_terminal(
+                    &state,
+                    &stored,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    ProviderOutcome::Failure {
+                        status_code: error.status.as_u16(),
+                    },
+                )
+                .await;
+                return Err(error);
             }
+        };
+        let (ProviderType::GrokOAuth, account_id, auth_identity_generation) =
+            execution.managed_account_identity_target().ok_or_else(|| {
+                ProxyError::conflict(
+                    "Grok video task cannot be bound because its managed account changed",
+                )
+            })?
+        else {
+            return Err(ProxyError::conflict(
+                "Grok video task cannot be bound to a non-Grok account",
+            ));
+        };
+        let owner_share_id = share_id
+            .clone()
+            .unwrap_or_else(|| format!("test-share:{}", stored.provider.id));
+        if let Err(error) = state
+            .remember_grok_media_task_if_current(
+                stored.app,
+                stored.provider.id.clone(),
+                execution.plan.provider_revision,
+                execution.plan.runtime_fingerprint.clone(),
+                account_id.to_string(),
+                auth_identity_generation,
+                task_id,
+                owner_share_id,
+                user_email.as_deref(),
+                24 * 60 * 60 * 1000,
+            )
+            .await
+        {
+            let error = grok_media_task_commit_error(error);
+            record_grok_media_terminal(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                ProviderOutcome::Failure {
+                    status_code: error.status.as_u16(),
+                },
+            )
+            .await;
+            return Err(error);
         }
     }
     if status.is_success() {
@@ -4955,9 +5260,9 @@ impl Drop for GrokImageLifecycleGuard {
     }
 }
 
-fn ensure_grok_media_session_binding(
+fn ensure_grok_media_task_binding(
     execution: &ProviderExecution,
-    binding: &GrokMediaSessionBinding,
+    binding: &GrokMediaTaskBinding,
 ) -> Result<(), ProxyError> {
     let account_matches = execution.managed_account_identity_target().is_some_and(
         |(provider_type, account_id, auth_identity_generation)| {
@@ -4966,14 +5271,41 @@ fn ensure_grok_media_session_binding(
                 && binding.auth_identity_generation == auth_identity_generation
         },
     );
-    if binding.provider_id == execution.stored.provider.id && account_matches {
+    if binding.provider_id == execution.stored.provider.id
+        && account_matches
+        && binding.runtime_fingerprint == execution.plan.runtime_fingerprint
+    {
         return Ok(());
     }
     Err(ProxyError {
         status: StatusCode::CONFLICT,
-        message: "Grok media session is bound to a different Provider or OAuth account identity"
-            .to_string(),
+        message:
+            "Grok media task is bound to a different Provider, OAuth account, or runtime identity"
+                .to_string(),
     })
+}
+
+fn grok_media_task_store_error(error: anyhow::Error) -> ProxyError {
+    ProxyError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: format!("Grok media task ownership store is unavailable: {error}"),
+    }
+}
+
+fn grok_media_task_commit_error(error: GrokMediaTaskCommitError) -> ProxyError {
+    match error {
+        GrokMediaTaskCommitError::BindingChanged => ProxyError::conflict(
+            "Grok Provider or bound account changed before video task ownership was committed",
+        ),
+        GrokMediaTaskCommitError::Store(error) => grok_media_task_store_error(error),
+    }
+}
+
+fn grok_media_task_not_found(task_id: &str) -> ProxyError {
+    ProxyError::not_found(format!(
+        "Grok media task {} is not owned by this Share/user scope",
+        opaque_ref("task", task_id)
+    ))
 }
 
 async fn forward_codex_images_request(
@@ -5410,15 +5742,11 @@ async fn forward_codex_images_request(
         },
     )
     .await;
-    let upstream_is_sse = content_type
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let downstream_stream = prepared.stream;
     let stream = codex_images_response_stream(CodexImagesStreamArgs {
         state,
         stored,
         upstream,
-        upstream_is_sse,
         prepared,
         request_context,
         started,
@@ -5476,11 +5804,12 @@ async fn send_codex_images_attempt(
     execution.apply_auth(&mut target_headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut target_headers, stored, &accounts)?;
     execution.finalize_outbound_identity(&mut target_headers)?;
+    target_headers.retain(|(name, _)| !name.eq_ignore_ascii_case(ACCEPT.as_str()));
+    target_headers.push((ACCEPT.as_str().to_string(), "text/event-stream".to_string()));
     let access_token = bearer_token_from_owned_headers(&target_headers).map(str::to_string);
     let http_client = forward_http_client(state, stored).await?;
     let mut request = http_client
         .post(&url)
-        .header(ACCEPT, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
         .body(adapter_request.body.clone());
     for (name, value) in &target_headers {
@@ -6103,7 +6432,6 @@ struct CodexImagesStreamArgs {
     state: ServerState,
     stored: StoredProvider,
     upstream: reqwest::Response,
-    upstream_is_sse: bool,
     prepared: CodexImagesPreparedRequest,
     request_context: UsageLogContext,
     started: Instant,
@@ -6124,7 +6452,6 @@ fn codex_images_response_stream(
         state,
         stored,
         upstream,
-        upstream_is_sse,
         prepared,
         request_context,
         started,
@@ -6162,7 +6489,7 @@ fn codex_images_response_stream(
     };
     async_stream::stream! {
         let mut inner = upstream.bytes_stream();
-        let mut parser = CodexImagesResponseParser::new(upstream_is_sse);
+        let mut parser = CodexImagesResponseParser::new();
         let initial = if prepared.stream {
             Bytes::from_static(b": connected\n\n")
         } else {
@@ -6524,7 +6851,6 @@ struct CodexImagesCompletion {
 }
 
 struct CodexImagesResponseParser {
-    sse: bool,
     buffer: Vec<u8>,
     total_bytes: usize,
     pending_results: Vec<CodexImageResult>,
@@ -6534,9 +6860,8 @@ struct CodexImagesResponseParser {
 }
 
 impl CodexImagesResponseParser {
-    fn new(sse: bool) -> Self {
+    fn new() -> Self {
         Self {
-            sse,
             buffer: Vec::new(),
             total_bytes: 0,
             pending_results: Vec::new(),
@@ -6555,12 +6880,6 @@ impl CodexImagesResponseParser {
             )));
         }
         self.buffer.extend_from_slice(chunk);
-        if !self.sse {
-            return Ok(CodexImagesParsedChunk {
-                events: Vec::new(),
-                saw_valid_event: false,
-            });
-        }
         let mut events = Vec::new();
         let mut saw_valid_event = false;
         while let Some((event_end, delimiter_len)) = next_sse_event_boundary_bytes(&self.buffer) {
@@ -6584,44 +6903,27 @@ impl CodexImagesResponseParser {
     }
 
     fn finish(&mut self) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
-        if self.sse {
-            let mut events = Vec::new();
-            let mut saw_valid_event = false;
-            if !self.buffer.iter().all(u8::is_ascii_whitespace) {
-                let tail = std::mem::take(&mut self.buffer);
-                if let Some(event) = self.parse_sse_event(&tail, &mut saw_valid_event)? {
-                    events.push(event);
-                }
+        let mut events = Vec::new();
+        let mut saw_valid_event = false;
+        if !self.buffer.iter().all(u8::is_ascii_whitespace) {
+            let tail = std::mem::take(&mut self.buffer);
+            if let Some(event) = self.parse_sse_event(&tail, &mut saw_valid_event)? {
+                events.push(event);
             }
-            if !events.iter().any(|event| {
-                matches!(
-                    event,
-                    CodexImagesProtocolEvent::Completed(_) | CodexImagesProtocolEvent::Failed(_)
-                )
-            }) {
-                return Err(CodexImagesFailure::protocol(
-                    "Codex image stream ended before a terminal event",
-                ));
-            }
-            return Ok(CodexImagesParsedChunk {
-                events,
-                saw_valid_event,
-            });
         }
-
-        let value = serde_json::from_slice::<Value>(&self.buffer).map_err(|error| {
-            CodexImagesFailure::protocol(format!("invalid Codex Images upstream JSON: {error}"))
-        })?;
-        let event = self
-            .protocol_event_from_value(&value, None)?
-            .unwrap_or_else(|| {
-                CodexImagesProtocolEvent::Failed(CodexImagesFailure::protocol(
-                    "Codex Images upstream JSON did not contain a terminal response",
-                ))
-            });
+        if !events.iter().any(|event| {
+            matches!(
+                event,
+                CodexImagesProtocolEvent::Completed(_) | CodexImagesProtocolEvent::Failed(_)
+            )
+        }) {
+            return Err(CodexImagesFailure::protocol(
+                "Codex image stream ended before a terminal event",
+            ));
+        }
         Ok(CodexImagesParsedChunk {
-            events: vec![event],
-            saw_valid_event: true,
+            events,
+            saw_valid_event,
         })
     }
 
@@ -6644,6 +6946,14 @@ impl CodexImagesResponseParser {
             }
         }
         if data.is_empty() {
+            if event.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with('{') || line.starts_with('[')
+            }) {
+                return Err(CodexImagesFailure::protocol(
+                    "Codex Images upstream did not use the expected SSE data framing",
+                ));
+            }
             return Ok(None);
         }
         let payload = data.join("\n");
@@ -6734,7 +7044,6 @@ impl CodexImagesResponseParser {
                 Ok(None)
             }
             "response.completed" | "response.done" => self.completion_from_value(value).map(Some),
-            "" if !self.sse => self.completion_from_value(value).map(Some),
             _ => Ok(None),
         }
     }
@@ -9953,6 +10262,7 @@ async fn prepare_codex_http_fallback_target(
     execution.apply_auth(&mut headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
+    execution.guard_coding_plan_request(ProxyRoute::CodexResponses, &adapter_request, &url)?;
 
     Ok(PreparedCodexHttpFallbackTarget {
         http_client: forward_http_client(state, &stored).await?,
@@ -11259,6 +11569,110 @@ async fn maybe_mark_upstream_rate_limited(
         .await;
 }
 
+fn antigravity_limit_info(
+    execution: &ProviderExecution,
+    status: StatusCode,
+    body: &[u8],
+) -> Option<super::antigravity_retry::AntigravityRetryInfo> {
+    matches!(
+        execution.stored.provider_type,
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    )
+    .then(|| super::antigravity_retry::parse_google_rpc_retry(status.as_u16(), body))
+    .flatten()
+}
+
+fn next_antigravity_limit_attempt(
+    route: ProxyRoute,
+    attempt_context: &ForwardAttemptContext,
+    execution: &ProviderExecution,
+    limit: &super::antigravity_retry::AntigravityRetryInfo,
+) -> Option<ForwardAttemptContext> {
+    if attempt_context.antigravity_retry_attempted
+        || !attempt_context.retry_allowed()
+        || !limit.is_short_delay()
+        || execution.managed_account_identity_target().is_none()
+    {
+        return None;
+    }
+    let source = limit.kind.reason();
+    record_forward_retry(route, "capacity", source);
+    Some(attempt_context.after_antigravity_retry(execution, source))
+}
+
+async fn record_antigravity_limit_evidence(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    limit: &super::antigravity_retry::AntigravityRetryInfo,
+) {
+    use crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::{
+        Unknown, Unsupported,
+    };
+
+    let Some((provider_type, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return;
+    };
+    let observation_state = match limit.kind {
+        super::antigravity_retry::AntigravityLimitKind::RateLimit => Unknown,
+        super::antigravity_retry::AntigravityLimitKind::ModelCapacity => Unsupported,
+    };
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let expires_at_ms =
+        now_ms.saturating_add(i64::try_from(limit.retry_delay_ms.max(1_000)).unwrap_or(i64::MAX));
+    if let Err(error) = state
+        .record_antigravity_capability_observation_if_current(
+            account_id,
+            crate::domain::accounts::capability_evidence::MODEL_CAPACITY_DIMENSION,
+            crate::state::CurrentAccountCapabilityObservation {
+                provider_type,
+                auth_identity_generation,
+                state: observation_state,
+                source: "google_rpc_error",
+                reason: Some(limit.kind.reason()),
+                expires_at_ms: Some(expires_at_ms),
+            },
+        )
+        .await
+    {
+        tracing::warn!(
+            account_id,
+            provider_type = provider_type.as_str(),
+            error = %error,
+            "failed to persist Antigravity capacity evidence"
+        );
+    }
+}
+
+fn mark_antigravity_limit_cooldown(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    request_context: &UsageLogContext,
+    limit: &super::antigravity_retry::AntigravityRetryInfo,
+) {
+    let Some(share_id) = request_context
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let delay_ms = i64::try_from(limit.retry_delay_ms.max(1_000)).unwrap_or(i64::MAX);
+    let until_ms =
+        super::bounded_upstream_rate_limit_until(now_ms, now_ms.saturating_add(delay_ms));
+    state.mark_share_model_cooldown(
+        share_id,
+        &execution.plan.runtime_fingerprint,
+        &limit.model,
+        until_ms,
+        limit.kind.reason(),
+        now_ms,
+    );
+}
+
 async fn mark_managed_account_auth_cooldown(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -11512,6 +11926,1244 @@ fn codex_rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
             }
         })
         .filter(|until| *until > now_ms)
+}
+
+struct QoderForwardOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    adapter: adapters::GenericForwardingAdapter,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+struct PreparedQoderWireResponse {
+    inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    decoder: super::qoder::QoderSseDecoder,
+    first_canonical: Bytes,
+}
+
+enum QoderForwardAttemptError {
+    Upstream(super::qoder::QoderUpstreamError),
+    Proxy(ProxyError),
+}
+
+async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyError> {
+    let QoderForwardOptions {
+        state,
+        execution,
+        stored,
+        adapter,
+        mut adapter_request,
+        route,
+        mut request_context,
+        account_in_flight_guard,
+        share_invocation_guard,
+        started,
+    } = options;
+    let (ProviderType::QoderCosy, account_id, expected_identity_generation) =
+        execution.managed_account_identity_target().ok_or_else(|| {
+            ProxyError::bad_request(
+                "Qoder COSY Provider must bind one explicit qoder_cosy managed account",
+            )
+        })?
+    else {
+        return Err(ProxyError::bad_request(
+            "Qoder COSY Provider account type does not match its runtime contract",
+        ));
+    };
+    let share_id = request_context
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("Qoder COSY inference requires a Router Share"))?
+        .to_string();
+    let user_namespace = opaque_ref(
+        "qoder_user",
+        request_context
+            .user_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("anonymous"),
+    );
+    let downstream_session_id = request_context
+        .session_id
+        .clone()
+        .or_else(|| request_context.request_id.clone())
+        .unwrap_or_else(|| {
+            opaque_ref(
+                "qoder_request",
+                std::str::from_utf8(&adapter_request.body).unwrap_or("non_utf8_request"),
+            )
+        });
+    request_context.session_id = Some(downstream_session_id.clone());
+    let requested_model = match adapter_request
+        .actual_model
+        .clone()
+        .or_else(|| adapter_request.model.clone())
+        .or_else(|| qoder_model_from_canonical_chat(&adapter_request.body))
+    {
+        Some(model) => model,
+        None => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                ProxyError::bad_request("Qoder COSY request is missing a model"),
+            )
+            .await;
+        }
+    };
+    let canonical_chat_request = match serde_json::from_slice::<Value>(&adapter_request.body) {
+        Ok(request) => request,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                ProxyError::bad_request(format!("invalid Qoder Chat request: {error}")),
+            )
+            .await;
+        }
+    };
+
+    let mut auth_recovery_attempted = false;
+    let (runtime, model_key, wire) = loop {
+        let runtime = match state
+            .prepare_qoder_runtime(
+                stored.app,
+                &stored.provider.id,
+                execution.plan.provider_revision,
+                &execution.plan.runtime_fingerprint,
+                account_id,
+                expected_identity_generation,
+                execution.request_timeout(),
+            )
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
+                auth_recovery_attempted = true;
+                recover_qoder_auth_before_commit(
+                    &state,
+                    &execution,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    None,
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => {
+                let error = qoder_runtime_error_to_proxy_error(error);
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let model_key = match super::qoder_runtime::resolve_qoder_model_key(
+            runtime.session.session.site,
+            &requested_model,
+        ) {
+            Ok(model_key) => model_key,
+            Err(message) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    ProxyError::bad_request(message),
+                )
+                .await;
+            }
+        };
+        if !runtime
+            .catalog
+            .enabled_models
+            .iter()
+            .any(|enabled| enabled == &model_key)
+        {
+            let error = ProxyError {
+                status: StatusCode::FORBIDDEN,
+                message: format!(
+                    "Qoder model {model_key} is not enabled in the bound account's live catalog"
+                ),
+            };
+            record_qoder_nonstream_failure(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+        let exact_model_config = match runtime.exact_model_config(&model_key) {
+            Some(config) => config,
+            None => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    ProxyError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: format!(
+                            "Qoder live catalog has no exact model_config for enabled model {model_key}"
+                        ),
+                    },
+                )
+                .await;
+            }
+        };
+        let conversation_session_id =
+            match super::qoder_runtime::derive_qoder_conversation_session_id(
+                &runtime.scope,
+                &share_id,
+                &user_namespace,
+                &downstream_session_id,
+                &model_key,
+            ) {
+                Ok(session_id) => session_id,
+                Err(message) => {
+                    return qoder_fail_before_commit(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        ProxyError::bad_request(message),
+                    )
+                    .await;
+                }
+            };
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let payload = match super::qoder_runtime::build_qoder_payload(
+            &canonical_chat_request,
+            exact_model_config,
+            runtime.session.session.site,
+            &model_key,
+            &conversation_session_id,
+            &runtime.session.session.identity.user_type,
+            now_ms,
+        ) {
+            Ok(payload) => payload,
+            Err(message) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    ProxyError::bad_request(message),
+                )
+                .await;
+            }
+        };
+        let wire =
+            send_qoder_generation(&state, &execution, &runtime, &payload, exact_model_config).await;
+        match wire {
+            Ok(wire) => break (runtime, model_key, wire),
+            Err(QoderForwardAttemptError::Upstream(error))
+                if error.is_authentication_failure() && !auth_recovery_attempted =>
+            {
+                auth_recovery_attempted = true;
+                recover_qoder_auth_before_commit(
+                    &state,
+                    &execution,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    Some(&runtime),
+                )
+                .await?;
+            }
+            Err(QoderForwardAttemptError::Upstream(error)) => {
+                record_qoder_limit_if_needed(&state, &execution, &error).await;
+                let error = error.into_proxy_error();
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(QoderForwardAttemptError::Proxy(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    };
+
+    adapter_request.actual_model = Some(model_key.clone());
+    adapter_request.actual_model_source = Some("qoder_live_catalog".to_string());
+    if let Err(error) = ensure_share_model_available(
+        &state,
+        &execution,
+        request_context.share_id.as_deref(),
+        Some(&model_key),
+    ) {
+        return qoder_fail_before_commit(
+            &state,
+            &stored,
+            &adapter_request,
+            &request_context,
+            started,
+            error,
+        )
+        .await;
+    }
+    if adapter_request.stream_requested {
+        forward_qoder_stream(QoderStreamOptions {
+            state,
+            execution,
+            runtime,
+            stored,
+            adapter_request,
+            route,
+            request_context,
+            wire,
+            account_in_flight_guard,
+            share_invocation_guard,
+            started,
+        })
+        .await
+    } else {
+        let canonical =
+            match aggregate_qoder_nonstream(&state, &execution, &runtime, wire, &model_key).await {
+                Ok(canonical) => canonical,
+                Err(QoderForwardAttemptError::Upstream(error)) => {
+                    record_qoder_limit_if_needed(&state, &execution, &error).await;
+                    let error = error.into_proxy_error();
+                    record_qoder_nonstream_failure(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                Err(QoderForwardAttemptError::Proxy(error)) => {
+                    record_qoder_nonstream_failure(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+        finish_qoder_nonstream(QoderNonstreamFinishOptions {
+            state,
+            stored,
+            adapter,
+            adapter_request,
+            route,
+            request_context,
+            canonical,
+            account_in_flight_guard,
+            share_invocation_guard,
+            started,
+        })
+        .await
+    }
+}
+
+fn qoder_model_from_canonical_chat(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn send_qoder_generation(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::qoder_runtime::PreparedQoderRuntime,
+    payload: &super::qoder_runtime::PreparedQoderPayload,
+    exact_model_config: &Value,
+) -> Result<PreparedQoderWireResponse, QoderForwardAttemptError> {
+    if !qoder_runtime_is_current(state, execution, runtime).await {
+        return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
+            "Qoder Provider or bound account changed before inference",
+        )));
+    }
+    let plain_body = serde_json::to_vec(&payload.body).map_err(|error| {
+        QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
+            "encode Qoder generation payload: {error}"
+        )))
+    })?;
+    let encoded_body = Bytes::from(crate::domain::qoder::qoder_encode(&plain_body));
+    let mut target_headers = runtime
+        .session
+        .session
+        .signed_headers(
+            &encoded_body,
+            crate::domain::qoder::QODER_GENERATION_SIGNATURE_PATH,
+            chrono::Utc::now().timestamp(),
+            &payload.request_id,
+            &crate::domain::qoder::qoder_machine_os(),
+            "",
+        )
+        .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+    target_headers.extend([
+        ("x-model-key".to_string(), payload.model_key.clone()),
+        (
+            "x-model-source".to_string(),
+            exact_model_config
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("system")
+                .to_string(),
+        ),
+        (
+            "user-agent".to_string(),
+            format!("QoderCLI/{}", runtime.session.session.client_version),
+        ),
+    ]);
+    let mut headers = HeaderMap::new();
+    super::outbound_request::insert_target_headers(&mut headers, &target_headers)
+        .map_err(QoderForwardAttemptError::Proxy)?;
+    let url = super::join_url(
+        &runtime.session.gateway_base_url,
+        crate::domain::qoder::QODER_GENERATION_PATH,
+    );
+    let request = state
+        .http_client()
+        .await
+        .post(url)
+        .headers(headers)
+        .body(encoded_body);
+    let response = match execution.stream_first_byte_timeout() {
+        Some(timeout) => tokio::time::timeout(timeout, request.send())
+            .await
+            .map_err(|_| {
+                QoderForwardAttemptError::Proxy(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Qoder generation response-header timeout after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            })?
+            .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+        None => request
+            .send()
+            .await
+            .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+    };
+    if !qoder_runtime_is_current(state, execution, runtime).await {
+        return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
+            "Qoder Provider or bound account changed while inference was starting",
+        )));
+    }
+    let mut response = response;
+    let status = response.status();
+    if !status.is_success() {
+        let body = crate::infra::http::read_response_body_limited(
+            &mut response,
+            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+        .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+        return Err(QoderForwardAttemptError::Upstream(
+            super::qoder::QoderUpstreamError::from_status_body(status.as_u16(), &body),
+        ));
+    }
+
+    let mut inner = response.bytes_stream().boxed();
+    let mut decoder = super::qoder::QoderSseDecoder::default();
+    let mut received_chunk = false;
+    loop {
+        let timeout = if received_chunk {
+            execution.stream_idle_timeout()
+        } else {
+            execution.stream_first_byte_timeout()
+        };
+        let next = qoder_next_wire_chunk(&mut inner, timeout).await?;
+        let Some(chunk) = next else {
+            let tail = decoder.finish_classified().map_err(|error| match error {
+                super::qoder::QoderSseDecodeError::Upstream(error) => {
+                    QoderForwardAttemptError::Upstream(error)
+                }
+                super::qoder::QoderSseDecodeError::Protocol(error) => {
+                    QoderForwardAttemptError::Proxy(error)
+                }
+            })?;
+            return Ok(PreparedQoderWireResponse {
+                inner,
+                decoder,
+                first_canonical: tail,
+            });
+        };
+        received_chunk = true;
+        let canonical = decoder
+            .push_classified(chunk)
+            .map_err(|error| match error {
+                super::qoder::QoderSseDecodeError::Upstream(error) => {
+                    QoderForwardAttemptError::Upstream(error)
+                }
+                super::qoder::QoderSseDecodeError::Protocol(error) => {
+                    QoderForwardAttemptError::Proxy(error)
+                }
+            })?;
+        if !canonical.is_empty() || decoder.is_terminal() {
+            if !qoder_runtime_is_current(state, execution, runtime).await {
+                return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
+                    "Qoder Provider or bound account changed before response commit",
+                )));
+            }
+            return Ok(PreparedQoderWireResponse {
+                inner,
+                decoder,
+                first_canonical: canonical,
+            });
+        }
+    }
+}
+
+async fn qoder_next_wire_chunk(
+    inner: &mut BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    timeout: Option<Duration>,
+) -> Result<Option<Bytes>, QoderForwardAttemptError> {
+    let next = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, inner.try_next())
+            .await
+            .map_err(|_| {
+                QoderForwardAttemptError::Proxy(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Qoder generation stream timeout after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            })?,
+        None => inner.try_next().await,
+    };
+    next.map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))
+}
+
+async fn qoder_runtime_is_current(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::qoder_runtime::PreparedQoderRuntime,
+) -> bool {
+    state
+        .qoder_runtime_generation_matches(
+            execution.stored.app,
+            &execution.stored.provider.id,
+            execution.plan.provider_revision,
+            &execution.plan.runtime_fingerprint,
+            &runtime.account_id,
+            runtime.auth_identity_generation,
+            runtime.token_refresh_generation,
+        )
+        .await
+}
+
+async fn recover_qoder_auth(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: Option<&super::qoder_runtime::PreparedQoderRuntime>,
+) -> Result<(), ProxyError> {
+    let (provider_type, account_id, expected_generation) = execution
+        .managed_account_identity_target()
+        .ok_or_else(|| ProxyError::bad_request("Qoder managed account binding is missing"))?;
+    let rail = match runtime {
+        Some(runtime) => {
+            state.invalidate_qoder_runtime_scope(&runtime.scope).await;
+            runtime.credential_rail
+        }
+        None => {
+            let account = state
+                .find_account_for_provider(provider_type, account_id)
+                .await
+                .ok_or_else(|| ProxyError::not_found("Qoder managed account not found"))?;
+            crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref())
+                .map_err(ProxyError::bad_request)?
+                .credential_rail
+        }
+    };
+    if rail == crate::domain::qoder::QoderCredentialRail::PatJobToken {
+        return Ok(());
+    }
+    state
+        .refresh_managed_account_now_for_generation(provider_type, account_id, expected_generation)
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_qoder_auth_before_commit(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    stored: &StoredProvider,
+    request: &adapters::AdapterRequest,
+    request_context: &UsageLogContext,
+    started: Instant,
+    runtime: Option<&super::qoder_runtime::PreparedQoderRuntime>,
+) -> Result<(), ProxyError> {
+    match recover_qoder_auth(state, execution, runtime).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            record_qoder_nonstream_failure(
+                state,
+                stored,
+                request,
+                request_context,
+                started,
+                &error,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+fn qoder_runtime_error_to_proxy_error(error: QoderRuntimeError) -> ProxyError {
+    match error {
+        QoderRuntimeError::NotFound => ProxyError::not_found("Qoder managed account not found"),
+        QoderRuntimeError::IdentityChanged => ProxyError::conflict(
+            "Qoder Provider or bound account identity changed during runtime preparation",
+        ),
+        QoderRuntimeError::CredentialPersistenceDegraded => managed_credential_persistence_error(),
+        QoderRuntimeError::InvalidAccount(message) => ProxyError::bad_request(message),
+        QoderRuntimeError::Refresh(error) => managed_account_refresh_error_to_proxy_error(error),
+        QoderRuntimeError::Upstream {
+            status_code,
+            message,
+            retryable,
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            ProxyError {
+                status: if retryable
+                    && status.is_client_error()
+                    && status != StatusCode::TOO_MANY_REQUESTS
+                {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                },
+                message,
+            }
+        }
+    }
+}
+
+async fn qoder_fail_before_commit(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request: &adapters::AdapterRequest,
+    request_context: &UsageLogContext,
+    started: Instant,
+    error: ProxyError,
+) -> Result<Response, ProxyError> {
+    record_qoder_nonstream_failure(state, stored, request, request_context, started, &error).await;
+    Err(error)
+}
+
+async fn record_qoder_limit_if_needed(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    error: &super::qoder::QoderUpstreamError,
+) {
+    if !error.is_agent_limited() {
+        return;
+    }
+    let Some((ProviderType::QoderCosy, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return;
+    };
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let until_ms = super::bounded_upstream_rate_limit_until(
+        now_ms,
+        error
+            .agent_limit_reset_at_ms
+            .unwrap_or_else(|| now_ms.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
+    );
+    state
+        .mark_account_rate_limited_until_if_current(
+            account_id,
+            ProviderType::QoderCosy,
+            auth_identity_generation,
+            until_ms,
+            Some(format!("Qoder agent limit is active until {until_ms}")),
+        )
+        .await;
+}
+
+async fn record_qoder_nonstream_failure(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request: &adapters::AdapterRequest,
+    request_context: &UsageLogContext,
+    started: Instant,
+    error: &ProxyError,
+) {
+    log_usage(
+        state,
+        stored,
+        error.status.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(request),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: request.stream_requested,
+            stream_status: request
+                .stream_requested
+                .then(|| "upstream_error".to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        TokenUsage::default(),
+    )
+    .await;
+    record_provider_outcome(
+        state,
+        stored,
+        provider_outcome_from_status(error.status.as_u16()),
+    )
+    .await;
+}
+
+struct QoderNonstreamFinishOptions {
+    state: ServerState,
+    stored: StoredProvider,
+    adapter: adapters::GenericForwardingAdapter,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    canonical: Value,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+async fn aggregate_qoder_nonstream(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::qoder_runtime::PreparedQoderRuntime,
+    mut wire: PreparedQoderWireResponse,
+    model_key: &str,
+) -> Result<Value, QoderForwardAttemptError> {
+    let mut aggregator = super::qoder::QoderChatSseAggregator::default();
+    aggregator
+        .push(wire.first_canonical)
+        .map_err(QoderForwardAttemptError::Proxy)?;
+    while !wire.decoder.is_terminal() {
+        let chunk =
+            match qoder_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    let tail = wire
+                        .decoder
+                        .finish_classified()
+                        .map_err(|error| match error {
+                            super::qoder::QoderSseDecodeError::Upstream(error) => {
+                                QoderForwardAttemptError::Upstream(error)
+                            }
+                            super::qoder::QoderSseDecodeError::Protocol(error) => {
+                                QoderForwardAttemptError::Proxy(error)
+                            }
+                        })?;
+                    aggregator
+                        .push(tail)
+                        .map_err(QoderForwardAttemptError::Proxy)?;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+        let canonical = match wire.decoder.push_classified(chunk) {
+            Ok(canonical) => canonical,
+            Err(super::qoder::QoderSseDecodeError::Upstream(error)) => {
+                return Err(QoderForwardAttemptError::Upstream(error));
+            }
+            Err(super::qoder::QoderSseDecodeError::Protocol(error)) => {
+                return Err(QoderForwardAttemptError::Proxy(error));
+            }
+        };
+        if !qoder_runtime_is_current(state, execution, runtime).await {
+            return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
+                "Qoder Provider or bound account changed during inference",
+            )));
+        }
+        aggregator
+            .push(canonical)
+            .map_err(QoderForwardAttemptError::Proxy)?;
+    }
+    if !qoder_runtime_is_current(state, execution, runtime).await {
+        return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
+            "Qoder Provider or bound account changed before response commit",
+        )));
+    }
+    aggregator
+        .finish(model_key, chrono::Utc::now().timestamp())
+        .map_err(QoderForwardAttemptError::Proxy)
+}
+
+async fn finish_qoder_nonstream(
+    options: QoderNonstreamFinishOptions,
+) -> Result<Response, ProxyError> {
+    let QoderNonstreamFinishOptions {
+        state,
+        stored,
+        adapter,
+        adapter_request,
+        route,
+        request_context,
+        canonical,
+        account_in_flight_guard: _account_in_flight_guard,
+        share_invocation_guard: _share_invocation_guard,
+        started,
+    } = options;
+    let usage = usage_from_json_with_semantics(&canonical, InputTokenSemantics::Inclusive);
+    let canonical_bytes = match serde_json::to_vec(&canonical).map(Bytes::from) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                ProxyError::bad_gateway(error),
+            )
+            .await;
+        }
+    };
+    let response_bytes = match adapter.transform_response_for_request(
+        canonical_bytes,
+        &stored,
+        route,
+        &adapter_request,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error,
+            )
+            .await;
+        }
+    };
+    log_usage(
+        &state,
+        &stored,
+        StatusCode::OK.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(&adapter_request),
+        usage,
+        UsageLogContext {
+            is_streaming: false,
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        &state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    record_provider_outcome(
+        &state,
+        &stored,
+        ProviderOutcome::from_status(StatusCode::OK.as_u16()),
+    )
+    .await;
+    let mut response = Response::new(Body::from(response_bytes));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
+}
+
+struct QoderStreamOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    runtime: super::qoder_runtime::PreparedQoderRuntime,
+    stored: StoredProvider,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    wire: PreparedQoderWireResponse,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, ProxyError> {
+    let QoderStreamOptions {
+        state,
+        execution,
+        runtime,
+        stored,
+        adapter_request,
+        route,
+        request_context,
+        mut wire,
+        account_in_flight_guard,
+        share_invocation_guard,
+        started,
+    } = options;
+    let first_canonical = wire.first_canonical;
+    let mut stream_transform = super::stream_transforms::StreamEventTransformer::new(
+        &stored,
+        route,
+        adapter_request.responses_tool_context.clone(),
+    );
+    let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
+        Ok(transformed) => transformed,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error,
+            )
+            .await;
+        }
+    };
+    if wire.decoder.is_terminal() {
+        let tail = match stream_transform.finish() {
+            Ok(tail) => tail,
+            Err(error) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    error,
+                )
+                .await;
+            }
+        };
+        first_transformed = join_bytes(first_transformed, tail);
+    }
+    let request_id = log_usage(
+        &state,
+        &stored,
+        StatusCode::OK.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(&adapter_request),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: true,
+            stream_status: Some("pending".to_string()),
+            usage_state: Some(UsageState::Pending),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
+    let stream = async_stream::stream! {
+        let _account_in_flight_guard = account_in_flight_guard;
+        let _share_invocation_guard = share_invocation_guard;
+        let mut interrupt_guard = ShareStreamInterruptGuard {
+            armed: true,
+            state: state.clone(),
+            stored: stored.clone(),
+            request_id: request_id.clone(),
+            status_code: StatusCode::OK.as_u16(),
+            share_id: share_id.clone(),
+            user_email: user_email.clone(),
+            started,
+            first_token_ms: None,
+            usage: StreamUsageAccumulator::default(),
+        };
+        let mut first_token_ms = None;
+        if !first_canonical.is_empty() {
+            interrupt_guard.usage.push(&first_canonical);
+        }
+        if !first_transformed.is_empty() {
+            first_token_ms = Some(started.elapsed().as_millis());
+            interrupt_guard.first_token_ms = first_token_ms;
+            update_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                StatusCode::OK.as_u16(),
+                started.elapsed().as_millis(),
+                first_token_ms,
+                TokenUsage::default(),
+                Some("streaming"),
+            ).await;
+            yield Ok::<Bytes, std::io::Error>(first_transformed);
+        }
+        if wire.decoder.is_terminal() {
+            finish_qoder_stream_success(&mut interrupt_guard).await;
+            return;
+        }
+        loop {
+            let chunk = match qoder_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    let error = wire.decoder.finish_classified().err().map(
+                        super::qoder::QoderSseDecodeError::into_proxy_error,
+                    ).unwrap_or_else(|| ProxyError::bad_gateway("Qoder stream ended unexpectedly"));
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+                Err(QoderForwardAttemptError::Proxy(error)) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+                Err(QoderForwardAttemptError::Upstream(error)) => {
+                    record_qoder_limit_if_needed(&state, &execution, &error).await;
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            let canonical = match wire.decoder.push_classified(chunk) {
+                Ok(canonical) => canonical,
+                Err(super::qoder::QoderSseDecodeError::Upstream(error)) => {
+                    record_qoder_limit_if_needed(&state, &execution, &error).await;
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+                Err(super::qoder::QoderSseDecodeError::Protocol(error)) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            if !qoder_runtime_is_current(&state, &execution, &runtime).await {
+                let error = ProxyError::conflict(
+                    "Qoder Provider or bound account changed during inference",
+                );
+                if let Some(frame) = finish_qoder_stream_failure(
+                    &mut interrupt_guard,
+                    route,
+                    &error,
+                ).await {
+                    yield Ok(frame);
+                }
+                return;
+            }
+            if !canonical.is_empty() {
+                interrupt_guard.usage.push(&canonical);
+            }
+            let mut transformed = match stream_transform.push(canonical) {
+                Ok(transformed) => transformed,
+                Err(error) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            if wire.decoder.is_terminal() {
+                match stream_transform.finish() {
+                    Ok(tail) => transformed = join_bytes(transformed, tail),
+                    Err(error) => {
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
+                    }
+                }
+            }
+            if !transformed.is_empty() {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(started.elapsed().as_millis());
+                    interrupt_guard.first_token_ms = first_token_ms;
+                    update_stream_usage(
+                        &state,
+                        &stored,
+                        &request_id,
+                        StatusCode::OK.as_u16(),
+                        started.elapsed().as_millis(),
+                        first_token_ms,
+                        TokenUsage::default(),
+                        Some("streaming"),
+                    ).await;
+                }
+                yield Ok(transformed);
+            }
+            if wire.decoder.is_terminal() {
+                finish_qoder_stream_success(&mut interrupt_guard).await;
+                return;
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    Ok(response)
+}
+
+async fn finish_qoder_stream_success(guard: &mut ShareStreamInterruptGuard) {
+    let usage_result = std::mem::take(&mut guard.usage).finish_with_status();
+    let usage = usage_result.usage;
+    update_stream_usage_result(
+        &guard.state,
+        &guard.stored,
+        &guard.request_id,
+        StatusCode::OK.as_u16(),
+        guard.started.elapsed().as_millis(),
+        guard.first_token_ms,
+        usage_result,
+        Some("completed"),
+    )
+    .await;
+    record_share_invocation_result(
+        &guard.state,
+        guard.share_id.as_deref(),
+        guard.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    record_provider_outcome(
+        &guard.state,
+        &guard.stored,
+        ProviderOutcome::from_status(StatusCode::OK.as_u16()),
+    )
+    .await;
+    guard.disarm();
+}
+
+async fn finish_qoder_stream_failure(
+    guard: &mut ShareStreamInterruptGuard,
+    route: ProxyRoute,
+    error: &ProxyError,
+) -> Option<Bytes> {
+    let usage_result = std::mem::take(&mut guard.usage).finish_with_status();
+    let usage = usage_result.usage;
+    update_stream_usage_result(
+        &guard.state,
+        &guard.stored,
+        &guard.request_id,
+        error.status.as_u16(),
+        guard.started.elapsed().as_millis(),
+        guard.first_token_ms,
+        usage_result,
+        Some("upstream_error"),
+    )
+    .await;
+    update_terminal_usage_error(&guard.state, &guard.request_id, error.message.clone()).await;
+    record_share_invocation_result(
+        &guard.state,
+        guard.share_id.as_deref(),
+        guard.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    record_provider_outcome(
+        &guard.state,
+        &guard.stored,
+        provider_outcome_from_status(error.status.as_u16()),
+    )
+    .await;
+    guard.disarm();
+    stream_terminal_error_frame(route, &error.message, error.status.as_u16())
 }
 
 struct ClaudeKiroForwardOptions {
@@ -11890,7 +13542,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.contains("claude-code")));
     let mut auth_recovery = retry_policy::AuthRecoveryState::default();
-    let (upstream, prepared) = loop {
+    let (upstream, prepared, first_frame_deadline) = loop {
         let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
         execution.materialize_auth(&accounts)?;
         let account_id = execution
@@ -11948,23 +13600,34 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             stream_requested,
         )?;
 
+        let first_frame_timeout = stream_requested
+            .then(|| execution.stream_first_byte_timeout())
+            .flatten();
+        let first_frame_deadline =
+            first_frame_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let upstream_result = if stream_requested {
-            match execution.stream_first_byte_timeout() {
-                Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
+            match (first_frame_timeout, first_frame_deadline) {
+                (Some(timeout), Some(deadline)) => {
+                    match tokio::time::timeout_at(deadline, request.send()).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                ProviderOutcome::NetworkFailure,
+                            )
                             .await;
-                        return Err(ProxyError {
-                            status: StatusCode::GATEWAY_TIMEOUT,
-                            message: format!(
-                                "proxy upstream streaming first byte timeout after {}ms",
-                                timeout.as_millis()
-                            ),
-                        });
+                            return Err(ProxyError {
+                                status: StatusCode::GATEWAY_TIMEOUT,
+                                message: format!(
+                                    "proxy upstream streaming first byte timeout after {}ms",
+                                    timeout.as_millis()
+                                ),
+                            });
+                        }
                     }
-                },
-                None => request.send().await,
+                }
+                _ => request.send().await,
             }
         } else {
             request.send().await
@@ -12023,9 +13686,9 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                     )
                     .await;
                 }
-                break (upstream, prepared);
+                break (upstream, prepared, first_frame_deadline);
             }
-            None => break (upstream, prepared),
+            None => break (upstream, prepared, first_frame_deadline),
         }
     };
     let status = upstream.status();
@@ -12051,6 +13714,8 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             started,
             status,
             status_code,
+            first_frame_deadline,
+            idle_timeout: execution.stream_idle_timeout(),
         })
         .await;
     }
@@ -12211,6 +13876,8 @@ struct ClaudeKiroStreamOptions {
     started: Instant,
     status: reqwest::StatusCode,
     status_code: u16,
+    first_frame_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Option<Duration>,
 }
 
 async fn forward_claude_kiro_stream(
@@ -12233,6 +13900,8 @@ async fn forward_claude_kiro_stream(
         started,
         status,
         status_code,
+        first_frame_deadline,
+        idle_timeout,
     } = options;
     let request_id = log_usage(
         &state,
@@ -12250,12 +13919,14 @@ async fn forward_claude_kiro_stream(
     .await;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
-    let stream = kiro::kiro_event_stream_to_claude_sse_scoped(
+    let stream = kiro::kiro_event_stream_to_claude_sse_scoped_with_timeouts(
         upstream.bytes_stream(),
         response_model,
         tool_name_map,
         &request_body,
         &cache_namespace,
+        first_frame_deadline,
+        idle_timeout,
     );
     let stream_transform = super::stream_transforms::StreamEventTransformer::new(
         &stored,
@@ -12284,6 +13955,7 @@ async fn forward_claude_kiro_stream(
             let canonical_chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
+                    let failure_status = kiro_stream_failure_status(&error);
                     let usage_result = std::mem::take(&mut interrupt_guard.usage)
                         .finish_with_status();
                     let usage = usage_result.usage;
@@ -12291,7 +13963,7 @@ async fn forward_claude_kiro_stream(
                         &state,
                         &stored,
                         &request_id,
-                        StatusCode::BAD_GATEWAY.as_u16(),
+                        failure_status.as_u16(),
                         started.elapsed().as_millis(),
                         first_token_ms,
                         usage_result,
@@ -12307,13 +13979,15 @@ async fn forward_claude_kiro_stream(
                     record_provider_outcome(
                         &state,
                         &stored,
-                        ProviderOutcome::Failure { status_code: 502 },
+                        ProviderOutcome::Failure {
+                            status_code: failure_status.as_u16(),
+                        },
                     ).await;
                     interrupt_guard.disarm();
                     if let Some(frame) = stream_terminal_error_frame(
                         route,
                         &error.to_string(),
-                        StatusCode::BAD_GATEWAY.as_u16(),
+                        failure_status.as_u16(),
                     ) {
                         yield Ok::<Bytes, std::io::Error>(frame);
                     } else {
@@ -12461,6 +14135,17 @@ async fn forward_claude_kiro_stream(
     Ok(response)
 }
 
+fn kiro_stream_failure_status(error: &std::io::Error) -> StatusCode {
+    if error
+        .to_string()
+        .starts_with("[KIRO_EVENT_STREAM_TIMEOUT] ")
+    {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 struct ShareStreamInterruptGuard {
     armed: bool,
     state: ServerState,
@@ -12536,14 +14221,14 @@ fn routed_model_metadata(
 fn kiro_api_base_override(stored: &StoredProvider) -> Option<String> {
     #[cfg(test)]
     {
-        return setting(
+        setting(
             &stored.provider,
             &[
                 "KIRO_API_BASE_URL",
                 "KIRO_BASE_URL",
                 "CODEWHISPERER_BASE_URL",
             ],
-        );
+        )
     }
     #[cfg(not(test))]
     {
@@ -13270,6 +14955,102 @@ async fn record_grok_capability_evidence(
     }
 }
 
+async fn record_grok_media_capability_observation(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    capability: GrokAccountCapability,
+    status: StatusCode,
+    body: &[u8],
+) {
+    let Some((observation_state, reason)) = grok_media_capability_observation(status, body) else {
+        return;
+    };
+    let Some((ProviderType::GrokOAuth, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return;
+    };
+    if let Err(error) = state
+        .record_grok_capability_observation_if_current(
+            account_id,
+            capability,
+            crate::state::CurrentAccountCapabilityObservation {
+                provider_type: ProviderType::GrokOAuth,
+                auth_identity_generation,
+                state: observation_state,
+                source: "media_response",
+                reason: Some(reason),
+                expires_at_ms: None,
+            },
+        )
+        .await
+    {
+        tracing::warn!(
+            account_id,
+            capability = capability.as_str(),
+            error = %error,
+            "failed to persist Grok media capability observation"
+        );
+    }
+}
+
+fn grok_media_capability_observation(
+    status: StatusCode,
+    body: &[u8],
+) -> Option<(
+    crate::domain::accounts::capability_evidence::AccountCapabilityObservationState,
+    &'static str,
+)> {
+    use crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::{
+        Unknown, Unsupported,
+    };
+
+    match status {
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => {
+            Some((Unsupported, "endpoint_not_supported"))
+        }
+        StatusCode::FORBIDDEN if grok_media_body_is_explicit_entitlement_rejection(body) => {
+            Some((Unsupported, "media_entitlement_rejected"))
+        }
+        StatusCode::FORBIDDEN => Some((Unknown, "forbidden_without_entitlement_code")),
+        _ => None,
+    }
+}
+
+fn grok_media_body_is_explicit_entitlement_rejection(body: &[u8]) -> bool {
+    let text =
+        crate::logging::redact_sensitive_text(&String::from_utf8_lossy(body)).to_ascii_lowercase();
+    let entitlement_subject = [
+        "entitlement",
+        "subscription",
+        "billing",
+        "paid plan",
+        "premium plan",
+        "upgrade your plan",
+        "plan required",
+        "media access",
+        "image generation access",
+        "video generation access",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let rejection = [
+        "required",
+        "not entitled",
+        "not eligible",
+        "unsupported",
+        "not available",
+        "access denied",
+        "forbidden",
+        "upgrade",
+        "inactive",
+        "expired",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    entitlement_subject && rejection
+}
+
 async fn next_claude_transport_attempt(
     _state: &ServerState,
     route: ProxyRoute,
@@ -13372,7 +15153,11 @@ async fn force_refresh_execution_auth(
     if provider_type == ProviderType::GitHubCopilot {
         let rejected_token = bearer_token_from_owned_headers(target_headers);
         state
-            .refresh_copilot_upstream_auth_now(account_id, rejected_token)
+            .refresh_copilot_upstream_auth_now(
+                account_id,
+                expected_auth_identity_generation,
+                rejected_token,
+            )
             .await
             .map(|_| ())
             .map_err(copilot_upstream_auth_error_to_proxy_error)
@@ -13734,6 +15519,42 @@ fn copilot_managed_account_auth_required(app: AppKind, stored: &StoredProvider) 
     stored.provider_type == ProviderType::GitHubCopilot && !provider_secret_configured(app, stored)
 }
 
+fn copilot_inference_origin(
+    _execution: &ProviderExecution,
+    validated_origin: &str,
+) -> Result<String, ProxyError> {
+    #[cfg(test)]
+    if let Some(override_origin) = _execution
+        .plan
+        .driver_options
+        .get("testCopilotInferenceUrl")
+        .and_then(Value::as_str)
+    {
+        let parsed = url::Url::parse(override_origin).map_err(|error| {
+            ProxyError::bad_request(format!("invalid Copilot test URL: {error}"))
+        })?;
+        let loopback = parsed.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        if parsed.scheme() != "http"
+            || !loopback
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(ProxyError::bad_request(
+                "Copilot test URL must be a credential-free loopback HTTP origin",
+            ));
+        }
+        return Ok(override_origin.trim_end_matches('/').to_string());
+    }
+    Ok(validated_origin.to_string())
+}
+
 fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
     match provider_type {
         ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
@@ -13743,7 +15564,7 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         | ProviderType::CodexOAuth
         | ProviderType::OllamaCloud
         | ProviderType::GrokOAuth => AppKind::Codex,
-        ProviderType::KimiCode => AppKind::Codex,
+        ProviderType::KimiCode | ProviderType::QoderCosy => AppKind::Codex,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {
@@ -13828,6 +15649,13 @@ fn copilot_upstream_auth_error_to_proxy_error(error: CopilotUpstreamAuthError) -
         CopilotUpstreamAuthError::NotFound => {
             ProxyError::not_found("github_copilot managed account not found")
         }
+        CopilotUpstreamAuthError::IdentityChanged {
+            account_id,
+            expected,
+            observed,
+        } => ProxyError::conflict(format!(
+            "github_copilot managed account {account_id} identity changed (expected generation {expected}, observed {observed})"
+        )),
         CopilotUpstreamAuthError::CredentialPersistenceDegraded => {
             managed_credential_persistence_error()
         }
@@ -15109,8 +16937,9 @@ fn responses_semantic_inspection_required(
     semantic_guard_enabled: bool,
     overflow_compact_eligible: bool,
     image_transport: bool,
+    mandatory_contract: bool,
 ) -> bool {
-    semantic_guard_enabled || overflow_compact_eligible || image_transport
+    semantic_guard_enabled || overflow_compact_eligible || image_transport || mandatory_contract
 }
 
 fn responses_candidate_requests_image_generation(candidate: &Value) -> bool {
@@ -15151,6 +16980,185 @@ fn codex_image_tool_rejection_body(body: &[u8]) -> bool {
         .any(|marker| text.contains(marker))
 }
 
+async fn prepare_kimi_thinking_replay(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    route: ProxyRoute,
+    request_context: &UsageLogContext,
+    body: &mut Bytes,
+) -> Option<KimiThinkingReplayWriteContext> {
+    if route != ProxyRoute::ClaudeMessages || !execution.driver_is("oauth.kimi_code") {
+        return None;
+    }
+    let share_id = request_context
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let user_namespace = kimi_thinking_replay_user_namespace(
+        request_context
+            .user_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?,
+    )?;
+    let session_id = request_context
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let model = serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()?
+        .to_string();
+    let model_family = kimi_thinking_replay_model_family(&model)?;
+    let (provider_type, account_id, auth_identity_generation) =
+        execution.managed_account_identity_target()?;
+    if provider_type != ProviderType::KimiCode {
+        return None;
+    }
+    let scope = KimiThinkingReplayScope::derive(
+        execution.plan.provider_key.app.as_str(),
+        &execution.stored.provider.id,
+        execution.plan.provider_revision,
+        &execution.plan.runtime_fingerprint,
+        account_id,
+        auth_identity_generation,
+        share_id,
+        &user_namespace,
+        session_id,
+        model_family,
+    )?;
+    let (cached, snapshot) = state
+        .kimi_thinking_replays
+        .get(&scope, kimi_replay_now_ms())
+        .await;
+    let mut replay_applied = false;
+    if let Some(cached) = cached {
+        if let Some(restored) = restore_kimi_thinking_replay_content(body, &cached) {
+            *body = restored;
+            replay_applied = true;
+        }
+    }
+    Some(KimiThinkingReplayWriteContext {
+        scope,
+        snapshot,
+        replay_applied,
+        app: execution.plan.provider_key.app,
+        provider_id: execution.stored.provider.id.clone(),
+        provider_revision: execution.plan.provider_revision,
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        account_id: account_id.to_string(),
+        auth_identity_generation,
+        share_id: share_id.to_string(),
+    })
+}
+
+async fn clear_rejected_kimi_thinking_replay(
+    state: &ServerState,
+    context: Option<&KimiThinkingReplayWriteContext>,
+) {
+    let Some(context) = context.filter(|context| context.replay_applied) else {
+        return;
+    };
+    state
+        .kimi_thinking_replays
+        .delete_if_unchanged(&context.scope, context.snapshot)
+        .await;
+}
+
+fn kimi_thinking_replay_content_from_response(body: &[u8]) -> Option<Bytes> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let content = value.get("content")?.as_array()?;
+    serde_json::to_vec(content).ok().map(Bytes::from)
+}
+
+async fn commit_kimi_thinking_replay(
+    state: &ServerState,
+    context: Option<&KimiThinkingReplayWriteContext>,
+    content: Option<Bytes>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    if !kimi_thinking_replay_binding_is_current(state, context).await {
+        return;
+    }
+    match content {
+        Some(content) if super::kimi_runtime::valid_replay_content(&content) => {
+            state
+                .kimi_thinking_replays
+                .replace_if_unchanged(
+                    context.scope.clone(),
+                    context.snapshot,
+                    content,
+                    kimi_replay_now_ms(),
+                )
+                .await;
+        }
+        Some(_) => {
+            state
+                .kimi_thinking_replays
+                .delete_if_unchanged(&context.scope, context.snapshot)
+                .await;
+        }
+        None => {}
+    }
+}
+
+async fn kimi_thinking_replay_binding_is_current(
+    state: &ServerState,
+    context: &KimiThinkingReplayWriteContext,
+) -> bool {
+    if state.credential_persistence_degraded() {
+        return false;
+    }
+    let Some(plan) = state
+        .provider_runtime_plan(context.app, &context.provider_id)
+        .await
+    else {
+        return false;
+    };
+    if plan.provider_revision != context.provider_revision
+        || plan.runtime_fingerprint != context.runtime_fingerprint
+        || !matches!(
+            &plan.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::KimiCode,
+                auth_identity_generation,
+            } if account_id == &context.account_id
+                && *auth_identity_generation == context.auth_identity_generation
+        )
+    {
+        return false;
+    }
+    let Some(account) = state
+        .find_account_for_provider(ProviderType::KimiCode, &context.account_id)
+        .await
+    else {
+        return false;
+    };
+    if account.auth_identity_generation != context.auth_identity_generation {
+        return false;
+    }
+    let shares = state.shares.read().await;
+    shares.get(&context.share_id).is_some_and(|share| {
+        share.enabled
+            && share.status == "active"
+            && share.bindings.iter().any(|binding| {
+                binding.app == context.app
+                    && binding.provider_id == context.provider_id
+                    && binding.provider_type == ProviderType::KimiCode
+            })
+    })
+}
+
+fn kimi_replay_now_ms() -> i64 {
+    current_time_ms().min(i64::MAX as u128) as i64
+}
+
 struct StreamForwardState {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     stored: StoredProvider,
@@ -15167,7 +17175,12 @@ struct StreamForwardState {
     codex_completed_output_patcher: CodexCompletedOutputPatcher,
     codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher,
     codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher,
+    grok_responses_sse: Option<super::grok::GrokResponsesSseInspector>,
+    grok_search_identity: Option<(String, u64)>,
+    grok_search_evidence_recorded: bool,
+    kimi_thinking_replay: Option<KimiThinkingReplayStreamWrite>,
     stream_transform: super::stream_transforms::StreamEventTransformer,
+    terminal_detector: UpstreamTerminalDetector,
     claude_tool_name_stream_patcher: super::claude_oauth::ClaudeToolNameStreamPatcher,
     timeouts: StreamTimeoutConfig,
     pending_chunk: Option<Bytes>,
@@ -15190,6 +17203,26 @@ struct StreamForwardState {
     share_invocation_guard: Option<ShareInFlightGuard>,
 }
 
+#[derive(Debug, Clone)]
+struct KimiThinkingReplayWriteContext {
+    scope: KimiThinkingReplayScope,
+    snapshot: KimiThinkingReplaySnapshot,
+    replay_applied: bool,
+    app: AppKind,
+    provider_id: String,
+    provider_revision: u64,
+    runtime_fingerprint: String,
+    account_id: String,
+    auth_identity_generation: u64,
+    share_id: String,
+}
+
+#[derive(Debug)]
+struct KimiThinkingReplayStreamWrite {
+    context: KimiThinkingReplayWriteContext,
+    accumulator: KimiThinkingReplayStreamAccumulator,
+}
+
 async fn update_terminal_usage_error(state: &ServerState, request_id: &str, message: String) {
     let message = bounded_codex_image_message(message);
     let _ = state
@@ -15200,6 +17233,79 @@ async fn update_terminal_usage_error(state: &ServerState, request_id: &str, mess
 }
 
 impl StreamForwardState {
+    async fn inspect_grok_responses_chunk(&mut self, chunk: Bytes) -> Bytes {
+        let Some(inspector) = self.grok_responses_sse.as_mut() else {
+            return chunk;
+        };
+        let output = inspector.push(chunk);
+        let observed_search = inspector.take_search_observation();
+        self.record_grok_search_observation(observed_search).await;
+        output
+    }
+
+    fn inspect_kimi_thinking_replay_chunk(&mut self, chunk: &[u8]) {
+        if let Some(replay) = self.kimi_thinking_replay.as_mut() {
+            replay.accumulator.push(chunk);
+        }
+    }
+
+    async fn commit_kimi_thinking_replay_stream(&mut self) {
+        if !self
+            .kimi_thinking_replay
+            .as_ref()
+            .is_some_and(|replay| replay.accumulator.is_complete())
+        {
+            return;
+        }
+        let Some(mut replay) = self.kimi_thinking_replay.take() else {
+            return;
+        };
+        let content = match replay.accumulator.finish() {
+            KimiThinkingReplayStreamOutcome::Replayable(content) => Some(content),
+            KimiThinkingReplayStreamOutcome::NonReplayable => Some(Bytes::new()),
+            KimiThinkingReplayStreamOutcome::Incomplete => None,
+        };
+        commit_kimi_thinking_replay(&self.state, Some(&replay.context), content).await;
+    }
+
+    async fn finish_grok_responses_inspection(&mut self) -> Bytes {
+        let Some(inspector) = self.grok_responses_sse.as_mut() else {
+            return Bytes::new();
+        };
+        let output = inspector.finish();
+        let observed_search = inspector.take_search_observation();
+        self.record_grok_search_observation(observed_search).await;
+        output
+    }
+
+    async fn record_grok_search_observation(&mut self, observed: bool) {
+        if !observed || self.grok_search_evidence_recorded {
+            return;
+        }
+        let Some((account_id, auth_identity_generation)) = self.grok_search_identity.as_ref()
+        else {
+            return;
+        };
+        match self
+            .state
+            .record_grok_capability_evidence_if_current(
+                account_id,
+                ProviderType::GrokOAuth,
+                *auth_identity_generation,
+                GrokAccountCapability::Search,
+                "responses_search_completed",
+            )
+            .await
+        {
+            Ok(_) => self.grok_search_evidence_recorded = true,
+            Err(error) => tracing::warn!(
+                account_id,
+                error = %error,
+                "failed to persist Grok search capability evidence"
+            ),
+        }
+    }
+
     async fn finalize_terminal_usage(&mut self, allow_eof_without_semantic_terminal: bool) -> bool {
         if self.terminal_usage_published {
             return true;
@@ -15215,10 +17321,15 @@ impl StreamForwardState {
             .as_ref()
             .and_then(AnthropicSseInspector::terminal)
             .cloned();
+        let detected_terminal = self.terminal_detector.terminal();
         let has_semantic_inspector =
             self.responses_semantics.is_some() || self.anthropic_semantics.is_some();
+        let fallback_terminal = (!has_semantic_inspector)
+            .then_some(detected_terminal)
+            .flatten();
         if semantic_terminal.is_none()
             && anthropic_terminal.is_none()
+            && fallback_terminal.is_none()
             && (!allow_eof_without_semantic_terminal || has_semantic_inspector)
         {
             return false;
@@ -15232,6 +17343,13 @@ impl StreamForwardState {
                     .as_ref()
                     .map(SemanticTerminal::stream_status)
             })
+            .or_else(|| {
+                fallback_terminal.map(|terminal| match terminal {
+                    UpstreamTerminal::Completed => "completed",
+                    UpstreamTerminal::Incomplete => "incomplete",
+                    UpstreamTerminal::Failed => "provider_failed",
+                })
+            })
             .unwrap_or("completed");
         let terminal_status_code = match (&anthropic_terminal, &semantic_terminal) {
             (Some(AnthropicTerminal::Error(_)), _) => StatusCode::BAD_GATEWAY.as_u16(),
@@ -15239,6 +17357,9 @@ impl StreamForwardState {
                 FailureOrigin::Client => StatusCode::BAD_REQUEST.as_u16(),
                 FailureOrigin::Provider => StatusCode::BAD_GATEWAY.as_u16(),
             },
+            _ if fallback_terminal == Some(UpstreamTerminal::Failed) => {
+                StatusCode::BAD_GATEWAY.as_u16()
+            }
             _ => self.status_code,
         };
         let terminal_error_message = match (&anthropic_terminal, &semantic_terminal) {
@@ -15304,6 +17425,16 @@ impl StreamForwardState {
                     }
                 }
                 Some(SemanticTerminal::Failure(_)) => {}
+                _ if fallback_terminal == Some(UpstreamTerminal::Failed)
+                    && !self.semantic_provider_outcome_recorded =>
+                {
+                    record_provider_outcome(
+                        &self.state,
+                        &self.stored,
+                        ProviderOutcome::Failure { status_code: 502 },
+                    )
+                    .await;
+                }
                 _ if !self.sse_error_outcome_recorded => {
                     record_provider_outcome(
                         &self.state,
@@ -15318,6 +17449,8 @@ impl StreamForwardState {
         self.terminal_usage_published = true;
         self.interrupted_update_armed
             .store(false, Ordering::Relaxed);
+        drop(self.account_in_flight_guard.take());
+        drop(self.share_invocation_guard.take());
         true
     }
 
@@ -16465,6 +18598,7 @@ fn stream_error_code_and_message(message: &str) -> (&'static str, &str) {
         ("[TOOL_JSON_LIMIT] ", "TOOL_JSON_LIMIT"),
         ("[KIRO_EVENT_STREAM_INVALID] ", "KIRO_EVENT_STREAM_INVALID"),
         ("[KIRO_EVENT_STREAM_LIMIT] ", "KIRO_EVENT_STREAM_LIMIT"),
+        ("[KIRO_EVENT_STREAM_TIMEOUT] ", "KIRO_EVENT_STREAM_TIMEOUT"),
         (
             "[KIRO_UPSTREAM_STREAM_ERROR] ",
             "KIRO_UPSTREAM_STREAM_ERROR",
@@ -17961,10 +20095,1131 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct CopilotInferenceObservation {
+        authorization: String,
+        user_agent: String,
+        editor_version: String,
+        plugin_version: String,
+        api_version: String,
+        body: Value,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CopilotInferenceFixture {
+        NonStreamTool,
+        StreamTool,
+    }
+
+    #[derive(Clone)]
+    struct CopilotFixtureState {
+        fixture: CopilotInferenceFixture,
+        unauthorized_responses: usize,
+        inference_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        token_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        token_authorizations: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        observations: std::sync::Arc<std::sync::Mutex<Vec<CopilotInferenceObservation>>>,
+    }
+
+    async fn spawn_copilot_upstream(
+        fixture: CopilotInferenceFixture,
+        unauthorized_responses: usize,
+    ) -> (
+        std::net::SocketAddr,
+        CopilotFixtureState,
+        tokio::task::JoinHandle<()>,
+    ) {
+        async fn token(
+            axum::extract::State(state): axum::extract::State<CopilotFixtureState>,
+            headers: HeaderMap,
+        ) -> axum::Json<Value> {
+            state
+                .token_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.token_authorizations.lock().unwrap().push(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            axum::Json(json!({
+                "token": "copilot-refreshed-sub-token",
+                "expires_at": i64::MAX / 2,
+                "endpoints": {"api": "https://api.githubcopilot.com"}
+            }))
+        }
+
+        async fn inference(
+            axum::extract::State(state): axum::extract::State<CopilotFixtureState>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response {
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let observation = CopilotInferenceObservation {
+                authorization: header("authorization"),
+                user_agent: header("user-agent"),
+                editor_version: header("editor-version"),
+                plugin_version: header("editor-plugin-version"),
+                api_version: header("x-github-api-version"),
+                body,
+            };
+            let wire = format!("{headers:?}{:?}", observation.body);
+            assert!(!wire.contains("github-oauth-long-lived-secret"));
+            state.observations.lock().unwrap().push(observation);
+            let request = state
+                .inference_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if request < state.unauthorized_responses {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":{"message":"expired sub-token"}}"#))
+                    .unwrap();
+            }
+
+            match state.fixture {
+                CopilotInferenceFixture::NonStreamTool => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "id": "chatcmpl_copilot_tool",
+                            "object": "chat.completion",
+                            "created": 1,
+                            "model": "claude-sonnet-5",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_weather",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup_weather",
+                                            "arguments": "{\"city\":\"Paris\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 9,
+                                "completion_tokens": 4,
+                                "total_tokens": 13
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+                CopilotInferenceFixture::StreamTool => {
+                    let chunks = [
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                        )),
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"type\":\"function\",\"function\":{\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                        )),
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                        )),
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"total_tokens\":11}}\n\n",
+                        )),
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n")),
+                    ];
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                        .unwrap()
+                }
+            }
+        }
+
+        let state = CopilotFixtureState {
+            fixture,
+            unauthorized_responses,
+            inference_requests: Default::default(),
+            token_requests: Default::default(),
+            token_authorizations: Default::default(),
+            observations: Default::default(),
+        };
+        let app = axum::Router::new()
+            .route("/token", axum::routing::get(token))
+            .route("/chat/completions", axum::routing::post(inference))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, state, server)
+    }
+
+    async fn install_copilot_test_provider(
+        state: &ServerState,
+        name: &str,
+        app: AppKind,
+        inference_origin: String,
+        token_url: String,
+    ) -> (String, String) {
+        let account_id = format!("{name}-account");
+        let provider_id = format!("{name}-provider");
+        let account_id_for_state = account_id.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "github_copilot",
+                        "email": "copilot-fixture@example.com",
+                        "accessToken": "copilot-initial-sub-token",
+                        "refreshToken": "github-oauth-long-lived-secret",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "github-oauth-long-lived-secret",
+                            "copilotToken": {"token": "copilot-initial-sub-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com",
+                            "testCopilotTokenUrl": token_url
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let mut stored = stored_provider(
+            app,
+            ProviderType::GitHubCopilot,
+            json!({"testCopilotInferenceUrl": inference_origin}),
+            Some(&account_id),
+        );
+        stored.provider.id = provider_id.clone();
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let plan = providers.runtime_plan(app, &provider_id).unwrap();
+        assert_eq!(plan.driver_id.as_str(), "special.copilot");
+        assert_eq!(
+            plan.driver_options
+                .get("testCopilotInferenceUrl")
+                .and_then(Value::as_str),
+            Some(inference_origin.as_str())
+        );
+        state.replace_provider_store_for_test(providers).await;
+        (provider_id, account_id)
+    }
+
+    fn assert_copilot_identity(observation: &CopilotInferenceObservation) {
+        assert_eq!(
+            observation.user_agent,
+            crate::provider_identity::COPILOT_USER_AGENT
+        );
+        assert_eq!(
+            observation.editor_version,
+            crate::provider_identity::COPILOT_EDITOR_VERSION
+        );
+        assert_eq!(
+            observation.plugin_version,
+            crate::provider_identity::COPILOT_PLUGIN_VERSION
+        );
+        assert_eq!(
+            observation.api_version,
+            crate::provider_identity::COPILOT_API_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_forwarder_bridges_claude_messages_tools_with_only_the_sub_token() {
+        let (address, probe, server) =
+            spawn_copilot_upstream(CopilotInferenceFixture::NonStreamTool, 0).await;
+        let state = forwarder_test_state("copilot-claude-tools");
+        let (provider_id, _) = install_copilot_test_provider(
+            &state,
+            "copilot-claude-tools",
+            AppKind::Claude,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+        )
+        .await;
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"weather"}],"tools":[{"name":"lookup_weather","description":"look up weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"stream":false}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&collect_response_body(response).await).unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["stop_reason"], "tool_use");
+        assert_eq!(body["content"][0]["type"], "tool_use");
+        assert_eq!(body["content"][0]["id"], "call_weather");
+        assert_eq!(body["content"][0]["name"], "lookup_weather");
+        assert_eq!(body["content"][0]["input"]["city"], "Paris");
+
+        assert_eq!(
+            probe
+                .inference_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            probe
+                .token_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let observations = probe.observations.lock().unwrap().clone();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(
+            observation.authorization,
+            "Bearer copilot-initial-sub-token"
+        );
+        assert_copilot_identity(observation);
+        assert_eq!(observation.body["model"], "claude-sonnet-5");
+        assert_eq!(observation.body["stream"], false);
+        assert_eq!(
+            observation.body["tools"][0]["function"]["name"],
+            "lookup_weather"
+        );
+        assert!(observation.body["messages"].is_array());
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copilot_forwarder_bridges_claude_messages_streaming_tools() {
+        let (address, probe, server) =
+            spawn_copilot_upstream(CopilotInferenceFixture::StreamTool, 0).await;
+        let state = forwarder_test_state("copilot-claude-stream-tools");
+        let (provider_id, _) = install_copilot_test_provider(
+            &state,
+            "copilot-claude-stream-tools",
+            AppKind::Claude,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+        )
+        .await;
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"weather"}],"tools":[{"name":"lookup_weather","description":"look up weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"stream":true}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("event: content_block_start"), "{body}");
+        assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+        assert!(body.contains("lookup_weather"), "{body}");
+        assert!(body.contains("event: content_block_delta"), "{body}");
+        assert!(body.contains("\"type\":\"input_json_delta\""), "{body}");
+        assert!(body.contains("Paris"), "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+
+        assert_eq!(
+            probe
+                .inference_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            probe
+                .token_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let observations = probe.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].authorization,
+            "Bearer copilot-initial-sub-token"
+        );
+        assert_copilot_identity(&observations[0]);
+        assert_eq!(observations[0].body["stream"], true);
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copilot_forwarder_bridges_responses_non_streaming_tools() {
+        let (address, probe, server) =
+            spawn_copilot_upstream(CopilotInferenceFixture::NonStreamTool, 0).await;
+        let state = forwarder_test_state("copilot-responses-tools");
+        let (provider_id, _) = install_copilot_test_provider(
+            &state,
+            "copilot-responses-tools",
+            AppKind::Codex,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+        )
+        .await;
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::CodexResponses,
+            provider_id,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"weather"}]}],"tools":[{"type":"function","name":"lookup_weather","description":"look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"stream":false}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&collect_response_body(response).await).unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        let function_call = body["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(function_call["call_id"], "call_weather");
+        assert_eq!(function_call["name"], "lookup_weather");
+        assert_eq!(function_call["arguments"], r#"{"city":"Paris"}"#);
+
+        assert_eq!(
+            probe
+                .inference_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            probe
+                .token_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let observations = probe.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].authorization,
+            "Bearer copilot-initial-sub-token"
+        );
+        assert_copilot_identity(&observations[0]);
+        assert_eq!(observations[0].body["model"], "gpt-5.5");
+        assert_eq!(observations[0].body["stream"], false);
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copilot_forwarder_responses_stream_replays_one_401_on_the_same_account() {
+        let (address, probe, server) =
+            spawn_copilot_upstream(CopilotInferenceFixture::StreamTool, 1).await;
+        let state = forwarder_test_state("copilot-responses-stream-401");
+        let (provider_id, account_id) = install_copilot_test_provider(
+            &state,
+            "copilot-responses-stream-401",
+            AppKind::Codex,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+        )
+        .await;
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            provider_id,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-5","input":[{"role":"user","content":[{"type":"input_text","text":"weather"}]}],"tools":[{"type":"function","name":"lookup_weather","description":"look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"stream":true}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("response.output_item.added"), "{body}");
+        assert!(
+            body.contains("response.function_call_arguments.delta"),
+            "{body}"
+        );
+        assert!(body.contains("lookup_weather"), "{body}");
+        assert!(body.contains("call_weather"), "{body}");
+        assert_eq!(body.matches("\"type\":\"response.completed\"").count(), 1);
+        assert_eq!(body.matches("data: [DONE]").count(), 1);
+
+        assert_eq!(
+            probe
+                .inference_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            probe
+                .token_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            probe.token_authorizations.lock().unwrap().as_slice(),
+            ["token github-oauth-long-lived-secret"]
+        );
+        let observations = probe.observations.lock().unwrap().clone();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.authorization.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Bearer copilot-initial-sub-token",
+                "Bearer copilot-refreshed-sub-token"
+            ]
+        );
+        for observation in observations.iter() {
+            assert_copilot_identity(observation);
+            assert_eq!(observation.body["stream"], true);
+            assert_eq!(
+                observation.body["tools"][0]["function"]["name"],
+                "lookup_weather"
+            );
+        }
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert_eq!(account.auth_identity_generation, 1);
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("github-oauth-long-lived-secret")
+        );
+        server.abort();
+    }
+
+    #[derive(Debug, Clone)]
+    struct KimiReplayObservation {
+        uri: String,
+        body: Value,
+    }
+
+    #[derive(Clone)]
+    struct KimiReplayFixtureState {
+        observations: Arc<StdMutex<Vec<KimiReplayObservation>>>,
+        requests: Arc<AtomicUsize>,
+        stream_first: bool,
+        reject_request: Option<(usize, StatusCode)>,
+    }
+
+    fn kimi_signed_tool_response() -> Value {
+        json!({
+            "id": "msg_kimi_replay",
+            "type": "message",
+            "role": "assistant",
+            "model": "kimi-for-coding",
+            "content": [
+                {"type": "thinking", "thinking": "inspect the file", "signature": "kimi-signed-thinking"},
+                {"type": "text", "text": "inspect"},
+                {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "README.md"}}
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 8, "output_tokens": 4}
+        })
+    }
+
+    fn kimi_signed_tool_sse() -> Bytes {
+        Bytes::from_static(
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kimi_replay\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"inspect the file\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"kimi-signed-thinking\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"inspect\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Read\",\"input\":{}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            )
+            .as_bytes(),
+        )
+    }
+
+    async fn spawn_kimi_replay_upstream(
+        stream_first: bool,
+        reject_request: Option<(usize, StatusCode)>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<StdMutex<Vec<KimiReplayObservation>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        async fn inference(
+            axum::extract::State(state): axum::extract::State<KimiReplayFixtureState>,
+            uri: axum::http::Uri,
+            body: Bytes,
+        ) -> Response {
+            let body = serde_json::from_slice(&body).unwrap();
+            state
+                .observations
+                .lock()
+                .unwrap()
+                .push(KimiReplayObservation {
+                    uri: uri.to_string(),
+                    body,
+                });
+            let request = state.requests.fetch_add(1, Ordering::SeqCst);
+            if state.stream_first && request == 0 {
+                let chunks = stream::once(async {
+                    Ok::<_, std::convert::Infallible>(kimi_signed_tool_sse())
+                })
+                .chain(stream::pending());
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .unwrap();
+            }
+            if state
+                .reject_request
+                .is_some_and(|(index, _)| index == request)
+            {
+                let status = state.reject_request.unwrap().1;
+                return Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"type":"error","error":{"type":"invalid_request_error","message":"replayed thinking rejected"}}"#))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(kimi_signed_tool_response().to_string()))
+                .unwrap()
+        }
+
+        let state = KimiReplayFixtureState {
+            observations: Default::default(),
+            requests: Default::default(),
+            stream_first,
+            reject_request,
+        };
+        let observations = Arc::clone(&state.observations);
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(inference))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, observations, server)
+    }
+
+    async fn install_kimi_replay_test_provider(
+        state: &ServerState,
+        name: &str,
+        endpoint: String,
+    ) -> (String, String) {
+        let account_id = format!("{name}-account");
+        let account_id_for_state = account_id.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "kimi_code",
+                        "authIdentityGeneration": 1,
+                        "tokenRefreshGeneration": 1,
+                        "email": "kimi-replay@example.test",
+                        "accessToken": "kimi-replay-access",
+                        "refreshToken": "kimi-replay-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "userId": "kimi-replay-user",
+                            "kimiDevice": {
+                                "deviceId": "kimi-replay-device",
+                                "deviceName": "fixture",
+                                "deviceModel": "fixture",
+                                "osVersion": "fixture"
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let provider_id = format!("{name}-provider");
+        let mut stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::KimiCode,
+            json!({"testRuntimeEndpoint": endpoint}),
+            Some(&account_id),
+        );
+        stored.provider.id = provider_id.clone();
+        stored.resource.profile_id =
+            Some(crate::domain::providers::registry::ProfileId::parse("claude.kimi_code").unwrap());
+        stored.resource.profile_schema_revision = Some(1);
+        stored.resource.revision = 1;
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        (provider_id, account_id)
+    }
+
+    fn kimi_replay_headers(share_id: &str, session_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        headers.insert(
+            "x-cc-switch-session-id",
+            HeaderValue::from_str(session_id).unwrap(),
+        );
+        headers
+    }
+
+    fn kimi_seed_request(stream: bool) -> Bytes {
+        Bytes::from(
+            json!({
+                "model": "kimi-for-coding",
+                "max_tokens": 64,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "inspect"}]
+            })
+            .to_string(),
+        )
+    }
+
+    fn kimi_continuation_request() -> Bytes {
+        Bytes::from(
+            json!({
+                "model": "kimi-for-coding",
+                "max_tokens": 64,
+                "stream": false,
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "inspect"},
+                        {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "README.md"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}
+                    ]}
+                ]
+            })
+            .to_string(),
+        )
+    }
+
+    fn request_has_signed_kimi_thinking(body: &Value) -> bool {
+        body.pointer("/messages/1/content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("thinking")
+                        && block.get("signature").and_then(Value::as_str)
+                            == Some("kimi-signed-thinking")
+                })
+            })
+    }
+
+    #[tokio::test]
+    async fn kimi_non_stream_replay_is_exact_session_scoped_and_rejected_replay_is_deleted() {
+        let (address, observations, server) =
+            spawn_kimi_replay_upstream(false, Some((3, StatusCode::UNPROCESSABLE_ENTITY))).await;
+        let state = forwarder_test_state("kimi-non-stream-replay-lifecycle");
+        let (provider_id, _) = install_kimi_replay_test_provider(
+            &state,
+            "kimi-non-stream-replay",
+            format!("http://{address}/coding/v1"),
+        )
+        .await;
+        let share_id = "kimi-non-stream-replay-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::KimiCode,
+            &provider_id,
+        )
+        .await;
+
+        let seed = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            kimi_replay_headers(share_id, "session-a"),
+            kimi_seed_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seed.status(), StatusCode::OK);
+        let _ = collect_response_body(seed).await;
+
+        let different_session = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            kimi_replay_headers(share_id, "session-b"),
+            kimi_continuation_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(different_session.status(), StatusCode::OK);
+        let _ = collect_response_body(different_session).await;
+
+        let restored = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            kimi_replay_headers(share_id, "session-a"),
+            kimi_continuation_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        let _ = collect_response_body(restored).await;
+
+        let rejected = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            kimi_replay_headers(share_id, "session-a"),
+            kimi_continuation_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let _ = collect_response_body(rejected).await;
+
+        let after_rejection = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            kimi_replay_headers(share_id, "session-a"),
+            kimi_continuation_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_rejection.status(), StatusCode::OK);
+        let _ = collect_response_body(after_rejection).await;
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 5);
+        assert!(observations
+            .iter()
+            .all(|observation| observation.uri == "/coding/v1/messages?beta=true"));
+        assert!(!request_has_signed_kimi_thinking(&observations[1].body));
+        assert!(request_has_signed_kimi_thinking(&observations[2].body));
+        assert!(request_has_signed_kimi_thinking(&observations[3].body));
+        assert!(!request_has_signed_kimi_thinking(&observations[4].body));
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_stream_commits_replay_at_message_stop_before_upstream_eof() {
+        let (address, observations, server) = spawn_kimi_replay_upstream(true, None).await;
+        let state = forwarder_test_state("kimi-stream-replay-terminal-commit");
+        let (provider_id, _) = install_kimi_replay_test_provider(
+            &state,
+            "kimi-stream-replay",
+            format!("http://{address}/coding/v1"),
+        )
+        .await;
+        let share_id = "kimi-stream-replay-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::KimiCode,
+            &provider_id,
+        )
+        .await;
+
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            kimi_replay_headers(share_id, "stream-session"),
+            kimi_seed_request(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut downstream = Vec::new();
+        while !String::from_utf8_lossy(&downstream).contains("event: message_stop") {
+            let chunk = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("Kimi terminal chunk must arrive before upstream EOF")
+                .expect("Kimi stream must remain open through message_stop")
+                .unwrap();
+            downstream.extend_from_slice(&chunk);
+        }
+        drop(body);
+
+        let continuation = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            kimi_replay_headers(share_id, "stream-session"),
+            kimi_continuation_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(continuation.status(), StatusCode::OK);
+        let _ = collect_response_body(continuation).await;
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(request_has_signed_kimi_thinking(&observations[1].body));
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_replay_write_is_blocked_by_account_or_provider_generation_drift() {
+        for drift in ["account", "provider"] {
+            let state = forwarder_test_state(&format!("kimi-replay-{drift}-drift"));
+            let (provider_id, account_id) = install_kimi_replay_test_provider(
+                &state,
+                &format!("kimi-replay-{drift}-drift"),
+                "http://127.0.0.1:9/coding/v1".to_string(),
+            )
+            .await;
+            let share_id = format!("kimi-replay-{drift}-drift-share");
+            install_antigravity_test_share(
+                &state,
+                &share_id,
+                AppKind::Claude,
+                ProviderType::KimiCode,
+                &provider_id,
+            )
+            .await;
+
+            let execution = {
+                let providers = state.providers.read().await;
+                let stored = providers.providers[0].clone();
+                ProviderExecution::from_store(&providers, stored).unwrap()
+            };
+            let request_context = UsageLogContext {
+                share_id: Some(share_id),
+                user_email: Some("owner@example.com".to_string()),
+                session_id: Some("generation-drift-session".to_string()),
+                ..UsageLogContext::default()
+            };
+            let mut body = kimi_continuation_request();
+            let context = prepare_kimi_thinking_replay(
+                &state,
+                &execution,
+                ProxyRoute::ClaudeMessages,
+                &request_context,
+                &mut body,
+            )
+            .await
+            .unwrap();
+
+            match drift {
+                "account" => {
+                    let mut accounts = state.accounts_snapshot().await;
+                    let account = accounts
+                        .accounts
+                        .iter_mut()
+                        .find(|account| account.id == account_id)
+                        .unwrap();
+                    account.auth_identity_generation += 1;
+                    state.replace_account_store_for_test(accounts).await;
+                }
+                "provider" => {
+                    let mut providers = state.providers_snapshot().await;
+                    providers.providers[0].resource.revision += 1;
+                    let accounts = state.accounts_snapshot().await;
+                    providers.rebuild_runtime_index(&accounts).unwrap();
+                    state.replace_provider_store_for_test(providers).await;
+                }
+                _ => unreachable!(),
+            }
+
+            let content = serde_json::to_vec(&kimi_signed_tool_response()["content"])
+                .map(Bytes::from)
+                .unwrap();
+            commit_kimi_thinking_replay(&state, Some(&context), Some(content)).await;
+            assert!(
+                state
+                    .kimi_thinking_replays
+                    .get(&context.scope, kimi_replay_now_ms())
+                    .await
+                    .0
+                    .is_none(),
+                "{drift} drift must fence a stale replay write"
+            );
+        }
+    }
+
+    #[derive(Debug, Clone)]
     struct GeminiV1InternalObservation {
         authorization: String,
         uri: String,
         body: Value,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum AntigravityLimitFixture {
+        RateLimit,
+        ModelCapacity,
+    }
+
+    impl AntigravityLimitFixture {
+        fn status(self) -> StatusCode {
+            match self {
+                Self::RateLimit => StatusCode::TOO_MANY_REQUESTS,
+                Self::ModelCapacity => StatusCode::SERVICE_UNAVAILABLE,
+            }
+        }
+
+        fn rpc_status(self) -> &'static str {
+            match self {
+                Self::RateLimit => "RESOURCE_EXHAUSTED",
+                Self::ModelCapacity => "UNAVAILABLE",
+            }
+        }
+
+        fn reason(self) -> &'static str {
+            match self {
+                Self::RateLimit => "RATE_LIMIT_EXCEEDED",
+                Self::ModelCapacity => "MODEL_CAPACITY_EXHAUSTED",
+            }
+        }
+    }
+
+    async fn spawn_antigravity_limit_upstream(
+        limit: AntigravityLimitFixture,
+        limited_responses: usize,
+        model: &'static str,
+        retry_delay: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |headers: HeaderMap, uri: axum::http::Uri| {
+                let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    assert_eq!(uri.path(), "/v1internal:streamGenerateContent");
+                    authorizations.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let request = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if request < limited_responses {
+                        let body = json!({
+                            "error": {
+                                "code": limit.status().as_u16(),
+                                "status": limit.rpc_status(),
+                                "message": "structured Antigravity fixture limit",
+                                "details": [
+                                    {
+                                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                        "reason": limit.reason(),
+                                        "metadata": {"model": model}
+                                    },
+                                    {
+                                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                        "retryDelay": retry_delay
+                                    }
+                                ]
+                            }
+                        });
+                        return Response::builder()
+                            .status(limit.status())
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}}\n\n",
+                        ))
+                        .unwrap()
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, authorizations, server)
     }
 
     async fn spawn_gemini_v1internal_upstream(
@@ -18336,19 +21591,26 @@ mod tests {
         (provider_id, account_id)
     }
 
-    async fn install_antigravity_claude_test_provider(
+    async fn install_antigravity_test_provider(
         state: &ServerState,
         fixture: &str,
+        app: AppKind,
+        provider_type: ProviderType,
         endpoint: String,
-    ) -> String {
+    ) -> (String, String, String) {
+        assert!(matches!(
+            provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ));
         let account_id = format!("antigravity-{fixture}-account");
         let account_id_for_state = account_id.clone();
+        let provider_type_id = provider_type.as_str();
         state
             .mutate_accounts_immediate(move |accounts| {
                 accounts.upsert(
                     serde_json::from_value(json!({
                         "id": account_id_for_state,
-                        "providerType": "antigravity_oauth",
+                        "providerType": provider_type_id,
                         "authIdentityGeneration": 1,
                         "accessToken": "antigravity-access",
                         "tokenType": "Bearer",
@@ -18366,16 +21628,21 @@ mod tests {
 
         let provider_id = format!("antigravity-{fixture}-provider");
         let mut stored = stored_provider(
-            AppKind::Claude,
-            ProviderType::AntigravityOAuth,
-            json!({}),
+            app,
+            provider_type,
+            json!({"testRuntimeEndpoint": endpoint}),
             Some(&account_id),
         );
         stored.provider.id = provider_id.clone();
-        stored.resource.profile_id = Some(
-            crate::domain::providers::registry::ProfileId::parse("gemini.antigravity_oauth")
-                .unwrap(),
-        );
+        let profile_id = match (app, provider_type) {
+            (AppKind::Claude, ProviderType::AntigravityOAuth) => "claude.antigravity_oauth",
+            (AppKind::Claude, ProviderType::AgyOAuth) => "claude.antigravity_cli",
+            (AppKind::Gemini, ProviderType::AntigravityOAuth) => "gemini.antigravity_oauth",
+            (AppKind::Gemini, ProviderType::AgyOAuth) => "gemini.antigravity_cli",
+            _ => unreachable!(),
+        };
+        stored.resource.profile_id =
+            Some(crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap());
         stored.resource.profile_schema_revision = Some(1);
         let accounts = state.accounts_snapshot().await;
         let mut providers = ProviderStore {
@@ -18383,16 +21650,82 @@ mod tests {
             ..ProviderStore::default()
         };
         providers.rebuild_runtime_index(&accounts).unwrap();
-        let mut plan = providers
-            .runtime_plan(AppKind::Claude, &provider_id)
+        let runtime_fingerprint = providers
+            .runtime_plan(app, &provider_id)
             .unwrap()
-            .as_ref()
+            .runtime_fingerprint
             .clone();
-        plan.endpoint = endpoint;
-        plan.runtime_fingerprint = format!("antigravity-{fixture}-runtime");
-        std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
         state.replace_provider_store_for_test(providers).await;
-        provider_id
+        (provider_id, account_id, runtime_fingerprint)
+    }
+
+    async fn install_antigravity_claude_test_provider(
+        state: &ServerState,
+        fixture: &str,
+        endpoint: String,
+    ) -> String {
+        install_antigravity_test_provider(
+            state,
+            fixture,
+            AppKind::Claude,
+            ProviderType::AntigravityOAuth,
+            endpoint,
+        )
+        .await
+        .0
+    }
+
+    async fn install_antigravity_test_share(
+        state: &ServerState,
+        share_id: &str,
+        app: AppKind,
+        provider_type: ProviderType,
+        provider_id: &str,
+    ) {
+        let share_id = share_id.to_string();
+        let provider_id = provider_id.to_string();
+        state
+            .mutate_shares_immediate(move |shares| {
+                shares.shares.push(
+                    serde_json::from_value(json!({
+                        "id": share_id,
+                        "app": app,
+                        "providerId": provider_id,
+                        "providerType": provider_type.as_str(),
+                        "ownerEmail": "owner@example.com",
+                        "enabled": true,
+                        "status": "active",
+                        "bindings": [{
+                            "app": app,
+                            "providerId": provider_id,
+                            "providerType": provider_type.as_str()
+                        }],
+                        "userGrants": {
+                            "owner@example.com": {
+                                "email": "owner@example.com",
+                                "role": "owner",
+                                "active": true
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+    }
+
+    fn antigravity_share_headers(share_id: &str) -> HeaderMap {
+        let mut headers = gemini_v1internal_downstream_headers();
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        headers
     }
 
     fn gemini_v1internal_downstream_headers() -> HeaderMap {
@@ -18765,6 +22098,277 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn antigravity_gemini_short_429_replays_once_on_the_same_account() {
+        let (address, authorizations, upstream_server) = spawn_antigravity_limit_upstream(
+            AntigravityLimitFixture::RateLimit,
+            1,
+            "models/gemini-3.5-flash-medium",
+            "0.001s",
+        )
+        .await;
+        let state = forwarder_test_state("antigravity-gemini-short-429");
+        let (provider_id, _, _) = install_antigravity_test_provider(
+            &state,
+            "gemini-short-429",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            format!("http://{address}"),
+        )
+        .await;
+
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"retry"}]}]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorizations.lock().unwrap().as_slice(),
+            ["Bearer antigravity-access", "Bearer antigravity-access"]
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_agy_claude_short_503_replays_once_on_the_same_account() {
+        let (address, authorizations, upstream_server) = spawn_antigravity_limit_upstream(
+            AntigravityLimitFixture::ModelCapacity,
+            1,
+            "publishers/anthropic/models/claude-sonnet-4-6",
+            "0.001s",
+        )
+        .await;
+        let state = forwarder_test_state("agy-claude-short-503");
+        let (provider_id, _, _) = install_antigravity_test_provider(
+            &state,
+            "agy-claude-short-503",
+            AppKind::Claude,
+            ProviderType::AgyOAuth,
+            format!("http://{address}"),
+        )
+        .await;
+
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"retry"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorizations.lock().unwrap().as_slice(),
+            ["Bearer antigravity-access", "Bearer antigravity-access"]
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_second_structured_limit_stops_after_one_replay() {
+        for (limit, provider_type, app, route, path, body, model) in [
+            (
+                AntigravityLimitFixture::RateLimit,
+                ProviderType::AntigravityOAuth,
+                AppKind::Gemini,
+                ProxyRoute::Gemini,
+                Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+                Bytes::from_static(br#"{"contents":[{"parts":[{"text":"reject"}]}]}"#),
+                "models/gemini-3.5-flash-medium",
+            ),
+            (
+                AntigravityLimitFixture::ModelCapacity,
+                ProviderType::AgyOAuth,
+                AppKind::Claude,
+                ProxyRoute::ClaudeMessages,
+                None,
+                Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"reject"}]}"#,
+                ),
+                "publishers/anthropic/models/claude-sonnet-4-6",
+            ),
+        ] {
+            let (address, authorizations, upstream_server) =
+                spawn_antigravity_limit_upstream(limit, usize::MAX, model, "0.001s").await;
+            let state = forwarder_test_state(&format!(
+                "antigravity-persistent-{}",
+                provider_type.as_str()
+            ));
+            let (provider_id, _, _) = install_antigravity_test_provider(
+                &state,
+                &format!("persistent-{}", provider_type.as_str()),
+                app,
+                provider_type,
+                format!("http://{address}"),
+            )
+            .await;
+            let response = forward_for_test_surface(
+                state,
+                route,
+                provider_id,
+                path,
+                gemini_v1internal_downstream_headers(),
+                body,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), limit.status());
+            assert_eq!(authorizations.lock().unwrap().len(), 2);
+            upstream_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_long_limit_cools_only_the_structured_share_runtime_model() {
+        let (address, authorizations, upstream_server) = spawn_antigravity_limit_upstream(
+            AntigravityLimitFixture::RateLimit,
+            usize::MAX,
+            "models/gemini-3.5-flash-medium",
+            "60s",
+        )
+        .await;
+        let state = forwarder_test_state("antigravity-long-share-model-cooldown");
+        let (provider_id, account_id, runtime_fingerprint) = install_antigravity_test_provider(
+            &state,
+            "long-share-model-cooldown",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "antigravity-long-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            &provider_id,
+        )
+        .await;
+        let request = || {
+            forward(
+                state.clone(),
+                ProxyRoute::Gemini,
+                Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+                antigravity_share_headers(share_id),
+                Bytes::from_static(br#"{"contents":[{"parts":[{"text":"limited"}]}]}"#),
+            )
+        };
+        let first = request().await.unwrap();
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(authorizations.lock().unwrap().len(), 1);
+
+        let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let cooldown = state
+            .share_model_cooldown(
+                share_id,
+                &runtime_fingerprint,
+                "gemini-3.5-flash-medium",
+                now,
+            )
+            .expect("structured model scope must be cooled down");
+        assert_eq!(cooldown.reason, "rate_limit_exceeded");
+        assert!(cooldown.until_ms > now);
+        assert!(state
+            .share_model_cooldown(
+                "different-share",
+                &runtime_fingerprint,
+                "gemini-3.5-flash-medium",
+                now,
+            )
+            .is_none());
+        assert!(state
+            .share_model_cooldown(share_id, &runtime_fingerprint, "different-model", now)
+            .is_none());
+        assert!(state
+            .find_account_by_id(&account_id)
+            .await
+            .unwrap()
+            .rate_limited_until
+            .is_none());
+
+        let blocked = request().await.unwrap_err();
+        assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(blocked.message.contains("cooling down"));
+        assert_eq!(authorizations.lock().unwrap().len(), 1);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_retry_rechecks_identity_generation_before_second_send() {
+        let (address, authorizations, upstream_server) = spawn_antigravity_limit_upstream(
+            AntigravityLimitFixture::ModelCapacity,
+            1,
+            "models/gemini-3.5-flash-medium",
+            "0.2s",
+        )
+        .await;
+        let state = forwarder_test_state("antigravity-stale-generation-retry");
+        let (provider_id, account_id, _) = install_antigravity_test_provider(
+            &state,
+            "stale-generation-retry",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            format!("http://{address}"),
+        )
+        .await;
+        let request = tokio::spawn(forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+            gemini_v1internal_downstream_headers(),
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"stale"}]}]}"#),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if authorizations.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap();
+                account.auth_identity_generation += 1;
+            })
+            .await
+            .unwrap();
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(
+            error.message.contains("changed") && error.message.contains("binding"),
+            "{}",
+            error.message
+        );
+        assert_eq!(authorizations.lock().unwrap().len(), 1);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
     async fn antigravity_embedded_stream_error_terminates_claude_and_records_failure() {
         let _ = crate::metrics::init();
         let (address, upstream_server) = spawn_gemini_embedded_error_upstream().await;
@@ -19106,17 +22710,7 @@ mod tests {
     ) -> ProviderExecution {
         let account_id = format!("{name}-account");
         let provider_id = format!("{name}-provider");
-        let mut capability_evidence = serde_json::Map::new();
-        for capability in capabilities {
-            capability_evidence.insert(
-                capability.as_str().to_string(),
-                json!({
-                    "status": "supported",
-                    "source": "test_fixture",
-                    "observedAtMs": 1
-                }),
-            );
-        }
+        let capabilities = capabilities.to_vec();
         let account_id_for_state = account_id.clone();
         let name_for_state = name.to_string();
         let access_token = access_token.to_string();
@@ -19135,13 +22729,21 @@ mod tests {
                             "verifiedGrokClaims": {
                                 "subject": format!("subject-{name_for_state}"),
                                 "email": format!("{name_for_state}@example.com")
-                            },
-                            "grokCapabilities": Value::Object(capability_evidence)
+                            }
                         },
                         "raw": {"testOAuthTokenUrl": refresh_url}
                     }))
                     .unwrap(),
                 );
+                let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                for capability in capabilities {
+                    assert!(accounts.record_grok_capability_evidence(
+                        &account_id_for_state,
+                        capability,
+                        "test_fixture",
+                        observed_at_ms,
+                    ));
+                }
             })
             .await
             .unwrap();
@@ -19262,6 +22864,25 @@ mod tests {
         provider_id
     }
 
+    async fn set_kiro_test_stream_timeouts(
+        state: &ServerState,
+        app: AppKind,
+        provider_id: &str,
+        first_frame_timeout_ms: u64,
+        idle_timeout_ms: u64,
+    ) {
+        let mut providers = state.providers_snapshot().await;
+        let mut plan = providers
+            .runtime_plan(app, provider_id)
+            .expect("Kiro test runtime plan")
+            .as_ref()
+            .clone();
+        plan.transport_policy.stream_first_byte_timeout_ms = Some(first_frame_timeout_ms);
+        plan.transport_policy.stream_idle_timeout_ms = Some(idle_timeout_ms);
+        std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        state.replace_provider_store_for_test(providers).await;
+    }
+
     async fn spawn_kiro_eventstream_upstream(
         response_body: Vec<u8>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -19286,6 +22907,56 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (address, server)
+    }
+
+    async fn spawn_kiro_partial_frame_upstream(
+        frame: Vec<u8>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let partial = Bytes::copy_from_slice(&frame[..frame.len() / 2]);
+        let app = axum::Router::new().route(
+            "/generateAssistantResponse",
+            axum::routing::post(move |headers: HeaderMap| {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                let partial = partial.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    authorizations.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let chunks = futures_util::stream::once(async move {
+                        Ok::<Bytes, std::convert::Infallible>(partial)
+                    })
+                    .chain(futures_util::stream::pending());
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                        .body(Body::from_stream(chunks))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, requests, authorizations, server)
     }
 
     fn kiro_text_eventstream(text: &str) -> Vec<u8> {
@@ -19377,6 +23048,68 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    async fn assert_kiro_timeout_surface(
+        app: AppKind,
+        route: ProxyRoute,
+        name: &str,
+        endpoint: &str,
+        token_url: &str,
+        upstream_requests: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        expected_request_count: usize,
+    ) {
+        let state = forwarder_test_state(name);
+        let provider = install_kiro_test_provider_for_app(
+            &state,
+            app,
+            name,
+            endpoint.to_string(),
+            token_url.to_string(),
+        )
+        .await;
+        set_kiro_test_stream_timeouts(&state, app, &provider, 200, 1_000).await;
+        let body = match route {
+            ProxyRoute::ClaudeMessages => Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-8","max_tokens":32,"messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+            ),
+            ProxyRoute::CodexChatCompletions => Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-8","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+            ),
+            ProxyRoute::CodexResponses => Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-8","input":"ping","stream":true}"#,
+            ),
+            _ => unreachable!("unsupported Kiro timeout test surface"),
+        };
+        let response =
+            forward_for_test_surface(state.clone(), route, provider, None, HeaderMap::new(), body)
+                .await
+                .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal =
+            tokio::time::timeout(Duration::from_secs(2), collect_response_body(response))
+                .await
+                .expect("Kiro first-frame timeout must terminate the downstream stream");
+        let terminal = String::from_utf8(terminal).unwrap();
+        assert!(
+            terminal.contains("\"code\":\"KIRO_EVENT_STREAM_TIMEOUT\""),
+            "{route:?}: {terminal}"
+        );
+        assert!(terminal.contains("\"status\":504"), "{route:?}: {terminal}");
+        assert_eq!(
+            upstream_requests.load(std::sync::atomic::Ordering::SeqCst),
+            expected_request_count,
+            "a Kiro stream timeout must not replay the request"
+        );
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::KiroOAuth, &format!("{name}-account")),
+            0,
+            "the Kiro account lease must be released after timeout accounting"
+        );
     }
 
     #[tokio::test]
@@ -19579,6 +23312,86 @@ mod tests {
 
         let truncated = valid[..valid.len() - 1].to_vec();
         assert_kiro_wire_error_on_all_stream_surfaces(truncated, "truncated").await;
+
+        let missing_end_event =
+            kiro::fixture_event_frame("assistantResponseEvent", &json!({"content": "open"}));
+        assert_kiro_wire_error_on_all_stream_surfaces(missing_end_event, "missing-end-event").await;
+    }
+
+    #[tokio::test]
+    async fn kiro_partial_first_frame_timeout_is_504_without_refresh_replay_or_lease_leak() {
+        let frame =
+            kiro::fixture_event_frame("assistantResponseEvent", &json!({"content": "late"}));
+        let (upstream_address, upstream_requests, authorizations, upstream_server) =
+            spawn_kiro_partial_frame_upstream(frame).await;
+
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+
+        let endpoint = format!("http://{upstream_address}");
+        let token_url = format!("http://{token_address}/token");
+        for (index, (app, route, name)) in [
+            (
+                AppKind::Claude,
+                ProxyRoute::ClaudeMessages,
+                "kiro-timeout-claude",
+            ),
+            (
+                AppKind::Codex,
+                ProxyRoute::CodexChatCompletions,
+                "kiro-timeout-chat",
+            ),
+            (
+                AppKind::Codex,
+                ProxyRoute::CodexResponses,
+                "kiro-timeout-responses",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_kiro_timeout_surface(
+                app,
+                route,
+                name,
+                &endpoint,
+                &token_url,
+                &upstream_requests,
+                index + 1,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            token_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an EventStream timeout is not an authentication failure"
+        );
+        let authorizations = authorizations.lock().unwrap();
+        assert_eq!(authorizations.len(), 3);
+        assert!(authorizations
+            .iter()
+            .all(|authorization| authorization == "Bearer kiro-old-access"));
+        drop(authorizations);
+        token_server.abort();
+        upstream_server.abort();
     }
 
     #[tokio::test]
@@ -19642,7 +23455,10 @@ mod tests {
                         Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
-                            .body(Body::empty())
+                            .body(Body::from(kiro::fixture_event_frame(
+                                "endEvent",
+                                &json!({}),
+                            )))
                             .unwrap()
                     }
                 }
@@ -19934,6 +23750,8 @@ mod tests {
             started: Instant::now(),
             status: reqwest::StatusCode::OK,
             status_code: StatusCode::OK.as_u16(),
+            first_frame_deadline: None,
+            idle_timeout: None,
         })
         .await
         .unwrap();
@@ -20284,6 +24102,181 @@ mod tests {
         assert_eq!(log.usage_revision, 1);
         assert_eq!(log.stream_status.as_deref(), Some("completed"));
         assert!(!log.is_streaming);
+
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_terminal_releases_leases_without_upstream_eof() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_cancelled = Arc::new(AtomicBool::new(false));
+        let upstream_cancelled_for_route = upstream_cancelled.clone();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move || {
+                let upstream_cancelled = upstream_cancelled_for_route.clone();
+                async move {
+                    struct CancelGuard(Arc<AtomicBool>);
+                    impl Drop for CancelGuard {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
+                    }
+
+                    let stream = async_stream::stream! {
+                        let _cancel_guard = CancelGuard(upstream_cancelled);
+                        yield Ok::<_, std::convert::Infallible>(Bytes::from_static(concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"total_tokens\":6}}}\n\n"
+                        ).as_bytes()));
+                        std::future::pending::<()>().await;
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let name = "terminal-without-eof";
+        let (state, execution) = codex_bridge_test_context(name, format!("http://{address}")).await;
+        let provider_id = execution.stored.provider.id.clone();
+        let share_id = "terminal-without-eof-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            &provider_id,
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("x-cc-switch-share-id", HeaderValue::from_static(share_id));
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut body = response.into_body().into_data_stream();
+        let terminal_chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .expect("downstream must receive the protocol terminal event")
+            .expect("terminal response chunk")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&terminal_chunk).contains("response.completed"));
+        assert!(!state.share_in_flight.has_in_flight(share_id));
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CodexOAuth, &format!("{name}-account")),
+            0
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .expect("downstream must finish after the protocol terminal event")
+            .is_none());
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("streaming usage log");
+        assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        assert_eq!(log.total_tokens, Some(6));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !upstream_cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the upstream response body must be cancelled after terminal detection");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn done_without_responses_terminal_releases_leases_but_stays_protocol_error() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(
+                Duration::ZERO,
+                Bytes::from_static(concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-missing-terminal\",\"status\":\"in_progress\"}}\n\n",
+                    "data: [DONE]\n\n"
+                ).as_bytes()),
+            )],
+            true,
+        )
+        .await;
+        let name = "done-without-responses-terminal";
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let provider_id = execution.stored.provider.id.clone();
+        let share_id = "done-without-responses-terminal-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            &provider_id,
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("x-cc-switch-share-id", HeaderValue::from_static(share_id));
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+
+        let error = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .expect_err("[DONE] without response terminal must fail before committing downstream");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error
+            .message
+            .contains("[DONE] before a terminal response event"));
+        assert!(!state.share_in_flight.has_in_flight(share_id));
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::CodexOAuth, &format!("{name}-account")),
+            0
+        );
+        let usage = state.usage_snapshot().await;
+        assert!(usage
+            .logs
+            .iter()
+            .all(|log| log.stream_status.as_deref() != Some("completed")));
 
         upstream.server.abort();
     }
@@ -21780,29 +25773,49 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         }
     }
 
+    struct TestStreamingCodexImagesUpstream {
+        address: std::net::SocketAddr,
+        accepts: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
     async fn spawn_test_streaming_codex_images_upstream(
         chunks: Vec<(Duration, Bytes)>,
         stall_after_chunks: bool,
-    ) -> TestUnauthorizedCodexUpstream {
+    ) -> TestStreamingCodexImagesUpstream {
+        spawn_test_codex_images_protocol_upstream(
+            Some("text/event-stream"),
+            chunks,
+            stall_after_chunks,
+        )
+        .await
+    }
+
+    async fn spawn_test_codex_images_protocol_upstream(
+        content_type: Option<&'static str>,
+        chunks: Vec<(Duration, Bytes)>,
+        stall_after_chunks: bool,
+    ) -> TestStreamingCodexImagesUpstream {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let authorizations_for_route = std::sync::Arc::clone(&authorizations);
+        let accepts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepts_for_route = std::sync::Arc::clone(&accepts);
         let chunks = std::sync::Arc::new(chunks);
         let app = axum::Router::new().route(
             "/v1/responses",
             axum::routing::post(move |headers: HeaderMap| {
-                let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                let accepts = std::sync::Arc::clone(&accepts_for_route);
                 let chunks = std::sync::Arc::clone(&chunks);
                 async move {
-                    authorizations.lock().unwrap().push(
+                    accepts.lock().unwrap().push(
                         headers
-                            .get(axum::http::header::AUTHORIZATION)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string(),
+                            .get_all(ACCEPT)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .map(str::to_string)
+                            .collect(),
                     );
                     let chunks = futures_util::stream::iter(chunks.as_ref().clone()).then(
                         |(delay, chunk)| async move {
@@ -21815,20 +25828,20 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                     } else {
                         Body::from_stream(chunks)
                     };
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "text/event-stream")
-                        .body(body)
-                        .unwrap()
+                    let mut response = Response::builder().status(StatusCode::OK);
+                    if let Some(content_type) = content_type {
+                        response = response.header(CONTENT_TYPE, content_type);
+                    }
+                    response.body(body).unwrap()
                 }
             }),
         );
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        TestUnauthorizedCodexUpstream {
+        TestStreamingCodexImagesUpstream {
             address,
-            authorizations,
+            accepts,
             server,
         }
     }
@@ -21925,7 +25938,6 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             state: state.clone(),
             stored,
             upstream,
-            upstream_is_sse: true,
             prepared,
             request_context,
             started,
@@ -22603,10 +26615,21 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
     #[test]
     fn responses_image_transport_forces_semantic_inspection_during_incident_rollback() {
-        assert!(responses_semantic_inspection_required(false, false, true));
-        assert!(responses_semantic_inspection_required(true, false, false));
-        assert!(responses_semantic_inspection_required(false, true, false));
-        assert!(!responses_semantic_inspection_required(false, false, false));
+        assert!(responses_semantic_inspection_required(
+            false, false, true, false
+        ));
+        assert!(responses_semantic_inspection_required(
+            true, false, false, false
+        ));
+        assert!(responses_semantic_inspection_required(
+            false, true, false, false
+        ));
+        assert!(responses_semantic_inspection_required(
+            false, false, false, true
+        ));
+        assert!(!responses_semantic_inspection_required(
+            false, false, false, false
+        ));
     }
 
     #[test]
@@ -23230,7 +27253,7 @@ data: {"type":"response.output_item.done","output_index":2,"item":{"type":"funct
             Some("1024x1024")
         );
 
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         let parsed = parser
             .push(
                 br#"data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","result":"aGVsbG8=","output_format":"png","revised_prompt":"cat"}}
@@ -23368,7 +27391,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
 
     #[test]
     fn codex_images_parser_maps_partial_and_terminal_failure_events() {
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         let partial = parser
             .push(
                 br#"data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"iVBORw0KGgo=","partial_image_index":2,"created_at":1800000000}
@@ -23391,7 +27414,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             json!({"type": "response.incomplete", "response": {"status": "incomplete"}}),
             json!({"type": "response.cancelled", "response": {"status": "cancelled"}}),
         ] {
-            let mut parser = CodexImagesResponseParser::new(true);
+            let mut parser = CodexImagesResponseParser::new();
             let parsed = parser
                 .push(format!("data: {payload}\n\n").as_bytes())
                 .unwrap();
@@ -23404,7 +27427,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             }
         }
 
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         let parsed = parser
             .push(b"event: error\ndata: {\"message\":\"event failure\"}\n\n")
             .unwrap();
@@ -23416,7 +27439,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
 
     #[test]
     fn codex_images_parser_rejects_eof_without_terminal_event() {
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         parser
             .push(
                 b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}}\n\n",
@@ -23433,8 +27456,51 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
     }
 
     #[test]
+    fn codex_images_parser_handles_sse_split_at_every_byte_boundary() {
+        let payload = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[]}}\n\n"
+        );
+        let mut parser = CodexImagesResponseParser::new();
+        let mut completion = None;
+
+        for byte in payload.as_bytes() {
+            let parsed = parser.push(std::slice::from_ref(byte)).unwrap();
+            completion = parsed
+                .events
+                .into_iter()
+                .find_map(|event| match event {
+                    CodexImagesProtocolEvent::Completed(completion) => Some(completion),
+                    _ => None,
+                })
+                .or(completion);
+        }
+
+        let completion = completion.expect("byte-split SSE must produce a completion");
+        assert_eq!(completion.created_at, 1_800_000_000);
+        assert_eq!(completion.results.len(), 1);
+        assert_eq!(completion.results[0].result, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn codex_images_parser_rejects_raw_json_as_non_sse_protocol() {
+        let mut parser = CodexImagesResponseParser::new();
+        parser
+            .push(br#"{"type":"response.completed","response":{"output":[]}}"#)
+            .unwrap();
+
+        let error = match parser.finish() {
+            Ok(_) => panic!("raw JSON must not satisfy the SSE image protocol"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "invalid_upstream_image_response");
+        assert!(error.message.contains("expected SSE data framing"));
+    }
+
+    #[test]
     fn codex_images_parser_accepts_response_done_and_surfaces_text_refusal() {
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         let parsed = parser
             .push(
                 b"data: {\"type\":\"response.done\",\"response\":{\"created_at\":1800000000,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}]}}\n\n",
@@ -23445,7 +27511,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             [CodexImagesProtocolEvent::Completed(_)]
         ));
 
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         let result = parser.push(
             "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"This image request was refused.\"}]}]}}\n\n"
                 .as_bytes(),
@@ -23457,7 +27523,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
         assert_eq!(failure.code, "image_generation_failed");
         assert!(failure.message.contains("This image request was refused."));
 
-        let mut parser = CodexImagesResponseParser::new(true);
+        let mut parser = CodexImagesResponseParser::new();
         let result = parser.push(
             b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"},{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}]}}\n\n",
         );
@@ -24580,6 +28646,48 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         execution
     }
 
+    #[test]
+    fn grok_media_capability_negative_evidence_is_conservative() {
+        use crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::{
+            Unknown, Unsupported,
+        };
+
+        assert_eq!(
+            grok_media_capability_observation(StatusCode::NOT_FOUND, b"missing"),
+            Some((Unsupported, "endpoint_not_supported"))
+        );
+        assert_eq!(
+            grok_media_capability_observation(StatusCode::METHOD_NOT_ALLOWED, b"method"),
+            Some((Unsupported, "endpoint_not_supported"))
+        );
+        assert_eq!(
+            grok_media_capability_observation(
+                StatusCode::FORBIDDEN,
+                br#"{"error":{"code":"subscription_required","message":"paid plan required"}}"#,
+            ),
+            Some((Unsupported, "media_entitlement_rejected"))
+        );
+        assert_eq!(
+            grok_media_capability_observation(
+                StatusCode::FORBIDDEN,
+                br#"{"error":{"message":"request forbidden by policy"}}"#,
+            ),
+            Some((Unknown, "forbidden_without_entitlement_code"))
+        );
+        assert_eq!(
+            grok_media_capability_observation(StatusCode::UNAUTHORIZED, b"unauthorized"),
+            None
+        );
+        assert_eq!(
+            grok_media_capability_observation(StatusCode::TOO_MANY_REQUESTS, b"limited"),
+            None
+        );
+        assert_eq!(
+            grok_media_capability_observation(StatusCode::BAD_GATEWAY, b"temporary"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn grok_image_json_uses_identity_and_legal_whitespace_heartbeats() {
         let upstream = spawn_test_grok_image_upstream(
@@ -25698,6 +29806,139 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             .error_message
             .as_deref()
             .is_some_and(|message| message.contains("response body exceeds")));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_success_always_consumes_sse_and_requests_exact_accept() {
+        for (suffix, content_type) in [
+            ("sse", Some("text/event-stream")),
+            ("mislabelled-json", Some("application/json")),
+            ("missing-content-type", None),
+        ] {
+            let name = format!("codex-images-protocol-{suffix}");
+            let upstream = spawn_test_codex_images_protocol_upstream(
+                content_type,
+                vec![(
+                    Duration::ZERO,
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[]}}\n\n",
+                    ),
+                )],
+                false,
+            )
+            .await;
+            let (state, execution) =
+                codex_bridge_test_context(&name, format!("http://{}", upstream.address)).await;
+            let prepared = codex_images_generation_request(
+                br#"{"model":"gpt-image-2","prompt":"protocol","stream":false}"#,
+            )
+            .unwrap();
+
+            let response = forward_codex_images_request(
+                state,
+                execution,
+                HeaderMap::new(),
+                prepared,
+                UsageLogContext::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(
+                body.pointer("/data/0/b64_json"),
+                Some(&json!("iVBORw0KGgo=")),
+                "upstream content type case {suffix}"
+            );
+            assert_eq!(
+                upstream.accepts.lock().unwrap().as_slice(),
+                &[vec!["text/event-stream".to_string()]],
+                "upstream content type case {suffix}"
+            );
+            upstream.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_images_empty_success_body_reports_missing_terminal_event() {
+        let name = "codex-images-empty-sse";
+        let upstream =
+            spawn_test_codex_images_protocol_upstream(Some("application/json"), Vec::new(), false)
+                .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"empty","stream":true}"#,
+        )
+        .unwrap();
+
+        let response = forward_codex_images_request(
+            state,
+            execution,
+            HeaderMap::new(),
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("invalid_upstream_image_response"));
+        assert!(body.contains("ended before a terminal event"));
+        assert!(!body.contains("upstream JSON"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_images_raw_json_success_reports_expected_sse_protocol() {
+        let name = "codex-images-raw-json";
+        let upstream = spawn_test_codex_images_protocol_upstream(
+            Some("application/json"),
+            vec![(
+                Duration::ZERO,
+                Bytes::from_static(
+                    br#"{"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"iVBORw0KGgo=","output_format":"png"}]}}"#,
+                ),
+            )],
+            false,
+        )
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"raw json","stream":true}"#,
+        )
+        .unwrap();
+
+        let response = forward_codex_images_request(
+            state,
+            execution,
+            HeaderMap::new(),
+            prepared,
+            UsageLogContext::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("invalid_upstream_image_response"));
+        assert!(body.contains("expected SSE data framing"));
         upstream.server.abort();
     }
 
@@ -27870,8 +32111,10 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                     if streaming {
                         let sse = concat!(
                             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-grok-http\",\"status\":\"in_progress\"}}\n\n",
+                            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
                             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
-                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-grok-http\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"search_1\",\"status\":\"completed\"}}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-grok-http\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"search_1\",\"status\":\"completed\"}]}}\n\n",
                             "data: [DONE]\n\n"
                         );
                         Response::builder()
@@ -27933,8 +32176,22 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("response.completed"));
+        assert!(body.contains(": ping\n\n"));
+        assert!(!body.contains("event: ping"));
         let account_id = execution.managed_account_id().unwrap().to_string();
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert!(
+            crate::domain::accounts::store::grok_account_capability_evidence_present(
+                &account,
+                GrokAccountCapability::Search,
+            )
+        );
+        assert_eq!(
+            account.capability_observations["grok_code_plan:search"].auth_identity_generation,
+            account.auth_identity_generation
+        );
         state
             .mutate_accounts_immediate(move |accounts| {
                 let account = accounts
@@ -27984,6 +32241,329 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             assert_eq!(pair[0].2, pair[1].2);
         }
         token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_http_non_stream_completed_search_records_current_generation_evidence() {
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "id": "resp-grok-json-search",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "x_search_call",
+                        "id": "search_json_1",
+                        "status": "completed"
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-http-json-search");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-http-json-search",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-http-json-search-access",
+            None,
+            &[],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"grok","input":"search","stream":false}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["status"],
+            "completed"
+        );
+
+        let account = state.find_account_by_id(&account_id).await.unwrap();
+        assert!(
+            crate::domain::accounts::store::grok_account_capability_evidence_present(
+                &account,
+                GrokAccountCapability::Search,
+            )
+        );
+        let observation = &account.capability_observations["grok_code_plan:search"];
+        assert_eq!(observation.source, "upstream_success");
+        assert_eq!(
+            observation.auth_identity_generation,
+            account.auth_identity_generation
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_video_task_store_failure_records_503_and_releases_account_lease() {
+        let _ = crate::metrics::init();
+        let metric_count = || {
+            crate::metrics::render()
+                .lines()
+                .find(|line| {
+                    line.starts_with("cc_switch_provider_outcome_total")
+                        && line.contains("app=\"codex\"")
+                        && line.contains("provider_type=\"grok_oauth\"")
+                        && line.contains("outcome=\"failure\"")
+                })
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or_default()
+        };
+        let before_failures = metric_count();
+        let upstream_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_requests_for_route = std::sync::Arc::clone(&upstream_requests);
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new().route(
+            "/v1/videos/generations",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&upstream_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({"request_id": "video-persist-failure"}))
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-video-task-store-failure");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-video-task-store-failure",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-video-task-store-failure-access",
+            None,
+            &[GrokAccountCapability::VideoGeneration],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        std::fs::create_dir(state.config_dir.join("grok-media-tasks.json")).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let error = forward_grok_media_for_test_surface(
+            state.clone(),
+            execution.stored.provider.id.clone(),
+            Method::POST,
+            "/videos/generations".to_string(),
+            headers,
+            Bytes::from_static(br#"{"model":"grok-imagine-video","prompt":"move"}"#),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("ownership store is unavailable"));
+        assert_eq!(
+            upstream_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(metric_count() >= before_failures + 1.0);
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::GrokOAuth, &account_id),
+            0
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_video_success_without_valid_task_id_fails_closed_and_releases_lease() {
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new().route(
+            "/v1/videos/generations",
+            axum::routing::post(|| async { axum::Json(json!({"status": "accepted"})) }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-video-missing-task-id");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-video-missing-task-id",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-video-missing-task-access",
+            None,
+            &[GrokAccountCapability::VideoGeneration],
+        )
+        .await;
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let error = forward_grok_media_for_test_surface(
+            state.clone(),
+            execution.stored.provider.id.clone(),
+            Method::POST,
+            "/videos/generations".to_string(),
+            headers,
+            Bytes::from_static(br#"{"model":"grok-imagine-video","prompt":"move"}"#),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("valid task id"));
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::GrokOAuth, &account_id),
+            0
+        );
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_video_task_commit_rejects_concurrent_account_identity_replacement() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_for_route = Arc::clone(&entered);
+        let release_for_route = Arc::clone(&release);
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new().route(
+            "/v1/videos/generations",
+            axum::routing::post(move || {
+                let entered = Arc::clone(&entered_for_route);
+                let release = Arc::clone(&release_for_route);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"request_id": "video-stale-owner"}))
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-video-stale-owner");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-video-stale-owner",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-video-stale-owner-access",
+            None,
+            &[GrokAccountCapability::VideoGeneration],
+        )
+        .await;
+        let provider_id = execution.stored.provider.id.clone();
+        let account_id = execution.managed_account_id().unwrap().to_string();
+        let original_generation = state
+            .find_account_by_id(&account_id)
+            .await
+            .unwrap()
+            .auth_identity_generation;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request_state = state.clone();
+        let request_provider_id = provider_id.clone();
+        let request = tokio::spawn(async move {
+            forward_grok_media_for_test_surface(
+                request_state,
+                request_provider_id,
+                Method::POST,
+                "/videos/generations".to_string(),
+                headers,
+                Bytes::from_static(br#"{"model":"grok-imagine-video","prompt":"move"}"#),
+            )
+            .await
+        });
+        entered.notified().await;
+
+        let replacement_account_id = account_id.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": replacement_account_id,
+                        "providerType": "grok_oauth",
+                        "email": "replacement@example.com",
+                        "accessToken": "replacement-access",
+                        "refreshToken": "replacement-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "verifiedGrokClaims": {
+                                "subject": "replacement-subject",
+                                "email": "replacement@example.com"
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            state
+                .find_account_by_id(&account_id)
+                .await
+                .unwrap()
+                .auth_identity_generation
+                > original_generation
+        );
+        release.notify_one();
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("task ownership"));
+        assert!(state
+            .grok_media_task_binding(
+                &format!("test-share:{provider_id}"),
+                None,
+                "video-stale-owner",
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state
+                .account_in_flight
+                .snapshot()
+                .current(ProviderType::GrokOAuth, &account_id),
+            0
+        );
         upstream_server.abort();
     }
 
@@ -28189,82 +32769,65 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             execution.managed_account_identity_target().unwrap();
         let account_id = account_id.to_string();
         let headers = HeaderMap::new();
-
-        state.remember_grok_media_session(
-            "grok-video:request-1".to_string(),
-            "different-provider".to_string(),
-            account_id.clone(),
+        let base_binding = GrokMediaTaskBinding {
+            task_id: "request-1".to_string(),
+            provider_id: provider_id.clone(),
+            account_id: account_id.clone(),
             auth_identity_generation,
-            60_000,
-        );
-        let provider_drift = forward_grok_media_for_test_surface(
-            state.clone(),
-            provider_id.clone(),
-            Method::GET,
-            "/videos/request-1".to_string(),
-            headers.clone(),
-            Bytes::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(provider_drift.status, StatusCode::CONFLICT);
+            share_id: format!("test-share:{provider_id}"),
+            runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+            user_namespace: "principal-test".to_string(),
+            created_at_ms: 1,
+            expires_at_ms: i64::MAX,
+        };
+        for (name, binding) in [
+            (
+                "provider",
+                GrokMediaTaskBinding {
+                    provider_id: "different-provider".to_string(),
+                    ..base_binding.clone()
+                },
+            ),
+            (
+                "account",
+                GrokMediaTaskBinding {
+                    account_id: "different-account".to_string(),
+                    ..base_binding.clone()
+                },
+            ),
+            (
+                "generation",
+                GrokMediaTaskBinding {
+                    auth_identity_generation: auth_identity_generation.saturating_add(1),
+                    ..base_binding.clone()
+                },
+            ),
+            (
+                "runtime",
+                GrokMediaTaskBinding {
+                    runtime_fingerprint: "different-runtime".to_string(),
+                    ..base_binding.clone()
+                },
+            ),
+        ] {
+            let error = ensure_grok_media_task_binding(&execution, &binding).unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT, "{name}");
+        }
+        ensure_grok_media_task_binding(&execution, &base_binding).unwrap();
 
-        state.remember_grok_media_session(
-            "grok-video:request-1".to_string(),
-            provider_id.clone(),
-            "different-account".to_string(),
-            auth_identity_generation,
-            60_000,
-        );
-        let account_drift = forward_grok_media_for_test_surface(
-            state.clone(),
-            provider_id.clone(),
-            Method::GET,
-            "/videos/request-1".to_string(),
-            headers.clone(),
-            Bytes::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(account_drift.status, StatusCode::CONFLICT);
-
-        state.remember_grok_media_session(
-            "grok-video:request-1".to_string(),
-            provider_id.clone(),
-            account_id.clone(),
-            auth_identity_generation.saturating_add(1),
-            60_000,
-        );
-        let generation_drift = forward_grok_media_for_test_surface(
-            state.clone(),
-            provider_id.clone(),
-            Method::GET,
-            "/videos/request-1".to_string(),
-            headers.clone(),
-            Bytes::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(generation_drift.status, StatusCode::CONFLICT);
-
-        ensure_grok_media_session_binding(
-            &execution,
-            &GrokMediaSessionBinding {
+        state
+            .remember_grok_media_task(
+                "request-1".to_string(),
                 provider_id,
                 account_id,
                 auth_identity_generation,
-                expires_at_ms: i64::MAX,
-            },
-        )
-        .unwrap();
-
-        state.remember_grok_media_session(
-            "grok-video:request-1".to_string(),
-            execution.stored.provider.id.clone(),
-            execution.managed_account_id().unwrap().to_string(),
-            auth_identity_generation,
-            60_000,
-        );
+                format!("test-share:{}", execution.stored.provider.id),
+                execution.plan.runtime_fingerprint.clone(),
+                None,
+                60_000,
+            )
+            .await
+            .unwrap();
         let response = forward_grok_media_for_test_surface(
             state,
             execution.stored.provider.id.clone(),

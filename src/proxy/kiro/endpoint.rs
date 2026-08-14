@@ -1,6 +1,7 @@
 use serde_json::Value;
 
-use super::{default_profile_arn_for_auth_method, next_uuid_like, KiroAccountData};
+use super::{next_uuid_like, KiroAccountData};
+use crate::proxy::ProxyError;
 
 pub(super) const FALLBACK_IDE_VERSION: &str = "0.9.2";
 const FALLBACK_CLI_VERSION: &str = "1.19.0";
@@ -176,21 +177,33 @@ fn replace_origin(value: &mut Value) {
     }
 }
 
-pub(super) fn profile_arn(account: &KiroAccountData) -> String {
-    account
+pub(super) fn profile_arn(account: &KiroAccountData) -> Result<Option<String>, ProxyError> {
+    if let Some(profile_arn) = account
         .profile_arn
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            default_profile_arn_for_auth_method(
-                account
-                    .auth_method
-                    .as_deref()
-                    .or(account.provider.as_deref()),
-                &account.api_region,
-            )
-        })
+    {
+        return Ok(Some(profile_arn.to_string()));
+    }
+    let auth_method = account
+        .auth_method
+        .as_deref()
+        .or(account.provider.as_deref())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match auth_method.as_str() {
+        "api_key" | "api-key" | "apikey" => Ok(None),
+        "social" | "google" | "github" => Ok(Some(
+            crate::domain::providers::kiro::SOCIAL_PROFILE_ARN.to_string(),
+        )),
+        "builder-id" | "builder_id" | "builderid" | "builder" | "" => Ok(Some(
+            crate::domain::providers::kiro::BUILDER_ID_PROFILE_ARN.to_string(),
+        )),
+        _ => Err(ProxyError::bad_request(format!(
+            "kiro {auth_method} account lacks a resolved profile ARN"
+        ))),
+    }
 }
 
 #[cfg(test)]

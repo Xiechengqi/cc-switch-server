@@ -266,6 +266,18 @@ export function requiresPerAppModelPolicy(family: ProviderFamilySpec): boolean {
     );
 }
 
+function defaultsToPerAppModelPolicy(family: ProviderFamilySpec): boolean {
+  if (requiresPerAppModelPolicy(family)) return true;
+  const profiles = family.surfaces
+    .map((surface) => profileById(surface.profileId))
+    .filter((profile): profile is ProviderRegistryProfile => Boolean(profile));
+  if (profiles.length < 2) return false;
+  const defaultModels = new Set(
+    profiles.map((profile) => profile.defaultUpstreamModel ?? ""),
+  );
+  return defaultModels.size > 1;
+}
+
 export function supportsPerAppModelPolicy(family: ProviderFamilySpec): boolean {
   return (
     requiresPerAppModelPolicy(family) ||
@@ -329,12 +341,10 @@ function credentialSlotsForFamily(
   const profile = profileById(family.credentialProfileId);
   if (!profile) return [];
   if (profile.credentialPolicy.mode === "static_secret") {
-    return [
-      {
-        logical: profile.credentialPolicy.slots[0] ?? "api_key",
-        pointer: PRIMARY_SECRET_SLOT,
-      },
-    ];
+    return profile.credentialPolicy.slots.map((slot) => ({
+      logical: slot,
+      pointer: slot.startsWith("/") ? slot : PRIMARY_SECRET_SLOT,
+    }));
   }
   if (profile.credentialPolicy.mode === "aws") {
     return profile.credentialPolicy.slots.map((logical) => ({
@@ -529,7 +539,9 @@ export function createProviderBundleDraft(
     awsRegion: readAwsRegion(
       sourcePreset.settingsConfig as Record<string, unknown>,
     ),
-    modelPolicyScope: requiresPerAppModelPolicy(family) ? "per_app" : "global",
+    modelPolicyScope: defaultsToPerAppModelPolicy(family)
+      ? "per_app"
+      : "global",
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     testApp,

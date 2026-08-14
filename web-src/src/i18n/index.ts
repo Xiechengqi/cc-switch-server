@@ -76,6 +76,7 @@ const ACCOUNT_TRANSLATION_NAMESPACES = [
   "geminiOauth",
   "grokOauth",
   "kiroOauth",
+  "qoderOauth",
 ] as const;
 
 function mergeTranslationTrees(

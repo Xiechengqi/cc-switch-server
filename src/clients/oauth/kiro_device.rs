@@ -23,12 +23,7 @@ pub(crate) const KIRO_AUTH_METHOD_IDC: &str = "idc";
 pub(crate) const KIRO_AUTH_METHOD_API_KEY: &str = "api_key";
 pub(crate) const KIRO_AUTH_METHOD_SOCIAL: &str = "social";
 const KIRO_SOCIAL_CLIENT_ID: &str = "kiro-cli";
-pub(crate) const BUILDER_ID_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
-pub(crate) const SOCIAL_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
-pub(crate) const ENTERPRISE_FALLBACK_PROFILE_ACCOUNT_ID: &str = "610548660232";
-pub(crate) const ENTERPRISE_FALLBACK_PROFILE_ID: &str = "VNECVYCYYAWN";
+pub(crate) use crate::domain::providers::kiro::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
 
 #[derive(Debug, Clone, Default)]
 pub struct KiroDeviceFlowStore {
@@ -491,16 +486,39 @@ pub async fn poll_social_device_flow(
         .or_else(|| token.pointer("/expires_in"))
         .and_then(Value::as_i64)
         .unwrap_or(3600);
-    let input = crate::clients::oauth::kiro::import_credentials_json(
+    let token_profile_arn = string_at(&token, &["/profileArn", "/profile_arn"])
+        .map(|profile_arn| {
+            crate::domain::providers::kiro::parse_profile_arn(&profile_arn)
+                .map(|profile| profile.arn)
+                .ok_or_else(|| {
+                    KiroDeviceError::bad_gateway("kiro social token returned invalid profile ARN")
+                })
+        })
+        .transpose()?;
+    let discovered_profile = if token_profile_arn.is_none() {
+        discover_profile_arn(http, Some(&flow.auth_region), &access_token, None)
+            .await?
+            .map(|(profile_arn, _)| profile_arn)
+    } else {
+        None
+    };
+    let (profile_arn, profile_provenance) = if let Some(profile_arn) = token_profile_arn {
+        (Some(profile_arn), Some("token_response"))
+    } else if let Some(profile_arn) = discovered_profile {
+        (Some(profile_arn), Some("list_available_profiles"))
+    } else {
+        (None, None)
+    };
+    let mut input = crate::clients::oauth::kiro::import_credentials_json(
         json!({
             "accessToken": access_token,
             "refreshToken": refresh_token,
-            "profileArn": string_at(&token, &["/profileArn", "/profile_arn"]),
+            "profileArn": profile_arn,
+            "profileProvenance": profile_provenance,
             "expiresAt": now_ms.saturating_add(expires_in.saturating_mul(1000)),
             "authMethod": KIRO_AUTH_METHOD_SOCIAL,
             "provider": social_provider_label(&flow.provider),
             "authRegion": flow.auth_region,
-            "apiRegion": DEFAULT_REGION,
         }),
         now_ms,
     )
@@ -510,6 +528,15 @@ pub async fn poll_social_device_flow(
             error.message,
         )
     })?;
+    if let Some(profile_provenance) = profile_provenance {
+        for value in [&mut input.profile, &mut input.raw]
+            .into_iter()
+            .filter_map(Option::as_mut)
+            .filter_map(Value::as_object_mut)
+        {
+            value.insert("profileProvenance".to_string(), json!(profile_provenance));
+        }
+    }
     Ok(KiroDevicePollResult {
         pending: false,
         message: "kiro social device authorization completed".to_string(),
@@ -673,24 +700,46 @@ async fn account_input_from_token(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let discovered_profile_arn = if explicit_profile_arn.is_none() {
-        fetch_available_profile_arn(http, &flow.region, &access_token, None)
-            .await
-            .ok()
-            .flatten()
+        .map(|profile_arn| {
+            crate::domain::providers::kiro::parse_profile_arn(profile_arn)
+                .map(|parsed| parsed.arn)
+                .ok_or_else(|| {
+                    KiroDeviceError::bad_gateway("kiro token returned invalid profile ARN")
+                })
+        })
+        .transpose()?;
+    let discovered_profile = if explicit_profile_arn.is_none() {
+        discover_profile_arn(http, Some(&flow.region), &access_token, None).await?
     } else {
         None
     };
-    let profile_arn = explicit_profile_arn
-        .or(discovered_profile_arn)
-        .unwrap_or_else(|| {
-            default_profile_arn(&json!({ "authMethod": flow.auth_method }), &flow.region)
-        });
+    let (profile_arn, profile_provenance) = if let Some(profile_arn) = explicit_profile_arn {
+        (profile_arn, "token_response")
+    } else if let Some((profile_arn, _)) = discovered_profile {
+        (profile_arn, "list_available_profiles")
+    } else if let Some(profile_arn) =
+        default_profile_arn(&json!({ "authMethod": flow.auth_method }))
+    {
+        (profile_arn, "auth_method_default")
+    } else {
+        return Err(KiroDeviceError::bad_gateway(
+            "kiro IdC login completed but no organization profile ARN was discovered",
+        ));
+    };
+    if flow.auth_method == KIRO_AUTH_METHOD_IDC
+        && crate::domain::providers::kiro::is_legacy_enterprise_fallback_profile(&profile_arn)
+    {
+        return Err(KiroDeviceError::bad_gateway(
+            "kiro IdC login returned a legacy shared fallback profile ARN instead of an organization profile",
+        ));
+    }
+    let runtime =
+        crate::domain::providers::kiro::resolve_runtime_identity(Some(&profile_arn), None, None)
+            .map_err(|_| KiroDeviceError::bad_gateway("kiro login resolved invalid profile ARN"))?;
     let usage = fetch_usage_limits(
         http,
-        &flow.region,
-        &profile_arn,
+        &runtime.runtime_region,
+        Some(&profile_arn),
         &machine_id,
         &access_token,
         None,
@@ -718,13 +767,14 @@ async fn account_input_from_token(
     let quota = usage
         .as_ref()
         .map(|value| quota_from_usage_limits(value.clone(), subscription_level.clone(), now_ms));
+    let quota_percent = quota.as_ref().and_then(agentic_quota_percent);
     let expires_at = token
         .expires_in
         .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)));
     let profile_auth_region = flow.region.clone();
     let raw_auth_region = flow.region.clone();
-    let profile_api_region = flow.region.clone();
-    let raw_api_region = flow.region.clone();
+    let profile_runtime_region = runtime.runtime_region.clone();
+    let raw_runtime_region = runtime.runtime_region.clone();
     let profile_start_url = flow.start_url.clone();
     let raw_start_url = flow.start_url.clone();
     let profile_issuer_url = flow.issuer_url.clone();
@@ -750,7 +800,9 @@ async fn account_input_from_token(
         "email": email.as_deref(),
         "profileArn": profile_profile_arn,
         "authRegion": profile_auth_region,
-        "apiRegion": profile_api_region,
+        "runtimeRegion": profile_runtime_region,
+        "apiRegion": runtime.runtime_region,
+        "profileProvenance": profile_provenance,
         "machineId": profile_machine_id,
         "startUrl": profile_start_url,
         "issuerUrl": profile_issuer_url,
@@ -766,9 +818,11 @@ async fn account_input_from_token(
         "startUrl": raw_start_url,
         "issuerUrl": raw_issuer_url,
         "authRegion": raw_auth_region,
-        "apiRegion": raw_api_region,
+        "runtimeRegion": raw_runtime_region,
+        "apiRegion": runtime.runtime_region,
         "profileArn": token.profile_arn,
         "resolvedProfileArn": raw_profile_arn,
+        "profileProvenance": profile_provenance,
         "machineId": raw_machine_id,
         "tokenResponse": token.extra,
         "kiroUsageLimits": usage.as_ref(),
@@ -794,7 +848,7 @@ async fn account_input_from_token(
         raw: Some(raw),
         subscription_level,
         entitlement_status: None,
-        quota_percent: None,
+        quota_percent,
         quota,
         quota_refreshed_at: usage_fetched.then_some(now_ms),
         quota_next_refresh_at: usage_fetched.then_some(now_ms.saturating_add(
@@ -809,7 +863,7 @@ async fn account_input_from_token(
 pub(crate) async fn fetch_usage_limits(
     http: &reqwest::Client,
     region: &str,
-    profile_arn: &str,
+    profile_arn: Option<&str>,
     machine_id: &str,
     access_token: &str,
     token_type: Option<&str>,
@@ -820,10 +874,12 @@ pub(crate) async fn fetch_usage_limits(
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-2.3.0-{machine_id}");
     let q_host = format!("q.{region}.amazonaws.com");
-    for url in [
-        usage_limits_url(&q_host, Some(profile_arn)),
-        usage_limits_url(&q_host, None),
-    ] {
+    let mut urls = Vec::with_capacity(2);
+    if profile_arn.is_some() {
+        urls.push(usage_limits_url(&q_host, profile_arn));
+    }
+    urls.push(usage_limits_url(&q_host, None));
+    for url in urls {
         match send_usage_limits_get(
             http,
             &url,
@@ -902,6 +958,7 @@ pub(crate) async fn fetch_available_profile_arn(
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("authorization", format!("Bearer {access_token}"))
         .header("connection", "close")
+        .timeout(std::time::Duration::from_secs(10))
         .body(r#"{"maxResults":10}"#);
     if let Some(token_type) = token_type {
         request = request.header("tokentype", token_type);
@@ -918,20 +975,35 @@ pub(crate) async fn fetch_available_profile_arn(
     let matching = profiles
         .iter()
         .filter_map(|profile| string_at(profile, &["/arn", "/profileArn"]))
-        .find(|arn| region_from_profile_arn(arn).as_deref() == Some(region.as_str()));
+        .filter_map(|arn| crate::domain::providers::kiro::parse_profile_arn(&arn))
+        .find(|profile| profile.region == region)
+        .map(|profile| profile.arn);
     Ok(matching.or_else(|| {
         profiles
             .iter()
             .find_map(|profile| string_at(profile, &["/arn", "/profileArn"]))
+            .and_then(|arn| crate::domain::providers::kiro::parse_profile_arn(&arn))
+            .map(|profile| profile.arn)
     }))
 }
 
-fn region_from_profile_arn(arn: &str) -> Option<String> {
-    let mut parts = arn.split(':');
-    (parts.next() == Some("arn")).then_some(())?;
-    (parts.next() == Some("aws")).then_some(())?;
-    (parts.next() == Some("codewhisperer")).then_some(())?;
-    parts.next().map(str::to_string)
+pub(crate) async fn discover_profile_arn(
+    http: &reqwest::Client,
+    auth_region: Option<&str>,
+    access_token: &str,
+    token_type: Option<&str>,
+) -> Result<Option<(String, String)>, KiroDeviceError> {
+    let regions = crate::domain::providers::kiro::profile_discovery_regions(auth_region)
+        .ok_or_else(|| KiroDeviceError::bad_request("invalid Kiro auth region"))?;
+    for region in regions {
+        match fetch_available_profile_arn(http, &region, access_token, token_type).await {
+            Ok(Some(profile_arn)) => return Ok(Some((profile_arn, region))),
+            Ok(None) => {}
+            Err(error) if error.status == StatusCode::UNAUTHORIZED => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(None)
 }
 
 async fn handle_json_response<T: for<'de> Deserialize<'de>>(
@@ -974,89 +1046,249 @@ pub(crate) fn quota_from_usage_limits(
             "/overage_configuration/overage_enabled",
         ],
     );
-    let breakdown = value_at(
-        &body,
-        &[
-            "/usageBreakdownList/0",
-            "/usage_breakdown_list/0",
-            "/usageBreakdown/0",
-            "/usage_breakdown/0",
-        ],
-    );
-    let current_usage = breakdown
-        .as_ref()
-        .and_then(|value| {
-            number_at(
-                value,
-                &[
-                    "/currentUsageWithPrecision",
-                    "/current_usage_with_precision",
-                    "/currentUsage",
-                    "/current_usage",
-                ],
-            )
-        })
-        .unwrap_or(0.0)
-        + number_at(
-            breakdown.as_ref().unwrap_or(&Value::Null),
-            &[
-                "/freeTrialInfo/currentUsageWithPrecision",
-                "/free_trial_info/current_usage_with_precision",
-            ],
-        )
-        .unwrap_or(0.0)
-        + bonuses_total(breakdown.as_ref(), &["currentUsage", "current_usage"]);
-    let usage_limit = breakdown
-        .as_ref()
-        .and_then(|value| {
-            number_at(
-                value,
-                &[
-                    "/usageLimitWithPrecision",
-                    "/usage_limit_with_precision",
-                    "/usageLimit",
-                    "/usage_limit",
-                ],
-            )
-        })
-        .unwrap_or(0.0)
-        + number_at(
-            breakdown.as_ref().unwrap_or(&Value::Null),
-            &[
-                "/freeTrialInfo/usageLimitWithPrecision",
-                "/free_trial_info/usage_limit_with_precision",
-            ],
-        )
-        .unwrap_or(0.0)
-        + bonuses_total(breakdown.as_ref(), &["usageLimit", "usage_limit"]);
-    let utilization = if usage_limit > 0.0 {
-        (current_usage / usage_limit).clamp(0.0, 1.0)
+    let breakdowns = usage_breakdowns(&body);
+    let mut resources = Vec::with_capacity(breakdowns.len());
+    let mut tiers = Vec::with_capacity(breakdowns.len());
+    let mut used_names = std::collections::BTreeSet::new();
+    for (index, breakdown) in breakdowns.iter().enumerate() {
+        let resource = parse_usage_breakdown(breakdown, index, &body);
+        let normalized_resource = normalize_resource_name(&resource.resource_type);
+        let mut tier_name = if normalized_resource == "agentic_request" {
+            "kiro_agentic_requests".to_string()
+        } else {
+            format!("kiro_{normalized_resource}")
+        };
+        if !used_names.insert(tier_name.clone()) {
+            tier_name.push('_');
+            tier_name.push_str(&(index + 1).to_string());
+            used_names.insert(tier_name.clone());
+        }
+        tiers.push(AccountQuotaTier {
+            name: tier_name,
+            label: Some(resource.resource_type.clone()),
+            utilization: (resource.limit > 0.0)
+                .then_some((resource.used / resource.limit).clamp(0.0, 1.0)),
+            used: Some(resource.used),
+            limit: Some(resource.limit),
+            unit: Some("credits".to_string()),
+            resets_at: resource.resets_at,
+        });
+        resources.push(json!({
+            "resourceType": resource.resource_type,
+            "used": resource.used,
+            "limit": resource.limit,
+            "baseUsed": resource.base_used,
+            "baseLimit": resource.base_limit,
+            "freeTrialUsed": resource.free_trial_used,
+            "freeTrialLimit": resource.free_trial_limit,
+            "bonusUsed": resource.bonus_used,
+            "bonusLimit": resource.bonus_limit,
+            "resetsAt": resource.resets_at,
+        }));
+    }
+    let availability = if tiers.is_empty() {
+        "no_usage_breakdown"
     } else {
-        0.0
+        "observed"
     };
     AccountQuota {
         success: true,
         credential_message: plan.or_else(|| Some("Kiro OAuth".to_string())),
-        tiers: vec![AccountQuotaTier {
-            name: "kiro_agentic_requests".to_string(),
-            label: None,
-            utilization: Some(utilization),
-            used: Some(current_usage),
-            limit: Some(usage_limit),
-            unit: Some("credits".to_string()),
-            resets_at: breakdown
-                .as_ref()
-                .and_then(|value| {
-                    number_at(value, &["/nextResetTimestamp", "/next_reset_timestamp"])
-                })
-                .and_then(timestamp_number_to_unix_ms),
-        }],
+        tiers,
         extra_usage: Some(json!({
             "raw": body,
             "source": "kiro_device_flow",
+            "availability": availability,
+            "resources": resources,
             "overageEnabled": overage_enabled,
             "queriedAt": now_ms,
         })),
+    }
+}
+
+pub(crate) fn agentic_quota_percent(quota: &AccountQuota) -> Option<f64> {
+    quota
+        .tiers
+        .iter()
+        .find(|tier| tier.name == "kiro_agentic_requests")
+        .and_then(|tier| tier.utilization)
+        .filter(|value| value.is_finite())
+        .map(|value| (value * 100.0).clamp(0.0, 10_000.0))
+}
+
+#[derive(Debug)]
+struct KiroUsageResource {
+    resource_type: String,
+    base_used: f64,
+    base_limit: f64,
+    free_trial_used: f64,
+    free_trial_limit: f64,
+    bonus_used: f64,
+    bonus_limit: f64,
+    used: f64,
+    limit: f64,
+    resets_at: Option<i64>,
+}
+
+fn usage_breakdowns(body: &Value) -> Vec<&Value> {
+    [
+        "/usageBreakdownList",
+        "/usage_breakdown_list",
+        "/usageBreakdown",
+        "/usage_breakdown",
+    ]
+    .iter()
+    .find_map(|pointer| body.pointer(pointer).and_then(Value::as_array))
+    .map(|breakdowns| breakdowns.iter().collect())
+    .unwrap_or_default()
+}
+
+fn parse_usage_breakdown(breakdown: &Value, index: usize, body: &Value) -> KiroUsageResource {
+    let resource_type =
+        string_at(breakdown, &["/resourceType", "/resource_type"]).unwrap_or_else(|| {
+            if index == 0 {
+                "AGENTIC_REQUEST".to_string()
+            } else {
+                format!("UNKNOWN_{}", index + 1)
+            }
+        });
+    let base_used = number_at(
+        breakdown,
+        &[
+            "/currentUsageWithPrecision",
+            "/current_usage_with_precision",
+            "/currentUsage",
+            "/current_usage",
+        ],
+    )
+    .unwrap_or(0.0);
+    let base_limit = number_at(
+        breakdown,
+        &[
+            "/usageLimitWithPrecision",
+            "/usage_limit_with_precision",
+            "/usageLimit",
+            "/usage_limit",
+        ],
+    )
+    .unwrap_or(0.0);
+    let free_trial_used = number_at(
+        breakdown,
+        &[
+            "/freeTrialInfo/currentUsageWithPrecision",
+            "/free_trial_info/current_usage_with_precision",
+            "/freeTrialInfo/currentUsage",
+            "/free_trial_info/current_usage",
+        ],
+    )
+    .filter(|_| {
+        usage_component_is_active(
+            breakdown,
+            &[
+                "/freeTrialInfo/freeTrialStatus",
+                "/free_trial_info/free_trial_status",
+            ],
+        )
+    })
+    .unwrap_or(0.0);
+    let free_trial_limit = number_at(
+        breakdown,
+        &[
+            "/freeTrialInfo/usageLimitWithPrecision",
+            "/free_trial_info/usage_limit_with_precision",
+            "/freeTrialInfo/usageLimit",
+            "/free_trial_info/usage_limit",
+        ],
+    )
+    .filter(|_| {
+        usage_component_is_active(
+            breakdown,
+            &[
+                "/freeTrialInfo/freeTrialStatus",
+                "/free_trial_info/free_trial_status",
+            ],
+        )
+    })
+    .unwrap_or(0.0);
+    let bonus_used = bonuses_total(Some(breakdown), &["currentUsage", "current_usage"]);
+    let bonus_limit = bonuses_total(Some(breakdown), &["usageLimit", "usage_limit"]);
+    let resets_at = number_at(
+        breakdown,
+        &[
+            "/nextResetTimestamp",
+            "/next_reset_timestamp",
+            "/nextDateReset",
+            "/next_date_reset",
+        ],
+    )
+    .or_else(|| {
+        number_at(
+            body,
+            &[
+                "/nextDateReset",
+                "/next_date_reset",
+                "/resetDate",
+                "/reset_date",
+            ],
+        )
+    })
+    .and_then(timestamp_number_to_unix_ms)
+    .or_else(|| {
+        timestamp_string_at(
+            breakdown,
+            &[
+                "/nextResetTimestamp",
+                "/next_reset_timestamp",
+                "/nextDateReset",
+                "/next_date_reset",
+            ],
+        )
+    })
+    .or_else(|| {
+        timestamp_string_at(
+            body,
+            &[
+                "/nextDateReset",
+                "/next_date_reset",
+                "/resetDate",
+                "/reset_date",
+            ],
+        )
+    });
+    KiroUsageResource {
+        resource_type,
+        base_used,
+        base_limit,
+        free_trial_used,
+        free_trial_limit,
+        bonus_used,
+        bonus_limit,
+        used: base_used + free_trial_used + bonus_used,
+        limit: base_limit + free_trial_limit + bonus_limit,
+        resets_at,
+    }
+}
+
+fn normalize_resource_name(resource_type: &str) -> String {
+    let mut output = String::with_capacity(resource_type.len().min(64));
+    let mut previous_separator = false;
+    for byte in resource_type.bytes().take(64) {
+        let normalized = if byte.is_ascii_alphanumeric() {
+            previous_separator = false;
+            byte.to_ascii_lowercase() as char
+        } else if !previous_separator {
+            previous_separator = true;
+            '_'
+        } else {
+            continue;
+        };
+        output.push(normalized);
+    }
+    let normalized = output.trim_matches('_');
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized.to_string()
     }
 }
 
@@ -1106,7 +1338,7 @@ fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     url
 }
 
-pub(crate) fn default_profile_arn(token_extra: &Value, region: &str) -> String {
+pub(crate) fn default_profile_arn(token_extra: &Value) -> Option<String> {
     let kind = string_at(
         token_extra,
         &[
@@ -1120,22 +1352,12 @@ pub(crate) fn default_profile_arn(token_extra: &Value, region: &str) -> String {
     .unwrap_or_default()
     .to_ascii_lowercase();
     if matches!(kind.as_str(), "social" | "google" | "github") {
-        return SOCIAL_PROFILE_ARN.to_string();
+        return Some(SOCIAL_PROFILE_ARN.to_string());
     }
-    if matches!(
-        kind.as_str(),
-        "enterprise" | "idc" | "iam_sso" | "iam-sso" | "external_idp" | "externalidp"
-    ) {
-        let region = if region.starts_with("eu-") {
-            "eu-central-1"
-        } else {
-            "us-east-1"
-        };
-        return format!(
-            "arn:aws:codewhisperer:{region}:{ENTERPRISE_FALLBACK_PROFILE_ACCOUNT_ID}:profile/{ENTERPRISE_FALLBACK_PROFILE_ID}"
-        );
+    if crate::domain::providers::kiro::is_enterprise_auth_method(&kind) {
+        return None;
     }
-    BUILDER_ID_PROFILE_ARN.to_string()
+    Some(BUILDER_ID_PROFILE_ARN.to_string())
 }
 
 fn percent_encode(value: &str) -> String {
@@ -1242,12 +1464,6 @@ pub(crate) fn find_email_in_value(value: &Value) -> Option<&str> {
     }
 }
 
-fn value_at(value: &Value, pointers: &[&str]) -> Option<Value> {
-    pointers
-        .iter()
-        .find_map(|pointer| value.pointer(pointer).cloned())
-}
-
 pub(crate) fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
     pointers.iter().find_map(|pointer| {
         value
@@ -1289,6 +1505,16 @@ fn bonuses_total(breakdown: Option<&Value>, field_names: &[&str]) -> f64 {
         .map(|bonuses| {
             bonuses
                 .iter()
+                .filter(|bonus| {
+                    bonus
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|status| !status.is_empty())
+                        .is_none_or(|status| {
+                            matches!(status.to_ascii_uppercase().as_str(), "ACTIVE" | "ENABLED")
+                        })
+                })
                 .filter_map(|bonus| {
                     field_names.iter().find_map(|name| {
                         bonus.get(*name).and_then(|value| {
@@ -1299,6 +1525,25 @@ fn bonuses_total(breakdown: Option<&Value>, field_names: &[&str]) -> f64 {
                 .sum()
         })
         .unwrap_or(0.0)
+}
+
+fn usage_component_is_active(value: &Value, status_pointers: &[&str]) -> bool {
+    status_pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .is_none_or(|status| matches!(status.to_ascii_uppercase().as_str(), "ACTIVE" | "ENABLED"))
+}
+
+fn timestamp_string_at(value: &Value, pointers: &[&str]) -> Option<i64> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value.trim()).ok())
+            .map(|value| value.timestamp_millis())
+    })
 }
 
 fn timestamp_number_to_unix_ms(value: f64) -> Option<i64> {
@@ -1335,7 +1580,7 @@ mod tests {
         let usage_error = fetch_usage_limits(
             &http,
             invalid,
-            BUILDER_ID_PROFILE_ARN,
+            Some(BUILDER_ID_PROFILE_ARN),
             "machine",
             "access",
             None,
@@ -1359,14 +1604,126 @@ mod tests {
         assert_eq!(normalize_social_provider("github").unwrap(), "github");
         assert!(normalize_social_provider("amazon").is_err());
         assert_eq!(
-            default_profile_arn(&json!({ "authMethod": "social" }), "us-west-2"),
-            SOCIAL_PROFILE_ARN
+            default_profile_arn(&json!({ "authMethod": "social" })).as_deref(),
+            Some(SOCIAL_PROFILE_ARN)
+        );
+        assert_eq!(default_profile_arn(&json!({ "authMethod": "idc" })), None);
+    }
+
+    #[test]
+    fn quota_preserves_multiple_resources_and_only_active_credit_components() {
+        let quota = quota_from_usage_limits(
+            json!({
+                "subscriptionInfo": {"subscriptionTitle": "Kiro Pro"},
+                "resetDate": "2026-09-01T00:00:00Z",
+                "usageBreakdownList": [
+                    {
+                        "resourceType": "AGENTIC_REQUEST",
+                        "currentUsageWithPrecision": 10.0,
+                        "usageLimitWithPrecision": 100.0,
+                        "freeTrialInfo": {
+                            "freeTrialStatus": "ACTIVE",
+                            "currentUsageWithPrecision": 2.0,
+                            "usageLimitWithPrecision": 20.0
+                        },
+                        "bonuses": [
+                            {"status": "ACTIVE", "currentUsage": 3.0, "usageLimit": 30.0},
+                            {"status": "EXPIRED", "currentUsage": 90.0, "usageLimit": 900.0}
+                        ]
+                    },
+                    {
+                        "resourceType": "CODE_REVIEW",
+                        "currentUsageWithPrecision": 4.0,
+                        "usageLimitWithPrecision": 40.0,
+                        "freeTrialInfo": {
+                            "freeTrialStatus": "EXPIRED",
+                            "currentUsageWithPrecision": 8.0,
+                            "usageLimitWithPrecision": 80.0
+                        }
+                    }
+                ]
+            }),
+            Some("Kiro Pro".to_string()),
+            1_000,
+        );
+
+        assert!(quota.success);
+        assert_eq!(quota.tiers.len(), 2);
+        assert_eq!(quota.tiers[0].name, "kiro_agentic_requests");
+        assert_eq!(quota.tiers[0].label.as_deref(), Some("AGENTIC_REQUEST"));
+        assert_eq!(quota.tiers[0].used, Some(15.0));
+        assert_eq!(quota.tiers[0].limit, Some(150.0));
+        assert_eq!(quota.tiers[0].utilization, Some(0.1));
+        assert_eq!(quota.tiers[0].resets_at, Some(1_788_220_800_000));
+        assert_eq!(quota.tiers[1].name, "kiro_code_review");
+        assert_eq!(quota.tiers[1].used, Some(4.0));
+        assert_eq!(quota.tiers[1].limit, Some(40.0));
+        assert_eq!(
+            quota
+                .extra_usage
+                .as_ref()
+                .and_then(|value| value.pointer("/resources/0/bonusUsed"))
+                .and_then(Value::as_f64),
+            Some(3.0)
         );
         assert_eq!(
-            default_profile_arn(&json!({ "authMethod": "idc" }), "eu-west-1"),
-            format!(
-                "arn:aws:codewhisperer:eu-central-1:{ENTERPRISE_FALLBACK_PROFILE_ACCOUNT_ID}:profile/{ENTERPRISE_FALLBACK_PROFILE_ID}"
-            )
+            quota
+                .extra_usage
+                .as_ref()
+                .and_then(|value| value.pointer("/availability"))
+                .and_then(Value::as_str),
+            Some("observed")
         );
+    }
+
+    #[test]
+    fn empty_usage_breakdown_is_connected_but_not_fake_zero_quota() {
+        let quota = quota_from_usage_limits(
+            json!({
+                "subscriptionInfo": {"subscriptionTitle": "Kiro Builder ID"},
+                "usageBreakdownList": []
+            }),
+            Some("Kiro Builder ID".to_string()),
+            1_000,
+        );
+
+        assert!(quota.success);
+        assert!(quota.tiers.is_empty());
+        assert_eq!(
+            quota
+                .extra_usage
+                .as_ref()
+                .and_then(|value| value.pointer("/availability"))
+                .and_then(Value::as_str),
+            Some("no_usage_breakdown")
+        );
+    }
+
+    #[test]
+    fn quota_identifies_agentic_requests_by_resource_type_not_array_position() {
+        let quota = quota_from_usage_limits(
+            json!({
+                "usageBreakdownList": [
+                    {
+                        "resourceType": "CODE_REVIEW",
+                        "currentUsage": 2,
+                        "usageLimit": 2
+                    },
+                    {
+                        "resourceType": "AGENTIC_REQUEST",
+                        "currentUsage": 3,
+                        "usageLimit": 10
+                    }
+                ]
+            }),
+            Some("Kiro Pro".to_string()),
+            1_000,
+        );
+
+        assert_eq!(quota.tiers[0].name, "kiro_code_review");
+        assert_eq!(quota.tiers[1].name, "kiro_agentic_requests");
+        assert_eq!(quota.tiers[0].utilization, Some(1.0));
+        assert_eq!(quota.tiers[1].utilization, Some(0.3));
+        assert_eq!(agentic_quota_percent(&quota), Some(30.0));
     }
 }

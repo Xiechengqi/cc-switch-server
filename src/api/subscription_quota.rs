@@ -286,6 +286,14 @@ fn account_credential_status(account: &Account) -> &'static str {
     if !account_has_credentials(account) {
         return "not_found";
     }
+    // GitHub Copilot stores the expiry of its exchanged data-plane token in
+    // `expiresAt`. The durable credential used for quota and a new exchange is
+    // the GitHub OAuth token, so an expired sub-token is not an expired account.
+    if account.provider_type == ProviderType::GitHubCopilot
+        && copilot_has_github_credential(account)
+    {
+        return "valid";
+    }
     let now_ms = crate::infra::time::now_ms() as i64;
     if account
         .expires_at
@@ -294,6 +302,20 @@ fn account_credential_status(account: &Account) -> &'static str {
         return "expired";
     }
     "valid"
+}
+
+fn copilot_has_github_credential(account: &Account) -> bool {
+    account
+        .raw
+        .as_ref()
+        .and_then(|raw| {
+            raw.get("githubToken")
+                .or_else(|| raw.get("github_token"))
+                .and_then(Value::as_str)
+        })
+        .or(account.refresh_token.as_deref())
+        .or(account.api_key.as_deref())
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn account_has_credentials(account: &Account) -> bool {
@@ -371,6 +393,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: Default::default(),
         }
     }
 
@@ -458,6 +481,47 @@ mod tests {
         );
         assert_eq!(cached["quota"]["tiers"][0]["utilization"], 25.0);
         assert_eq!(cached["nextRefreshAt"], json!(1_700_000_300_000i64));
+    }
+
+    #[test]
+    fn copilot_expired_subtoken_is_valid_when_github_oauth_credential_exists() {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("Copilot Pro".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "premium".to_string(),
+                utilization: Some(0.25),
+                ..Default::default()
+            }],
+            extra_usage: None,
+        });
+        account.provider_type = ProviderType::GitHubCopilot;
+        account.access_token = Some("expired-copilot-subtoken".to_string());
+        account.refresh_token = Some("github-oauth-token".to_string());
+        account.expires_at = Some(1);
+        account.raw = Some(json!({
+            "githubToken": "github-oauth-token",
+            "copilotToken": {"token": "expired-copilot-subtoken"}
+        }));
+
+        let quota = subscription_quota_from_account(&account, "github_copilot");
+        assert_eq!(quota["credentialStatus"], "valid");
+        assert_eq!(quota["success"], true);
+    }
+
+    #[test]
+    fn copilot_expired_subtoken_without_github_credential_is_expired() {
+        let mut account = sample_account(AccountQuota::default());
+        account.provider_type = ProviderType::GitHubCopilot;
+        account.access_token = Some("expired-copilot-subtoken".to_string());
+        account.refresh_token = None;
+        account.api_key = None;
+        account.expires_at = Some(1);
+        account.raw = Some(json!({
+            "copilotToken": {"token": "expired-copilot-subtoken"}
+        }));
+
+        assert_eq!(account_credential_status(&account), "expired");
     }
 
     #[test]

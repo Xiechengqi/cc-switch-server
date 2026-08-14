@@ -7,11 +7,11 @@ export const requiredProviderTypes = Object.freeze([
   ["gemini", "Google Gemini API key", ["gemini"]],
   ["gemini_cli", "Google Gemini OAuth / CLI", ["gemini", "claude"]],
   ["openrouter", "OpenRouter", ["claude", "codex", "gemini"]],
-  ["github_copilot", "GitHub Copilot", ["claude"]],
+  ["github_copilot", "GitHub Copilot", ["claude", "codex"]],
   ["deepseek_account", "DeepSeek account", ["claude"]],
   ["kiro_oauth", "Kiro OAuth", ["claude", "codex"]],
-  ["cursor_oauth", "Cursor OAuth", ["claude", "codex"]],
-  ["cursor_apikey", "Cursor API key", ["claude", "codex"]],
+  ["cursor_oauth", "Cursor OAuth", ["claude", "codex", "gemini"]],
+  ["cursor_apikey", "Cursor API key", ["claude", "codex", "gemini"]],
   ["antigravity_oauth", "Antigravity OAuth", ["claude", "gemini"]],
   ["agy_oauth", "Antigravity CLI / agy", ["claude", "gemini"]],
   ["ollama_cloud", "Ollama API key", ["claude", "codex"]],
@@ -23,6 +23,7 @@ export const serverCompatibilityProviderTypes = Object.freeze([
   ["deepseek_api", "DeepSeek API key", ["claude", "codex"]],
   ["grok_oauth", "Grok/xAI OAuth reverse proxy", ["claude", "codex", "gemini"]],
   ["kimi_code", "Kimi Code OAuth", ["claude", "codex", "gemini"]],
+  ["qoder_cosy", "Qoder COSY", ["claude", "codex", "gemini"]],
 ]);
 
 export function requiredProviderProfilePairs() {

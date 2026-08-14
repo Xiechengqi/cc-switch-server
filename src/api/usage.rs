@@ -31,7 +31,7 @@ pub(in crate::api) async fn usage_trends(
     let requested_window_ms = params.window_ms.map(u128::from);
     let (query, meta) = usage_query(params)?;
     let range_ms = meta.to_ms.saturating_sub(meta.from_ms);
-    let window_ms = requested_window_ms.unwrap_or_else(|| {
+    let window_ms = requested_window_ms.unwrap_or({
         if range_ms <= DEFAULT_USAGE_RANGE_MS {
             60 * 60 * 1_000
         } else {

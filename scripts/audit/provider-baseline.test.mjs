@@ -54,11 +54,33 @@ test("first-class Server Profiles are committed additions, not candidates", () =
     "claude.anthropic_api_key",
     "claude.google_oauth",
     "claude.kimi_code",
+    "claude.qoder_cosy",
+    "codex.github_copilot",
     "codex.kiro_oauth",
     "codex.kimi_code",
+    "codex.qoder_cosy",
     "codex.openai_api_key",
     "gemini.google_api_key",
     "gemini.kimi_code",
+    "gemini.qoder_cosy",
+    "gemini.cursor_api_key",
+    "gemini.cursor_oauth",
+    "claude.kimi_coding_api_key",
+    "codex.kimi_coding_api_key",
+    "claude.zhipu_glm_cn",
+    "codex.zhipu_glm_cn",
+    "claude.zhipu_glm_global",
+    "codex.zhipu_glm_global",
+    "claude.minimax_cn",
+    "codex.minimax_cn",
+    "claude.minimax_global",
+    "codex.minimax_global",
+    "claude.volcengine_coding_plan",
+    "codex.volcengine_coding_plan",
+    "claude.xiaomi_mimo_token_plan",
+    "codex.xiaomi_mimo_token_plan",
+    "claude.xiaomi_mimo_token_plan_sgp",
+    "codex.xiaomi_mimo_token_plan_sgp",
   ]);
   assert.equal("directApiCandidates" in mappings, false);
   assert.deepEqual(mappings.customRecipeAdditions, [
@@ -112,7 +134,7 @@ test("inventory validation rejects altered Custom HTTP recipe additions", () => 
 
 test("every required Provider type/app pair has a creatable Profile or recipe", () => {
   const registry = contract("provider-registry.json");
-  assert.equal(requiredProviderProfilePairs().length, 37);
+  assert.equal(requiredProviderProfilePairs().length, 43);
   assert.doesNotThrow(() => assertRequiredProviderCoverage(registry));
 
   const missing = structuredClone(registry);

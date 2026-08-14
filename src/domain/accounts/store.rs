@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::capability_evidence::{
+    fresh_observation_state, has_fresh_supported_observation, record_observation_drafts,
+    AccountCapabilityObservation, AccountCapabilityObservationDraft,
+    AccountCapabilityObservationState, GROK_CODE_PLAN_CAPABILITY, MEDIA_ENTITLEMENT_DIMENSION,
+};
 use crate::domain::accounts::oauth::{
     invalid_grant_requires_immediate_relogin as oauth_invalid_grant_requires_immediate_relogin,
     oauth_provider_spec, OAuthErrorKind,
@@ -110,6 +115,8 @@ pub struct Account {
     pub refresh_consecutive_failures: u32,
     #[serde(default)]
     pub needs_relogin: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capability_observations: BTreeMap<String, AccountCapabilityObservation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -218,6 +225,7 @@ pub struct AccountUsageBlock {
 const DEFAULT_QUOTA_EVIDENCE_TTL_MS: i64 = 60 * 60 * 1000;
 const MIN_QUOTA_REFRESH_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const MAX_QUOTA_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+const KIRO_AGENTIC_REQUESTS_QUOTA_TIER: &str = "kiro_agentic_requests";
 
 pub fn active_account_usage_block(account: &Account, now_ms: i64) -> Option<AccountUsageBlock> {
     if let Some(until_ms) = account.rate_limited_until.filter(|until| *until > now_ms) {
@@ -258,16 +266,30 @@ pub fn active_account_usage_block(account: &Account, now_ms: i64) -> Option<Acco
         }
         ProviderType::KiroOAuth
             if extra.pointer("/overageEnabled").and_then(Value::as_bool) == Some(false)
-                && quota.tiers.iter().any(quota_tier_is_exhausted) =>
+                && quota
+                    .tiers
+                    .iter()
+                    .any(kiro_inference_quota_tier_is_exhausted) =>
         {
             ("upstream reported the Kiro usage limit", "kiro_account")
+        }
+        ProviderType::QoderCosy
+            if extra
+                .pointer("/qoderQuota/exhausted")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            ("upstream reported the Qoder credit limit", "qoder_account")
         }
         _ => return None,
     };
     let until_ms = quota
         .tiers
         .iter()
-        .filter(|tier| quota_tier_is_exhausted(tier))
+        .filter(|tier| match account.provider_type {
+            ProviderType::KiroOAuth => kiro_inference_quota_tier_is_exhausted(tier),
+            _ => quota_tier_is_exhausted(tier),
+        })
         .filter_map(|tier| tier.resets_at)
         .filter(|reset| *reset > now_ms)
         .min()
@@ -327,6 +349,10 @@ fn quota_tier_is_exhausted(tier: &AccountQuotaTier) -> bool {
     tier.utilization
         .filter(|value| value.is_finite())
         .is_some_and(|value| value >= 1.0)
+}
+
+fn kiro_inference_quota_tier_is_exhausted(tier: &AccountQuotaTier) -> bool {
+    tier.name == KIRO_AGENTIC_REQUESTS_QUOTA_TIER && quota_tier_is_exhausted(tier)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,8 +421,12 @@ pub struct AccountRefreshUpdate {
     pub quota_refreshed_at: Option<i64>,
     pub quota_next_refresh_at: Option<i64>,
     pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_rate_limited_until_if: Option<i64>,
     pub rate_limited_until: Option<i64>,
     pub last_refresh_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_observations: Vec<AccountCapabilityObservationDraft>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -418,6 +448,7 @@ pub enum GrokAccountCapability {
     ImageGeneration,
     ImageEdit,
     VideoGeneration,
+    Search,
 }
 
 impl GrokAccountCapability {
@@ -427,6 +458,7 @@ impl GrokAccountCapability {
             Self::ImageGeneration => "image_generation",
             Self::ImageEdit => "image_edit",
             Self::VideoGeneration => "video_generation",
+            Self::Search => "search",
         }
     }
 }
@@ -441,7 +473,54 @@ pub fn grok_account_capability_enabled(
     if configured_grok_capabilities().contains(capability.as_str()) {
         return true;
     }
-    grok_account_capability_evidence_present(account, capability)
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let endpoint_state = fresh_observation_state(
+        account,
+        GROK_CODE_PLAN_CAPABILITY,
+        capability.as_str(),
+        now_ms,
+    );
+    if endpoint_state == Some(AccountCapabilityObservationState::Unsupported) {
+        return false;
+    }
+    if matches!(
+        grok_account_media_entitlement_state(account),
+        Some(AccountCapabilityObservationState::Unsupported)
+    ) && matches!(
+        capability,
+        GrokAccountCapability::ImageGeneration
+            | GrokAccountCapability::ImageEdit
+            | GrokAccountCapability::VideoGeneration
+    ) {
+        return false;
+    }
+    endpoint_state == Some(AccountCapabilityObservationState::Supported)
+        || (matches!(
+            capability,
+            GrokAccountCapability::ImageGeneration
+                | GrokAccountCapability::ImageEdit
+                | GrokAccountCapability::VideoGeneration
+        ) && grok_account_media_entitlement_evidence_present(account))
+}
+
+pub fn grok_account_media_entitlement_evidence_present(account: &Account) -> bool {
+    grok_account_media_entitlement_state(account)
+        == Some(AccountCapabilityObservationState::Supported)
+}
+
+pub fn grok_account_media_entitlement_state(
+    account: &Account,
+) -> Option<AccountCapabilityObservationState> {
+    if account.provider_type != ProviderType::GrokOAuth {
+        return None;
+    }
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    fresh_observation_state(
+        account,
+        GROK_CODE_PLAN_CAPABILITY,
+        MEDIA_ENTITLEMENT_DIMENSION,
+        now_ms,
+    )
 }
 
 pub fn grok_account_capability_evidence_present(
@@ -451,14 +530,13 @@ pub fn grok_account_capability_evidence_present(
     if account.provider_type != ProviderType::GrokOAuth {
         return false;
     }
-    account
-        .profile
-        .as_ref()
-        .and_then(|profile| profile.get(GROK_CAPABILITIES_KEY))
-        .and_then(|capabilities| capabilities.get(capability.as_str()))
-        .and_then(|evidence| evidence.get("status"))
-        .and_then(Value::as_str)
-        == Some("supported")
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    has_fresh_supported_observation(
+        account,
+        GROK_CODE_PLAN_CAPABILITY,
+        capability.as_str(),
+        now_ms,
+    )
 }
 
 fn configured_grok_capabilities() -> std::collections::BTreeSet<String> {
@@ -473,6 +551,7 @@ fn parse_grok_capability_config(raw: &str) -> std::collections::BTreeSet<String>
         GrokAccountCapability::ImageGeneration.as_str(),
         GrokAccountCapability::ImageEdit.as_str(),
         GrokAccountCapability::VideoGeneration.as_str(),
+        GrokAccountCapability::Search.as_str(),
     ];
     let requested = raw
         .split([',', ';', ' '])
@@ -687,6 +766,7 @@ impl AccountStore {
             last_refresh_error: input.last_refresh_error,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: BTreeMap::new(),
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
@@ -706,6 +786,9 @@ impl AccountStore {
             }
             if input.extra_headers.is_none() {
                 account.extra_headers = existing.extra_headers.clone();
+            }
+            if account.provider_type == existing.provider_type {
+                account.capability_observations = existing.capability_observations.clone();
             }
             if account.provider_type == ProviderType::CodexOAuth {
                 if let Some(profile) = account.profile.as_mut() {
@@ -1012,11 +1095,18 @@ impl AccountStore {
         if let Some(value) = update.expires_at {
             account.expires_at = Some(value);
         }
+        if update
+            .clear_rate_limited_until_if
+            .is_some_and(|expected| account.rate_limited_until == Some(expected))
+        {
+            account.rate_limited_until = None;
+        }
         if let Some(value) = update.rate_limited_until {
             account.rate_limited_until = Some(value);
         }
         account.last_refresh_error = update.last_refresh_error;
         advance_account_generations(&previous, account);
+        record_observation_drafts(account, update.capability_observations);
         Some(account.clone())
     }
 
@@ -1090,50 +1180,55 @@ impl AccountStore {
         source: &str,
         observed_at_ms: i64,
     ) -> bool {
+        self.record_grok_capability_observation(
+            account_id,
+            capability,
+            AccountCapabilityObservationState::Supported,
+            source,
+            None,
+            observed_at_ms,
+        )
+    }
+
+    pub fn record_grok_capability_observation(
+        &mut self,
+        account_id: &str,
+        capability: GrokAccountCapability,
+        state: AccountCapabilityObservationState,
+        source: &str,
+        reason: Option<&str>,
+        observed_at_ms: i64,
+    ) -> bool {
         let Some(account) = self.accounts.iter_mut().find(|account| {
             account.id == account_id && account.provider_type == ProviderType::GrokOAuth
         }) else {
             return false;
         };
-        if account
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.get(GROK_CAPABILITIES_KEY))
-            .and_then(|capabilities| capabilities.get(capability.as_str()))
-            .and_then(|evidence| evidence.get("status"))
-            .and_then(Value::as_str)
-            == Some("supported")
-        {
-            return false;
-        }
+        record_observation_drafts(
+            account,
+            [AccountCapabilityObservationDraft::grok_feature(
+                capability.as_str(),
+                state,
+                source,
+                reason,
+                observed_at_ms,
+            )],
+        ) > 0
+    }
 
-        let profile = account
-            .profile
-            .get_or_insert_with(|| Value::Object(Map::new()));
-        if !profile.is_object() {
-            *profile = Value::Object(Map::new());
-        }
-        let profile = profile
-            .as_object_mut()
-            .expect("Grok profile was normalized to an object");
-        let capabilities = profile
-            .entry(GROK_CAPABILITIES_KEY.to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !capabilities.is_object() {
-            *capabilities = Value::Object(Map::new());
-        }
-        capabilities
-            .as_object_mut()
-            .expect("Grok capabilities were normalized to an object")
-            .insert(
-                capability.as_str().to_string(),
-                serde_json::json!({
-                    "status": "supported",
-                    "source": source,
-                    "observedAtMs": observed_at_ms,
-                }),
-            );
-        true
+    pub fn record_account_capability_observations(
+        &mut self,
+        account_id: &str,
+        drafts: impl IntoIterator<Item = AccountCapabilityObservationDraft>,
+    ) -> bool {
+        let Some(account) = self
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+        else {
+            return false;
+        };
+        record_observation_drafts(account, drafts) > 0
     }
 
     pub fn mark_refresh_failure(&mut self, account_id: &str, error: String) -> Option<Account> {
@@ -1229,6 +1324,7 @@ struct AccountAuthIdentitySnapshot {
     principal: Option<AccountPrincipal>,
     kiro_evidence: Option<KiroIdentityEvidence>,
     codex_workspace_id: Option<String>,
+    qoder_identity: Option<QoderIdentityEvidence>,
     fallback_email: Option<String>,
 }
 
@@ -1243,6 +1339,16 @@ struct KiroIdentityEvidence {
     subject: Option<String>,
     user_id: Option<String>,
     upstream_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QoderIdentityEvidence {
+    site: String,
+    credential_rail: String,
+    uid: String,
+    aid: String,
+    organization_id: String,
+    machine_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1299,6 +1405,9 @@ fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnaps
         codex_workspace_id: (account.provider_type == ProviderType::CodexOAuth)
             .then(|| effective_codex_workspace_id(account))
             .flatten(),
+        qoder_identity: (account.provider_type == ProviderType::QoderCosy)
+            .then(|| qoder_identity_evidence(account))
+            .flatten(),
         fallback_email: normalized_identity_email(account.email.as_deref()),
     }
 }
@@ -1318,6 +1427,17 @@ fn account_auth_identity_changed(
     if previous.provider_type == ProviderType::KiroOAuth {
         return match (&previous.kiro_evidence, &current.kiro_evidence) {
             (Some(previous), Some(current)) => kiro_identity_evidence_replaced(previous, current),
+            (None, None) => previous.fallback_email != current.fallback_email,
+            (None, Some(_)) => matches!(
+                (&previous.fallback_email, &current.fallback_email),
+                (Some(previous), Some(current)) if previous != current
+            ),
+            (Some(_), None) => true,
+        };
+    }
+    if previous.provider_type == ProviderType::QoderCosy {
+        return match (&previous.qoder_identity, &current.qoder_identity) {
+            (Some(previous), Some(current)) => previous != current,
             (None, None) => previous.fallback_email != current.fallback_email,
             (None, Some(_)) => matches!(
                 (&previous.fallback_email, &current.fallback_email),
@@ -1359,6 +1479,16 @@ pub fn account_refresh_replaces_auth_identity(
             (Some(previous), Some(candidate)) => {
                 kiro_identity_evidence_replaced(previous, candidate)
             }
+            (None, None) => {
+                identity_component_replaced(&previous.fallback_email, &candidate.fallback_email)
+            }
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+        };
+    }
+    if previous.provider_type == ProviderType::QoderCosy {
+        return match (&previous.qoder_identity, &candidate.qoder_identity) {
+            (Some(previous), Some(candidate)) => previous != candidate,
             (None, None) => {
                 identity_component_replaced(&previous.fallback_email, &candidate.fallback_email)
             }
@@ -1464,6 +1594,21 @@ fn strongest_kiro_principal(account: &Account) -> Option<AccountPrincipal> {
     evidence.upstream_account_id.map(|value| AccountPrincipal {
         kind: "kiro_account_id",
         value,
+    })
+}
+
+fn qoder_identity_evidence(account: &Account) -> Option<QoderIdentityEvidence> {
+    let profile =
+        crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref()).ok()?;
+    let [site, credential_rail, uid, aid, organization_id, machine_id] =
+        profile.stable_identity_components();
+    Some(QoderIdentityEvidence {
+        site: site.to_string(),
+        credential_rail: credential_rail.to_string(),
+        uid: uid.to_string(),
+        aid: aid.to_string(),
+        organization_id: organization_id.to_string(),
+        machine_id: machine_id.to_string(),
     })
 }
 
@@ -2060,6 +2205,9 @@ fn account_secret_field(field: &str) -> bool {
             | "codeverifier"
             | "authorizationcode"
             | "clientassertion"
+            | "machinetoken"
+            | "securityoauthtoken"
+            | "personaltoken"
     ) || [
         "accesstoken",
         "refreshtoken",
@@ -2403,6 +2551,82 @@ mod tests {
     }
 
     #[test]
+    fn quota_refresh_only_clears_the_rate_limit_reset_it_observed() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::QoderCosy);
+        input.id = Some("qoder-quota-cas".to_string());
+        input.profile = Some(json!({
+            "site": "global",
+            "credentialRail": "global_oauth",
+            "refreshMode": "cosy",
+            "uid": "qoder-user",
+            "machineId": "qoder-machine"
+        }));
+        input.raw = Some(json!({"qoderSecrets": {"machineToken": "machine-token"}}));
+        input.access_token = Some("qoder-access".to_string());
+        input.refresh_token = Some("qoder-refresh".to_string());
+        input.rate_limited_until = Some(2_000);
+        store.upsert(input);
+
+        let cleared = store
+            .mark_refresh_success(
+                "qoder-quota-cas",
+                AccountRefreshUpdate {
+                    clear_rate_limited_until_if: Some(2_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(cleared.rate_limited_until.is_none());
+
+        store.mark_rate_limited_until("qoder-quota-cas", 3_000);
+        let preserved = store
+            .mark_refresh_success(
+                "qoder-quota-cas",
+                AccountRefreshUpdate {
+                    clear_rate_limited_until_if: Some(2_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved.rate_limited_until, Some(3_000));
+
+        let replaced = store
+            .mark_refresh_success(
+                "qoder-quota-cas",
+                AccountRefreshUpdate {
+                    clear_rate_limited_until_if: Some(3_000),
+                    rate_limited_until: Some(4_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced.rate_limited_until, Some(4_000));
+    }
+
+    #[test]
+    fn fresh_qoder_exhaustion_blocks_until_the_quota_reset() {
+        let now_ms = 1_000_000_000;
+        let reset_at = now_ms + 30 * 60 * 1000;
+        let account = quota_account(
+            ProviderType::QoderCosy,
+            now_ms,
+            json!({"qoderQuota": {"exhausted": true}}),
+            vec![AccountQuotaTier {
+                name: "qoder_user".to_string(),
+                utilization: Some(1.0),
+                resets_at: Some(reset_at),
+                ..Default::default()
+            }],
+        );
+
+        let block = active_account_usage_block(&account, now_ms).unwrap();
+        assert_eq!(block.kind, AccountUsageBlockKind::QuotaExhausted);
+        assert_eq!(block.scope, "qoder_account");
+        assert_eq!(block.until_ms, reset_at);
+    }
+
+    #[test]
     fn expired_rate_limit_does_not_hide_fresh_explicit_quota_exhaustion() {
         let now_ms = 1_000_000_000;
         let account = quota_account(
@@ -2501,6 +2725,62 @@ mod tests {
     }
 
     #[test]
+    fn kiro_non_inference_resource_exhaustion_does_not_block_generation() {
+        let now_ms = 1_000_000_000;
+        let account = quota_account(
+            ProviderType::KiroOAuth,
+            now_ms,
+            json!({"overageEnabled": false}),
+            vec![
+                AccountQuotaTier {
+                    name: "kiro_code_review".to_string(),
+                    utilization: Some(1.0),
+                    resets_at: Some(now_ms + 60_000),
+                    ..Default::default()
+                },
+                AccountQuotaTier {
+                    name: KIRO_AGENTIC_REQUESTS_QUOTA_TIER.to_string(),
+                    utilization: Some(0.5),
+                    resets_at: Some(now_ms + 20 * 60 * 1000),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        assert!(active_account_usage_block(&account, now_ms).is_none());
+    }
+
+    #[test]
+    fn kiro_block_expiry_uses_only_the_inference_resource_reset() {
+        let now_ms = 1_000_000_000;
+        let inference_reset = now_ms + 20 * 60 * 1000;
+        let account = quota_account(
+            ProviderType::KiroOAuth,
+            now_ms,
+            json!({"overageEnabled": false}),
+            vec![
+                AccountQuotaTier {
+                    name: "kiro_code_review".to_string(),
+                    utilization: Some(1.0),
+                    resets_at: Some(now_ms + 60_000),
+                    ..Default::default()
+                },
+                AccountQuotaTier {
+                    name: KIRO_AGENTIC_REQUESTS_QUOTA_TIER.to_string(),
+                    utilization: Some(1.0),
+                    resets_at: Some(inference_reset),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        assert_eq!(
+            active_account_usage_block(&account, now_ms).map(|block| block.until_ms),
+            Some(inference_reset)
+        );
+    }
+
+    #[test]
     fn upserts_and_finds_account_by_provider_type() {
         let mut store = AccountStore::default();
         let account = store.upsert(UpsertAccountInput {
@@ -2541,6 +2821,62 @@ mod tests {
         assert!(store
             .find_for_provider(ProviderType::CodexOAuth, Some("a1"))
             .is_none());
+    }
+
+    #[test]
+    fn capability_observations_default_preserve_and_drop_at_identity_boundaries() {
+        let legacy: Account = serde_json::from_value(json!({
+            "id": "legacy-gemini",
+            "providerType": "gemini_cli"
+        }))
+        .unwrap();
+        assert!(legacy.capability_observations.is_empty());
+
+        let mut store = AccountStore::default();
+        let mut initial = fixture_input(ProviderType::GeminiCli);
+        initial.id = Some("gemini-evidence-account".to_string());
+        initial.email = Some("before@example.com".to_string());
+        initial.access_token = Some("access-before".to_string());
+        let created = store.upsert(initial);
+        let observed = store
+            .mark_refresh_success(
+                &created.id,
+                AccountRefreshUpdate {
+                    capability_observations: vec![
+                        AccountCapabilityObservationDraft::gemini_project(true, 1_000, None),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let evidence_generation = observed
+            .capability_observations
+            .values()
+            .next()
+            .unwrap()
+            .auth_identity_generation;
+
+        let mut relogin = fixture_input(ProviderType::GeminiCli);
+        relogin.id = Some(created.id.clone());
+        relogin.email = Some("after@example.com".to_string());
+        relogin.access_token = Some("access-after".to_string());
+        let relogged = store.upsert(relogin);
+        assert!(relogged.auth_identity_generation > evidence_generation);
+        assert_eq!(
+            relogged
+                .capability_observations
+                .values()
+                .next()
+                .unwrap()
+                .auth_identity_generation,
+            evidence_generation
+        );
+
+        let mut changed_provider = fixture_input(ProviderType::AntigravityOAuth);
+        changed_provider.id = Some(created.id);
+        changed_provider.access_token = Some("antigravity-access".to_string());
+        let changed_provider = store.upsert(changed_provider);
+        assert!(changed_provider.capability_observations.is_empty());
     }
 
     #[test]
@@ -2735,6 +3071,89 @@ mod tests {
         let reloaded: AccountStore = serde_json::from_value(persisted).unwrap();
         assert_eq!(reloaded.accounts[0].auth_identity_generation, 2);
         assert_eq!(reloaded.accounts[0].token_refresh_generation, 2);
+    }
+
+    #[test]
+    fn qoder_identity_generation_fences_site_principal_organization_and_machine() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::QoderCosy);
+        input.id = Some("qoder-generation-account".to_string());
+        input.access_token = Some("security-token-1".to_string());
+        input.refresh_token = Some("refresh-token-1".to_string());
+        input.profile = Some(json!({
+            "site": "global",
+            "refreshMode": "cosy",
+            "uid": "user-a",
+            "aid": "account-a",
+            "organizationId": "org-a",
+            "machineId": "machine-a",
+            "machineType": "type-a"
+        }));
+        input.raw = Some(json!({
+            "qoderSecrets": {"machineToken": "machine-token-1"}
+        }));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+        assert_eq!(created.token_refresh_generation, 1);
+
+        let token_only = store
+            .mark_refresh_success(
+                "qoder-generation-account",
+                AccountRefreshUpdate {
+                    access_token: Some("security-token-2".to_string()),
+                    refresh_token: Some("refresh-token-2".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(token_only.auth_identity_generation, 1);
+        assert_eq!(token_only.token_refresh_generation, 2);
+
+        for (expected_generation, profile) in [
+            (
+                2,
+                json!({
+                    "site": "global", "refreshMode": "cosy", "uid": "user-b",
+                    "aid": "account-a", "organizationId": "org-a", "machineId": "machine-a"
+                }),
+            ),
+            (
+                3,
+                json!({
+                    "site": "global", "refreshMode": "cosy", "uid": "user-b",
+                    "aid": "account-a", "organizationId": "org-b", "machineId": "machine-a"
+                }),
+            ),
+            (
+                4,
+                json!({
+                    "site": "global", "refreshMode": "cosy", "uid": "user-b",
+                    "aid": "account-a", "organizationId": "org-b", "machineId": "machine-b"
+                }),
+            ),
+        ] {
+            let changed = store
+                .mark_refresh_success(
+                    "qoder-generation-account",
+                    AccountRefreshUpdate {
+                        profile: Some(profile),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(changed.auth_identity_generation, expected_generation);
+        }
+
+        let current = store.accounts[0].clone();
+        let mut cn = current.clone();
+        cn.profile = Some(json!({
+            "site": "cn", "refreshMode": "qodercn20", "uid": "user-b",
+            "aid": "account-a", "organizationId": "org-b", "machineId": "machine-b"
+        }));
+        assert!(account_auth_identity_changed(
+            &account_auth_identity_snapshot(&current),
+            &account_auth_identity_snapshot(&cn)
+        ));
     }
 
     #[test]
@@ -4006,12 +4425,13 @@ mod tests {
                 .into_iter()
                 .collect()
         );
-        assert_eq!(parse_grok_capability_config("all").len(), 4);
+        assert_eq!(parse_grok_capability_config("all").len(), 5);
 
         let mut store = AccountStore::default();
         let mut input = fixture_input(ProviderType::GrokOAuth);
         input.id = Some("grok-capability-account".to_string());
         store.upsert(input);
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         assert!(!grok_account_capability_evidence_present(
             &store.accounts[0],
             GrokAccountCapability::Websocket
@@ -4021,13 +4441,13 @@ mod tests {
             "grok-capability-account",
             GrokAccountCapability::Websocket,
             "upstream_success",
-            1_234,
+            now_ms,
         ));
-        assert!(!store.record_grok_capability_evidence(
+        assert!(store.record_grok_capability_evidence(
             "grok-capability-account",
             GrokAccountCapability::Websocket,
             "upstream_success",
-            9_999,
+            now_ms.saturating_add(1_000),
         ));
         let account = &store.accounts[0];
         assert!(grok_account_capability_evidence_present(
@@ -4036,16 +4456,15 @@ mod tests {
         ));
         assert_eq!(
             account
-                .profile
-                .as_ref()
-                .and_then(|profile| { profile.pointer("/grokCapabilities/websocket/observedAtMs") })
-                .and_then(Value::as_i64),
-            Some(1_234)
+                .capability_observations
+                .get("grok_code_plan:websocket")
+                .map(|observation| observation.observed_at_ms),
+            Some(now_ms.saturating_add(1_000))
         );
     }
 
     #[test]
-    fn grok_relogin_preserves_capability_evidence() {
+    fn grok_relogin_for_the_same_verified_subject_preserves_capability_evidence() {
         let mut store = AccountStore::default();
         let mut initial = fixture_input(ProviderType::GrokOAuth);
         initial.id = Some("grok-relogin-account".to_string());
@@ -4053,16 +4472,19 @@ mod tests {
             "verifiedGrokClaims": {
                 "subject": "grok-subject",
                 "email": "before@example.com"
-            },
-            "grokCapabilities": {
-                "websocket": {
-                    "status": "supported",
-                    "source": "upstream_success",
-                    "observedAtMs": 1_234
-                }
             }
         }));
-        store.upsert(initial);
+        let initial = store.upsert(initial);
+        assert!(store.record_grok_capability_evidence(
+            &initial.id,
+            GrokAccountCapability::Websocket,
+            "upstream_success",
+            crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+        ));
+        assert!(grok_account_capability_evidence_present(
+            &store.accounts[0],
+            GrokAccountCapability::Websocket
+        ));
 
         let mut relogin = fixture_input(ProviderType::GrokOAuth);
         relogin.id = Some("grok-relogin-account".to_string());
@@ -4088,6 +4510,11 @@ mod tests {
             &account,
             GrokAccountCapability::Websocket
         ));
+        assert_eq!(account.capability_observations.len(), 1);
+        assert_eq!(
+            account.capability_observations["grok_code_plan:websocket"].auth_identity_generation,
+            account.auth_identity_generation
+        );
     }
 
     #[test]
@@ -4121,6 +4548,7 @@ mod tests {
                 },
                 "githubToken": "github-token-secret",
                 "copilotToken": {"token": "copilot-token-secret"},
+                "qoderSecrets": {"machineToken": "qoder-machine-token-secret"},
                 "entry": {"key": "grok-key-secret"},
                 "extra_headers": {"x-private": "extra-header-secret"}
             })),
@@ -4145,6 +4573,7 @@ mod tests {
         assert!(!content.contains("nested-snake-id-secret"));
         assert!(!content.contains("github-token-secret"));
         assert!(!content.contains("copilot-token-secret"));
+        assert!(!content.contains("qoder-machine-token-secret"));
         assert!(!content.contains("grok-key-secret"));
         assert!(!content.contains("extra-header-secret"));
         assert!(content.contains(ENCRYPTED_V2_PREFIX));
@@ -4190,6 +4619,14 @@ mod tests {
                 .and_then(|value| value.pointer("/copilotToken/token"))
                 .and_then(Value::as_str),
             Some("copilot-token-secret")
+        );
+        assert_eq!(
+            account
+                .raw
+                .as_ref()
+                .and_then(|value| value.pointer("/qoderSecrets/machineToken"))
+                .and_then(Value::as_str),
+            Some("qoder-machine-token-secret")
         );
         assert_eq!(
             account

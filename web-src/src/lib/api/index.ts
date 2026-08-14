@@ -74,6 +74,9 @@ export type {
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
   ImportGrokAuthJsonResponse,
+  ImportQoderPatResponse,
+  QoderCredentialRail,
+  QoderSite,
   DeepSeekAccount,
   DeepSeekAccountStatus,
 } from "./auth";

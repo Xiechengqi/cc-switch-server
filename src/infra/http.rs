@@ -129,8 +129,14 @@ pub fn direct_client_builder() -> reqwest::ClientBuilder {
 /// Builds the shared server outbound client. Proxy environment inherited by
 /// reqwest is disabled; only the explicitly validated server setting applies.
 pub fn outbound_client_builder() -> anyhow::Result<reqwest::ClientBuilder> {
+    outbound_client_builder_for_proxy(outbound_proxy_config()?)
+}
+
+fn outbound_client_builder_for_proxy(
+    proxy: Option<OutboundProxyConfig>,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     let mut builder = direct_client_builder();
-    if let Some(proxy) = outbound_proxy_config()? {
+    if let Some(proxy) = proxy {
         let mut reqwest_proxy = reqwest::Proxy::all(proxy.endpoint.as_str())
             .context("configure explicit outbound HTTP proxy")?;
         if let Some(username) = proxy.username.as_deref() {
@@ -140,6 +146,13 @@ pub fn outbound_client_builder() -> anyhow::Result<reqwest::ClientBuilder> {
         builder = builder.proxy(reqwest_proxy);
     }
     Ok(builder)
+}
+
+#[cfg(test)]
+pub(crate) fn test_outbound_client_builder_with_proxy(
+    value: &str,
+) -> anyhow::Result<reqwest::ClientBuilder> {
+    outbound_client_builder_for_proxy(Some(parse_outbound_proxy_config(value)?))
 }
 
 pub(crate) fn outbound_proxy_config() -> anyhow::Result<Option<OutboundProxyConfig>> {

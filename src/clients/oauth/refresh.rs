@@ -179,7 +179,10 @@ impl AccountRefreshFailure {
 }
 
 pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
-    if provider_type == ProviderType::KiroOAuth {
+    if matches!(
+        provider_type,
+        ProviderType::KiroOAuth | ProviderType::QoderCosy
+    ) {
         return true;
     }
     oauth_provider_spec(provider_type)
@@ -391,6 +394,15 @@ where
         .await?;
         return validate_native_account_refresh_receipt(http, account, receipt).await;
     }
+    if account.provider_type == ProviderType::QoderCosy {
+        return crate::clients::oauth::qoder::refresh_qoder_account(
+            http,
+            account,
+            now_ms,
+            receipt_hook,
+        )
+        .await;
+    }
 
     let spec = oauth_provider_spec(account.provider_type).ok_or_else(|| {
         AccountRefreshFailure::bad_request(format!(
@@ -590,6 +602,53 @@ pub async fn validate_native_account_refresh_receipt(
             Some(&refreshed_user_id),
             &device,
         );
+    } else if account.provider_type == ProviderType::KiroOAuth {
+        let previous = crate::domain::providers::kiro::runtime_identity_from_account(account)
+            .map_err(|error| AccountRefreshFailure::parse(error.to_string()))?;
+        let candidate = crate::domain::providers::kiro::runtime_identity_from_values(
+            update.profile.as_ref(),
+            update.raw.as_ref(),
+        )
+        .map_err(|error| AccountRefreshFailure::parse(error.to_string()))?;
+        let previous_profile_is_authoritative =
+            previous.profile_arn.as_deref().is_some_and(|arn| {
+                !crate::domain::providers::kiro::is_legacy_enterprise_fallback_profile(arn)
+            }) && account
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileProvenance"))
+                .or_else(|| {
+                    account
+                        .raw
+                        .as_ref()
+                        .and_then(|value| value.pointer("/profileProvenance"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| !value.eq_ignore_ascii_case("auth_method_default"));
+        if previous_profile_is_authoritative
+            && previous
+                .profile_arn
+                .as_deref()
+                .zip(candidate.profile_arn.as_deref())
+                .is_some_and(|(previous, candidate)| previous != candidate)
+        {
+            return Err(AccountRefreshFailure {
+                status_code: 409,
+                upstream_status: None,
+                message: "Kiro OAuth refresh returned a different profile identity; re-login as a new account"
+                    .to_string(),
+                kind: OAuthErrorKind::InvalidGrant,
+                retryable: false,
+                retry_after_ms: None,
+                immediate_relogin: true,
+                outcome_unknown: true,
+                endpoint_fallback_safe: false,
+            });
+        }
+    } else if account.provider_type == ProviderType::QoderCosy {
+        update =
+            crate::clients::oauth::qoder::complete_qoder_refresh_receipt(http, account, update)
+                .await?;
     }
     if let Some(raw) = update.raw.take() {
         update.raw = Some(merge_account_refresh_raw(account.raw.as_ref(), raw));
@@ -1242,6 +1301,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capability_observations: Default::default(),
         }
     }
 
@@ -2276,6 +2336,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kiro_legacy_idc_refresh_preserves_rotated_token_and_clears_fake_profile() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            "/token",
+            post(|| async {
+                Json(serde_json::json!({
+                    "accessToken": "kiro-idc-rotated-access",
+                    "refreshToken": "kiro-idc-rotated-refresh",
+                    "expiresIn": 3600
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::KiroOAuth,
+            Some("expired-kiro-access"),
+            Some("kiro-idc-old-refresh"),
+            Some(1),
+        );
+        account.id = "kiro-legacy-idc-profile-migration".to_string();
+        account.profile = Some(serde_json::json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "runtimeRegion": "eu-central-1",
+            "apiRegion": "eu-central-1",
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN",
+            "profileProvenance": "auth_method_default"
+        }));
+        account.raw = Some(serde_json::json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "resolvedProfileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN",
+            "profileProvenance": "auth_method_default",
+            "testOAuthTokenUrl": format!("http://{address}/token")
+        }));
+        let locks = AccountRefreshLocks::default();
+        let mut guard = locks.lock(account.provider_type, &account.id).await;
+        let receipts = Arc::new(StdMutex::new(Vec::<AccountRefreshUpdate>::new()));
+        let receipts_for_hook = Arc::clone(&receipts);
+
+        let update = execute_native_account_refresh_with_receipt_hook(
+            &reqwest::Client::new(),
+            &account,
+            8_500_000,
+            60_000,
+            &mut guard,
+            move |update| {
+                receipts_for_hook.lock().unwrap().push(update.clone());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receipts.lock().unwrap().len(), 1);
+        assert_eq!(
+            update.access_token.as_deref(),
+            Some("kiro-idc-rotated-access")
+        );
+        assert_eq!(
+            update.refresh_token.as_deref(),
+            Some("kiro-idc-rotated-refresh")
+        );
+        assert_eq!(
+            update
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileArn")),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            update
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileProvenance"))
+                .and_then(serde_json::Value::as_str),
+            Some("profile_resolution_required")
+        );
+        let candidate = crate::domain::providers::kiro::operational_runtime_identity_from_values(
+            update.profile.as_ref(),
+            update.raw.as_ref(),
+        );
+        assert!(candidate.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_legacy_idc_refresh_records_token_before_real_profile_enrichment() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let discovery_authorization = Arc::new(StdMutex::new(Vec::new()));
+        let discovery_authorization_for_route = Arc::clone(&discovery_authorization);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "accessToken": "kiro-idc-discovery-access",
+                        "refreshToken": "kiro-idc-discovery-refresh",
+                        "expiresIn": 3600
+                    }))
+                }),
+            )
+            .route(
+                "/profile",
+                get(move |headers: axum::http::HeaderMap| {
+                    let observed = Arc::clone(&discovery_authorization_for_route);
+                    async move {
+                        observed.lock().unwrap().push(
+                            headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        Json(serde_json::json!({
+                            "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/organization-profile"
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::KiroOAuth,
+            Some("expired-kiro-access"),
+            Some("kiro-idc-discovery-old-refresh"),
+            Some(1),
+        );
+        account.id = "kiro-legacy-idc-profile-discovery".to_string();
+        account.profile = Some(serde_json::json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "runtimeRegion": "us-east-1",
+            "apiRegion": "us-east-1",
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN",
+            "profileProvenance": "auth_method_default"
+        }));
+        account.raw = Some(serde_json::json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "apiRegion": "us-east-1",
+            "testOAuthTokenUrl": format!("http://{address}/token"),
+            "testKiroProfileDiscoveryUrl": format!("http://{address}/profile")
+        }));
+        let locks = AccountRefreshLocks::default();
+        let mut guard = locks.lock(account.provider_type, &account.id).await;
+        let receipts = Arc::new(StdMutex::new(Vec::<AccountRefreshUpdate>::new()));
+        let receipts_for_hook = Arc::clone(&receipts);
+
+        let update = execute_native_account_refresh_with_receipt_hook(
+            &reqwest::Client::new(),
+            &account,
+            8_600_000,
+            60_000,
+            &mut guard,
+            move |update| {
+                receipts_for_hook.lock().unwrap().push(update.clone());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let receipts = receipts.lock().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts[0]
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileArn")),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            receipts[1]
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileArn"))
+                .and_then(serde_json::Value::as_str),
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/organization-profile")
+        );
+        assert!(receipts.iter().all(|receipt| {
+            receipt.access_token.as_deref() == Some("kiro-idc-discovery-access")
+                && receipt.refresh_token.as_deref() == Some("kiro-idc-discovery-refresh")
+        }));
+        drop(receipts);
+        assert_eq!(
+            discovery_authorization.lock().unwrap().as_slice(),
+            ["Bearer kiro-idc-discovery-access"]
+        );
+        assert_eq!(
+            update
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/runtimeRegion"))
+                .and_then(serde_json::Value::as_str),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            update
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileProvenance"))
+                .and_then(serde_json::Value::as_str),
+            Some("refresh_list_available_profiles")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn kiro_normal_refresh_uses_pending_receipt_identity_validator() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2327,6 +2607,88 @@ mod tests {
 
         assert_eq!(error.status_code, 409);
         assert!(error.message.contains("different subscription identity"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_profile_drift_is_rejected_after_rotated_receipt_is_recorded() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "accessToken": "kiro-drift-access",
+                        "refreshToken": "kiro-drift-refresh",
+                        "expiresIn": 3600,
+                        "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/replacement"
+                    }))
+                }),
+            )
+            .route("/usage", get(|| async { Json(serde_json::json!({})) }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let mut account = account(
+            ProviderType::KiroOAuth,
+            Some("expired-kiro-access"),
+            Some("kiro-old-refresh"),
+            Some(1),
+        );
+        account.id = "kiro-profile-drift".to_string();
+        account.profile = Some(serde_json::json!({
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/current",
+            "authRegion": "eu-north-1",
+            "runtimeRegion": "us-east-1",
+            "authMethod": "idc"
+        }));
+        account.raw = Some(serde_json::json!({
+            "authMethod": "idc",
+            "authRegion": "eu-north-1",
+            "clientId": "client",
+            "clientSecret": "secret",
+            "machineId": "kiro-drift-machine",
+            "testOAuthTokenUrl": format!("http://{address}/token"),
+            "testKiroUsageUrl": format!("http://{address}/usage")
+        }));
+        let locks = AccountRefreshLocks::default();
+        let mut guard = locks.lock(account.provider_type, &account.id).await;
+        let receipts = Arc::new(StdMutex::new(Vec::<AccountRefreshUpdate>::new()));
+        let receipts_for_hook = Arc::clone(&receipts);
+
+        let error = execute_native_account_refresh_with_receipt_hook(
+            &reqwest::Client::new(),
+            &account,
+            10_000_000,
+            60_000,
+            &mut guard,
+            move |update| {
+                receipts_for_hook.lock().unwrap().push(update.clone());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let receipt = receipts.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(receipt.access_token.as_deref(), Some("kiro-drift-access"));
+        assert_eq!(receipt.refresh_token.as_deref(), Some("kiro-drift-refresh"));
+        assert_eq!(
+            receipt
+                .profile
+                .as_ref()
+                .and_then(|value| value.pointer("/profileArn"))
+                .and_then(serde_json::Value::as_str),
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/replacement")
+        );
+        assert_eq!(error.status_code, 409);
+        assert!(error.message.contains("different profile identity"));
+        assert!(error.immediate_relogin);
+        assert!(error.outcome_unknown);
         server.abort();
     }
 

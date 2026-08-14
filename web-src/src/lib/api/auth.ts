@@ -10,7 +10,11 @@ export type ManagedAuthProvider =
   | "agy_oauth"
   | "cursor_oauth"
   | "kiro_oauth"
-  | "kimi_code";
+  | "kimi_code"
+  | "qoder_cosy";
+
+export type QoderSite = "global" | "cn";
+export type QoderCredentialRail = "global_oauth" | "cn_oauth" | "pat_job_token";
 
 export interface DeepSeekAccount {
   id: string;
@@ -39,6 +43,10 @@ export interface ManagedAuthAccount {
   github_domain: string;
   workspaces?: Array<{ id: string; name: string }>;
   selected_workspace_id?: string | null;
+  qoder?: {
+    site: QoderSite;
+    credentialRail: QoderCredentialRail;
+  } | null;
   subscriptionExpiry: ManagedAuthSubscriptionExpiry;
 }
 
@@ -101,6 +109,9 @@ export interface ManagedAuthDeviceCodeResponse {
   verification_uri: string;
   expires_in: number;
   interval: number;
+  state?: string | null;
+  verification_uri_complete?: string | null;
+  site?: QoderSite | null;
 }
 
 export interface ImportGrokAuthJsonResponse {
@@ -120,6 +131,11 @@ export interface ImportKiroCredentialsResponse {
   ok: boolean;
   account: ManagedAuthAccount;
   source?: string | null;
+}
+
+export interface ImportQoderPatResponse {
+  ok: boolean;
+  account: ManagedAuthAccount;
 }
 
 /**
@@ -281,6 +297,7 @@ export async function authStartLogin(
    */
   oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device",
   kiroLoginProvider?: "google" | "github" | null,
+  qoderSite?: QoderSite | null,
 ): Promise<ManagedAuthDeviceCodeResponse> {
   if (shouldBlockLocalCallbackAuthInClientWeb(authProvider)) {
     throw new Error(localCallbackAuthBlockedMessage());
@@ -290,6 +307,7 @@ export async function authStartLogin(
     githubDomain: githubDomain || null,
     oauthFlowMode: oauthFlowMode || null,
     kiroLoginProvider: kiroLoginProvider || null,
+    qoderSite: qoderSite || null,
   });
 }
 
@@ -325,11 +343,13 @@ export async function authPollForAccount(
   authProvider: ManagedAuthProvider,
   deviceCode: string,
   githubDomain?: string,
+  flowState?: string | null,
 ): Promise<ManagedAuthAccount | null> {
   return invokeCommand<ManagedAuthAccount | null>("auth_poll_for_account", {
     authProvider,
     deviceCode,
     githubDomain: githubDomain || null,
+    flowState: flowState || null,
   });
 }
 
@@ -469,6 +489,14 @@ export async function importKiroApiKey(
   return invokeCommand<ImportKiroCredentialsResponse>("kiro_import_api_key", {
     apiKey,
     region: region || null,
+  });
+}
+
+export async function importQoderPat(
+  personalToken: string,
+): Promise<ImportQoderPatResponse> {
+  return invokeCommand<ImportQoderPatResponse>("qoder_import_pat", {
+    personalToken,
   });
 }
 

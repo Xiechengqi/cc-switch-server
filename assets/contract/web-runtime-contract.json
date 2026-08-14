@@ -354,7 +354,7 @@
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Routes copilot/kiro device poll and browser oauth callback polling into ManagedAuthAccount."
+      "notes": "Routes Copilot/Kiro/Kimi/Qoder device poll and browser OAuth callback polling into ManagedAuthAccount; Qoder requires the matching flow state."
     },
     {
       "name": "auth_remove_account",
@@ -400,7 +400,7 @@
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Returns ManagedAuthDeviceCodeResponse for copilot/kiro device flow and browser oauth providers."
+      "notes": "Returns ManagedAuthDeviceCodeResponse for Copilot/Kiro/Kimi/Qoder device flow and browser OAuth providers; Qoder preserves Global/CN site and flow state."
     },
     {
       "name": "auth_submit_oauth_code",
@@ -441,6 +441,14 @@
       "feature": "accounts",
       "endpoint": "POST /api/accounts/kiro/api-key/import",
       "notes": "Validates a ksk_ API key with ListAvailableProfiles before importing it."
+    },
+    {
+      "name": "qoder_import_pat",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/qoder/pat/import",
+      "notes": "Exchanges and imports one Global Qoder pt-* personal token into the encrypted managed account store."
     },
     {
       "name": "cursor_import_local_auth",
@@ -1056,10 +1064,11 @@
     },
     {
       "name": "get_coding_plan_quota",
-      "support": "excluded",
-      "implemented": false,
+      "support": "native",
+      "implemented": true,
       "feature": "providers",
-      "notes": "Custom usage script removed from server; coding plan quota via account refresh."
+      "endpoint": "POST /web-api/invoke/get_coding_plan_quota",
+      "notes": "Reads the exact Provider revision, credential generation, and runtime-fingerprint coding-plan quota snapshot."
     },
     {
       "name": "get_common_config_snippet",
@@ -1559,6 +1568,14 @@
       "feature": "accounts",
       "endpoint": "GET /api/accounts/:id/quota?refresh=true",
       "notes": "Server-native Web compatibility command. Explicit refresh defaults to force=true so provider-card actions bypass the background quota cooldown."
+    },
+    {
+      "name": "refresh_coding_plan_quota",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /web-api/invoke/refresh_coding_plan_quota",
+      "notes": "Forces one quota refresh for the exact Provider credential without selecting another Provider or Account."
     },
     {
       "name": "remove_custom_endpoint",

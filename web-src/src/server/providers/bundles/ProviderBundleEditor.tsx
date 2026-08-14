@@ -183,6 +183,12 @@ function Section({
 }
 
 function fieldLabel(logical: string): string {
+  if (logical.endsWith("/VOLC_ACCESS_KEY_ID")) {
+    return "Volcengine Access Key ID";
+  }
+  if (logical.endsWith("/VOLC_SECRET_ACCESS_KEY")) {
+    return "Volcengine Secret Access Key";
+  }
   switch (logical) {
     case "access_key_id":
       return "AWS Access Key ID";
@@ -728,6 +734,10 @@ function BundleShareEditor({
       routerManagedEmails,
     ],
   );
+  const protectedGrantEmails = useMemo(
+    () => new Set([...selectedMarketEmails, ...routerManagedEmails]),
+    [routerManagedEmails, selectedMarketEmails],
+  );
   const directEmails = useMemo(
     () =>
       draft.sharedWithEmails.filter(
@@ -987,7 +997,7 @@ function BundleShareEditor({
             value={displayedUserGrants}
             ownerEmail={normalizedOwnerEmail}
             defaultPolicy={defaultUserPolicy}
-            protectedEmails={routerManagedEmails}
+            protectedEmails={protectedGrantEmails}
             onChange={updateUserGrants}
           />
           <div className="space-y-2">

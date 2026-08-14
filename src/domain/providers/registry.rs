@@ -4,9 +4,10 @@ use std::sync::OnceLock;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
+use super::coding_plan::CodingPlanProfileSpec;
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 6;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 7;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -177,6 +178,8 @@ pub struct ProfileSpec {
     pub visibility: ProfileVisibility,
     pub creation_policy: CreationPolicy,
     pub maturity: ProfileMaturity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_plan: Option<CodingPlanProfileSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +311,7 @@ pub enum ManagedIdentityFamily {
     GeminiCli,
     GrokCli,
     KimiCli,
+    Qoder,
     Kiro,
     Cursor,
     Copilot,
@@ -763,6 +767,16 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             &driver_ids,
             &custom_policy_ids,
         )?;
+        if let Some(contract) = profile.coding_plan.as_ref() {
+            super::coding_plan::validate_profile_contract(profile.app, contract).with_context(
+                || {
+                    format!(
+                        "profile {} has an invalid coding-plan contract",
+                        profile.profile_id
+                    )
+                },
+            )?;
+        }
     }
 
     for recipe in &registry.custom_recipes {
@@ -918,9 +932,12 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
                     surface.profile_id
                 );
             }
-            if profile.credential_policy != credential_profile.credential_policy {
+            if !credential_policies_share_source(
+                &profile.credential_policy,
+                &credential_profile.credential_policy,
+            ) {
                 bail!(
-                    "Provider family {} surfaces do not share one credential policy",
+                    "Provider family {} surfaces do not share one credential source",
                     family.family_id
                 );
             }
@@ -947,9 +964,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     }
 
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 19usize),
-        (AppKind::Codex, 11usize),
-        (AppKind::Gemini, 7usize),
+        (AppKind::Claude, 28usize),
+        (AppKind::Codex, 21usize),
+        (AppKind::Gemini, 10usize),
     ]);
     for (app, expected) in expected_counts {
         let actual = registry
@@ -970,9 +987,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 43 {
+    if registry.profiles.len() != 65 {
         bail!(
-            "Provider registry contains {} profiles, expected 43",
+            "Provider registry contains {} profiles, expected 65",
             registry.profiles.len()
         );
     }
@@ -1024,16 +1041,7 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         }
     }
 
-    let reviewed_first_class_additions = BTreeSet::from([
-        "claude.anthropic_api_key",
-        "claude.google_oauth",
-        "claude.kimi_code",
-        "codex.kiro_oauth",
-        "codex.kimi_code",
-        "codex.openai_api_key",
-        "gemini.google_api_key",
-        "gemini.kimi_code",
-    ]);
+    let reviewed_first_class_additions = BTreeSet::from(REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS);
     let expected_mapped_profile_ids = registry
         .profiles
         .iter()
@@ -1249,6 +1257,49 @@ fn validate_profile_contract(
                 }
                 _ => {}
             }
+            if let Some(contract) = profile.coding_plan.as_ref() {
+                if profile.form_composition != FormComposition::StaticSecret
+                    || profile.endpoint_policy != EndpointPolicy::Fixed
+                    || profile.model_policy != ModelPolicyKind::Passthrough
+                    || driver.upstream_protocol != contract.inference.protocol
+                {
+                    bail!(
+                        "coding-plan profile {} disagrees with its fixed Driver/profile policy",
+                        profile.profile_id
+                    );
+                }
+                let CredentialPolicy::StaticSecret { slots, auth_scheme } =
+                    &profile.credential_policy
+                else {
+                    unreachable!("coding-plan form policy was checked");
+                };
+                if *auth_scheme != contract.inference.auth_scheme
+                    || !slots
+                        .iter()
+                        .any(|slot| slot == &contract.inference.credential_slot)
+                {
+                    bail!(
+                        "coding-plan profile {} does not declare its inference credential",
+                        profile.profile_id
+                    );
+                }
+                let expected_slots = std::iter::once(&contract.inference.credential_slot)
+                    .chain(
+                        contract
+                            .quota
+                            .credential_slots
+                            .iter()
+                            .map(|credential| &credential.slot),
+                    )
+                    .collect::<BTreeSet<_>>();
+                let declared_slots = slots.iter().collect::<BTreeSet<_>>();
+                if expected_slots != declared_slots {
+                    bail!(
+                        "coding-plan profile {} credential slots disagree with its inference/quota contract",
+                        profile.profile_id
+                    );
+                }
+            }
         }
         DriverBinding::Custom { custom_policy_id } => {
             if !custom_policy_ids.contains(custom_policy_id.as_str()) {
@@ -1278,6 +1329,16 @@ fn validate_profile_contract(
         bail!("legacy profile {} allows creation", profile.profile_id);
     }
     Ok(())
+}
+
+fn credential_policies_share_source(left: &CredentialPolicy, right: &CredentialPolicy) -> bool {
+    match (left, right) {
+        (
+            CredentialPolicy::StaticSecret { slots: left, .. },
+            CredentialPolicy::StaticSecret { slots: right, .. },
+        ) => left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>(),
+        _ => left == right,
+    }
 }
 
 fn validate_conformance_state(
@@ -1331,6 +1392,39 @@ fn validate_operation_contract(driver: &DriverSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
+const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 30] = [
+    "claude.anthropic_api_key",
+    "claude.google_oauth",
+    "claude.kimi_code",
+    "claude.qoder_cosy",
+    "codex.github_copilot",
+    "codex.kiro_oauth",
+    "codex.kimi_code",
+    "codex.qoder_cosy",
+    "codex.openai_api_key",
+    "gemini.google_api_key",
+    "gemini.kimi_code",
+    "gemini.qoder_cosy",
+    "gemini.cursor_api_key",
+    "gemini.cursor_oauth",
+    "claude.kimi_coding_api_key",
+    "codex.kimi_coding_api_key",
+    "claude.zhipu_glm_cn",
+    "codex.zhipu_glm_cn",
+    "claude.zhipu_glm_global",
+    "codex.zhipu_glm_global",
+    "claude.minimax_cn",
+    "codex.minimax_cn",
+    "claude.minimax_global",
+    "codex.minimax_global",
+    "claude.volcengine_coding_plan",
+    "codex.volcengine_coding_plan",
+    "claude.xiaomi_mimo_token_plan",
+    "codex.xiaomi_mimo_token_plan",
+    "claude.xiaomi_mimo_token_plan_sgp",
+    "codex.xiaomi_mimo_token_plan_sgp",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,7 +1434,8 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.profiles.len(), 43);
+        assert_eq!(registry.families.len(), 31);
+        assert_eq!(registry.profiles.len(), 65);
         assert_eq!(registry.legacy_preset_mappings.len(), 29);
         assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(
@@ -1386,13 +1481,16 @@ mod tests {
             (ProviderType::OpenRouter, AppKind::Codex),
             (ProviderType::OpenRouter, AppKind::Gemini),
             (ProviderType::GitHubCopilot, AppKind::Claude),
+            (ProviderType::GitHubCopilot, AppKind::Codex),
             (ProviderType::DeepSeekAccount, AppKind::Claude),
             (ProviderType::KiroOAuth, AppKind::Claude),
             (ProviderType::KiroOAuth, AppKind::Codex),
             (ProviderType::CursorOAuth, AppKind::Claude),
             (ProviderType::CursorOAuth, AppKind::Codex),
+            (ProviderType::CursorOAuth, AppKind::Gemini),
             (ProviderType::CursorApiKey, AppKind::Claude),
             (ProviderType::CursorApiKey, AppKind::Codex),
+            (ProviderType::CursorApiKey, AppKind::Gemini),
             (ProviderType::AntigravityOAuth, AppKind::Claude),
             (ProviderType::AntigravityOAuth, AppKind::Gemini),
             (ProviderType::AgyOAuth, AppKind::Claude),
@@ -1410,9 +1508,12 @@ mod tests {
             (ProviderType::KimiCode, AppKind::Claude),
             (ProviderType::KimiCode, AppKind::Codex),
             (ProviderType::KimiCode, AppKind::Gemini),
+            (ProviderType::QoderCosy, AppKind::Claude),
+            (ProviderType::QoderCosy, AppKind::Codex),
+            (ProviderType::QoderCosy, AppKind::Gemini),
         ];
 
-        assert_eq!(required.len(), 37);
+        assert_eq!(required.len(), 43);
 
         for (provider_type, app) in required {
             let profiles = provider_registry()

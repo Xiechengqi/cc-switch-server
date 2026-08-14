@@ -112,17 +112,29 @@ function matchingBrace(source, openingBrace) {
   let quote = null;
   let escaped = false;
   let lineComment = false;
-  let blockComment = false;
+  let blockCommentDepth = 0;
+  let rawStringTerminator = null;
   for (let index = openingBrace; index < source.length; index += 1) {
     const char = source[index];
     const next = source[index + 1];
+    if (rawStringTerminator) {
+      if (source.startsWith(rawStringTerminator, index)) {
+        index += rawStringTerminator.length - 1;
+        rawStringTerminator = null;
+      }
+      continue;
+    }
     if (lineComment) {
       if (char === "\n") lineComment = false;
       continue;
     }
-    if (blockComment) {
+    if (blockCommentDepth > 0) {
+      if (char === "/" && next === "*") {
+        blockCommentDepth += 1;
+        index += 1;
+      }
       if (char === "*" && next === "/") {
-        blockComment = false;
+        blockCommentDepth -= 1;
         index += 1;
       }
       continue;
@@ -143,8 +155,16 @@ function matchingBrace(source, openingBrace) {
       continue;
     }
     if (char === "/" && next === "*") {
-      blockComment = true;
+      blockCommentDepth = 1;
       index += 1;
+      continue;
+    }
+    const rawString = source
+      .slice(index)
+      .match(/^(?:b|c)?r(#{0,255})"/);
+    if (rawString) {
+      rawStringTerminator = `"${rawString[1]}`;
+      index += rawString[0].length - 1;
       continue;
     }
     if (char === '"') {
@@ -169,13 +189,13 @@ function matchingBrace(source, openingBrace) {
 
 export function stripCfgTestModules(source) {
   let result = source;
-  const marker = "#[cfg(test)]";
+  const modulePattern = /#\[cfg\(test\)\]\s*(?:#\[[^\]]+\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{/g;
   while (true) {
-    const start = result.indexOf(marker);
-    if (start < 0) return result;
-    const openingBrace = result.indexOf("{", start + marker.length);
-    if (openingBrace < 0)
-      throw new Error("#[cfg(test)] block has no opening brace");
+    modulePattern.lastIndex = 0;
+    const match = modulePattern.exec(result);
+    if (!match) return result;
+    const start = match.index;
+    const openingBrace = start + match[0].lastIndexOf("{");
     const end = matchingBrace(result, openingBrace);
     result = `${result.slice(0, start)}\n${result.slice(end + 1)}`;
   }

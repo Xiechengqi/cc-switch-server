@@ -14,7 +14,10 @@ const ANTIGRAVITY_CLIENT_METADATA_PLATFORM: i32 = 2;
 const ANTIGRAVITY_UPDATER_USER_AGENT: &str = "electron-builder";
 const ANTIGRAVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const ANTIGRAVITY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
+pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.54.0";
+pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.126.0";
+pub const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.54.0";
+pub const COPILOT_API_VERSION: &str = "2026-06-01";
 pub const GEMINI_CLI_X_GOOG_API_CLIENT: &str = "google-genai-sdk/1.41.0 gl-node/v22.19.0";
 
 static ANTIGRAVITY_VERSION: OnceLock<RwLock<String>> = OnceLock::new();
@@ -192,6 +195,18 @@ mod tests {
         assert_eq!(
             gemini_cli_code_assist_metadata(),
             json!({"ideType": "GEMINI_CLI", "pluginType": "GEMINI"})
+        );
+    }
+
+    #[test]
+    fn copilot_identity_is_one_consistent_editor_plugin_release() {
+        assert_eq!(COPILOT_USER_AGENT, "GitHubCopilotChat/0.54.0");
+        assert_eq!(COPILOT_EDITOR_VERSION, "vscode/1.126.0");
+        assert_eq!(COPILOT_PLUGIN_VERSION, "copilot-chat/0.54.0");
+        assert_eq!(COPILOT_API_VERSION, "2026-06-01");
+        assert_eq!(
+            COPILOT_USER_AGENT.strip_prefix("GitHubCopilotChat/"),
+            COPILOT_PLUGIN_VERSION.strip_prefix("copilot-chat/")
         );
     }
 }

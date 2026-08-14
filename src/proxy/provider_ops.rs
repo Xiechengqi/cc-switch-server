@@ -12,8 +12,9 @@ use crate::domain::accounts::managers::{
     CredentialKind,
 };
 use crate::domain::accounts::store::{effective_codex_workspace_id, Account, AccountStore};
+use crate::domain::providers::coding_plan::CodingPlanRoute;
 use crate::domain::providers::credentials::reveal_provider_credential;
-use crate::domain::providers::model::{CodexImageToolStripPolicy, ProviderType};
+use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::registry::{
     provider_registry, AuthScheme, OperationSupport, UpstreamProtocol,
 };
@@ -171,8 +172,12 @@ impl ProviderExecution {
             UpstreamProtocol::OpenAiResponses => Some("openai_responses"),
             UpstreamProtocol::GeminiNative => Some("gemini_native"),
             UpstreamProtocol::Special => match self.plan.driver_id.as_str() {
-                "special.cursor" | "special.copilot" => Some("openai_chat"),
+                "special.cursor" | "special.copilot" | "special.qoder_cosy" => Some("openai_chat"),
                 "special.antigravity" | "special.agy" => Some("gemini_native"),
+                "oauth.kimi_code" => Some(match self.plan.provider_key.app {
+                    AppKind::Claude => "anthropic",
+                    AppKind::Codex | AppKind::Gemini => "openai_chat",
+                }),
                 _ => None,
             },
             UpstreamProtocol::Bedrock | UpstreamProtocol::Custom | UpstreamProtocol::Legacy => None,
@@ -648,6 +653,32 @@ impl ProviderExecution {
         )
     }
 
+    pub fn guard_coding_plan_request(
+        &self,
+        route: ProxyRoute,
+        request: &AdapterRequest,
+        endpoint: &str,
+    ) -> Result<(), ProxyError> {
+        let Some(contract) = self.plan.coding_plan.as_ref() else {
+            return Ok(());
+        };
+        let contract_route = coding_plan_route(route)?;
+        let model = request
+            .actual_model
+            .clone()
+            .or_else(|| request.model.clone())
+            .or_else(|| request_model(&request.body))
+            .ok_or_else(|| ProxyError::bad_request("coding-plan request has no model"))?;
+        if !contract.allows_model(&model) {
+            return Err(ProxyError::bad_request(format!(
+                "model {model} is not in the coding-plan Registry catalog"
+            )));
+        }
+        contract
+            .guard_final_endpoint(contract_route, endpoint)
+            .map_err(|error| ProxyError::bad_request(error.to_string()))
+    }
+
     pub fn apply_openai_codex_final_request_contract(
         &self,
         route: ProxyRoute,
@@ -722,6 +753,11 @@ impl ProviderExecution {
         gemini_path: Option<String>,
         request: &AdapterRequest,
     ) -> Result<String, ProxyError> {
+        if let Some(contract) = self.plan.coding_plan.as_ref() {
+            return contract
+                .endpoint_for_route(coding_plan_route(route)?)
+                .map_err(|error| ProxyError::bad_request(error.to_string()));
+        }
         if self.plan.endpoint.trim().is_empty() {
             return Err(ProxyError::bad_request(
                 "Provider endpoint is not configured",
@@ -828,6 +864,22 @@ impl ProviderExecution {
             .transport_policy
             .stream_idle_timeout_ms
             .map(std::time::Duration::from_millis)
+    }
+}
+
+fn coding_plan_route(route: ProxyRoute) -> Result<CodingPlanRoute, ProxyError> {
+    match route {
+        ProxyRoute::ClaudeMessages => Ok(CodingPlanRoute::ClaudeMessages),
+        ProxyRoute::ClaudeCountTokens => Ok(CodingPlanRoute::ClaudeCountTokens),
+        ProxyRoute::CodexChatCompletions => Ok(CodingPlanRoute::CodexChatCompletions),
+        ProxyRoute::CodexResponses => Ok(CodingPlanRoute::CodexResponses),
+        ProxyRoute::CodexResponsesCompact => Err(ProxyError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: "coding-plan contract does not support Responses compact".to_string(),
+        }),
+        ProxyRoute::Gemini => Err(ProxyError::bad_request(
+            "coding-plan contract does not support the Gemini route",
+        )),
     }
 }
 
@@ -959,7 +1011,11 @@ fn managed_auth(
 fn managed_auth_is_protocol_owned(execution: &ProviderExecution) -> bool {
     matches!(
         execution.plan.driver_id.as_str(),
-        "special.cursor" | "special.kiro" | "special.deepseek_account" | "special.copilot"
+        "special.cursor"
+            | "special.kiro"
+            | "special.qoder_cosy"
+            | "special.deepseek_account"
+            | "special.copilot"
     )
 }
 
@@ -1100,7 +1156,11 @@ fn runtime_model_is_body_field(execution: &ProviderExecution) -> bool {
         UpstreamProtocol::GeminiNative => false,
         UpstreamProtocol::Special => matches!(
             execution.plan.driver_id.as_str(),
-            "special.cursor" | "special.copilot" | "special.kiro" | "special.deepseek_account"
+            "special.cursor"
+                | "special.copilot"
+                | "special.kiro"
+                | "special.deepseek_account"
+                | "oauth.kimi_code"
         ),
     }
 }
@@ -1276,6 +1336,7 @@ mod tests {
                     crate::domain::providers::registry::OutboundIdentityPolicy::CustomOverride,
                 auth_ref,
                 model_policy: RuntimeModelPolicy::Passthrough,
+                coding_plan: None,
                 test_model: None,
                 aws_region: None,
                 media_policy: None,
@@ -1392,6 +1453,7 @@ mod tests {
                 model_policy: RuntimeModelPolicy::Single {
                     upstream_model: "actual-model".to_string(),
                 },
+                coding_plan: None,
                 test_model: None,
                 aws_region: None,
                 media_policy: None,
@@ -1996,7 +2058,7 @@ mod tests {
             headers
                 .get("user-agent")
                 .and_then(|value| value.to_str().ok()),
-            Some("GitHubCopilotChat/0.38.2")
+            Some(crate::provider_identity::COPILOT_USER_AGENT)
         );
     }
 
@@ -2580,6 +2642,174 @@ mod tests {
         )
         .unwrap();
         assert_eq!(signed_again, prepared.adapter_request.body);
+    }
+
+    #[test]
+    fn typed_kimi_surfaces_project_app_protocols_and_exact_coding_endpoints() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "kimi-contract-account",
+            "providerType": "kimi_code",
+            "authIdentityGeneration": 1,
+            "tokenRefreshGeneration": 3,
+            "accessToken": "kimi-contract-access",
+            "refreshToken": "kimi-contract-refresh",
+            "tokenType": "Bearer",
+            "expiresAt": i64::MAX / 2,
+            "profile": {
+                "userId": "kimi-contract-user",
+                "kimiDevice": {
+                    "deviceId": "kimi-contract-device",
+                    "deviceName": "contract-fixture",
+                    "deviceModel": "contract-fixture",
+                    "osVersion": "contract-fixture"
+                }
+            }
+        }))
+        .unwrap();
+        let accounts = AccountStore {
+            accounts: vec![account],
+            ..Default::default()
+        };
+
+        struct Case {
+            app: AppKind,
+            profile_id: &'static str,
+            route: ProxyRoute,
+            gemini_path: Option<&'static str>,
+            body: &'static [u8],
+            api_format: &'static str,
+            endpoint: &'static str,
+        }
+
+        for (case_index, case) in [
+            Case {
+                app: AppKind::Claude,
+                profile_id: "claude.kimi_code",
+                route: ProxyRoute::ClaudeMessages,
+                gemini_path: None,
+                body: br#"{"model":"claude-sonnet-5","max_tokens":32,"messages":[{"role":"user","content":"ping"}]}"#,
+                api_format: "anthropic",
+                endpoint: "https://api.kimi.com/coding/v1/messages?beta=true",
+            },
+            Case {
+                app: AppKind::Claude,
+                profile_id: "claude.kimi_code",
+                route: ProxyRoute::ClaudeCountTokens,
+                gemini_path: None,
+                body: br#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"count"}]}"#,
+                api_format: "anthropic",
+                endpoint: "https://api.kimi.com/coding/v1/messages/count_tokens?beta=true",
+            },
+            Case {
+                app: AppKind::Codex,
+                profile_id: "codex.kimi_code",
+                route: ProxyRoute::CodexResponses,
+                gemini_path: None,
+                body: br#"{"model":"gpt-5.5","input":"ping","stream":false}"#,
+                api_format: "openai_chat",
+                endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+            },
+            Case {
+                app: AppKind::Codex,
+                profile_id: "codex.kimi_code",
+                route: ProxyRoute::CodexChatCompletions,
+                gemini_path: None,
+                body: br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+                api_format: "openai_chat",
+                endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+            },
+            Case {
+                app: AppKind::Gemini,
+                profile_id: "gemini.kimi_code",
+                route: ProxyRoute::Gemini,
+                gemini_path: Some("models/gemini-3.5-flash:generateContent"),
+                body: br#"{"contents":[{"role":"user","parts":[{"text":"ping"}]}]}"#,
+                api_format: "openai_chat",
+                endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let execution = typed_execution(
+                case.app,
+                case.profile_id,
+                typed_managed_provider(
+                    &format!("typed-kimi-{case_index}"),
+                    ProviderType::KimiCode,
+                    "kimi-contract-account",
+                    json!({}),
+                ),
+                &accounts,
+                0,
+            );
+            assert_eq!(execution.plan.driver_id.as_str(), "oauth.kimi_code");
+            assert_eq!(execution.plan.driver_contract_revision, 2);
+            assert_eq!(execution.plan.upstream_protocol, UpstreamProtocol::Special);
+            assert_eq!(
+                execution.managed_account_identity_target(),
+                Some((ProviderType::KimiCode, "kimi-contract-account", 1))
+            );
+
+            let stored = execution.runtime_stored_view();
+            assert_eq!(
+                stored
+                    .provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.api_format.as_deref()),
+                Some(case.api_format)
+            );
+            let adapter = adapters::adapter_for(case.app, ProviderType::KimiCode);
+            let mut request = adapter
+                .transform_request_for_route(
+                    Bytes::copy_from_slice(case.body),
+                    &stored,
+                    case.route,
+                    case.gemini_path,
+                )
+                .unwrap();
+            execution.enforce_model_policy(&mut request).unwrap();
+            execution.finalize_request(&mut request).unwrap();
+            let mut endpoint = execution
+                .resolve_endpoint(
+                    case.route,
+                    case.gemini_path.map(str::to_string),
+                    &request,
+                )
+                .unwrap();
+            assert_eq!(endpoint, case.endpoint);
+            assert_eq!(request.actual_model.as_deref(), Some("kimi-for-coding"));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap()["model"],
+                json!("kimi-for-coding")
+            );
+
+            let mut headers = adapter
+                .build_headers(case.app, &stored, &accounts)
+                .unwrap()
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect::<Vec<_>>();
+            let auth = execution.materialize_auth(&accounts).unwrap();
+            execution
+                .apply_auth(&mut headers, &mut endpoint, &auth)
+                .unwrap();
+            execution.finalize_outbound_identity(&mut headers).unwrap();
+            execution
+                .finalize_protocol_auth(&accounts, &mut request, &mut endpoint, &mut headers)
+                .unwrap();
+            for (name, value) in [
+                ("authorization", "Bearer kimi-contract-access"),
+                ("x-msh-platform", "kimi_cli"),
+                ("x-msh-device-id", "kimi-contract-device"),
+                ("user-agent", crate::domain::kimi_cli::KIMI_USER_AGENT),
+            ] {
+                assert!(headers.iter().any(|(candidate, candidate_value)| {
+                    candidate.eq_ignore_ascii_case(name) && candidate_value == value
+                }), "app={:?} route={:?} missing {name}", case.app, case.route);
+            }
+        }
     }
 
     #[test]

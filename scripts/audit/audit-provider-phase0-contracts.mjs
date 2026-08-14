@@ -404,7 +404,7 @@ const adapterByAppType = Object.freeze({
   "claude:cursor_apikey": ["claude_cursor_apikey_agentservice", "native"],
   "claude:antigravity_oauth": ["claude_antigravity_gemini_native", "native"],
   "claude:agy_oauth": ["claude_antigravity_gemini_native", "native"],
-  "claude:github_copilot": ["claude_copilot_skeleton", "generic_fallback"],
+  "claude:github_copilot": ["claude_to_copilot_chat", "native"],
   "claude:deepseek_account": ["claude_deepseek_account_planned", "planned"],
   "claude:aws_bedrock": ["claude_bedrock_signature_planned", "planned"],
   "claude:openrouter": ["claude_openrouter_compatible", "native"],
@@ -534,7 +534,7 @@ function knownStatus(app, providerType, presetName) {
     return { status: "partial", reason: "production uses Cursor AgentService while manual test/discovery do not execute the same operation path" };
   }
   if (providerType === "github_copilot") {
-    return { status: "partial", reason: "production adds managed Copilot auth but capability remains generic_fallback" };
+    return { status: "partial", reason: "forwarding and discovery are fixture-verified Native; the manual test operation and live github.com/GHES acceptance remain pending" };
   }
   if (app === "gemini" && providerType !== "gemini_cli" && providerType !== "grok_oauth") {
     return { status: "partial", reason: "legacy Gemini path does not enforce the target single-model policy" };

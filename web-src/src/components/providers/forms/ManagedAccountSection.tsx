@@ -17,6 +17,7 @@ import { GeminiOAuthSection } from "./GeminiOAuthSection";
 import { GrokOAuthSection } from "./GrokOAuthSection";
 import { KiroOAuthSection } from "./KiroOAuthSection";
 import { KimiOAuthSection } from "./KimiOAuthSection";
+import { QoderOAuthSection } from "./QoderOAuthSection";
 
 export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "claude_oauth",
@@ -29,6 +30,7 @@ export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "cursor_oauth",
   "kiro_oauth",
   "kimi_code",
+  "qoder_cosy",
   "deepseek_account",
 ] as const;
 
@@ -149,6 +151,8 @@ export function ManagedAccountSection({
       return <KiroOAuthSection {...common} />;
     case "kimi_code":
       return <KimiOAuthSection {...common} />;
+    case "qoder_cosy":
+      return <QoderOAuthSection {...common} />;
     case "deepseek_account":
       return <DeepSeekAccountSection {...common} />;
   }

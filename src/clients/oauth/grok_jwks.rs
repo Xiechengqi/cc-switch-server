@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
+};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,6 +14,8 @@ use url::Url;
 const DEFAULT_XAI_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 const DEFAULT_XAI_ISSUER: &str = "https://auth.x.ai";
 const DEFAULT_XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const XAI_ID_TOKEN_ALGORITHM: Algorithm = Algorithm::ES256;
+const XAI_ID_TOKEN_ALGORITHM_NAME: &str = "ES256";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_RESPONSE_BODY_BYTES: usize = 64 * 1024;
@@ -21,7 +25,7 @@ const MAX_JWKS_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 pub enum GrokJwtError {
     #[error("Grok token header is invalid: {0}")]
     InvalidHeader(String),
-    #[error("Grok ID token must use RS256")]
+    #[error("Grok ID token must use ES256")]
     UnsupportedAlgorithm,
     #[error("Grok ID token header is missing kid")]
     MissingKeyId,
@@ -95,25 +99,25 @@ pub async fn verify_grok_id_token(
     }
     let header =
         decode_header(token).map_err(|error| GrokJwtError::InvalidHeader(error.to_string()))?;
-    if header.alg != Algorithm::RS256 {
+    if header.alg != XAI_ID_TOKEN_ALGORITHM {
         return Err(GrokJwtError::UnsupportedAlgorithm);
     }
     let kid = header.kid.ok_or(GrokJwtError::MissingKeyId)?;
     let provider = load_provider(http).await?;
-    if !provider.algorithms.is_empty()
-        && !provider
-            .algorithms
-            .iter()
-            .any(|algorithm| algorithm == "RS256")
+    if !provider
+        .algorithms
+        .iter()
+        .any(|algorithm| algorithm == XAI_ID_TOKEN_ALGORITHM_NAME)
     {
         return Err(GrokJwtError::InvalidMetadata(
-            "provider does not advertise RS256 for ID tokens".to_string(),
+            "provider does not advertise ES256 for ID tokens".to_string(),
         ));
     }
     let jwk = load_key(http, &provider.jwks_uri, &kid).await?;
+    validate_grok_signing_key(&jwk)?;
     let key =
         DecodingKey::from_jwk(&jwk).map_err(|error| GrokJwtError::InvalidKey(error.to_string()))?;
-    let mut validation = Validation::new(Algorithm::RS256);
+    let mut validation = Validation::new(XAI_ID_TOKEN_ALGORITHM);
     validation.set_issuer(&[provider.issuer]);
     validation.set_audience(&[xai_client_id()]);
     validation.validate_exp = true;
@@ -157,6 +161,44 @@ pub async fn verify_grok_id_token(
         canonical_claims: crate::domain::accounts::oauth::canonical_grok_claims(&identity),
         identity,
     })
+}
+
+fn validate_grok_signing_key(jwk: &Jwk) -> Result<(), GrokJwtError> {
+    if jwk.common.key_algorithm != Some(KeyAlgorithm::ES256) {
+        return Err(GrokJwtError::InvalidKey(
+            "key must declare alg=ES256".to_string(),
+        ));
+    }
+    if jwk
+        .common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|key_use| key_use != &PublicKeyUse::Signature)
+    {
+        return Err(GrokJwtError::InvalidKey(
+            "key use must be sig when present".to_string(),
+        ));
+    }
+    if jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
+    {
+        return Err(GrokJwtError::InvalidKey(
+            "key_ops must include verify when present".to_string(),
+        ));
+    }
+    match &jwk.algorithm {
+        AlgorithmParameters::EllipticCurve(parameters)
+            if parameters.curve == EllipticCurve::P256 =>
+        {
+            Ok(())
+        }
+        _ => Err(GrokJwtError::InvalidKey(
+            "key must use EC P-256 parameters".to_string(),
+        )),
+    }
 }
 
 async fn load_provider(http: &reqwest::Client) -> Result<ProviderMetadata, GrokJwtError> {
@@ -346,7 +388,7 @@ pub(crate) async fn install_test_provider(jwk: Jwk) {
             metadata: ProviderMetadata {
                 issuer: DEFAULT_XAI_ISSUER.to_string(),
                 jwks_uri: jwks_uri.clone(),
-                algorithms: vec!["RS256".to_string()],
+                algorithms: vec![XAI_ID_TOKEN_ALGORITHM_NAME.to_string()],
             },
         },
     );
@@ -364,44 +406,23 @@ pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const TEST_KID: &str = "cc-switch-grok-test-rsa";
-    const TEST_RSA_N: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
-    const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
-7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
-IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
-eelOEdHIjG7LRkx5l/FUvlqsyHDVJEQsHwegZ8b8C0fz0EgT2MMEdn10t6Ur1rXz
-jMB/wvCg8vG8lvciXmedyo9xJ8oMOh0wUEgxziVDMMovmC+aJctcHUAYubwoGN8T
-yzcvnGqL7JSh36Pwy28iPzXZ2RLhAyJFU39vLaHdljwthUaupldlNyCfa6Ofy4qN
-ctlUPlN1AgMBAAECggEAdESTQjQ70O8QIp1ZSkCYXeZjuhj081CK7jhhp/4ChK7J
-GlFQZMwiBze7d6K84TwAtfQGZhQ7km25E1kOm+3hIDCoKdVSKch/oL54f/BK6sKl
-qlIzQEAenho4DuKCm3I4yAw9gEc0DV70DuMTR0LEpYyXcNJY3KNBOTjN5EYQAR9s
-2MeurpgK2MdJlIuZaIbzSGd+diiz2E6vkmcufJLtmYUT/k/ddWvEtz+1DnO6bRHh
-xuuDMeJA/lGB/EYloSLtdyCF6sII6C6slJJtgfb0bPy7l8VtL5iDyz46IKyzdyzW
-tKAn394dm7MYR1RlUBEfqFUyNK7C+pVMVoTwCC2V4QKBgQD64syfiQ2oeUlLYDm4
-CcKSP3RnES02bcTyEDFSuGyyS1jldI4A8GXHJ/lG5EYgiYa1RUivge4lJrlNfjyf
-dV230xgKms7+JiXqag1FI+3mqjAgg4mYiNjaao8N8O3/PD59wMPeWYImsWXNyeHS
-55rUKiHERtCcvdzKl4u35ZtTqQKBgQDNKnX2bVqOJ4WSqCgHRhOm386ugPHfy+8j
-m6cicmUR46ND6ggBB03bCnEG9OtGisxTo/TuYVRu3WP4KjoJs2LD5fwdwJqpgtHl
-yVsk45Y1Hfo+7M6lAuR8rzCi6kHHNb0HyBmZjysHWZsn79ZM+sQnLpgaYgQGRbKV
-DZWlbw7g7QKBgQCl1u+98UGXAP1jFutwbPsx40IVszP4y5ypCe0gqgon3UiY/G+1
-zTLp79GGe/SjI2VpQ7AlW7TI2A0bXXvDSDi3/5Dfya9ULnFXv9yfvH1QwWToySpW
-Kvd1gYSoiX84/WCtjZOr0e0HmLIb0vw0hqZA4szJSqoxQgvF22EfIWaIaQKBgQCf
-34+OmMYw8fEvSCPxDxVvOwW2i7pvV14hFEDYIeZKW2W1HWBhVMzBfFB5SE8yaCQy
-pRfOzj9aKOCm2FjjiErVNpkQoi6jGtLvScnhZAt/lr2TXTrl8OwVkPrIaN0bG/AS
-aUYxmBPCpXu3UjhfQiWqFq/mFyzlqlgvuCc9g95HPQKBgAscKP8mLxdKwOgX8yFW
-GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
-2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
-3wc9h4G8BBCtWN2TN/LsGZdB
+    const TEST_KID: &str = "cc-switch-grok-test-ec";
+    const TEST_EC_X: &str = "w7JAoU_gJbZJvV-zCOvU9yFJq0FNC_edCMRM78P8eQQ";
+    const TEST_EC_Y: &str = "wQg1EytcsEmGrM70Gb53oluoDbVhCZ3Uq3hHMslHVb4";
+    const TEST_EC_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWTFfCGljY6aw3Hrt
+kHmPRiazukxPLb6ilpRAewjW8nihRANCAATDskChT+Altkm9X7MI69T3IUmrQU0L
+950IxEzvw/x5BMEINRMrXLBJhqzO9Bm+d6JbqA21YQmd1Kt4RzLJR1W+
 -----END PRIVATE KEY-----"#;
 
     pub(crate) async fn install_test_key() {
         let jwk = serde_json::from_value(serde_json::json!({
-            "kty": "RSA",
-            "n": TEST_RSA_N,
-            "e": "AQAB",
+            "kty": "EC",
+            "crv": "P-256",
+            "x": TEST_EC_X,
+            "y": TEST_EC_Y,
             "kid": TEST_KID,
-            "alg": "RS256",
+            "alg": "ES256",
             "use": "sig"
         }))
         .unwrap();
@@ -410,7 +431,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
     pub(crate) fn signed_token(audience: &str, nonce: &str, expires_at: i64) -> String {
         let now = chrono::Utc::now().timestamp();
-        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        let mut header = jsonwebtoken::Header::new(XAI_ID_TOKEN_ALGORITHM);
         header.kid = Some(TEST_KID.to_string());
         jsonwebtoken::encode(
             &header,
@@ -425,7 +446,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 "nbf": now - 1,
                 "exp": expires_at,
             }),
-            &jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+            &jsonwebtoken::EncodingKey::from_ec_pem(TEST_EC_PRIVATE_KEY.as_bytes()).unwrap(),
         )
         .unwrap()
     }
@@ -441,16 +462,75 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
-    fn rejects_unsigned_tokens_before_discovery_access() {
+    fn rejects_non_es256_tokens_before_discovery_access() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let error = runtime
             .block_on(verify_grok_id_token(
                 &reqwest::Client::new(),
-                "eyJhbGciOiJIUzI1NiIsImtpZCI6InRlc3QifQ.eyJleHAiOjQxMDI0NDQ4MDB9.sig",
+                "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJleHAiOjQxMDI0NDQ4MDB9.sig",
                 None,
             ))
             .unwrap_err();
         assert!(matches!(error, GrokJwtError::UnsupportedAlgorithm));
+    }
+
+    #[test]
+    fn rejects_jwks_outside_the_es256_verification_contract() {
+        let rsa: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "RSA",
+            "n": "AQAB",
+            "e": "AQAB",
+            "kid": TEST_KID,
+            "alg": "RS256",
+            "use": "sig"
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_grok_signing_key(&rsa),
+            Err(GrokJwtError::InvalidKey(_))
+        ));
+
+        let p384: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC",
+            "crv": "P-384",
+            "x": TEST_EC_X,
+            "y": TEST_EC_Y,
+            "kid": TEST_KID,
+            "alg": "ES256",
+            "use": "sig"
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_grok_signing_key(&p384),
+            Err(GrokJwtError::InvalidKey(_))
+        ));
+
+        let signing_only: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": TEST_EC_X,
+            "y": TEST_EC_Y,
+            "kid": TEST_KID,
+            "alg": "ES256",
+            "key_ops": ["sign"]
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_grok_signing_key(&signing_only),
+            Err(GrokJwtError::InvalidKey(_))
+        ));
+
+        let verification_key: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": TEST_EC_X,
+            "y": TEST_EC_Y,
+            "kid": TEST_KID,
+            "alg": "ES256",
+            "key_ops": ["verify"]
+        }))
+        .unwrap();
+        assert!(validate_grok_signing_key(&verification_key).is_ok());
     }
 
     #[tokio::test]

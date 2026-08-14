@@ -42,6 +42,58 @@ export interface ProviderIdentityView {
   warning?: string;
 }
 
+export type CodingPlanQuotaAdapter =
+  "kimi" | "zhipu" | "minimax" | "volcengine" | "unavailable";
+
+export interface ProviderRuntimeCodingPlan {
+  contractRevision: number;
+  fixedOrigin: string;
+  protocol: ProviderUpstreamProtocol;
+  inferenceCredentialSlot: string;
+  inferenceAuthScheme: ProviderAuthScheme;
+  routes: Partial<
+    Record<
+      | "claude_messages"
+      | "claude_count_tokens"
+      | "codex_chat_completions"
+      | "codex_responses",
+      string
+    >
+  >;
+  models: Array<{
+    id: string;
+    displayName: string;
+    contextWindow: number;
+    inputModalities: Array<"text" | "image">;
+  }>;
+  quota: {
+    adapter: CodingPlanQuotaAdapter;
+    endpoint?: string;
+    credentialSlots: Array<{
+      role: "inference_credential" | "access_key_id" | "secret_access_key";
+      slot: string;
+    }>;
+    cacheTtlMs: number;
+    staleTtlMs: number;
+  };
+  cacheTokens: "input_includes_cached" | "input_excludes_cached";
+  stream: {
+    format: "anthropic_sse" | "open_ai_chat_sse" | "open_ai_responses_sse";
+    terminalEvent: string;
+    errorBeforeTerminalIsFatal: boolean;
+  };
+  error: {
+    envelope: "anthropic" | "open_ai";
+    retrySameCredentialOnceOn401: boolean;
+    retryAfterCommit: boolean;
+  };
+  pricing: {
+    evidence: "flat_rate_subscription_no_usd";
+    source: string;
+    capturedAt: string;
+  };
+}
+
 export interface ProviderRuntimePlan {
   providerKey: { app: CoreProviderApp; providerId: string };
   providerRevision: number;
@@ -55,6 +107,7 @@ export interface ProviderRuntimePlan {
   authRef: unknown;
   modelPolicy:
     { mode: "passthrough" } | { mode: "single"; upstreamModel: string };
+  codingPlan?: ProviderRuntimeCodingPlan;
   testModel?: string;
   awsRegion?: string;
   mediaPolicy?: unknown;
@@ -70,6 +123,36 @@ export interface ProviderRuntimePlan {
   configurationState: "ready" | "legacy_compat" | "needs_attention";
   warnings?: string[];
   runtimeFingerprint: string;
+}
+
+export type CodingPlanQuotaState =
+  "supported" | "stale" | "unknown" | "unavailable";
+
+export interface CodingPlanQuotaWindow {
+  kind: "five_hour" | "weekly" | "monthly";
+  scope?: string;
+  utilization: number;
+  resetsAtMs?: number;
+  used?: number;
+  limit?: number;
+  unit?: string;
+}
+
+export interface CodingPlanQuotaSnapshot {
+  providerKey: { app: CoreProviderApp; providerId: string };
+  providerRevision: number;
+  credentialGeneration: number;
+  runtimeFingerprint: string;
+  profileId: string;
+  source: "live" | "fresh_cache" | "stale_cache" | "contract";
+  quota: {
+    state: CodingPlanQuotaState;
+    windows: CodingPlanQuotaWindow[];
+    plan?: string;
+    observedAtMs?: number;
+    staleSinceMs?: number;
+    reason?: string;
+  };
 }
 
 export interface ProviderResource {
@@ -276,6 +359,24 @@ export const providersApi = {
 
   async getResources(appId: AppId): Promise<ProviderResource[]> {
     return await invokeCommand("get_provider_resources", { app: appId });
+  },
+
+  async getCodingPlanQuota(
+    app: CoreProviderApp,
+    providerId: string,
+  ): Promise<CodingPlanQuotaSnapshot> {
+    return await invokeCommand("get_coding_plan_quota", { app, providerId });
+  },
+
+  async refreshCodingPlanQuota(
+    app: CoreProviderApp,
+    providerId: string,
+  ): Promise<CodingPlanQuotaSnapshot> {
+    return await invokeCommand(
+      "refresh_coding_plan_quota",
+      { app, providerId },
+      { cache: "no-store" },
+    );
   },
 
   async getCredential(

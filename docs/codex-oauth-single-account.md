@@ -127,7 +127,7 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 
 ### Images 兼容与资源边界
 
-Codex OAuth 图片桥覆盖 Share URL 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游始终使用增量 SSE，generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
+Codex OAuth 图片桥覆盖 Share URL 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游固定发送 `stream=true` 与唯一的 `Accept: text/event-stream`，所有成功 body 都按增量 SSE 消费，不用上游 `Content-Type` 选择 JSON/SSE 解析模式。generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
 
 - 输入模型只接受 `gpt-image-*`；`gpt-image-2-2k` 和 `gpt-image-2-4k` 会规范化为 `gpt-image-2` 及对应方向尺寸。
 - `response_format` 支持 `b64_json` 和 `url`；同时校验 `size`、`quality`、`background`、`output_format`、`moderation`、`input_fidelity`、`output_compression`、`partial_images` 和 `stream` 的类型、范围及组合关系。

@@ -2428,6 +2428,7 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::AgyOAuth => "agy_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::QoderCosy => "qoder_cosy",
         ProviderType::DeepSeekAccount => "deepseek_account",
         _ => "unknown",
     }
@@ -2509,8 +2510,16 @@ mod managed_auth_provider_label_tests {
             "kimi_code"
         );
         assert_eq!(
+            managed_auth_provider_label(ProviderType::QoderCosy),
+            "qoder_cosy"
+        );
+        assert_eq!(
             web_parse_auth_provider_type("kimi_code").unwrap(),
             ProviderType::KimiCode
+        );
+        assert_eq!(
+            web_parse_auth_provider_type("qoder_cosy").unwrap(),
+            ProviderType::QoderCosy
         );
     }
 
@@ -2646,6 +2655,15 @@ pub(in crate::api) fn map_managed_auth_account(
         SubscriptionExpirySource::RecurringRule => "recurring_billing_period",
         SubscriptionExpirySource::LegacyManual => "billing_period",
     });
+    let qoder = (account.provider_type == ProviderType::QoderCosy)
+        .then(|| crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref()).ok())
+        .flatten()
+        .map(|profile| {
+            json!({
+                "site": profile.site,
+                "credentialRail": profile.credential_rail,
+            })
+        });
     json!({
         "id": account.id,
         "provider": provider_label,
@@ -2659,6 +2677,7 @@ pub(in crate::api) fn map_managed_auth_account(
         "github_domain": "github.com",
         "workspaces": workspaces,
         "selected_workspace_id": selected_workspace_id,
+        "qoder": qoder,
         "subscriptionExpiry": {
             "capability": subscription_expiry.capability,
             "rule": if supports_manual { account.manual_subscription_expiry_rule.as_ref() } else { None },
@@ -2874,6 +2893,35 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 response.device.interval,
             ))
         }
+        ProviderType::QoderCosy => {
+            let site = crate::domain::qoder::QoderSite::parse(
+                web_optional_string_any(args, &["qoderSite", "qoder_site", "site"])
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+            .map_err(ApiError::bad_request)?;
+            let response = start_qoder_device_login(
+                State(state),
+                headers,
+                Json(StartQoderDeviceLoginRequest {
+                    site: Some(site.as_str().to_string()),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!({
+                "flow": "device",
+                "provider": provider_label,
+                "device_code": response.device.device_code,
+                "state": response.device.state,
+                "user_code": "",
+                "verification_uri": response.device.verification_uri_complete,
+                "verification_uri_complete": response.device.verification_uri_complete,
+                "expires_in": response.device.expires_in,
+                "interval": response.device.interval,
+                "site": response.device.site,
+            }))
+        }
         ProviderType::CodexOAuth if !managed_auth_is_cli_oauth_flow(oauth_flow_mode_ref) => {
             let response = start_codex_device_login(
                 State(state),
@@ -3003,6 +3051,30 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
+        ProviderType::QoderCosy => {
+            let flow_state = web_arg_string_any(args, &["flowState", "flow_state", "state"])?;
+            let response = poll_qoder_device_login(
+                State(state.clone()),
+                headers,
+                Json(PollQoderDeviceLoginRequest {
+                    device_code,
+                    state: flow_state,
+                }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("Qoder device flow completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
         ProviderType::CodexOAuth
             if !device_code.starts_with("cli:") && !device_code.starts_with("manual:") =>
         {
@@ -3111,6 +3183,16 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
             State(state),
             headers,
             Json(CancelCodexDeviceLoginRequest { device_code }),
+        )
+        .await?
+        .0;
+        return Ok(json!(response));
+    }
+    if provider_type == ProviderType::QoderCosy {
+        let response = cancel_qoder_device_login(
+            State(state),
+            headers,
+            Json(CancelQoderDeviceLoginRequest { device_code }),
         )
         .await?
         .0;

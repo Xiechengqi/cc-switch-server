@@ -37,6 +37,8 @@ export interface CodexProviderPreset {
   providerType?:
     | "codex_oauth"
     | "grok_oauth"
+    | "github_copilot"
+    | "kiro_oauth"
     | "cursor_oauth"
     | "cursor_apikey"
     | "ollama_cloud";

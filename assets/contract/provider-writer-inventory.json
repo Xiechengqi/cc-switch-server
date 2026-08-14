@@ -9,19 +9,19 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "9cba46ba4f7e6b206375b58db397e0aadf0a820b50e2a6cd9db55f362d2a9684"
+      "sha256": "5500c0bcd7491e40a29b6b52792049036d1d8ee6f7d2ff5894bba6d73931bc16"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "e8d385b055bcbf441eea48ae14b968b5929bc9070d0acc8e4a1a66d89bf0c762"
+      "sha256": "9e53acc748691c28faa99d52b5b2142c14c4dd28599c2ba2d1acbdae8410efd5"
     },
     {
       "path": "src/api/types/providers.rs",
-      "sha256": "0c0a310348c2217eacb7f8b37fcb027a36550e154bec08cc3a2d13f9a052aead"
+      "sha256": "34e4d22d4e75342ab9dca5d3775748a0ec54c66a02dbe330a799c91f083bf395"
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "7d8ebdcd831cc87788cc1aa31a2d1a234e72c53054f91ab3e4e2c1845ae348c3"
+      "sha256": "c3dfd77ebe79d99c8583c187fc434914a1464e17108dc60bc19d81e2e976dde5"
     },
     {
       "path": "src/domain/providers/migrate.rs",
@@ -33,7 +33,7 @@
     },
     {
       "path": "src/domain/providers/store.rs",
-      "sha256": "5edb61d8a31405a3c9ea48199e2002b455971c6e82c7f977719646f02eda70d1"
+      "sha256": "fb1374763fd9b1c23c3cfeea51bc0184ea7f4b5a037668a7c2e2af3ca2f9b942"
     },
     {
       "path": "src/domain/providers/store_v2.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "98bac517c710e169f3c6748dbe0e74be1f539b5da47405f6db63d2c1fc02969c"
+      "sha256": "2b8671676b52d2b1c22170269353ff09978454d802f9d556547346c1279e921a"
     }
   ],
   "entries": [

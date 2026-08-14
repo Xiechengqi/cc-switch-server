@@ -36,6 +36,8 @@
     "show": "Show",
     "hide": "Hide",
     "back": "Back",
+    "previous": "Previous",
+    "next": "Next",
     "continue": "Continue",
     "retry": "Retry",
     "logout": "Sign out",
@@ -3360,6 +3362,22 @@
     "userCodeHint": "Kimi Code device verification code:",
     "loginRequired": "Sign in to a Kimi Code account first",
     "selectAccountRequired": "Kimi Code must be bound to a Kimi Code account"
+  },
+  "qoderOauth": {
+    "description": "Manage Qoder COSY accounts",
+    "authStatus": "Qoder COSY authentication",
+    "deviceLogin": "Device sign-in",
+    "patImport": "PAT import",
+    "globalSite": "Global",
+    "cnSite": "China",
+    "oauthRail": "OAuth",
+    "patRail": "PAT",
+    "loginWithQoder": "Sign in with Qoder",
+    "patLabel": "Global personal token",
+    "patPlaceholder": "pt-...",
+    "importPat": "Import PAT",
+    "patInvalid": "Qoder PAT must start with pt-",
+    "importSuccess": "Qoder PAT imported"
   },
   "kiroOauth": {
     "importSuccess": "Kiro credentials imported",

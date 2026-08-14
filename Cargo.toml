@@ -6,12 +6,14 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+aes = "0.8"
 argon2 = "0.5"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
@@ -37,9 +39,11 @@ jsonwebtoken = "9"
 libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+md5 = "0.7"
 multer = "3"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls-webpki-roots", "stream"] }
+rsa = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 russh = { version = "0.46", default-features = false, features = ["flate2"] }
 serde = { version = "1", features = ["derive"] }

@@ -54,7 +54,7 @@ pub fn resolve_shell_mcp_tool_name(declared: &[String]) -> Option<String> {
         "run_terminal_command",
         "terminal",
     ];
-    resolve_mcp_tool_by_aliases(declared, SHELL_ALIASES).or_else(|| declared.first().cloned())
+    resolve_mcp_tool_by_aliases(declared, SHELL_ALIASES)
 }
 
 /// Remap Cursor-side MCP tool names/args before surfacing to the client.
@@ -379,5 +379,56 @@ mod tests {
         let d = declared(&["Read"]);
         assert!(is_declared_tool(&d, "read"));
         assert!(!is_declared_tool(&d, "write"));
+    }
+
+    #[test]
+    fn builtin_bridge_matrix_preserves_arguments_and_never_guesses_unrelated_tools() {
+        let d = declared(&[
+            "read_file",
+            "apply_patch",
+            "delete",
+            "glob",
+            "grep",
+            "read_lints",
+            "bash",
+            "web_fetch",
+        ]);
+
+        let (name, args) = bridge_read_tool(&d, "src/main.rs", Some(4), Some(20)).unwrap();
+        assert_eq!(name, "read_file");
+        assert_eq!(args["path"], "src/main.rs");
+        assert_eq!(args["offset"], 4);
+        assert_eq!(args["limit"], 20);
+
+        let (name, args) = bridge_write_or_edit_tool(&d, "src/main.rs", "", "@@ patch").unwrap();
+        assert_eq!(name, "apply_patch");
+        assert_eq!(args["stream_content"], "@@ patch");
+
+        let (name, args) =
+            bridge_builtin_tool(BuiltinBridgeKind::Delete, &d, "old.rs", "", "").unwrap();
+        assert_eq!(name, "delete");
+        assert_eq!(args["path"], "old.rs");
+
+        let (name, args) = bridge_ls_or_glob_tool(&d, "src/**/*.rs").unwrap();
+        assert_eq!(name, "glob");
+        assert_eq!(args["pattern"], "src/**/*.rs");
+
+        let (name, args) =
+            bridge_grep_tool(&d, "TODO", "src", "*.rs", "files", true, Some(8)).unwrap();
+        assert_eq!(name, "grep");
+        assert_eq!(args["pattern"], "TODO");
+        assert_eq!(args["case_insensitive"], true);
+        assert_eq!(args["head_limit"], 8);
+
+        assert_eq!(bridge_read_lints_tool(&d, &[]).unwrap().0, "read_lints");
+        assert_eq!(resolve_shell_mcp_tool_name(&d).as_deref(), Some("bash"));
+        let (name, args) =
+            bridge_builtin_tool(BuiltinBridgeKind::Fetch, &d, "", "https://example.com", "")
+                .unwrap();
+        assert_eq!(name, "web_fetch");
+        assert_eq!(args["url"], "https://example.com");
+
+        assert!(resolve_shell_mcp_tool_name(&declared(&["weather"])).is_none());
+        assert!(bridge_read_tool(&declared(&["weather"]), "main.rs", None, None).is_none());
     }
 }

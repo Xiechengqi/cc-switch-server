@@ -36,6 +36,8 @@
     "show": "表示",
     "hide": "非表示",
     "back": "戻る",
+    "previous": "前へ",
+    "next": "次へ",
     "continue": "続行",
     "retry": "再試行",
     "logout": "ログアウト",
@@ -3289,6 +3291,22 @@
     "userCodeHint": "Kimi Code デバイス確認コード：",
     "loginRequired": "先に Kimi Code アカウントへログインしてください",
     "selectAccountRequired": "Kimi Code を Kimi Code アカウントに関連付けてください"
+  },
+  "qoderOauth": {
+    "description": "Qoder COSY アカウントを管理",
+    "authStatus": "Qoder COSY 認証",
+    "deviceLogin": "デバイスログイン",
+    "patImport": "PAT インポート",
+    "globalSite": "グローバル",
+    "cnSite": "中国",
+    "oauthRail": "OAuth",
+    "patRail": "PAT",
+    "loginWithQoder": "Qoder でログイン",
+    "patLabel": "グローバル個人トークン",
+    "patPlaceholder": "pt-...",
+    "importPat": "PAT をインポート",
+    "patInvalid": "Qoder PAT は pt- で始まる必要があります",
+    "importSuccess": "Qoder PAT をインポートしました"
   },
   "kiroOauth": {
     "importSuccess": "Kiro 認証情報をインポートしました",

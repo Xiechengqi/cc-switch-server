@@ -688,6 +688,7 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
         | ProviderType::KimiCode
+        | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountManagerKind::NativeOAuth,
@@ -718,6 +719,62 @@ fn validate_required_account_credential(
             "deepseek_account requires a non-empty accessToken".to_string(),
         ));
     }
+    if input.provider_type == ProviderType::QoderCosy {
+        validate_qoder_account_input(input)?;
+    }
+    Ok(())
+}
+
+fn validate_qoder_account_input(input: &UpsertAccountInput) -> Result<(), AccountManagerError> {
+    use crate::domain::qoder::{
+        machine_token_from_raw, QoderAccountProfile, QoderCredentialRail, QoderSite,
+    };
+
+    let profile = QoderAccountProfile::parse(input.profile.as_ref()).map_err(|error| {
+        AccountManagerError::CredentialUnavailable(format!("invalid Qoder account: {error}"))
+    })?;
+    let access_token = input
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let refresh_token = input
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let api_key = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match profile.credential_rail {
+        QoderCredentialRail::GlobalOauth | QoderCredentialRail::CnOauth => {
+            if access_token.is_none() || refresh_token.is_none() || api_key.is_some() {
+                return Err(AccountManagerError::CredentialUnavailable(format!(
+                    "Qoder {} requires exactly accessToken + refreshToken and forbids apiKey",
+                    profile.credential_rail.as_str()
+                )));
+            }
+        }
+        QoderCredentialRail::PatJobToken => {
+            if profile.site != QoderSite::Global
+                || access_token.is_some()
+                || refresh_token.is_some()
+                || api_key.is_none_or(|value| !value.starts_with("pt-"))
+            {
+                return Err(AccountManagerError::CredentialUnavailable(
+                    "Qoder pat_job_token requires one Global pt-* apiKey and forbids stored access/refresh tokens"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if profile.site == QoderSite::Global && machine_token_from_raw(input.raw.as_ref()).is_none() {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "Qoder Global account is missing raw.qoderSecrets.machineToken".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -742,7 +799,7 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 16] {
+fn account_provider_types() -> [ProviderType; 17] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
@@ -752,6 +809,7 @@ fn account_provider_types() -> [ProviderType; 16] {
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
         ProviderType::KimiCode,
+        ProviderType::QoderCosy,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -798,6 +856,7 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             | ProviderType::DeepSeekAccount
             | ProviderType::KiroOAuth
             | ProviderType::KimiCode
+            | ProviderType::QoderCosy
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -873,6 +932,7 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
         | ProviderType::KimiCode
+        | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountCredentialOwnership::ManagedAccount,
@@ -905,6 +965,7 @@ fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapabilit
             | ProviderType::GitHubCopilot
             | ProviderType::KiroOAuth
             | ProviderType::KimiCode
+            | ProviderType::QoderCosy
             | ProviderType::GrokOAuth
     ) {
         flows.push(AccountLoginFlowCapability {
@@ -913,7 +974,10 @@ fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapabilit
             supports_poll: true,
             supports_cancel: matches!(
                 provider_type,
-                ProviderType::CodexOAuth | ProviderType::GrokOAuth | ProviderType::KimiCode
+                ProviderType::CodexOAuth
+                    | ProviderType::GrokOAuth
+                    | ProviderType::KimiCode
+                    | ProviderType::QoderCosy
             ),
         });
     }
@@ -1275,6 +1339,7 @@ mod tests {
             if matches!(
                 provider_type,
                 ProviderType::CursorOAuth
+                    | ProviderType::GitHubCopilot
                     | ProviderType::KiroOAuth
                     | ProviderType::AntigravityOAuth
                     | ProviderType::AgyOAuth
@@ -1343,8 +1408,8 @@ mod tests {
             ),
             (
                 ProviderType::GitHubCopilot,
-                OAuthRefreshCapability::Unavailable,
-                OAuthQuotaCapability::ImportedSnapshot,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
                 true,
             ),
             (
@@ -1362,7 +1427,13 @@ mod tests {
             (
                 ProviderType::KimiCode,
                 OAuthRefreshCapability::OAuthRequest,
-                OAuthQuotaCapability::Unavailable,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::QoderCosy,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
                 true,
             ),
             (
@@ -1485,7 +1556,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            10
+            11
         );
         assert_eq!(
             registrations

@@ -1,4 +1,5 @@
 pub mod bundle;
+pub mod coding_plan;
 pub mod credentials;
 pub(crate) mod kiro;
 pub mod matrix;

@@ -397,7 +397,7 @@ fn spawn_detached_helper(
                 return Ok(());
             }
             stop_transient_helper(&transient_unit);
-            return Err(match launch {
+            Err(match launch {
                 Ok(output) if output.status.success() => SelfUpdateError::Internal(
                     "systemd update helper did not confirm startup within 2s".into(),
                 ),
@@ -408,7 +408,7 @@ fn spawn_detached_helper(
                 Err(error) => SelfUpdateError::Internal(format!(
                     "launch systemd update helper failed: {error}"
                 )),
-            });
+            })
         }
         RestartStrategy::OpenRc | RestartStrategy::Standalone => {
             use std::os::unix::process::CommandExt;
@@ -458,10 +458,10 @@ fn spawn_detached_helper(
                 std::thread::sleep(Duration::from_millis(25));
             }
             let _ = child.kill();
-            return Err(SelfUpdateError::Internal(format!(
+            Err(SelfUpdateError::Internal(format!(
                 "update helper did not confirm startup within 2s; see {}",
                 helper_log_path.display()
-            )));
+            )))
         }
     }
 }

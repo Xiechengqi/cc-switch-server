@@ -16,6 +16,7 @@ pub struct VerifiedCursorApiKey {
 #[derive(Debug, Clone)]
 pub struct CursorPublicApiError {
     pub status_code: u16,
+    pub retryable: bool,
     pub message: String,
 }
 
@@ -81,6 +82,7 @@ pub async fn available_models(
         .or_else(|| value.as_array())
         .ok_or_else(|| CursorPublicApiError {
             status_code: 502,
+            retryable: false,
             message: "Cursor /v1/models returned an unsupported response shape".to_string(),
         })?;
     let mut models = items
@@ -111,6 +113,7 @@ async fn cursor_public_json(
         .await
         .map_err(|error| CursorPublicApiError {
             status_code: 502,
+            retryable: true,
             message: format!("Cursor public API request failed: {error}"),
         })?;
     let status = response.status();
@@ -118,6 +121,7 @@ async fn cursor_public_json(
     if !status.is_success() {
         return Err(CursorPublicApiError {
             status_code: status.as_u16(),
+            retryable: status.as_u16() == 429 || status.is_server_error(),
             message: match status.as_u16() {
                 401 | 403 => "Cursor API key was rejected".to_string(),
                 429 => "Cursor API key validation was rate limited".to_string(),
@@ -127,6 +131,7 @@ async fn cursor_public_json(
     }
     serde_json::from_slice(&body).map_err(|error| CursorPublicApiError {
         status_code: 502,
+        retryable: false,
         message: format!("Cursor public API returned invalid JSON: {error}"),
     })
 }
@@ -143,6 +148,7 @@ async fn read_limited(response: reqwest::Response) -> Result<Vec<u8>, CursorPubl
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| CursorPublicApiError {
             status_code: 502,
+            retryable: true,
             message: format!("Cursor public API response read failed: {error}"),
         })?;
         if body.len().saturating_add(chunk.len()) > MAX_CURSOR_PUBLIC_BODY_BYTES {
@@ -156,6 +162,7 @@ async fn read_limited(response: reqwest::Response) -> Result<Vec<u8>, CursorPubl
 fn body_too_large() -> CursorPublicApiError {
     CursorPublicApiError {
         status_code: 502,
+        retryable: false,
         message: "Cursor public API response exceeded 1 MiB".to_string(),
     }
 }
@@ -187,5 +194,27 @@ mod tests {
             Some("owner@example.com")
         );
         assert_eq!(sha256_hex("key").len(), 64);
+    }
+
+    #[test]
+    fn public_api_error_retryability_distinguishes_transport_from_protocol() {
+        let transient = CursorPublicApiError {
+            status_code: 502,
+            retryable: true,
+            message: "transport".to_string(),
+        };
+        let malformed = CursorPublicApiError {
+            status_code: 502,
+            retryable: false,
+            message: "invalid json".to_string(),
+        };
+        let auth = CursorPublicApiError {
+            status_code: 401,
+            retryable: false,
+            message: "rejected".to_string(),
+        };
+        assert!(transient.retryable);
+        assert!(!malformed.retryable);
+        assert!(!auth.retryable);
     }
 }

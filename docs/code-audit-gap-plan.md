@@ -67,15 +67,15 @@
 
 ### X5 Copilot 请求时 internal token 交换与端点发现
 
-- **状态（2026-07-07）**：**静态实现已完成**。`src/clients/oauth/copilot_device.rs` 提供 Copilot internal token 交换与 `/copilot_internal/user` endpoint 发现；`ServerStateInner::prepare_copilot_upstream_auth` 增加 per-account 内存缓存（过期前 60 秒刷新），GHES 分支直接使用 GitHub token 并回退 `copilot-api.{domain}`；`forwarder` 在 GitHub Copilot managed-account 路径覆盖 `Authorization` 与 API endpoint，Provider 静态 secret 继续旁路。补充测试覆盖交换请求 shape、endpoint 发现/回退、缓存种子、静态 secret 旁路、Codex/Gemini Copilot 分类和 API 合同级 endpoint/header 覆盖。**capability 仍不得升级 native**，需真实 device-flow 账号 non-stream/stream + usage 验收后另行调整。
+- **状态（2026-08-12）**：**Claude/Codex fixture-verified Native 已完成，真实验收仍 pending**。github.com 与 GHES 均使用各自域的 `copilot_internal/v2/token` 将 GitHub OAuth token 换成短期 Copilot token；GitHub OAuth token 不再进入 inference/models。动态 endpoint 必须通过 public/GHES 同域族、无凭据/query/fragment、origin-root 校验。模型目录按 Account/身份代际/token 代际/domain/origin 缓存，GHES 禁止公共静态 fallback；实时 quota、能力证据和专用 refresh API 已接入。Claude/Codex 的 non-stream/stream tool fixture 与同账号 401 单次 replay 已关闭本地协议合同，Gemini surface 仍为 fallback；真实 github.com/GHES device flow、models、quota 和 inference 仍是 `live_pending`。
 - **现状证据**：Copilot 协议要求用 GitHub token 换取短时效 internal token，并经 `/copilot_internal/user` 发现每账号 API endpoint（含 GHES 分支）。Server 当时的 Copilot 分支只把 Provider 配置里的静态 bearer 原样转发，没有请求时交换、端点发现或续期。
 - **实施细节**：
   1. ✅ 新增 client 侧 `fetch_copilot_internal_token` / `fetch_copilot_api_endpoint`，按 Copilot/GHES 协议构造 API 域名；
   2. ✅ `ServerState` 增加 per-account internal token 缓存（过期前 60s 视为失效并重换）；
-  3. ✅ forwarder Copilot 分支改为：绑定 managed account（`accounts.json` 中 device flow 导入的 GitHub token）时走交换 + endpoint 发现；provider 配置显式给静态 token 时保留现行为（向后兼容）；
+  3. ✅ forwarder Copilot 分支改为：绑定 managed account（`accounts.json` 中 device flow 导入的 GitHub token）时走交换 + endpoint 发现；github.com/GHES 都只向 data plane 发送短期 Copilot token；Provider 静态 secret 继续作为独立兼容 rail；
   4. ✅ 交换请求走 server 的代理感知 `reqwest::Client`；失败返回结构化 `upstream_error`；
-  5. ✅ fixture：交换请求 shape（URL/header）、缓存种子、endpoint 发现/回退、GHES fallback 规则、静态 token 旁路、API 合同级 endpoint/header 覆盖。
-- **验收标准**：静态 fixture 全绿；`copilot_model_map` / `copilot_optimizer` 现有测试不回归。**capability 升级 gate**：真实 device flow 账号 non-stream/stream + usage 口径验收后才把 Copilot×3 从 fallback 升级（不在本计划内）。
+  5. ✅ fixture：交换请求 shape、恶意 endpoint 拒绝、缓存/代际失效、github.com/GHES models、付费/无限/free quota、Claude/Codex 非流/流工具桥、同账号 401 replay 和静态 token 旁路。
+- **验收标准**：Claude/Codex adapter 与 Driver forward/discovery 可按本地证据标记 fixture-verified Native；Gemini 保持 fallback。真实 github.com/GHES device flow、models、quota、non-stream/stream 仍需外部账号，不能由 fixture 代替。
 - **工作量**：L。**依赖**：R4 的 accounts 域收敛已完成（state 外零直接写，字段已降 `pub(crate)`；X5 新增后台并发写路径必须复用 state 域方法）；真实验收依赖外部凭据。
 
 ### X6 Kiro 转发桥实现

@@ -146,6 +146,7 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
         | ProviderType::KimiCode
+        | ProviderType::QoderCosy
         | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
         ProviderType::Claude
         | ProviderType::ClaudeAuth

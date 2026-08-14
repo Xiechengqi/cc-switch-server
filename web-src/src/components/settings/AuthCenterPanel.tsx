@@ -42,6 +42,7 @@ import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSect
 import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
 import { KimiOAuthSection } from "@/components/providers/forms/KimiOAuthSection";
+import { QoderOAuthSection } from "@/components/providers/forms/QoderOAuthSection";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { settingsApi } from "@/lib/api";
 import {
@@ -505,6 +506,17 @@ export function AuthCenterPanel({
             description={t("kimiOauth.description")}
           >
             <KimiOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
+
+        {canShowAccountProvider("qoder_cosy") ? (
+          <AuthProviderAccordionItem
+            value="qoder-cosy"
+            icon={<ProviderIcon icon="qoder" name="Qoder" size={24} />}
+            title="Qoder COSY"
+            description={t("qoderOauth.description")}
+          >
+            <QoderOAuthSection showLoggedInAccounts />
           </AuthProviderAccordionItem>
         ) : null}
 

@@ -1995,6 +1995,134 @@ mod tests {
     }
 
     #[test]
+    fn builtin_result_encoders_preserve_protocol_variant_and_rejection_payload() {
+        fn exec_result(frame: &Bytes, expected_field: u64) -> Vec<u8> {
+            let mut parser = ConnectFrameParser::new();
+            let frames = parser.feed(frame).expect("valid Connect frame");
+            assert_eq!(frames.len(), 1);
+            let exec = field_bytes(&frames[0].payload, ACM_EXEC_CLIENT_MESSAGE);
+            assert_eq!(field_varint(exec, ECM_ID), 17);
+            assert_eq!(field_string(exec, ECM_EXEC_ID), "exec-17");
+            field_bytes(exec, expected_field).to_vec()
+        }
+
+        fn assert_path_rejection(frame: Bytes, result_field: u64, path: &str) {
+            let result = exec_result(&frame, result_field);
+            let rejection = field_bytes(&result, RES_REJECTED);
+            assert_eq!(field_string(rejection, REJ_PATH), path);
+            assert_eq!(
+                field_string(rejection, REJ_REASON),
+                "client tool unavailable"
+            );
+        }
+
+        assert_path_rejection(
+            encode_exec_read_rejected(17, "exec-17", "src/main.rs", "client tool unavailable"),
+            ECM_READ_RESULT,
+            "src/main.rs",
+        );
+        assert_path_rejection(
+            encode_exec_write_rejected(17, "exec-17", "src/lib.rs", "client tool unavailable"),
+            ECM_WRITE_RESULT,
+            "src/lib.rs",
+        );
+        assert_path_rejection(
+            encode_exec_delete_rejected(17, "exec-17", "old.rs", "client tool unavailable"),
+            ECM_DELETE_RESULT,
+            "old.rs",
+        );
+        assert_path_rejection(
+            encode_exec_ls_rejected(17, "exec-17", "src", "client tool unavailable"),
+            ECM_LS_RESULT,
+            "src",
+        );
+
+        for (frame, result_field) in [
+            (
+                encode_exec_shell_rejected(
+                    17,
+                    "exec-17",
+                    "cargo test",
+                    "/workspace",
+                    "client tool unavailable",
+                ),
+                ECM_SHELL_RESULT,
+            ),
+            (
+                encode_exec_background_shell_rejected(
+                    17,
+                    "exec-17",
+                    "cargo test",
+                    "/workspace",
+                    "client tool unavailable",
+                ),
+                ECM_BACKGROUND_SHELL_SPAWN_RES,
+            ),
+        ] {
+            let result = exec_result(&frame, result_field);
+            let rejection = field_bytes(&result, RES_REJECTED);
+            assert_eq!(field_string(rejection, SREJ_COMMAND), "cargo test");
+            assert_eq!(field_string(rejection, SREJ_WORKING_DIR), "/workspace");
+            assert_eq!(
+                field_string(rejection, SREJ_REASON),
+                "client tool unavailable"
+            );
+        }
+
+        let grep = exec_result(
+            &encode_exec_grep_error(17, "exec-17", "client tool unavailable"),
+            ECM_GREP_RESULT,
+        );
+        assert_eq!(
+            field_string(field_bytes(&grep, RES_REJECTED), ERR_MESSAGE),
+            "client tool unavailable"
+        );
+
+        let fetch = exec_result(
+            &encode_exec_fetch_error(
+                17,
+                "exec-17",
+                "https://example.com",
+                "client tool unavailable",
+            ),
+            ECM_FETCH_RESULT,
+        );
+        let fetch_rejection = field_bytes(&fetch, RES_REJECTED);
+        assert_eq!(
+            field_string(fetch_rejection, FERR_URL),
+            "https://example.com"
+        );
+        assert_eq!(
+            field_string(fetch_rejection, FERR_ERROR),
+            "client tool unavailable"
+        );
+
+        let stdin = exec_result(
+            &encode_exec_write_shell_stdin_error(17, "exec-17", "client tool unavailable"),
+            ECM_WRITE_SHELL_STDIN_RESULT,
+        );
+        assert_eq!(
+            field_string(field_bytes(&stdin, RES_REJECTED), ERR_MESSAGE),
+            "client tool unavailable"
+        );
+
+        let diagnostics = exec_result(
+            &encode_exec_diagnostics_result(17, "exec-17"),
+            ECM_DIAGNOSTICS_RESULT,
+        );
+        assert!(diagnostics.is_empty());
+
+        let mcp = exec_result(
+            &encode_exec_mcp_error(17, "exec-17", "declared tool unavailable"),
+            ECM_MCP_RESULT,
+        );
+        assert_eq!(
+            field_string(field_bytes(&mcp, MCR_ERROR), ERR_MESSAGE),
+            "declared tool unavailable"
+        );
+    }
+
+    #[test]
     fn decode_read_exec_includes_offset_limit() {
         let args = concat_bytes(&[
             encode_string(ARG_PATH, "/src/main.rs"),

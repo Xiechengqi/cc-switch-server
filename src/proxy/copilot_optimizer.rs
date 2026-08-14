@@ -439,11 +439,23 @@ fn deterministic_interaction_id(session_id: &str) -> Option<String> {
 
 fn copilot_static_headers() -> Vec<(&'static str, String)> {
     vec![
-        ("user-agent", "GitHubCopilotChat/0.38.2".to_string()),
-        ("editor-version", "vscode/1.110.1".to_string()),
-        ("editor-plugin-version", "copilot-chat/0.38.2".to_string()),
+        (
+            "user-agent",
+            crate::provider_identity::COPILOT_USER_AGENT.to_string(),
+        ),
+        (
+            "editor-version",
+            crate::provider_identity::COPILOT_EDITOR_VERSION.to_string(),
+        ),
+        (
+            "editor-plugin-version",
+            crate::provider_identity::COPILOT_PLUGIN_VERSION.to_string(),
+        ),
         ("copilot-integration-id", "vscode-chat".to_string()),
-        ("x-github-api-version", "2025-10-01".to_string()),
+        (
+            "x-github-api-version",
+            crate::provider_identity::COPILOT_API_VERSION.to_string(),
+        ),
         ("openai-intent", "conversation-panel".to_string()),
         ("x-initiator", "user".to_string()),
         (

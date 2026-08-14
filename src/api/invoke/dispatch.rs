@@ -349,6 +349,22 @@ async fn web_invoke_dispatch(
             };
             Ok(json!(state.provider_views(Some(app)).await))
         }
+        "get_coding_plan_quota" | "refresh_coding_plan_quota" => {
+            let app = web_arg_app(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id", "id"])?;
+            let provider_key =
+                crate::domain::providers::registry::ProviderKey::new(app, provider_id)
+                    .map_err(ApiError::bad_request)?;
+            let snapshot = state
+                .coding_plan_quota_snapshot(
+                    provider_key,
+                    command == "refresh_coding_plan_quota",
+                )
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(snapshot))
+        }
         "add_provider" | "update_provider" => {
             require_provider_write_contract(state, headers)?;
             let app = web_arg_app(&args)?;
@@ -1141,6 +1157,24 @@ async fn web_invoke_dispatch(
             )
             .await?;
             Ok(json!({ "ok": response.ok, "account": account, "source": response.source }))
+        }
+        "qoder_import_pat" => {
+            let personal_token =
+                web_arg_string_any(&args, &["personalToken", "personal_token", "pat"])?;
+            let response = import_qoder_pat(
+                State(state.clone()),
+                headers.clone(),
+                Json(ImportQoderPatRequest { personal_token }),
+            )
+            .await?
+            .0;
+            let account = web_managed_auth_account_by_id(
+                state,
+                &response.account.id,
+                managed_auth_provider_label(ProviderType::QoderCosy),
+            )
+            .await?;
+            Ok(json!({ "ok": response.ok, "account": account }))
         }
         "cursor_import_local_auth" => {
             let response = import_cursor_local_auth(State(state.clone()), headers.clone())

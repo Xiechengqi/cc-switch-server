@@ -33,6 +33,7 @@ pub(super) fn finalize_headers(
         OutboundIdentityPolicy::ManagedVersion {
             family: ManagedVersionFamily::Antigravity,
         } => {
+            scrub_antigravity_headers(headers);
             set_user_agent(headers, crate::provider_identity::antigravity_user_agent());
             replace_header(
                 headers,
@@ -43,6 +44,42 @@ pub(super) fn finalize_headers(
         OutboundIdentityPolicy::LegacyFrozen => {}
     }
     Ok(())
+}
+
+const ANTIGRAVITY_SCRUBBED_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "forwarded",
+    "via",
+    "x-title",
+    "http-referer",
+    "referer",
+    "origin",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-dest",
+    "priority",
+    "accept-encoding",
+    "x-goog-api-client",
+    "x-client-name",
+    "x-client-version",
+    "x-machine-id",
+    "x-vscode-sessionid",
+];
+
+fn scrub_antigravity_headers(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        !name.starts_with("x-stainless-")
+            && !name.starts_with("x-cc-switch-")
+            && !ANTIGRAVITY_SCRUBBED_HEADERS.contains(&name.as_str())
+    });
 }
 
 fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(String, String)>) {
@@ -69,6 +106,9 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
                 headers,
                 crate::domain::kimi_cli::KIMI_USER_AGENT.to_string(),
             );
+        }
+        ManagedIdentityFamily::Qoder => {
+            set_user_agent(headers, "QoderCLI/1.21.2".to_string());
         }
         ManagedIdentityFamily::Kiro => {
             set_user_agent(headers, "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string())
@@ -123,6 +163,7 @@ mod tests {
             outbound_identity_policy: policy,
             auth_ref: RuntimeAuthRef::Missing,
             model_policy: RuntimeModelPolicy::Passthrough,
+            coding_plan: None,
             test_model: None,
             aws_region: None,
             media_policy: None,
@@ -255,6 +296,16 @@ mod tests {
         let mut headers = vec![
             ("User-Agent".to_string(), "untrusted/1".to_string()),
             ("client-metadata".to_string(), "untrusted".to_string()),
+            (
+                "Authorization".to_string(),
+                "Bearer bound-account".to_string(),
+            ),
+            ("X-Forwarded-For".to_string(), "203.0.113.2".to_string()),
+            ("X-Stainless-Lang".to_string(), "js".to_string()),
+            ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
+            ("X-Goog-Api-Client".to_string(), "spoofed".to_string()),
+            ("X-CC-Switch-Trace".to_string(), "internal".to_string()),
+            ("Accept-Encoding".to_string(), "zstd".to_string()),
         ];
         finalize_headers(
             &plan(OutboundIdentityPolicy::ManagedVersion {
@@ -276,6 +327,20 @@ mod tests {
                     .as_str()
             )
         );
+        assert_eq!(
+            header(&headers, "authorization"),
+            Some("Bearer bound-account")
+        );
+        for scrubbed in [
+            "x-forwarded-for",
+            "x-stainless-lang",
+            "sec-fetch-site",
+            "x-goog-api-client",
+            "x-cc-switch-trace",
+            "accept-encoding",
+        ] {
+            assert_eq!(header(&headers, scrubbed), None, "{scrubbed} survived");
+        }
     }
 
     #[test]

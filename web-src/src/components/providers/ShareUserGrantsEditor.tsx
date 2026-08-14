@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -35,6 +36,7 @@ import type {
   ShareUserPolicy,
 } from "@/lib/api/share";
 import { isValidShareEmail } from "@/utils/shareFormUtils";
+import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
 
 type PolicyDraft = {
   email: string;
@@ -43,6 +45,12 @@ type PolicyDraft = {
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchor: string;
   expiresAt: string;
+};
+
+type BatchPolicyDraft = Omit<PolicyDraft, "email"> & {
+  applyParallelLimit: boolean;
+  applyTokenLimit: boolean;
+  applyExpiresAt: boolean;
 };
 
 const ANCHORED_PERIODS: ReadonlySet<ShareTokenPeriod> = new Set(["sevenDays", "thirtyDays"]);
@@ -86,6 +94,20 @@ function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
   };
 }
 
+function batchPolicyDraft(policy: ShareUserPolicy): BatchPolicyDraft {
+  const draft = policyDraft("", policy);
+  return {
+    parallelLimit: draft.parallelLimit,
+    tokenLimit: draft.tokenLimit,
+    tokenPeriod: draft.tokenPeriod,
+    tokenPeriodAnchor: draft.tokenPeriodAnchor,
+    expiresAt: draft.expiresAt,
+    applyParallelLimit: false,
+    applyTokenLimit: false,
+    applyExpiresAt: false,
+  };
+}
+
 function displayLimit(value: number | undefined, unlimited: string) {
   return value == null ? unlimited : value.toLocaleString();
 }
@@ -106,6 +128,9 @@ export function ShareUserGrantsEditor({
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [editingEmail, setEditingEmail] = useState<string | null>(null);
   const [draft, setDraft] = useState<PolicyDraft | null>(null);
+  const [selectedEmails, setSelectedEmails] = useState<Set<string>>(new Set());
+  const [batchDraft, setBatchDraft] = useState<BatchPolicyDraft | null>(null);
+  const [batchError, setBatchError] = useState("");
 
   const grants = useMemo(
     () =>
@@ -118,6 +143,30 @@ export function ShareUserGrantsEditor({
         }),
     [value],
   );
+  const selectableEmails = useMemo(
+    () => grants
+      .filter((grant) => !protectedEmails?.has(grant.email))
+      .map((grant) => grant.email),
+    [grants, protectedEmails],
+  );
+  const selectableEmailKey = selectableEmails.join("\0");
+  const selectedEditableEmails = new Set(
+    selectableEmails.filter((email) => selectedEmails.has(email)),
+  );
+  const allSelected = selectableEmails.length > 0 &&
+    selectableEmails.every((email) => selectedEditableEmails.has(email));
+  const someSelected = selectedEditableEmails.size > 0;
+
+  useEffect(() => {
+    const selectable = new Set(selectableEmailKey ? selectableEmailKey.split("\0") : []);
+    setSelectedEmails((current) => {
+      const next = new Set(Array.from(current).filter((email) => selectable.has(email)));
+      if (next.size === current.size && Array.from(next).every((email) => current.has(email))) {
+        return current;
+      }
+      return next;
+    });
+  }, [selectableEmailKey]);
 
   useEffect(() => {
     if (!normalizedOwner || value[normalizedOwner]) return;
@@ -140,6 +189,13 @@ export function ShareUserGrantsEditor({
   const openEdit = (grant: ShareUserGrant) => {
     setEditingEmail(grant.email);
     setDraft(policyDraft(grant.email, grant.policy));
+  };
+
+  const openBatchEdit = () => {
+    const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
+    if (!firstSelected) return;
+    setBatchError("");
+    setBatchDraft(batchPolicyDraft(firstSelected.policy));
   };
 
   const saveDraft = () => {
@@ -195,6 +251,68 @@ export function ShareUserGrantsEditor({
     setDraft(null);
   };
 
+  const saveBatchDraft = () => {
+    if (!batchDraft || selectedEditableEmails.size === 0) return;
+    const parallelLimit = batchDraft.parallelLimit.trim()
+      ? Number(batchDraft.parallelLimit)
+      : undefined;
+    const tokenLimit = batchDraft.tokenLimit.trim()
+      ? Number(batchDraft.tokenLimit)
+      : undefined;
+    const expiresAt = batchDraft.expiresAt
+      ? new Date(batchDraft.expiresAt).getTime()
+      : undefined;
+    const anchored = ANCHORED_PERIODS.has(batchDraft.tokenPeriod);
+    const tokenPeriodAnchorAtMs = anchored
+      ? parseUtcDateTime(batchDraft.tokenPeriodAnchor)
+      : undefined;
+    if (
+      !batchDraft.applyParallelLimit &&
+      !batchDraft.applyTokenLimit &&
+      !batchDraft.applyExpiresAt
+    ) {
+      return;
+    }
+    if (
+      (batchDraft.applyParallelLimit && parallelLimit != null &&
+        (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
+      (batchDraft.applyTokenLimit && tokenLimit != null &&
+        (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
+      (batchDraft.applyExpiresAt && expiresAt != null && !Number.isFinite(expiresAt)) ||
+      (batchDraft.applyTokenLimit && anchored && (
+        tokenPeriodAnchorAtMs == null ||
+        !Number.isFinite(tokenPeriodAnchorAtMs) ||
+        tokenPeriodAnchorAtMs > Math.floor(Date.now() / 60_000) * 60_000
+      ))
+    ) {
+      setBatchError(t("share.userLimit.invalidPolicy", {
+        defaultValue: "限制必须为正整数，且时间必须有效。",
+      }));
+      return;
+    }
+
+    onChange(applyShareUserPolicyBatch(value, selectedEditableEmails, {
+      ...(batchDraft.applyParallelLimit
+        ? { parallelLimit: { value: parallelLimit } }
+        : {}),
+      ...(batchDraft.applyTokenLimit
+        ? {
+            tokenLimit: {
+              value: tokenLimit,
+              period: batchDraft.tokenPeriod,
+              periodAnchorAtMs: tokenPeriodAnchorAtMs,
+            },
+          }
+        : {}),
+      ...(batchDraft.applyExpiresAt
+        ? { expiresAt: { value: expiresAt } }
+        : {}),
+    }));
+    setSelectedEmails(new Set());
+    setBatchDraft(null);
+    setBatchError("");
+  };
+
   const unlimited = t("share.unlimited", { defaultValue: "无限" });
   const permanent = t("share.permanent", { defaultValue: "永久" });
   const periodLabels: Record<ShareTokenPeriod, string> = {
@@ -217,22 +335,49 @@ export function ShareUserGrantsEditor({
             })}
           </p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={disabled}
-          onClick={openAdd}
-        >
-          <Plus className="mr-1.5 h-4 w-4" />
-          {t("share.userLimit.add", { defaultValue: "添加用户" })}
-        </Button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={disabled || selectedEditableEmails.size === 0}
+            onClick={openBatchEdit}
+          >
+            <Pencil className="mr-1.5 h-4 w-4" />
+            {t("share.userLimit.batchEdit", {
+              defaultValue: "批量编辑（{{count}}）",
+              count: selectedEditableEmails.size,
+            })}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={disabled}
+            onClick={openAdd}
+          >
+            <Plus className="mr-1.5 h-4 w-4" />
+            {t("share.userLimit.add", { defaultValue: "添加用户" })}
+          </Button>
+        </div>
       </div>
 
       <div className="overflow-x-auto rounded-md border border-border-default">
-        <Table className="min-w-[720px]">
+        <Table className="min-w-[760px]">
           <TableHeader>
             <TableRow>
+              <TableHead className="h-9 w-10 px-3">
+                <Checkbox
+                  checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                  disabled={disabled || selectableEmails.length === 0}
+                  aria-label={t("share.userLimit.selectAll", {
+                    defaultValue: "选择全部可编辑用户",
+                  })}
+                  onCheckedChange={(checked) =>
+                    setSelectedEmails(new Set(checked === true ? selectableEmails : []))
+                  }
+                />
+              </TableHead>
               <TableHead className="h-9 px-3">Email</TableHead>
               <TableHead className="h-9 px-3">{t("share.parallelLimit", { defaultValue: "并发" })}</TableHead>
               <TableHead className="h-9 px-3">Token</TableHead>
@@ -243,6 +388,24 @@ export function ShareUserGrantsEditor({
           <TableBody>
             {grants.map((grant) => (
               <TableRow key={grant.email}>
+                <TableCell className="w-10 px-3 py-2">
+                  <Checkbox
+                    checked={selectedEmails.has(grant.email)}
+                    disabled={disabled || protectedEmails?.has(grant.email)}
+                    aria-label={t("share.userLimit.selectUser", {
+                      defaultValue: "选择 {{email}}",
+                      email: grant.email,
+                    })}
+                    onCheckedChange={(checked) => {
+                      setSelectedEmails((current) => {
+                        const next = new Set(current);
+                        if (checked === true) next.add(grant.email);
+                        else next.delete(grant.email);
+                        return next;
+                      });
+                    }}
+                  />
+                </TableCell>
                 <TableCell className="px-3 py-2">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="truncate">{grant.email}</span>
@@ -346,6 +509,174 @@ export function ShareUserGrantsEditor({
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setDraft(null)}>{t("common.cancel", { defaultValue: "取消" })}</Button>
             <Button type="button" onClick={saveDraft}>{t("common.save", { defaultValue: "保存" })}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchDraft != null} onOpenChange={(open) => {
+        if (!open) {
+          setBatchDraft(null);
+          setBatchError("");
+        }
+      }}>
+        <DialogContent className="max-w-xl" zIndex="top">
+          <DialogHeader>
+            <DialogTitle>
+              {t("share.userLimit.batchTitle", { defaultValue: "批量编辑用户限制" })}
+            </DialogTitle>
+          </DialogHeader>
+          {batchDraft ? (
+            <div className="grid gap-4 overflow-y-auto px-6 py-5 sm:grid-cols-2">
+              <p className="text-sm text-muted-foreground sm:col-span-2">
+                {t("share.userLimit.batchHint", {
+                  defaultValue: "已选择 {{count}} 个用户。仅覆盖勾选的参数，其他参数保持不变；空限额表示无限，空到期时间表示永久。",
+                  count: selectedEditableEmails.size,
+                })}
+              </p>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="share-user-batch-parallel-enabled"
+                    checked={batchDraft.applyParallelLimit}
+                    onCheckedChange={(checked) => setBatchDraft({
+                      ...batchDraft,
+                      applyParallelLimit: checked === true,
+                    })}
+                  />
+                  <Label htmlFor="share-user-batch-parallel-enabled">
+                    {t("share.parallelLimit", { defaultValue: "并发限额" })}
+                  </Label>
+                </div>
+                <Input
+                  type="number"
+                  min={1}
+                  disabled={!batchDraft.applyParallelLimit}
+                  placeholder={unlimited}
+                  value={batchDraft.parallelLimit}
+                  onChange={(event) => setBatchDraft({
+                    ...batchDraft,
+                    parallelLimit: event.target.value,
+                  })}
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="share-user-batch-token-enabled"
+                    checked={batchDraft.applyTokenLimit}
+                    onCheckedChange={(checked) => setBatchDraft({
+                      ...batchDraft,
+                      applyTokenLimit: checked === true,
+                    })}
+                  />
+                  <Label htmlFor="share-user-batch-token-enabled">
+                    {t("share.tokenLimit", { defaultValue: "Token 限额" })}
+                  </Label>
+                </div>
+                <Input
+                  type="number"
+                  min={1}
+                  disabled={!batchDraft.applyTokenLimit}
+                  placeholder={unlimited}
+                  value={batchDraft.tokenLimit}
+                  onChange={(event) => setBatchDraft({
+                    ...batchDraft,
+                    tokenLimit: event.target.value,
+                  })}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t("share.userLimit.period", { defaultValue: "Token 周期" })}</Label>
+                <Select
+                  disabled={!batchDraft.applyTokenLimit}
+                  value={batchDraft.tokenPeriod}
+                  onValueChange={(tokenPeriod: ShareTokenPeriod) => setBatchDraft({
+                    ...batchDraft,
+                    tokenPeriod,
+                    tokenPeriodAnchor: ANCHORED_PERIODS.has(tokenPeriod)
+                      ? (batchDraft.tokenPeriodAnchor || toUtcDateTime())
+                      : "",
+                  })}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent className="z-[120]">
+                    {(Object.keys(periodLabels) as ShareTokenPeriod[]).map((period) => (
+                      <SelectItem key={period} value={period}>{periodLabels[period]}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {batchDraft.applyTokenLimit && ANCHORED_PERIODS.has(batchDraft.tokenPeriod) ? (
+                <div className="space-y-2 sm:col-span-2">
+                  <Label htmlFor="share-user-batch-period-anchor">
+                    {t("share.userLimit.anchor", { defaultValue: "周期开始时间（UTC）" })}
+                  </Label>
+                  <Input
+                    id="share-user-batch-period-anchor"
+                    type="datetime-local"
+                    step={60}
+                    value={batchDraft.tokenPeriodAnchor}
+                    onChange={(event) => setBatchDraft({
+                      ...batchDraft,
+                      tokenPeriodAnchor: event.target.value,
+                    })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t("share.userLimit.anchorHint", {
+                      defaultValue: "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
+                    })}
+                  </p>
+                </div>
+              ) : null}
+              <div className="space-y-2 sm:col-span-2">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="share-user-batch-expiry-enabled"
+                    checked={batchDraft.applyExpiresAt}
+                    onCheckedChange={(checked) => setBatchDraft({
+                      ...batchDraft,
+                      applyExpiresAt: checked === true,
+                    })}
+                  />
+                  <Label htmlFor="share-user-batch-expiry-enabled">
+                    {t("share.expiration", { defaultValue: "到期时间" })}
+                  </Label>
+                </div>
+                <Input
+                  type="datetime-local"
+                  disabled={!batchDraft.applyExpiresAt}
+                  value={batchDraft.expiresAt}
+                  onChange={(event) => setBatchDraft({
+                    ...batchDraft,
+                    expiresAt: event.target.value,
+                  })}
+                />
+              </div>
+              {batchError ? (
+                <p className="text-sm text-destructive sm:col-span-2">{batchError}</p>
+              ) : null}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => {
+              setBatchDraft(null);
+              setBatchError("");
+            }}>
+              {t("common.cancel", { defaultValue: "取消" })}
+            </Button>
+            <Button
+              type="button"
+              disabled={batchDraft != null &&
+                !batchDraft.applyParallelLimit &&
+                !batchDraft.applyTokenLimit &&
+                !batchDraft.applyExpiresAt}
+              onClick={saveBatchDraft}
+            >
+              {t("share.userLimit.batchApply", {
+                defaultValue: "应用到 {{count}} 个用户",
+                count: selectedEditableEmails.size,
+              })}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

@@ -118,6 +118,26 @@
     "title": "供应商"
   },
   "provider": {
+    "codingPlanQuota": {
+      "supported": "实时额度",
+      "stale": "缓存额度",
+      "unknown": "额度未知",
+      "unavailable": "额度不可用",
+      "loading": "正在加载额度",
+      "queryFailed": "无法读取额度",
+      "refresh": "强制刷新 Coding Plan 额度",
+      "fiveHour": "5 小时",
+      "weekly": "每周",
+      "monthly": "每月",
+      "resetsIn": "{{time}} 后重置",
+      "quotaAvailable": "额度可用",
+      "source": {
+        "live": "实时响应",
+        "fresh_cache": "新鲜缓存",
+        "stale_cache": "过期缓存",
+        "contract": "供应商合同"
+      }
+    },
     "share": {
       "sectionTitle": "远程分享",
       "addPageBadge": "保存后可用",
@@ -180,6 +200,13 @@
       "hint": "总 Share 限制始终生效；每个用户还受自己的限制约束。",
       "add": "添加用户",
       "edit": "编辑用户限制",
+      "selectAll": "选择全部可编辑用户",
+      "selectUser": "选择 {{email}}",
+      "batchEdit": "批量编辑（{{count}}）",
+      "batchTitle": "批量编辑用户限制",
+      "batchHint": "已选择 {{count}} 个用户。仅覆盖勾选的参数，其他参数保持不变；空限额表示无限，空到期时间表示永久。",
+      "batchApply": "应用到 {{count}} 个用户",
+      "invalidPolicy": "限制必须为正整数，且时间必须有效。",
       "period": "Token 周期"
     },
     "boundProviderHint": "此应用的请求固定使用绑定的 Provider，不参与故障转移。",

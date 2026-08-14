@@ -618,6 +618,15 @@ pub(crate) fn map_kimi_device_error(error: KimiDeviceError) -> ApiError {
     )
 }
 
+pub(crate) fn map_qoder_client_error(
+    error: crate::clients::oauth::qoder::QoderClientError,
+) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        super::providers::redact_provider_test_error(&error.message),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,6 +773,7 @@ mod tests {
             status: reqwest::StatusCode::BAD_GATEWAY,
             message: "request https://client:password@example.com/token?code=private failed"
                 .to_string(),
+            endpoint_validation: false,
         });
         assert!(!copilot.message.contains("client"));
         assert!(!copilot.message.contains("password"));

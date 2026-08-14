@@ -190,6 +190,14 @@ mod tests {
             "missing_or_event_plus_terminal_error_exception"
         );
         assert_eq!(stream["unexpectedEof"], "error");
+        assert_eq!(stream["successTerminalEvidence"], "endEvent_required");
+        assert_eq!(stream["framesAfterTerminal"], "error");
+        assert_eq!(
+            stream["firstFrameDeadline"],
+            "absolute_from_request_send_through_first_complete_valid_frame"
+        );
+        assert_eq!(stream["partialBytesExtendFirstFrameDeadline"], false);
+        assert_eq!(stream["idleDeadline"], "reset_only_by_complete_valid_frame");
         assert_eq!(stream["maxFrameBytes"], frame::DEFAULT_MAX_FRAME_LENGTH);
         assert_eq!(
             stream["maxBufferedBytes"],
@@ -218,6 +226,10 @@ mod tests {
                 message: "fixture".to_string(),
             }
             .code()
+        );
+        assert_eq!(
+            fixture["errorCodes"]["eventStreamTimeout"],
+            "KIRO_EVENT_STREAM_TIMEOUT"
         );
     }
 }

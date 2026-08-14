@@ -533,8 +533,8 @@
       },
       "production": {
         "branch": "generic_adapter_with_provider_contract",
-        "adapter": "claude_copilot_skeleton",
-        "adapterSupport": "generic_fallback"
+        "adapter": "claude_to_copilot_chat",
+        "adapterSupport": "native"
       },
       "endpoint": {
         "origin": "https://api.githubcopilot.com",
@@ -570,7 +570,7 @@
       },
       "knownStatus": {
         "status": "partial",
-        "reason": "production adds managed Copilot auth but capability remains generic_fallback"
+        "reason": "forwarding and discovery are fixture-verified Native; the manual test operation and live github.com/GHES acceptance remain pending"
       }
     },
     {

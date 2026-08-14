@@ -36,6 +36,8 @@
     "show": "显示",
     "hide": "隐藏",
     "back": "返回",
+    "previous": "上一页",
+    "next": "下一页",
     "continue": "继续",
     "retry": "重试",
     "logout": "退出登录",
@@ -3364,6 +3366,22 @@
     "userCodeHint": "Kimi Code 设备验证码：",
     "loginRequired": "请先登录 Kimi Code 账号",
     "selectAccountRequired": "Kimi Code 必须绑定一个 Kimi Code 账号"
+  },
+  "qoderOauth": {
+    "description": "管理 Qoder COSY 账号",
+    "authStatus": "Qoder COSY 认证",
+    "deviceLogin": "设备登录",
+    "patImport": "PAT 导入",
+    "globalSite": "国际站",
+    "cnSite": "中国站",
+    "oauthRail": "OAuth",
+    "patRail": "PAT",
+    "loginWithQoder": "使用 Qoder 登录",
+    "patLabel": "国际站个人令牌",
+    "patPlaceholder": "pt-...",
+    "importPat": "导入 PAT",
+    "patInvalid": "Qoder PAT 必须以 pt- 开头",
+    "importSuccess": "Qoder PAT 已导入"
   },
   "kiroOauth": {
     "importSuccess": "Kiro 凭据已导入",

@@ -97,6 +97,43 @@ describe("Server Provider profile drafts", () => {
     expect(profileAllowsEndpointEditing(profile!)).toBe(false);
   });
 
+  it("materializes the Server-native Codex GitHub Copilot surface", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "codex.github_copilot",
+    );
+    expect(profile).toBeDefined();
+
+    const draft = createDraftForProfile(profile!);
+    expect(draft.name).toBe("GitHub Copilot");
+    expect(readEndpoint(draft.settingsConfig, "codex")).toBe(
+      "https://api.githubcopilot.com",
+    );
+    expect(readUpstreamModel(draft.settingsConfig)).toBe("gpt-5.5");
+    expect(draft.meta).toMatchObject({
+      providerType: "github_copilot",
+    });
+    expect(serializedSecrets(draft.settingsConfig)).toEqual([]);
+    expect(profileAllowsEndpointEditing(profile!)).toBe(false);
+  });
+
+  it("materializes the Server-native Codex Kiro surface", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "codex.kiro_oauth",
+    );
+    expect(profile).toBeDefined();
+
+    const draft = createDraftForProfile(profile!);
+    expect(draft.name).toBe("Kiro OAuth");
+    expect(readEndpoint(draft.settingsConfig, "codex")).toBe(
+      "https://q.us-east-1.amazonaws.com",
+    );
+    expect(readUpstreamModel(draft.settingsConfig)).toBe(
+      "claude-sonnet-4-8",
+    );
+    expect(draft.meta.providerType).toBe("kiro_oauth");
+    expect(serializedSecrets(draft.settingsConfig)).toEqual([]);
+  });
+
   it("has an icon-selector preset for every non-custom creatable profile", () => {
     for (const profile of creatable.filter(
       (item) => item.formComposition !== "custom",
@@ -105,6 +142,26 @@ describe("Server Provider profile drafts", () => {
         providerPresetForProfile(profile),
         profile.profileId,
       ).toBeDefined();
+    }
+  });
+
+  it("materializes all Qoder surfaces with the managed-account visual identity", () => {
+    for (const profileId of [
+      "claude.qoder_cosy",
+      "codex.qoder_cosy",
+      "gemini.qoder_cosy",
+    ]) {
+      const profile = providerRegistry.profiles.find(
+        (item) => item.profileId === profileId,
+      );
+      expect(profile, profileId).toBeDefined();
+
+      const draft = createDraftForProfile(profile!);
+      expect(draft.name, profileId).toBe("Qoder COSY");
+      expect(draft.icon, profileId).toBe("qoder");
+      expect(draft.meta.providerType, profileId).toBe("qoder_cosy");
+      expect(readUpstreamModel(draft.settingsConfig), profileId).toBe("auto");
+      expect(serializedSecrets(draft.settingsConfig), profileId).toEqual([]);
     }
   });
 

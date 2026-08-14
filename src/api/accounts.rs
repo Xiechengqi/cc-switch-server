@@ -1605,6 +1605,16 @@ async fn persist_completed_device_login(
         .await;
     drop(managed_auth_operation);
     state.schedule_gemini_v1internal_project_enrichment(account.provider_type, &account.id);
+    if account.provider_type == ProviderType::GitHubCopilot {
+        state
+            .record_copilot_auth_evidence_if_current(
+                &account.id,
+                account.auth_identity_generation,
+                "copilot_device_flow",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+    }
     Ok(account)
 }
 
@@ -1826,6 +1836,215 @@ pub(in crate::api) async fn cancel_kimi_device_login(
     Ok(Json(CancelKimiDeviceLoginResponse {
         ok: true,
         cancelled,
+    }))
+}
+
+pub(in crate::api) async fn start_qoder_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<StartQoderDeviceLoginRequest>,
+) -> Result<Json<StartQoderDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let site = crate::domain::qoder::QoderSite::parse(input.site.as_deref().unwrap_or_default())
+        .map_err(ApiError::bad_request)?;
+    let now = now_ms() as i64;
+    let (device, flow) = crate::clients::oauth::qoder::start_device_flow(site, now)
+        .map_err(map_qoder_client_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    state
+        .insert_qoder_device_flow(device.device_code.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::QoderCosy,
+            device.device_code.clone(),
+            principal.oauth_binding_id(),
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(StartQoderDeviceLoginResponse { ok: true, device }))
+}
+
+pub(in crate::api) async fn poll_qoder_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollQoderDeviceLoginRequest>,
+) -> Result<Json<PollQoderDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
+    let now = now_ms() as i64;
+    require_device_flow_owner(
+        &state,
+        ProviderType::QoderCosy,
+        &input.device_code,
+        &principal_id,
+        now,
+        "Qoder",
+    )
+    .await?;
+    if !state
+        .qoder_device_flow_state_matches(&input.device_code, &input.state, now)
+        .await
+    {
+        return Err(ApiError::unauthorized(
+            "Qoder device flow state is expired or invalid",
+        ));
+    }
+    let lease = state
+        .begin_qoder_device_poll(&input.device_code, now)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("Qoder device flow is expired or unknown"))?;
+    let result = match lease {
+        crate::clients::oauth::qoder::QoderDevicePollLease::Ready(flow) => {
+            let http_client = state.http_client().await;
+            match crate::clients::oauth::qoder::poll_device_flow(
+                &http_client,
+                &flow,
+                &input.state,
+                now,
+            )
+            .await
+            {
+                Ok(result) => {
+                    let completed_at = now_ms() as i64;
+                    if !state
+                        .finish_qoder_device_poll(&input.device_code, result.clone(), completed_at)
+                        .await
+                    {
+                        return Err(ApiError::unauthorized(
+                            "Qoder device flow was cancelled while polling",
+                        ));
+                    }
+                    result
+                }
+                Err(error) => {
+                    let completed_at = now_ms() as i64;
+                    if error.terminal {
+                        let managed_auth_operation = state.lock_managed_auth_operations().await;
+                        state
+                            .fail_qoder_device_poll(&input.device_code, true, completed_at)
+                            .await;
+                        state
+                            .remove_device_flow_for_principal_under_managed_auth_guard(
+                                &managed_auth_operation,
+                                ProviderType::QoderCosy,
+                                &input.device_code,
+                                &principal_id,
+                                completed_at,
+                            )
+                            .await;
+                        drop(managed_auth_operation);
+                    } else {
+                        state
+                            .fail_qoder_device_poll(&input.device_code, false, completed_at)
+                            .await;
+                    }
+                    return Err(map_qoder_client_error(error));
+                }
+            }
+        }
+        crate::clients::oauth::qoder::QoderDevicePollLease::Wait(retry_after_secs) => {
+            return Ok(Json(PollQoderDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_interval_not_elapsed".to_string(),
+                retry_after_secs: Some(retry_after_secs.max(1)),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::qoder::QoderDevicePollLease::InProgress => {
+            return Ok(Json(PollQoderDeviceLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_in_progress".to_string(),
+                retry_after_secs: Some(1),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::qoder::QoderDevicePollLease::Completed(result) => *result,
+    };
+    if result.pending {
+        return Ok(Json(PollQoderDeviceLoginResponse {
+            ok: true,
+            pending: true,
+            message: result.message,
+            retry_after_secs: result.retry_after_secs,
+            account: None,
+        }));
+    }
+    let account_input = result
+        .account_input
+        .clone()
+        .ok_or_else(|| ApiError::bad_gateway("Qoder device flow completed without account"))?;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::QoderCosy,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
+    Ok(Json(PollQoderDeviceLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
+pub(in crate::api) async fn cancel_qoder_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelQoderDeviceLoginRequest>,
+) -> Result<Json<CancelQoderDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancelled = state
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
+            ProviderType::QoderCosy,
+            &input.device_code,
+            &principal.oauth_binding_id(),
+            now_ms() as i64,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(CancelQoderDeviceLoginResponse {
+        ok: true,
+        cancelled,
+    }))
+}
+
+pub(in crate::api) async fn import_qoder_pat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ImportQoderPatRequest>,
+) -> Result<Json<ImportQoderPatResponse>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    let http_client = state.http_client().await;
+    let account_input = crate::clients::oauth::qoder::import_pat(
+        &http_client,
+        &input.personal_token,
+        now_ms() as i64,
+    )
+    .await
+    .map_err(map_qoder_client_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let account = state
+        .try_mutate_accounts_immediate(|store| {
+            manager_for(ProviderType::QoderCosy)
+                .finish_login(store, account_input)
+                .map_err(ApiError::bad_request)
+        })
+        .await
+        .map_err(map_account_write_error)??;
+    drop(managed_auth_operation);
+    Ok(Json(ImportQoderPatResponse {
+        ok: true,
+        account: AccountLoginAccountSummary::from_account(&account),
     }))
 }
 
@@ -2376,6 +2595,30 @@ pub(in crate::api) async fn refresh_account(
         .await
         .ok_or_else(|| ApiError::not_found("account not found"))?;
 
+    if existing.provider_type == ProviderType::GitHubCopilot {
+        ensure_managed_account_outbound_allowed(&state, &existing).await?;
+        state
+            .refresh_copilot_upstream_auth_now(
+                &existing.id,
+                existing.auth_identity_generation,
+                None,
+            )
+            .await
+            .map_err(map_copilot_account_refresh_error)?;
+        let account = state
+            .find_account_by_id(&id)
+            .await
+            .filter(|account| {
+                account.provider_type == existing.provider_type
+                    && account.auth_identity_generation == existing.auth_identity_generation
+            })
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        return Ok(Json(UpsertAccountResponse {
+            ok: true,
+            account: account.into(),
+        }));
+    }
+
     if provider_native_refresh_available(existing.provider_type) {
         ensure_managed_account_outbound_allowed(&state, &existing).await?;
         state
@@ -2416,6 +2659,35 @@ pub(in crate::api) async fn refresh_account(
         ok: true,
         account: account.into(),
     }))
+}
+
+fn map_copilot_account_refresh_error(error: crate::state::CopilotUpstreamAuthError) -> ApiError {
+    use crate::state::CopilotUpstreamAuthError;
+
+    match error {
+        CopilotUpstreamAuthError::NotFound => ApiError::not_found("account not found"),
+        CopilotUpstreamAuthError::IdentityChanged { .. } => ApiError::conflict_code(
+            "cc_switch_account_credentials_changed",
+            "account credentials changed while Copilot token exchange was in progress; retry",
+        ),
+        CopilotUpstreamAuthError::CredentialPersistenceDegraded => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed account credentials are waiting for durable persistence",
+        ),
+        CopilotUpstreamAuthError::MissingGitHubToken { .. } => ApiError::bad_request(
+            "GitHub Copilot account lacks the GitHub OAuth token required for token exchange",
+        ),
+        CopilotUpstreamAuthError::TokenExchange { status_code, .. } => ApiError::new(
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            if matches!(status_code, 401 | 403) {
+                "GitHub credentials were rejected; sign in again"
+            } else if status_code == 429 {
+                "GitHub Copilot token exchange was rate limited; retry later"
+            } else {
+                "GitHub Copilot token exchange failed"
+            },
+        ),
+    }
 }
 
 pub(in crate::api) fn account_refresh_api_error(error: AccountRefreshFailure) -> ApiError {
@@ -2501,6 +2773,18 @@ pub(in crate::api) async fn account_refresh_plan(
             }),
             body_format: crate::domain::accounts::oauth::OAuthRequestBodyFormat::Json,
         }))
+    } else if account.provider_type == ProviderType::GitHubCopilot {
+        Some(redact_oauth_request(OAuthHttpRequest {
+            method: "GET",
+            url: "github-copilot://copilot_internal/v2/token".to_string(),
+            headers: vec![],
+            body: json!({
+                "credential": "github_oauth_token",
+                "result": "short_lived_copilot_token",
+                "binding": "exact_account_and_identity_generation",
+            }),
+            body_format: crate::domain::accounts::oauth::OAuthRequestBodyFormat::Json,
+        }))
     } else {
         build_refresh_request(account.provider_type, &account)
             .ok()
@@ -2514,6 +2798,8 @@ pub(in crate::api) async fn account_refresh_plan(
     let refresh_required = token_expires_soon(&account, now_ms() as i64);
     let message = if account.provider_type == ProviderType::KiroOAuth {
         "Kiro native refresh is dynamic and selected by authMethod; API key credentials do not refresh".to_string()
+    } else if account.provider_type == ProviderType::GitHubCopilot {
+        "GitHub Copilot refresh exchanges the bound account's GitHub OAuth token for a short-lived Copilot token; it never uses the generic OAuth refresh path".to_string()
     } else if spec.is_some_and(|item| item.server_native_refresh_enabled())
         && refresh_request.is_some()
     {
@@ -2981,6 +3267,231 @@ mod tests {
             "OAuth credentials were rejected; sign in again"
         );
         assert!(!error.message.contains("refresh-secret"));
+    }
+
+    #[test]
+    fn copilot_refresh_api_error_does_not_expose_exchange_response() {
+        let error = map_copilot_account_refresh_error(
+            crate::state::CopilotUpstreamAuthError::TokenExchange {
+                status_code: 502,
+                message: "upstream body contained github-oauth-secret and copilot-sub-token"
+                    .to_string(),
+            },
+        );
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.message, "GitHub Copilot token exchange failed");
+        assert!(!error.message.contains("github-oauth-secret"));
+        assert!(!error.message.contains("copilot-sub-token"));
+    }
+
+    #[tokio::test]
+    async fn copilot_refresh_plan_describes_specialized_dual_credential_exchange() {
+        let state = account_api_test_state("copilot-refresh-plan");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-refresh-plan-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "expired-copilot-sub-token",
+                        "refreshToken": "github-oauth-long-lived-secret",
+                        "expiresAt": 1,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "github-oauth-long-lived-secret",
+                            "copilotToken": {"token": "expired-copilot-sub-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+
+        let Json(plan) = account_refresh_plan(
+            State(state),
+            headers,
+            Path("copilot-refresh-plan-account".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(plan.ok);
+        assert_eq!(plan.provider_type, ProviderType::GitHubCopilot);
+        assert!(plan.refresh_required);
+        assert_eq!(
+            plan.server_native_stage,
+            Some(crate::domain::accounts::oauth::OAuthSupportStage::NativeRefreshProfile)
+        );
+        assert_eq!(
+            plan.quota_strategy,
+            Some(crate::domain::accounts::oauth::OAuthQuotaStrategy::ProviderSpecific)
+        );
+        assert_eq!(
+            oauth_provider_spec(ProviderType::GitHubCopilot)
+                .unwrap()
+                .quota_capability,
+            crate::domain::accounts::oauth::OAuthQuotaCapability::LiveRefresh
+        );
+        let request = plan.refresh_request.as_ref().unwrap();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, "github-copilot://copilot_internal/v2/token");
+        assert_eq!(request.body["credential"], "github_oauth_token");
+        assert_eq!(request.body["result"], "short_lived_copilot_token");
+        assert_eq!(
+            request.body["binding"],
+            "exact_account_and_identity_generation"
+        );
+        assert!(request.headers.is_empty());
+        assert!(plan.profile_request.is_none());
+        assert!(plan
+            .message
+            .contains("never uses the generic OAuth refresh path"));
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(!serialized.contains("github-oauth-long-lived-secret"));
+        assert!(!serialized.contains("expired-copilot-sub-token"));
+    }
+
+    #[tokio::test]
+    async fn copilot_account_refresh_api_uses_specialized_exchange_and_caches_sub_token() {
+        #[derive(Clone, Default)]
+        struct Probe {
+            get_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            post_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            authorizations: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        let probe = Probe::default();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let get_probe = probe.clone();
+        let post_probe = probe.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::get(move |headers: HeaderMap| {
+                let probe = get_probe.clone();
+                async move {
+                    probe
+                        .get_requests
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    probe.authorizations.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    Json(json!({
+                        "token": "copilot-refreshed-sub-token",
+                        "expires_at": i64::MAX / 2,
+                        "endpoints": {"api": "https://api.githubcopilot.com"}
+                    }))
+                }
+            })
+            .post(move || {
+                let probe = post_probe.clone();
+                async move {
+                    probe
+                        .post_requests
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "generic refresh must not run"})),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = account_api_test_state("copilot-specialized-refresh");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-specialized-refresh-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "copilot-old-sub-token",
+                        "refreshToken": "github-oauth-for-refresh",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "github-oauth-for-refresh",
+                            "copilotToken": {"token": "copilot-old-sub-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com",
+                            "testCopilotTokenUrl": token_url
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+
+        let Json(response) = refresh_account(
+            State(state.clone()),
+            headers,
+            Path("copilot-specialized-refresh-account".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.account.provider_type, ProviderType::GitHubCopilot);
+        assert_eq!(response.account.auth_identity_generation, 1);
+        assert_eq!(
+            probe.get_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            probe
+                .post_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            probe.authorizations.lock().unwrap().as_slice(),
+            ["token github-oauth-for-refresh"]
+        );
+        let cached = state
+            .prepare_copilot_upstream_auth("copilot-specialized-refresh-account", 1)
+            .await
+            .unwrap();
+        assert_eq!(cached.token, "copilot-refreshed-sub-token");
+        assert_eq!(cached.api_endpoint, "https://api.githubcopilot.com");
+        assert_eq!(
+            probe.get_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the freshly exchanged sub-token must be reused from the account-scoped cache"
+        );
+        let account = state
+            .find_account_by_id("copilot-specialized-refresh-account")
+            .await
+            .unwrap();
+        assert_eq!(account.auth_identity_generation, 1);
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("github-oauth-for-refresh")
+        );
+        server.abort();
     }
 
     #[tokio::test]

@@ -116,6 +116,7 @@ function quotaQueryRoot(providerType: string): string | null {
     case "codex_oauth":
     case "grok_oauth":
     case "kiro_oauth":
+    case "qoder_cosy":
     case "antigravity_oauth":
     case "agy_oauth":
       return providerType;

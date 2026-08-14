@@ -536,6 +536,42 @@ pub(in crate::api) async fn provider_health(
     }))
 }
 
+pub(in crate::api) async fn get_coding_plan_quota(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderResourceQuery>,
+) -> Result<Json<CodingPlanQuotaResponse>, ApiError> {
+    coding_plan_quota_response(state, headers, id, query.app, false).await
+}
+
+pub(in crate::api) async fn refresh_coding_plan_quota(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderResourceQuery>,
+) -> Result<Json<CodingPlanQuotaResponse>, ApiError> {
+    coding_plan_quota_response(state, headers, id, query.app, true).await
+}
+
+async fn coding_plan_quota_response(
+    state: ServerState,
+    headers: HeaderMap,
+    provider_id: String,
+    app: AppKind,
+    force_refresh: bool,
+) -> Result<Json<CodingPlanQuotaResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_key = crate::domain::providers::registry::ProviderKey::new(app, provider_id)
+        .map_err(ApiError::bad_request)?;
+    let snapshot = state
+        .coding_plan_quota_snapshot(provider_key, force_refresh)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    Ok(Json(CodingPlanQuotaResponse { ok: true, snapshot }))
+}
+
 pub(in crate::api) async fn provider_storage_migration(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -746,6 +782,7 @@ pub(in crate::api) async fn test_provider_inner(
     let requested_stream = query.stream.unwrap_or(false);
     let model = provider_test_model(stored.app, stored, query.model.as_deref(), Some(&defaults));
     let gemini_path = default_gemini_test_path(stored.app, &model, requested_stream);
+    let grok_reconciliation_before = grok_reconciliation_snapshot(state, &execution).await;
     if let Err(error) =
         execution.ensure_operation_supported(proxy::provider_ops::ProviderOperation::Test)
     {
@@ -770,6 +807,17 @@ pub(in crate::api) async fn test_provider_inner(
                 network_latency_ms: None,
                 network_stream_completed: None,
                 network_error: Some(error.message.clone()),
+                reconciliation: grok_reconciliation_report(
+                    &execution,
+                    grok_reconciliation_before.as_ref(),
+                    grok_reconciliation_before.as_ref(),
+                    true,
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
                 message: error.message,
             });
         }
@@ -796,8 +844,82 @@ pub(in crate::api) async fn test_provider_inner(
             network_latency_ms: None,
             network_stream_completed: None,
             network_error: Some(message.clone()),
+            reconciliation: grok_reconciliation_report(
+                &execution,
+                grok_reconciliation_before.as_ref(),
+                grok_reconciliation_before.as_ref(),
+                true,
+                false,
+                None,
+                None,
+                None,
+                false,
+            ),
             message,
         });
+    }
+    if let Some(snapshot) = grok_reconciliation_before.as_ref() {
+        let blocking = snapshot.binding_status != GrokBindingStatus::Current
+            || matches!(
+                snapshot.credential_reason.as_str(),
+                "account_requires_relogin"
+                    | "access_and_refresh_token_missing"
+                    | "expired_access_token_without_refresh"
+            );
+        let dry_run_actionable = !query.network.unwrap_or(false)
+            && snapshot.credential_action != GrokCredentialAction::None;
+        if blocking || dry_run_actionable {
+            let outcome = if blocking {
+                match snapshot.binding_status {
+                    GrokBindingStatus::Current => ProviderOperationOutcome::Auth,
+                    _ => ProviderOperationOutcome::InvalidConfig,
+                }
+            } else {
+                ProviderOperationOutcome::Success
+            };
+            let message = if blocking {
+                "Grok Provider binding or credential is not executable; rebind or sign in again"
+                    .to_string()
+            } else {
+                format!(
+                    "configuration dry-run completed; planned credential action: {}",
+                    snapshot.credential_reason
+                )
+            };
+            return Ok(TestProviderResponse {
+                ok: !blocking,
+                outcome,
+                driver_id: execution.plan.driver_id.to_string(),
+                runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+                provider_id: stored.provider.id.clone(),
+                app: stored.app,
+                provider_type: stored.provider_type,
+                provider_revision: stored.resource.revision,
+                adapter: capability.adapter,
+                support: capability.support,
+                endpoint: redact_provider_endpoint(&execution.plan.endpoint),
+                model,
+                stream: requested_stream,
+                header_names: Vec::new(),
+                network_checked: false,
+                network_status_code: None,
+                network_latency_ms: None,
+                network_stream_completed: None,
+                network_error: blocking.then(|| snapshot.credential_reason.clone()),
+                reconciliation: grok_reconciliation_report(
+                    &execution,
+                    Some(snapshot),
+                    Some(snapshot),
+                    true,
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                message,
+            });
+        }
     }
 
     if query.network.unwrap_or(false) {
@@ -805,14 +927,57 @@ pub(in crate::api) async fn test_provider_inner(
         if let Some((provider_type, account_id, expected_generation)) =
             execution.managed_account_identity_target()
         {
-            state
+            let refresh_result = state
                 .refresh_managed_account_if_needed_for_generation(
                     provider_type,
                     account_id,
                     expected_generation,
                 )
-                .await
-                .map_err(map_managed_account_refresh_error)?;
+                .await;
+            if let Err(error) = refresh_result {
+                if provider_type != ProviderType::GrokOAuth {
+                    return Err(map_managed_account_refresh_error(error));
+                }
+                let outcome = grok_refresh_failure_outcome(&error);
+                let public_error = map_managed_account_refresh_error(error);
+                let message = public_error.message;
+                let status = public_error.status.as_u16();
+                let grok_reconciliation_after =
+                    grok_reconciliation_snapshot(state, &execution).await;
+                return Ok(TestProviderResponse {
+                    ok: false,
+                    outcome,
+                    driver_id: execution.plan.driver_id.to_string(),
+                    runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+                    provider_id: stored.provider.id.clone(),
+                    app: stored.app,
+                    provider_type: stored.provider_type,
+                    provider_revision: stored.resource.revision,
+                    adapter: capability.adapter,
+                    support: capability.support,
+                    endpoint: redact_provider_endpoint(&execution.plan.endpoint),
+                    model,
+                    stream: requested_stream,
+                    header_names: Vec::new(),
+                    network_checked: false,
+                    network_status_code: None,
+                    network_latency_ms: None,
+                    network_stream_completed: None,
+                    network_error: Some(message.clone()),
+                    reconciliation: grok_reconciliation_report(
+                        &execution,
+                        grok_reconciliation_before.as_ref(),
+                        grok_reconciliation_after.as_ref(),
+                        false,
+                        false,
+                        Some(status),
+                        None,
+                        Some(&message),
+                        false,
+                    ),
+                    message,
+                });
+            }
             if matches!(
                 provider_type,
                 ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
@@ -892,6 +1057,9 @@ pub(in crate::api) async fn test_provider_inner(
                 &mut target_headers,
             )
             .map_err(ApiError::proxy)?;
+        execution
+            .guard_coding_plan_request(route, &adapter_request, &endpoint)
+            .map_err(ApiError::proxy)?;
         (adapter_request, endpoint, target_headers)
     };
     let stream = adapter_request.upstream_stream_requested || requested_stream;
@@ -899,6 +1067,7 @@ pub(in crate::api) async fn test_provider_inner(
     let mut network_latency_ms = None;
     let mut network_error = None;
     let mut network_stream_completed = None;
+    let mut grok_model_rejected = false;
     if query.network.unwrap_or(false) {
         let started = std::time::Instant::now();
         let http_client = state.http_client().await;
@@ -944,6 +1113,7 @@ pub(in crate::api) async fn test_provider_inner(
                     .await
                     {
                         Ok(body) => {
+                            grok_model_rejected = grok_probe_model_rejected(status, body.as_ref());
                             network_error =
                                 Some(redact_provider_test_error(&String::from_utf8_lossy(&body)));
                         }
@@ -997,7 +1167,19 @@ pub(in crate::api) async fn test_provider_inner(
     } else {
         "configuration check passed; upstream network/model call is not executed".to_string()
     };
+    let grok_reconciliation_after = grok_reconciliation_snapshot(state, &execution).await;
 
+    let reconciliation = grok_reconciliation_report(
+        &execution,
+        grok_reconciliation_before.as_ref(),
+        grok_reconciliation_after.as_ref(),
+        !query.network.unwrap_or(false),
+        query.network.unwrap_or(false),
+        network_status_code,
+        network_stream_completed,
+        network_error.as_deref(),
+        grok_model_rejected,
+    );
     Ok(TestProviderResponse {
         ok,
         outcome,
@@ -1021,8 +1203,280 @@ pub(in crate::api) async fn test_provider_inner(
         network_latency_ms,
         network_stream_completed,
         network_error,
+        reconciliation,
         message,
     })
+}
+
+#[derive(Debug, Clone)]
+struct GrokReconciliationSnapshot {
+    binding_status: GrokBindingStatus,
+    credential_action: GrokCredentialAction,
+    credential_reason: String,
+    expected_auth_identity_generation: Option<u64>,
+    observed_auth_identity_generation: Option<u64>,
+    token_refresh_generation: Option<u64>,
+    capability_evidence:
+        Option<crate::domain::accounts::capability_evidence::AccountCapabilityProjection>,
+}
+
+async fn grok_reconciliation_snapshot(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+) -> Option<GrokReconciliationSnapshot> {
+    if execution.stored.provider_type != ProviderType::GrokOAuth {
+        return None;
+    }
+    let (account_id, expected_generation) = match &execution.plan.auth_ref {
+        crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+            account_id,
+            expected_provider_type: ProviderType::GrokOAuth,
+            auth_identity_generation,
+        } if !account_id.trim().is_empty() => {
+            (account_id.as_str(), Some(*auth_identity_generation))
+        }
+        _ => {
+            return Some(GrokReconciliationSnapshot {
+                binding_status: GrokBindingStatus::MissingBinding,
+                credential_action: GrokCredentialAction::Relogin,
+                credential_reason: "managed_account_binding_missing".to_string(),
+                expected_auth_identity_generation: None,
+                observed_auth_identity_generation: None,
+                token_refresh_generation: None,
+                capability_evidence: None,
+            });
+        }
+    };
+    let Some(account) = state.find_account_by_id(account_id).await else {
+        return Some(GrokReconciliationSnapshot {
+            binding_status: GrokBindingStatus::MissingAccount,
+            credential_action: GrokCredentialAction::Relogin,
+            credential_reason: "bound_account_missing".to_string(),
+            expected_auth_identity_generation: expected_generation,
+            observed_auth_identity_generation: None,
+            token_refresh_generation: None,
+            capability_evidence: None,
+        });
+    };
+    let binding_status = if account.provider_type != ProviderType::GrokOAuth {
+        GrokBindingStatus::ProviderTypeMismatch
+    } else if expected_generation != Some(account.auth_identity_generation) {
+        GrokBindingStatus::StaleIdentity
+    } else {
+        GrokBindingStatus::Current
+    };
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let (credential_action, credential_reason) =
+        grok_credential_reconciliation(&account, binding_status, now_ms);
+    let capability_evidence =
+        crate::domain::accounts::capability_evidence::account_capability_projections(
+            &account, now_ms,
+        )
+        .into_iter()
+        .find(|projection| {
+            projection.capability
+                == crate::domain::accounts::capability_evidence::GROK_CODE_PLAN_CAPABILITY
+        });
+    Some(GrokReconciliationSnapshot {
+        binding_status,
+        credential_action,
+        credential_reason: credential_reason.to_string(),
+        expected_auth_identity_generation: expected_generation,
+        observed_auth_identity_generation: Some(account.auth_identity_generation),
+        token_refresh_generation: Some(account.token_refresh_generation),
+        capability_evidence,
+    })
+}
+
+fn grok_credential_reconciliation(
+    account: &crate::domain::accounts::store::Account,
+    binding_status: GrokBindingStatus,
+    now_ms: i64,
+) -> (GrokCredentialAction, &'static str) {
+    if binding_status != GrokBindingStatus::Current {
+        return (GrokCredentialAction::Relogin, "binding_not_current");
+    }
+    if account.needs_relogin {
+        return (GrokCredentialAction::Relogin, "account_requires_relogin");
+    }
+    let access_token_missing = account
+        .access_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty());
+    let refresh_token_missing = !crate::clients::oauth::refresh::account_has_refresh_token(account);
+    if access_token_missing && refresh_token_missing {
+        return (
+            GrokCredentialAction::Relogin,
+            "access_and_refresh_token_missing",
+        );
+    }
+    if refresh_token_missing {
+        if account
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now_ms)
+        {
+            return (
+                GrokCredentialAction::Relogin,
+                "expired_access_token_without_refresh",
+            );
+        }
+        return (GrokCredentialAction::Relogin, "refresh_token_missing");
+    }
+    if access_token_missing {
+        return (GrokCredentialAction::Refresh, "access_token_missing");
+    }
+    if account.expires_at.is_none() {
+        return (GrokCredentialAction::Refresh, "access_token_expiry_missing");
+    }
+    if crate::clients::oauth::refresh::account_needs_native_refresh(account, now_ms) {
+        return (GrokCredentialAction::Refresh, "access_token_expires_soon");
+    }
+    (GrokCredentialAction::None, "credentials_current")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grok_reconciliation_report(
+    execution: &proxy::provider_ops::ProviderExecution,
+    before: Option<&GrokReconciliationSnapshot>,
+    after: Option<&GrokReconciliationSnapshot>,
+    read_only: bool,
+    probe_checked: bool,
+    network_status_code: Option<u16>,
+    network_stream_completed: Option<bool>,
+    network_error: Option<&str>,
+    model_rejected: bool,
+) -> Option<GrokProviderReconciliationReport> {
+    let before = before?;
+    let after = after.unwrap_or(before);
+    let successful_probe = probe_checked
+        && network_status_code.is_some_and(|status| (200..300).contains(&status))
+        && network_stream_completed.unwrap_or(true)
+        && network_error.is_none();
+    let model_rejected = probe_checked && model_rejected;
+    let endpoint_rejected =
+        probe_checked && matches!(network_status_code, Some(404 | 405)) && !model_rejected;
+    let status = |unsupported: bool| {
+        if !probe_checked {
+            GrokProbeCapabilityStatus::NotChecked
+        } else if successful_probe {
+            GrokProbeCapabilityStatus::Supported
+        } else if unsupported {
+            GrokProbeCapabilityStatus::Unsupported
+        } else {
+            GrokProbeCapabilityStatus::Inconclusive
+        }
+    };
+    let endpoint_is_expected = execution.plan.endpoint.trim_end_matches('/')
+        == crate::proxy::grok_fixed_api_base_url().trim_end_matches('/');
+    let endpoint_policy_status = if endpoint_is_expected
+        && execution
+            .plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("fixed endpoint policy ignored"))
+    {
+        GrokEndpointPolicyStatus::ConfiguredOverrideIgnored
+    } else if endpoint_is_expected {
+        GrokEndpointPolicyStatus::Expected
+    } else {
+        GrokEndpointPolicyStatus::UnexpectedRuntimeEndpoint
+    };
+    let identity_stable = before.binding_status == GrokBindingStatus::Current
+        && after.binding_status == GrokBindingStatus::Current
+        && before.expected_auth_identity_generation == before.observed_auth_identity_generation
+        && before.observed_auth_identity_generation == after.observed_auth_identity_generation;
+    let refresh_performed = identity_stable
+        && before
+            .token_refresh_generation
+            .zip(after.token_refresh_generation)
+            .is_some_and(|(before, after)| after > before);
+    Some(GrokProviderReconciliationReport {
+        read_only,
+        binding_status_before: before.binding_status,
+        binding_status_after: after.binding_status,
+        planned_credential_action: before.credential_action,
+        planned_credential_reason: before.credential_reason.clone(),
+        remaining_credential_action: after.credential_action,
+        remaining_credential_reason: after.credential_reason.clone(),
+        expected_auth_identity_generation: before.expected_auth_identity_generation,
+        observed_auth_identity_generation_before: before.observed_auth_identity_generation,
+        observed_auth_identity_generation_after: after.observed_auth_identity_generation,
+        token_refresh_generation_before: before.token_refresh_generation,
+        token_refresh_generation_after: after.token_refresh_generation,
+        refresh_performed,
+        identity_stable,
+        endpoint_policy_status,
+        responses_endpoint_status: status(endpoint_rejected),
+        model_status: status(model_rejected),
+        capability_evidence: after.capability_evidence.clone(),
+    })
+}
+
+fn grok_probe_model_rejected(status: u16, body: &[u8]) -> bool {
+    if !matches!(status, 400 | 403 | 404 | 422) || body.is_empty() {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let mut evidence = Vec::new();
+    for pointer in [
+        "/error/code",
+        "/error/type",
+        "/error/message",
+        "/code",
+        "/type",
+        "/message",
+        "/detail",
+    ] {
+        if let Some(value) = payload.pointer(pointer).and_then(serde_json::Value::as_str) {
+            let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+            if !normalized.is_empty() {
+                evidence.push(normalized);
+            }
+        }
+    }
+    evidence.iter().any(|value| {
+        matches!(
+            value.as_str(),
+            "model_not_found"
+                | "unknown_model"
+                | "unsupported_model"
+                | "model_unsupported"
+                | "invalid_model"
+        ) || value.contains("model_not_found")
+            || value.contains("model_was_not_found")
+            || value.contains("requested_model_not_found")
+            || value.contains("unknown_model")
+            || value.contains("unsupported_model")
+            || value.contains("model_is_not_supported")
+            || value.contains("does_not_support_model")
+            || value.contains("model_does_not_exist")
+            || value.contains("invalid_model")
+    })
+}
+
+fn grok_refresh_failure_outcome(
+    error: &crate::state::ManagedAccountRefreshError,
+) -> ProviderOperationOutcome {
+    use crate::state::ManagedAccountRefreshError;
+
+    match error {
+        ManagedAccountRefreshError::Conflict { .. }
+        | ManagedAccountRefreshError::InactiveCodexAccount
+        | ManagedAccountRefreshError::IdentityChanged { .. }
+        | ManagedAccountRefreshError::NotFound => ProviderOperationOutcome::InvalidConfig,
+        ManagedAccountRefreshError::CredentialPersistenceDegraded => {
+            ProviderOperationOutcome::Upstream
+        }
+        ManagedAccountRefreshError::Refresh { status_code, .. } => match status_code {
+            400 | 401 | 403 => ProviderOperationOutcome::Auth,
+            408 => ProviderOperationOutcome::Timeout,
+            429 => ProviderOperationOutcome::RateLimit,
+            500..=599 => ProviderOperationOutcome::Upstream,
+            _ => ProviderOperationOutcome::Protocol,
+        },
+    }
 }
 
 fn provider_test_outcome(
@@ -1164,6 +1618,26 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .ensure_operation_supported(proxy::provider_ops::ProviderOperation::Discovery)
         .map_err(ApiError::proxy)?;
+    if let Some(contract) = execution.plan.coding_plan.as_ref() {
+        return Ok(ProviderModelsFetchResult {
+            url: format!("registry://{}/models", execution.plan.profile_id),
+            models: contract
+                .models
+                .iter()
+                .map(|model| FetchedProviderModel {
+                    id: model.id.clone(),
+                    upstream_model: model.id.clone(),
+                    display_name: Some(model.display_name.clone()),
+                    raw: serde_json::to_value(model).unwrap_or(Value::Null),
+                })
+                .collect(),
+            source: Some("registry_coding_plan".to_string()),
+            stale: Some(false),
+            fetched_at_ms: chrono::DateTime::parse_from_rfc3339(&contract.pricing.captured_at)
+                .ok()
+                .map(|value| value.timestamp_millis()),
+        });
+    }
     if stored.provider_type == ProviderType::ClaudeOAuth
         && execution.driver_is("oauth.claude_messages")
     {
@@ -1172,6 +1646,43 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         ));
     }
     ensure_provider_outbound_allowed(state, execution).await?;
+    if stored.provider_type == ProviderType::GitHubCopilot {
+        let (account_id, expected_generation) = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::GitHubCopilot,
+                auth_identity_generation,
+            } if execution.driver_is("special.copilot") && !account_id.trim().is_empty() => {
+                (account_id.as_str(), *auth_identity_generation)
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "github_copilot model discovery requires one explicit managed account binding",
+                ));
+            }
+        };
+        let timeout = timeout_ms
+            .filter(|value| *value > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| execution.request_timeout());
+        #[cfg(test)]
+        let models_url_override = execution
+            .plan
+            .driver_options
+            .get("testCopilotModelsUrl")
+            .and_then(Value::as_str);
+        let catalog = state
+            .copilot_model_catalog(
+                account_id,
+                expected_generation,
+                timeout,
+                #[cfg(test)]
+                models_url_override,
+            )
+            .await
+            .map_err(copilot_model_catalog_error_to_api_error)?;
+        return Ok(copilot_provider_models_fetch_result(catalog));
+    }
     if stored.provider_type == ProviderType::KiroOAuth {
         let managed_binding = match &execution.plan.auth_ref {
             crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
@@ -1183,9 +1694,9 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             }
             _ => None,
         };
-        let mut result_url = "static://kiro/models".to_string();
+        let mut result_url = "unavailable://kiro/models".to_string();
         let catalog = match managed_binding {
-            None => crate::clients::oauth::kiro_runtime::static_model_catalog(
+            None => crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
                 "managed_account_binding_unavailable",
             ),
             Some((account_id, expected_generation)) => {
@@ -1198,7 +1709,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                     .await;
                 if let Err(error) = refresh {
                     tracing::warn!(error = ?error, "Kiro model discovery token refresh failed");
-                    crate::clients::oauth::kiro_runtime::static_model_catalog(
+                    crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
                         "token_refresh_failed",
                     )
                 } else if let Some(account) = state
@@ -1219,7 +1730,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                         .or_else(|| {
                             crate::clients::oauth::kiro_runtime::model_discovery_url(&account).ok()
                         })
-                        .unwrap_or_else(|| "static://kiro/models".to_string());
+                        .unwrap_or_else(|| "unavailable://kiro/models".to_string());
                     let timeout = timeout_ms
                         .filter(|value| *value > 0)
                         .map(std::time::Duration::from_millis)
@@ -1232,7 +1743,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                     )
                     .await
                 } else {
-                    crate::clients::oauth::kiro_runtime::static_model_catalog(
+                    crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
                         "bound_account_unavailable",
                     )
                 }
@@ -1384,6 +1895,50 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     })
 }
 
+fn copilot_model_catalog_error_to_api_error(
+    error: crate::state::CopilotModelCatalogError,
+) -> ApiError {
+    match error {
+        crate::state::CopilotModelCatalogError::Auth(error) => {
+            let (status, message) = match error {
+                crate::state::CopilotUpstreamAuthError::NotFound => (
+                    axum::http::StatusCode::NOT_FOUND,
+                    "github_copilot managed account not found".to_string(),
+                ),
+                crate::state::CopilotUpstreamAuthError::IdentityChanged { .. } => (
+                    axum::http::StatusCode::CONFLICT,
+                    "github_copilot account identity changed during model discovery".to_string(),
+                ),
+                crate::state::CopilotUpstreamAuthError::CredentialPersistenceDegraded => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "managed account credentials are waiting for durable persistence".to_string(),
+                ),
+                crate::state::CopilotUpstreamAuthError::MissingGitHubToken { .. } => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "github_copilot managed account lacks its GitHub OAuth token".to_string(),
+                ),
+                crate::state::CopilotUpstreamAuthError::TokenExchange {
+                    status_code,
+                    message,
+                } => (
+                    axum::http::StatusCode::from_u16(status_code)
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                    format!("github_copilot token exchange failed: {message}"),
+                ),
+            };
+            ApiError::new(status, message)
+        }
+        crate::state::CopilotModelCatalogError::Discovery {
+            status_code,
+            message,
+        } => ApiError::new(
+            axum::http::StatusCode::from_u16(status_code)
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+            format!("github_copilot model discovery failed: {message}"),
+        ),
+    }
+}
+
 async fn read_provider_control_response_body(
     response: &mut reqwest::Response,
     limit: usize,
@@ -1434,6 +1989,36 @@ fn grok_provider_models_fetch_result(
         .collect();
     ProviderModelsFetchResult {
         url: url.to_string(),
+        models,
+        source: Some(catalog.source.to_string()),
+        stale: Some(catalog.stale),
+        fetched_at_ms: catalog.fetched_at_ms,
+    }
+}
+
+fn copilot_provider_models_fetch_result(
+    catalog: crate::clients::oauth::copilot_models::CopilotModelCatalog,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .models
+        .iter()
+        .map(|id| FetchedProviderModel {
+            id: id.clone(),
+            upstream_model: id.clone(),
+            display_name: None,
+            raw: serde_json::json!({
+                "id": id,
+                "object": "model",
+                "owned_by": "github",
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: catalog
+            .api_origin
+            .as_deref()
+            .map(|origin| format!("{origin}/models"))
+            .unwrap_or_else(|| "static://github-copilot/models".to_string()),
         models,
         source: Some(catalog.source.to_string()),
         stale: Some(catalog.stale),
@@ -1635,8 +2220,12 @@ fn s1_provider_for_profile(
                 "env": {"ANTHROPIC_BASE_URL": "https://cloudcode-pa.googleapis.com"}
             }),
         ),
+        "codex.github_copilot" => ("GitHub Copilot", json!({})),
         "codex.kiro_oauth" => ("Kiro OAuth", json!({})),
         "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi Code", json!({})),
+        "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => ("Qoder COSY", json!({})),
+        "gemini.cursor_api_key" => ("Cursor API Key", json!({})),
+        "gemini.cursor_oauth" => ("Cursor OAuth", json!({})),
         "codex.openai_api_key" => (
             "OpenAI API Key",
             json!({
@@ -1649,6 +2238,7 @@ fn s1_provider_for_profile(
         "claude.custom_http" | "codex.custom_http" | "gemini.custom_http" => {
             ("Custom Provider", json!({}))
         }
+        _ if profile.coding_plan.is_some() => (profile.label.as_str(), json!({})),
         _ => {
             return Err(ApiError::bad_request(
                 "Provider profile does not have an S1 creation bridge",
@@ -2228,6 +2818,476 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grok_reconciliation_classifies_credentials_and_probe_drift() {
+        let now_ms = 1_000_000;
+        let mut account: crate::domain::accounts::store::Account = serde_json::from_value(json!({
+            "id": "grok-reconcile-account",
+            "providerType": "grok_oauth",
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "expiresAt": now_ms + 3_600_000
+        }))
+        .unwrap();
+        assert_eq!(
+            grok_credential_reconciliation(&account, GrokBindingStatus::Current, now_ms),
+            (GrokCredentialAction::None, "credentials_current")
+        );
+        account.expires_at = None;
+        assert_eq!(
+            grok_credential_reconciliation(&account, GrokBindingStatus::Current, now_ms),
+            (GrokCredentialAction::Refresh, "access_token_expiry_missing")
+        );
+        account.expires_at = Some(now_ms + 1_000);
+        assert_eq!(
+            grok_credential_reconciliation(&account, GrokBindingStatus::Current, now_ms),
+            (GrokCredentialAction::Refresh, "access_token_expires_soon")
+        );
+        account.refresh_token = None;
+        account.expires_at = Some(now_ms - 1);
+        assert_eq!(
+            grok_credential_reconciliation(&account, GrokBindingStatus::Current, now_ms),
+            (
+                GrokCredentialAction::Relogin,
+                "expired_access_token_without_refresh"
+            )
+        );
+        assert_eq!(
+            grok_credential_reconciliation(&account, GrokBindingStatus::StaleIdentity, now_ms),
+            (GrokCredentialAction::Relogin, "binding_not_current")
+        );
+        assert!(grok_probe_model_rejected(
+            404,
+            br#"{"error":{"code":"model_not_found","message":"requested model was not found"}}"#
+        ));
+        assert!(grok_probe_model_rejected(
+            400,
+            br#"{"detail":"Unknown model grok-retired"}"#
+        ));
+        assert!(grok_probe_model_rejected(
+            403,
+            br#"{"error":{"type":"unsupported_model"}}"#
+        ));
+        assert!(!grok_probe_model_rejected(
+            404,
+            br#"{"error":{"message":"endpoint not found"}}"#
+        ));
+        assert!(!grok_probe_model_rejected(
+            403,
+            br#"{"error":{"message":"subscription entitlement required"}}"#
+        ));
+        assert!(!grok_probe_model_rejected(404, b"404 page not found"));
+        assert!(!grok_probe_model_rejected(
+            500,
+            br#"{"error":{"code":"model_not_found"}}"#
+        ));
+    }
+
+    async fn install_grok_reconciliation_test_provider(
+        state: &ServerState,
+        endpoint: String,
+        token_url: String,
+    ) -> proxy::provider_ops::ProviderExecution {
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "grok-reconciliation-account",
+                        "providerType": "grok_oauth",
+                        "accessToken": "grok-reconciliation-old-access",
+                        "refreshToken": "grok-reconciliation-refresh",
+                        "expiresAt": 1,
+                        "profile": {
+                            "verifiedGrokClaims": {"subject": "grok-reconciliation-subject"}
+                        },
+                        "raw": {"testOAuthTokenUrl": token_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-reconciliation-provider".to_string(),
+                        name: "Grok reconciliation provider".to_string(),
+                        settings_config: json!({"testRuntimeEndpoint": endpoint}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-reconciliation-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        resolve_provider_execution_by_key(state, AppKind::Codex, "grok-reconciliation-provider")
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn grok_provider_reconciliation_dry_run_is_local_and_network_refresh_is_generation_safe()
+    {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let response_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let response_requests_for_route = std::sync::Arc::clone(&response_requests);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({
+                            "access_token": "grok-reconciliation-new-access",
+                            "refresh_token": "grok-reconciliation-rotated-refresh",
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/responses",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let requests = std::sync::Arc::clone(&response_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(
+                            headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer grok-reconciliation-new-access")
+                        );
+                        axum::Json(json!({
+                            "id": "resp-reconciliation",
+                            "object": "response",
+                            "status": "completed",
+                            "output": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                axum::routing::post({
+                    let response_requests = std::sync::Arc::clone(&response_requests);
+                    move |headers: HeaderMap| {
+                        let requests = std::sync::Arc::clone(&response_requests);
+                        async move {
+                            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            assert_eq!(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("Bearer grok-reconciliation-new-access")
+                            );
+                            axum::Json(json!({
+                                "id": "resp-reconciliation",
+                                "object": "response",
+                                "status": "completed",
+                                "output": []
+                            }))
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = provider_api_test_state("grok-reconciliation");
+        let execution = install_grok_reconciliation_test_provider(
+            &state,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+        )
+        .await;
+        let dry_run = test_provider_inner(
+            &state,
+            execution.clone(),
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(false),
+                timeout_ms: Some(2_000),
+                model: Some("grok-4.5".to_string()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(dry_run.ok);
+        let report = dry_run.reconciliation.unwrap();
+        assert!(report.read_only);
+        assert_eq!(report.binding_status_before, GrokBindingStatus::Current);
+        assert_eq!(
+            report.planned_credential_action,
+            GrokCredentialAction::Refresh
+        );
+        assert_eq!(
+            report.planned_credential_reason,
+            "access_token_expires_soon"
+        );
+        assert!(!report.refresh_performed);
+        assert_eq!(
+            report.responses_endpoint_status,
+            GrokProbeCapabilityStatus::NotChecked
+        );
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            response_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let network = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(true),
+                timeout_ms: Some(2_000),
+                model: Some("grok-4.5".to_string()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            network.ok,
+            "message={:?} status={:?} error={:?} endpoint={} token_requests={} response_requests={}",
+            network.message,
+            network.network_status_code,
+            network.network_error,
+            network.endpoint,
+            token_requests.load(std::sync::atomic::Ordering::SeqCst),
+            response_requests.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let report = network.reconciliation.unwrap();
+        assert!(!report.read_only);
+        assert_eq!(report.binding_status_after, GrokBindingStatus::Current);
+        assert_eq!(
+            report.remaining_credential_action,
+            GrokCredentialAction::None
+        );
+        assert!(report.refresh_performed);
+        assert!(report.identity_stable);
+        assert_eq!(report.expected_auth_identity_generation, Some(1));
+        assert_eq!(report.observed_auth_identity_generation_before, Some(1));
+        assert_eq!(report.observed_auth_identity_generation_after, Some(1));
+        assert!(
+            report.token_refresh_generation_after.unwrap()
+                > report.token_refresh_generation_before.unwrap()
+        );
+        assert_eq!(
+            report.responses_endpoint_status,
+            GrokProbeCapabilityStatus::Supported
+        );
+        assert_eq!(report.model_status, GrokProbeCapabilityStatus::Supported);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            response_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_provider_reconciliation_refresh_rejection_is_structured_and_stops_before_probe() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let response_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let response_requests_for_route = std::sync::Arc::clone(&response_requests);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({
+                                "error": "invalid_grant",
+                                "error_description": "rejected grok-reconciliation-refresh secret"
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/responses",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&response_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({"status": "must-not-be-requested"}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                axum::routing::post({
+                    let response_requests = std::sync::Arc::clone(&response_requests);
+                    move || {
+                        let requests = std::sync::Arc::clone(&response_requests);
+                        async move {
+                            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::Json(json!({"status": "must-not-be-requested"}))
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = provider_api_test_state("grok-reconciliation-refresh-rejected");
+        let execution = install_grok_reconciliation_test_provider(
+            &state,
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+        )
+        .await;
+
+        let response = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(true),
+                timeout_ms: Some(2_000),
+                model: Some("grok-4.5".to_string()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(response.outcome, ProviderOperationOutcome::Auth);
+        assert!(!response.network_checked);
+        assert_eq!(response.network_status_code, None);
+        assert!(response.header_names.is_empty());
+        assert_eq!(
+            response.network_error.as_deref(),
+            Some("managed account refresh was rejected; sign in again")
+        );
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains("error_description"));
+        assert!(!serialized.contains("rejected grok-reconciliation-refresh secret"));
+        assert!(!serialized.contains("grok-reconciliation-old-access"));
+        let report = response.reconciliation.unwrap();
+        assert!(!report.read_only);
+        assert_eq!(report.binding_status_before, GrokBindingStatus::Current);
+        assert_eq!(report.binding_status_after, GrokBindingStatus::Current);
+        assert_eq!(
+            report.planned_credential_action,
+            GrokCredentialAction::Refresh
+        );
+        assert_eq!(
+            report.remaining_credential_action,
+            GrokCredentialAction::Refresh
+        );
+        assert_eq!(
+            report.remaining_credential_reason,
+            "access_token_expires_soon"
+        );
+        assert!(!report.refresh_performed);
+        assert!(report.identity_stable);
+        assert_eq!(report.expected_auth_identity_generation, Some(1));
+        assert_eq!(report.observed_auth_identity_generation_before, Some(1));
+        assert_eq!(report.observed_auth_identity_generation_after, Some(1));
+        assert_eq!(
+            report.token_refresh_generation_before,
+            report.token_refresh_generation_after
+        );
+        assert_eq!(
+            report.responses_endpoint_status,
+            GrokProbeCapabilityStatus::NotChecked
+        );
+        assert_eq!(report.model_status, GrokProbeCapabilityStatus::NotChecked);
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            response_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let account = state
+            .find_account_by_id("grok-reconciliation-account")
+            .await
+            .unwrap();
+        assert_eq!(account.refresh_consecutive_failures, 1);
+        assert!(!account.needs_relogin);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_provider_reconciliation_stale_identity_blocks_before_network() {
+        let state = provider_api_test_state("grok-reconciliation-stale");
+        let execution = install_grok_reconciliation_test_provider(
+            &state,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:9/token".to_string(),
+        )
+        .await;
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "grok-reconciliation-account")
+                    .unwrap();
+                account.auth_identity_generation += 1;
+            })
+            .await
+            .unwrap();
+
+        let response = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(true),
+                timeout_ms: Some(100),
+                model: Some("grok-4.5".to_string()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.outcome, ProviderOperationOutcome::InvalidConfig);
+        assert!(!response.network_checked);
+        let report = response.reconciliation.unwrap();
+        assert_eq!(
+            report.binding_status_before,
+            GrokBindingStatus::StaleIdentity
+        );
+        assert_eq!(
+            report.planned_credential_action,
+            GrokCredentialAction::Relogin
+        );
+        assert!(!report.identity_stable);
+        assert!(!report.refresh_performed);
+    }
+
     #[tokio::test]
     async fn grok_model_discovery_exposes_source_stale_and_fetch_time() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -2314,6 +3374,169 @@ mod tests {
         assert_eq!(
             observed_authorization.lock().unwrap().as_str(),
             "Bearer grok-model-access"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copilot_provider_api_discovery_proves_fixture_verified_contract() {
+        #[derive(Debug, Clone, Default)]
+        struct Observation {
+            authorization: String,
+            user_agent: String,
+            editor_version: String,
+            plugin_version: String,
+            api_version: String,
+        }
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observation = std::sync::Arc::new(std::sync::Mutex::new(Observation::default()));
+        let observation_for_route = std::sync::Arc::clone(&observation);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |headers: HeaderMap| {
+                let observation = std::sync::Arc::clone(&observation_for_route);
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    *observation.lock().unwrap() = Observation {
+                        authorization: header("authorization"),
+                        user_agent: header("user-agent"),
+                        editor_version: header("editor-version"),
+                        plugin_version: header("editor-plugin-version"),
+                        api_version: header("x-github-api-version"),
+                    };
+                    axum::Json(json!({
+                        "data": [
+                            {"id": "claude-sonnet-5"},
+                            {"id": "claude-sonnet-5"},
+                            {"id": "gpt-5.6-codex"},
+                            {"id": "   "},
+                            {"not_a_model": "ignored"}
+                        ]
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("copilot-model-catalog");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-model-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "copilot-model-sub-token",
+                        "refreshToken": "github-oauth-must-not-reach-models",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "github-oauth-must-not-reach-models",
+                            "copilotToken": {"token": "copilot-model-sub-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Claude,
+                    Provider {
+                        id: "copilot-model-provider".to_string(),
+                        name: "Copilot model provider".to_string(),
+                        settings_config: json!({"testCopilotModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("github_copilot".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("github_copilot".to_string()),
+                                account_id: Some("copilot-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Claude, "copilot-model-provider")
+                .await
+                .unwrap();
+        assert_eq!(execution.plan.driver_id.as_str(), "special.copilot");
+        assert_eq!(
+            execution
+                .plan
+                .driver_options
+                .get("testCopilotModelsUrl")
+                .and_then(Value::as_str),
+            Some(format!("http://{address}/models").as_str())
+        );
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(fetched.source.as_deref(), Some("copilot_models_api"));
+        assert_eq!(fetched.stale, Some(false));
+        assert!(fetched.fetched_at_ms.is_some_and(|value| value > 0));
+        assert_eq!(fetched.url, "https://api.githubcopilot.com/models");
+        assert_eq!(
+            fetched
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-sonnet-5", "gpt-5.6-codex"]
+        );
+        let observation = observation.lock().unwrap();
+        assert_eq!(observation.authorization, "Bearer copilot-model-sub-token");
+        assert_eq!(
+            observation.user_agent,
+            crate::provider_identity::COPILOT_USER_AGENT
+        );
+        assert_eq!(
+            observation.editor_version,
+            crate::provider_identity::COPILOT_EDITOR_VERSION
+        );
+        assert_eq!(
+            observation.plugin_version,
+            crate::provider_identity::COPILOT_PLUGIN_VERSION
+        );
+        assert_eq!(
+            observation.api_version,
+            crate::provider_identity::COPILOT_API_VERSION
+        );
+        assert!(!format!("{observation:?}").contains("github-oauth-must-not-reach-models"));
+        drop(observation);
+
+        let conformance = crate::domain::providers::registry::provider_registry()
+            .conformance
+            .iter()
+            .find(|item| item.driver_id.as_str() == "special.copilot")
+            .unwrap();
+        assert_eq!(
+            conformance.discovery,
+            crate::domain::providers::registry::ConformanceState::FixtureVerified
         );
         server.abort();
     }
@@ -2424,6 +3647,101 @@ mod tests {
             observed_authorizations.lock().unwrap().as_slice(),
             ["Bearer kiro-bound-model-access"]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_provider_model_discovery_is_empty_while_idc_profile_is_unresolved() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "models": [{"modelId": "must-not-be-requested"}]
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("kiro-unresolved-idc-model-catalog");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "kiro-unresolved-idc-model-account",
+                        "providerType": "kiro_oauth",
+                        "accessToken": "rotated-but-unresolved-access",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "authMethod": "idc",
+                            "authRegion": "eu-north-1",
+                            "runtimeRegion": "eu-central-1",
+                            "profileProvenance": "profile_resolution_required"
+                        },
+                        "raw": {
+                            "authMethod": "idc",
+                            "profileProvenance": "profile_resolution_required"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "kiro-unresolved-idc-model-provider".to_string(),
+                        name: "Kiro unresolved IdC model provider".to_string(),
+                        settings_config: json!({"testKiroModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("kiro_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("kiro_oauth".to_string()),
+                                account_id: Some("kiro-unresolved-idc-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Codex,
+            "kiro-unresolved-idc-model-provider",
+        )
+        .await
+        .unwrap();
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert!(fetched.models.is_empty());
+        assert_eq!(fetched.source.as_deref(), Some("kiro_identity_unresolved"));
+        assert_eq!(fetched.stale, Some(false));
+        assert_eq!(fetched.fetched_at_ms, None);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         server.abort();
     }
 

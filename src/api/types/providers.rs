@@ -112,6 +112,13 @@ pub(in crate::api) struct ProviderResourceQuery {
     pub(in crate::api) app: AppKind,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CodingPlanQuotaResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) snapshot: crate::domain::providers::coding_plan::CodingPlanQuotaSnapshot,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::api) struct DeleteProviderQuery {
@@ -370,7 +377,69 @@ pub(in crate::api) struct TestProviderResponse {
     pub(in crate::api) network_latency_ms: Option<u128>,
     pub(in crate::api) network_stream_completed: Option<bool>,
     pub(in crate::api) network_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) reconciliation: Option<GrokProviderReconciliationReport>,
     pub(in crate::api) message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::api) enum GrokBindingStatus {
+    Current,
+    MissingBinding,
+    MissingAccount,
+    ProviderTypeMismatch,
+    StaleIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::api) enum GrokCredentialAction {
+    None,
+    Refresh,
+    Relogin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::api) enum GrokEndpointPolicyStatus {
+    Expected,
+    ConfiguredOverrideIgnored,
+    UnexpectedRuntimeEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::api) enum GrokProbeCapabilityStatus {
+    NotChecked,
+    Supported,
+    Unsupported,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct GrokProviderReconciliationReport {
+    pub(in crate::api) read_only: bool,
+    pub(in crate::api) binding_status_before: GrokBindingStatus,
+    pub(in crate::api) binding_status_after: GrokBindingStatus,
+    pub(in crate::api) planned_credential_action: GrokCredentialAction,
+    pub(in crate::api) planned_credential_reason: String,
+    pub(in crate::api) remaining_credential_action: GrokCredentialAction,
+    pub(in crate::api) remaining_credential_reason: String,
+    pub(in crate::api) expected_auth_identity_generation: Option<u64>,
+    pub(in crate::api) observed_auth_identity_generation_before: Option<u64>,
+    pub(in crate::api) observed_auth_identity_generation_after: Option<u64>,
+    pub(in crate::api) token_refresh_generation_before: Option<u64>,
+    pub(in crate::api) token_refresh_generation_after: Option<u64>,
+    pub(in crate::api) refresh_performed: bool,
+    pub(in crate::api) identity_stable: bool,
+    pub(in crate::api) endpoint_policy_status: GrokEndpointPolicyStatus,
+    pub(in crate::api) responses_endpoint_status: GrokProbeCapabilityStatus,
+    pub(in crate::api) model_status: GrokProbeCapabilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) capability_evidence:
+        Option<crate::domain::accounts::capability_evidence::AccountCapabilityProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

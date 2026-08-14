@@ -605,9 +605,9 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             user_agent: Some(crate::domain::kimi_cli::KIMI_USER_AGENT),
             profile_url: None,
             profile_strategy: OAuthProfileStrategy::ProviderSpecific,
-            quota_strategy: OAuthQuotaStrategy::NotAvailable,
+            quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
             refresh_capability: OAuthRefreshCapability::OAuthRequest,
-            quota_capability: OAuthQuotaCapability::Unavailable,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
         ProviderType::KiroOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -629,8 +629,51 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             refresh_capability: OAuthRefreshCapability::ProviderDynamic,
             quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
-        ProviderType::GitHubCopilot
-        | ProviderType::DeepSeekAccount
+        ProviderType::GitHubCopilot => Some(OAuthProviderSpec {
+            provider_type,
+            stage: OAuthSupportStage::NativeRefreshProfile,
+            authorize_url: None,
+            authorize_flow: OAuthAuthorizeFlow::Unsupported,
+            authorize_scope: None,
+            token_urls: &[],
+            token_body_format: OAuthRequestBodyFormat::Json,
+            client_id: None,
+            client_id_env: None,
+            client_secret: None,
+            client_secret_env: None,
+            refresh_scope: None,
+            user_agent: Some("cc-switch-server-github-copilot"),
+            profile_url: None,
+            profile_strategy: OAuthProfileStrategy::ProviderSpecific,
+            quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
+            // The GitHub OAuth token is the long-lived credential. Refreshing
+            // Copilot means exchanging it for a short-lived, account-bound
+            // data-plane token, not sending that sub-token to a generic OAuth
+            // refresh endpoint.
+            refresh_capability: OAuthRefreshCapability::ProviderDynamic,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
+        }),
+        ProviderType::QoderCosy => Some(OAuthProviderSpec {
+            provider_type,
+            stage: OAuthSupportStage::NativeRefreshProfile,
+            authorize_url: None,
+            authorize_flow: OAuthAuthorizeFlow::Unsupported,
+            authorize_scope: None,
+            token_urls: &[],
+            token_body_format: OAuthRequestBodyFormat::Json,
+            client_id: None,
+            client_id_env: None,
+            client_secret: None,
+            client_secret_env: None,
+            refresh_scope: None,
+            user_agent: Some("cc-switch-server-qoder-cosy"),
+            profile_url: None,
+            profile_strategy: OAuthProfileStrategy::ProviderSpecific,
+            quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
+            refresh_capability: OAuthRefreshCapability::ProviderDynamic,
+            quota_capability: OAuthQuotaCapability::LiveRefresh,
+        }),
+        ProviderType::DeepSeekAccount
         | ProviderType::CursorApiKey
         | ProviderType::OllamaCloud
         | ProviderType::AwsBedrock
@@ -658,9 +701,7 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             },
             refresh_capability: OAuthRefreshCapability::Unavailable,
             quota_capability: match provider_type {
-                ProviderType::GitHubCopilot | ProviderType::CursorApiKey => {
-                    OAuthQuotaCapability::ImportedSnapshot
-                }
+                ProviderType::CursorApiKey => OAuthQuotaCapability::ImportedSnapshot,
                 ProviderType::OllamaCloud => OAuthQuotaCapability::LiveRefresh,
                 ProviderType::DeepSeekAccount
                 | ProviderType::AwsBedrock
@@ -683,6 +724,7 @@ pub fn oauth_specs() -> Vec<OAuthProviderSpec> {
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
         ProviderType::KimiCode,
+        ProviderType::QoderCosy,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
         ProviderType::AgyOAuth,
@@ -3381,7 +3423,6 @@ mod tests {
         }
 
         for provider_type in [
-            ProviderType::GitHubCopilot,
             ProviderType::DeepSeekAccount,
             ProviderType::CursorApiKey,
             ProviderType::OllamaCloud,
@@ -3397,6 +3438,10 @@ mod tests {
         let kiro = oauth_provider_spec(ProviderType::KiroOAuth).unwrap();
         assert_eq!(kiro.stage, OAuthSupportStage::NativeRefreshProfile);
         assert!(kiro.token_urls.is_empty());
+
+        let copilot = oauth_provider_spec(ProviderType::GitHubCopilot).unwrap();
+        assert_eq!(copilot.stage, OAuthSupportStage::NativeRefreshProfile);
+        assert!(copilot.token_urls.is_empty());
     }
 
     #[test]
@@ -3424,8 +3469,8 @@ mod tests {
             ),
             (
                 ProviderType::GitHubCopilot,
-                OAuthRefreshCapability::Unavailable,
-                OAuthQuotaCapability::ImportedSnapshot,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
             ),
             (
                 ProviderType::DeepSeekAccount,
@@ -3440,7 +3485,7 @@ mod tests {
             (
                 ProviderType::KimiCode,
                 OAuthRefreshCapability::OAuthRequest,
-                OAuthQuotaCapability::Unavailable,
+                OAuthQuotaCapability::LiveRefresh,
             ),
             (
                 ProviderType::CursorOAuth,

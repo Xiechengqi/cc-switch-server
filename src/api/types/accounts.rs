@@ -1,3 +1,6 @@
+use crate::domain::accounts::capability_evidence::{
+    account_capability_projections, AccountCapabilityProjection,
+};
 use crate::domain::accounts::login::{OAuthLoginCancellation, OAuthLoginFinish, OAuthLoginStart};
 use crate::domain::accounts::oauth::{
     OAuthErrorKind, OAuthHttpRequest, OAuthQuotaStrategy, OAuthSupportStage,
@@ -83,6 +86,8 @@ pub(in crate::api) struct AccountPublicView {
     pub(in crate::api) has_refresh_error: bool,
     pub(in crate::api) refresh_consecutive_failures: u32,
     pub(in crate::api) needs_relogin: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::api) capability_evidence: Vec<AccountCapabilityProjection>,
 }
 
 impl From<&Account> for AccountPublicView {
@@ -120,6 +125,10 @@ impl From<&Account> for AccountPublicView {
                 .is_some_and(|value| !value.trim().is_empty()),
             refresh_consecutive_failures: account.refresh_consecutive_failures,
             needs_relogin: account.needs_relogin,
+            capability_evidence: account_capability_projections(
+                account,
+                crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+            ),
         }
     }
 }
@@ -274,6 +283,13 @@ fn account_public_key_is_sensitive(key: &str) -> bool {
             | "signingkey"
             | "codeverifier"
             | "authorizationcode"
+            | "machinetoken"
+            | "securityoauthtoken"
+            | "personaltoken"
+            | "project"
+            | "projectid"
+            | "projectnumber"
+            | "cloudaicompanionproject"
             | "credential"
             | "credentials"
     ) || [
@@ -285,6 +301,7 @@ fn account_public_key_is_sensitive(key: &str) -> bool {
         "privatekey",
         "signingkey",
         "sessioncookie",
+        "machinetoken",
     ]
     .iter()
     .any(|suffix| compact.ends_with(suffix))
@@ -589,6 +606,65 @@ pub(in crate::api) struct PollKimiDeviceLoginResponse {
     pub(in crate::api) account: Option<AccountLoginAccountSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartQoderDeviceLoginRequest {
+    #[serde(default)]
+    pub(in crate::api) site: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartQoderDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) device: crate::clients::oauth::qoder::QoderDeviceCodeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollQoderDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+    pub(in crate::api) state: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollQoderDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) pending: bool,
+    pub(in crate::api) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelQoderDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelQoderDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportQoderPatRequest {
+    pub(in crate::api) personal_token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportQoderPatResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountLoginAccountSummary,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct PollKiroDeviceLoginResponse {
@@ -790,6 +866,88 @@ mod tests {
         }
         assert!(serialized.contains("visible"));
         assert!(serialized.contains("tokenLimit"));
+        assert!(serialized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn account_public_view_exposes_generation_scoped_capability_without_project_or_tokens() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "acct-gemini-capability",
+            "providerType": "gemini_cli",
+            "authIdentityGeneration": 4,
+            "accessToken": "gemini-access-secret",
+            "refreshToken": "gemini-refresh-secret",
+            "profile": {"projectId": "secret-project-id"},
+            "capabilityObservations": {
+                "gemini_code_plan:project_provisioning": {
+                    "capability": "gemini_code_plan",
+                    "dimension": "project_provisioning",
+                    "state": "supported",
+                    "source": "load_code_assist",
+                    "observedAtMs": 1000,
+                    "expiresAtMs": 4102444800000_i64,
+                    "authIdentityGeneration": 4
+                },
+                "gemini_code_plan:model_entitlement": {
+                    "capability": "gemini_code_plan",
+                    "dimension": "model_entitlement",
+                    "state": "supported",
+                    "source": "retrieve_user_quota",
+                    "observedAtMs": 1000,
+                    "expiresAtMs": 4102444800000_i64,
+                    "authIdentityGeneration": 4
+                }
+            }
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+
+        assert_eq!(value["capabilityEvidence"][0]["state"], "supported");
+        assert_eq!(
+            value["capabilityEvidence"][0]["dimensions"]["project_provisioning"]["freshness"],
+            "fresh"
+        );
+        assert_eq!(value["capabilityEvidence"][0]["authIdentityGeneration"], 4);
+        let serialized = value.to_string();
+        for secret in [
+            "gemini-access-secret",
+            "gemini-refresh-secret",
+            "secret-project-id",
+        ] {
+            assert!(!serialized.contains(secret), "leaked secret: {secret}");
+        }
+    }
+
+    #[test]
+    fn account_public_quota_redacts_google_project_identifiers() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "acct-gemini-project-redaction",
+            "providerType": "gemini_cli",
+            "quota": {
+                "success": true,
+                "extraUsage": {
+                    "loadCodeAssist": {
+                        "cloudaicompanionProject": {"id": "project-object-secret"},
+                        "projectId": "project-id-secret"
+                    },
+                    "retrieveUserQuota": {"project": "quota-project-secret"},
+                    "safe": "visible"
+                }
+            }
+        }))
+        .unwrap();
+
+        let serialized = serde_json::to_string(&AccountPublicView::from(&account)).unwrap();
+
+        for secret in [
+            "project-object-secret",
+            "project-id-secret",
+            "quota-project-secret",
+        ] {
+            assert!(!serialized.contains(secret), "leaked project: {secret}");
+        }
+        assert!(serialized.contains("visible"));
         assert!(serialized.contains("[REDACTED]"));
     }
 

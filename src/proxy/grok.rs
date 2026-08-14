@@ -1,5 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 
+use std::collections::BTreeSet;
+
 use axum::http::{HeaderMap, Method, StatusCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -18,6 +20,300 @@ use crate::domain::providers::model_routing::DEFAULT_GROK_MODEL;
 const GROK_API_BASE: &str = "https://api.x.ai/v1";
 const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
 const GROK_VIDEO_REQUEST_ID_MAX_LEN: usize = 128;
+const GROK_SSE_INSPECTION_MAX_FRAME_BYTES: usize = 64 * 1024;
+const GROK_SSE_INSPECTION_MAX_FRAME_LINES: usize = 128;
+
+#[derive(Debug)]
+pub(super) struct GrokResponsesSseInspector {
+    normalize_ping: bool,
+    buffer: Vec<u8>,
+    passthrough_oversized_frame: bool,
+    passthrough_tail: Vec<u8>,
+    completed_searches: BTreeSet<String>,
+    search_observation_pending: bool,
+}
+
+impl Default for GrokResponsesSseInspector {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl GrokResponsesSseInspector {
+    pub(super) fn new(normalize_ping: bool) -> Self {
+        Self {
+            normalize_ping,
+            buffer: Vec::new(),
+            passthrough_oversized_frame: false,
+            passthrough_tail: Vec::new(),
+            completed_searches: BTreeSet::new(),
+            search_observation_pending: false,
+        }
+    }
+
+    pub(super) fn push(&mut self, chunk: Bytes) -> Bytes {
+        let mut output = Vec::with_capacity(chunk.len());
+        let mut remaining = chunk.as_ref();
+        while !remaining.is_empty() {
+            if self.passthrough_oversized_frame {
+                let consumed = self.forward_oversized_frame(remaining, &mut output);
+                remaining = &remaining[consumed..];
+                continue;
+            }
+
+            let room = GROK_SSE_INSPECTION_MAX_FRAME_BYTES
+                .saturating_add(4)
+                .saturating_sub(self.buffer.len())
+                .max(1);
+            let take = remaining.len().min(room);
+            self.buffer.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            self.drain_complete_frames(&mut output);
+
+            if self.buffer.len() > GROK_SSE_INSPECTION_MAX_FRAME_BYTES
+                || sse_frame_line_count(&self.buffer) > GROK_SSE_INSPECTION_MAX_FRAME_LINES
+            {
+                output.extend_from_slice(&self.buffer);
+                self.passthrough_tail = trailing_sse_boundary_prefix(&self.buffer);
+                self.buffer.clear();
+                self.passthrough_oversized_frame = true;
+            }
+        }
+        Bytes::from(output)
+    }
+
+    pub(super) fn finish(&mut self) -> Bytes {
+        if self.passthrough_oversized_frame || self.buffer.is_empty() {
+            return Bytes::new();
+        }
+        let frame = std::mem::take(&mut self.buffer);
+        Bytes::from(self.process_frame(&frame, frame.len()))
+    }
+
+    pub(super) fn take_search_observation(&mut self) -> bool {
+        std::mem::take(&mut self.search_observation_pending)
+    }
+
+    #[cfg(test)]
+    fn completed_search_count(&self) -> usize {
+        self.completed_searches.len()
+    }
+
+    fn drain_complete_frames(&mut self, output: &mut Vec<u8>) {
+        while let Some((event_end, delimiter_len)) = next_sse_frame_boundary(&self.buffer) {
+            let frame_len = event_end.saturating_add(delimiter_len);
+            let frame = self.buffer.drain(..frame_len).collect::<Vec<_>>();
+            output.extend_from_slice(&self.process_frame(&frame, event_end));
+        }
+    }
+
+    fn process_frame(&mut self, frame: &[u8], event_end: usize) -> Vec<u8> {
+        let event = &frame[..event_end];
+        if event.len() > GROK_SSE_INSPECTION_MAX_FRAME_BYTES
+            || sse_frame_line_count(event) > GROK_SSE_INSPECTION_MAX_FRAME_LINES
+        {
+            return frame.to_vec();
+        }
+        if self.normalize_ping && grok_sse_event_is_ping(event) {
+            return b": ping\n\n".to_vec();
+        }
+        if let Some(value) = grok_sse_json_payload(event) {
+            let previous_count = self.completed_searches.len();
+            observe_completed_searches(&value, &mut self.completed_searches);
+            if self.completed_searches.len() > previous_count {
+                self.search_observation_pending = true;
+            }
+        }
+        frame.to_vec()
+    }
+
+    fn forward_oversized_frame(&mut self, input: &[u8], output: &mut Vec<u8>) -> usize {
+        let mut recent = std::mem::take(&mut self.passthrough_tail);
+        for (index, byte) in input.iter().copied().enumerate() {
+            output.push(byte);
+            recent.push(byte);
+            if recent.ends_with(b"\n\n") || recent.ends_with(b"\r\n\r\n") {
+                self.passthrough_oversized_frame = false;
+                self.passthrough_tail.clear();
+                return index + 1;
+            }
+            if recent.len() > 3 {
+                recent.remove(0);
+            }
+        }
+        self.passthrough_tail = recent;
+        input.len()
+    }
+}
+
+pub(super) fn grok_response_has_completed_search(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    if !grok_response_is_completed(&value) {
+        return false;
+    }
+    let mut completed = BTreeSet::new();
+    observe_completed_searches(&value, &mut completed);
+    !completed.is_empty()
+}
+
+fn next_sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if crlf <= lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+fn sse_frame_line_count(frame: &[u8]) -> usize {
+    frame
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_add(1)
+}
+
+fn trailing_sse_boundary_prefix(frame: &[u8]) -> Vec<u8> {
+    frame[frame.len().saturating_sub(3)..].to_vec()
+}
+
+fn grok_sse_event_is_ping(event: &[u8]) -> bool {
+    let Ok(event) = std::str::from_utf8(event) else {
+        return false;
+    };
+    let mut event_names = Vec::new();
+    let mut data = Vec::new();
+    for line in event.lines().map(|line| line.trim_end_matches('\r')) {
+        if let Some(value) = line.strip_prefix("event:") {
+            event_names.push(value.trim());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim_start());
+        }
+    }
+    if event_names.is_empty() || event_names.iter().any(|name| *name != "ping") {
+        return false;
+    }
+    let payload = data.join("\n");
+    if payload.trim().is_empty() {
+        return true;
+    }
+    serde_json::from_str::<Value>(&payload)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|event_type| event_type == "ping")
+        })
+}
+
+fn grok_sse_json_payload(event: &[u8]) -> Option<Value> {
+    let event = std::str::from_utf8(event).ok()?;
+    let data = event
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    if data.is_empty() {
+        return serde_json::from_str(event.trim()).ok();
+    }
+    serde_json::from_str(&data.join("\n")).ok()
+}
+
+fn observe_completed_searches(value: &Value, completed: &mut BTreeSet<String>) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.output_item.done") => {
+            if let Some(item) = value.get("item") {
+                record_completed_search(
+                    item,
+                    value.get("output_index").and_then(Value::as_i64),
+                    completed,
+                );
+            }
+        }
+        Some("response.completed") | Some("response.done") => {
+            observe_response_search_output(value.get("response").unwrap_or(value), completed);
+        }
+        _ if grok_response_is_completed(value) => {
+            observe_response_search_output(value.get("response").unwrap_or(value), completed);
+        }
+        _ => {}
+    }
+}
+
+fn grok_response_is_completed(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.completed" | "response.done")
+    ) || value
+        .get("status")
+        .or_else(|| value.pointer("/response/status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "completed" | "succeeded" | "done"))
+}
+
+fn observe_response_search_output(response: &Value, completed: &mut BTreeSet<String>) {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, item) in output.iter().enumerate() {
+        record_completed_search(item, i64::try_from(index).ok(), completed);
+    }
+}
+
+fn record_completed_search(
+    item: &Value,
+    output_index: Option<i64>,
+    completed: &mut BTreeSet<String>,
+) {
+    let Some(kind) = grok_completed_search_kind(item) else {
+        return;
+    };
+    if item
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| !matches!(status, "completed" | "succeeded" | "done"))
+    {
+        return;
+    }
+    let key = item
+        .get("id")
+        .or_else(|| item.get("call_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|id| format!("id:{id}"))
+        .or_else(|| output_index.map(|index| format!("index:{index}:{kind}")))
+        .unwrap_or_else(|| {
+            let stable = json!({
+                "type": item.get("type"),
+                "name": item.get("name"),
+                "action": item.get("action"),
+                "input": item.get("input"),
+            });
+            let digest = Sha256::digest(stable.to_string().as_bytes());
+            format!("synthetic:{kind}:{}", hex::encode(&digest[..12]))
+        });
+    completed.insert(key);
+}
+
+fn grok_completed_search_kind(item: &Value) -> Option<&'static str> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("web_search_call") => Some("web_search"),
+        Some("x_search_call") => Some("x_search"),
+        Some("tool_search_call") => Some("tool_search"),
+        Some("custom_tool_call") => match item.get("name").and_then(Value::as_str) {
+            Some("web_search") => Some("web_search"),
+            Some("x_search") => Some("x_search"),
+            Some("tool_search") => Some("tool_search"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 pub(super) struct GrokForwardContract {
     pub session_id: Option<String>,
@@ -544,7 +840,7 @@ fn trim_part_data(data: &[u8]) -> &[u8] {
     &data[..end]
 }
 
-pub(super) fn sticky_media_session_key(path: &str, body: &[u8]) -> Option<String> {
+pub(super) fn video_task_id_from_request(path: &str, body: &[u8]) -> Option<String> {
     let value = serde_json::from_slice::<Value>(body).ok();
     if path.contains("/videos/") {
         if let Some(request_id) = path
@@ -553,7 +849,7 @@ pub(super) fn sticky_media_session_key(path: &str, body: &[u8]) -> Option<String
             .next()
             .filter(|item| !item.is_empty() && *item != "generations")
         {
-            return Some(format!("grok-video:{request_id}"));
+            return Some(request_id.to_string());
         }
         if let Some(request_id) = value
             .as_ref()
@@ -561,13 +857,13 @@ pub(super) fn sticky_media_session_key(path: &str, body: &[u8]) -> Option<String
             .and_then(Value::as_str)
             .filter(|request_id| valid_video_request_id(request_id))
         {
-            return Some(format!("grok-video:{request_id}"));
+            return Some(request_id.to_string());
         }
     }
     None
 }
 
-pub(super) fn video_session_key_from_response(body: &[u8]) -> Option<String> {
+pub(super) fn video_task_id_from_response(body: &[u8]) -> Option<String> {
     let value = serde_json::from_slice::<Value>(body).ok()?;
     [
         "/request_id",
@@ -580,7 +876,7 @@ pub(super) fn video_session_key_from_response(body: &[u8]) -> Option<String> {
     .into_iter()
     .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
     .filter(|request_id| valid_video_request_id(request_id))
-    .map(|request_id| format!("grok-video:{request_id}"))
+    .map(str::to_string)
 }
 
 fn normalize_ws_response_body(value: &mut Value, session_id: Option<&str>) {
@@ -1295,49 +1591,52 @@ mod tests {
     }
 
     #[test]
-    fn video_session_key_from_response_accepts_common_shapes() {
+    fn video_task_id_from_response_accepts_common_shapes() {
         assert_eq!(
-            video_session_key_from_response(br#"{"request_id":"vid_1"}"#).as_deref(),
-            Some("grok-video:vid_1")
+            video_task_id_from_response(br#"{"request_id":"vid_1"}"#).as_deref(),
+            Some("vid_1")
         );
         assert_eq!(
-            video_session_key_from_response(br#"{"data":{"id":"vid_2"}}"#).as_deref(),
-            Some("grok-video:vid_2")
+            video_task_id_from_response(br#"{"data":{"id":"vid_2"}}"#).as_deref(),
+            Some("vid_2")
         );
         for body in [
             br#"{"request_id":"../models"}"#.as_slice(),
             br#"{"request_id":"request?include=token"}"#.as_slice(),
             br#"{"request_id":" vid_3 "}"#.as_slice(),
         ] {
-            assert_eq!(video_session_key_from_response(body), None);
+            assert_eq!(video_task_id_from_response(body), None);
         }
         let oversized = serde_json::to_vec(&json!({
             "request_id": "a".repeat(GROK_VIDEO_REQUEST_ID_MAX_LEN + 1)
         }))
         .unwrap();
-        assert_eq!(video_session_key_from_response(&oversized), None);
+        assert_eq!(video_task_id_from_response(&oversized), None);
     }
 
     #[test]
-    fn sticky_video_session_key_rejects_untrusted_body_ids() {
+    fn video_task_id_from_request_rejects_untrusted_body_ids() {
         assert_eq!(
-            sticky_media_session_key("/videos/generations", br#"{"request_id":"request_1"}"#,)
+            video_task_id_from_request("/videos/generations", br#"{"request_id":"request_1"}"#,)
                 .as_deref(),
-            Some("grok-video:request_1")
+            Some("request_1")
         );
         for body in [
             br#"{"request_id":"../models"}"#.as_slice(),
             br#"{"request_id":"request?include=token"}"#.as_slice(),
             br#"{"request_id":" request_2 "}"#.as_slice(),
         ] {
-            assert_eq!(sticky_media_session_key("/videos/generations", body), None);
+            assert_eq!(
+                video_task_id_from_request("/videos/generations", body),
+                None
+            );
         }
         let oversized = serde_json::to_vec(&json!({
             "request_id": "a".repeat(GROK_VIDEO_REQUEST_ID_MAX_LEN + 1)
         }))
         .unwrap();
         assert_eq!(
-            sticky_media_session_key("/videos/generations", &oversized),
+            video_task_id_from_request("/videos/generations", &oversized),
             None
         );
     }
@@ -1351,6 +1650,97 @@ mod tests {
         );
         let until = retry_after_until_ms(&headers, 1_700_000_000_000).unwrap();
         assert!(until > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn responses_sse_ping_filter_only_rewrites_unambiguous_ping_frames() {
+        for input in [
+            b"event: ping\n\n".as_slice(),
+            b"event: ping\ndata:\n\n".as_slice(),
+            b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n".as_slice(),
+        ] {
+            let mut inspector = GrokResponsesSseInspector::default();
+            assert_eq!(inspector.push(Bytes::copy_from_slice(input)), ": ping\n\n");
+            assert!(inspector.finish().is_empty());
+        }
+
+        for input in [
+            b"event: ping\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ping\"}\n\n"
+                .as_slice(),
+            b"event: response.output_text.delta\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
+            b"event: ping\ndata: not-json\n\n".as_slice(),
+        ] {
+            let mut inspector = GrokResponsesSseInspector::default();
+            assert_eq!(inspector.push(Bytes::copy_from_slice(input)), input);
+        }
+    }
+
+    #[test]
+    fn responses_sse_ping_filter_handles_fragmentation_crlf_and_eof_tail() {
+        let input = b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\nevent: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\r\n\r\n";
+        for split in 0..=input.len() {
+            let mut inspector = GrokResponsesSseInspector::default();
+            let mut output = inspector
+                .push(Bytes::copy_from_slice(&input[..split]))
+                .to_vec();
+            output.extend_from_slice(&inspector.push(Bytes::copy_from_slice(&input[split..])));
+            output.extend_from_slice(&inspector.finish());
+            assert_eq!(
+                output,
+                b": ping\n\nevent: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\r\n\r\n"
+            );
+        }
+
+        let mut inspector = GrokResponsesSseInspector::default();
+        assert!(inspector
+            .push(Bytes::from_static(b"event: ping\ndata:"))
+            .is_empty());
+        assert_eq!(inspector.finish(), ": ping\n\n");
+    }
+
+    #[test]
+    fn responses_sse_ping_filter_passthrough_is_bounded() {
+        let payload = "x".repeat(GROK_SSE_INSPECTION_MAX_FRAME_BYTES + 32);
+        let oversized = format!("event: ping\ndata: {payload}\n\n");
+        let next = "event: ping\n\n";
+        let mut inspector = GrokResponsesSseInspector::default();
+        let first = inspector.push(Bytes::from(oversized.clone()));
+        let second = inspector.push(Bytes::from_static(next.as_bytes()));
+        assert_eq!(first, oversized.as_bytes());
+        assert_eq!(second, ": ping\n\n");
+    }
+
+    #[test]
+    fn responses_search_observation_deduplicates_done_and_completed_snapshots() {
+        let item_done = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"search_1\",\"status\":\"completed\"}}\n\n";
+        let completed = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"search_1\",\"status\":\"completed\"}]}}\n\n";
+        let mut inspector = GrokResponsesSseInspector::default();
+        assert_eq!(
+            inspector.push(Bytes::from_static(item_done.as_bytes())),
+            item_done
+        );
+        assert!(inspector.take_search_observation());
+        assert!(!inspector.take_search_observation());
+        assert_eq!(
+            inspector.push(Bytes::from_static(completed.as_bytes())),
+            completed
+        );
+        assert!(!inspector.take_search_observation());
+        assert_eq!(inspector.completed_search_count(), 1);
+    }
+
+    #[test]
+    fn responses_search_observation_uses_stable_synthetic_keys_without_ids() {
+        let body = br#"{"type":"response.completed","response":{"output":[{"type":"custom_tool_call","name":"x_search","status":"completed","input":{"query":"rust"}}]}}"#;
+        assert!(grok_response_has_completed_search(body));
+
+        let frame = format!("data: {}\n\n", String::from_utf8_lossy(body));
+        let mut inspector = GrokResponsesSseInspector::default();
+        inspector.push(Bytes::from(frame.clone()));
+        assert!(inspector.take_search_observation());
+        inspector.push(Bytes::from(frame));
+        assert!(!inspector.take_search_observation());
+        assert_eq!(inspector.completed_search_count(), 1);
     }
 }
 

@@ -26,6 +26,7 @@ import CursorOauthQuotaFooter from "@/components/CursorOauthQuotaFooter";
 import OllamaQuotaFooter from "@/components/OllamaQuotaFooter";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
+import CodingPlanQuotaFooter from "@/components/providers/CodingPlanQuotaFooter";
 import { ProviderInUseTag } from "@/components/providers/ProviderQuotaMetaRow";
 import { ProviderShareStatusTag } from "@/components/providers/ProviderShareStatusTag";
 import { ProviderShareReuseDialog } from "@/components/providers/ProviderShareReuseDialog";
@@ -483,7 +484,9 @@ export function ProviderCard({
 
         <div className="flex w-full min-w-0 flex-col gap-2 sm:ml-auto sm:w-auto sm:max-w-[55%]">
           <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-x-1 gap-y-1">
-            {quotaSource === "copilot" ? (
+            {resource?.runtime?.codingPlan ? (
+              <CodingPlanQuotaFooter resource={resource} inline />
+            ) : quotaSource === "copilot" ? (
               <CopilotQuotaFooter
                 meta={provider.meta}
                 appId={appId}

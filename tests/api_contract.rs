@@ -149,6 +149,7 @@ async fn spawn_kiro_fixed_endpoint_tls_mock(
                     authority,
                     Some("q.us-east-1.amazonaws.com:443")
                         | Some("prod.download.desktop.kiro.dev:443")
+                        | Some("api.githubcopilot.com:443")
                 ) {
                     let _ = client
                         .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
@@ -2724,10 +2725,6 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
 
 #[tokio::test]
 async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
     let seen = Arc::new(AtomicUsize::new(0));
     let upstream = Router::new()
         .route(
@@ -2760,9 +2757,8 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
             ),
         )
         .with_state(seen.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, upstream).await.unwrap();
-    });
+    let (proxy_addr, upstream_server, proxy_server) =
+        spawn_kiro_fixed_endpoint_tls_mock(upstream).await;
 
     let state = test_state();
     let app = app_router(state.clone());
@@ -2805,11 +2801,8 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
                 raw: Some(json!({
                     "githubDomain": "github.com",
                     "githubToken": "github-token",
-                    "copilotUsage": {
-                        "endpoints": {
-                            "api": format!("http://{upstream_addr}")
-                        }
-                    }
+                    "copilotToken": {"token": "cached-copilot-token"},
+                    "copilotApiBase": "https://api.githubcopilot.com"
                 })),
                 subscription_level: None,
                 entitlement_status: None,
@@ -2824,6 +2817,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
         })
         .await
         .unwrap();
+    install_kiro_fixed_endpoint_test_client(&state, proxy_addr).await;
 
     let response = app
         .oneshot(
@@ -2850,13 +2844,17 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
         .unwrap();
 
     let status = response.status();
-    let body = json_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    let body_text = body_text(response).await;
+    assert_eq!(status, StatusCode::OK, "{body_text:?}");
+    let body: Value = serde_json::from_str(&body_text)
+        .unwrap_or_else(|error| panic!("Copilot response is not JSON: {error}: {body_text:?}"));
     assert_eq!(
         body["choices"][0]["message"]["content"].as_str(),
         Some("ok")
     );
     assert_eq!(seen.load(Ordering::SeqCst), 1);
+    upstream_server.abort();
+    proxy_server.abort();
 }
 
 #[tokio::test]
@@ -7204,16 +7202,16 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
-    assert_eq!(registry["registry"]["schemaVersion"], 6);
+    assert_eq!(registry["registry"]["schemaVersion"], 7);
     assert_eq!(
         registry["registry"]["optionSchemas"]
             .as_array()
             .map(Vec::len),
-        Some(19)
+        Some(20)
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        43
+        65
     );
     assert!(registry["registry"]["families"]
         .as_array()
@@ -7274,7 +7272,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert_eq!(presets.status(), StatusCode::OK);
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
-    assert_eq!(presets.len(), 12);
+    assert_eq!(presets.len(), 22);
     assert!(presets
         .iter()
         .all(|preset| preset["profileId"].as_str().is_some()));
@@ -7290,6 +7288,9 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.kiro_oauth"));
+    assert!(presets
+        .iter()
+        .any(|preset| preset["profileId"] == "codex.github_copilot"));
 
     let created = app
         .clone()
@@ -7339,6 +7340,113 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert!(!serde_json::to_string(&resources[0]["runtime"])
         .unwrap()
         .contains("api-contract-openai-key"));
+}
+
+#[tokio::test]
+async fn coding_plan_quota_web_invoke_uses_the_exact_provider_contract() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+    let secret = "api-contract-mimo-key";
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            json!({
+                "id": "api-contract-mimo-token-plan",
+                "familyId": "family.xiaomi_mimo_token_plan",
+                "name": "MiMo Token Plan",
+                "modelPolicyScope": "global",
+                "modelPolicy": "passthrough",
+                "testApp": "codex",
+                "testModel": "mimo-v2.5-pro",
+                "surfaces": [
+                    {
+                        "app": "claude",
+                        "enabled": true,
+                        "profileId": "claude.xiaomi_mimo_token_plan"
+                    },
+                    {
+                        "app": "codex",
+                        "enabled": true,
+                        "profileId": "codex.xiaomi_mimo_token_plan"
+                    }
+                ],
+                "clientRequestId": "api-contract-create-mimo-token-plan",
+                "credentialPatches": {
+                    "/settingsConfig/apiKey": {
+                        "action": "replace",
+                        "value": secret
+                    }
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(created).await
+    );
+    let resources = json_body(
+        app.clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/get_provider_resources",
+                json!({"app": "codex"}),
+                Some(&token),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let resource = resources
+        .as_array()
+        .and_then(|resources| {
+            resources
+                .iter()
+                .find(|resource| resource["profileId"] == "codex.xiaomi_mimo_token_plan")
+        })
+        .expect("MiMo resource");
+    let provider_id = resource["provider"]["id"]
+        .as_str()
+        .expect("MiMo provider id");
+    assert_eq!(
+        resource["runtime"]["codingPlan"]["quota"]["adapter"],
+        "unavailable"
+    );
+    assert!(resource["runtime"]["runtimeFingerprint"].as_str().is_some());
+    assert!(!serde_json::to_string(resource).unwrap().contains(secret));
+
+    let invoke = |command: &str| {
+        json_request(
+            Method::POST,
+            &format!("/web-api/invoke/{command}"),
+            json!({"app": "codex", "providerId": provider_id}),
+            Some(&token),
+        )
+    };
+    for command in ["get_coding_plan_quota", "refresh_coding_plan_quota"] {
+        let response = app.clone().oneshot(invoke(command)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+        assert_eq!(snapshot["providerKey"]["app"], "codex");
+        assert_eq!(snapshot["providerKey"]["providerId"], provider_id);
+        assert_eq!(snapshot["providerRevision"], resource["revision"]);
+        assert_eq!(
+            snapshot["runtimeFingerprint"],
+            resource["runtime"]["runtimeFingerprint"]
+        );
+        assert_eq!(snapshot["profileId"], "codex.xiaomi_mimo_token_plan");
+        assert_eq!(snapshot["source"], "contract");
+        assert_eq!(snapshot["quota"]["state"], "unavailable");
+        assert!(snapshot["quota"]["windows"].as_array().unwrap().is_empty());
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains(secret));
+    }
 }
 
 #[tokio::test]
@@ -12874,7 +12982,13 @@ fn test_share_input(id: &str, provider_id: &str, provider_type: ProviderType) ->
     test_share_input_for_app(id, AppKind::Codex, provider_id, provider_type)
 }
 
-fn event_stream_bytes(events: Vec<(&str, Value)>) -> Vec<u8> {
+fn event_stream_bytes(mut events: Vec<(&str, Value)>) -> Vec<u8> {
+    if events
+        .last()
+        .is_none_or(|(event_type, _)| *event_type != "endEvent")
+    {
+        events.push(("endEvent", json!({})));
+    }
     events
         .into_iter()
         .flat_map(|(event_type, payload)| event_frame(event_type, payload))
@@ -12926,4 +13040,136 @@ async fn json_body(response: Response) -> serde_json::Value {
 async fn body_text(response: Response) -> String {
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     String::from_utf8(body.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn qoder_web_managed_auth_preserves_site_state_and_cancel_contract() {
+    let state = test_state();
+    let app = app_router(state);
+    let token = setup_and_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_start_login",
+            json!({
+                "authProvider": "qoder_cosy",
+                "oauthFlowMode": "device",
+                "qoderSite": "cn"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = json_body(response).await;
+    assert_eq!(login["provider"], "qoder_cosy");
+    assert_eq!(login["flow"], "device");
+    assert_eq!(login["site"], "cn");
+    let device_code = login["device_code"].as_str().unwrap().to_string();
+    let flow_state = login["state"].as_str().unwrap().to_string();
+    assert!(!device_code.is_empty());
+    assert!(!flow_state.is_empty());
+    let verification_uri = url::Url::parse(login["verification_uri"].as_str().unwrap()).unwrap();
+    assert_eq!(verification_uri.host_str(), Some("qoder.com.cn"));
+    assert!(verification_uri
+        .query_pairs()
+        .any(|(key, value)| key == "nonce" && !value.is_empty()));
+    assert!(verification_uri
+        .query_pairs()
+        .any(|(key, value)| key == "challenge" && !value.is_empty()));
+    assert!(!verification_uri
+        .query_pairs()
+        .any(|(key, value)| key == "state" || value == flow_state));
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_poll_for_account",
+            json!({
+                "authProvider": "qoder_cosy",
+                "deviceCode": device_code
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_poll_for_account",
+            json!({
+                "authProvider": "qoder_cosy",
+                "deviceCode": device_code,
+                "flowState": "wrong-state"
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_cancel_login",
+            json!({
+                "authProvider": "qoder_cosy",
+                "deviceCode": device_code
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["cancelled"], true);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_poll_for_account",
+            json!({
+                "authProvider": "qoder_cosy",
+                "deviceCode": device_code,
+                "flowState": flow_state
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/qoder_import_pat",
+            json!({"personalToken": "invalid-token"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/auth_get_status",
+            json!({"authProvider": "qoder_cosy"}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = json_body(response).await;
+    assert_eq!(status["provider"], "qoder_cosy");
+    assert_eq!(status["authenticated"], false);
+    assert_eq!(status["accounts"], json!([]));
 }
