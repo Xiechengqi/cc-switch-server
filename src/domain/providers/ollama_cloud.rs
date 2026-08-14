@@ -174,7 +174,8 @@ pub fn snapshot_status<T, U>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OllamaCloudAccountView {
-    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,7 +396,7 @@ mod tests {
 
     fn account(id: &str) -> OllamaCloudAccountView {
         OllamaCloudAccountView {
-            id: id.to_string(),
+            id: Some(id.to_string()),
             email: None,
             name: None,
             first_name: None,
@@ -412,7 +413,15 @@ mod tests {
         cache.insert_account(key(1), account("old"), 1_000);
         cache.insert_account(key(2), account("new"), 2_000);
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.fresh_account(&key(2), 2_000).unwrap().data.id, "new");
+        assert_eq!(
+            cache
+                .fresh_account(&key(2), 2_000)
+                .unwrap()
+                .data
+                .id
+                .as_deref(),
+            Some("new")
+        );
         assert!(cache
             .stale_account(&key(2), 2_000 + OLLAMA_CLOUD_STALE_TTL_MS as i64 + 1)
             .is_none());

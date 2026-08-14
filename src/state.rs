@@ -22506,7 +22506,10 @@ mod tests {
             snapshot.credential_generation,
             updated.resource.credential_generation
         );
-        assert_eq!(snapshot.account.data.as_ref().unwrap().id, "new-account");
+        assert_eq!(
+            snapshot.account.data.as_ref().unwrap().id.as_deref(),
+            Some("new-account")
+        );
         server.abort();
     }
 

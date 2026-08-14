@@ -2,7 +2,9 @@ use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use chrono::DateTime;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
+};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -184,6 +186,7 @@ impl OllamaCloudClient {
         headers.insert(AUTHORIZATION, authorization);
         if content_type_json {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
         }
         let mut response = self
             .http
@@ -197,7 +200,7 @@ impl OllamaCloudClient {
             return Err(OllamaCloudFetchError::invalid_response());
         }
         match response.status() {
-            StatusCode::OK => {}
+            status if status.is_success() => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 return Err(OllamaCloudFetchError::authentication())
             }
@@ -271,36 +274,45 @@ fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 #[derive(Debug, Deserialize)]
 struct RawAccount {
     #[serde(default, alias = "ID", alias = "id")]
-    id: Option<String>,
+    id: Option<serde_json::Value>,
     #[serde(default, alias = "Email", alias = "email")]
-    email: Option<String>,
+    email: Option<serde_json::Value>,
     #[serde(default, alias = "Name", alias = "name")]
-    name: Option<String>,
+    name: Option<serde_json::Value>,
     #[serde(
         default,
         alias = "FirstName",
         alias = "firstName",
-        alias = "first_name"
+        alias = "first_name",
+        alias = "firstname"
     )]
-    first_name: Option<String>,
-    #[serde(default, alias = "LastName", alias = "lastName", alias = "last_name")]
-    last_name: Option<String>,
+    first_name: Option<serde_json::Value>,
+    #[serde(
+        default,
+        alias = "LastName",
+        alias = "lastName",
+        alias = "last_name",
+        alias = "lastname"
+    )]
+    last_name: Option<serde_json::Value>,
     #[serde(
         default,
         alias = "AvatarURL",
         alias = "avatarURL",
-        alias = "avatar_url"
+        alias = "avatar_url",
+        alias = "avatarurl"
     )]
-    avatar_url: Option<String>,
+    avatar_url: Option<serde_json::Value>,
     #[serde(default, alias = "Plan", alias = "plan")]
-    plan: Option<String>,
+    plan: Option<serde_json::Value>,
     #[serde(
         default,
         alias = "CreatedAt",
         alias = "createdAt",
-        alias = "created_at"
+        alias = "created_at",
+        alias = "createdat"
     )]
-    created_at: Option<String>,
+    created_at: Option<serde_json::Value>,
 }
 
 fn parse_account(
@@ -308,19 +320,31 @@ fn parse_account(
 ) -> Result<OllamaCloudAccountView, OllamaCloudFetchError> {
     let raw: RawAccount = serde_json::from_value(body.clone())
         .map_err(|_| OllamaCloudFetchError::invalid_response())?;
-    let id = required_string(raw.id, 256)?;
-    let created_at_ms = raw
-        .created_at
-        .map(|value| parse_timestamp(&value))
-        .transpose()?;
+    let id = optional_json_string(raw.id, 256)?;
+    let email = optional_json_string(raw.email, 320)?;
+    let name = optional_json_string(raw.name, 256)?;
+    let first_name = optional_json_string(raw.first_name, 256)?;
+    let last_name = optional_json_string(raw.last_name, 256)?;
+    let avatar_url = optional_json_string(raw.avatar_url, 2_048)?;
+    let plan = optional_json_string(raw.plan, 128)?;
+    let created_at_ms = optional_json_timestamp(raw.created_at);
+    if id.is_none()
+        && email.is_none()
+        && name.is_none()
+        && first_name.is_none()
+        && last_name.is_none()
+        && plan.is_none()
+    {
+        return Err(OllamaCloudFetchError::invalid_response());
+    }
     Ok(OllamaCloudAccountView {
         id,
-        email: optional_string(raw.email, 320)?,
-        name: optional_string(raw.name, 256)?,
-        first_name: optional_string(raw.first_name, 256)?,
-        last_name: optional_string(raw.last_name, 256)?,
-        avatar_url: optional_string(raw.avatar_url, 2_048)?,
-        plan: optional_string(raw.plan, 128)?,
+        email,
+        name,
+        first_name,
+        last_name,
+        avatar_url,
+        plan,
         created_at_ms,
     })
 }
@@ -486,6 +510,24 @@ fn optional_string(
     Ok(Some(value.to_string()))
 }
 
+fn optional_json_string(
+    value: Option<serde_json::Value>,
+    max_len: usize,
+) -> Result<Option<String>, OllamaCloudFetchError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => optional_string(Some(value), max_len),
+        Some(_) => Ok(None),
+    }
+}
+
+fn optional_json_timestamp(value: Option<serde_json::Value>) -> Option<i64> {
+    match value {
+        Some(serde_json::Value::String(value)) => parse_timestamp(&value).ok(),
+        _ => None,
+    }
+}
+
 fn parse_timestamp(value: &str) -> Result<i64, OllamaCloudFetchError> {
     DateTime::parse_from_rfc3339(value.trim())
         .map(|value| value.timestamp_millis())
@@ -506,45 +548,64 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone, Default)]
-    struct RequestLog(Arc<Mutex<Vec<(String, String, String)>>>);
+    struct RecordedRequest {
+        method: String,
+        authorization: String,
+        content_type: String,
+        content_length: String,
+    }
 
-    async fn me(State(log): State<RequestLog>, headers: AxumHeaderMap) -> Json<serde_json::Value> {
-        log.0.lock().await.push((
-            "POST".to_string(),
-            headers
+    #[derive(Clone, Default)]
+    struct RequestLog(Arc<Mutex<Vec<RecordedRequest>>>);
+
+    async fn me(
+        State(log): State<RequestLog>,
+        headers: AxumHeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        log.0.lock().await.push(RecordedRequest {
+            method: "POST".to_string(),
+            authorization: headers
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string(),
-            headers
+            content_type: headers
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string(),
-        ));
-        Json(json!({
-            "ID": "account-1",
-            "CreatedAt": "2026-06-21T08:39:00.256543Z",
-            "Email": "owner@example.com",
-            "Name": "owner",
-            "Plan": "free"
-        }))
+            content_length: headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        });
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "ID": "account-1",
+                "CreatedAt": "2026-06-21T08:39:00.256543Z",
+                "Email": "owner@example.com",
+                "Name": "owner",
+                "Plan": "free"
+            })),
+        )
     }
 
     async fn usage(
         State(log): State<RequestLog>,
         headers: AxumHeaderMap,
     ) -> Json<serde_json::Value> {
-        log.0.lock().await.push((
-            "GET".to_string(),
-            headers
+        log.0.lock().await.push(RecordedRequest {
+            method: "GET".to_string(),
+            authorization: headers
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string(),
-            String::new(),
-        ));
+            content_type: String::new(),
+            content_length: String::new(),
+        });
         Json(json!({
             "activity": {
                 "cost": "0.00000",
@@ -588,28 +649,63 @@ mod tests {
         assert_eq!(usage.limits[0].models[0].name, "gpt-oss:120b");
         let requests = log.0.lock().await;
         assert_eq!(requests.len(), 2);
-        assert!(requests.iter().any(|item| item.0 == "POST"
-            && item.1 == "Bearer free-test-key"
-            && item.2 == "application/json"));
+        assert!(requests.iter().any(|item| item.method == "POST"
+            && item.authorization == "Bearer free-test-key"
+            && item.content_type == "application/json"
+            && item.content_length == "0"));
         assert!(requests
             .iter()
-            .any(|item| item.0 == "GET" && item.1 == "Bearer free-test-key"));
+            .any(|item| item.method == "GET" && item.authorization == "Bearer free-test-key"));
         server.abort();
     }
 
     #[test]
     fn account_parser_accepts_case_variants_and_missing_optional_free_fields() {
-        let upper = parse_account(&json!({"ID": "one", "Email": "a@example.com"})).unwrap();
+        let upper = parse_account(&json!({
+            "ID": "one",
+            "CreatedAt": "2026-06-21T08:39:00.256543Z",
+            "Email": "a@example.com",
+            "Name": "owner",
+            "Bio": "",
+            "AvatarURL": "/public/avatar.png",
+            "FirstName": "",
+            "LastName": "",
+            "Links": [],
+            "Plan": "free"
+        }))
+        .unwrap();
+        assert_eq!(upper.id.as_deref(), Some("one"));
         assert_eq!(upper.email.as_deref(), Some("a@example.com"));
-        assert!(upper.plan.is_none());
+        assert_eq!(upper.plan.as_deref(), Some("free"));
         let lower = parse_account(&json!({
             "id": "two",
-            "created_at": "2026-08-14T00:00:00Z",
+            "createdat": "2026-08-14T00:00:00Z",
+            "firstname": "First",
+            "lastname": "Last",
+            "avatarurl": "/public/avatar.png",
             "plan": "free"
         }))
         .unwrap();
-        assert_eq!(lower.id, "two");
+        assert_eq!(lower.id.as_deref(), Some("two"));
+        assert_eq!(lower.first_name.as_deref(), Some("First"));
         assert_eq!(lower.plan.as_deref(), Some("free"));
+
+        let drifted_optional_fields = parse_account(&json!({
+            "id": {"future": "shape"},
+            "created_at": 1786700000,
+            "plan": "free"
+        }))
+        .unwrap();
+        assert!(drifted_optional_fields.id.is_none());
+        assert!(drifted_optional_fields.created_at_ms.is_none());
+        assert_eq!(drifted_optional_fields.plan.as_deref(), Some("free"));
+
+        assert_eq!(
+            parse_account(&json!({"unrecognized": true}))
+                .unwrap_err()
+                .kind,
+            OllamaCloudErrorKind::InvalidResponse
+        );
     }
 
     #[test]
@@ -768,7 +864,12 @@ mod tests {
             .await;
         let account = result.account.expect("fetch live Ollama account");
         let usage = result.usage.expect("fetch live Ollama usage");
-        assert!(!account.id.is_empty());
+        assert!(
+            account.id.is_some()
+                || account.email.is_some()
+                || account.name.is_some()
+                || account.plan.is_some()
+        );
         assert!(usage
             .limits
             .iter()

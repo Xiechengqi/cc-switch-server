@@ -179,7 +179,7 @@ export interface OllamaCloudSection<T> {
 }
 
 export interface OllamaCloudAccountView {
-  id: string;
+  id?: string;
   email?: string;
   name?: string;
   firstName?: string;

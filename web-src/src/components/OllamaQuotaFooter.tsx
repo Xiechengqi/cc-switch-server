@@ -52,8 +52,9 @@ function accountLabel(snapshot: OllamaCloudSnapshot): string | null {
     (value, index, values): value is string =>
       Boolean(value) && values.indexOf(value) === index,
   );
-  if (identities.length === 0) identities.push(account.id);
-  return [account.plan, ...identities].filter(Boolean).join(" · ");
+  if (identities.length === 0 && account.id) identities.push(account.id);
+  const parts = [account.plan, ...identities].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function firstSectionReason(snapshot: OllamaCloudSnapshot): string | null {
