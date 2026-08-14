@@ -335,12 +335,20 @@
       "auth": {
         "headers": [
           "authorization",
-          "x-cursor-checksum",
-          "x-cursor-client-version",
+          "connect-accept-encoding",
+          "connect-protocol-version",
+          "content-type",
+          "backend-traceparent",
+          "traceparent",
+          "user-agent",
+          "x-cursor-client-type=cli",
+          "x-cursor-client-version=cli-*",
+          "x-ghost-mode",
+          "x-original-request-id",
           "x-request-id"
         ],
         "credentialSource": [
-          "accountBinding.accountId -> AccountStore access token"
+          "accountBinding.accountId -> AccountStore access token -> OAuth CLI rail"
         ]
       },
       "model": {
@@ -390,12 +398,17 @@
       "auth": {
         "headers": [
           "authorization",
-          "x-cursor-checksum",
-          "x-cursor-client-version",
+          "connect-protocol-version",
+          "content-type",
+          "user-agent",
+          "x-cursor-client-type=sdk",
+          "x-cursor-client-version=sdk-*",
+          "x-ghost-mode",
+          "x-original-request-id",
           "x-request-id"
         ],
         "credentialSource": [
-          "provider.settingsConfig auth/API key"
+          "provider.settingsConfig API key -> same-rail token exchange -> API Key SDK rail"
         ]
       },
       "model": {
@@ -1021,12 +1034,17 @@
       "auth": {
         "headers": [
           "authorization",
-          "x-cursor-checksum",
-          "x-cursor-client-version",
+          "connect-protocol-version",
+          "content-type",
+          "user-agent",
+          "x-cursor-client-type=sdk",
+          "x-cursor-client-version=sdk-*",
+          "x-ghost-mode",
+          "x-original-request-id",
           "x-request-id"
         ],
         "credentialSource": [
-          "provider.settingsConfig auth/API key"
+          "provider.settingsConfig API key -> same-rail token exchange -> API Key SDK rail"
         ]
       },
       "model": {
@@ -1076,12 +1094,20 @@
       "auth": {
         "headers": [
           "authorization",
-          "x-cursor-checksum",
-          "x-cursor-client-version",
+          "connect-accept-encoding",
+          "connect-protocol-version",
+          "content-type",
+          "backend-traceparent",
+          "traceparent",
+          "user-agent",
+          "x-cursor-client-type=cli",
+          "x-cursor-client-version=cli-*",
+          "x-ghost-mode",
+          "x-original-request-id",
           "x-request-id"
         ],
         "credentialSource": [
-          "accountBinding.accountId -> AccountStore access token"
+          "accountBinding.accountId -> AccountStore access token -> OAuth CLI rail"
         ]
       },
       "model": {

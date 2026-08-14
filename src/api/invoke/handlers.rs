@@ -2670,7 +2670,7 @@ pub(in crate::api) fn map_managed_auth_account(
         "authIdentityGeneration": account.auth_identity_generation,
         "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
         "email": account.email,
-        "subscriptionLevel": account.subscription_level,
+        "subscriptionLevel": crate::api::types::account_subscription_level_public_view(account),
         "avatar_url": Value::Null,
         "authenticated_at": account_authenticated_at(account),
         "is_default": default_account_id == Some(account.id.as_str()),

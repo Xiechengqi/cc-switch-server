@@ -118,6 +118,26 @@
     "title": "Providers"
   },
   "provider": {
+    "ollama": {
+      "complete": "ライブ使用量",
+      "partial": "一部のデータ",
+      "stale": "キャッシュデータ",
+      "error": "アカウント利用不可",
+      "unconfigured": "API Key が必要",
+      "loading": "アカウントを読み込み中",
+      "queryFailed": "Ollama アカウント使用量を読み込めませんでした",
+      "refresh": "Ollama アカウントと使用量を更新",
+      "session": "セッション",
+      "weekly": "週間",
+      "cost": "アクティビティ ${{value}}",
+      "modelsMore": "ほか {{count}} 件",
+      "source": {
+        "live": "ライブ応答",
+        "fresh_cache": "新しいキャッシュ",
+        "stale_cache": "古いキャッシュ",
+        "configuration": "プロバイダー設定"
+      }
+    },
     "codingPlanQuota": {
       "supported": "ライブクォータ",
       "stale": "キャッシュ済みクォータ",

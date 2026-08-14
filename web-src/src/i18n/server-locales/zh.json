@@ -118,6 +118,26 @@
     "title": "供应商"
   },
   "provider": {
+    "ollama": {
+      "complete": "实时用量",
+      "partial": "部分数据",
+      "stale": "缓存数据",
+      "error": "账号不可用",
+      "unconfigured": "需要 API Key",
+      "loading": "正在读取账号",
+      "queryFailed": "无法读取 Ollama 账号用量",
+      "refresh": "刷新 Ollama 账号和用量",
+      "session": "会话",
+      "weekly": "每周",
+      "cost": "活动费用 ${{value}}",
+      "modelsMore": "另有 {{count}} 项",
+      "source": {
+        "live": "实时响应",
+        "fresh_cache": "新鲜缓存",
+        "stale_cache": "过期缓存",
+        "configuration": "供应商配置"
+      }
+    },
     "codingPlanQuota": {
       "supported": "实时额度",
       "stale": "缓存额度",

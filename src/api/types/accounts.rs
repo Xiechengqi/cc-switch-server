@@ -1,6 +1,7 @@
 use crate::domain::accounts::capability_evidence::{
     account_capability_projections, AccountCapabilityProjection,
 };
+use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::login::{OAuthLoginCancellation, OAuthLoginFinish, OAuthLoginStart};
 use crate::domain::accounts::oauth::{
     OAuthErrorKind, OAuthHttpRequest, OAuthQuotaStrategy, OAuthSupportStage,
@@ -100,7 +101,7 @@ impl From<&Account> for AccountPublicView {
             email: account.email.clone(),
             token_type: account.token_type.clone(),
             scopes: account.scopes.clone(),
-            subscription_level: account.subscription_level.clone(),
+            subscription_level: account_subscription_level_public_view(account),
             entitlement_status: account.entitlement_status.clone(),
             quota_percent: account.quota_percent,
             quota: account_quota_public_view(account, account.quota.as_ref()),
@@ -148,6 +149,9 @@ pub(in crate::api) fn account_quota_public_view(
     quota: Option<&AccountQuota>,
 ) -> Option<AccountQuota> {
     let mut quota = quota.cloned()?;
+    if account.provider_type == ProviderType::GrokOAuth {
+        normalize_grok_quota_public_plan(&mut quota);
+    }
     let secrets = account_secret_values(account);
     if let Some(message) = quota.credential_message.as_mut() {
         *message = crate::logging::redact_sensitive_text(message);
@@ -166,6 +170,41 @@ pub(in crate::api) fn account_quota_public_view(
         redact_account_public_value(extra_usage, &secrets);
     }
     Some(quota)
+}
+
+pub(in crate::api) fn account_subscription_level_public_view(account: &Account) -> Option<String> {
+    if account.provider_type == ProviderType::GrokOAuth {
+        return account
+            .subscription_level
+            .as_deref()
+            .and_then(canonical_grok_subscription_level);
+    }
+    account.subscription_level.clone()
+}
+
+fn normalize_grok_quota_public_plan(quota: &mut AccountQuota) {
+    if let Some(message) = quota.credential_message.as_mut() {
+        if let Some(canonical) = canonical_grok_subscription_level(message) {
+            *message = canonical;
+        }
+    }
+    let Some(subscription) = quota
+        .extra_usage
+        .as_mut()
+        .and_then(|extra| extra.pointer_mut("/subscription"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for key in ["planType", "planLabel"] {
+        let canonical = subscription
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(canonical_grok_subscription_level);
+        if let Some(canonical) = canonical {
+            subscription.insert(key.to_string(), Value::String(canonical));
+        }
+    }
 }
 
 pub(in crate::api) fn redact_account_public_text(account: &Account, value: &str) -> String {
@@ -760,7 +799,7 @@ impl AccountLoginAccountSummary {
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
             email: account.email.clone(),
-            subscription_level: account.subscription_level.clone(),
+            subscription_level: account_subscription_level_public_view(account),
             entitlement_status: account.entitlement_status.clone(),
             expires_at: account.expires_at,
             has_access_token: account
@@ -949,6 +988,44 @@ mod tests {
         }
         assert!(serialized.contains("visible"));
         assert!(serialized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn grok_account_public_view_canonicalizes_cached_grokpro_plan() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "acct-grok-plan",
+            "providerType": "grok_oauth",
+            "subscriptionLevel": "GrokPro",
+            "quota": {
+                "success": true,
+                "credentialMessage": "GrokPro",
+                "extraUsage": {
+                    "user": {"subscriptionTier": "GrokPro"},
+                    "subscription": {
+                        "planType": "GrokPro",
+                        "planLabel": "GrokPro"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+
+        assert_eq!(value["subscriptionLevel"], "SuperGrok");
+        assert_eq!(value["quota"]["credentialMessage"], "SuperGrok");
+        assert_eq!(
+            value["quota"]["extraUsage"]["subscription"]["planType"],
+            "SuperGrok"
+        );
+        assert_eq!(
+            value["quota"]["extraUsage"]["subscription"]["planLabel"],
+            "SuperGrok"
+        );
+        assert_eq!(
+            value["quota"]["extraUsage"]["user"]["subscriptionTier"],
+            "GrokPro"
+        );
     }
 
     #[test]

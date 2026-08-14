@@ -1,6 +1,6 @@
-//! Pull the structured fields cursor's AgentService needs out of the three
+//! Pull the structured fields cursor's AgentService needs out of the four
 //! request body shapes cc-switch accepts (Anthropic Messages, OpenAI Chat
-//! Completions, OpenAI Responses).
+//! Completions, OpenAI Responses, Gemini native).
 //!
 //! Tool-steering directives (`TOOL_COMMIT_DIRECTIVE`, `tool_choice` hints) and
 //! output constraints (`max_tokens`, `stop`, `response_format`) are injected
@@ -668,6 +668,12 @@ fn decompose_gemini_native(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let call_id = function_call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .unwrap_or(name);
             let args = function_call
                 .get("args")
                 .cloned()
@@ -675,7 +681,7 @@ fn decompose_gemini_native(
                 .to_string();
             if !name.is_empty() {
                 conversation_lines.push(format!(
-                    "Assistant called tool {name} ({name}) with arguments: {args}"
+                    "Assistant called tool {name} ({call_id}) with arguments: {args}"
                 ));
             }
         }
@@ -685,16 +691,23 @@ fn decompose_gemini_native(
                 .and_then(Value::as_str)
                 .unwrap_or("gemini_function_response")
                 .to_string();
+            let tool_call_id = function_response
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| name.clone());
             let response = function_response
                 .get("response")
                 .map(Value::to_string)
                 .unwrap_or_else(|| "{}".to_string());
             tool_results.push(ToolResultBlock {
-                tool_call_id: name.clone(),
+                tool_call_id: tool_call_id.clone(),
                 content: response.clone(),
                 is_error: false,
             });
-            conversation_lines.push(format!("Tool result ({name}): {response}"));
+            conversation_lines.push(format!("Tool result ({tool_call_id}): {response}"));
         }
 
         if text.is_empty() {
@@ -1343,6 +1356,52 @@ mod tests {
         assert_eq!(plan.images.len(), 1);
         assert_eq!(plan.tools.len(), 1);
         assert_eq!(plan.tools[0].name, "lookup");
+    }
+
+    #[test]
+    fn gemini_native_tool_result_prefers_call_id_with_name_fallback() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "call_lookup_1",
+                            "name": "lookup",
+                            "args": {"query": "status"}
+                        }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "id": "call_lookup_1",
+                                "name": "lookup",
+                                "response": {"value": "ready"}
+                            }
+                        },
+                        {
+                            "functionResponse": {
+                                "name": "legacy_lookup",
+                                "response": {"value": "legacy"}
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let plan = build_plan(InboundProtocol::GeminiNative, &body);
+        assert_eq!(plan.tool_results.len(), 2);
+        assert_eq!(plan.tool_results[0].tool_call_id, "call_lookup_1");
+        assert_eq!(plan.tool_results[1].tool_call_id, "legacy_lookup");
+        assert!(plan
+            .user_text
+            .contains("Assistant called tool lookup (call_lookup_1)"));
+        assert!(plan.user_text.contains("Tool result (call_lookup_1)"));
     }
 
     #[test]

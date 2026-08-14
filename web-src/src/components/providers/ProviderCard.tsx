@@ -558,13 +558,9 @@ export function ProviderCard({
                 isCurrent={isCurrent}
               />
             ) : quotaSource === "ollama_cloud" ? (
-              <OllamaQuotaFooter
-                meta={provider.meta}
-                providerId={provider.id}
-                appId={appId}
-                inline={true}
-                isCurrent={isCurrent}
-              />
+              resource ? (
+                <OllamaQuotaFooter resource={resource} inline={true} />
+              ) : null
             ) : isOfficial &&
               supportsOfficialSubscription &&
               !isManagedOauth ? (

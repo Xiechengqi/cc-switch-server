@@ -41,9 +41,9 @@ Claude / Codex / Gemini client
 - Provider API 导出仅返回脱敏视图；受控导入按 server 当前分类和凭据补丁契约执行，不提供跨 store 的通用配置导入导出。
 - 已实现 Codex Chat Completions 与 Responses 的直接互转，保留 max/reasoning/response_format/tool/usage 等 Codex bridge 关键字段。
 - 已接入 Claude/Codex/Gemini/OpenAI-compatible/Gemini-native/Anthropic-native 之间的主要跨协议 adapter contract，并把 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset 纳入 coverage。
-- Cursor AgentService 已默认接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；Provider maturity 保持 Experimental，直到 OAuth/API key 真实验收矩阵通过。
+- Cursor 已按 OAuth CLI / API Key SDK 双 rail 接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；生产 endpoint 只从 runtime secrets 读取，Provider maturity 保持 Experimental，直到两条 rail 的真实验收矩阵分别通过。
 - GitHub Copilot 已提供 device flow 静态导入路径，真实 token/live models/stream 回归完成前保持 fallback。Kiro 已有 server-native refresh、模型发现和 Claude/Codex 非流/流式桥，本地协议合同为 Native/fixture-verified；真实账号的模型、usage、401 rollover、tool/image 与限流验收仍为 live pending。
-- Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Ollama、Antigravity/Agy 等账号可执行 server-native refresh/profile/quota。
+- Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Antigravity/Agy 等受管账号可执行 server-native refresh/profile/quota；Ollama API Key 仍是 Provider-owned 凭据，保存后直接读取官方 `/api/me` 与 `/api/usage` 并在 Provider 卡片显示账号、计划和用量，不创建 Account 行。
 - Managed OAuth Provider Bundle 必须显式绑定账号。Codex OAuth 的 active account 仅是账号中心独立操作的目标，不重绑 Provider 或 Share，也不参与数据面路由。所有外部推理请求只能通过 Router 暴露的同一个 Share URL 进入；Server 校验 Router ingress 签名和 Share 身份后，由 Share binding 精确选择 Claude/Codex/Gemini Surface 及其绑定账号。请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
 - Provider Bundle 的模型策略默认由全局控制，可切换为按 App 独立控制；只有至少两个 App Surface 支持可配置策略时才允许独立模式。Profile 固定策略不接受覆盖，Server Web、Share descriptor 与 Router 均显式展示其为固定例外。
 - Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
@@ -72,7 +72,7 @@ Claude / Codex / Gemini client
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
-| **Cursor** | 作为 Claude/Codex 上游桥（非 IDE MITM） | 🧪 Experimental | AgentService h2/protobuf 默认接线；固定单凭据，待真实验收 |
+| **Cursor** | 作为 Claude/Codex 上游桥（非 IDE MITM） | 🧪 Experimental | OAuth CLI / API Key SDK 双 rail；固定单凭据与 runtime-secret endpoint，待分轨真实验收 |
 | **GitHub Copilot** | 作为 Claude 上游桥 | ⚠️ Fallback | 静态 preflight 与 model map 已接入；token 交换与 live 回归待验收 |
 | **Kiro** | 作为 Claude 上游桥 | ⚠️ Planned | CodeWhisperer 协议桥已静态接线；仅 Claude app，待真实验收 |
 | **DeepSeek Account** | 作为 Claude 上游桥 | ⚠️ Planned | 账密协议桥与 PoW 已接线；Codex/Gemini 路径仍为 skeleton |
@@ -91,7 +91,7 @@ Claude / Codex / Gemini client
 | Gemini / Gemini CLI OAuth | ✅ | ✅ | ✅ | Native |
 | OpenRouter / Ollama / Nvidia / DeepSeek API | ✅ | ✅ | ✅ | Native |
 | Antigravity / Agy OAuth | ✅ | — | ✅ | Native（经预设映射） |
-| Cursor OAuth / API Key | 🧪 | 🧪 | 🧪 | Experimental（AgentService 默认接线，live-unverified） |
+| Cursor OAuth / API Key | 🧪 | 🧪 | 🧪 | Experimental（CLI/SDK 分轨接线，runtime endpoint 必配，live-unverified） |
 | AWS Bedrock | ⚠️ | ⚠️ | ⚠️ | Planned（SigV4 合同已生成） |
 | GitHub Copilot | ⚠️ | ⚠️ | ⚠️ | Fallback |
 | Kiro OAuth | ⚠️ | — | — | Planned（仅 Claude） |

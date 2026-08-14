@@ -1,6 +1,7 @@
 pub mod capability_evidence;
 pub mod claude_subscription;
 pub mod cursor_import;
+pub mod grok_subscription;
 pub mod login;
 pub mod managers;
 pub mod oauth;

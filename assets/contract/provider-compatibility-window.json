@@ -13,11 +13,11 @@
   "currentSourceEvidence": [
     {
       "path": "src/api/mod.rs",
-      "sha256": "4c2966e32b1d6c17922c35d9b8bb759783d9eb3982755fb7e6fd9e3e7d7e4a57"
+      "sha256": "8ad75ddc63fbd184f11b133e78331cfdd678837ca8a10ddc907191e7f8f9c00b"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "9e53acc748691c28faa99d52b5b2142c14c4dd28599c2ba2d1acbdae8410efd5"
+      "sha256": "24aeff98612bcbab490a49971221b8e8773a4116a5a79c8bb18f4f82b4f8f781"
     },
     {
       "path": "src/domain/providers/credentials.rs",

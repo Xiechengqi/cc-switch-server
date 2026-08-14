@@ -1071,6 +1071,14 @@
       "notes": "Reads the exact Provider revision, credential generation, and runtime-fingerprint coding-plan quota snapshot."
     },
     {
+      "name": "get_provider_account_usage",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /web-api/invoke/get_provider_account_usage",
+      "notes": "Reads the Provider-owned Ollama account and usage snapshot without creating or selecting a managed Account."
+    },
+    {
       "name": "get_common_config_snippet",
       "support": "shim",
       "implemented": true,
@@ -1576,6 +1584,14 @@
       "feature": "providers",
       "endpoint": "POST /web-api/invoke/refresh_coding_plan_quota",
       "notes": "Forces one quota refresh for the exact Provider credential without selecting another Provider or Account."
+    },
+    {
+      "name": "refresh_provider_account_usage",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /web-api/invoke/refresh_provider_account_usage",
+      "notes": "Forces one Provider-owned Ollama account and usage refresh for the canonical Bundle credential source."
     },
     {
       "name": "remove_custom_endpoint",

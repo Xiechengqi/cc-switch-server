@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::providers::registry::ProviderKey;
 
 const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -159,7 +160,6 @@ pub(in crate::api) async fn create_provider(
         .await
         .map_err(ApiError::internal)?
         .map_err(map_provider_command_error)?;
-
     Ok(Json(CreateProviderResponse {
         ok: true,
         stored: crate::domain::providers::credentials::ProviderView::from_stored(&stored),
@@ -552,6 +552,49 @@ pub(in crate::api) async fn refresh_coding_plan_quota(
     Query(query): Query<ProviderResourceQuery>,
 ) -> Result<Json<CodingPlanQuotaResponse>, ApiError> {
     coding_plan_quota_response(state, headers, id, query.app, true).await
+}
+
+pub(in crate::api) async fn get_provider_account_usage(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderResourceQuery>,
+) -> Result<(HeaderMap, Json<OllamaCloudSnapshotResponse>), ApiError> {
+    ollama_cloud_snapshot_response(state, headers, id, query.app, false).await
+}
+
+pub(in crate::api) async fn refresh_provider_account_usage(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderResourceQuery>,
+) -> Result<(HeaderMap, Json<OllamaCloudSnapshotResponse>), ApiError> {
+    ollama_cloud_snapshot_response(state, headers, id, query.app, true).await
+}
+
+async fn ollama_cloud_snapshot_response(
+    state: ServerState,
+    headers: HeaderMap,
+    provider_id: String,
+    app: AppKind,
+    force_refresh: bool,
+) -> Result<(HeaderMap, Json<OllamaCloudSnapshotResponse>), ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_key = ProviderKey::new(app, provider_id).map_err(ApiError::bad_request)?;
+    let snapshot = state
+        .ollama_cloud_snapshot(provider_key, force_refresh)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    Ok((
+        response_headers,
+        Json(OllamaCloudSnapshotResponse { ok: true, snapshot }),
+    ))
 }
 
 async fn coding_plan_quota_response(

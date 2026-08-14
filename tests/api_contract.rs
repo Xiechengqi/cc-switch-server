@@ -7450,6 +7450,114 @@ async fn coding_plan_quota_web_invoke_uses_the_exact_provider_contract() {
 }
 
 #[tokio::test]
+async fn ollama_account_usage_is_session_scoped_provider_owned_and_secret_free() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let secret = "api-contract-ollama\nsecret";
+    let provider_id = "api-contract-ollama";
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            json!({
+                "id": provider_id,
+                "familyId": "family.ollama_cloud",
+                "name": "Ollama API Key",
+                "modelPolicyScope": "global",
+                "modelPolicy": "single",
+                "upstreamModel": "gpt-oss:120b-cloud",
+                "testApp": "codex",
+                "testModel": "gpt-oss:120b-cloud",
+                "surfaces": [
+                    {
+                        "app": "claude",
+                        "enabled": true,
+                        "profileId": "claude.ollama_cloud"
+                    },
+                    {
+                        "app": "codex",
+                        "enabled": true,
+                        "profileId": "codex.ollama_cloud"
+                    }
+                ],
+                "clientRequestId": "api-contract-create-ollama",
+                "credentialPatches": {
+                    "/settingsConfig/apiKey": {
+                        "action": "replace",
+                        "value": secret
+                    }
+                }
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(created).await
+    );
+    assert!(state
+        .accounts_snapshot()
+        .await
+        .accounts
+        .iter()
+        .all(|account| account.provider_type != ProviderType::OllamaCloud));
+
+    let path = format!("/api/providers/{provider_id}/account-usage?app=codex");
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request(Method::GET, &path, Value::Null, None))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(Method::GET, &path, Value::Null, Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["cache-control"],
+        "private, no-store, max-age=0"
+    );
+    let body = json_body(response).await;
+    let snapshot = &body["snapshot"];
+    assert_eq!(snapshot["providerKey"]["app"], "codex");
+    assert_eq!(snapshot["credentialSourceKey"]["app"], "codex");
+    assert_eq!(snapshot["status"], "error");
+    assert_eq!(snapshot["account"]["errorKind"], "authentication");
+    assert_eq!(snapshot["usage"]["errorKind"], "authentication");
+    assert!(!serde_json::to_string(snapshot).unwrap().contains(secret));
+
+    for command in [
+        "get_provider_account_usage",
+        "refresh_provider_account_usage",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/web-api/invoke/{command}"),
+                json!({"app": "claude", "providerId": provider_id}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+        assert_eq!(snapshot["providerKey"]["app"], "claude");
+        assert_eq!(snapshot["credentialSourceKey"]["app"], "codex");
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains(secret));
+    }
+}
+
+#[tokio::test]
 async fn openai_oauth_bundle_requires_per_app_model_policies() {
     let state = test_state();
     state

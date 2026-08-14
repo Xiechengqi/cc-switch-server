@@ -512,7 +512,7 @@ relevant.
   `open-sse/executors/cursor.ts`, `open-sse/executors/cursor/builtinToolBridge.ts`,
   `open-sse/executors/cursor/composer.ts`, and
   `open-sse/services/cursorSessionManager.ts`. It provides the strongest local
-  evidence for native `AgentService/Run`, Composer model handling, declared-MCP
+  evidence for the native Cursor Connect-RPC method, Composer model handling, declared-MCP
   bridging, explicit builtin rejection, and same-h2-stream tool-result resume.
   Its registry is keyed only by raw conversation ID and its documented
   cross-instance cold resume is intentionally not adopted because neither
@@ -597,7 +597,7 @@ relevant.
 
 ### Verified Acceptance
 
-- `cargo test --lib cursor` passes 153 tests. This includes scoped session and
+- `cargo test --lib cursor` passes 188 tests. This includes scoped session and
   response/tool indexes, initial and post-tool absolute deadlines, protocol-level
   builtin rejection, credential/catalog isolation, same-account 401, bound 429,
   all four response emitters, and the signed Gemini Share catalog contract.

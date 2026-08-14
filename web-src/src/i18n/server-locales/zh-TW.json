@@ -118,6 +118,26 @@
     "title": "供應商"
   },
   "provider": {
+    "ollama": {
+      "complete": "即時用量",
+      "partial": "部分資料",
+      "stale": "快取資料",
+      "error": "帳號不可用",
+      "unconfigured": "需要 API Key",
+      "loading": "正在讀取帳號",
+      "queryFailed": "無法讀取 Ollama 帳號用量",
+      "refresh": "重新整理 Ollama 帳號和用量",
+      "session": "工作階段",
+      "weekly": "每週",
+      "cost": "活動費用 ${{value}}",
+      "modelsMore": "另有 {{count}} 項",
+      "source": {
+        "live": "即時回應",
+        "fresh_cache": "新鮮快取",
+        "stale_cache": "過期快取",
+        "configuration": "供應商設定"
+      }
+    },
     "codingPlanQuota": {
       "supported": "即時額度",
       "stale": "快取額度",

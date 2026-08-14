@@ -501,8 +501,17 @@ function authContract(app, providerType, presetName) {
   if (type === "kiro_oauth") {
     return { headers: ["authorization", "x-amz-user-agent", "x-amz-target", "x-amzn-kiro-agent-mode"], credentialSource: ["accountBinding.accountId -> AccountStore access token"] };
   }
-  if (type === "cursor_oauth" || type === "cursor_apikey") {
-    return { headers: ["authorization", "x-cursor-checksum", "x-cursor-client-version", "x-request-id"], credentialSource: [type === "cursor_oauth" ? "accountBinding.accountId -> AccountStore access token" : "provider.settingsConfig auth/API key"] };
+  if (type === "cursor_oauth") {
+    return {
+      headers: ["authorization", "connect-accept-encoding", "connect-protocol-version", "content-type", "backend-traceparent", "traceparent", "user-agent", "x-cursor-client-type=cli", "x-cursor-client-version=cli-*", "x-ghost-mode", "x-original-request-id", "x-request-id"],
+      credentialSource: ["accountBinding.accountId -> AccountStore access token -> OAuth CLI rail"],
+    };
+  }
+  if (type === "cursor_apikey") {
+    return {
+      headers: ["authorization", "connect-protocol-version", "content-type", "user-agent", "x-cursor-client-type=sdk", "x-cursor-client-version=sdk-*", "x-ghost-mode", "x-original-request-id", "x-request-id"],
+      credentialSource: ["provider.settingsConfig API key -> same-rail token exchange -> API Key SDK rail"],
+    };
   }
   if (["antigravity_oauth", "agy_oauth", "github_copilot", "deepseek_account"].includes(type)) {
     return { headers: ["authorization"], credentialSource: ["accountBinding.accountId -> AccountStore managed credential"] };

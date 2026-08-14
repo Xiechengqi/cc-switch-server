@@ -50,6 +50,7 @@ use crate::clients::oauth::refresh::{
     provider_native_refresh_available, record_refresh_flight_failure,
     validate_native_account_refresh_receipt, AccountRefreshFailure,
 };
+use crate::clients::ollama_cloud::{OllamaCloudClient, OllamaCloudFetchError};
 use crate::clients::router::client::{
     self, ActivateTunnelPayload, NamespaceLeasePayload, NamespaceLeaseResponse,
     NamespaceRenewLeasePayload, ShareEditAckPayload, ShareEditView, TunnelStatePayload,
@@ -74,8 +75,8 @@ use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
     bundle_id as provider_bundle_id, bundle_model_policy_scope, bundle_model_policy_source,
     bundle_test_app, credential_source_app, has_bundle_managed_metadata,
-    is_explicit_bundle_surface, surface_enabled, ModelPolicyScope, ProviderBundleReferencePreview,
-    ProviderBundleView, ProviderBundleWriteDraft,
+    is_explicit_bundle_surface, shared_credential_source_key, surface_enabled, ModelPolicyScope,
+    ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
 };
 use crate::domain::providers::coding_plan::{
     CodingPlanQuotaAdapter, CodingPlanQuotaCache, CodingPlanQuotaCacheKey,
@@ -92,6 +93,11 @@ use crate::domain::providers::credentials::{
 };
 use crate::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE,
+};
+use crate::domain::providers::ollama_cloud::{
+    snapshot_status as ollama_cloud_snapshot_status, OllamaCloudAccountView, OllamaCloudCache,
+    OllamaCloudCacheKey, OllamaCloudErrorKind, OllamaCloudSection, OllamaCloudSectionState,
+    OllamaCloudSnapshot, OllamaCloudSnapshotSource, OllamaCloudUsageView,
 };
 use crate::domain::providers::registry::{
     profile_by_id, resolve_custom_binding, CreationPolicy, CredentialPolicy, CustomBindingInput,
@@ -112,7 +118,7 @@ use crate::domain::sharing::previous_response_cache::{
     PreviousResponseCache, PreviousResponseCacheScope,
 };
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint,
+    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint, ShareDescriptor,
     ShareRequestLogEntry, ShareSyncOperation,
 };
 use crate::domain::sharing::shares::{
@@ -714,6 +720,11 @@ pub struct ServerStateInner {
     coding_plan_quota_refreshes:
         Mutex<BTreeMap<CodingPlanQuotaCacheKey, Weak<CodingPlanQuotaRefreshFlight>>>,
     coding_plan_quota_http_client: reqwest::Client,
+    ollama_cloud_cache: Mutex<OllamaCloudCache>,
+    ollama_cloud_refreshes: Mutex<BTreeMap<OllamaCloudCacheKey, Weak<OllamaCloudRefreshFlight>>>,
+    ollama_cloud_client: RwLock<OllamaCloudClient>,
+    #[cfg(test)]
+    ollama_cloud_post_commit_refresh_enabled: std::sync::atomic::AtomicBool,
     grok_media_tasks: Mutex<GrokMediaTaskStore>,
     grok_media_task_persistence: AsyncMutex<()>,
     image_capabilities: Arc<crate::image_store::ImageCapabilityStore>,
@@ -1400,6 +1411,58 @@ impl CodingPlanQuotaRefreshFlight {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OllamaCloudTarget {
+    provider_key: ProviderKey,
+    provider_revision: u64,
+    cache_key: OllamaCloudCacheKey,
+}
+
+#[derive(Debug, Clone)]
+struct OllamaCloudRefreshResult {
+    source: OllamaCloudSnapshotSource,
+    account: OllamaCloudSection<OllamaCloudAccountView>,
+    usage: OllamaCloudSection<OllamaCloudUsageView>,
+}
+
+#[derive(Debug, Default)]
+struct OllamaCloudRefreshFlight {
+    gate: Arc<AsyncMutex<()>>,
+    result: Mutex<Option<OllamaCloudRefreshResult>>,
+}
+
+impl OllamaCloudRefreshFlight {
+    fn clear_result(&self) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn complete(
+        &self,
+        source: OllamaCloudSnapshotSource,
+        account: OllamaCloudSection<OllamaCloudAccountView>,
+        usage: OllamaCloudSection<OllamaCloudUsageView>,
+    ) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(OllamaCloudRefreshResult {
+            source,
+            account,
+            usage,
+        });
+    }
+
+    fn completed_result(&self) -> Option<OllamaCloudRefreshResult> {
+        self.result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 fn coding_plan_quota_target_from_store(
     providers: &ProviderStore,
     key: &ProviderKey,
@@ -1521,6 +1584,130 @@ fn coding_plan_quota_snapshot(
         source,
         quota,
     }
+}
+
+fn ollama_cloud_target_from_store(
+    providers: &ProviderStore,
+    key: &ProviderKey,
+) -> Result<OllamaCloudTarget, ProviderCommandError> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|stored| stored.app == key.app && stored.provider.id == key.provider_id)
+        .ok_or(ProviderCommandError::NotFound)?;
+    if !is_ollama_cloud_provider(stored) {
+        return Err(ProviderCommandError::Invalid(
+            "Provider is not an Ollama API Key Provider".to_string(),
+        ));
+    }
+    let credential_source_key = shared_credential_source_key(stored)
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?
+        .unwrap_or_else(|| key.clone());
+    let credential_source = providers
+        .providers
+        .iter()
+        .find(|candidate| {
+            candidate.app == credential_source_key.app
+                && candidate.provider.id == credential_source_key.provider_id
+        })
+        .ok_or_else(|| {
+            ProviderCommandError::Invalid(
+                "Ollama Provider credential source does not exist".to_string(),
+            )
+        })?;
+    if !is_ollama_cloud_provider(credential_source) {
+        return Err(ProviderCommandError::Invalid(
+            "Ollama Provider credential source has an incompatible profile".to_string(),
+        ));
+    }
+    Ok(OllamaCloudTarget {
+        provider_key: key.clone(),
+        provider_revision: stored.resource.revision,
+        cache_key: OllamaCloudCacheKey {
+            credential_source_key,
+            credential_generation: credential_source.resource.credential_generation,
+        },
+    })
+}
+
+fn is_ollama_cloud_provider(stored: &StoredProvider) -> bool {
+    match stored.resource.profile_id.as_ref() {
+        Some(profile_id) => profile_by_id(profile_id.as_str()).is_some_and(|profile| {
+            profile.compatibility_provider_type == Some(ProviderType::OllamaCloud)
+        }),
+        None => stored.provider_type == ProviderType::OllamaCloud,
+    }
+}
+
+fn ollama_cloud_credentials_from_store(
+    providers: &ProviderStore,
+    target: &OllamaCloudTarget,
+) -> anyhow::Result<Result<zeroize::Zeroizing<String>, String>> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|candidate| {
+            candidate.app == target.cache_key.credential_source_key.app
+                && candidate.provider.id == target.cache_key.credential_source_key.provider_id
+        })
+        .ok_or_else(|| anyhow::anyhow!("Ollama credential source disappeared"))?;
+    let mut materialized = providers.materialize_provider_record(stored)?;
+    let result = [
+        "/settingsConfig/apiKey",
+        "/settingsConfig/auth/OPENAI_API_KEY",
+        "/settingsConfig/env/OPENAI_API_KEY",
+        "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+        "/settingsConfig/env/ANTHROPIC_API_KEY",
+        "/settingsConfig/env/API_KEY",
+    ]
+    .iter()
+    .find_map(|slot| reveal_provider_credential(&materialized.provider, slot).ok())
+    .map(zeroize::Zeroizing::new)
+    .map(|secret| {
+        if secret.trim().len() == secret.len() {
+            secret
+        } else {
+            zeroize::Zeroizing::new(secret.trim().to_string())
+        }
+    })
+    .filter(|secret| !secret.is_empty())
+    .ok_or_else(|| "Ollama API key is not configured".to_string());
+    crate::domain::providers::credentials::zeroize_materialized_provider(
+        &mut materialized.provider,
+    );
+    Ok(result)
+}
+
+fn ollama_cloud_snapshot(
+    target: &OllamaCloudTarget,
+    source: OllamaCloudSnapshotSource,
+    account: OllamaCloudSection<OllamaCloudAccountView>,
+    usage: OllamaCloudSection<OllamaCloudUsageView>,
+) -> OllamaCloudSnapshot {
+    OllamaCloudSnapshot {
+        provider_key: target.provider_key.clone(),
+        provider_revision: target.provider_revision,
+        credential_source_key: target.cache_key.credential_source_key.clone(),
+        credential_generation: target.cache_key.credential_generation,
+        source,
+        status: ollama_cloud_snapshot_status(&account, &usage),
+        account,
+        usage,
+    }
+}
+
+fn ollama_cloud_cache_keys_from_store(providers: &ProviderStore) -> BTreeSet<OllamaCloudCacheKey> {
+    providers
+        .providers
+        .iter()
+        .filter(|stored| is_ollama_cloud_provider(stored))
+        .filter_map(|stored| {
+            let key = ProviderKey::new(stored.app, stored.provider.id.clone()).ok()?;
+            ollama_cloud_target_from_store(providers, &key)
+                .ok()
+                .map(|target| target.cache_key)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5252,6 +5439,8 @@ impl ServerStateInner {
         let http_client = build_http_client()?;
         let coding_plan_quota_http_client =
             build_coding_plan_quota_client().context("build coding-plan quota HTTP client")?;
+        let ollama_cloud_client =
+            OllamaCloudClient::official().context("build Ollama Cloud account HTTP client")?;
         let (events, _) = broadcast::channel(256);
         let (shutdown, _) = watch::channel(false);
         let mut provider_import_preview_key = [0u8; 32];
@@ -5303,6 +5492,11 @@ impl ServerStateInner {
             coding_plan_quota_cache: Mutex::new(CodingPlanQuotaCache::default()),
             coding_plan_quota_refreshes: Mutex::new(BTreeMap::new()),
             coding_plan_quota_http_client,
+            ollama_cloud_cache: Mutex::new(OllamaCloudCache::default()),
+            ollama_cloud_refreshes: Mutex::new(BTreeMap::new()),
+            ollama_cloud_client: RwLock::new(ollama_cloud_client),
+            #[cfg(test)]
+            ollama_cloud_post_commit_refresh_enabled: std::sync::atomic::AtomicBool::new(false),
             grok_media_tasks: Mutex::new(grok_media_tasks),
             grok_media_task_persistence: AsyncMutex::new(()),
             image_capabilities,
@@ -6651,6 +6845,341 @@ impl ServerStateInner {
             .invalidate(key);
     }
 
+    pub async fn ollama_cloud_snapshot(
+        &self,
+        provider_key: ProviderKey,
+        force_refresh: bool,
+    ) -> anyhow::Result<Result<OllamaCloudSnapshot, ProviderCommandError>> {
+        for _ in 0..3 {
+            let target = {
+                let providers = self.providers.read().await;
+                match ollama_cloud_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            self.retain_current_ollama_cloud_cache(&target.cache_key);
+
+            if !force_refresh {
+                if let Some((account, usage)) =
+                    self.fresh_ollama_cloud_sections(&target.cache_key, now_ms_i64())
+                {
+                    return Ok(Ok(ollama_cloud_snapshot(
+                        &target,
+                        OllamaCloudSnapshotSource::FreshCache,
+                        account,
+                        usage,
+                    )));
+                }
+            }
+
+            let refresh_flight = self.ollama_cloud_refresh_flight(&target.cache_key);
+            let (refresh_guard, waited) = match Arc::clone(&refresh_flight.gate).try_lock_owned() {
+                Ok(guard) => (guard, false),
+                Err(_) => (Arc::clone(&refresh_flight.gate).lock_owned().await, true),
+            };
+            if waited {
+                let current = {
+                    let providers = self.providers.read().await;
+                    match ollama_cloud_target_from_store(&providers, &provider_key) {
+                        Ok(target) => target,
+                        Err(error) => return Ok(Err(error)),
+                    }
+                };
+                if current.cache_key != target.cache_key {
+                    drop(refresh_guard);
+                    continue;
+                }
+                if let Some(result) = refresh_flight.completed_result() {
+                    return Ok(Ok(ollama_cloud_snapshot(
+                        &current,
+                        result.source,
+                        result.account,
+                        result.usage,
+                    )));
+                }
+            } else {
+                refresh_flight.clear_result();
+            }
+
+            let credentials = {
+                let providers = self.providers.read().await;
+                let current = match ollama_cloud_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if current.cache_key != target.cache_key {
+                    drop(refresh_guard);
+                    continue;
+                }
+                match ollama_cloud_credentials_from_store(&providers, &current)? {
+                    Ok(credentials) => credentials,
+                    Err(reason) => {
+                        self.clear_ollama_cloud_cache(&target.cache_key);
+                        let account = OllamaCloudSection::unconfigured(reason.clone());
+                        let usage = OllamaCloudSection::unconfigured(reason);
+                        refresh_flight.complete(
+                            OllamaCloudSnapshotSource::Configuration,
+                            account.clone(),
+                            usage.clone(),
+                        );
+                        return Ok(Ok(ollama_cloud_snapshot(
+                            &current,
+                            OllamaCloudSnapshotSource::Configuration,
+                            account,
+                            usage,
+                        )));
+                    }
+                }
+            };
+
+            if !force_refresh || waited {
+                if let Some((account, usage)) =
+                    self.fresh_ollama_cloud_sections(&target.cache_key, now_ms_i64())
+                {
+                    return Ok(Ok(ollama_cloud_snapshot(
+                        &target,
+                        OllamaCloudSnapshotSource::FreshCache,
+                        account,
+                        usage,
+                    )));
+                }
+            }
+
+            let client = self.ollama_cloud_client.read().await.clone();
+            let result = client.fetch(&credentials).await;
+            let current = {
+                let providers = self.providers.read().await;
+                match ollama_cloud_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            if current.cache_key != target.cache_key {
+                drop(refresh_guard);
+                continue;
+            }
+
+            if result
+                .account
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.kind == OllamaCloudErrorKind::Authentication)
+                || result
+                    .usage
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.kind == OllamaCloudErrorKind::Authentication)
+            {
+                self.clear_ollama_cloud_cache(&target.cache_key);
+            }
+            let observed_at_ms = now_ms_i64();
+            let account = self.ollama_cloud_account_section(
+                &target.cache_key,
+                result.account,
+                observed_at_ms,
+            );
+            let usage =
+                self.ollama_cloud_usage_section(&target.cache_key, result.usage, observed_at_ms);
+            let source = if matches!(account.state, OllamaCloudSectionState::Stale)
+                || matches!(usage.state, OllamaCloudSectionState::Stale)
+            {
+                OllamaCloudSnapshotSource::StaleCache
+            } else {
+                OllamaCloudSnapshotSource::Live
+            };
+            refresh_flight.complete(source, account.clone(), usage.clone());
+            return Ok(Ok(ollama_cloud_snapshot(&current, source, account, usage)));
+        }
+
+        Ok(Err(ProviderCommandError::Conflict {
+            code: "provider_credential_changed",
+            message:
+                "Provider credential changed repeatedly while refreshing Ollama account information"
+                    .to_string(),
+        }))
+    }
+
+    fn refresh_ollama_cloud_after_provider_commit(self: &Arc<Self>, provider_key: ProviderKey) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            match state
+                .ollama_cloud_snapshot(provider_key.clone(), true)
+                .await
+            {
+                Ok(Ok(_)) | Ok(Err(ProviderCommandError::NotFound)) => {}
+                Ok(Err(error)) => tracing::debug!(
+                    app = provider_key.app.as_str(),
+                    provider_id = %provider_key.provider_id,
+                    error = %error,
+                    "saved Provider does not expose Ollama account information"
+                ),
+                Err(error) => tracing::warn!(
+                    app = provider_key.app.as_str(),
+                    provider_id = %provider_key.provider_id,
+                    error = %error,
+                    "Ollama account refresh after Provider save failed"
+                ),
+            }
+        });
+    }
+
+    fn ollama_cloud_refresh_flight(
+        &self,
+        key: &OllamaCloudCacheKey,
+    ) -> Arc<OllamaCloudRefreshFlight> {
+        let mut refreshes = self
+            .ollama_cloud_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        refreshes.retain(|_, refresh| refresh.strong_count() > 0);
+        if let Some(refresh) = refreshes.get(key).and_then(Weak::upgrade) {
+            return refresh;
+        }
+        let refresh = Arc::new(OllamaCloudRefreshFlight::default());
+        refreshes.insert(key.clone(), Arc::downgrade(&refresh));
+        refresh
+    }
+
+    fn fresh_ollama_cloud_sections(
+        &self,
+        key: &OllamaCloudCacheKey,
+        now_ms: i64,
+    ) -> Option<(
+        OllamaCloudSection<OllamaCloudAccountView>,
+        OllamaCloudSection<OllamaCloudUsageView>,
+    )> {
+        let cache = self
+            .ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let account = cache.fresh_account(key, now_ms)?;
+        let usage = cache.fresh_usage(key, now_ms)?;
+        Some((
+            OllamaCloudSection::available(account.data, account.observed_at_ms),
+            OllamaCloudSection::available(usage.data, usage.observed_at_ms),
+        ))
+    }
+
+    fn ollama_cloud_account_section(
+        &self,
+        key: &OllamaCloudCacheKey,
+        result: Result<OllamaCloudAccountView, OllamaCloudFetchError>,
+        observed_at_ms: i64,
+    ) -> OllamaCloudSection<OllamaCloudAccountView> {
+        let mut cache = self
+            .ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match result {
+            Ok(account) => {
+                cache.insert_account(key.clone(), account.clone(), observed_at_ms);
+                OllamaCloudSection::available(account, observed_at_ms)
+            }
+            Err(error) => {
+                let stale = error
+                    .permits_stale()
+                    .then(|| cache.stale_account(key, observed_at_ms))
+                    .flatten();
+                if let Some(stale) = stale {
+                    OllamaCloudSection::stale(
+                        stale.data,
+                        stale.observed_at_ms,
+                        error.kind,
+                        error.public_message(),
+                        error.retry_after_ms,
+                    )
+                } else {
+                    cache.remove_account(key);
+                    OllamaCloudSection::error(
+                        error.kind,
+                        error.public_message(),
+                        error.retry_after_ms,
+                    )
+                }
+            }
+        }
+    }
+
+    fn ollama_cloud_usage_section(
+        &self,
+        key: &OllamaCloudCacheKey,
+        result: Result<OllamaCloudUsageView, OllamaCloudFetchError>,
+        observed_at_ms: i64,
+    ) -> OllamaCloudSection<OllamaCloudUsageView> {
+        let mut cache = self
+            .ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match result {
+            Ok(usage) => {
+                cache.insert_usage(key.clone(), usage.clone(), observed_at_ms);
+                OllamaCloudSection::available(usage, observed_at_ms)
+            }
+            Err(error) => {
+                let stale = error
+                    .permits_stale()
+                    .then(|| cache.stale_usage(key, observed_at_ms))
+                    .flatten();
+                if let Some(stale) = stale {
+                    OllamaCloudSection::stale(
+                        stale.data,
+                        stale.observed_at_ms,
+                        error.kind,
+                        error.public_message(),
+                        error.retry_after_ms,
+                    )
+                } else {
+                    cache.remove_usage(key);
+                    OllamaCloudSection::error(
+                        error.kind,
+                        error.public_message(),
+                        error.retry_after_ms,
+                    )
+                }
+            }
+        }
+    }
+
+    fn retain_current_ollama_cloud_cache(&self, key: &OllamaCloudCacheKey) {
+        self.ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_current(key);
+    }
+
+    fn clear_ollama_cloud_cache(&self, key: &OllamaCloudCacheKey) {
+        let mut cache = self
+            .ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.remove_account(key);
+        cache.remove_usage(key);
+    }
+
+    #[cfg(test)]
+    async fn set_ollama_cloud_client_for_test(&self, client: OllamaCloudClient) {
+        *self.ollama_cloud_client.write().await = client;
+    }
+
+    #[cfg(test)]
+    fn enable_ollama_cloud_post_commit_refresh_for_test(&self) {
+        self.ollama_cloud_post_commit_refresh_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn ollama_cloud_post_commit_refresh_is_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.ollama_cloud_post_commit_refresh_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
     pub async fn provider_views(&self, app: Option<AppKind>) -> Vec<ProviderView> {
         let store = self.providers.read().await;
         let accounts = self.accounts.read().await;
@@ -7818,6 +8347,12 @@ impl ServerStateInner {
         candidate
             .rebuild_runtime_index(&accounts)
             .context("compile sealed Provider runtime index before commit")?;
+        let previous_ollama_cloud_cache_keys = ollama_cloud_cache_keys_from_store(&current);
+        let ollama_cloud_cache_keys = ollama_cloud_cache_keys_from_store(&candidate);
+        let ollama_cloud_refresh_keys = ollama_cloud_cache_keys
+            .difference(&previous_ollama_cloud_cache_keys)
+            .map(|key| key.credential_source_key.clone())
+            .collect::<Vec<_>>();
         let capacity_pool_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
             .context("resolve key for Share capacity pools")?;
         let mut projected_shares = shares.clone();
@@ -7876,6 +8411,15 @@ impl ServerStateInner {
         }
 
         *self.providers.write().await = candidate;
+        self.ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_keys(&ollama_cloud_cache_keys);
+        if self.ollama_cloud_post_commit_refresh_is_enabled() {
+            for provider_key in ollama_cloud_refresh_keys {
+                self.refresh_ollama_cloud_after_provider_commit(provider_key);
+            }
+        }
         let changed_capacity_share_ids = self
             .apply_share_capacity_pool_updates_under_provider_commit(&capacity_pool_updates)
             .await?;
@@ -15934,6 +16478,55 @@ pub async fn pending_router_log_count(state: &ServerState) -> usize {
         .count()
 }
 
+pub(crate) async fn authoritative_share_descriptor(
+    state: &ServerState,
+    share_id: &str,
+) -> anyhow::Result<ShareDescriptor> {
+    for _ in 0..8 {
+        let config = state.config_snapshot().await;
+        let providers = state.providers.read().await.clone();
+        let accounts = state.accounts.read().await.clone();
+        let usage = state.usage.read().await.clone();
+        let share = state
+            .shares
+            .read()
+            .await
+            .get(share_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("share not found"))?;
+        let expected_config_revision = share.config_revision;
+        let descriptor = descriptor_for_share_with_accounts_and_usage(
+            &share,
+            &providers,
+            Some(&accounts),
+            Some(&usage),
+        );
+        let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
+        let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+        let share_id = share_id.to_string();
+        let prepared = state
+            .try_mutate_shares_immediate(|store| {
+                if store.get(&share_id).map(|share| share.config_revision)
+                    != Some(expected_config_revision)
+                {
+                    return Err(());
+                }
+                store
+                    .prepare_descriptor_projection(&share_id, fingerprint)
+                    .ok_or(())
+            })
+            .await?;
+        let Ok((generation, fingerprint)) = prepared else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+        descriptor.descriptor_generation = generation;
+        descriptor.descriptor_fingerprint = fingerprint;
+        return Ok(descriptor);
+    }
+    anyhow::bail!("Share changed repeatedly while building its authoritative descriptor")
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareEditSyncSummary {
@@ -15999,7 +16592,14 @@ async fn apply_and_ack_share_edit(
     summary: &mut ShareEditSyncSummary,
 ) {
     let apply_result = apply_share_edit_locally(state, &edit).await;
-    let (ack_status, ack_error, ack_error_code, ack_retryable) = match apply_result {
+    let (
+        ack_status,
+        ack_error,
+        ack_error_code,
+        ack_retryable,
+        current_config_revision,
+        current_share,
+    ) = match apply_result {
         Ok(()) => {
             summary.applied += 1;
             let sync_result = sync_one_share_to_router(state, &edit.share_id).await;
@@ -16015,18 +16615,55 @@ async fn apply_and_ack_share_edit(
                     );
                 }
             }
-            ("applied".to_string(), None, None, None)
+            ("applied".to_string(), None, None, None, None, None)
         }
         Err(error) => {
             summary.rejected += 1;
             let message = error.to_string();
-            let patch_error =
-                error.downcast_ref::<crate::domain::sharing::shares::SharePatchError>();
+            let (error_code, retryable, current_config_revision) = error
+                .downcast_ref::<crate::domain::sharing::shares::SharePatchError>()
+                .map(|error| {
+                    let current_config_revision = match error {
+                        crate::domain::sharing::shares::SharePatchError::RevisionConflict {
+                            current,
+                            ..
+                        } => Some(*current),
+                        _ => None,
+                    };
+                    (
+                        Some(error.code().to_string()),
+                        Some(error.retryable()),
+                        current_config_revision,
+                    )
+                })
+                .unwrap_or((None, None, None));
+            let current_share = if current_config_revision.is_some() {
+                match authoritative_share_descriptor(state, &edit.share_id).await {
+                    Ok(descriptor) => Some(descriptor),
+                    Err(descriptor_error) => {
+                        tracing::warn!(
+                            share_id = %edit.share_id,
+                            edit_id = %edit.id,
+                            error = %descriptor_error,
+                            "failed to build authoritative Share descriptor for revision-conflict ACK"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let current_config_revision = current_share
+                .as_ref()
+                .map(|share| share.config_revision)
+                .or(current_config_revision);
             (
                 "rejected".to_string(),
                 Some(message),
-                patch_error.map(|error| error.code().to_string()),
-                patch_error.map(|error| error.retryable()),
+                error_code,
+                retryable,
+                current_config_revision,
+                current_share,
             )
         }
     };
@@ -16037,6 +16674,8 @@ async fn apply_and_ack_share_edit(
         error_message: ack_error,
         error_code: ack_error_code,
         retryable: ack_retryable,
+        current_config_revision,
+        current_share,
     };
     let http_client = state.http_client().await;
     match client::ack_share_edit(&http_client, config, ack).await {
@@ -17467,7 +18106,7 @@ async fn issue_share_tunnel_lease(
 mod tests {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::cli::Cli;
@@ -21437,6 +22076,438 @@ mod tests {
             credential_generation: 1,
             ..ProviderResourceMetadata::default()
         }
+    }
+
+    async fn install_ollama_bundle(state: &ServerState, provider_id: &str, api_key: &str) {
+        let provider_id = provider_id.to_string();
+        let api_key = api_key.to_string();
+        state
+            .mutate_providers_immediate(move |providers| {
+                for (app, profile_id) in [
+                    (AppKind::Claude, "claude.ollama_cloud"),
+                    (AppKind::Codex, "codex.ollama_cloud"),
+                ] {
+                    providers.upsert_with_resource(
+                        app,
+                        Provider {
+                            id: provider_id.clone(),
+                            name: "Ollama API Key".to_string(),
+                            settings_config: json!({
+                                "apiKey": api_key,
+                                "modelMapping": {
+                                    "mode": "single",
+                                    "upstreamModel": "gpt-oss:120b-cloud"
+                                }
+                            }),
+                            category: None,
+                            meta: None,
+                            extra: BTreeMap::from([
+                                ("bundleId".to_string(), json!(provider_id)),
+                                ("familyId".to_string(), json!("family.ollama_cloud")),
+                                ("surfaceEnabled".to_string(), json!(true)),
+                                ("modelPolicyScope".to_string(), json!("global")),
+                                ("testApp".to_string(), json!("codex")),
+                            ]),
+                        },
+                        provider_resource(profile_id, 1),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+    }
+
+    fn ollama_test_provider(id: &str, name: &str) -> Provider {
+        let mut provider = test_provider(id, name);
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("ollama_cloud".to_string()),
+            ..ProviderMeta::default()
+        });
+        provider
+    }
+
+    #[derive(Clone)]
+    struct OllamaUsageMock {
+        mode: Arc<AtomicU8>,
+        me_requests: Arc<AtomicUsize>,
+        usage_requests: Arc<AtomicUsize>,
+    }
+
+    async fn ollama_mock_me(
+        AxumState(mock): AxumState<OllamaUsageMock>,
+    ) -> Result<Json<Value>, StatusCode> {
+        mock.me_requests.fetch_add(1, AtomicOrdering::SeqCst);
+        if mock.mode.load(AtomicOrdering::SeqCst) == 3 {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(Json(json!({
+            "ID": "ollama-account",
+            "Email": "owner@example.com",
+            "Name": "owner",
+            "Plan": "free"
+        })))
+    }
+
+    async fn ollama_mock_usage(
+        AxumState(mock): AxumState<OllamaUsageMock>,
+    ) -> Result<Json<Value>, StatusCode> {
+        mock.usage_requests.fetch_add(1, AtomicOrdering::SeqCst);
+        let mode = mock.mode.load(AtomicOrdering::SeqCst);
+        if matches!(mode, 0 | 2) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if mode == 3 {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(Json(json!({
+            "activity": {
+                "cost": "0.00000",
+                "period": {"type": "last_4_weeks"},
+                "models": []
+            },
+            "limits": {
+                "session": {"usage": 0, "models": [{"name": "gpt-oss:120b", "request_count": 1}]},
+                "weekly": {"usage": 0, "models": [{"name": "gpt-oss:120b", "request_count": 6}]}
+            }
+        })))
+    }
+
+    async fn spawn_ollama_usage_mock(
+        mock: OllamaUsageMock,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/api/me", post(ollama_mock_me))
+            .route("/api/usage", get(ollama_mock_usage))
+            .with_state(mock);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn ollama_provider_commit_warms_one_shared_credential_snapshot() {
+        let state = test_state();
+        let mock = OllamaUsageMock {
+            mode: Arc::new(AtomicU8::new(1)),
+            me_requests: Arc::new(AtomicUsize::new(0)),
+            usage_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let (origin, server) = spawn_ollama_usage_mock(mock.clone()).await;
+        state
+            .set_ollama_cloud_client_for_test(OllamaCloudClient::for_test_origin(&origin).unwrap())
+            .await;
+        state.enable_ollama_cloud_post_commit_refresh_for_test();
+
+        install_ollama_bundle(&state, "ollama-post-commit", "post-commit-key").await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.me_requests.load(AtomicOrdering::SeqCst) < 1
+                || mock.usage_requests.load(AtomicOrdering::SeqCst) < 1
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("post-commit Ollama refresh did not complete");
+
+        assert_eq!(mock.me_requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(mock.usage_requests.load(AtomicOrdering::SeqCst), 1);
+        let snapshot = state
+            .ollama_cloud_snapshot(
+                ProviderKey::new(AppKind::Claude, "ollama-post-commit").unwrap(),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.source, OllamaCloudSnapshotSource::FreshCache);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_cloud_partial_refresh_preserves_each_successful_section_as_stale() {
+        let state = test_state();
+        install_ollama_bundle(&state, "ollama-partial", "partial-key").await;
+        let mock = OllamaUsageMock {
+            mode: Arc::new(AtomicU8::new(0)),
+            me_requests: Arc::new(AtomicUsize::new(0)),
+            usage_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let (origin, server) = spawn_ollama_usage_mock(mock.clone()).await;
+        state
+            .set_ollama_cloud_client_for_test(OllamaCloudClient::for_test_origin(&origin).unwrap())
+            .await;
+        let key = ProviderKey::new(AppKind::Codex, "ollama-partial").unwrap();
+
+        let partial = state
+            .ollama_cloud_snapshot(key.clone(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.status,
+            crate::domain::providers::ollama_cloud::OllamaCloudSnapshotStatus::Partial
+        );
+        assert_eq!(partial.account.state, OllamaCloudSectionState::Available);
+        assert_eq!(partial.usage.state, OllamaCloudSectionState::Error);
+
+        mock.mode.store(1, AtomicOrdering::SeqCst);
+        let complete = state
+            .ollama_cloud_snapshot(key.clone(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            complete.status,
+            crate::domain::providers::ollama_cloud::OllamaCloudSnapshotStatus::Complete
+        );
+        assert_eq!(
+            complete.usage.data.as_ref().unwrap().limits[0].utilization,
+            0.0
+        );
+
+        mock.mode.store(2, AtomicOrdering::SeqCst);
+        let stale = state
+            .ollama_cloud_snapshot(key, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale.status,
+            crate::domain::providers::ollama_cloud::OllamaCloudSnapshotStatus::Stale
+        );
+        assert_eq!(stale.account.state, OllamaCloudSectionState::Available);
+        assert_eq!(stale.usage.state, OllamaCloudSectionState::Stale);
+        assert_eq!(stale.source, OllamaCloudSnapshotSource::StaleCache);
+        assert!(stale.usage.data.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_authentication_failure_clears_all_cached_sections() {
+        let state = test_state();
+        install_ollama_bundle(&state, "ollama-auth-clear", "auth-key").await;
+        let mock = OllamaUsageMock {
+            mode: Arc::new(AtomicU8::new(1)),
+            me_requests: Arc::new(AtomicUsize::new(0)),
+            usage_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let (origin, server) = spawn_ollama_usage_mock(mock.clone()).await;
+        state
+            .set_ollama_cloud_client_for_test(OllamaCloudClient::for_test_origin(&origin).unwrap())
+            .await;
+        let key = ProviderKey::new(AppKind::Codex, "ollama-auth-clear").unwrap();
+
+        let complete = state
+            .ollama_cloud_snapshot(key.clone(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(complete.account.data.is_some());
+        assert!(complete.usage.data.is_some());
+
+        mock.mode.store(3, AtomicOrdering::SeqCst);
+        let failed = state
+            .ollama_cloud_snapshot(key.clone(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.account.state, OllamaCloudSectionState::Error);
+        assert_eq!(failed.usage.state, OllamaCloudSectionState::Error);
+        assert!(failed.account.data.is_none());
+        assert!(failed.usage.data.is_none());
+        assert!(state
+            .fresh_ollama_cloud_sections(
+                &OllamaCloudCacheKey {
+                    credential_source_key: key,
+                    credential_generation: failed.credential_generation,
+                },
+                now_ms_i64(),
+            )
+            .is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_bundle_surfaces_share_one_refresh_and_delete_prunes_cached_identity() {
+        let state = test_state();
+        install_ollama_bundle(&state, "ollama-shared-flight", "shared-key").await;
+        let mock = OllamaUsageMock {
+            mode: Arc::new(AtomicU8::new(1)),
+            me_requests: Arc::new(AtomicUsize::new(0)),
+            usage_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let (origin, server) = spawn_ollama_usage_mock(mock.clone()).await;
+        state
+            .set_ollama_cloud_client_for_test(OllamaCloudClient::for_test_origin(&origin).unwrap())
+            .await;
+        let claude_key = ProviderKey::new(AppKind::Claude, "ollama-shared-flight").unwrap();
+        let codex_key = ProviderKey::new(AppKind::Codex, "ollama-shared-flight").unwrap();
+
+        let (claude, codex) = tokio::join!(
+            state.ollama_cloud_snapshot(claude_key, true),
+            state.ollama_cloud_snapshot(codex_key.clone(), true)
+        );
+        let claude = claude.unwrap().unwrap();
+        let codex = codex.unwrap().unwrap();
+        assert_eq!(claude.provider_key.app, AppKind::Claude);
+        assert_eq!(codex.provider_key.app, AppKind::Codex);
+        assert_eq!(claude.credential_source_key, codex_key);
+        assert_eq!(codex.credential_source_key, codex_key);
+        assert_eq!(mock.me_requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(mock.usage_requests.load(AtomicOrdering::SeqCst), 1);
+
+        let cached = state
+            .ollama_cloud_snapshot(codex_key.clone(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.source, OllamaCloudSnapshotSource::FreshCache);
+        let old_cache_key = OllamaCloudCacheKey {
+            credential_source_key: codex_key.clone(),
+            credential_generation: cached.credential_generation,
+        };
+        state
+            .delete_provider_bundle_command("ollama-shared-flight".to_string(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .fresh_ollama_cloud_sections(&old_cache_key, now_ms_i64())
+            .is_none());
+        assert!(matches!(
+            state.ollama_cloud_snapshot(codex_key, false).await.unwrap(),
+            Err(ProviderCommandError::NotFound)
+        ));
+        server.abort();
+    }
+
+    #[derive(Clone)]
+    struct OllamaRotationMock {
+        old_started: Arc<AtomicUsize>,
+        old_started_notify: Arc<Notify>,
+        release_old: Arc<Notify>,
+    }
+
+    async fn ollama_rotation_authorization(
+        mock: &OllamaRotationMock,
+        headers: &axum::http::HeaderMap,
+    ) -> bool {
+        let old = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer old-key");
+        if old {
+            mock.old_started.fetch_add(1, AtomicOrdering::SeqCst);
+            mock.old_started_notify.notify_one();
+            mock.release_old.notified().await;
+        }
+        old
+    }
+
+    async fn ollama_rotation_me(
+        AxumState(mock): AxumState<OllamaRotationMock>,
+        headers: axum::http::HeaderMap,
+    ) -> Json<Value> {
+        let old = ollama_rotation_authorization(&mock, &headers).await;
+        Json(json!({
+            "ID": if old { "old-account" } else { "new-account" },
+            "Plan": "free"
+        }))
+    }
+
+    async fn ollama_rotation_usage(
+        AxumState(mock): AxumState<OllamaRotationMock>,
+        headers: axum::http::HeaderMap,
+    ) -> Json<Value> {
+        let _ = ollama_rotation_authorization(&mock, &headers).await;
+        Json(json!({
+            "limits": {
+                "session": {"usage": 0, "models": []},
+                "weekly": {"usage": 0, "models": []}
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn ollama_refresh_discards_an_in_flight_result_after_credential_rotation() {
+        let state = test_state();
+        let provider_id = "ollama-rotation";
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                ollama_test_provider(provider_id, "Ollama Rotation"),
+                Some(ProfileId::parse("codex.ollama_cloud").unwrap()),
+                None,
+                Some("ollama-rotation-create".to_string()),
+                BTreeMap::from([(
+                    "/settingsConfig/apiKey".to_string(),
+                    CredentialPatch::Replace {
+                        value: "old-key".to_string(),
+                    },
+                )]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = OllamaRotationMock {
+            old_started: Arc::new(AtomicUsize::new(0)),
+            old_started_notify: Arc::new(Notify::new()),
+            release_old: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/api/me", post(ollama_rotation_me))
+            .route("/api/usage", get(ollama_rotation_usage))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        state
+            .set_ollama_cloud_client_for_test(
+                OllamaCloudClient::for_test_origin(&format!("http://{addr}")).unwrap(),
+            )
+            .await;
+        let key = ProviderKey::new(AppKind::Codex, provider_id).unwrap();
+        let refresh_state = state.clone();
+        let refresh_key = key.clone();
+        let refresh =
+            tokio::spawn(
+                async move { refresh_state.ollama_cloud_snapshot(refresh_key, true).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.old_started.load(AtomicOrdering::SeqCst) < 2 {
+                mock.old_started_notify.notified().await;
+            }
+        })
+        .await
+        .expect("old credential requests did not start");
+
+        let updated = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                ollama_test_provider(provider_id, "Ollama Rotation"),
+                Some(ProfileId::parse("codex.ollama_cloud").unwrap()),
+                Some(created.resource.revision),
+                None,
+                BTreeMap::from([(
+                    "/settingsConfig/apiKey".to_string(),
+                    CredentialPatch::Replace {
+                        value: "new-key".to_string(),
+                    },
+                )]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        mock.release_old.notify_waiters();
+        let snapshot = refresh.await.unwrap().unwrap().unwrap();
+        assert_eq!(snapshot.provider_revision, updated.resource.revision);
+        assert_eq!(
+            snapshot.credential_generation,
+            updated.resource.credential_generation
+        );
+        assert_eq!(snapshot.account.data.as_ref().unwrap().id, "new-account");
+        server.abort();
     }
 
     #[tokio::test]

@@ -1,208 +1,230 @@
 import React from "react";
-import { RefreshCw, Clock } from "lucide-react";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import type { ProviderMeta } from "@/types";
-import type { AppId } from "@/lib/api";
-import { useOllamaQuota } from "@/lib/query/ollama";
-import { subscriptionApi } from "@/lib/api/subscription";
-import {
-  formatExpireDistance,
-  SubscriptionQuotaView,
-} from "@/components/SubscriptionQuotaFooter";
-import {
-  PROVIDER_REFRESH_TITLE_KEY,
-  resolveQuotaQueriedAt,
-} from "@/utils/providerQuotaUi";
+
+import { formatRelativeTime } from "@/components/SubscriptionQuotaFooter";
 import { ProviderQuotaMetaRow } from "@/components/providers/ProviderQuotaMetaRow";
+import type {
+  OllamaCloudModelUsage,
+  OllamaCloudSnapshot,
+  OllamaCloudSnapshotStatus,
+  OllamaCloudUsageWindow,
+  ProviderResource,
+} from "@/lib/api/providers";
+import { useOllamaQuota, useRefreshOllamaQuota } from "@/lib/query/ollama";
+import { cn } from "@/lib/utils";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { refreshOauthQuotaAndReload } from "@/lib/query/oauthQuotaSnapshot";
 
 interface OllamaQuotaFooterProps {
-  meta?: ProviderMeta;
-  providerId: string;
-  appId: AppId;
+  resource: ProviderResource;
   inline?: boolean;
-  isCurrent?: boolean;
 }
 
-function formatRelativeTime(
-  timestamp: number,
-  now: number,
-  t: (key: string, options?: { count?: number }) => string,
+const STATUS_CLASSES: Record<OllamaCloudSnapshotStatus, string> = {
+  complete: "text-green-600 dark:text-green-400",
+  partial: "text-amber-600 dark:text-amber-400",
+  stale: "text-amber-600 dark:text-amber-400",
+  error: "text-destructive",
+  unconfigured: "text-muted-foreground",
+};
+
+function compactNumber(value: number): string {
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: value % 1 === 0 ? 0 : 1,
+    useGrouping: false,
+  }).format(value);
+}
+
+function usageWindowLabel(
+  window: OllamaCloudUsageWindow,
+  t: TFunction,
 ): string {
-  const diff = Math.floor((now - timestamp) / 1000);
-  if (diff < 60) return t("usage.justNow");
-  if (diff < 3600)
-    return t("usage.minutesAgo", { count: Math.floor(diff / 60) });
-  if (diff < 86400)
-    return t("usage.hoursAgo", { count: Math.floor(diff / 3600) });
-  return t("usage.daysAgo", { count: Math.floor(diff / 86400) });
+  return `${t(`provider.ollama.${window.kind}`)} ${compactNumber(
+    window.utilization,
+  )}%`;
+}
+
+function accountLabel(snapshot: OllamaCloudSnapshot): string | null {
+  const account = snapshot.account.data;
+  if (!account) return null;
+  const identities = [account.name, account.email].filter(
+    (value, index, values): value is string =>
+      Boolean(value) && values.indexOf(value) === index,
+  );
+  if (identities.length === 0) identities.push(account.id);
+  return [account.plan, ...identities].filter(Boolean).join(" · ");
+}
+
+function firstSectionReason(snapshot: OllamaCloudSnapshot): string | null {
+  return snapshot.account.reason || snapshot.usage.reason || null;
+}
+
+export function formatOllamaCloudSummary(
+  snapshot: OllamaCloudSnapshot,
+  t: TFunction,
+): string {
+  const identity = accountLabel(snapshot);
+  const windows =
+    snapshot.usage.data?.limits.map((window) => usageWindowLabel(window, t)) ??
+    [];
+  const cost = snapshot.usage.data?.activity?.cost;
+  const usage = [
+    ...windows,
+    cost !== undefined ? t("provider.ollama.cost", { value: cost }) : undefined,
+  ].filter(Boolean);
+  const reason = firstSectionReason(snapshot);
+  return [
+    identity,
+    ...usage,
+    reason && (identity || usage.length > 0) ? reason : null,
+    !identity && usage.length === 0 && reason
+      ? reason
+      : !identity && usage.length === 0
+        ? t(`provider.ollama.${snapshot.status}`)
+        : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function formatModelList(
+  models: OllamaCloudModelUsage[],
+  modelsTruncated: boolean,
+  t: TFunction,
+  visibleLimit = 3,
+): string {
+  const visible = models
+    .slice(0, visibleLimit)
+    .map((model) => `${model.name} ${model.requestCount}`);
+  const hidden = Math.max(0, models.length - visible.length);
+  if (hidden > 0 || modelsTruncated) {
+    visible.push(
+      t("provider.ollama.modelsMore", {
+        count: hidden + (modelsTruncated ? 1 : 0),
+      }),
+    );
+  }
+  return visible.join(", ");
+}
+
+export function formatOllamaCloudModels(
+  snapshot: OllamaCloudSnapshot,
+  t: TFunction,
+): string {
+  return (
+    snapshot.usage.data?.limits
+      .map((window) => {
+        const models = formatModelList(
+          window.models,
+          window.modelsTruncated,
+          t,
+        );
+        return models
+          ? `${t(`provider.ollama.${window.kind}`)}: ${models}`
+          : null;
+      })
+      .filter(Boolean)
+      .join(" · ") ?? ""
+  );
+}
+
+function observedAt(snapshot?: OllamaCloudSnapshot): number | undefined {
+  if (!snapshot) return undefined;
+  const values = [
+    snapshot.account.observedAtMs,
+    snapshot.usage.observedAtMs,
+  ].filter((value): value is number => typeof value === "number");
+  return values.length > 0 ? Math.max(...values) : undefined;
 }
 
 const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
-  providerId,
-  appId,
+  resource,
   inline = false,
 }) => {
   const { t } = useTranslation();
-  const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
-    defaultValue: "供应商信息刷新",
-  });
-  const [lastManualRefreshAt, setLastManualRefreshAt] = React.useState<
-    number | null
-  >(null);
-  const [manualRefreshLoading, setManualRefreshLoading] = React.useState(false);
-  const {
-    data: cached,
-    isFetching: loading,
-    refetch,
-  } = useOllamaQuota(providerId, {
-    enabled: true,
-    appId,
-  });
-
-  const handleRefresh = React.useCallback(async () => {
-    if (manualRefreshLoading) return;
-    setManualRefreshLoading(true);
-    try {
-      await refreshOauthQuotaAndReload(
-        () =>
-          subscriptionApi.refreshOauthQuota(
-            "ollama_cloud",
-            null,
-            "ollama_cloud",
-            appId,
-            providerId,
-          ),
-        () => refetch(),
-      );
-      setLastManualRefreshAt(Date.now());
-    } finally {
-      setManualRefreshLoading(false);
-    }
-  }, [appId, manualRefreshLoading, providerId, refetch]);
-  const effectiveLoading = loading || manualRefreshLoading;
-  const reportRefreshError = React.useCallback(
-    (error: unknown) =>
-      toast.error(extractErrorMessage(error) || t("subscription.queryFailed")),
-    [t],
-  );
-
-  const displayQueriedAt = resolveQuotaQueriedAt(
-    cached?.refreshedAt ?? cached?.quota?.queriedAt ?? null,
-    lastManualRefreshAt,
-  );
-
+  const query = useOllamaQuota(resource);
+  const refresh = useRefreshOllamaQuota(resource);
   const [now, setNow] = React.useState(Date.now());
-  React.useEffect(() => {
-    const serverQueriedAt = cached?.refreshedAt ?? cached?.quota?.queriedAt;
-    if (serverQueriedAt && serverQueriedAt > 0) {
-      setLastManualRefreshAt(null);
-    }
-  }, [cached?.refreshedAt, cached?.quota?.queriedAt]);
+  const snapshot = query.data;
+  const timestamp = observedAt(snapshot);
 
   React.useEffect(() => {
-    if (
-      !displayQueriedAt &&
-      !cached?.quota?.subscription?.expiresAt &&
-      !cached?.quota?.tiers?.some((tier) => tier.resetsAt)
-    ) {
-      return;
-    }
-    const interval = setInterval(() => setNow(Date.now()), 30000);
-    return () => clearInterval(interval);
-  }, [
-    displayQueriedAt,
-    cached?.quota?.subscription?.expiresAt,
-    cached?.quota?.tiers,
-  ]);
+    if (!timestamp) return;
+    const interval = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(interval);
+  }, [timestamp]);
 
-  if (!cached) return null;
+  const status = query.isError ? "error" : (snapshot?.status ?? "unconfigured");
+  const loading = query.isFetching || refresh.isPending;
+  const statusLabel = query.isPending
+    ? t("provider.ollama.loading")
+    : query.isError
+      ? t("provider.ollama.error")
+      : t(`provider.ollama.${status}`);
+  const summary = snapshot
+    ? formatOllamaCloudSummary(snapshot, t)
+    : query.isError
+      ? t("provider.ollama.queryFailed")
+      : t("provider.ollama.loading");
+  const models = snapshot ? formatOllamaCloudModels(snapshot, t) : "";
+  const timeLabel = timestamp
+    ? formatRelativeTime(timestamp, now, t)
+    : t("provider.quotaNeverUpdated", { defaultValue: "Never updated" });
+  const detail = snapshot
+    ? [
+        t(`provider.ollama.source.${snapshot.source}`),
+        snapshot.account.reason,
+        snapshot.usage.reason,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : undefined;
 
-  const quota = cached.quota;
-
-  if (!quota.success) {
-    return (
-      <SubscriptionQuotaView
-        quota={{
-          ...quota,
-          refreshedAt: cached.refreshedAt,
-          nextRefreshAt: cached.nextRefreshAt,
-        }}
-        loading={effectiveLoading}
-        refetch={handleRefresh}
-        appIdForExpiredHint="ollama_cloud"
-        inline={inline}
-      />
-    );
-  }
-
-  const plan =
-    quota.subscription?.planLabel || quota.credentialMessage || "unknown";
-  const email = quota.tiers[0]?.name || "";
-  const periodEnd = quota.subscription?.expiresAt || quota.tiers[0]?.resetsAt;
-  const summaryText = [plan, formatExpireDistance(periodEnd)]
-    .filter(Boolean)
-    .join(" · ");
-
-  if (inline) {
-    return (
-      <div className="flex flex-col items-end gap-1 text-xs whitespace-nowrap flex-shrink-0">
-        <ProviderQuotaMetaRow
-          timeLabel={
-            displayQueriedAt
-              ? formatRelativeTime(displayQueriedAt, now, t)
-              : t("provider.quotaNeverUpdated", { defaultValue: "从未更新" })
-          }
-          loading={effectiveLoading}
-          onRefresh={(event) => {
-            event.stopPropagation();
-            void handleRefresh().catch(reportRefreshError);
-          }}
-          refreshTitle={refreshTitle}
-        />
-        <div className="min-w-0 max-w-full text-right text-[10px] font-medium text-foreground break-words">
-          {summaryText}
-        </div>
-      </div>
-    );
-  }
+  const handleRefresh = () => {
+    void refresh.mutateAsync().catch((error) => {
+      toast.error(
+        extractErrorMessage(error) || t("provider.ollama.queryFailed"),
+      );
+    });
+  };
 
   return (
-    <div className="mt-3 rounded-xl border border-border-default bg-card px-4 py-3 shadow-sm">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs text-gray-500 dark:text-gray-400 font-medium">
-          {t("subscription.title", { defaultValue: "Subscription" })}
-        </span>
-        <div className="flex items-center gap-2">
-          {displayQueriedAt && (
-            <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
-              <Clock size={10} />
-              {formatRelativeTime(displayQueriedAt, now, t)}
-            </span>
-          )}
-          <button
-            onClick={() => void handleRefresh().catch(reportRefreshError)}
-            disabled={effectiveLoading}
-            className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-            title={refreshTitle}
+    <div
+      className={cn(
+        "flex min-w-0 flex-col items-end gap-1",
+        inline ? "max-w-full text-xs" : "w-full border-t border-border pt-3",
+      )}
+      title={detail || undefined}
+      data-ollama-cloud-status={query.isPending ? "loading" : status}
+    >
+      <ProviderQuotaMetaRow
+        timeLabel={timeLabel}
+        loading={loading}
+        onRefresh={(event) => {
+          event.stopPropagation();
+          handleRefresh();
+        }}
+        refreshTitle={t("provider.ollama.refresh")}
+        leading={
+          <span
+            className={cn("text-[10px] font-semibold", STATUS_CLASSES[status])}
           >
-            <RefreshCw
-              size={12}
-              className={effectiveLoading ? "animate-spin" : ""}
-            />
-          </button>
-        </div>
-      </div>
-      <div className="flex flex-col gap-1 text-xs">
-        <span className="font-semibold">{summaryText}</span>
-        {email && (
-          <span className="text-muted-foreground truncate" title={email}>
-            {email}
+            {statusLabel}
           </span>
-        )}
+        }
+      />
+      <div className="min-w-0 max-w-full text-right text-[10px] font-medium text-foreground break-words">
+        {summary}
       </div>
+      {models && (
+        <div
+          className="min-w-0 max-w-full text-right text-[10px] text-muted-foreground break-words"
+          title={models}
+        >
+          {models}
+        </div>
+      )}
     </div>
   );
 };

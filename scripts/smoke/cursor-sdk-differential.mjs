@@ -7,45 +7,114 @@ const routerTokenHeader = process.env.ROUTER_API_TOKEN_HEADER || "Authorization"
 const oracleToken = requiredEnv("CURSOR_SDK_ORACLE_TOKEN");
 const model = process.env.CURSOR_TEST_MODEL || "composer-2.5";
 const timeoutMs = numberEnv("CURSOR_DIFFERENTIAL_TIMEOUT_MS", 120_000);
+const textPrompt = "Reply with exactly CURSOR_DIFFERENTIAL_OK";
+
+function chatBody(stream, prompt = textPrompt) {
+  return {
+    model,
+    stream,
+    messages: [{ role: "user", content: prompt }],
+  };
+}
 
 const fixtures = [
   {
-    id: "non_stream_text",
-    body: {
-      model,
-      stream: false,
-      messages: [{ role: "user", content: "Reply with exactly CURSOR_DIFFERENTIAL_OK" }],
-    },
-  },
-  {
-    id: "stream_text",
-    body: {
-      model,
+    id: "anthropic_stream_text",
+    expectation: "text",
+    server: {
+      path: "/v1/messages",
       stream: true,
-      messages: [{ role: "user", content: "Reply with exactly CURSOR_DIFFERENTIAL_OK" }],
+      headers: { "anthropic-version": "2023-06-01" },
+      body: {
+        model,
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: "user", content: textPrompt }],
+      },
+    },
+    oracle: { path: "/v1/chat/completions", stream: true, body: chatBody(true) },
+  },
+  {
+    id: "chat_stream_text",
+    expectation: "text",
+    server: { path: "/v1/chat/completions", stream: true, body: chatBody(true) },
+    oracle: { path: "/v1/chat/completions", stream: true, body: chatBody(true) },
+  },
+  {
+    id: "responses_stream_text",
+    expectation: "text",
+    server: {
+      path: "/v1/responses",
+      stream: true,
+      body: { model, stream: true, input: textPrompt },
+    },
+    oracle: {
+      path: "/v1/responses",
+      stream: true,
+      body: { model, stream: true, input: textPrompt },
     },
   },
   {
-    id: "declared_tool",
-    body: {
-      model,
+    id: "gemini_non_stream_text",
+    expectation: "text",
+    server: {
+      path: `/v1beta/models/${encodeURIComponent(model)}:generateContent`,
       stream: false,
-      messages: [{ role: "user", content: "Call the lookup tool with key cursor" }],
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: "lookup",
-            description: "Look up a key",
-            parameters: {
-              type: "object",
-              properties: { key: { type: "string" } },
-              required: ["key"],
+      body: {
+        contents: [{ role: "user", parts: [{ text: textPrompt }] }],
+        generationConfig: { maxOutputTokens: 128 },
+      },
+    },
+    oracle: { path: "/v1/chat/completions", stream: false, body: chatBody(false) },
+  },
+  {
+    id: "chat_declared_tool",
+    expectation: "tool",
+    server: {
+      path: "/v1/chat/completions",
+      stream: false,
+      body: {
+        model,
+        stream: false,
+        messages: [{ role: "user", content: "Call the lookup tool with key cursor" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "lookup",
+              description: "Look up a key",
+              parameters: {
+                type: "object",
+                properties: { key: { type: "string" } },
+                required: ["key"],
+              },
             },
           },
-        },
-      ],
-      tool_choice: { type: "function", function: { name: "lookup" } },
+        ],
+        tool_choice: { type: "function", function: { name: "lookup" } },
+      },
+    },
+    oracle: {
+      path: "/v1/chat/completions",
+      stream: false,
+      body: {
+        ...chatBody(false, "Call the lookup tool with key cursor"),
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "lookup",
+              description: "Look up a key",
+              parameters: {
+                type: "object",
+                properties: { key: { type: "string" } },
+                required: ["key"],
+              },
+            },
+          },
+        ],
+        tool_choice: { type: "function", function: { name: "lookup" } },
+      },
     },
   },
 ];
@@ -53,10 +122,10 @@ const fixtures = [
 const results = [];
 for (const fixture of fixtures) {
   const [server, oracle] = await Promise.all([
-    invoke(shareBase, routerAuthHeaders(routerTokenHeader, routerToken), fixture.body),
-    invoke(oracleBase, { authorization: `Bearer ${oracleToken}` }, fixture.body),
+    invoke(shareBase, routerAuthHeaders(routerTokenHeader, routerToken), fixture.server),
+    invoke(oracleBase, { authorization: `Bearer ${oracleToken}` }, fixture.oracle),
   ]);
-  const comparison = compareSemantics(server, oracle, fixture.id);
+  const comparison = compareSemantics(server, oracle, fixture.expectation);
   results.push({ id: fixture.id, server, oracle, comparison });
 }
 
@@ -64,26 +133,27 @@ const ok = results.every((result) => result.comparison.ok);
 process.stdout.write(`${JSON.stringify({ ok, model, results }, null, 2)}\n`);
 process.exit(ok ? 0 : 1);
 
-async function invoke(base, authHeaders, body) {
+async function invoke(base, authHeaders, request) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${base.replace(/\/$/, "")}/v1/chat/completions`, {
+    const response = await fetch(`${base.replace(/\/$/, "")}${request.path}`, {
       method: "POST",
       headers: {
         ...authHeaders,
+        ...(request.headers || {}),
         "content-type": "application/json",
-        accept: body.stream ? "text/event-stream" : "application/json",
+        accept: request.stream ? "text/event-stream" : "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(request.body),
       signal: controller.signal,
     });
     const text = await readLimited(response, 2 * 1024 * 1024);
-    return summarize(response.status, text, body.stream);
+    return summarize(response.status, text, request.stream);
   } catch (error) {
     return {
       status: 0,
-      streaming: Boolean(body.stream),
+      streaming: Boolean(request.stream),
       hasContent: false,
       hasDone: false,
       toolNames: [],
@@ -122,13 +192,13 @@ function summarize(status, text, streaming) {
   };
 }
 
-function compareSemantics(server, oracle, id) {
+function compareSemantics(server, oracle, expectation) {
   const reasons = [];
   if (Math.trunc(server.status / 100) !== Math.trunc(oracle.status / 100)) {
     reasons.push("HTTP status classes differ");
   }
   if (server.error || oracle.error) reasons.push("one or both requests failed");
-  if (id === "declared_tool") {
+  if (expectation === "tool") {
     if (!server.toolNames.includes("lookup") || !oracle.toolNames.includes("lookup")) {
       reasons.push("lookup tool call was not emitted by both implementations");
     }

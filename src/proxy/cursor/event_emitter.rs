@@ -319,6 +319,23 @@ impl AgentSseWriter {
         self.output_tokens
     }
 
+    pub fn has_visible_text(&self) -> bool {
+        !self.aggregate_text.is_empty()
+    }
+
+    pub fn has_response_content(&self) -> bool {
+        !self.aggregate_text.is_empty()
+            || !self.aggregate_reasoning.is_empty()
+            || !self.aggregate_tool_calls.is_empty()
+    }
+
+    pub fn has_deferred_business_output(&self) -> bool {
+        matches!(self.format, CursorResponseFormat::GeminiGenerateContent)
+            && self.aggregate_text.is_empty()
+            && self.aggregate_tool_calls.is_empty()
+            && !self.aggregate_reasoning.is_empty()
+    }
+
     /// Clear per-turn output so a tool-call retry does not duplicate aggregated text.
     /// Preserves `msg_id` and `started` so OpenAI Responses session binding stays stable.
     pub fn reset_for_retry(&mut self) {
@@ -542,6 +559,16 @@ impl AgentSseWriter {
 
         if let CursorResponseFormat::GeminiGenerateContent = self.format {
             if !self.error_mode {
+                if self.has_deferred_business_output() {
+                    out.push(gemini_chunk(
+                        &self.msg_id,
+                        &self.model,
+                        Some(&self.aggregate_reasoning),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
                 out.push(gemini_chunk(
                     &self.msg_id,
                     &self.model,
@@ -555,6 +582,10 @@ impl AgentSseWriter {
         }
 
         // OpenAI Chat
+        if self.error_mode {
+            out.push("data: [DONE]\n\n".to_string());
+            return out;
+        }
         let finish_reason = if self.aggregate_tool_calls.is_empty() {
             "stop"
         } else {
@@ -1099,6 +1130,7 @@ impl AgentSseWriter {
                 out.push(gemini_function_call_chunk(
                     &self.msg_id,
                     &self.model,
+                    &tc.id,
                     &tc.name,
                     args,
                 ));
@@ -1176,6 +1208,7 @@ impl AgentSseWriter {
             let args: Value = serde_json::from_str(&tc.arguments_json).unwrap_or(json!({}));
             parts.push(json!({
                 "functionCall": {
+                    "id": tc.id,
                     "name": tc.name,
                     "args": args
                 }
@@ -1281,15 +1314,22 @@ fn gemini_chunk(
     format!("data: {}\n\n", body)
 }
 
-fn gemini_function_call_chunk(id: &str, model: &str, name: &str, args: Value) -> String {
+fn gemini_function_call_chunk(
+    response_id: &str,
+    model: &str,
+    call_id: &str,
+    name: &str,
+    args: Value,
+) -> String {
     let body = json!({
         "modelVersion": model,
-        "responseId": id,
+        "responseId": response_id,
         "candidates": [{
             "content": {
                 "role": "model",
                 "parts": [{
                     "functionCall": {
+                        "id": call_id,
                         "name": name,
                         "args": args
                     }
@@ -1546,6 +1586,51 @@ mod tests {
     }
 
     #[test]
+    fn gemini_json_tool_call_preserves_resume_id() {
+        let mut writer = AgentSseWriter::new(
+            "gemini-2.5-pro".to_string(),
+            CursorResponseFormat::GeminiGenerateContent,
+            0,
+        );
+        writer.event(&AgentEvent::ToolCall(CapturedToolCall {
+            id: "call_lookup_1".to_string(),
+            name: "lookup".to_string(),
+            arguments_json: "{\"query\":\"status\"}".to_string(),
+        }));
+
+        let body = writer.json_response();
+        assert_eq!(
+            body.pointer("/candidates/0/content/parts/0/functionCall/id"),
+            Some(&Value::String("call_lookup_1".to_string()))
+        );
+    }
+
+    #[test]
+    fn gemini_stream_tool_call_preserves_resume_id() {
+        let mut writer = AgentSseWriter::new(
+            "gemini-2.5-pro".to_string(),
+            CursorResponseFormat::GeminiGenerateContent,
+            0,
+        );
+        let events = writer.event(&AgentEvent::ToolCall(CapturedToolCall {
+            id: "call_lookup_1".to_string(),
+            name: "lookup".to_string(),
+            arguments_json: "{\"query\":\"status\"}".to_string(),
+        }));
+
+        assert_eq!(events.len(), 1);
+        let payload = events[0]
+            .trim()
+            .strip_prefix("data: ")
+            .expect("Gemini streaming event must be an SSE data frame");
+        let body: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            body.pointer("/candidates/0/content/parts/0/functionCall/id"),
+            Some(&Value::String("call_lookup_1".to_string()))
+        );
+    }
+
+    #[test]
     fn gemini_stream_events_are_data_frames() {
         let mut w = AgentSseWriter::new(
             "gemini-2.5-pro".to_string(),
@@ -1560,6 +1645,25 @@ mod tests {
         assert!(joined.contains("\"parts\":[{\"text\":\"hi\"}]"));
         assert!(joined.contains("\"usageMetadata\""));
         assert!(!joined.contains("event:"));
+    }
+
+    #[test]
+    fn gemini_reasoning_only_stream_surfaces_content_before_stop() {
+        let mut writer = AgentSseWriter::new(
+            "gemini-2.5-pro".to_string(),
+            CursorResponseFormat::GeminiGenerateContent,
+            2,
+        );
+        assert!(writer
+            .event(&AgentEvent::Thinking("reasoned answer".to_string()))
+            .is_empty());
+        assert!(writer.has_deferred_business_output());
+
+        let events = writer.done_events();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("\"parts\":[{\"text\":\"reasoned answer\"}]"));
+        assert!(!events[0].contains("\"finishReason\""));
+        assert!(events[1].contains("\"finishReason\":\"STOP\""));
     }
 
     // ── Regression: first-frame timeout terminal events ───────────────────
@@ -1602,5 +1706,20 @@ mod tests {
         assert!(joined.contains("event: message_stop"));
         // stop_reason must be "error", not "end_turn".
         assert!(joined.contains("\"stop_reason\":\"error\""));
+    }
+
+    #[test]
+    fn chat_error_then_done_does_not_emit_a_success_finish_reason() {
+        let mut writer = AgentSseWriter::new(
+            "gpt-5".to_string(),
+            CursorResponseFormat::OpenAiChatCompletions,
+            0,
+        );
+        let mut events = writer.error_events("upstream failed");
+        events.extend(writer.done_events());
+        let joined = events.join("");
+        assert!(joined.contains("\"finish_reason\":\"error\""));
+        assert!(!joined.contains("\"finish_reason\":\"stop\""));
+        assert!(joined.ends_with("data: [DONE]\n\n"));
     }
 }

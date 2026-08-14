@@ -6,6 +6,7 @@ pub mod matrix;
 pub mod migrate;
 pub mod model;
 pub mod model_routing;
+pub mod ollama_cloud;
 pub mod registry;
 pub mod runtime;
 pub mod storage_migration;

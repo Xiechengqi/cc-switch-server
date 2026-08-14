@@ -3,12 +3,14 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::domain::accounts::cursor_import::detect_cursor_ide_version;
+use crate::domain::accounts::cursor_import::normalize_cursor_access_token;
 use crate::domain::accounts::store::Account;
 
 use super::h2_client::agent_connect_headers;
+use super::profile::CursorProtocolRail;
 
-pub const DEFAULT_CURSOR_CLIENT_VERSION: &str = "cli-2026.01.09-231024f";
+pub const DEFAULT_CURSOR_CLI_VERSION: &str = "cli-2026.07.08-0c04a8a";
+pub const DEFAULT_CURSOR_SDK_VERSION: &str = "sdk-1.0.13";
 const CURSOR_CLIENT_ID: &str = "cc-switch-server";
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,9 +42,10 @@ impl CursorAccountData {
 
     pub fn resolved_client_version(&self) -> String {
         self.cursor_client_version
-            .clone()
+            .as_deref()
+            .and_then(normalize_cursor_cli_version)
             .or_else(detect_cursor_cli_version)
-            .unwrap_or_else(|| DEFAULT_CURSOR_CLIENT_VERSION.to_string())
+            .unwrap_or_else(|| DEFAULT_CURSOR_CLI_VERSION.to_string())
     }
 
     pub fn config_version(&self) -> String {
@@ -77,168 +80,141 @@ pub fn cursor_account_for_api_key(api_key: &str) -> CursorAccountData {
         refresh_token: None,
         id_token: None,
         cursor_service_machine_id: Some(hash.clone()),
-        cursor_client_version: Some(DEFAULT_CURSOR_CLIENT_VERSION.to_string()),
+        cursor_client_version: None,
         cursor_config_version: Some(stable_uuid_like(&format!("cursor-config:{hash}"))),
         cursor_client_id: None,
     }
 }
 
-pub fn cursor_agent_headers(account: &CursorAccountData, token: &str) -> Vec<(String, String)> {
-    let mut headers = vec![
-        ("authorization".to_string(), format!("Bearer {token}")),
-        (
-            "accept".to_string(),
-            "application/connect+proto".to_string(),
-        ),
-        ("accept-encoding".to_string(), "gzip".to_string()),
-        ("x-amzn-trace-id".to_string(), random_uuid_like()),
-    ];
-    headers.extend(agent_connect_headers());
-    headers.extend(identity_headers(account, token));
-    headers
-}
-
 pub fn cursor_agentservice_headers(
+    rail: CursorProtocolRail,
     account: &CursorAccountData,
     token: &str,
 ) -> Vec<(String, String)> {
-    let mut headers = agent_connect_headers();
+    let mut headers = agent_connect_headers(matches!(rail, CursorProtocolRail::OAuthCli));
     let request_id = random_uuid_like();
-    let traceparent = random_traceparent();
     headers.extend([
-        ("authorization".to_string(), format!("Bearer {token}")),
+        (
+            "authorization".to_string(),
+            format!("Bearer {}", normalize_cursor_access_token(token)),
+        ),
+        (
+            "x-cursor-client-type".to_string(),
+            match rail {
+                CursorProtocolRail::OAuthCli => "cli",
+                CursorProtocolRail::ApiKeySdk => "sdk",
+            }
+            .to_string(),
+        ),
         (
             "x-cursor-client-version".to_string(),
-            account.resolved_client_version(),
-        ),
-        ("x-cursor-client-type".to_string(), "cli".to_string()),
-        ("x-cursor-client-os".to_string(), cursor_os().to_string()),
-        (
-            "x-cursor-client-arch".to_string(),
-            std::env::consts::ARCH.to_string(),
+            match rail {
+                CursorProtocolRail::OAuthCli => account.resolved_client_version(),
+                CursorProtocolRail::ApiKeySdk => cursor_sdk_client_version(),
+            },
         ),
         ("x-ghost-mode".to_string(), "true".to_string()),
-        ("traceparent".to_string(), traceparent.clone()),
-        ("backend-traceparent".to_string(), traceparent),
         ("x-request-id".to_string(), request_id.clone()),
         ("x-original-request-id".to_string(), request_id),
     ]);
+    if rail == CursorProtocolRail::OAuthCli {
+        let traceparent = random_traceparent();
+        headers.extend([
+            ("traceparent".to_string(), traceparent.clone()),
+            ("backend-traceparent".to_string(), traceparent),
+        ]);
+    }
     headers
 }
 
-pub fn identity_headers(account: &CursorAccountData, token: &str) -> Vec<(String, String)> {
-    let machine_id = account.machine_id();
-    vec![
-        ("x-client-key".to_string(), sha256_hex(token)),
-        (
-            "x-cursor-checksum".to_string(),
-            build_cursor_checksum(token, machine_id),
-        ),
-        (
-            "x-cursor-client-version".to_string(),
-            account.resolved_client_version(),
-        ),
-        ("x-cursor-client-type".to_string(), "ide".to_string()),
-        ("x-cursor-client-os".to_string(), cursor_os().to_string()),
-        (
-            "x-cursor-client-arch".to_string(),
-            std::env::consts::ARCH.to_string(),
-        ),
-        (
-            "x-cursor-client-device-type".to_string(),
-            "desktop".to_string(),
-        ),
-        (
-            "x-cursor-config-version".to_string(),
-            account.config_version(),
-        ),
-        (
-            "x-cursor-client-id".to_string(),
-            account.client_id().to_string(),
-        ),
-        ("x-cursor-timezone".to_string(), cursor_timezone()),
-        ("x-ghost-mode".to_string(), "true".to_string()),
-        ("x-session-id".to_string(), random_uuid_like()),
-        ("x-request-id".to_string(), random_uuid_like()),
-    ]
-}
-
-fn cursor_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "macos",
-        "windows" => "windows",
-        _ => "linux",
-    }
-}
-
-fn cursor_timezone() -> String {
-    std::env::var("TZ")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "UTC".to_string())
-}
-
 fn detect_cursor_cli_version() -> Option<String> {
-    let version = detect_cursor_ide_version()?;
-    Some(if version.starts_with("cli-") {
-        version
-    } else {
-        format!("cli-{version}")
+    for name in [
+        "CC_SWITCH_CURSOR_AGENT_CLI_VERSION",
+        "CURSOR_AGENT_CLI_VERSION",
+    ] {
+        if let Some(version) = std::env::var(name)
+            .ok()
+            .and_then(|value| normalize_cursor_cli_version(&value))
+        {
+            return Some(version);
+        }
+    }
+    detect_cursor_cli_version_from_fs()
+}
+
+fn normalize_cursor_cli_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    let build = value.strip_prefix("cli-").unwrap_or(value);
+    let (date, revision) = build.split_once('-')?;
+    let mut date_parts = date.split('.');
+    let valid_date = date_parts
+        .next()
+        .is_some_and(|part| part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && date_parts.clone().count() == 2
+        && date_parts.all(|part| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit()));
+    let valid_revision = revision.len() >= 6
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    (valid_date && valid_revision).then(|| format!("cli-{build}"))
+}
+
+fn detect_cursor_cli_version_from_fs() -> Option<String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)?;
+    for binary in ["agent", "cursor-agent"] {
+        let path = home.join(".local/bin").join(binary);
+        if let Ok(resolved) = std::fs::canonicalize(path) {
+            if let Some(version) = cursor_cli_version_from_path(&resolved) {
+                return Some(version);
+            }
+        }
+    }
+    let versions_dir = std::env::var_os("CURSOR_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|path| path.join("versions"))
+        .unwrap_or_else(|| default_cursor_cli_versions_dir(&home));
+    let mut versions = std::fs::read_dir(versions_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|value| normalize_cursor_cli_version(&value))
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.pop()
+}
+
+fn cursor_cli_version_from_path(path: &std::path::Path) -> Option<String> {
+    let parts = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    parts.windows(2).rev().find_map(|parts| {
+        (parts[0] == "versions")
+            .then(|| normalize_cursor_cli_version(&parts[1]))
+            .flatten()
     })
 }
 
-fn build_cursor_checksum(token: &str, machine_id: &str) -> String {
-    let stable_machine_id = if machine_id.is_empty() {
-        sha256_hex(&format!("{token}machineId"))
+fn default_cursor_cli_versions_dir(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"))
+            .join("cursor-agent/versions")
     } else {
-        machine_id.to_string()
-    };
-    let timestamp = (chrono::Utc::now().timestamp_millis() / 1_000_000) as u64;
-    let mut buf = [
-        ((timestamp >> 40) & 0xff) as u8,
-        ((timestamp >> 32) & 0xff) as u8,
-        ((timestamp >> 24) & 0xff) as u8,
-        ((timestamp >> 16) & 0xff) as u8,
-        ((timestamp >> 8) & 0xff) as u8,
-        (timestamp & 0xff) as u8,
-    ];
-    let mut previous = 165u8;
-    for (index, byte) in buf.iter_mut().enumerate() {
-        *byte = (*byte ^ previous).wrapping_add((index % 256) as u8);
-        previous = *byte;
+        home.join(".local/share/cursor-agent/versions")
     }
-    format!("{}{}", jyh_encode(&buf), stable_machine_id)
 }
 
-fn jyh_encode(bytes: &[u8]) -> String {
-    const URL_SAFE_BASE64: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let a = bytes[index];
-        let b = if index + 1 < bytes.len() {
-            bytes[index + 1]
-        } else {
-            0
-        };
-        let c = if index + 2 < bytes.len() {
-            bytes[index + 2]
-        } else {
-            0
-        };
-        out.push(URL_SAFE_BASE64[(a >> 2) as usize] as char);
-        out.push(URL_SAFE_BASE64[(((a & 3) << 4) | (b >> 4)) as usize] as char);
-        if index + 1 < bytes.len() {
-            out.push(URL_SAFE_BASE64[(((b & 15) << 2) | (c >> 6)) as usize] as char);
-        }
-        if index + 2 < bytes.len() {
-            out.push(URL_SAFE_BASE64[(c & 63) as usize] as char);
-        }
-        index += 3;
-    }
-    out
+fn cursor_sdk_client_version() -> String {
+    std::env::var("CC_SWITCH_CURSOR_SDK_CLIENT_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.starts_with("sdk-") && value.len() > 4)
+        .unwrap_or_else(|| DEFAULT_CURSOR_SDK_VERSION.to_string())
 }
 
 fn string_path(account: &Account, paths: &[&str]) -> Option<String> {
@@ -381,12 +357,12 @@ mod tests {
     #[test]
     fn api_key_account_uses_stable_hash_identity() {
         let account = cursor_account_for_api_key("cursor-key");
+        let repeated = cursor_account_for_api_key("cursor-key");
         assert!(account.account_id.starts_with("cursor_apikey_"));
         assert_eq!(account.machine_id().len(), 64);
-        assert_eq!(
-            account.resolved_client_version(),
-            DEFAULT_CURSOR_CLIENT_VERSION
-        );
+        assert_eq!(account.account_id, repeated.account_id);
+        assert_eq!(account.machine_id(), repeated.machine_id());
+        assert_eq!(account.config_version(), repeated.config_version());
     }
 
     #[test]
@@ -407,7 +383,7 @@ mod tests {
             profile: None,
             raw: Some(json!({
                 "cursorServiceMachineId": "machine",
-                "cursorClientVersion": "cli-test",
+                "cursorClientVersion": "cli-2026.07.08-0c04a8a",
                 "cursorConfigVersion": "config",
                 "cursorClientId": "client"
             })),
@@ -429,17 +405,65 @@ mod tests {
         };
         let cursor = cursor_account_from_managed_account(&account);
         assert_eq!(cursor.machine_id(), "machine");
-        assert_eq!(cursor.resolved_client_version(), "cli-test");
+        assert_eq!(cursor.resolved_client_version(), "cli-2026.07.08-0c04a8a");
         assert_eq!(cursor.config_version(), "config");
         assert_eq!(cursor.client_id(), "client");
     }
 
     #[test]
-    fn agent_headers_include_connect_and_identity() {
+    fn agentservice_headers_are_rail_specific_and_strip_composite_tokens() {
         let account = cursor_account_for_api_key("cursor-key");
-        let headers = cursor_agent_headers(&account, "access-token");
-        assert!(headers.iter().any(|(key, _)| key == "authorization"));
-        assert!(headers.iter().any(|(key, _)| key == "content-type"));
-        assert!(headers.iter().any(|(key, _)| key == "x-cursor-checksum"));
+        let cli = cursor_agentservice_headers(
+            CursorProtocolRail::OAuthCli,
+            &account,
+            "subject::access-token",
+        );
+        let sdk =
+            cursor_agentservice_headers(CursorProtocolRail::ApiKeySdk, &account, "access-token");
+        assert!(cli
+            .iter()
+            .any(|(key, value)| { key == "authorization" && value == "Bearer access-token" }));
+        assert!(cli
+            .iter()
+            .any(|(key, value)| key == "x-cursor-client-type" && value == "cli"));
+        assert!(cli.iter().any(|(key, _)| key == "traceparent"));
+        assert!(cli.iter().any(|(key, _)| key == "backend-traceparent"));
+        assert!(cli
+            .iter()
+            .any(|(key, value)| key == "connect-accept-encoding" && value == "gzip"));
+        assert!(sdk
+            .iter()
+            .any(|(key, value)| key == "x-cursor-client-type" && value == "sdk"));
+        assert!(sdk.iter().any(|(key, value)| {
+            key == "x-cursor-client-version" && value == DEFAULT_CURSOR_SDK_VERSION
+        }));
+        assert!(!sdk.iter().any(|(key, _)| key == "traceparent"));
+        assert!(!sdk.iter().any(|(key, _)| key == "backend-traceparent"));
+        assert!(!sdk.iter().any(|(key, _)| key == "connect-accept-encoding"));
+        for headers in [&cli, &sdk] {
+            assert!(!headers.iter().any(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "x-cursor-checksum"
+                        | "x-client-key"
+                        | "x-cursor-config-version"
+                        | "x-cursor-client-id"
+                        | "x-amzn-trace-id"
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn cli_version_rejects_ide_semver_and_accepts_agent_build_ids() {
+        assert_eq!(normalize_cursor_cli_version("3.1.2"), None);
+        assert_eq!(
+            normalize_cursor_cli_version("2026.07.08-0c04a8a").as_deref(),
+            Some("cli-2026.07.08-0c04a8a")
+        );
+        assert_eq!(
+            normalize_cursor_cli_version("cli-2026.07.08-0c04a8a").as_deref(),
+            Some("cli-2026.07.08-0c04a8a")
+        );
     }
 }

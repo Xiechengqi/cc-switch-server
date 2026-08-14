@@ -29014,7 +29014,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
 
         assert_eq!(error.status, StatusCode::FORBIDDEN);
         let account = state.find_account_by_id(&account_id).await.unwrap();
-        assert_eq!(account.subscription_level.as_deref(), Some("supergrok"));
+        assert_eq!(account.subscription_level.as_deref(), Some("SuperGrok"));
         assert_eq!(account.entitlement_status.as_deref(), Some("blocked"));
         assert!(account
             .rate_limited_until

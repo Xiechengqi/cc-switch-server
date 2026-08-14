@@ -551,6 +551,24 @@ pub async fn validate_native_account_refresh_receipt(
         } else {
             require_existing_verified_grok_subject(account)?;
         }
+    } else if account.provider_type == ProviderType::CursorOAuth {
+        let existing_subject =
+            crate::domain::accounts::cursor_import::cursor_subject_from_account(account);
+        let refreshed_subject =
+            crate::domain::accounts::cursor_import::cursor_subject_from_refresh_update(&update);
+        match (existing_subject.as_deref(), refreshed_subject.as_deref()) {
+            (Some(existing), Some(refreshed)) if existing != refreshed => {
+                return Err(cursor_refresh_identity_failure(
+                    "Cursor OAuth refresh subject does not match the existing account",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(cursor_refresh_identity_failure(
+                    "Cursor OAuth refresh did not produce a stable subject",
+                ));
+            }
+            _ => {}
+        }
     } else if account.provider_type == ProviderType::KimiCode {
         let access_token = update
             .access_token
@@ -670,6 +688,20 @@ pub async fn validate_native_account_refresh_receipt(
         });
     }
     Ok(update)
+}
+
+fn cursor_refresh_identity_failure(message: &str) -> AccountRefreshFailure {
+    AccountRefreshFailure {
+        status_code: 409,
+        upstream_status: None,
+        message: message.to_string(),
+        kind: OAuthErrorKind::InvalidGrant,
+        retryable: false,
+        retry_after_ms: None,
+        immediate_relogin: true,
+        outcome_unknown: true,
+        endpoint_fallback_safe: false,
+    }
 }
 
 fn openai_jwt_refresh_failure(
@@ -1303,6 +1335,33 @@ mod tests {
             needs_relogin: false,
             capability_observations: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn cursor_refresh_receipt_rejects_subject_switch() {
+        let mut existing = account(
+            ProviderType::CursorOAuth,
+            Some("old-access-token"),
+            Some("refresh-token"),
+            None,
+        );
+        existing.profile = Some(serde_json::json!({
+            "cursorIdentity": {"subject": "cursor-subject-a", "source": "oauth_login"}
+        }));
+        let update = AccountRefreshUpdate {
+            access_token: Some("new-access-token".to_string()),
+            raw: Some(serde_json::json!({
+                "accessToken": "cursor-subject-b::new-access-token"
+            })),
+            ..Default::default()
+        };
+        let error =
+            validate_native_account_refresh_receipt(&reqwest::Client::new(), &existing, update)
+                .await
+                .unwrap_err();
+        assert_eq!(error.status_code, 409);
+        assert!(error.immediate_relogin);
+        assert!(error.message.contains("does not match"));
     }
 
     #[tokio::test]

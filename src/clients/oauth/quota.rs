@@ -23,6 +23,7 @@ use crate::domain::accounts::claude_subscription::{
     parse_claude_subscription_plan, resolve_claude_subscription, ClaudeSubscriptionCandidate,
     ClaudeSubscriptionResolution, ClaudeSubscriptionSource,
 };
+use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
     gemini_v1internal_project_id, Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
 };
@@ -2116,7 +2117,12 @@ async fn refresh_grok_quota(
                 .and_then(grok_subscription_level)
         })
         .or_else(|| grok_access_plan(&user_probe, billing_body))
-        .or_else(|| account.subscription_level.clone())
+        .or_else(|| {
+            account
+                .subscription_level
+                .as_deref()
+                .and_then(canonical_grok_subscription_level)
+        })
         .or_else(|| account.entitlement_status.clone());
     let previous_billing_tiers = account
         .quota
@@ -2456,6 +2462,9 @@ fn grok_quota_from_probes(
     now_ms: i64,
     previous_billing_tiers: &[AccountQuotaTier],
 ) -> AccountQuota {
+    let subscription_level = subscription_level
+        .as_deref()
+        .and_then(canonical_grok_subscription_level);
     let GrokQuotaProbes {
         weekly,
         monthly,
@@ -3248,6 +3257,7 @@ fn grok_subscription_level(value: &Value) -> Option<String> {
             )
         })
     })
+    .and_then(|value| canonical_grok_subscription_level(&value))
 }
 
 fn grok_access_plan(user: &Value, billing: Option<&Value>) -> Option<String> {
@@ -8875,10 +8885,10 @@ mod tests {
     }
 
     #[test]
-    fn grok_user_and_billing_normalize_account_and_credit_metadata() {
+    fn grok_user_and_billing_normalize_legacy_plan_and_credit_metadata() {
         let user = json!({
             "email": "owner@example.com",
-            "subscriptionTier": "SuperGrok",
+            "subscriptionTier": "GrokPro",
             "entitlementStatus": "active"
         });
         let billing = json!({
@@ -8901,7 +8911,7 @@ mod tests {
                 task_usage: &skipped,
                 subscriptions: &skipped,
             },
-            Some("SuperGrok".to_string()),
+            Some("GrokPro".to_string()),
             1_000,
             &[],
         );

@@ -19,6 +19,7 @@ use crate::domain::accounts::capability_evidence::{
     AccountCapabilityObservation, AccountCapabilityObservationDraft,
     AccountCapabilityObservationState, GROK_CODE_PLAN_CAPABILITY, MEDIA_ENTITLEMENT_DIMENSION,
 };
+use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::oauth::{
     invalid_grant_requires_immediate_relogin as oauth_invalid_grant_requires_immediate_relogin,
     oauth_provider_spec, OAuthErrorKind,
@@ -737,6 +738,8 @@ impl AccountStore {
     }
 
     pub fn upsert(&mut self, input: UpsertAccountInput) -> Account {
+        let subscription_level =
+            normalized_account_subscription_level(input.provider_type, input.subscription_level);
         let mut account = Account {
             id: input.id.unwrap_or_else(generate_account_id),
             provider_type: input.provider_type,
@@ -752,7 +755,7 @@ impl AccountStore {
             scopes: input.scopes,
             profile: input.profile,
             raw: input.raw,
-            subscription_level: input.subscription_level,
+            subscription_level,
             entitlement_status: input.entitlement_status,
             quota_percent: input.quota_percent,
             quota: input.quota,
@@ -1074,7 +1077,9 @@ impl AccountStore {
         if update.clear_subscription_level {
             account.subscription_level = None;
         }
-        if let Some(value) = update.subscription_level {
+        if let Some(value) =
+            normalized_account_subscription_level(account.provider_type, update.subscription_level)
+        {
             account.subscription_level = Some(value);
         }
         if let Some(value) = update.entitlement_status {
@@ -1139,6 +1144,8 @@ impl AccountStore {
             .accounts
             .iter_mut()
             .find(|item| item.id == account_id)?;
+        let subscription_level =
+            normalized_account_subscription_level(account.provider_type, subscription_level);
         if let Some(value) = subscription_level.as_ref() {
             account.subscription_level = Some(value.clone());
         }
@@ -1518,6 +1525,16 @@ fn identity_component_replaced<T: PartialEq>(previous: &Option<T>, candidate: &O
 }
 
 fn strongest_account_principal(account: &Account) -> Option<AccountPrincipal> {
+    if account.provider_type == ProviderType::CursorOAuth {
+        if let Some(value) =
+            crate::domain::accounts::cursor_import::cursor_subject_from_account(account)
+        {
+            return Some(AccountPrincipal {
+                kind: "cursor_subject",
+                value,
+            });
+        }
+    }
     if account.provider_type == ProviderType::CodexOAuth {
         if let Some(value) = verified_openai_subject(account) {
             return Some(AccountPrincipal {
@@ -2358,6 +2375,16 @@ fn encrypt_secret_v1(plain: &str, key: &[u8; 32]) -> anyhow::Result<String> {
         URL_SAFE_NO_PAD.encode(nonce),
         URL_SAFE_NO_PAD.encode(ciphertext)
     ))
+}
+
+fn normalized_account_subscription_level(
+    provider_type: ProviderType,
+    value: Option<String>,
+) -> Option<String> {
+    if provider_type == ProviderType::GrokOAuth {
+        return value.as_deref().and_then(canonical_grok_subscription_level);
+    }
+    value
 }
 
 fn generate_account_id() -> String {
@@ -4375,7 +4402,7 @@ mod tests {
     #[test]
     fn update_entitlement_snapshot_preserves_tier_and_entitlement_status() {
         let mut store = AccountStore::default();
-        store.upsert(UpsertAccountInput {
+        let inserted = store.upsert(UpsertAccountInput {
             id: Some("acct-1".to_string()),
             provider_type: ProviderType::GrokOAuth,
             email: Some("owner@example.com".to_string()),
@@ -4388,7 +4415,7 @@ mod tests {
             scopes: Vec::new(),
             profile: Some(json!({"source": "fixture"})),
             raw: None,
-            subscription_level: None,
+            subscription_level: Some("GrokPro".to_string()),
             entitlement_status: None,
             quota_percent: None,
             quota: None,
@@ -4398,11 +4425,12 @@ mod tests {
             rate_limited_until: None,
             last_refresh_error: None,
         });
+        assert_eq!(inserted.subscription_level.as_deref(), Some("SuperGrok"));
 
         let account = store
             .update_entitlement_snapshot(
                 "acct-1",
-                Some("SuperGrok".to_string()),
+                Some("GrokPro".to_string()),
                 Some("denied".to_string()),
                 1_234,
             )

@@ -246,6 +246,8 @@ pub(crate) struct ErrorResponse {
     pub(crate) retryable: Option<bool>,
     #[serde(rename = "retryAfterSeconds", skip_serializing_if = "Option::is_none")]
     pub(crate) retry_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) details: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -256,6 +258,7 @@ pub struct ApiError {
     pub(crate) error_type: Option<&'static str>,
     pub(crate) retryable: Option<bool>,
     pub(crate) retry_after_seconds: Option<u64>,
+    pub(crate) details: Option<Box<Value>>,
 }
 
 impl ApiError {
@@ -267,6 +270,7 @@ impl ApiError {
             error_type: None,
             retryable: None,
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -282,6 +286,7 @@ impl ApiError {
             error_type: None,
             retryable: None,
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -305,6 +310,7 @@ impl ApiError {
             error_type: None,
             retryable: None,
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -316,6 +322,7 @@ impl ApiError {
             error_type: None,
             retryable: Some(false),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -327,6 +334,7 @@ impl ApiError {
             error_type: Some("provider_contract_mismatch"),
             retryable: Some(false),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -342,6 +350,7 @@ impl ApiError {
             error_type: Some("feature_disabled"),
             retryable: Some(false),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -356,6 +365,7 @@ impl ApiError {
             error_type: Some("web_invoke_unknown"),
             retryable: Some(false),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -367,6 +377,7 @@ impl ApiError {
             error_type: Some("web_invoke_not_wired"),
             retryable: Some(false),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -382,6 +393,7 @@ impl ApiError {
             error_type: Some("unavailable_error"),
             retryable: Some(true),
             retry_after_seconds: Some(1),
+            details: None,
         }
     }
 
@@ -407,6 +419,7 @@ impl ApiError {
             error_type: Some(error_type),
             retryable: Some(retryable),
             retry_after_seconds,
+            details: None,
         }
     }
 
@@ -424,6 +437,11 @@ impl ApiError {
         self.retryable = Some(retryable);
         self
     }
+
+    pub(crate) fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(Box::new(details));
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -439,6 +457,7 @@ impl IntoResponse for ApiError {
                 status: Some(self.status.as_u16()),
                 retryable: self.retryable,
                 retry_after_seconds,
+                details: self.details.map(|details| *details),
             }),
         )
             .into_response();
@@ -662,6 +681,27 @@ mod tests {
         assert_eq!(body["code"], "cursor_session_lost");
         assert_eq!(body["error"], "Cursor session is unavailable");
         assert_eq!(body["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn revision_conflict_error_preserves_authoritative_details() {
+        let response = ApiError::conflict_code(
+            "cc_switch_share_revision_conflict",
+            "managed grant expected config revision 3, current revision is 4",
+        )
+        .with_retryable(true)
+        .with_details(serde_json::json!({
+            "currentConfigRevision": 4,
+            "currentShare": { "shareId": "share-a", "configRevision": 4 },
+        }))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "cc_switch_share_revision_conflict");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["details"]["currentConfigRevision"], 4);
+        assert_eq!(body["details"]["currentShare"]["shareId"], "share-a");
+        assert_eq!(body["details"]["currentShare"]["configRevision"], 4);
     }
 
     #[tokio::test]

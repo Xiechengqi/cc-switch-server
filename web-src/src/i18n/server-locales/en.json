@@ -118,6 +118,26 @@
     "title": "Providers"
   },
   "provider": {
+    "ollama": {
+      "complete": "Live usage",
+      "partial": "Partial data",
+      "stale": "Cached data",
+      "error": "Account unavailable",
+      "unconfigured": "API key required",
+      "loading": "Loading account",
+      "queryFailed": "Ollama account usage could not be loaded",
+      "refresh": "Refresh Ollama account and usage",
+      "session": "Session",
+      "weekly": "Weekly",
+      "cost": "Activity ${{value}}",
+      "modelsMore": "+{{count}} more",
+      "source": {
+        "live": "Live response",
+        "fresh_cache": "Fresh cache",
+        "stale_cache": "Stale cache",
+        "configuration": "Provider configuration"
+      }
+    },
     "codingPlanQuota": {
       "supported": "Live quota",
       "stale": "Cached quota",

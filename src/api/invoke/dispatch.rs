@@ -33,7 +33,7 @@ pub(in crate::api) async fn web_invoke_compat(
         )));
     }
 
-    web_invoke_dispatch(&state, &headers, &command, args)
+    Box::pin(web_invoke_dispatch(&state, &headers, &command, args))
         .await
         .map(Json)
 }
@@ -359,6 +359,22 @@ async fn web_invoke_dispatch(
                 .coding_plan_quota_snapshot(
                     provider_key,
                     command == "refresh_coding_plan_quota",
+                )
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            Ok(json!(snapshot))
+        }
+        "get_provider_account_usage" | "refresh_provider_account_usage" => {
+            let app = web_arg_app(&args)?;
+            let provider_id = web_arg_string_any(&args, &["providerId", "provider_id", "id"])?;
+            let provider_key =
+                crate::domain::providers::registry::ProviderKey::new(app, provider_id)
+                    .map_err(ApiError::bad_request)?;
+            let snapshot = state
+                .ollama_cloud_snapshot(
+                    provider_key,
+                    command == "refresh_provider_account_usage",
                 )
                 .await
                 .map_err(ApiError::internal)?

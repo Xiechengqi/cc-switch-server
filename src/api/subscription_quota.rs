@@ -2,7 +2,8 @@ use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 
 use super::types::{
-    account_quota_public_view, redact_account_public_diagnostic, AccountQuotaResponse,
+    account_quota_public_view, account_subscription_level_public_view,
+    redact_account_public_diagnostic, AccountQuotaResponse,
 };
 use crate::domain::accounts::store::{Account, AccountQuota, AccountQuotaTier};
 use crate::domain::accounts::subscription_expiry::{
@@ -135,7 +136,7 @@ fn subscription_quota_from_parts(
 
     let credential_message = quota
         .and_then(|quota| quota.credential_message.clone())
-        .or_else(|| account.subscription_level.clone());
+        .or_else(|| account_subscription_level_public_view(account));
 
     let success = credential_status == "valid" && quota.is_some_and(|quota| quota.success);
     let queried_at = queried_at.or_else(|| {
@@ -237,8 +238,8 @@ fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Optio
         );
     }
     if !object.contains_key("planLabel") {
-        if let Some(plan_label) = account.subscription_level.as_ref() {
-            object.insert("planLabel".to_string(), Value::String(plan_label.clone()));
+        if let Some(plan_label) = account_subscription_level_public_view(account) {
+            object.insert("planLabel".to_string(), Value::String(plan_label));
         }
     }
     Some(subscription)
@@ -525,10 +526,10 @@ mod tests {
     }
 
     #[test]
-    fn grok_quota_exposes_plan_and_usage_without_using_token_expiry() {
+    fn grok_quota_canonicalizes_cached_grokpro_for_provider_cards() {
         let mut account = sample_account(AccountQuota {
             success: true,
-            credential_message: Some("SuperGrok".to_string()),
+            credential_message: Some("GrokPro".to_string()),
             tiers: vec![AccountQuotaTier {
                 name: "grok_credits".to_string(),
                 label: Some("Credits".to_string()),
@@ -545,8 +546,8 @@ mod tests {
                 "warnings": [],
                 "staleTierNames": [],
                 "subscription": {
-                    "planType": "SuperGrok",
-                    "planLabel": "SuperGrok",
+                    "planType": "GrokPro",
+                    "planLabel": "GrokPro",
                     "expiresAt": Value::Null,
                     "expiryCapability": "automatic",
                     "expiryAvailability": "upstream_not_provided"
@@ -554,7 +555,7 @@ mod tests {
             })),
         });
         account.provider_type = ProviderType::GrokOAuth;
-        account.subscription_level = Some("SuperGrok".to_string());
+        account.subscription_level = Some("GrokPro".to_string());
         account.expires_at = Some(1_786_924_800_000);
 
         let quota = subscription_quota_from_account(&account, "grok_oauth");
@@ -564,6 +565,7 @@ mod tests {
         assert_eq!(quota["tiers"][0]["used"], 75.0);
         assert_eq!(quota["tiers"][0]["label"], "Credits");
         assert_eq!(quota["quotaStatus"], "valid_numeric");
+        assert_eq!(quota["subscription"]["planType"], "SuperGrok");
         assert_eq!(quota["subscription"]["planLabel"], "SuperGrok");
         assert_eq!(
             quota["subscription"]["expiryAvailability"],

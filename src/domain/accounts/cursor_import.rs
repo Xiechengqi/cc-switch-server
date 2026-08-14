@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::domain::accounts::store::UpsertAccountInput;
+use crate::domain::accounts::store::{Account, AccountRefreshUpdate, UpsertAccountInput};
 use crate::domain::providers::model::ProviderType;
 
 const ACCESS_TOKEN_KEYS: &[&str] = &["cursorAuth/accessToken", "cursorAuth/token"];
@@ -113,14 +113,28 @@ pub fn import_from_local_cursor() -> Result<CursorLocalImport, CursorImportError
 }
 
 pub fn upsert_input_from_cursor_local_import(
-    import: CursorLocalImport,
+    mut import: CursorLocalImport,
     profile_raw: Option<Value>,
     now_ms: i64,
 ) -> UpsertAccountInput {
+    let (composite_subject, access_token) = cursor_access_token_parts(&import.access_token);
+    if import.workos_user_id.is_none() {
+        import.workos_user_id = composite_subject.map(str::to_string);
+    }
+    import.access_token = access_token.to_string();
     let profile_email = profile_raw.as_ref().and_then(email_from_profile_value);
     let email = profile_email.or(import.email.clone());
     let account_id =
         stable_cursor_import_account_id(import.workos_user_id.as_deref(), &import.access_token);
+    let cursor_identity = import.workos_user_id.as_deref().map(|subject| {
+        json!({
+            "subject": subject,
+            "source": match &import.source {
+                CursorImportSource::IdeStateVscdb => "ide_token",
+                CursorImportSource::CursorAgentAuthJson => "agent_token",
+            },
+        })
+    });
     let mut profile = json!({
         "providerType": ProviderType::CursorOAuth.as_str(),
         "source": "cursor_local_import",
@@ -128,6 +142,7 @@ pub fn upsert_input_from_cursor_local_import(
         "accountId": account_id,
         "email": email,
         "workosUserId": import.workos_user_id,
+        "cursorIdentity": cursor_identity,
         "cursorServiceMachineId": import.machine_id,
         "path": import.path.as_ref().map(|path| path.display().to_string()),
     });
@@ -168,8 +183,78 @@ pub fn upsert_input_from_cursor_local_import(
 }
 
 pub fn cursor_workos_user_id_from_access_token(access_token: &str) -> Option<String> {
-    let claims = decode_jwt_claims(access_token)?;
-    string_at(&claims, &["/sub", "/user_id"])
+    let (composite_subject, access_token) = cursor_access_token_parts(access_token);
+    composite_subject.map(str::to_string).or_else(|| {
+        let claims = decode_jwt_claims(access_token)?;
+        string_at(&claims, &["/sub", "/user_id"])
+    })
+}
+
+pub fn cursor_access_token_parts(access_token: &str) -> (Option<&str>, &str) {
+    let access_token = access_token.trim();
+    if let Some((subject, token)) = access_token.split_once("::") {
+        let subject = subject.trim();
+        let token = token.trim();
+        if !subject.is_empty() && !token.is_empty() {
+            return (Some(subject), token);
+        }
+    }
+    (None, access_token)
+}
+
+pub fn normalize_cursor_access_token(access_token: &str) -> &str {
+    cursor_access_token_parts(access_token).1
+}
+
+pub fn cursor_subject_from_account(account: &Account) -> Option<String> {
+    cursor_subject_from_values(
+        account.profile.as_ref(),
+        account.raw.as_ref(),
+        account.access_token.as_deref(),
+    )
+}
+
+pub fn cursor_subject_from_refresh_update(update: &AccountRefreshUpdate) -> Option<String> {
+    cursor_subject_from_values(
+        update.profile.as_ref(),
+        update.raw.as_ref(),
+        update.access_token.as_deref(),
+    )
+}
+
+fn cursor_subject_from_values(
+    profile: Option<&Value>,
+    raw: Option<&Value>,
+    access_token: Option<&str>,
+) -> Option<String> {
+    for value in [profile, raw].into_iter().flatten() {
+        if let Some(subject) = string_at(
+            value,
+            &[
+                "/cursorIdentity/subject",
+                "/workosUserId",
+                "/sub",
+                "/profileRaw/sub",
+                "/profile/sub",
+            ],
+        ) {
+            return Some(subject);
+        }
+        if let Some(token) = string_at(
+            value,
+            &[
+                "/accessToken",
+                "/access_token",
+                "/token/accessToken",
+                "/token/access_token",
+            ],
+        ) {
+            if let Some(subject) = cursor_workos_user_id_from_access_token(&token) {
+                return Some(subject);
+            }
+        }
+    }
+    access_token.and_then(cursor_workos_user_id_from_access_token)
 }
 
 pub fn cursor_account_id_from_stable_subject(subject: &str) -> Option<String> {
@@ -373,6 +458,7 @@ fn try_agent_auth() -> Result<CursorLocalImport, CursorImportError> {
     .ok_or_else(|| CursorImportError::new("cursor-agent auth.json has no accessToken"))?;
     validate_access_token(&access_token)?;
     let (workos_user_id, email, expires_at) = access_token_identity(&access_token);
+    let access_token = normalize_cursor_access_token(&access_token).to_string();
     Ok(CursorLocalImport {
         access_token,
         machine_id: None,
@@ -495,6 +581,7 @@ fn tokens_to_ide_import(
         .ok_or_else(|| CursorImportError::new("Cursor state.vscdb has no access token"))?;
     validate_access_token(&access_token)?;
     let (workos_user_id, email, expires_at) = access_token_identity(&access_token);
+    let access_token = normalize_cursor_access_token(&access_token).to_string();
     Ok(CursorLocalImport {
         access_token,
         machine_id: tokens.machine_id.filter(|value| !value.trim().is_empty()),
@@ -521,7 +608,7 @@ fn normalize_vscdb_value(value: &str) -> Option<String> {
 }
 
 fn validate_access_token(access_token: &str) -> Result<(), CursorImportError> {
-    if access_token.trim().len() < MIN_CURSOR_TOKEN_LEN {
+    if normalize_cursor_access_token(access_token).len() < MIN_CURSOR_TOKEN_LEN {
         return Err(CursorImportError::new(
             "Cursor access token is missing or appears too short",
         ));
@@ -530,11 +617,14 @@ fn validate_access_token(access_token: &str) -> Result<(), CursorImportError> {
 }
 
 fn access_token_identity(access_token: &str) -> (Option<String>, Option<String>, Option<i64>) {
-    let Some(claims) = decode_jwt_claims(access_token) else {
-        return (None, None, None);
+    let composite_subject = cursor_access_token_parts(access_token)
+        .0
+        .map(str::to_string);
+    let Some(claims) = decode_jwt_claims(normalize_cursor_access_token(access_token)) else {
+        return (composite_subject, None, None);
     };
     (
-        string_at(&claims, &["/sub", "/user_id"]),
+        composite_subject.or_else(|| string_at(&claims, &["/sub", "/user_id"])),
         string_at(&claims, &["/email", "/preferred_username"]),
         integer_at(&claims, &["/exp"]).map(|seconds| seconds.saturating_mul(1000)),
     )
@@ -819,6 +909,34 @@ mod tests {
         assert_eq!(
             upsert.id,
             cursor_account_id_from_stable_subject("workos-subject")
+        );
+    }
+
+    #[test]
+    fn composite_cursor_token_preserves_subject_but_stores_only_bearer_token() {
+        let bearer = "x".repeat(64);
+        let import = CursorLocalImport {
+            access_token: format!("workos-subject::{bearer}"),
+            machine_id: None,
+            source: CursorImportSource::CursorAgentAuthJson,
+            path: None,
+            workos_user_id: None,
+            email: None,
+            expires_at: None,
+        };
+        let upsert = upsert_input_from_cursor_local_import(import, None, 2_000);
+        assert_eq!(upsert.access_token.as_deref(), Some(bearer.as_str()));
+        assert_eq!(
+            upsert.id,
+            cursor_account_id_from_stable_subject("workos-subject")
+        );
+        assert_eq!(
+            upsert
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.pointer("/cursorIdentity/subject"))
+                .and_then(Value::as_str),
+            Some("workos-subject")
         );
     }
 

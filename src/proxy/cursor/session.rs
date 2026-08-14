@@ -1,4 +1,4 @@
-//! Cursor `agent.v1.AgentService/Run` session registry.
+//! Cursor AgentService session registry for the runtime-configured RPC method.
 //!
 //! Keeps an open h2 stream alive across the OpenAI/Claude tool round-trip so
 //! a tool-using turn can complete inline. When the proxy emits a tool_calls
@@ -13,6 +13,7 @@
 
 use super::agent_proto::McpToolDef;
 use super::h2_client::CursorH2Stream;
+use super::profile::CursorProtocolRail;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -37,6 +38,8 @@ pub struct CursorSessionScopeInput<'a> {
     pub provider_id: &'a str,
     pub provider_revision: u64,
     pub runtime_fingerprint: &'a str,
+    pub rail: CursorProtocolRail,
+    pub protocol_revision: &'a str,
     pub principal: &'a str,
     pub share_id: Option<&'a str>,
     pub user_email: Option<&'a str>,
@@ -60,6 +63,8 @@ impl CursorSessionScope {
             "runtime_fingerprint",
             input.runtime_fingerprint,
         );
+        update_scope_component(&mut hasher, "rail", input.rail.label());
+        update_scope_component(&mut hasher, "protocol_revision", input.protocol_revision);
         update_scope_component(&mut hasher, "principal", input.principal);
         update_scope_component(&mut hasher, "share", &share_id);
         update_scope_component(&mut hasher, "user", &user_email);
@@ -73,6 +78,8 @@ impl CursorSessionScope {
             provider_id: "provider-fixture",
             provider_revision: 1,
             runtime_fingerprint: "runtime-fixture",
+            rail: CursorProtocolRail::OAuthCli,
+            protocol_revision: CursorProtocolRail::OAuthCli.protocol_revision(),
             principal: "account-fixture:1:1",
             share_id: Some(name),
             user_email: Some("USER@example.com"),
@@ -159,6 +166,7 @@ pub enum SessionState {
 /// Live state of a single AgentService run.
 pub struct CursorSession {
     pub key: CursorSessionKey,
+    pub rail: CursorProtocolRail,
     pub stream: Option<CursorH2Stream>,
     /// MCP tool names declared on the inbound turn (for shell→MCP bridging).
     pub declared_tool_names: Vec<String>,
@@ -283,6 +291,7 @@ impl CursorSessionManager {
     pub async fn open(
         &self,
         key: CursorSessionKey,
+        rail: CursorProtocolRail,
         stream: CursorH2Stream,
         blob_store: HashMap<String, Bytes>,
         declared_tools: Vec<McpToolDef>,
@@ -307,6 +316,7 @@ impl CursorSessionManager {
         let declared_tool_names = declared_tools.iter().map(|t| t.name.clone()).collect();
         let session = CursorSession {
             key: key.clone(),
+            rail,
             stream: Some(stream),
             declared_tool_names,
             declared_tools,
@@ -586,6 +596,7 @@ mod tests {
     fn session_entry(key: CursorSessionKey, state: SessionState) -> Arc<Mutex<CursorSession>> {
         Arc::new(Mutex::new(CursorSession {
             key,
+            rail: CursorProtocolRail::OAuthCli,
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
@@ -744,6 +755,8 @@ mod tests {
                 provider_id: "provider-a",
                 provider_revision: 4,
                 runtime_fingerprint: "runtime-a",
+                rail: CursorProtocolRail::OAuthCli,
+                protocol_revision: CursorProtocolRail::OAuthCli.protocol_revision(),
                 principal,
                 share_id: Some(share),
                 user_email: Some(email),
@@ -760,6 +773,37 @@ mod tests {
         assert_ne!(
             derive("account-a:2:7", "share-a", "user@example.com"),
             derive("account-a:2:7", "share-b", "user@example.com")
+        );
+    }
+
+    #[test]
+    fn scope_fences_cursor_rail_and_protocol_revision() {
+        let derive = |rail: CursorProtocolRail, revision: &str| {
+            CursorSessionScope::derive(CursorSessionScopeInput {
+                app: "codex",
+                provider_id: "provider-a",
+                provider_revision: 4,
+                runtime_fingerprint: "runtime-a",
+                rail,
+                protocol_revision: revision,
+                principal: "principal-a",
+                share_id: Some("share-a"),
+                user_email: Some("user@example.com"),
+            })
+        };
+        assert_ne!(
+            derive(
+                CursorProtocolRail::OAuthCli,
+                CursorProtocolRail::OAuthCli.protocol_revision()
+            ),
+            derive(
+                CursorProtocolRail::ApiKeySdk,
+                CursorProtocolRail::ApiKeySdk.protocol_revision()
+            )
+        );
+        assert_ne!(
+            derive(CursorProtocolRail::OAuthCli, "revision-a"),
+            derive(CursorProtocolRail::OAuthCli, "revision-b")
         );
     }
 

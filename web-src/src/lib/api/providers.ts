@@ -155,6 +155,79 @@ export interface CodingPlanQuotaSnapshot {
   };
 }
 
+export type OllamaCloudSnapshotSource =
+  "live" | "fresh_cache" | "stale_cache" | "configuration";
+export type OllamaCloudSnapshotStatus =
+  "complete" | "partial" | "stale" | "error" | "unconfigured";
+export type OllamaCloudSectionState =
+  "available" | "stale" | "error" | "unavailable";
+export type OllamaCloudErrorKind =
+  | "authentication"
+  | "rate_limited"
+  | "transient"
+  | "invalid_response"
+  | "not_configured";
+
+export interface OllamaCloudSection<T> {
+  state: OllamaCloudSectionState;
+  data?: T;
+  observedAtMs?: number;
+  staleSinceMs?: number;
+  errorKind?: OllamaCloudErrorKind;
+  reason?: string;
+  retryAfterMs?: number;
+}
+
+export interface OllamaCloudAccountView {
+  id: string;
+  email?: string;
+  name?: string;
+  firstName?: string;
+  lastName?: string;
+  avatarUrl?: string;
+  plan?: string;
+  createdAtMs?: number;
+}
+
+export interface OllamaCloudModelUsage {
+  name: string;
+  requestCount: number;
+}
+
+export interface OllamaCloudUsageWindow {
+  kind: "session" | "weekly";
+  utilization: number;
+  models: OllamaCloudModelUsage[];
+  modelsTruncated: boolean;
+}
+
+export interface OllamaCloudActivityView {
+  cost?: string;
+  period?: {
+    kind: string;
+    startingAtMs?: number;
+    endingAtMs?: number;
+  };
+  models: OllamaCloudModelUsage[];
+  modelsTruncated: boolean;
+}
+
+export interface OllamaCloudUsageView {
+  limits: OllamaCloudUsageWindow[];
+  activity?: OllamaCloudActivityView;
+}
+
+export interface OllamaCloudSnapshot {
+  providerKey: { app: CoreProviderApp; providerId: string };
+  providerRevision: number;
+  credentialSourceKey: { app: CoreProviderApp; providerId: string };
+  credentialGeneration: number;
+  source: OllamaCloudSnapshotSource;
+  status: OllamaCloudSnapshotStatus;
+  account: OllamaCloudSection<OllamaCloudAccountView>;
+  usage: OllamaCloudSection<OllamaCloudUsageView>;
+}
+
 export interface ProviderResource {
   app: "claude" | "codex" | "gemini";
   provider: Provider;
@@ -374,6 +447,27 @@ export const providersApi = {
   ): Promise<CodingPlanQuotaSnapshot> {
     return await invokeCommand(
       "refresh_coding_plan_quota",
+      { app, providerId },
+      { cache: "no-store" },
+    );
+  },
+
+  async getProviderAccountUsage(
+    app: CoreProviderApp,
+    providerId: string,
+  ): Promise<OllamaCloudSnapshot> {
+    return await invokeCommand("get_provider_account_usage", {
+      app,
+      providerId,
+    });
+  },
+
+  async refreshProviderAccountUsage(
+    app: CoreProviderApp,
+    providerId: string,
+  ): Promise<OllamaCloudSnapshot> {
+    return await invokeCommand(
+      "refresh_provider_account_usage",
       { app, providerId },
       { cache: "no-store" },
     );

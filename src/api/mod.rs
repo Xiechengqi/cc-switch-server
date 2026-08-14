@@ -348,6 +348,10 @@ pub fn app_router(state: ServerState) -> Router {
             get(get_coding_plan_quota).post(refresh_coding_plan_quota),
         )
         .route(
+            "/api/providers/:id/account-usage",
+            get(get_provider_account_usage).post(refresh_provider_account_usage),
+        )
+        .route(
             "/api/providers/:id/fetch-models",
             post(fetch_provider_models),
         )
@@ -1154,6 +1158,7 @@ fn web_dist_missing_response() -> Response {
             status: Some(StatusCode::NOT_FOUND.as_u16()),
             retryable: None,
             retry_after_seconds: None,
+            details: None,
         }),
     )
         .into_response()

@@ -12,7 +12,9 @@ use crate::domain::accounts::claude_subscription::{
 };
 use crate::domain::accounts::cursor_import::{
     cursor_account_id_from_stable_subject, cursor_workos_user_id_from_access_token,
+    normalize_cursor_access_token,
 };
+use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
     Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate, UpsertAccountInput,
 };
@@ -1135,9 +1137,14 @@ pub fn refresh_update_from_token_response(
         .and_then(|quota| quota.tiers.first())
         .and_then(|tier| tier.utilization)
         .map(|utilization| utilization * 100.0);
+    let access_token = if provider_type == ProviderType::CursorOAuth {
+        normalize_cursor_access_token(&response.access_token).to_string()
+    } else {
+        response.access_token.clone()
+    };
     AccountRefreshUpdate {
         email: identity.email.clone(),
-        access_token: Some(response.access_token.clone()),
+        access_token: Some(access_token),
         refresh_token: response.refresh_token.clone(),
         id_token: response.id_token.clone(),
         token_type: response.token_type.clone(),
@@ -1611,12 +1618,19 @@ fn unverified_identity_from_token_response(
         let fallback = openai_identity_from_jwt(&response.access_token).unwrap_or_default();
         return merge_verified_openai_identities(primary, fallback).unwrap_or_default();
     }
-    response
+    let mut identity = response
         .id_token
         .as_deref()
         .and_then(identity_from_jwt)
-        .or_else(|| identity_from_jwt(&response.access_token))
-        .unwrap_or_default()
+        .or_else(|| identity_from_jwt(normalize_cursor_access_token(&response.access_token)))
+        .unwrap_or_default();
+    if provider_type == ProviderType::CursorOAuth {
+        if let Some(subject) = cursor_workos_user_id_from_access_token(&response.access_token) {
+            identity.subject = Some(subject.clone());
+            identity.account_id = cursor_account_id_from_stable_subject(&subject);
+        }
+    }
+    identity
 }
 
 pub fn identity_from_jwt(token: &str) -> Option<OAuthIdentity> {
@@ -1829,14 +1843,16 @@ pub fn grok_account_record_id_from_subject(subject: &str) -> Option<String> {
 pub fn grok_identity_from_claims(claims: &Value) -> OAuthIdentity {
     let subject =
         string_field(Some(claims), "sub").or_else(|| string_field(Some(claims), "subject"));
+    let plan_type = plan_type_field(Some(claims), "tier")
+        .or_else(|| plan_type_field(Some(claims), "subscription_tier"))
+        .or_else(|| plan_type_field(Some(claims), "plan"))
+        .and_then(|value| canonical_grok_subscription_level(&value));
     OAuthIdentity {
         account_id: subject.clone(),
         subject,
         email: string_field(Some(claims), "email")
             .or_else(|| string_field(Some(claims), "preferred_username")),
-        plan_type: plan_type_field(Some(claims), "tier")
-            .or_else(|| plan_type_field(Some(claims), "subscription_tier"))
-            .or_else(|| plan_type_field(Some(claims), "plan")),
+        plan_type,
         subscription_expires_at: string_or_integer_field(claims.get("subscription"), "expires_at")
             .or_else(|| string_or_integer_field(Some(claims), "subscription_expires_at")),
         poid: None,
@@ -2039,6 +2055,7 @@ fn profile_value(
     });
     enrich_codex_profile_value(provider_type, identity, &mut value);
     enrich_grok_profile_value(provider_type, raw, &mut value);
+    enrich_cursor_profile_value(provider_type, identity, &mut value, "oauth_refresh");
     Some(value)
 }
 
@@ -2068,10 +2085,9 @@ fn login_identity(
             .or_else(|| {
                 profile_raw.and_then(|value| string_at(value, &["/sub", "/user_id", "/id"]))
             });
-        if let Some(account_id) =
-            stable_subject.and_then(|subject| cursor_account_id_from_stable_subject(&subject))
-        {
-            identity.account_id = Some(account_id);
+        if let Some(subject) = stable_subject {
+            identity.subject = Some(subject.clone());
+            identity.account_id = cursor_account_id_from_stable_subject(&subject);
         } else if let Some(refresh_token) = response
             .refresh_token
             .as_deref()
@@ -2133,6 +2149,7 @@ fn login_profile_value(
     });
     enrich_codex_profile_value(provider_type, identity, &mut value);
     enrich_grok_profile_value(provider_type, token_raw, &mut value);
+    enrich_cursor_profile_value(provider_type, identity, &mut value, "oauth_login");
     if let Some(resolution) = claude_subscription.as_ref() {
         apply_claude_subscription_to_profile(&mut value, resolution);
     }
@@ -2351,6 +2368,29 @@ fn enrich_grok_profile_value(provider_type: ProviderType, token_raw: &Value, val
     value["unverifiedTokenClaims"] = claims;
 }
 
+fn enrich_cursor_profile_value(
+    provider_type: ProviderType,
+    identity: &OAuthIdentity,
+    value: &mut Value,
+    source: &str,
+) {
+    if provider_type != ProviderType::CursorOAuth {
+        return;
+    }
+    let Some(subject) = identity
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+    else {
+        return;
+    };
+    value["cursorIdentity"] = json!({
+        "subject": subject,
+        "source": source,
+    });
+}
+
 fn split_scopes(scope: &str) -> Vec<String> {
     scope
         .split_whitespace()
@@ -2545,6 +2585,18 @@ mod tests {
 
     fn jwt(payload: &str) -> String {
         format!("header.{}.sig", URL_SAFE_NO_PAD.encode(payload.as_bytes()))
+    }
+
+    #[test]
+    fn grok_identity_canonicalizes_legacy_grokpro_tier() {
+        let identity = grok_identity_from_claims(&json!({
+            "sub": "xai-user-1",
+            "email": "owner@example.com",
+            "tier": "GrokPro"
+        }));
+
+        assert_eq!(identity.plan_type.as_deref(), Some("SuperGrok"));
+        assert_eq!(canonical_grok_claims(&identity)["planType"], "SuperGrok");
     }
 
     #[test]

@@ -119,7 +119,7 @@ function BundleQuotaSummary({ resource }: { resource?: ProviderResource }) {
     return <KiroOauthQuotaFooter meta={provider.meta} inline />;
   }
   if (quotaSource === "ollama_cloud") {
-    return <OllamaQuotaFooter providerId={provider.id} appId={app} inline />;
+    return <OllamaQuotaFooter resource={resource} inline />;
   }
   return null;
 }

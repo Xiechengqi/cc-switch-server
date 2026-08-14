@@ -111,56 +111,72 @@ pub(crate) async fn control_apply_share_settings(
     }
     // Control RPC is Router → Client only. Managed Share Market grants must be
     // applied here too; the ordinary dashboard patch helper rejects them.
-    let share = state
+    let share = match state
         .apply_router_share_settings_patch_immediate(&input.share_id, input.patch)
         .await
         .map_err(ApiError::internal)?
-        .map_err(|error| match error {
+    {
+        Ok(share) => share,
+        Err(error) => match error {
             crate::domain::sharing::shares::SharePatchError::NotFound => {
-                ApiError::not_found("share not found")
+                return Err(ApiError::not_found("share not found"));
             }
             crate::domain::sharing::shares::SharePatchError::BindingImmutable => {
-                ApiError::conflict_code("cc_switch_share_binding_immutable", error.to_string())
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_binding_immutable",
+                    error.to_string(),
+                ));
             }
             crate::domain::sharing::shares::SharePatchError::PolicyDivergent(message) => {
-                ApiError::conflict_code("cc_switch_share_policy_divergent", message)
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_policy_divergent",
+                    message,
+                ));
             }
             crate::domain::sharing::shares::SharePatchError::RevisionConflict {
                 expected,
                 current,
-            } => ApiError::conflict_code(
-                "cc_switch_share_revision_conflict",
-                format!(
-                    "managed grant expected config revision {expected}, current revision is {current}"
-                ),
-            )
-            .with_retryable(true),
-            crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
-                ApiError::bad_request(message)
+            } => {
+                let current_share = match crate::state::authoritative_share_descriptor(
+                    &state,
+                    &input.share_id,
+                )
+                .await
+                {
+                    Ok(descriptor) => Some(descriptor),
+                    Err(descriptor_error) => {
+                        tracing::warn!(
+                            share_id = %input.share_id,
+                            error = %descriptor_error,
+                            "failed to build authoritative Share descriptor for revision-conflict response"
+                        );
+                        None
+                    }
+                };
+                let current = current_share
+                    .as_ref()
+                    .map(|share| share.config_revision)
+                    .unwrap_or(current);
+                return Err(ApiError::conflict_code(
+                    "cc_switch_share_revision_conflict",
+                    format!(
+                        "managed grant expected config revision {expected}, current revision is {current}"
+                    ),
+                )
+                .with_retryable(true)
+                .with_details(serde_json::json!({
+                    "currentConfigRevision": current,
+                    "currentShare": current_share,
+                })));
             }
-        })?;
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let share = state
-        .shares
-        .read()
+            crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
+                return Err(ApiError::bad_request(message));
+            }
+        },
+    };
+    let descriptor = crate::state::authoritative_share_descriptor(&state, &share.id)
         .await
-        .shares
-        .iter()
-        .find(|item| item.id == share.id)
-        .cloned()
-        .unwrap_or(share);
-    let descriptor = descriptor_for_share_with_accounts_and_usage(
-        &share,
-        &providers,
-        Some(&accounts),
-        Some(&usage),
-    );
-    let config = state.config.read().await;
-    let descriptor =
-        crate::clients::router::client::canonicalize_share_descriptor(&config, descriptor)
-            .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?;
     Ok(Json(ControlApplyShareSettingsResponse {
         ok: true,
         share: descriptor,

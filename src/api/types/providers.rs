@@ -119,6 +119,13 @@ pub(in crate::api) struct CodingPlanQuotaResponse {
     pub(in crate::api) snapshot: crate::domain::providers::coding_plan::CodingPlanQuotaSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct OllamaCloudSnapshotResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) snapshot: crate::domain::providers::ollama_cloud::OllamaCloudSnapshot,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::api) struct DeleteProviderQuery {

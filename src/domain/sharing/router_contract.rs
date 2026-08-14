@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
     active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
     AccountUsageBlock,
@@ -1148,14 +1149,35 @@ fn account_context_for_share(
             .and_then(|account| account.email.clone())
             .or_else(|| share.account_email.clone()),
         subscription_level: account
-            .and_then(|account| account.subscription_level.clone())
-            .or_else(|| share.subscription_level.clone()),
+            .and_then(|account| {
+                canonical_provider_subscription_level(
+                    account.provider_type,
+                    account.subscription_level.as_deref(),
+                )
+            })
+            .or_else(|| {
+                canonical_provider_subscription_level(
+                    provider.provider_type,
+                    share.subscription_level.as_deref(),
+                )
+            }),
         subscription_expires_at: account.and_then(account_subscription_expires_at),
         subscription_remaining_ms: account.and_then(account_subscription_remaining_ms),
         quota_percent: account
             .and_then(|account| account.quota_percent)
             .or(share.quota_percent),
     }
+}
+
+fn canonical_provider_subscription_level(
+    provider_type: ProviderType,
+    value: Option<&str>,
+) -> Option<String> {
+    let value = value?;
+    if provider_type == ProviderType::GrokOAuth {
+        return canonical_grok_subscription_level(value);
+    }
+    Some(value.to_string())
 }
 
 fn account_for_provider<'a>(
@@ -1201,7 +1223,10 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         }
         return Some(ShareUpstreamQuota {
             status: "ok".to_string(),
-            plan: account.subscription_level.clone(),
+            plan: canonical_provider_subscription_level(
+                account.provider_type,
+                account.subscription_level.as_deref(),
+            ),
             queried_at: None,
             subscription_period_end,
             availability: Some(availability),
@@ -1220,8 +1245,14 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
     }
     let plan = quota
         .credential_message
-        .clone()
-        .or_else(|| account.subscription_level.clone());
+        .as_deref()
+        .and_then(|value| canonical_provider_subscription_level(account.provider_type, Some(value)))
+        .or_else(|| {
+            canonical_provider_subscription_level(
+                account.provider_type,
+                account.subscription_level.as_deref(),
+            )
+        });
     Some(ShareUpstreamQuota {
         status: if quota.success {
             "ok".to_string()
@@ -1747,6 +1778,41 @@ mod tests {
         );
         assert_eq!(provider.quota_percent, Some(42.0));
         assert_eq!(provider.quota_blocked, Some(false));
+    }
+
+    #[test]
+    fn descriptor_canonicalizes_cached_grokpro_for_router_nodes() {
+        let share = test_share(ProviderType::GrokOAuth, None);
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::GrokOAuth)],
+            ..Default::default()
+        };
+        let mut account = test_account(ProviderType::GrokOAuth);
+        account.subscription_level = Some("GrokPro".to_string());
+        account.quota.as_mut().unwrap().credential_message = Some("GrokPro".to_string());
+        let accounts = AccountStore {
+            accounts: vec![account],
+            ..Default::default()
+        };
+
+        let descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        let upstream = descriptor.upstream_provider.as_ref().unwrap();
+        let app_provider = descriptor.app_providers.codex.first().unwrap();
+
+        assert_eq!(upstream.subscription_level.as_deref(), Some("SuperGrok"));
+        assert_eq!(
+            app_provider.subscription_level.as_deref(),
+            Some("SuperGrok")
+        );
+        assert_eq!(
+            upstream.quota.as_ref().unwrap().plan.as_deref(),
+            Some("SuperGrok")
+        );
+        assert_eq!(
+            accounts.accounts[0].subscription_level.as_deref(),
+            Some("GrokPro")
+        );
     }
 
     #[test]

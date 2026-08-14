@@ -12,6 +12,7 @@ pub mod h2_client;
 pub mod identity;
 pub mod image;
 pub mod model;
+pub mod profile;
 pub mod protocol;
 pub mod request_builder;
 pub mod session;
@@ -116,6 +117,51 @@ pub fn is_cursor_provider(provider_type: ProviderType) -> bool {
 pub fn agentservice_driver_requested(stored: &StoredProvider) -> bool {
     if !is_cursor_provider(stored.provider_type) {
         return false;
+    }
+    let (runtime_enable_name, rail_setting_names, rail_enabled_pointers) =
+        match stored.provider_type {
+            ProviderType::CursorOAuth => (
+                "CC_SWITCH_CURSOR_OAUTH_AGENT_ENABLED",
+                [
+                    "CURSOR_OAUTH_AGENT_SERVICE",
+                    "CC_SWITCH_CURSOR_OAUTH_AGENT_SERVICE",
+                ],
+                [
+                    "/cursorAgentService/oauthEnabled",
+                    "/cursor_agent_service/oauth_enabled",
+                ],
+            ),
+            ProviderType::CursorApiKey => (
+                "CC_SWITCH_CURSOR_APIKEY_AGENT_ENABLED",
+                [
+                    "CURSOR_APIKEY_AGENT_SERVICE",
+                    "CC_SWITCH_CURSOR_APIKEY_AGENT_SERVICE",
+                ],
+                [
+                    "/cursorAgentService/apiKeyEnabled",
+                    "/cursor_agent_service/api_key_enabled",
+                ],
+            ),
+            _ => unreachable!("non-Cursor providers returned above"),
+        };
+    if let Some(value) = std::env::var(runtime_enable_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return truthy(&value);
+    }
+    if let Some(value) = setting(&stored.provider, &rail_setting_names) {
+        return truthy(&value);
+    }
+    if let Some(enabled) = rail_enabled_pointers.iter().find_map(|pointer| {
+        stored
+            .provider
+            .settings_config
+            .pointer(pointer)
+            .and_then(Value::as_bool)
+    }) {
+        return enabled;
     }
     if let Some(value) = setting(
         &stored.provider,
@@ -261,6 +307,10 @@ mod tests {
     use super::*;
 
     fn stored(settings_config: Value) -> StoredProvider {
+        stored_with_type(settings_config, ProviderType::CursorOAuth)
+    }
+
+    fn stored_with_type(settings_config: Value, provider_type: ProviderType) -> StoredProvider {
         StoredProvider {
             app: AppKind::Claude,
             provider: Provider {
@@ -269,13 +319,13 @@ mod tests {
                 settings_config,
                 category: None,
                 meta: Some(ProviderMeta {
-                    provider_type: Some("cursor_oauth".to_string()),
+                    provider_type: Some(provider_type.as_str().to_string()),
                     ..Default::default()
                 }),
                 extra: Default::default(),
             },
-            provider_type: ProviderType::CursorOAuth,
-            provider_type_id: "cursor_oauth".to_string(),
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
             resource: Default::default(),
         }
     }
@@ -326,6 +376,37 @@ mod tests {
     }
 
     #[test]
+    fn all_supported_ingress_routes_select_the_expected_cursor_lifecycle() {
+        for (route, protocol, response_format) in [
+            (
+                ProxyRoute::ClaudeMessages,
+                InboundProtocol::AnthropicMessages,
+                CursorResponseFormat::AnthropicMessages,
+            ),
+            (
+                ProxyRoute::CodexChatCompletions,
+                InboundProtocol::OpenAiChat,
+                CursorResponseFormat::OpenAiChatCompletions,
+            ),
+            (
+                ProxyRoute::CodexResponses,
+                InboundProtocol::OpenAiResponses,
+                CursorResponseFormat::OpenAiResponses,
+            ),
+            (
+                ProxyRoute::Gemini,
+                InboundProtocol::GeminiNative,
+                CursorResponseFormat::GeminiGenerateContent,
+            ),
+        ] {
+            let selected = protocol_for_route(route).expect("supported Cursor ingress");
+            assert_eq!(selected.0, protocol);
+            assert_eq!(selected.1, response_format);
+        }
+        assert!(protocol_for_route(ProxyRoute::ClaudeCountTokens).is_none());
+    }
+
+    #[test]
     fn agentservice_driver_defaults_on_with_explicit_disable() {
         assert!(agentservice_driver_requested(&stored(json!({}))));
         assert!(agentservice_driver_requested(&stored(json!({
@@ -334,6 +415,30 @@ mod tests {
         assert!(!agentservice_driver_requested(&stored(json!({
             "cursorAgentService": {"enabled": false}
         }))));
+    }
+
+    #[test]
+    fn cursor_rails_have_independent_provider_kill_switches() {
+        let oauth = stored_with_type(
+            json!({
+                "env": {
+                    "CURSOR_AGENT_SERVICE": "1",
+                    "CURSOR_OAUTH_AGENT_SERVICE": "0"
+                }
+            }),
+            ProviderType::CursorOAuth,
+        );
+        let api_key = stored_with_type(
+            json!({
+                "env": {
+                    "CURSOR_AGENT_SERVICE": "0",
+                    "CURSOR_APIKEY_AGENT_SERVICE": "1"
+                }
+            }),
+            ProviderType::CursorApiKey,
+        );
+        assert!(!agentservice_driver_requested(&oauth));
+        assert!(agentservice_driver_requested(&api_key));
     }
 
     #[test]

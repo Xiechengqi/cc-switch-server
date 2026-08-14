@@ -854,6 +854,14 @@ describe("Provider Bundle drafts", () => {
     };
 
     const edited = editProviderBundleDraft(view);
+    expect(edited.secrets[pointer]).toEqual({
+      configured: true,
+      value: "",
+      clear: false,
+    });
+    expect(toProviderBundleWriteDraft(edited).credentialPatches).toEqual({
+      [pointer]: { action: "keep" },
+    });
     expect(edited.surfaces[0]?.runtime?.runtimeFingerprint).toBe("fixture");
     expect(edited.testApp).toBe("claude");
     expect(edited.testModel).toBe("health-model");

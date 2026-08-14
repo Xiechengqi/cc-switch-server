@@ -1,5 +1,5 @@
 //! Hand-rolled protobuf encoder/decoder for Cursor's
-//! `agent.v1.AgentService/Run` Connect-RPC endpoint.
+//! Runtime-configured Cursor AgentService Connect-RPC method.
 //!
 //! This is a Rust port of OmniRoute's `cursorAgentProtobuf.ts`. The on-the-wire
 //! schema is non-public and pinned to the protobuf descriptor shipped in
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::model::resolve_cursor_model;
+use super::profile::CursorProtocolRail;
 
 pub const CURSOR_AGENT_PROTOCOL_REVISION: &str = "cursor-agent/2026.06.02-8c11d9f";
 
@@ -28,6 +29,7 @@ pub(crate) const WT_VARINT: u8 = 0;
 pub(crate) const WT_FIXED64: u8 = 1;
 pub(crate) const WT_LEN: u8 = 2;
 pub(crate) const WT_FIXED32: u8 = 5;
+const MAX_PROTO_FIELD_NUMBER: u64 = (1 << 29) - 1;
 
 fn random_uuid_like() -> String {
     let mut bytes = [0u8; 16];
@@ -78,7 +80,9 @@ pub const ARR_MCP_TOOLS: u64 = 4;
 pub const ARR_CONVERSATION_ID: u64 = 5;
 pub const ARR_REQUESTED_MODEL: u64 = 9;
 pub const ARR_UNKNOWN_12: u64 = 12;
+pub const ARR_CLIENT_KIND: u64 = 13;
 pub const ARR_REQUEST_ID: u64 = 16;
+pub const ARR_SDK_MODE: u64 = 19;
 pub const ARR_MCP_TOOLS_INNER: u64 = 1;
 
 pub const CSS_ROOT_PROMPT: u64 = 1;
@@ -262,6 +266,10 @@ const FLAG_END_STREAM: u8 = 0x02;
 pub enum ProtoError {
     #[error("varint truncated")]
     VarintTruncated,
+    #[error("varint exceeds u64")]
+    VarintOverflow,
+    #[error("invalid protobuf field number {0}")]
+    InvalidFieldNumber(u64),
     #[error("length-delimited field overruns buffer (len={len}, remaining={remaining})")]
     LengthOverrun { len: u64, remaining: usize },
     #[error("unsupported wire type {0}")]
@@ -270,6 +278,12 @@ pub enum ProtoError {
     Gzip(String),
     #[error("connect frame exceeds max size ({size} > {max})")]
     FrameTooLarge { size: usize, max: usize },
+    #[error("invalid connect frame flags 0x{0:02x}")]
+    InvalidFrameFlags(u8),
+    #[error("connect stream ended with {buffered} buffered bytes from an incomplete frame")]
+    IncompleteFrame { buffered: usize },
+    #[error("protobuf string field is not valid UTF-8: {0}")]
+    InvalidUtf8(String),
 }
 
 pub type ProtoResult<T> = Result<T, ProtoError>;
@@ -290,20 +304,27 @@ pub(crate) fn put_tag<B: BufMut>(out: &mut B, field: u64, wire: u8) {
 
 pub(crate) fn read_varint(src: &[u8], mut pos: usize) -> ProtoResult<(u64, usize)> {
     let mut result: u64 = 0;
-    let mut shift: u32 = 0;
-    while pos < src.len() {
+    for byte_index in 0..10 {
+        if pos >= src.len() {
+            return Err(ProtoError::VarintTruncated);
+        }
         let b = src[pos];
         pos += 1;
-        result |= ((b & 0x7F) as u64) << shift;
+
+        if byte_index == 9 {
+            if b > 1 {
+                return Err(ProtoError::VarintOverflow);
+            }
+            result |= (b as u64) << 63;
+            return Ok((result, pos));
+        }
+
+        result |= ((b & 0x7F) as u64) << (byte_index * 7);
         if b & 0x80 == 0 {
             return Ok((result, pos));
         }
-        shift += 7;
-        if shift >= 64 {
-            return Err(ProtoError::VarintTruncated);
-        }
     }
-    Err(ProtoError::VarintTruncated)
+    unreachable!("ten-byte varints return from the final iteration")
 }
 
 fn checked_len(len: u64, pos: usize, src: &[u8]) -> ProtoResult<usize> {
@@ -407,10 +428,17 @@ impl<'a> Iterator for FieldIter<'a> {
         }
         let (tag, np) = match read_varint(self.src, self.pos) {
             Ok(v) => v,
-            Err(e) => return Some(Err(e)),
+            Err(e) => {
+                self.pos = self.src.len();
+                return Some(Err(e));
+            }
         };
         self.pos = np;
         let field = tag >> 3;
+        if field == 0 || field > MAX_PROTO_FIELD_NUMBER {
+            self.pos = self.src.len();
+            return Some(Err(ProtoError::InvalidFieldNumber(field)));
+        }
         let wire = (tag & 0x7) as u8;
         match wire {
             WT_VARINT => match read_varint(self.src, self.pos) {
@@ -421,17 +449,26 @@ impl<'a> Iterator for FieldIter<'a> {
                         value: FieldValue::Varint(v),
                     }))
                 }
-                Err(e) => Some(Err(e)),
+                Err(e) => {
+                    self.pos = self.src.len();
+                    Some(Err(e))
+                }
             },
             WT_LEN => {
                 let (len, np) = match read_varint(self.src, self.pos) {
                     Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => {
+                        self.pos = self.src.len();
+                        return Some(Err(e));
+                    }
                 };
                 self.pos = np;
                 let n = match checked_len(len, self.pos, self.src) {
                     Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => {
+                        self.pos = self.src.len();
+                        return Some(Err(e));
+                    }
                 };
                 let slice = &self.src[self.pos..self.pos + n];
                 self.pos += n;
@@ -442,10 +479,9 @@ impl<'a> Iterator for FieldIter<'a> {
             }
             WT_FIXED64 => {
                 if self.pos + 8 > self.src.len() {
-                    return Some(Err(ProtoError::LengthOverrun {
-                        len: 8,
-                        remaining: self.src.len() - self.pos,
-                    }));
+                    let remaining = self.src.len() - self.pos;
+                    self.pos = self.src.len();
+                    return Some(Err(ProtoError::LengthOverrun { len: 8, remaining }));
                 }
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&self.src[self.pos..self.pos + 8]);
@@ -457,10 +493,9 @@ impl<'a> Iterator for FieldIter<'a> {
             }
             WT_FIXED32 => {
                 if self.pos + 4 > self.src.len() {
-                    return Some(Err(ProtoError::LengthOverrun {
-                        len: 4,
-                        remaining: self.src.len() - self.pos,
-                    }));
+                    let remaining = self.src.len() - self.pos;
+                    self.pos = self.src.len();
+                    return Some(Err(ProtoError::LengthOverrun { len: 4, remaining }));
                 }
                 let mut buf = [0u8; 4];
                 buf.copy_from_slice(&self.src[self.pos..self.pos + 4]);
@@ -470,7 +505,10 @@ impl<'a> Iterator for FieldIter<'a> {
                     value: FieldValue::Fixed32(buf),
                 }))
             }
-            other => Some(Err(ProtoError::UnsupportedWireType(other))),
+            other => {
+                self.pos = self.src.len();
+                Some(Err(ProtoError::UnsupportedWireType(other)))
+            }
         }
     }
 }
@@ -514,6 +552,41 @@ fn decode_varint_field(src: &[u8], field: u64) -> Option<u64> {
     None
 }
 
+fn find_bytes_field_strict(src: &[u8], field: u64) -> ProtoResult<Option<&[u8]>> {
+    let mut found = None;
+    for candidate in FieldIter::new(src) {
+        let candidate = candidate?;
+        if candidate.field == field {
+            if let FieldValue::Bytes(value) = candidate.value {
+                found = Some(value);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn find_varint_field_strict(src: &[u8], field: u64) -> ProtoResult<Option<u64>> {
+    let mut found = None;
+    for candidate in FieldIter::new(src) {
+        let candidate = candidate?;
+        if candidate.field == field {
+            if let FieldValue::Varint(value) = candidate.value {
+                found = Some(value);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn decode_string_field_strict(src: &[u8], field: u64) -> ProtoResult<String> {
+    let Some(value) = find_bytes_field_strict(src, field)? else {
+        return Ok(String::new());
+    };
+    std::str::from_utf8(value)
+        .map(str::to_string)
+        .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))
+}
+
 /// Decode repeated protobuf map-entry messages (`key` + `value` fields).
 fn decode_repeated_map_entries(payload: &[u8], entry_field: u64) -> serde_json::Map<String, Value> {
     let mut map = serde_json::Map::new();
@@ -547,6 +620,63 @@ fn decode_mcp_args_map(body: &[u8]) -> serde_json::Map<String, Value> {
         }
     }
     args
+}
+
+fn decode_repeated_map_entries_strict(
+    payload: &[u8],
+    entry_field: u64,
+) -> ProtoResult<serde_json::Map<String, Value>> {
+    let mut map = serde_json::Map::new();
+    for candidate in FieldIter::new(payload) {
+        let candidate = candidate?;
+        if candidate.field != entry_field {
+            continue;
+        }
+        let FieldValue::Bytes(entry) = candidate.value else {
+            continue;
+        };
+        let mut key = None;
+        let mut value = None;
+        for field in FieldIter::new(entry) {
+            let field = field?;
+            match (field.field, field.value) {
+                (MAP_KEY, FieldValue::Bytes(bytes)) => {
+                    key = Some(
+                        std::str::from_utf8(bytes)
+                            .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                            .to_string(),
+                    );
+                }
+                (MAP_VALUE, FieldValue::Bytes(bytes)) => value = Some(bytes),
+                _ => {}
+            }
+        }
+        if let Some(key) = key {
+            map.insert(
+                key,
+                value
+                    .map(decode_proto_value_strict)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+    Ok(map)
+}
+
+fn decode_mcp_args_map_strict(body: &[u8]) -> ProtoResult<serde_json::Map<String, Value>> {
+    let mut args = decode_repeated_map_entries_strict(body, MCA_ARGS)?;
+    for candidate in FieldIter::new(body) {
+        let candidate = candidate?;
+        if candidate.field == MCA_ARGS {
+            if let FieldValue::Bytes(value) = candidate.value {
+                for (key, value) in decode_repeated_map_entries_strict(value, 2)? {
+                    args.insert(key, value);
+                }
+            }
+        }
+    }
+    Ok(args)
 }
 
 // ─── Connect-RPC framing ───────────────────────────────────────────────────
@@ -586,6 +716,9 @@ impl ConnectFrameParser {
                 break;
             }
             let flags = self.buf[0];
+            if flags != FLAG_NONE && flags != FLAG_GZIP && flags != FLAG_END_STREAM {
+                return Err(ProtoError::InvalidFrameFlags(flags));
+            }
             let length =
                 u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
             if length > CONNECT_MAX_FRAME_BYTES {
@@ -610,6 +743,16 @@ impl ConnectFrameParser {
             // flag set so it can extract grpc-status / grpc-message.
         }
         Ok(out)
+    }
+
+    pub fn finish(&self) -> ProtoResult<()> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(ProtoError::IncompleteFrame {
+                buffered: self.buf.len(),
+            })
+        }
     }
 }
 
@@ -825,6 +968,86 @@ fn decode_proto_list(src: &[u8]) -> Vec<Value> {
     out
 }
 
+fn decode_proto_value_strict(src: &[u8]) -> ProtoResult<Value> {
+    let mut decoded = None;
+    for field in FieldIter::new(src) {
+        let field = field?;
+        let value = match (field.field, field.value) {
+            (VAL_NULL, FieldValue::Varint(_)) => Some(Value::Null),
+            (VAL_NUMBER, FieldValue::Fixed64(bytes)) => Some(
+                serde_json::Number::from_f64(f64::from_le_bytes(bytes))
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null),
+            ),
+            (VAL_STRING, FieldValue::Bytes(bytes)) => Some(Value::String(
+                std::str::from_utf8(bytes)
+                    .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                    .to_string(),
+            )),
+            (VAL_BOOL, FieldValue::Varint(value)) => Some(Value::Bool(value != 0)),
+            (VAL_STRUCT, FieldValue::Bytes(bytes)) => {
+                Some(Value::Object(decode_proto_struct_strict(bytes)?))
+            }
+            (VAL_LIST, FieldValue::Bytes(bytes)) => {
+                Some(Value::Array(decode_proto_list_strict(bytes)?))
+            }
+            _ => None,
+        };
+        if value.is_some() {
+            decoded = value;
+        }
+    }
+    Ok(decoded.unwrap_or(Value::Null))
+}
+
+fn decode_proto_struct_strict(src: &[u8]) -> ProtoResult<serde_json::Map<String, Value>> {
+    let mut out = serde_json::Map::new();
+    for field in FieldIter::new(src) {
+        let field = field?;
+        if field.field != STRUCT_FIELDS {
+            continue;
+        }
+        let FieldValue::Bytes(entry) = field.value else {
+            continue;
+        };
+        let mut key = String::new();
+        let mut value_bytes = None;
+        for entry_field in FieldIter::new(entry) {
+            let entry_field = entry_field?;
+            match (entry_field.field, entry_field.value) {
+                (MAP_KEY, FieldValue::Bytes(bytes)) => {
+                    key = std::str::from_utf8(bytes)
+                        .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                        .to_string();
+                }
+                (MAP_VALUE, FieldValue::Bytes(bytes)) => value_bytes = Some(bytes),
+                _ => {}
+            }
+        }
+        out.insert(
+            key,
+            value_bytes
+                .map(decode_proto_value_strict)
+                .transpose()?
+                .unwrap_or(Value::Null),
+        );
+    }
+    Ok(out)
+}
+
+fn decode_proto_list_strict(src: &[u8]) -> ProtoResult<Vec<Value>> {
+    let mut out = Vec::new();
+    for field in FieldIter::new(src) {
+        let field = field?;
+        if field.field == LIST_VALUES {
+            if let FieldValue::Bytes(bytes) = field.value {
+                out.push(decode_proto_value_strict(bytes)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ─── McpToolDefinition ─────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -968,6 +1191,7 @@ pub struct EncodedImage {
 }
 
 pub struct AgentRunInput<'a> {
+    pub rail: CursorProtocolRail,
     pub model_id: &'a str,
     pub user_text: &'a str,
     pub conversation_id: Option<&'a str>,
@@ -1005,12 +1229,18 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Result<Bytes, 
         .conversation_id
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(random_uuid_like);
+        .unwrap_or_else(|| match input.rail {
+            CursorProtocolRail::OAuthCli => random_uuid_like(),
+            CursorProtocolRail::ApiKeySdk => format!("agent-{}", random_uuid_like()),
+        });
     let message_id = input
         .message_id
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(random_uuid_like);
+        .unwrap_or_else(|| match input.rail {
+            CursorProtocolRail::OAuthCli => random_uuid_like(),
+            CursorProtocolRail::ApiKeySdk => format!("run-{}", random_uuid_like()),
+        });
 
     let resolved = resolve_cursor_model(input.model_id)?;
 
@@ -1080,20 +1310,30 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Result<Bytes, 
         .collect();
     let mcp_tools_block = encode_message(ARR_MCP_TOOLS, &tool_parts);
 
-    // AgentRunRequest body in field-number order.
-    Ok(encode_message(
-        ACM_RUN_REQUEST,
-        &[
-            conversation_state,
-            action,
-            model_details,
-            mcp_tools_block,
-            encode_string(ARR_CONVERSATION_ID, &conversation_id),
-            requested_model,
-            encode_uint32(ARR_UNKNOWN_12, 0),
-            encode_string(ARR_REQUEST_ID, &conversation_id),
-        ],
-    ))
+    let mut request_parts = vec![
+        conversation_state,
+        action,
+        model_details,
+        mcp_tools_block,
+        encode_string(ARR_CONVERSATION_ID, &conversation_id),
+    ];
+    match input.rail {
+        CursorProtocolRail::OAuthCli => {
+            request_parts.extend([
+                requested_model,
+                encode_uint32(ARR_UNKNOWN_12, 0),
+                encode_string(ARR_REQUEST_ID, &conversation_id),
+            ]);
+        }
+        CursorProtocolRail::ApiKeySdk => {
+            request_parts.extend([
+                encode_string(ARR_CLIENT_KIND, "sdk"),
+                requested_model,
+                encode_uint32(ARR_SDK_MODE, 1),
+            ]);
+        }
+    }
+    Ok(encode_message(ACM_RUN_REQUEST, &request_parts))
 }
 
 // ─── ExecClient encoders ───────────────────────────────────────────────────
@@ -1362,53 +1602,79 @@ pub enum InteractionDelta {
     Unknown(u64),
 }
 
-pub fn decode_agent_server_message(payload: &[u8]) -> Vec<InteractionDelta> {
-    let mut out = Vec::new();
-    for top in FieldIter::new(payload).flatten() {
-        match (top.field, &top.value) {
-            (f, FieldValue::Bytes(_)) if f == ASM_KV_SERVER_MESSAGE => {
-                out.push(InteractionDelta::KvServerMessage);
+fn last_known_agent_server_variant(payload: &[u8]) -> ProtoResult<Option<(u64, &[u8])>> {
+    let mut variant = None;
+    for field in FieldIter::new(payload) {
+        let field = field?;
+        if matches!(
+            field.field,
+            ASM_INTERACTION_UPDATE | ASM_EXEC_SERVER_MESSAGE | ASM_KV_SERVER_MESSAGE
+        ) {
+            if let FieldValue::Bytes(bytes) = field.value {
+                variant = Some((field.field, bytes));
             }
-            (f, FieldValue::Bytes(bytes)) if f == ASM_INTERACTION_UPDATE => {
-                for u in FieldIter::new(bytes).flatten() {
-                    match u.field {
-                        x if x == IU_TEXT_DELTA => {
-                            if let FieldValue::Bytes(b) = u.value {
-                                out.push(InteractionDelta::Text(decode_string_field(b, TDU_TEXT)));
-                            }
-                        }
-                        x if x == IU_THINKING_DELTA => {
-                            if let FieldValue::Bytes(b) = u.value {
-                                out.push(InteractionDelta::Thinking(decode_string_field(
-                                    b, TDU_TEXT,
-                                )));
-                            }
-                        }
-                        x if x == IU_THINKING_COMPLETED => {
-                            out.push(InteractionDelta::ThinkingComplete)
-                        }
-                        x if x == IU_TOOL_CALL_STARTED => {
-                            out.push(InteractionDelta::ToolCallStarted)
-                        }
-                        x if x == IU_TOOL_CALL_COMPLETED => {
-                            out.push(InteractionDelta::ToolCallCompleted)
-                        }
-                        x if x == IU_TOKEN_DELTA => {
-                            if let FieldValue::Bytes(b) = u.value {
-                                let tokens = find_varint_field(b, 1).unwrap_or(0);
-                                out.push(InteractionDelta::TokenDelta(tokens));
-                            }
-                        }
-                        x if x == IU_HEARTBEAT => out.push(InteractionDelta::Heartbeat),
-                        x if x == IU_TURN_ENDED => out.push(InteractionDelta::TurnEnded),
-                        other => out.push(InteractionDelta::Unknown(other)),
-                    }
-                }
-            }
-            _ => {}
         }
     }
-    out
+    Ok(variant)
+}
+
+pub fn decode_agent_server_message(payload: &[u8]) -> ProtoResult<Vec<InteractionDelta>> {
+    let Some((field, bytes)) = last_known_agent_server_variant(payload)? else {
+        return Ok(Vec::new());
+    };
+    if field == ASM_KV_SERVER_MESSAGE {
+        return Ok(vec![InteractionDelta::KvServerMessage]);
+    }
+    if field != ASM_INTERACTION_UPDATE {
+        return Ok(Vec::new());
+    }
+
+    let mut decoded = None;
+    let mut unknown = None;
+    for update in FieldIter::new(bytes) {
+        let update = update?;
+        let field = update.field;
+        let value = match (field, update.value) {
+            (IU_TEXT_DELTA, FieldValue::Bytes(body)) => Some(InteractionDelta::Text(
+                decode_string_field_strict(body, TDU_TEXT)?,
+            )),
+            (IU_THINKING_DELTA, FieldValue::Bytes(body)) => Some(InteractionDelta::Thinking(
+                decode_string_field_strict(body, TDU_TEXT)?,
+            )),
+            (IU_THINKING_COMPLETED, FieldValue::Bytes(_)) => {
+                Some(InteractionDelta::ThinkingComplete)
+            }
+            (IU_TOOL_CALL_STARTED, FieldValue::Bytes(_)) => Some(InteractionDelta::ToolCallStarted),
+            (IU_TOOL_CALL_COMPLETED, FieldValue::Bytes(_)) => {
+                Some(InteractionDelta::ToolCallCompleted)
+            }
+            (IU_TOKEN_DELTA, FieldValue::Bytes(body)) => Some(InteractionDelta::TokenDelta(
+                find_varint_field_strict(body, 1)?.unwrap_or(0),
+            )),
+            (IU_HEARTBEAT, FieldValue::Bytes(_)) => Some(InteractionDelta::Heartbeat),
+            (IU_TURN_ENDED, FieldValue::Bytes(_)) => Some(InteractionDelta::TurnEnded),
+            _ => None,
+        };
+        if let Some(value) = value {
+            decoded = Some(value);
+        } else if !matches!(
+            field,
+            IU_TEXT_DELTA
+                | IU_TOOL_CALL_STARTED
+                | IU_TOOL_CALL_COMPLETED
+                | IU_THINKING_DELTA
+                | IU_THINKING_COMPLETED
+                | IU_TOKEN_DELTA
+                | IU_HEARTBEAT
+                | IU_TURN_ENDED
+        ) {
+            unknown = Some(field);
+        }
+    }
+    Ok(decoded
+        .or_else(|| unknown.map(InteractionDelta::Unknown))
+        .into_iter()
+        .collect())
 }
 
 // ─── KvServer / ExecServer decoder ─────────────────────────────────────────
@@ -1428,56 +1694,65 @@ pub enum KvServerEvent {
     },
 }
 
-pub fn decode_kv_server_event(payload: &[u8]) -> Option<KvServerEvent> {
-    for top in FieldIter::new(payload).flatten() {
-        if top.field != ASM_KV_SERVER_MESSAGE {
-            continue;
-        }
-        let inner = match top.value {
-            FieldValue::Bytes(b) => b,
-            _ => continue,
-        };
-        let mut kv_id = 0u64;
-        let mut get_args: Option<&[u8]> = None;
-        let mut set_args: Option<&[u8]> = None;
-        let mut req_meta: Option<Bytes> = None;
-        for f in FieldIter::new(inner).flatten() {
-            match (f.field, f.value) {
-                (k, FieldValue::Varint(v)) if k == KSM_ID => kv_id = v,
-                (k, FieldValue::Bytes(b)) if k == KSM_GET_BLOB_ARGS => get_args = Some(b),
-                (k, FieldValue::Bytes(b)) if k == KSM_SET_BLOB_ARGS => set_args = Some(b),
-                (k, FieldValue::Bytes(b)) if k == KSM_REQUEST_METADATA => {
-                    req_meta = Some(Bytes::copy_from_slice(b))
-                }
-                _ => {}
+pub fn decode_kv_server_event(payload: &[u8]) -> ProtoResult<Option<KvServerEvent>> {
+    let Some((field, inner)) = last_known_agent_server_variant(payload)? else {
+        return Ok(None);
+    };
+    if field != ASM_KV_SERVER_MESSAGE {
+        return Ok(None);
+    }
+    let mut kv_id = 0u64;
+    enum KvVariant<'a> {
+        Get(&'a [u8]),
+        Set(&'a [u8]),
+    }
+
+    let mut variant: Option<KvVariant<'_>> = None;
+    let mut req_meta: Option<Bytes> = None;
+    for f in FieldIter::new(inner) {
+        let f = f?;
+        match (f.field, f.value) {
+            (k, FieldValue::Varint(v)) if k == KSM_ID => kv_id = v,
+            (k, FieldValue::Bytes(b)) if k == KSM_GET_BLOB_ARGS => {
+                variant = Some(KvVariant::Get(b))
             }
+            (k, FieldValue::Bytes(b)) if k == KSM_SET_BLOB_ARGS => {
+                variant = Some(KvVariant::Set(b))
+            }
+            (k, FieldValue::Bytes(b)) if k == KSM_REQUEST_METADATA => {
+                req_meta = Some(Bytes::copy_from_slice(b))
+            }
+            _ => {}
         }
-        if let Some(b) = get_args {
-            let blob_id = find_bytes_field(b, GBA_BLOB_ID)
+    }
+    match variant {
+        Some(KvVariant::Get(b)) => {
+            let blob_id = find_bytes_field_strict(b, GBA_BLOB_ID)?
                 .map(Bytes::copy_from_slice)
                 .unwrap_or_default();
-            return Some(KvServerEvent::GetBlob {
+            return Ok(Some(KvServerEvent::GetBlob {
                 kv_id,
                 blob_id,
                 request_metadata: req_meta,
-            });
+            }));
         }
-        if let Some(b) = set_args {
-            let blob_id = find_bytes_field(b, SBA_BLOB_ID)
+        Some(KvVariant::Set(b)) => {
+            let blob_id = find_bytes_field_strict(b, SBA_BLOB_ID)?
                 .map(Bytes::copy_from_slice)
                 .unwrap_or_default();
-            let blob_data = find_bytes_field(b, SBA_BLOB_DATA)
+            let blob_data = find_bytes_field_strict(b, SBA_BLOB_DATA)?
                 .map(Bytes::copy_from_slice)
                 .unwrap_or_default();
-            return Some(KvServerEvent::SetBlob {
+            return Ok(Some(KvServerEvent::SetBlob {
                 kv_id,
                 blob_id,
                 blob_data,
                 request_metadata: req_meta,
-            });
+            }));
         }
+        None => {}
     }
-    None
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -1639,139 +1914,167 @@ impl ExecServerEvent {
     }
 }
 
-pub fn decode_exec_server_event(payload: &[u8]) -> Option<ExecServerEvent> {
-    for top in FieldIter::new(payload).flatten() {
-        if top.field != ASM_EXEC_SERVER_MESSAGE {
-            continue;
-        }
-        let inner = match top.value {
-            FieldValue::Bytes(b) => b,
-            _ => continue,
-        };
-        let mut exec_msg_id = 0u64;
-        let mut exec_id = String::new();
-        let mut variant_field: u64 = 0;
-        let mut variant_bytes: Option<&[u8]> = None;
-        for f in FieldIter::new(inner).flatten() {
-            match (f.field, f.value) {
-                (k, FieldValue::Varint(v)) if k == ESM_ID => exec_msg_id = v,
-                (k, FieldValue::Bytes(b)) if k == ESM_EXEC_ID => {
-                    exec_id = String::from_utf8_lossy(b).into_owned();
-                }
-                (_, FieldValue::Bytes(b)) if variant_field == 0 => {
-                    variant_field = f.field;
-                    variant_bytes = Some(b);
-                }
-                _ => {}
-            }
-        }
-        let body = variant_bytes?;
-        return Some(match variant_field {
-            x if x == ESM_REQUEST_CONTEXT_ARGS => ExecServerEvent::RequestContext {
-                exec_msg_id,
-                exec_id,
-            },
-            x if x == ESM_READ_ARGS => ExecServerEvent::Read {
-                exec_msg_id,
-                exec_id,
-                path: decode_string_field(body, ARG_PATH),
-                tool_call_id: decode_string_field(body, ARG_READ_TOOL_CALL_ID),
-                offset: decode_varint_field(body, ARG_READ_OFFSET),
-                limit: decode_varint_field(body, ARG_READ_LIMIT),
-            },
-            x if x == ESM_WRITE_ARGS => ExecServerEvent::Write {
-                exec_msg_id,
-                exec_id,
-                path: decode_string_field(body, ARG_PATH),
-                file_text: decode_string_field(body, ARG_WRITE_FILE_TEXT),
-                stream_content: decode_string_field(body, ARG_WRITE_STREAM_CONTENT),
-                tool_call_id: decode_string_field(body, ARG_WRITE_TOOL_CALL_ID),
-            },
-            x if x == ESM_DELETE_ARGS => ExecServerEvent::Delete {
-                exec_msg_id,
-                exec_id,
-                path: decode_string_field(body, ARG_PATH),
-            },
-            x if x == ESM_LS_ARGS => ExecServerEvent::Ls {
-                exec_msg_id,
-                exec_id,
-                path: decode_string_field(body, ARG_PATH),
-            },
-            x if x == ESM_GREP_ARGS => {
-                let case_insensitive = decode_varint_field(body, 8).unwrap_or(0) != 0;
-                let head_limit = decode_varint_field(body, 10);
-                ExecServerEvent::Grep {
-                    exec_msg_id,
-                    exec_id,
-                    pattern: decode_string_field(body, 1),
-                    path: decode_string_field(body, 2),
-                    glob: decode_string_field(body, 3),
-                    output_mode: decode_string_field(body, 4),
-                    case_insensitive,
-                    head_limit,
-                }
-            }
-            x if x == ESM_DIAGNOSTICS_ARGS => ExecServerEvent::Diagnostics {
-                exec_msg_id,
-                exec_id,
-            },
-            x if x == ESM_SHELL_ARGS => ExecServerEvent::Shell {
-                exec_msg_id,
-                exec_id,
-                command: decode_string_field(body, ARG_SHELL_COMMAND),
-                working_dir: decode_string_field(body, ARG_SHELL_WORKING_DIR),
-            },
-            x if x == ESM_SHELL_STREAM_ARGS => ExecServerEvent::ShellStream {
-                exec_msg_id,
-                exec_id,
-                command: decode_string_field(body, ARG_SHELL_COMMAND),
-                working_dir: decode_string_field(body, ARG_SHELL_WORKING_DIR),
-            },
-            x if x == ESM_BACKGROUND_SHELL_SPAWN => ExecServerEvent::BackgroundShell {
-                exec_msg_id,
-                exec_id,
-                command: decode_string_field(body, ARG_SHELL_COMMAND),
-                working_dir: decode_string_field(body, ARG_SHELL_WORKING_DIR),
-            },
-            x if x == ESM_FETCH_ARGS => ExecServerEvent::Fetch {
-                exec_msg_id,
-                exec_id,
-                url: decode_string_field(body, ARG_FETCH_URL),
-            },
-            x if x == ESM_WRITE_SHELL_STDIN_ARGS => ExecServerEvent::WriteShellStdin {
-                exec_msg_id,
-                exec_id,
-            },
-            x if x == ESM_MCP_ARGS => {
-                let mut tool_name = String::new();
-                let mut tool_call_id = String::new();
-                for f in FieldIter::new(body).flatten() {
-                    match (f.field, f.value) {
-                        (k, FieldValue::Bytes(b)) if k == MCA_TOOL_NAME => {
-                            tool_name = String::from_utf8_lossy(b).into_owned();
-                        }
-                        (k, FieldValue::Bytes(b)) if k == MCA_NAME && tool_name.is_empty() => {
-                            tool_name = String::from_utf8_lossy(b).into_owned();
-                        }
-                        (k, FieldValue::Bytes(b)) if k == MCA_TOOL_CALL_ID => {
-                            tool_call_id = String::from_utf8_lossy(b).into_owned();
-                        }
-                        _ => {}
-                    }
-                }
-                let args = decode_mcp_args_map(body);
-                ExecServerEvent::Mcp {
-                    exec_msg_id,
-                    exec_id,
-                    tool_name,
-                    tool_call_id,
-                    args: Value::Object(args),
-                }
-            }
-            _ => continue,
-        });
+fn is_exec_server_variant(field: u64) -> bool {
+    matches!(
+        field,
+        ESM_SHELL_ARGS
+            | ESM_WRITE_ARGS
+            | ESM_DELETE_ARGS
+            | ESM_GREP_ARGS
+            | ESM_READ_ARGS
+            | ESM_LS_ARGS
+            | ESM_DIAGNOSTICS_ARGS
+            | ESM_REQUEST_CONTEXT_ARGS
+            | ESM_MCP_ARGS
+            | ESM_SHELL_STREAM_ARGS
+            | ESM_BACKGROUND_SHELL_SPAWN
+            | ESM_FETCH_ARGS
+            | ESM_WRITE_SHELL_STDIN_ARGS
+    )
+}
+
+pub fn decode_exec_server_event(payload: &[u8]) -> ProtoResult<Option<ExecServerEvent>> {
+    let Some((field, inner)) = last_known_agent_server_variant(payload)? else {
+        return Ok(None);
+    };
+    if field != ASM_EXEC_SERVER_MESSAGE {
+        return Ok(None);
     }
-    None
+    let mut exec_msg_id = 0u64;
+    let mut exec_id = String::new();
+    let mut variant_field: u64 = 0;
+    let mut variant_bytes: Option<&[u8]> = None;
+    for f in FieldIter::new(inner) {
+        let f = f?;
+        match (f.field, f.value) {
+            (k, FieldValue::Varint(v)) if k == ESM_ID => exec_msg_id = v,
+            (k, FieldValue::Bytes(b)) if k == ESM_EXEC_ID => {
+                exec_id = std::str::from_utf8(b)
+                    .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                    .to_string();
+            }
+            (k, FieldValue::Bytes(b)) if is_exec_server_variant(k) => {
+                variant_field = k;
+                variant_bytes = Some(b);
+            }
+            _ => {}
+        }
+    }
+    let Some(body) = variant_bytes else {
+        return Ok(None);
+    };
+    let event = match variant_field {
+        x if x == ESM_REQUEST_CONTEXT_ARGS => ExecServerEvent::RequestContext {
+            exec_msg_id,
+            exec_id,
+        },
+        x if x == ESM_READ_ARGS => ExecServerEvent::Read {
+            exec_msg_id,
+            exec_id,
+            path: decode_string_field_strict(body, ARG_PATH)?,
+            tool_call_id: decode_string_field_strict(body, ARG_READ_TOOL_CALL_ID)?,
+            offset: find_varint_field_strict(body, ARG_READ_OFFSET)?,
+            limit: find_varint_field_strict(body, ARG_READ_LIMIT)?,
+        },
+        x if x == ESM_WRITE_ARGS => ExecServerEvent::Write {
+            exec_msg_id,
+            exec_id,
+            path: decode_string_field_strict(body, ARG_PATH)?,
+            file_text: decode_string_field_strict(body, ARG_WRITE_FILE_TEXT)?,
+            stream_content: decode_string_field_strict(body, ARG_WRITE_STREAM_CONTENT)?,
+            tool_call_id: decode_string_field_strict(body, ARG_WRITE_TOOL_CALL_ID)?,
+        },
+        x if x == ESM_DELETE_ARGS => ExecServerEvent::Delete {
+            exec_msg_id,
+            exec_id,
+            path: decode_string_field_strict(body, ARG_PATH)?,
+        },
+        x if x == ESM_LS_ARGS => ExecServerEvent::Ls {
+            exec_msg_id,
+            exec_id,
+            path: decode_string_field_strict(body, ARG_PATH)?,
+        },
+        x if x == ESM_GREP_ARGS => {
+            let case_insensitive = find_varint_field_strict(body, 8)?.unwrap_or(0) != 0;
+            let head_limit = find_varint_field_strict(body, 10)?;
+            ExecServerEvent::Grep {
+                exec_msg_id,
+                exec_id,
+                pattern: decode_string_field_strict(body, 1)?,
+                path: decode_string_field_strict(body, 2)?,
+                glob: decode_string_field_strict(body, 3)?,
+                output_mode: decode_string_field_strict(body, 4)?,
+                case_insensitive,
+                head_limit,
+            }
+        }
+        x if x == ESM_DIAGNOSTICS_ARGS => ExecServerEvent::Diagnostics {
+            exec_msg_id,
+            exec_id,
+        },
+        x if x == ESM_SHELL_ARGS => ExecServerEvent::Shell {
+            exec_msg_id,
+            exec_id,
+            command: decode_string_field_strict(body, ARG_SHELL_COMMAND)?,
+            working_dir: decode_string_field_strict(body, ARG_SHELL_WORKING_DIR)?,
+        },
+        x if x == ESM_SHELL_STREAM_ARGS => ExecServerEvent::ShellStream {
+            exec_msg_id,
+            exec_id,
+            command: decode_string_field_strict(body, ARG_SHELL_COMMAND)?,
+            working_dir: decode_string_field_strict(body, ARG_SHELL_WORKING_DIR)?,
+        },
+        x if x == ESM_BACKGROUND_SHELL_SPAWN => ExecServerEvent::BackgroundShell {
+            exec_msg_id,
+            exec_id,
+            command: decode_string_field_strict(body, ARG_SHELL_COMMAND)?,
+            working_dir: decode_string_field_strict(body, ARG_SHELL_WORKING_DIR)?,
+        },
+        x if x == ESM_FETCH_ARGS => ExecServerEvent::Fetch {
+            exec_msg_id,
+            exec_id,
+            url: decode_string_field_strict(body, ARG_FETCH_URL)?,
+        },
+        x if x == ESM_WRITE_SHELL_STDIN_ARGS => ExecServerEvent::WriteShellStdin {
+            exec_msg_id,
+            exec_id,
+        },
+        x if x == ESM_MCP_ARGS => {
+            let mut tool_name = String::new();
+            let mut tool_call_id = String::new();
+            for f in FieldIter::new(body) {
+                let f = f?;
+                match (f.field, f.value) {
+                    (k, FieldValue::Bytes(b)) if k == MCA_TOOL_NAME => {
+                        tool_name = std::str::from_utf8(b)
+                            .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                            .to_string();
+                    }
+                    (k, FieldValue::Bytes(b)) if k == MCA_NAME && tool_name.is_empty() => {
+                        tool_name = std::str::from_utf8(b)
+                            .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                            .to_string();
+                    }
+                    (k, FieldValue::Bytes(b)) if k == MCA_TOOL_CALL_ID => {
+                        tool_call_id = std::str::from_utf8(b)
+                            .map_err(|error| ProtoError::InvalidUtf8(error.to_string()))?
+                            .to_string();
+                    }
+                    _ => {}
+                }
+            }
+            let args = decode_mcp_args_map_strict(body)?;
+            ExecServerEvent::Mcp {
+                exec_msg_id,
+                exec_id,
+                tool_name,
+                tool_call_id,
+                args: Value::Object(args),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -1782,12 +2085,52 @@ mod tests {
 
     #[test]
     fn varint_roundtrip() {
-        for v in [0u64, 1, 0x7F, 0x80, 0x3FFF, 0x4000, u64::MAX / 2] {
+        for v in [0u64, 1, 0x7F, 0x80, 0x3FFF, 0x4000, u64::MAX / 2, u64::MAX] {
             let mut buf = BytesMut::new();
             put_varint(&mut buf, v);
             let (decoded, _) = read_varint(&buf, 0).unwrap();
             assert_eq!(decoded, v);
         }
+    }
+
+    #[test]
+    fn malformed_varints_and_field_numbers_fail_closed() {
+        let overflow = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert!(matches!(
+            read_varint(&overflow, 0),
+            Err(ProtoError::VarintOverflow)
+        ));
+        assert!(matches!(
+            FieldIter::new(&overflow).next(),
+            Some(Err(ProtoError::VarintOverflow))
+        ));
+
+        assert!(matches!(
+            FieldIter::new(&[0x00]).next(),
+            Some(Err(ProtoError::InvalidFieldNumber(0)))
+        ));
+
+        let mut oversized_tag = BytesMut::new();
+        put_varint(&mut oversized_tag, (MAX_PROTO_FIELD_NUMBER + 1) << 3);
+        oversized_tag.put_u8(0);
+        assert!(matches!(
+            FieldIter::new(&oversized_tag).next(),
+            Some(Err(ProtoError::InvalidFieldNumber(field)))
+                if field == MAX_PROTO_FIELD_NUMBER + 1
+        ));
+    }
+
+    #[test]
+    fn malformed_field_iterator_is_fused_after_the_first_error() {
+        let mut fields = FieldIter::new(&[0x0a, 0x02, 0x01]);
+        assert!(matches!(
+            fields.next(),
+            Some(Err(ProtoError::LengthOverrun { .. }))
+        ));
+        assert!(fields.next().is_none());
+
+        // Non-strict compatibility helpers must also terminate on malformed input.
+        assert_eq!(find_bytes_field(&[0x0a, 0x02, 0x01], 1), None);
     }
 
     #[test]
@@ -1814,10 +2157,34 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_eof_with_partial_frame() {
+        let frame = wrap_connect_frame(b"partial");
+        let mut parser = ConnectFrameParser::new();
+        assert!(parser.feed(&frame[..6]).unwrap().is_empty());
+        assert!(matches!(
+            parser.finish().unwrap_err(),
+            ProtoError::IncompleteFrame { .. }
+        ));
+        parser.feed(&frame[6..]).unwrap();
+        parser.finish().unwrap();
+    }
+
+    #[test]
     fn invalid_gzip_frame_fails_closed() {
         let invalid = [FLAG_GZIP, 0, 0, 0, 3, 1, 2, 3];
         let error = ConnectFrameParser::new().feed(&invalid).unwrap_err();
         assert!(matches!(error, ProtoError::Gzip(_)));
+    }
+
+    #[test]
+    fn invalid_connect_frame_flags_fail_closed() {
+        for flags in [FLAG_GZIP | FLAG_END_STREAM, 0x04, 0xff] {
+            let frame = [flags, 0, 0, 0, 0];
+            assert!(matches!(
+                ConnectFrameParser::new().feed(&frame),
+                Err(ProtoError::InvalidFrameFlags(actual)) if actual == flags
+            ));
+        }
     }
 
     #[test]
@@ -1829,10 +2196,190 @@ mod tests {
     }
 
     #[test]
+    fn strict_server_decoders_reject_truncated_and_invalid_utf8_fields() {
+        let truncated = [0x0a, 0x02, 0x0a];
+        assert!(matches!(
+            decode_agent_server_message(&truncated),
+            Err(ProtoError::LengthOverrun { .. })
+        ));
+        assert!(matches!(
+            decode_kv_server_event(&truncated),
+            Err(ProtoError::LengthOverrun { .. })
+        ));
+        assert!(matches!(
+            decode_exec_server_event(&truncated),
+            Err(ProtoError::LengthOverrun { .. })
+        ));
+
+        let invalid_text = encode_message(
+            ASM_INTERACTION_UPDATE,
+            &[encode_message(
+                IU_TEXT_DELTA,
+                &[encode_bytes(TDU_TEXT, &[0xff])],
+            )],
+        );
+        assert!(matches!(
+            decode_agent_server_message(&invalid_text),
+            Err(ProtoError::InvalidUtf8(_))
+        ));
+
+        let invalid_exec = encode_message(ASM_EXEC_SERVER_MESSAGE, &[Bytes::from_static(&[0x80])]);
+        assert!(matches!(
+            decode_exec_server_event(&invalid_exec),
+            Err(ProtoError::VarintTruncated)
+        ));
+    }
+
+    #[test]
+    fn agent_server_and_interaction_oneofs_use_last_known_variant() {
+        let text = encode_message(IU_TEXT_DELTA, &[encode_string(TDU_TEXT, "visible text")]);
+        let turn_ended = encode_message(IU_TURN_ENDED, &[]);
+        let interaction = concat_bytes(&[
+            text.clone(),
+            encode_bytes(99, b"unknown-between"),
+            turn_ended,
+            encode_uint32(IU_TEXT_DELTA, 1),
+        ]);
+        let payload = encode_message(ASM_INTERACTION_UPDATE, &[interaction]);
+        let deltas = decode_agent_server_message(&payload).unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert!(matches!(deltas[0], InteractionDelta::TurnEnded));
+
+        let interaction = concat_bytes(&[
+            encode_message(IU_TURN_ENDED, &[]),
+            encode_bytes(100, b"unknown-between"),
+            text,
+        ]);
+        let payload = encode_message(ASM_INTERACTION_UPDATE, &[interaction]);
+        let deltas = decode_agent_server_message(&payload).unwrap();
+        assert_eq!(deltas.len(), 1);
+        match &deltas[0] {
+            InteractionDelta::Text(text) => assert_eq!(text, "visible text"),
+            other => panic!("expected last Text variant, got {other:?}"),
+        }
+
+        let exec = concat_bytes(&[
+            encode_uint32(ESM_ID, 41),
+            encode_message(ESM_REQUEST_CONTEXT_ARGS, &[]),
+        ]);
+        let interaction_top = encode_message(
+            ASM_INTERACTION_UPDATE,
+            &[encode_message(IU_TURN_ENDED, &[])],
+        );
+        let exec_top = encode_message(ASM_EXEC_SERVER_MESSAGE, &[exec]);
+        let payload = concat_bytes(&[
+            interaction_top.clone(),
+            encode_bytes(77, b"unknown-top-level"),
+            exec_top.clone(),
+        ]);
+        assert!(decode_agent_server_message(&payload).unwrap().is_empty());
+        assert!(matches!(
+            decode_exec_server_event(&payload).unwrap(),
+            Some(ExecServerEvent::RequestContext {
+                exec_msg_id: 41,
+                ..
+            })
+        ));
+        assert!(decode_kv_server_event(&payload).unwrap().is_none());
+
+        let payload = concat_bytes(&[exec_top, interaction_top]);
+        assert!(decode_exec_server_event(&payload).unwrap().is_none());
+        assert!(matches!(
+            decode_agent_server_message(&payload).unwrap().as_slice(),
+            [InteractionDelta::TurnEnded]
+        ));
+    }
+
+    #[test]
+    fn decode_kv_uses_last_known_oneof_variant_and_ignores_unknown_bytes() {
+        let get = encode_bytes(GBA_BLOB_ID, b"get-blob");
+        let set = concat_bytes(&[
+            encode_bytes(SBA_BLOB_ID, b"set-blob"),
+            encode_bytes(SBA_BLOB_DATA, b"set-data"),
+        ]);
+
+        let get_then_set = concat_bytes(&[
+            encode_uint32(KSM_ID, 7),
+            encode_bytes(9, b"unknown-before"),
+            encode_message(KSM_GET_BLOB_ARGS, std::slice::from_ref(&get)),
+            encode_bytes(10, b"unknown-between"),
+            encode_message(KSM_SET_BLOB_ARGS, std::slice::from_ref(&set)),
+            encode_bytes(11, b"unknown-after"),
+        ]);
+        let payload = encode_message(ASM_KV_SERVER_MESSAGE, &[get_then_set]);
+        match decode_kv_server_event(&payload).unwrap().unwrap() {
+            KvServerEvent::SetBlob {
+                kv_id,
+                blob_id,
+                blob_data,
+                ..
+            } => {
+                assert_eq!(kv_id, 7);
+                assert_eq!(blob_id, Bytes::from_static(b"set-blob"));
+                assert_eq!(blob_data, Bytes::from_static(b"set-data"));
+            }
+            other => panic!("expected last SetBlob variant, got {other:?}"),
+        }
+
+        let set_then_get = concat_bytes(&[
+            encode_message(KSM_SET_BLOB_ARGS, &[set]),
+            encode_bytes(12, b"unknown-between"),
+            encode_message(KSM_GET_BLOB_ARGS, &[get]),
+        ]);
+        let payload = encode_message(ASM_KV_SERVER_MESSAGE, &[set_then_get]);
+        match decode_kv_server_event(&payload).unwrap().unwrap() {
+            KvServerEvent::GetBlob { blob_id, .. } => {
+                assert_eq!(blob_id, Bytes::from_static(b"get-blob"));
+            }
+            other => panic!("expected last GetBlob variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_value_and_map_decoders_use_protobuf_duplicate_semantics() {
+        let value = concat_bytes(&[
+            encode_string(VAL_STRING, "first"),
+            encode_bytes(91, b"unknown-between"),
+            encode_bool(VAL_BOOL, true),
+        ]);
+        assert_eq!(
+            decode_proto_value_strict(&value).unwrap(),
+            Value::Bool(true)
+        );
+
+        let first = concat_bytes(&[
+            encode_string(MAP_KEY, "duplicate"),
+            encode_message(
+                MAP_VALUE,
+                &[encode_proto_value(&Value::String("first".to_string()))],
+            ),
+        ]);
+        let last = concat_bytes(&[
+            encode_string(MAP_KEY, "duplicate"),
+            encode_message(
+                MAP_VALUE,
+                &[encode_proto_value(&Value::String("last".to_string()))],
+            ),
+        ]);
+        let empty_key = encode_string(MAP_KEY, "");
+        let structure = concat_bytes(&[
+            encode_message(STRUCT_FIELDS, &[first]),
+            encode_message(STRUCT_FIELDS, &[last]),
+            encode_message(STRUCT_FIELDS, &[empty_key]),
+        ]);
+        let decoded = decode_proto_struct_strict(&structure).unwrap();
+        assert_eq!(
+            decoded.get("duplicate").and_then(Value::as_str),
+            Some("last")
+        );
+        assert_eq!(decoded.get(""), Some(&Value::Null));
+    }
+
+    #[test]
     fn reviewed_descriptor_fingerprint_is_stable() {
         let reviewed_fields = format!(
             "{}|{ACM_RUN_REQUEST},{ACM_EXEC_CLIENT_MESSAGE},{ACM_KV_CLIENT_MESSAGE}|\
-             {ARR_CONVERSATION_STATE},{ARR_ACTION},{ARR_MODEL_DETAILS},{ARR_MCP_TOOLS},{ARR_CONVERSATION_ID},{ARR_REQUESTED_MODEL},{ARR_UNKNOWN_12},{ARR_REQUEST_ID}|\
+             {ARR_CONVERSATION_STATE},{ARR_ACTION},{ARR_MODEL_DETAILS},{ARR_MCP_TOOLS},{ARR_CONVERSATION_ID},{ARR_REQUESTED_MODEL},{ARR_UNKNOWN_12},{ARR_CLIENT_KIND},{ARR_REQUEST_ID},{ARR_SDK_MODE}|\
              {ASM_INTERACTION_UPDATE},{ASM_EXEC_SERVER_MESSAGE},{ASM_KV_SERVER_MESSAGE}|\
              {IU_TEXT_DELTA},{IU_TOOL_CALL_STARTED},{IU_TOOL_CALL_COMPLETED},{IU_THINKING_DELTA},{IU_THINKING_COMPLETED},{IU_TOKEN_DELTA},{IU_HEARTBEAT},{IU_TURN_ENDED}|\
              {ESM_SHELL_ARGS},{ESM_WRITE_ARGS},{ESM_GREP_ARGS},{ESM_READ_ARGS},{ESM_LS_ARGS},{ESM_DIAGNOSTICS_ARGS},{ESM_REQUEST_CONTEXT_ARGS},{ESM_MCP_ARGS},{ESM_SHELL_STREAM_ARGS},{ESM_BACKGROUND_SHELL_SPAWN},{ESM_FETCH_ARGS},{ESM_WRITE_SHELL_STDIN_ARGS}|\
@@ -1841,7 +2388,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(Sha256::digest(reviewed_fields.as_bytes())),
-            "f4079225e38e8a2733538f9ee868c93eb1395948064369942741bd31a9b363c6",
+            "7ec027c226f8ac3b4d632039d87e59f1fb59c581799504a5e98a6367d865f0e7",
             "Cursor AgentService field numbers drifted; review a current cursor-agent descriptor before updating this fingerprint"
         );
     }
@@ -1890,6 +2437,7 @@ mod tests {
     #[test]
     fn agent_run_request_builds() {
         let mut input = AgentRunInput {
+            rail: CursorProtocolRail::OAuthCli,
             model_id: "claude-4.6-sonnet-medium",
             user_text: "hi there",
             conversation_id: Some("conv-123"),
@@ -1912,6 +2460,7 @@ mod tests {
     #[test]
     fn agent_run_request_encodes_plan_mode_and_fast_parameter() {
         let mut input = AgentRunInput {
+            rail: CursorProtocolRail::OAuthCli,
             model_id: "cursor-plan:gpt-5.5-fast",
             user_text: "hi there",
             conversation_id: Some("conv-plan"),
@@ -1934,6 +2483,49 @@ mod tests {
         let parameter = field_bytes(requested_model, RM_PARAMETERS);
         assert_eq!(field_string(parameter, RMP_ID), "fast");
         assert_eq!(field_string(parameter, RMP_VALUE), "true");
+    }
+
+    #[test]
+    fn api_key_sdk_run_request_uses_sdk_envelope_only() {
+        let mut input = AgentRunInput {
+            rail: CursorProtocolRail::ApiKeySdk,
+            model_id: "composer-2.5",
+            user_text: "hello",
+            conversation_id: Some("agent-sdk"),
+            message_id: Some("message-sdk"),
+            tools: Vec::new(),
+            system_prompt: None,
+            blob_store: None,
+            images: Vec::new(),
+        };
+        let body = encode_agent_run_request(&mut input).unwrap();
+        let run_request = field_bytes(&body, ACM_RUN_REQUEST);
+        assert_eq!(field_string(run_request, ARR_CLIENT_KIND), "sdk");
+        assert_eq!(field_varint(run_request, ARR_SDK_MODE), 1);
+        assert!(find_varint_field(run_request, ARR_UNKNOWN_12).is_none());
+        assert!(find_bytes_field(run_request, ARR_REQUEST_ID).is_none());
+    }
+
+    #[test]
+    fn api_key_sdk_default_identifiers_match_sdk_agent_and_run_shapes() {
+        let mut input = AgentRunInput {
+            rail: CursorProtocolRail::ApiKeySdk,
+            model_id: "composer-2.5",
+            user_text: "hello",
+            conversation_id: None,
+            message_id: None,
+            tools: Vec::new(),
+            system_prompt: None,
+            blob_store: None,
+            images: Vec::new(),
+        };
+        let body = encode_agent_run_request(&mut input).unwrap();
+        let run_request = field_bytes(&body, ACM_RUN_REQUEST);
+        assert!(field_string(run_request, ARR_CONVERSATION_ID).starts_with("agent-"));
+        let action = field_bytes(run_request, ARR_ACTION);
+        let user_action = field_bytes(action, CA_USER_MESSAGE_ACTION);
+        let user_message = field_bytes(user_action, UMA_USER_MESSAGE);
+        assert!(field_string(user_message, UM_MESSAGE_ID).starts_with("run-"));
     }
 
     fn field_bytes(source: &[u8], field: u64) -> &[u8] {
@@ -1964,6 +2556,38 @@ mod tests {
 
     fn field_string(source: &[u8], field: u64) -> &str {
         std::str::from_utf8(field_bytes(source, field)).unwrap()
+    }
+
+    fn request_context_body(frame: &Bytes) -> Vec<u8> {
+        let mut parser = ConnectFrameParser::new();
+        let frames = parser.feed(frame).expect("valid Connect frame");
+        assert_eq!(frames.len(), 1);
+        let exec = field_bytes(&frames[0].payload, ACM_EXEC_CLIENT_MESSAGE);
+        let result = field_bytes(exec, ECM_REQUEST_CONTEXT_RESULT);
+        let success = field_bytes(result, RCR_SUCCESS);
+        field_bytes(success, RCS_REQUEST_CONTEXT).to_vec()
+    }
+
+    #[test]
+    fn request_context_rails_have_disjoint_wire_shapes() {
+        let empty = encode_request_context_response(7, "exec-cli", &[]);
+        let empty_body = request_context_body(&empty);
+        assert!(empty_body.is_empty(), "OAuth CLI ack must be empty");
+
+        let rich = encode_rich_request_context_response(8, "exec-sdk", "/tmp/project");
+        let rich_body = request_context_body(&rich);
+        assert!(find_bytes_field(&rich_body, RCS_TOOLS).is_none());
+        let env = field_bytes(&rich_body, RCS_ENV);
+        assert_eq!(field_string(env, RCE_HOSTNAME), "cc-switch");
+        assert_eq!(field_string(env, RCE_WORKING_DIR), "/tmp/project");
+        assert_eq!(field_string(env, RCE_CWD_ALT), "/tmp/project");
+        assert_eq!(field_string(env, RCE_CWD_ALT2), "/tmp/project");
+        for field in [32, 33, 36, 39, 40, 41, 42, 43, 44, 45] {
+            assert_eq!(field_varint(&rich_body, field), 1);
+        }
+        for field in [17, 24, 35] {
+            assert_eq!(field_varint(&rich_body, field), 0);
+        }
     }
 
     #[test]
@@ -2135,7 +2759,9 @@ mod tests {
             encode_message(ESM_READ_ARGS, &[args]),
         ]);
         let payload = encode_message(ASM_EXEC_SERVER_MESSAGE, &[esm]);
-        let event = decode_exec_server_event(&payload).expect("read");
+        let event = decode_exec_server_event(&payload)
+            .expect("valid protobuf")
+            .expect("read");
         match event {
             ExecServerEvent::Read {
                 path,
@@ -2148,6 +2774,31 @@ mod tests {
                 assert_eq!(limit, Some(200));
             }
             other => panic!("expected read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_exec_ignores_unknown_bytes_fields_and_uses_last_known_oneof() {
+        let read_args = encode_string(ARG_PATH, "/first.rs");
+        let delete_args = encode_string(ARG_PATH, "/last.rs");
+        let esm = concat_bytes(&[
+            encode_uint32(ESM_ID, 3),
+            encode_bytes(6, b"unknown-before"),
+            encode_message(ESM_READ_ARGS, &[read_args]),
+            encode_bytes(17, b"unknown-after"),
+            encode_message(ESM_DELETE_ARGS, &[delete_args]),
+            encode_string(ESM_EXEC_ID, "exec-oneof"),
+        ]);
+        let payload = encode_message(ASM_EXEC_SERVER_MESSAGE, &[esm]);
+        let event = decode_exec_server_event(&payload)
+            .expect("valid protobuf")
+            .expect("known exec event");
+        match event {
+            ExecServerEvent::Delete { exec_id, path, .. } => {
+                assert_eq!(exec_id, "exec-oneof");
+                assert_eq!(path, "/last.rs");
+            }
+            other => panic!("expected last known oneof variant, got {other:?}"),
         }
     }
 
@@ -2178,7 +2829,9 @@ mod tests {
             encode_message(ESM_MCP_ARGS, &[body]),
         ]);
         let payload = encode_message(ASM_EXEC_SERVER_MESSAGE, &[esm]);
-        let event = decode_exec_server_event(&payload).expect("mcp");
+        let event = decode_exec_server_event(&payload)
+            .expect("valid protobuf")
+            .expect("mcp");
         match event {
             ExecServerEvent::Mcp {
                 tool_name, args, ..
@@ -2206,7 +2859,9 @@ mod tests {
             encode_message(ESM_GREP_ARGS, &[grep_args]),
         ]);
         let payload = encode_message(ASM_EXEC_SERVER_MESSAGE, &[esm]);
-        let event = decode_exec_server_event(&payload).expect("grep event");
+        let event = decode_exec_server_event(&payload)
+            .expect("valid protobuf")
+            .expect("grep event");
         match event {
             ExecServerEvent::Grep {
                 pattern,

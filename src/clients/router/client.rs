@@ -604,6 +604,10 @@ pub struct ShareEditAckPayload {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_config_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_share: Option<ShareDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3169,6 +3173,8 @@ mod tests {
                 error_message: None,
                 error_code: None,
                 retryable: None,
+                current_config_revision: None,
+                current_share: None,
             },
         };
         assert_eq!(
@@ -3186,6 +3192,32 @@ mod tests {
             .unwrap(),
             GOLDEN_EDIT_ACK_SIGNATURE
         );
+    }
+
+    #[test]
+    fn revision_conflict_ack_includes_authoritative_share_snapshot() {
+        let payload = ShareEditAckEnvelope {
+            ack: ShareEditAckPayload {
+                edit_id: "edit-conflict".into(),
+                revision: 8,
+                status: "rejected".into(),
+                error_message: Some(
+                    "managed grant expected config revision 3, current revision is 4".into(),
+                ),
+                error_code: Some("cc_switch_share_revision_conflict".into()),
+                retryable: Some(true),
+                current_config_revision: Some(4),
+                current_share: Some(ShareDescriptor {
+                    share_id: "share-conflict".into(),
+                    config_revision: 4,
+                    ..ShareDescriptor::default()
+                }),
+            },
+        };
+        let value = serde_json::to_value(payload).expect("serialize revision-conflict ACK");
+        assert_eq!(value["ack"]["currentConfigRevision"], 4);
+        assert_eq!(value["ack"]["currentShare"]["shareId"], "share-conflict");
+        assert_eq!(value["ack"]["currentShare"]["configRevision"], 4);
     }
 
     #[test]

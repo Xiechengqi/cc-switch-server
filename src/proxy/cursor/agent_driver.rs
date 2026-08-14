@@ -45,19 +45,20 @@ use super::agent_proto::{
     encode_exec_ls_rejected, encode_exec_mcp_error, encode_exec_mcp_result,
     encode_exec_read_rejected, encode_exec_shell_rejected, encode_exec_write_rejected,
     encode_exec_write_shell_stdin_error, encode_kv_get_blob_result, encode_kv_set_blob_result,
-    encode_rich_request_context_response, wrap_connect_frame, AgentRunInput, ConnectFrame,
-    ExecServerEvent, InteractionDelta, KvServerEvent,
+    encode_request_context_response, encode_rich_request_context_response, wrap_connect_frame,
+    AgentRunInput, ConnectFrame, ExecServerEvent, InteractionDelta, KvServerEvent, ProtoError,
 };
 use super::credential_cache::CursorApiKeyCredentialScope;
 use super::event_emitter::{
     AgentEvent, AgentSseWriter, CapturedToolCall, ComposerMarkerFilter, MarkerEvent,
 };
-use super::h2_client::{CursorH2Stream, CursorH2Timeouts, DEFAULT_AGENTSERVICE_BASE_URL};
+use super::h2_client::{cursor_transport_diagnostic, CursorH2Stream, CursorH2Timeouts};
 use super::identity::{
     cursor_account_for_api_key, cursor_account_from_managed_account, cursor_agentservice_headers,
     CursorAccountData,
 };
 use super::image::load_images;
+use super::profile::CursorProtocolRail;
 use super::request_builder::{
     build_plan, estimate_input_tokens, validate_tool_result_context, AgentRunPlan,
 };
@@ -71,9 +72,8 @@ use super::tool_bridge::{
     resolve_shell_mcp_tool_name, BuiltinBridgeKind,
 };
 use super::tool_resolver::resolve_tool_call;
+use crate::domain::accounts::cursor_import::normalize_cursor_access_token;
 
-const DEFAULT_CURSOR_BACKEND_BASE_URL: &str = "https://api2.cursor.sh";
-const EXCHANGE_USER_API_KEY_PATH: &str = "/auth/exchange_user_api_key";
 const MAX_CURSOR_ERROR_BODY_BYTES: usize = 8 * 1024;
 const CURSOR_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 
@@ -89,9 +89,38 @@ pub struct AgentServiceForwardOptions {
     pub timeouts: CursorH2Timeouts,
 }
 
-struct CursorCredential {
-    account: CursorAccountData,
-    access_token: String,
+enum CursorCredential {
+    OAuthCli {
+        account: CursorAccountData,
+        access_token: String,
+    },
+    ApiKeySdk {
+        account: CursorAccountData,
+        access_token: String,
+    },
+}
+
+impl CursorCredential {
+    fn rail(&self) -> CursorProtocolRail {
+        match self {
+            Self::OAuthCli { .. } => CursorProtocolRail::OAuthCli,
+            Self::ApiKeySdk { .. } => CursorProtocolRail::ApiKeySdk,
+        }
+    }
+
+    fn account(&self) -> &CursorAccountData {
+        match self {
+            Self::OAuthCli { account, .. } | Self::ApiKeySdk { account, .. } => account,
+        }
+    }
+
+    fn access_token(&self) -> &str {
+        match self {
+            Self::OAuthCli { access_token, .. } | Self::ApiKeySdk { access_token, .. } => {
+                access_token
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,10 +222,14 @@ pub async fn forward_agentservice(
     validate_tool_result_context(&plan).map_err(|message| {
         ProxyError::bad_request(format!("invalid cursor tool result context: {message}"))
     })?;
+    validate_cursor_runtime_configuration(&stored)?;
+    let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
+        ProxyError::bad_request("Cursor AgentService driver requires a Cursor provider")
+    })?;
 
     let session_scope =
         cursor_session_scope(&state, &stored, &runtime_fingerprint, &request_context).await?;
-    let resolved_session = resolve_session_key(&state, &plan, &session_scope).await?;
+    let resolved_session = resolve_session_key(&state, &plan, &session_scope, rail).await?;
     let mut session_key = resolved_session.key.clone();
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_input_tokens(&plan.user_text);
@@ -395,6 +428,10 @@ async fn stream_response(
     share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Response {
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
+    let rail = {
+        let session = session_entry.lock().await;
+        session.rail
+    };
     state
         .cursor_sessions
         .bind_response_id(&session_key, &session_entry, writer.message_id())
@@ -446,7 +483,15 @@ async fn stream_response(
         loop {
             let frame = match next_session_frame(&session_entry).await {
                 Ok(Some(frame)) => frame,
-                Ok(None) => break,
+                Ok(None) => {
+                    let error = cursor_incomplete_response_error(rail);
+                    final_status = error.status.as_u16();
+                    final_stream_status = "failed";
+                    for event in writer.error_events(&error.message) {
+                        yield Ok::<_, std::io::Error>(Bytes::from(event));
+                    }
+                    break;
+                }
                 Err(error) => {
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
@@ -456,7 +501,19 @@ async fn stream_response(
                     break;
                 }
             };
-            if let Err(error) = handle_kv_event(&session_entry, decode_kv_server_event(&frame.payload)).await {
+            let kv_event = match decode_kv_server_event(&frame.payload).map_err(cursor_proto_error) {
+                Ok(event) => event,
+                Err(error) => {
+                    final_status = error.status.as_u16();
+                    final_stream_status = "failed";
+                    for event in writer.error_events(&error.message) {
+                        yield Ok::<_, std::io::Error>(Bytes::from(event));
+                    }
+                    break;
+                }
+            };
+            let kv_terminal_candidate = kv_event.is_some();
+            if let Err(error) = handle_kv_event(&session_entry, kv_event).await {
                 final_status = error.status.as_u16();
                 final_stream_status = "failed";
                 for event in writer.error_events(&error.message) {
@@ -464,11 +521,22 @@ async fn stream_response(
                 }
                 break;
             }
+            let exec_event = match decode_exec_server_event(&frame.payload).map_err(cursor_proto_error) {
+                Ok(event) => event,
+                Err(error) => {
+                    final_status = error.status.as_u16();
+                    final_stream_status = "failed";
+                    for event in writer.error_events(&error.message) {
+                        yield Ok::<_, std::io::Error>(Bytes::from(event));
+                    }
+                    break;
+                }
+            };
             match handle_exec_event(
                 &state,
                 &session_entry,
                 &mut exec_dedup,
-                decode_exec_server_event(&frame.payload),
+                exec_event,
             )
             .await
             {
@@ -484,18 +552,13 @@ async fn stream_response(
                     }
                     let events = writer.event(&AgentEvent::ToolCall(tool_call));
                     if first_token_ms.is_none() && !events.is_empty() {
-                        let elapsed = started.elapsed().as_millis();
-                        first_token_ms = Some(elapsed);
-                        first_token_ms_shared.store(elapsed.min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
-                        update_stream_usage(
+                        record_cursor_first_output(
                             &state,
                             &stored,
                             &request_id,
-                            StatusCode::OK.as_u16(),
-                            elapsed,
-                            first_token_ms,
-                            TokenUsage::default(),
-                            Some("streaming"),
+                            started,
+                            &mut first_token_ms,
+                            &first_token_ms_shared,
                         )
                         .await;
                     }
@@ -514,21 +577,47 @@ async fn stream_response(
                     break;
                 }
             }
+            let deltas = match decode_agent_server_message(&frame.payload).map_err(cursor_proto_error) {
+                Ok(deltas) => deltas,
+                Err(error) => {
+                    final_status = error.status.as_u16();
+                    final_stream_status = "failed";
+                    for event in writer.error_events(&error.message) {
+                        yield Ok::<_, std::io::Error>(Bytes::from(event));
+                    }
+                    break;
+                }
+            };
             let mut ended = false;
-            for delta in decode_agent_server_message(&frame.payload) {
-                let business_output = cursor_delta_is_business_output(&delta);
-                let events = match cursor_delta_events(delta, &mut writer, &mut filter) {
-                    Ok(CursorDeltaOutcome::Events(events)) => events,
+            for delta in deltas {
+                let content_delta = cursor_delta_is_business_output(&delta);
+                let had_response_content = writer.has_response_content();
+                let (events, valid_output) = match cursor_delta_events(delta, &mut writer, &mut filter) {
+                    Ok(CursorDeltaOutcome::Events(events)) => (events, true),
                     Ok(CursorDeltaOutcome::TurnEnded(events)) => {
-                        ended = true;
-                        events
+                        if writer.has_response_content() {
+                            ended = true;
+                            (events, true)
+                        } else {
+                            let error = cursor_empty_response_error(rail);
+                            final_status = error.status.as_u16();
+                            final_stream_status = "failed";
+                            ended = true;
+                            (writer.error_events(&error.message), false)
+                        }
                     }
                     Err(error) => {
                         final_status = error.status.as_u16();
                         final_stream_status = "failed";
-                        writer.error_events(&error.message)
+                        (writer.error_events(&error.message), false)
                     }
                 };
+                let business_output = cursor_events_are_business_output(
+                    valid_output,
+                    content_delta,
+                    had_response_content,
+                    writer.has_response_content(),
+                );
                 if business_output {
                     if let Err(error) = mark_session_business_output(&session_entry).await {
                         final_status = error.status.as_u16();
@@ -540,19 +629,14 @@ async fn stream_response(
                         break;
                     }
                 }
-                if first_token_ms.is_none() && !events.is_empty() {
-                    let elapsed = started.elapsed().as_millis();
-                    first_token_ms = Some(elapsed);
-                    first_token_ms_shared.store(elapsed.min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
-                    update_stream_usage(
+                if first_token_ms.is_none() && business_output && !events.is_empty() {
+                    record_cursor_first_output(
                         &state,
                         &stored,
                         &request_id,
-                        StatusCode::OK.as_u16(),
-                        elapsed,
-                        first_token_ms,
-                        TokenUsage::default(),
-                        Some("streaming"),
+                        started,
+                        &mut first_token_ms,
+                        &first_token_ms_shared,
                     )
                     .await;
                 }
@@ -563,12 +647,69 @@ async fn stream_response(
                     ended = true;
                 }
             }
+            if !ended {
+                match cursor_kv_terminal_events(
+                    rail,
+                    kv_terminal_candidate,
+                    &mut writer,
+                    &mut filter,
+                ) {
+                    Ok(Some(events)) => {
+                        if let Err(error) = mark_session_business_output(&session_entry).await {
+                            final_status = error.status.as_u16();
+                            final_stream_status = "failed";
+                            for event in writer.error_events(&error.message) {
+                                yield Ok::<_, std::io::Error>(Bytes::from(event));
+                            }
+                        } else {
+                            if first_token_ms.is_none() && !events.is_empty() {
+                                record_cursor_first_output(
+                                    &state,
+                                    &stored,
+                                    &request_id,
+                                    started,
+                                    &mut first_token_ms,
+                                    &first_token_ms_shared,
+                                )
+                                .await;
+                            }
+                            for event in events {
+                                yield Ok::<_, std::io::Error>(Bytes::from(event));
+                            }
+                        }
+                        ended = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        final_status = error.status.as_u16();
+                        final_stream_status = "failed";
+                        ended = true;
+                        for event in writer.error_events(&error.message) {
+                            yield Ok::<_, std::io::Error>(Bytes::from(event));
+                        }
+                    }
+                }
+            }
             if ended {
                 break;
             }
         }
 
-        for event in writer.done_events() {
+        let deferred_business_output =
+            final_stream_status != "failed" && writer.has_deferred_business_output();
+        let done_events = writer.done_events();
+        if first_token_ms.is_none() && deferred_business_output && !done_events.is_empty() {
+            record_cursor_first_output(
+                &state,
+                &stored,
+                &request_id,
+                started,
+                &mut first_token_ms,
+                &first_token_ms_shared,
+            )
+            .await;
+        }
+        for event in done_events {
             yield Ok::<_, std::io::Error>(Bytes::from(event));
         }
         let usage = writer_usage(&writer);
@@ -617,6 +758,10 @@ async fn drive_non_stream(
     input_tokens: u32,
 ) -> Result<DriveOutcome, ProxyError> {
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
+    let rail = {
+        let session = session_entry.lock().await;
+        session.rail
+    };
     state
         .cursor_sessions
         .bind_response_id(session_key, &session_entry, writer.message_id())
@@ -626,17 +771,13 @@ async fn drive_non_stream(
     let mut exec_dedup = ExecDedup::default();
     loop {
         let Some(frame) = next_session_frame(&session_entry).await? else {
-            break;
+            return Err(cursor_incomplete_response_error(rail));
         };
-        handle_kv_event(&session_entry, decode_kv_server_event(&frame.payload)).await?;
-        match handle_exec_event(
-            state,
-            &session_entry,
-            &mut exec_dedup,
-            decode_exec_server_event(&frame.payload),
-        )
-        .await?
-        {
+        let kv_event = decode_kv_server_event(&frame.payload).map_err(cursor_proto_error)?;
+        let kv_terminal_candidate = kv_event.is_some();
+        handle_kv_event(&session_entry, kv_event).await?;
+        let exec_event = decode_exec_server_event(&frame.payload).map_err(cursor_proto_error)?;
+        match handle_exec_event(state, &session_entry, &mut exec_dedup, exec_event).await? {
             ExecHandling::Continue => {}
             ExecHandling::ToolCall(tool_call) => {
                 mark_session_business_output(&session_entry).await?;
@@ -652,15 +793,26 @@ async fn drive_non_stream(
                 ));
             }
         }
-        for delta in decode_agent_server_message(&frame.payload) {
-            let business_output = cursor_delta_is_business_output(&delta);
-            match cursor_delta_events(delta, &mut writer, &mut filter)? {
+        for delta in decode_agent_server_message(&frame.payload).map_err(cursor_proto_error)? {
+            let content_delta = cursor_delta_is_business_output(&delta);
+            let had_response_content = writer.has_response_content();
+            let outcome = cursor_delta_events(delta, &mut writer, &mut filter)?;
+            let business_output = cursor_events_are_business_output(
+                true,
+                content_delta,
+                had_response_content,
+                writer.has_response_content(),
+            );
+            match outcome {
                 CursorDeltaOutcome::Events(_) => {
                     if business_output {
                         mark_session_business_output(&session_entry).await?;
                     }
                 }
                 CursorDeltaOutcome::TurnEnded(_) => {
+                    if !writer.has_response_content() {
+                        return Err(cursor_empty_response_error(rail));
+                    }
                     mark_session_business_output(&session_entry).await?;
                     let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
                         ProxyError::bad_request(format!(
@@ -674,16 +826,21 @@ async fn drive_non_stream(
                 }
             }
         }
+        if cursor_kv_terminal_events(rail, kv_terminal_candidate, &mut writer, &mut filter)?
+            .is_some()
+        {
+            mark_session_business_output(&session_entry).await?;
+            let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
+                ProxyError::bad_request(format!(
+                    "Cursor AgentService JSON response encode failed: {error}"
+                ))
+            })?;
+            return Ok(DriveOutcome::Completed(
+                Bytes::from(body),
+                writer_usage(&writer),
+            ));
+        }
     }
-    let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
-        ProxyError::bad_request(format!(
-            "Cursor AgentService JSON response encode failed: {error}"
-        ))
-    })?;
-    Ok(DriveOutcome::Completed(
-        Bytes::from(body),
-        writer_usage(&writer),
-    ))
 }
 
 fn cursor_delta_is_business_output(delta: &InteractionDelta) -> bool {
@@ -691,12 +848,79 @@ fn cursor_delta_is_business_output(delta: &InteractionDelta) -> bool {
         InteractionDelta::Text(text) | InteractionDelta::Thinking(text) => !text.is_empty(),
         InteractionDelta::ThinkingComplete
         | InteractionDelta::TokenDelta(_)
-        | InteractionDelta::TurnEnded => true,
-        InteractionDelta::Heartbeat
+        | InteractionDelta::TurnEnded
+        | InteractionDelta::Heartbeat
         | InteractionDelta::ToolCallStarted
         | InteractionDelta::ToolCallCompleted
         | InteractionDelta::KvServerMessage
         | InteractionDelta::Unknown(_) => false,
+    }
+}
+
+fn cursor_events_are_business_output(
+    valid_output: bool,
+    content_delta: bool,
+    had_response_content: bool,
+    has_response_content: bool,
+) -> bool {
+    valid_output && (content_delta || (!had_response_content && has_response_content))
+}
+
+async fn record_cursor_first_output(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_id: &str,
+    started: Instant,
+    first_token_ms: &mut Option<u128>,
+    first_token_ms_shared: &AtomicU64,
+) {
+    if first_token_ms.is_some() {
+        return;
+    }
+    let elapsed = started.elapsed().as_millis();
+    *first_token_ms = Some(elapsed);
+    first_token_ms_shared.store(encode_optional_millis(elapsed), Ordering::Relaxed);
+    update_stream_usage(
+        state,
+        stored,
+        request_id,
+        StatusCode::OK.as_u16(),
+        elapsed,
+        *first_token_ms,
+        TokenUsage::default(),
+        Some("streaming"),
+    )
+    .await;
+}
+
+fn encode_optional_millis(value: u128) -> u64 {
+    value.min(u128::from(u64::MAX - 1)) as u64 + 1
+}
+
+fn cursor_proto_error(error: ProtoError) -> ProxyError {
+    ProxyError {
+        status: StatusCode::BAD_GATEWAY,
+        message: format!("Cursor Connect-RPC protobuf decode failed: {error}"),
+    }
+}
+
+fn cursor_incomplete_response_error(rail: CursorProtocolRail) -> ProxyError {
+    ProxyError {
+        status: StatusCode::BAD_GATEWAY,
+        message: format!(
+            "Cursor {} response ended before a business completion signal",
+            rail.label()
+        ),
+    }
+}
+
+fn cursor_empty_response_error(rail: CursorProtocolRail) -> ProxyError {
+    ProxyError {
+        status: StatusCode::BAD_GATEWAY,
+        message: format!(
+            "Cursor {} response completed without text, reasoning, or a tool call",
+            rail.label()
+        ),
     }
 }
 
@@ -767,6 +991,41 @@ fn cursor_delta_events(
     }
 }
 
+fn cursor_kv_terminal_events(
+    rail: CursorProtocolRail,
+    kv_seen: bool,
+    writer: &mut AgentSseWriter,
+    filter: &mut ComposerMarkerFilter,
+) -> Result<Option<Vec<String>>, ProxyError> {
+    if !kv_seen || !rail.accepts_kv_after_text_terminal() {
+        return Ok(None);
+    }
+    let events = flush_cursor_marker_filter(writer, filter)?;
+    Ok(writer.has_visible_text().then_some(events))
+}
+
+fn flush_cursor_marker_filter(
+    writer: &mut AgentSseWriter,
+    filter: &mut ComposerMarkerFilter,
+) -> Result<Vec<String>, ProxyError> {
+    let mut out = Vec::new();
+    for event in filter.flush() {
+        match event {
+            MarkerEvent::Text(text) => out.extend(writer.event(&AgentEvent::Text(text))),
+            MarkerEvent::ToolCall(tool_call) => {
+                return Err(ProxyError {
+                    status: StatusCode::NOT_IMPLEMENTED,
+                    message: format!(
+                        "Cursor AgentService emitted marker-only tool call `{}` without Exec/MCP metadata; session resume requires an AgentService MCP event",
+                        tool_call.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 async fn handle_kv_event(
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
     event: Option<KvServerEvent>,
@@ -833,11 +1092,15 @@ async fn handle_exec_event(
             exec_msg_id,
             exec_id,
         } => {
-            let working_directory = {
+            let (rail, working_directory) = {
                 let session = session_entry.lock().await;
-                session.working_directory.clone()
+                (session.rail, session.working_directory.clone())
             };
-            encode_rich_request_context_response(exec_msg_id, &exec_id, &working_directory)
+            if rail.uses_rich_request_context() {
+                encode_rich_request_context_response(exec_msg_id, &exec_id, &working_directory)
+            } else {
+                encode_request_context_response(exec_msg_id, &exec_id, &[])
+            }
         }
         ExecServerEvent::Read {
             exec_msg_id,
@@ -1145,7 +1408,7 @@ async fn acquire_or_open_session(
 
     let credential =
         resolve_cursor_credential(state, stored, runtime_fingerprint, timeouts.request).await?;
-    let access_token = credential.access_token.clone();
+    let access_token = credential.access_token().to_string();
     let entry = open_agent_stream(state, &credential, stored, plan, session_key, timeouts).await?;
     Ok((entry, Some(access_token)))
 }
@@ -1276,12 +1539,7 @@ fn cursor_error_message_from_body(body: &[u8]) -> Option<String> {
         (Some(code), None) => Some(code),
         _ => None,
     }?;
-    Some(
-        crate::logging::redact_sensitive_text(&detail)
-            .chars()
-            .take(512)
-            .collect(),
-    )
+    Some(cursor_transport_diagnostic(&detail))
 }
 
 fn cursor_error_field(value: &Value, pointers: &[&str]) -> Option<String> {
@@ -1487,6 +1745,7 @@ async fn resolve_session_key(
     state: &ServerState,
     plan: &AgentRunPlan,
     scope: &CursorSessionScope,
+    rail: CursorProtocolRail,
 ) -> Result<ResolvedCursorSession, ProxyError> {
     if !plan.tool_results.is_empty() {
         for result in &plan.tool_results {
@@ -1530,8 +1789,16 @@ async fn resolve_session_key(
 
     Ok(ResolvedCursorSession::new(CursorSessionKey::new(
         scope.clone(),
-        random_uuid_like(),
+        new_cursor_conversation_id(rail),
     )))
+}
+
+fn new_cursor_conversation_id(rail: CursorProtocolRail) -> String {
+    let id = random_uuid_like();
+    match rail {
+        CursorProtocolRail::OAuthCli => id,
+        CursorProtocolRail::ApiKeySdk => format!("agent-{id}"),
+    }
 }
 
 struct ResolvedCursorSession {
@@ -1563,6 +1830,7 @@ async fn open_agent_stream(
     let images = load_images(plan.images.clone()).await?;
     let mut blob_store = HashMap::new();
     let mut input = AgentRunInput {
+        rail: credential.rail(),
         model_id: &plan.model_id,
         user_text: &plan.user_text,
         conversation_id: Some(session_key.conversation_id()),
@@ -1576,16 +1844,27 @@ async fn open_agent_stream(
         ProxyError::bad_request(format!("invalid Cursor AgentService model: {message}"))
     })?;
     let stream = CursorH2Stream::open(
-        &cursor_agentservice_base_url(stored),
-        cursor_agentservice_headers(&credential.account, &credential.access_token),
+        &cursor_agentservice_url(stored, credential.rail())?,
+        cursor_agentservice_headers(
+            credential.rail(),
+            credential.account(),
+            credential.access_token(),
+        ),
         wrap_connect_frame(&body),
         timeouts,
     )
     .await?;
+    tracing::debug!(
+        cursor_rail = credential.rail().label(),
+        cursor_protocol_revision = credential.rail().protocol_revision(),
+        provider_id = %stored.provider.id,
+        "opened Cursor AgentService stream"
+    );
     Ok(state
         .cursor_sessions
         .open(
             session_key.clone(),
+            credential.rail(),
             stream,
             blob_store,
             plan.tools.clone(),
@@ -1600,6 +1879,9 @@ async fn cursor_session_scope(
     runtime_fingerprint: &str,
     request_context: &UsageLogContext,
 ) -> Result<CursorSessionScope, ProxyError> {
+    let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
+        ProxyError::bad_request("Cursor session identity requires a Cursor provider")
+    })?;
     let principal = match stored.provider_type {
         ProviderType::CursorOAuth => {
             let accounts = managed_credential_accounts_snapshot(state).await?;
@@ -1630,6 +1912,8 @@ async fn cursor_session_scope(
         provider_id: &stored.provider.id,
         provider_revision: stored.resource.revision,
         runtime_fingerprint,
+        rail,
+        protocol_revision: rail.protocol_revision(),
         principal: &principal,
         share_id: request_context.share_id.as_deref(),
         user_email: request_context.user_email.as_deref(),
@@ -1699,7 +1983,7 @@ impl CursorStreamInterruptGuard {
     fn first_token_ms(&self) -> Option<u128> {
         match self.first_token_ms.load(Ordering::Relaxed) {
             0 => None,
-            value => Some(u128::from(value)),
+            value => Some(u128::from(value - 1)),
         }
     }
 }
@@ -1753,6 +2037,26 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
 
+    fn cursor_endpoint_provider(
+        provider_type: ProviderType,
+        endpoint_env: Value,
+    ) -> StoredProvider {
+        StoredProvider {
+            app: crate::domain::providers::model::AppKind::Codex,
+            provider: crate::domain::providers::model::Provider {
+                id: format!("endpoint-{}", provider_type.as_str()),
+                name: "Cursor endpoint test".to_string(),
+                settings_config: json!({"env": endpoint_env}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
+            resource: Default::default(),
+        }
+    }
+
     fn cursor_stream_test_state(name: &str) -> ServerState {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1803,15 +2107,126 @@ mod tests {
         assert!(cursor_delta_is_business_output(
             &InteractionDelta::Thinking("reason".to_string())
         ));
-        assert!(cursor_delta_is_business_output(
+        assert!(!cursor_delta_is_business_output(
             &InteractionDelta::ThinkingComplete
         ));
-        assert!(cursor_delta_is_business_output(
+        assert!(!cursor_delta_is_business_output(
             &InteractionDelta::TokenDelta(0)
         ));
-        assert!(cursor_delta_is_business_output(
+        assert!(!cursor_delta_is_business_output(
             &InteractionDelta::TurnEnded
         ));
+    }
+
+    #[test]
+    fn cursor_business_output_classifier_is_independent_of_deferred_wire_events() {
+        assert!(!cursor_events_are_business_output(
+            true, false, false, false
+        ));
+        assert!(!cursor_events_are_business_output(true, false, true, true));
+        assert!(cursor_events_are_business_output(true, true, false, true));
+        assert!(cursor_events_are_business_output(true, false, false, true));
+        assert!(!cursor_events_are_business_output(false, true, false, true));
+    }
+
+    #[test]
+    fn cursor_interrupted_first_output_encoding_preserves_zero_milliseconds() {
+        assert_eq!(encode_optional_millis(0), 1);
+        assert_eq!(u128::from(encode_optional_millis(42) - 1), 42);
+        assert_eq!(encode_optional_millis(u128::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn cursor_business_completion_policy_is_rail_specific() {
+        let mut sdk_writer = AgentSseWriter::new(
+            "composer-2.5".to_string(),
+            super::super::protocol::CursorResponseFormat::OpenAiChatCompletions,
+            0,
+        );
+        sdk_writer.event(&AgentEvent::Text("answer".to_string()));
+        assert!(cursor_kv_terminal_events(
+            CursorProtocolRail::ApiKeySdk,
+            true,
+            &mut sdk_writer,
+            &mut ComposerMarkerFilter::default(),
+        )
+        .unwrap()
+        .is_none());
+
+        let mut cli_writer = AgentSseWriter::new(
+            "composer-2.5".to_string(),
+            super::super::protocol::CursorResponseFormat::OpenAiChatCompletions,
+            0,
+        );
+        assert!(cursor_kv_terminal_events(
+            CursorProtocolRail::OAuthCli,
+            true,
+            &mut cli_writer,
+            &mut ComposerMarkerFilter::default(),
+        )
+        .unwrap()
+        .is_none());
+        cli_writer.event(&AgentEvent::Text("answer".to_string()));
+        assert!(cursor_kv_terminal_events(
+            CursorProtocolRail::OAuthCli,
+            true,
+            &mut cli_writer,
+            &mut ComposerMarkerFilter::default(),
+        )
+        .unwrap()
+        .is_some());
+
+        assert_eq!(
+            cursor_incomplete_response_error(CursorProtocolRail::ApiKeySdk).status,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            cursor_empty_response_error(CursorProtocolRail::OAuthCli).status,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn cursor_endpoint_configuration_is_full_url_https_and_rail_scoped() {
+        assert_eq!(
+            validate_cursor_endpoint("https://cursor.example/rpc/run", "test endpoint").unwrap(),
+            "https://cursor.example/rpc/run"
+        );
+        assert!(validate_cursor_endpoint("http://127.0.0.1:8787/rpc/run", "test endpoint").is_ok());
+        for invalid in [
+            "http://cursor.example/rpc/run",
+            "https://cursor.example/",
+            "https://user@cursor.example/rpc/run",
+            "https://cursor.example/rpc/run#fragment",
+        ] {
+            let error = validate_cursor_endpoint(invalid, "test endpoint").unwrap_err();
+            assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        let oauth = cursor_endpoint_provider(
+            ProviderType::CursorOAuth,
+            json!({
+                "CURSOR_OAUTH_AGENT_ENDPOINT": "http://127.0.0.1:8787/oauth/run"
+            }),
+        );
+        validate_cursor_runtime_configuration(&oauth).unwrap();
+
+        let api_key = cursor_endpoint_provider(
+            ProviderType::CursorApiKey,
+            json!({
+                "CURSOR_APIKEY_AGENT_ENDPOINT": "http://127.0.0.1:8787/sdk/run",
+                "CURSOR_APIKEY_EXCHANGE_ENDPOINT": "http://127.0.0.1:8787/token/exchange"
+            }),
+        );
+        validate_cursor_runtime_configuration(&api_key).unwrap();
+        let invalid_exchange = cursor_endpoint_provider(
+            ProviderType::CursorApiKey,
+            json!({
+                "CURSOR_APIKEY_AGENT_ENDPOINT": "http://127.0.0.1:8787/sdk/run",
+                "CURSOR_APIKEY_EXCHANGE_ENDPOINT": "not-a-url"
+            }),
+        );
+        assert!(validate_cursor_runtime_configuration(&invalid_exchange).is_err());
     }
 
     #[tokio::test]
@@ -1841,6 +2256,7 @@ mod tests {
                 CursorSessionScope::fixture("cursor-stream-share"),
                 "cursor-stream-session",
             ),
+            rail: CursorProtocolRail::OAuthCli,
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
@@ -2321,6 +2737,13 @@ mod tests {
             .as_deref(),
             Some("quota exhausted")
         );
+        let redacted = cursor_error_message_from_body(
+            br#"{"message":"request https://private.example/internal/run failed"}"#,
+        )
+        .unwrap();
+        assert!(redacted.contains("[REDACTED_CURSOR_URL]"));
+        assert!(!redacted.contains("private.example"));
+        assert!(!redacted.contains("/internal/run"));
     }
 
     #[test]
@@ -2365,6 +2788,30 @@ mod tests {
         let now = 1_700_000_000_000;
         let expiry = cursor_exchange_expiry("not-a-jwt", Some(now + 600_000), Some(1_200), now);
         assert_eq!(expiry, now + 600_000);
+        let expiry = cursor_exchange_expiry("not-a-jwt", Some(now + 600_000), Some(120), now);
+        assert_eq!(expiry, now + 120_000);
+
+        assert!(!new_cursor_conversation_id(CursorProtocolRail::OAuthCli).starts_with("agent-"));
+        assert!(new_cursor_conversation_id(CursorProtocolRail::ApiKeySdk).starts_with("agent-"));
+    }
+
+    #[test]
+    fn cursor_exchange_success_payload_failures_are_upstream_errors() {
+        let error = parse_cursor_api_key_exchange_response(br#"{}"#, 1_700_000_000_000)
+            .expect_err("missing exchange token must fail");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+
+        let error = parse_cursor_api_key_exchange_response(b"not-json", 1_700_000_000_000)
+            .expect_err("malformed exchange payload must fail");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+
+        let (token, expires_at) = parse_cursor_api_key_exchange_response(
+            br#"{"accessToken":"exchanged-token","expiresIn":120}"#,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(token, "exchanged-token");
+        assert_eq!(expires_at, 1_700_000_120_000);
     }
 
     #[test]
@@ -2388,16 +2835,16 @@ async fn resolve_cursor_credential(
             let account = authoritative_managed_account(stored, &accounts).ok_or_else(|| {
                 ProxyError::conflict("Cursor OAuth account identity changed; rebind the Provider")
             })?;
-            let access_token = account
+            let stored_access_token = account
                 .access_token
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     ProxyError::bad_request("Cursor OAuth managed account access token is required")
-                })?
-                .to_string();
-            Ok(CursorCredential {
+                })?;
+            let access_token = normalize_cursor_access_token(stored_access_token).to_string();
+            Ok(CursorCredential::OAuthCli {
                 account: cursor_account_from_managed_account(account),
                 access_token,
             })
@@ -2412,7 +2859,7 @@ async fn resolve_cursor_credential(
                 request_timeout,
             )
             .await?;
-            Ok(CursorCredential {
+            Ok(CursorCredential::ApiKeySdk {
                 account: cursor_account_for_api_key(&api_key),
                 access_token,
             })
@@ -2526,11 +2973,7 @@ async fn exchange_cursor_api_key(
     api_key: &str,
     request_timeout: std::time::Duration,
 ) -> Result<(String, i64), ProxyError> {
-    let url = format!(
-        "{}{}",
-        cursor_backend_base_url(stored),
-        EXCHANGE_USER_API_KEY_PATH
-    );
+    let url = cursor_api_key_exchange_url(stored)?;
     let response = state
         .http_client()
         .await
@@ -2541,7 +2984,12 @@ async fn exchange_cursor_api_key(
         .timeout(request_timeout)
         .send()
         .await
-        .map_err(ProxyError::bad_gateway)?;
+        .map_err(|error| {
+            ProxyError::bad_gateway(format!(
+                "Cursor API key exchange request failed: {}",
+                cursor_transport_diagnostic(&error)
+            ))
+        })?;
     if !response.status().is_success() {
         let status = response.status();
         let headers = response.headers().clone();
@@ -2567,18 +3015,24 @@ async fn exchange_cursor_api_key(
         };
     }
     let body = read_reqwest_body_limited(response, MAX_CURSOR_ERROR_BODY_BYTES).await?;
-    let parsed = serde_json::from_slice::<CursorApiKeyExchangeResponse>(&body)
+    parse_cursor_api_key_exchange_response(&body, crate::infra::time::now_ms() as i64)
+}
+
+fn parse_cursor_api_key_exchange_response(
+    body: &[u8],
+    now_ms: i64,
+) -> Result<(String, i64), ProxyError> {
+    let parsed = serde_json::from_slice::<CursorApiKeyExchangeResponse>(body)
         .map_err(ProxyError::bad_gateway)?;
     let access_token = parsed
         .access_token
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            ProxyError::bad_request("Cursor API key exchange response missing access token")
+            ProxyError::bad_gateway("Cursor API key exchange response missing access token")
         })?;
-    let now = crate::infra::time::now_ms() as i64;
     let expires_at =
-        cursor_exchange_expiry(&access_token, parsed.expires_at, parsed.expires_in, now);
+        cursor_exchange_expiry(&access_token, parsed.expires_at, parsed.expires_in, now_ms);
     Ok((access_token, expires_at))
 }
 
@@ -2662,7 +3116,12 @@ async fn read_reqwest_body_limited(
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(ProxyError::bad_gateway)?;
+        let chunk = chunk.map_err(|error| {
+            ProxyError::bad_gateway(format!(
+                "Cursor upstream response read failed: {}",
+                cursor_transport_diagnostic(&error)
+            ))
+        })?;
         if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(ProxyError::bad_gateway(
                 "Cursor upstream response exceeded the configured limit",
@@ -2683,14 +3142,14 @@ fn cursor_exchange_expiry(
     expires_in: Option<i64>,
     now_ms: i64,
 ) -> i64 {
-    let explicit = expires_at.map(normalize_epoch_ms).or_else(|| {
-        expires_in
-            .filter(|seconds| *seconds > 0)
-            .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)))
-    });
+    let absolute = expires_at.map(normalize_epoch_ms);
+    let relative = expires_in
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)));
     let jwt = jwt_expiry_ms(token);
-    explicit
+    absolute
         .into_iter()
+        .chain(relative)
         .chain(jwt)
         .min()
         .unwrap_or_else(|| now_ms.saturating_add(10 * 60 * 1000))
@@ -2715,47 +3174,109 @@ fn jwt_expiry_ms(token: &str) -> Option<i64> {
     value.get("exp")?.as_i64().map(normalize_epoch_ms)
 }
 
-fn cursor_backend_base_url(stored: &StoredProvider) -> String {
-    cursor_test_endpoint_override(
+fn cursor_api_key_exchange_url(stored: &StoredProvider) -> Result<String, ProxyError> {
+    configured_cursor_endpoint(
         stored,
-        &["CURSOR_BACKEND_BASE_URL", "CURSOR_API_BASE_URL"],
-        "CC_SWITCH_CURSOR_BACKEND_BASE_URL",
+        &["CURSOR_APIKEY_EXCHANGE_ENDPOINT"],
+        &["CC_SWITCH_CURSOR_APIKEY_EXCHANGE_ENDPOINT"],
+        "Cursor API key exchange endpoint",
     )
-    .unwrap_or_else(|| DEFAULT_CURSOR_BACKEND_BASE_URL.to_string())
 }
 
-fn cursor_agentservice_base_url(stored: &StoredProvider) -> String {
-    cursor_test_endpoint_override(
-        stored,
-        &[
-            "CURSOR_AGENT_SERVICE_BASE_URL",
-            "CURSOR_AGENTSERVICE_BASE_URL",
-            "CURSOR_AGENT_BASE_URL",
-        ],
-        "CC_SWITCH_CURSOR_AGENT_SERVICE_BASE_URL",
-    )
-    .unwrap_or_else(|| DEFAULT_AGENTSERVICE_BASE_URL.to_string())
+fn validate_cursor_runtime_configuration(stored: &StoredProvider) -> Result<(), ProxyError> {
+    let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
+        cursor_configuration_error("Cursor AgentService driver requires a Cursor provider")
+    })?;
+    cursor_agentservice_url(stored, rail)?;
+    if rail == CursorProtocolRail::ApiKeySdk {
+        cursor_api_key_exchange_url(stored)?;
+    }
+    Ok(())
 }
 
-#[cfg(test)]
-fn cursor_test_endpoint_override(
+fn cursor_agentservice_url(
+    stored: &StoredProvider,
+    rail: CursorProtocolRail,
+) -> Result<String, ProxyError> {
+    match rail {
+        CursorProtocolRail::OAuthCli => configured_cursor_endpoint(
+            stored,
+            &["CURSOR_OAUTH_AGENT_ENDPOINT"],
+            &["CC_SWITCH_CURSOR_OAUTH_AGENT_ENDPOINT"],
+            "Cursor OAuth CLI AgentService endpoint",
+        ),
+        CursorProtocolRail::ApiKeySdk => configured_cursor_endpoint(
+            stored,
+            &["CURSOR_APIKEY_AGENT_ENDPOINT"],
+            &["CC_SWITCH_CURSOR_APIKEY_AGENT_ENDPOINT"],
+            "Cursor API key SDK AgentService endpoint",
+        ),
+    }
+}
+
+fn configured_cursor_endpoint(
     stored: &StoredProvider,
     setting_names: &[&str],
-    env_name: &str,
-) -> Option<String> {
-    setting(&stored.provider, setting_names)
-        .or_else(|| std::env::var(env_name).ok())
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
+    env_names: &[&str],
+    label: &str,
+) -> Result<String, ProxyError> {
+    #[cfg(test)]
+    let provider_override = setting(&stored.provider, setting_names);
+    #[cfg(not(test))]
+    let provider_override: Option<String> = {
+        let _ = (stored, setting_names);
+        None
+    };
+    let value = provider_override
+        .or_else(|| {
+            env_names.iter().find_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+        })
+        .ok_or_else(|| {
+            cursor_configuration_error(format!(
+                "{label} is not configured; set {} as a runtime secret",
+                env_names.join(" or ")
+            ))
+        })?;
+    validate_cursor_endpoint(&value, label)
 }
 
-#[cfg(not(test))]
-fn cursor_test_endpoint_override(
-    _stored: &StoredProvider,
-    _setting_names: &[&str],
-    _env_name: &str,
-) -> Option<String> {
-    None
+fn validate_cursor_endpoint(value: &str, label: &str) -> Result<String, ProxyError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| cursor_configuration_error(format!("invalid {label}: {error}")))?;
+    let test_loopback = cfg!(test)
+        && url.scheme() == "http"
+        && url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if url.scheme() != "https" && !test_loopback {
+        return Err(cursor_configuration_error(format!(
+            "{label} must use HTTPS"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(cursor_configuration_error(format!(
+            "{label} must not include userinfo or a fragment"
+        )));
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        return Err(cursor_configuration_error(format!(
+            "{label} must be a complete endpoint URL including its path"
+        )));
+    }
+    Ok(url.to_string())
+}
+
+fn cursor_configuration_error(message: impl Into<String>) -> ProxyError {
+    ProxyError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: message.into(),
+    }
 }
 
 fn response_model(request: &AdapterRequest, plan_model: &str) -> String {

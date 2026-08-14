@@ -10,6 +10,7 @@ import {
   KeyRound,
   LoaderCircle,
   Plus,
+  RefreshCw,
   Save,
   Share2,
   Target,
@@ -83,6 +84,12 @@ import {
   createDraftForProfile,
   profileAllowsEndpointEditing,
 } from "@/server/providers/editor/providerDraft";
+import {
+  credentialInputValue,
+  updateCredentialInput,
+  type CredentialEdit,
+  type CredentialRevealStatus,
+} from "@/server/providers/editor/credentialEditing";
 import { SecretInput } from "@/server/ui/SecretInput";
 import { cn } from "@/lib/utils";
 import {
@@ -122,6 +129,7 @@ import {
   updateSurfaceEndpoint,
   updateSurfaceModel,
   validateProviderBundleDraft,
+  type BundleSecretDraft,
   type BundleSurfaceEditorDraft,
   type ProviderBundleEditorDraft,
 } from "./bundleDraft";
@@ -199,6 +207,34 @@ function fieldLabel(logical: string): string {
     default:
       return "API Key / Token";
   }
+}
+
+function credentialEditForBundleSecret(
+  slot: string,
+  secret: BundleSecretDraft,
+): CredentialEdit {
+  return {
+    slot,
+    configured: secret.configured,
+    action: secret.clear
+      ? "clear"
+      : secret.value
+        ? "replace"
+        : secret.configured
+          ? "keep"
+          : "replace",
+    value: secret.value,
+  };
+}
+
+function bundleSecretFromCredentialEdit(
+  edit: CredentialEdit,
+): BundleSecretDraft {
+  return {
+    configured: edit.configured,
+    value: edit.action === "replace" ? edit.value : "",
+    clear: edit.action === "clear",
+  };
 }
 
 function SurfaceEditor({
@@ -1196,6 +1232,13 @@ export function ProviderBundleEditor({
   );
   const [saving, setSaving] = useState(false);
   const [modelScopeConfirmOpen, setModelScopeConfirmOpen] = useState(false);
+  const [revealedCredentialValues, setRevealedCredentialValues] = useState<
+    Record<string, string>
+  >({});
+  const [credentialRevealStatuses, setCredentialRevealStatuses] = useState<
+    Record<string, CredentialRevealStatus>
+  >({});
+  const credentialRevealGeneration = useRef(0);
   const shareSectionRef = useRef<HTMLDivElement>(null);
   const sharesQuery = useSharesQuery();
   const clientTunnelQuery = useClientTunnelQuery();
@@ -1215,6 +1258,12 @@ export function ProviderBundleEditor({
   });
   const accountsQuery = useManagedAccountsQuery();
   const credentialProfile = profileById(family.credentialProfileId);
+  const credentialSourceApp = credentialProfile?.app;
+  const configuredCredentialSlotsKey = Object.entries(draft.secrets)
+    .filter(([, secret]) => secret.configured)
+    .map(([slot]) => slot)
+    .sort()
+    .join("\n");
   const allowedModelPolicies = modelPoliciesForFamily(family);
   const defaultSharedModel = defaultUpstreamModelForFamily(family);
   const perAppModelPolicySupported = supportsPerAppModelPolicy(family);
@@ -1275,6 +1324,56 @@ export function ProviderBundleEditor({
   }, [accounts, draft.accountGeneration, draft.accountId]);
 
   useEffect(() => {
+    const generation = credentialRevealGeneration.current + 1;
+    credentialRevealGeneration.current = generation;
+    setRevealedCredentialValues({});
+    setCredentialRevealStatuses({});
+
+    const slots = configuredCredentialSlotsKey
+      ? configuredCredentialSlotsKey.split("\n")
+      : [];
+    if (!persisted || !credentialSourceApp || slots.length === 0) return;
+
+    setCredentialRevealStatuses(
+      Object.fromEntries(slots.map((slot) => [slot, "loading" as const])),
+    );
+    for (const slot of slots) {
+      void providersApi
+        .getCredential(credentialSourceApp, draft.id, slot)
+        .then((value) => {
+          if (credentialRevealGeneration.current !== generation) return;
+          setRevealedCredentialValues((current) => ({
+            ...current,
+            [slot]: value,
+          }));
+          setCredentialRevealStatuses((current) => ({
+            ...current,
+            [slot]: "ready",
+          }));
+        })
+        .catch(() => {
+          if (credentialRevealGeneration.current !== generation) return;
+          setCredentialRevealStatuses((current) => ({
+            ...current,
+            [slot]: "error",
+          }));
+        });
+    }
+
+    return () => {
+      if (credentialRevealGeneration.current === generation) {
+        credentialRevealGeneration.current += 1;
+      }
+    };
+  }, [
+    configuredCredentialSlotsKey,
+    credentialSourceApp,
+    draft.expectedRevision,
+    draft.id,
+    persisted,
+  ]);
+
+  useEffect(() => {
     const nextShareDraft = createBundleShareDraft(existingShare);
     shareBaselineRef.current = stableStringify(nextShareDraft);
     setShareDraft(nextShareDraft);
@@ -1322,6 +1421,37 @@ export function ProviderBundleEditor({
     setDraft(nextDraft);
     setActiveApp(nextDraft.surfaces[0]?.app ?? "claude");
     setShareDraft(createBundleShareDraft());
+  };
+
+  const retryCredentialReveal = async (slot: string) => {
+    if (!persisted || !credentialSourceApp) return;
+    const generation = credentialRevealGeneration.current;
+    setCredentialRevealStatuses((current) => ({
+      ...current,
+      [slot]: "loading",
+    }));
+    try {
+      const value = await providersApi.getCredential(
+        credentialSourceApp,
+        draft.id,
+        slot,
+      );
+      if (credentialRevealGeneration.current !== generation) return;
+      setRevealedCredentialValues((current) => ({
+        ...current,
+        [slot]: value,
+      }));
+      setCredentialRevealStatuses((current) => ({
+        ...current,
+        [slot]: "ready",
+      }));
+    } catch {
+      if (credentialRevealGeneration.current !== generation) return;
+      setCredentialRevealStatuses((current) => ({
+        ...current,
+        [slot]: "error",
+      }));
+    }
   };
 
   const updateSurface = (next: BundleSurfaceEditorDraft) =>
@@ -1619,26 +1749,82 @@ export function ProviderBundleEditor({
                   value: "",
                   clear: false,
                 };
+                const edit = credentialEditForBundleSecret(
+                  actualPointer,
+                  secret,
+                );
+                const revealedValue = revealedCredentialValues[actualPointer];
+                const revealStatus =
+                  credentialRevealStatuses[actualPointer] ?? "idle";
+                const value = credentialInputValue(edit, revealedValue);
+                const loadingCurrent =
+                  edit.configured &&
+                  edit.action === "keep" &&
+                  revealStatus === "loading";
+                const currentRevealFailed =
+                  edit.configured &&
+                  edit.action === "keep" &&
+                  revealStatus === "error";
                 return (
                   <div key={logical} className="space-y-2">
-                    <Label>{fieldLabel(logical)}</Label>
+                    <div className="flex min-h-6 items-center justify-between gap-2">
+                      <Label>{fieldLabel(logical)}</Label>
+                      {loadingCurrent ? (
+                        <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
+                      ) : currentRevealFailed ? (
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-6 w-6"
+                          title={t("common.retry")}
+                          aria-label={t("common.retry")}
+                          onClick={() =>
+                            void retryCredentialReveal(actualPointer)
+                          }
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />
+                        </Button>
+                      ) : null}
+                    </div>
                     <SecretInput
-                      value={secret.value}
-                      placeholder={secret.configured ? "••••••••" : undefined}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          secrets: {
-                            ...draft.secrets,
-                            [actualPointer]: {
-                              ...secret,
-                              value: event.target.value,
-                              clear: false,
-                            },
-                          },
-                        })
+                      value={value}
+                      disabled={loadingCurrent || edit.action === "clear"}
+                      autoComplete="new-password"
+                      placeholder={
+                        loadingCurrent
+                          ? t("serverProviderForm.credentials.loading")
+                          : currentRevealFailed
+                            ? t(
+                                "serverProviderForm.credentials.loadFailedPlaceholder",
+                              )
+                            : t("serverProviderForm.credentials.placeholder")
                       }
+                      onChange={(event) => {
+                        const next = updateCredentialInput(
+                          edit,
+                          event.target.value,
+                          {
+                            optional: logical === "session_token",
+                            revealedValue,
+                            revealStatus,
+                          },
+                        );
+                        setDraft((current) => ({
+                          ...current,
+                          secrets: {
+                            ...current.secrets,
+                            [actualPointer]:
+                              bundleSecretFromCredentialEdit(next),
+                          },
+                        }));
+                      }}
                     />
+                    {currentRevealFailed ? (
+                      <p className="text-xs text-destructive">
+                        {t("serverProviderForm.credentials.loadFailed")}
+                      </p>
+                    ) : null}
                   </div>
                 );
               })}

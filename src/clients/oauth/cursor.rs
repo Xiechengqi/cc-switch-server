@@ -56,9 +56,12 @@ pub async fn verify_api_key(
     api_key: &str,
 ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
     let profile = cursor_public_json(client, api_key, "/v1/me").await?;
-    let principal = first_string(&profile, &["/id", "/sub", "/user_id", "/userId", "/email"])
-        .unwrap_or_else(|| sha256_hex(api_key));
-    let email = first_string(&profile, &["/email", "/user/email"]);
+    let principal = first_scalar_string(
+        &profile,
+        &["/userId", "/id", "/sub", "/user_id", "/userEmail", "/email"],
+    )
+    .unwrap_or_else(|| sha256_hex(api_key));
+    let email = first_string(&profile, &["/userEmail", "/email", "/user/email"]);
     Ok(VerifiedCursorApiKey {
         account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
         email,
@@ -75,16 +78,11 @@ pub async fn available_models(
     api_key: &str,
 ) -> Result<Vec<String>, CursorPublicApiError> {
     let value = cursor_public_json(client, api_key, "/v1/models").await?;
-    let items = value
-        .get("data")
-        .or_else(|| value.get("models"))
-        .and_then(Value::as_array)
-        .or_else(|| value.as_array())
-        .ok_or_else(|| CursorPublicApiError {
-            status_code: 502,
-            retryable: false,
-            message: "Cursor /v1/models returned an unsupported response shape".to_string(),
-        })?;
+    let items = model_items(&value).ok_or_else(|| CursorPublicApiError {
+        status_code: 502,
+        retryable: false,
+        message: "Cursor /v1/models returned an unsupported response shape".to_string(),
+    })?;
     let mut models = items
         .iter()
         .filter_map(|item| {
@@ -178,6 +176,27 @@ fn first_string(value: &Value, pointers: &[&str]) -> Option<String> {
     })
 }
 
+fn first_scalar_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        let value = value.pointer(pointer)?;
+        match value {
+            Value::String(value) => Some(value.trim().to_string()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+        .filter(|value| !value.is_empty())
+    })
+}
+
+fn model_items(value: &Value) -> Option<&Vec<Value>> {
+    value
+        .get("items")
+        .or_else(|| value.get("data"))
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+}
+
 fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
@@ -194,6 +213,24 @@ mod tests {
             Some("owner@example.com")
         );
         assert_eq!(sha256_hex("key").len(), 64);
+
+        let cursor_me = json!({
+            "apiKeyName": "server",
+            "userId": 42,
+            "userEmail": "cursor@example.com"
+        });
+        assert_eq!(
+            first_scalar_string(&cursor_me, &["/userId"]).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            first_string(&cursor_me, &["/userEmail"]).as_deref(),
+            Some("cursor@example.com")
+        );
+        assert_eq!(
+            model_items(&json!({"items": [{"id": "composer-2.5"}]})).map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
