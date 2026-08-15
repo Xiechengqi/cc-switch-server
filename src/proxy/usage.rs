@@ -563,6 +563,7 @@ mod tests {
                         previous_response_cache_enabled: None,
                         auto_start: None,
                         description: None,
+                        enabled_apps: None,
                         bindings: vec![ShareBinding {
                             app: AppKind::Codex,
                             provider_id: stored.provider.id.clone(),

@@ -899,6 +899,7 @@ mod tests {
             created_at_ms: 0,
             auto_start: false,
             description: None,
+            enabled_apps: None,
             bindings: vec![ShareBinding {
                 app,
                 provider_id: provider_id.to_string(),

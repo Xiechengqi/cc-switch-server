@@ -2365,6 +2365,7 @@ mod grok_catalog_provider_tests {
                         previous_response_cache_enabled: None,
                         auto_start: Some(true),
                         description: None,
+                        enabled_apps: None,
                         bindings: vec![ShareBinding {
                             app,
                             provider_id,

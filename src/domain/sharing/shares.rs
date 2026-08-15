@@ -405,6 +405,8 @@ pub struct Share {
     pub auto_start: bool,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_apps: Option<BTreeSet<AppKind>>,
     #[serde(default)]
     pub bindings: Vec<ShareBinding>,
     #[serde(default)]
@@ -481,6 +483,61 @@ impl std::ops::DerefMut for Share {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.policy
     }
+}
+
+fn share_bound_apps(share: &Share) -> BTreeSet<AppKind> {
+    if share.bindings.is_empty() {
+        return BTreeSet::from([share.app]);
+    }
+    share.bindings.iter().map(|binding| binding.app).collect()
+}
+
+pub fn share_enabled_apps(share: &Share) -> BTreeSet<AppKind> {
+    let bound = share_bound_apps(share);
+    match share.enabled_apps.as_ref() {
+        Some(enabled) => enabled.intersection(&bound).copied().collect(),
+        None => bound,
+    }
+}
+
+pub fn share_app_api_enabled(share: &Share, app: AppKind) -> bool {
+    share_enabled_apps(share).contains(&app)
+}
+
+pub fn support_from_enabled_apps(enabled: &BTreeSet<AppKind>) -> crate::domain::sharing::router_contract::ShareSupport {
+    crate::domain::sharing::router_contract::ShareSupport {
+        claude: enabled.contains(&AppKind::Claude),
+        codex: enabled.contains(&AppKind::Codex),
+        gemini: enabled.contains(&AppKind::Gemini),
+    }
+}
+
+fn enabled_apps_from_support(
+    support: &crate::domain::sharing::router_contract::ShareSupport,
+    bound: &BTreeSet<AppKind>,
+) -> Result<BTreeSet<AppKind>, SharePatchError> {
+    let mut enabled = BTreeSet::new();
+    if support.claude {
+        enabled.insert(AppKind::Claude);
+    }
+    if support.codex {
+        enabled.insert(AppKind::Codex);
+    }
+    if support.gemini {
+        enabled.insert(AppKind::Gemini);
+    }
+    if let Some(app) = enabled.iter().find(|app| !bound.contains(app)) {
+        return Err(SharePatchError::Invalid(format!(
+            "support contains unbound app {}",
+            app.as_str()
+        )));
+    }
+    if enabled.is_empty() {
+        return Err(SharePatchError::Invalid(
+            "at least one bound app API must stay enabled".to_string(),
+        ));
+    }
+    Ok(enabled)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -573,6 +630,8 @@ pub struct UpsertShareInput {
     pub auto_start: Option<bool>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_apps: Option<BTreeSet<AppKind>>,
     #[serde(default)]
     pub bindings: Vec<ShareBinding>,
     #[serde(default)]
@@ -695,6 +754,7 @@ impl ShareStore {
                     existing.router_synced_descriptor_generation,
                     existing.router_synced_descriptor_fingerprint.clone(),
                     existing.user_grants.clone(),
+                    existing.enabled_apps.clone(),
                 )
             });
 
@@ -715,6 +775,7 @@ impl ShareStore {
             router_synced_descriptor_generation,
             router_synced_descriptor_fingerprint,
             preserved_user_grants,
+            preserved_enabled_apps,
         ) = preserved.unwrap_or((
             0,
             0,
@@ -731,6 +792,7 @@ impl ShareStore {
             0,
             None,
             BTreeMap::new(),
+            None,
         ));
         let created_at_ms = if created_at_ms > 0 {
             created_at_ms
@@ -794,6 +856,7 @@ impl ShareStore {
             created_at_ms,
             auto_start: input.auto_start.unwrap_or(true),
             description: input.description,
+            enabled_apps: input.enabled_apps.or(preserved_enabled_apps),
             bindings: input.bindings,
             binding_history,
             runtime_snapshot: input.runtime_snapshot,
@@ -1208,6 +1271,14 @@ impl ShareStore {
             return Err(ShareInvocationRejection {
                 reason: ShareRejectReason::UnsupportedApp,
                 message: format!("Share does not provide the {} API format.", app.as_str()),
+                status_changed: false,
+                concurrency: None,
+            });
+        }
+        if !share_app_api_enabled(share, app) {
+            return Err(ShareInvocationRejection {
+                reason: ShareRejectReason::UnsupportedApp,
+                message: format!("Share has disabled the {} API.", app.as_str()),
                 status_changed: false,
                 concurrency: None,
             });
@@ -2004,6 +2075,11 @@ impl ShareStore {
         }
         if let Some(auto_start) = patch.auto_start {
             share.auto_start = auto_start;
+        }
+        if let Some(support) = patch.support {
+            let bound = share_bound_apps(&share);
+            let enabled = enabled_apps_from_support(&support, &bound)?;
+            share.enabled_apps = if enabled == bound { None } else { Some(enabled) };
         }
 
         let pricing_eligible = share.for_sale && !share.free_access;
@@ -4158,6 +4234,7 @@ mod tests {
             previous_response_cache_enabled: None,
             auto_start: None,
             description: None,
+            enabled_apps: None,
             bindings: Vec::new(),
             runtime_snapshot: None,
             user_grants: BTreeMap::new(),
@@ -5003,6 +5080,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: Some(true),
                 description: Some("test".to_string()),
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),
@@ -5015,6 +5093,83 @@ mod tests {
         assert_eq!(share.bindings[0].provider_id, "p1");
         assert_eq!(share.token_limit, Some(1000));
         assert!(share.for_sale);
+    }
+
+    #[test]
+    fn settings_patch_can_disable_one_app_api_but_not_all() {
+        use crate::domain::sharing::router_contract::ShareSupport;
+
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("multi-app");
+        input.bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Claude,
+            },
+            ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "p1".to_string(),
+                provider_type: ProviderType::Codex,
+            },
+        ];
+        store.upsert(input).unwrap();
+
+        let updated = store
+            .apply_settings_patch(
+                "multi-app",
+                ShareSettingsPatch {
+                    support: Some(ShareSupport {
+                        claude: true,
+                        codex: false,
+                        gemini: false,
+                    }),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            updated.enabled_apps.as_ref(),
+            Some(&BTreeSet::from([AppKind::Claude]))
+        );
+        assert!(share_app_api_enabled(&updated, AppKind::Claude));
+        assert!(!share_app_api_enabled(&updated, AppKind::Codex));
+
+        let preserved = store
+            .upsert({
+                let mut input = codex_share_input("multi-app");
+                input.bindings = vec![
+                    ShareBinding {
+                        app: AppKind::Claude,
+                        provider_id: "p1".to_string(),
+                        provider_type: ProviderType::Claude,
+                    },
+                    ShareBinding {
+                        app: AppKind::Codex,
+                        provider_id: "p1".to_string(),
+                        provider_type: ProviderType::Codex,
+                    },
+                ];
+                input
+            })
+            .unwrap();
+        assert_eq!(
+            preserved.enabled_apps.as_ref(),
+            Some(&BTreeSet::from([AppKind::Claude]))
+        );
+
+        let rejected = store.apply_settings_patch(
+            "multi-app",
+            ShareSettingsPatch {
+                support: Some(ShareSupport {
+                    claude: false,
+                    codex: false,
+                    gemini: false,
+                }),
+                ..ShareSettingsPatch::default()
+            },
+        );
+        assert!(rejected.is_err());
     }
 
     #[test]
@@ -5247,6 +5402,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),
@@ -5290,6 +5446,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),
@@ -5442,6 +5599,7 @@ mod tests {
             created_at_ms: 0,
             auto_start: false,
             description: None,
+            enabled_apps: None,
             bindings: vec![ShareBinding {
                 app: AppKind::Claude,
                 provider_id: "p1".to_string(),
@@ -5514,6 +5672,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),
@@ -5596,6 +5755,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),
@@ -5807,6 +5967,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),
@@ -6086,6 +6247,7 @@ mod tests {
                 previous_response_cache_enabled: None,
                 auto_start: None,
                 description: None,
+                enabled_apps: None,
                 bindings: Vec::new(),
                 runtime_snapshot: None,
                 user_grants: BTreeMap::new(),

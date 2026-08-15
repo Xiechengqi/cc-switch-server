@@ -80,6 +80,8 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support: Option<ShareSupport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
@@ -669,14 +671,9 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         }
     }
 
-    let mut support = ShareSupport::default();
-    for app in bindings.keys() {
-        match app {
-            AppKind::Claude => support.claude = true,
-            AppKind::Codex => support.codex = true,
-            AppKind::Gemini => support.gemini = true,
-        }
-    }
+    let support = crate::domain::sharing::shares::support_from_enabled_apps(
+        &crate::domain::sharing::shares::share_enabled_apps(share),
+    );
 
     let shared_with_emails = share.acl.shared_with_emails.clone();
     let market_access_mode = share.acl.market_access_mode.clone().unwrap_or_else(|| {
@@ -2351,6 +2348,7 @@ mod tests {
             created_at_ms: 0,
             auto_start: false,
             description: None,
+            enabled_apps: None,
             bindings: vec![ShareBinding {
                 app: AppKind::Codex,
                 provider_id: "p1".to_string(),

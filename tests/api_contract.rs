@@ -13076,6 +13076,7 @@ fn test_share_input_for_app(
         auto_consume_banked_reset: None,
         banked_reset_expiry_lead_minutes: None,
         previous_response_cache_enabled: None,
+        enabled_apps: None,
         bindings: Vec::new(),
         runtime_snapshot: None,
         user_grants: BTreeMap::new(),

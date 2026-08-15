@@ -18417,6 +18417,12 @@ fn select_share_provider(
             "share is not active: {share_id}"
         )));
     }
+    if !crate::domain::sharing::shares::share_app_api_enabled(share, app) {
+        return Err(ProxyError::bad_request(format!(
+            "share has disabled the {} API",
+            app.as_str()
+        )));
+    }
     let provider_id = share
         .bindings
         .iter()
