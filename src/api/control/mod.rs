@@ -17,8 +17,8 @@ use crate::clients::oauth::refresh::provider_native_refresh_available;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareAppAvailability, ShareAppProviders,
-    ShareAppRuntimes, ShareDescriptor, ShareRequestLogEntry, ShareSettingsPatch, ShareSupport,
+    ShareAppAvailability, ShareAppProviders, ShareAppRuntimes, ShareDescriptor,
+    ShareRequestLogEntry, ShareSettingsPatch, ShareSupport,
 };
 use crate::domain::sharing::shares::Share;
 use crate::domain::sharing::shares::ShareBinding;

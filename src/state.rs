@@ -7106,6 +7106,26 @@ impl ServerStateInner {
         }
     }
 
+    /// Builds the descriptor fields returned by the Router's periodic runtime refresh.
+    /// The Router replaces its stored app runtimes/providers with this response, so
+    /// memory-only display projections must be applied on every refresh.
+    pub(crate) fn share_router_runtime_descriptor(
+        &self,
+        share: &Share,
+        providers: &ProviderStore,
+        accounts: &AccountStore,
+        usage: &UsageStore,
+    ) -> ShareDescriptor {
+        let mut descriptor = descriptor_for_share_with_accounts_and_usage(
+            share,
+            providers,
+            Some(accounts),
+            Some(usage),
+        );
+        self.apply_ollama_cloud_share_projections(&mut descriptor, share, providers);
+        descriptor
+    }
+
     async fn ollama_cloud_share_ids_for_cache_key(
         &self,
         cache_key: &OllamaCloudCacheKey,
@@ -22593,8 +22613,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ollama_cached_identity_and_usage_project_only_into_router_descriptor() {
+    async fn ollama_cached_identity_and_usage_survive_router_runtime_refresh() {
         let state = test_state();
+        let mut config = state.config_snapshot().await;
+        config.client.tunnel_subdomain = Some("clienttest".to_string());
+        state.replace_config(config).await.unwrap();
         let provider_id = "ollama-share-display";
         install_ollama_bundle(&state, provider_id, "display-key").await;
         let provider_key = ProviderKey::new(AppKind::Codex, provider_id).unwrap();
@@ -22655,6 +22678,7 @@ mod tests {
 
         let providers = state.providers.read().await.clone();
         let accounts = state.accounts.read().await.clone();
+        let usage = state.usage.read().await.clone();
         let mut share = share("ollama-share", false, true, "active");
         share.provider_id = "legacy-provider-id".to_string();
         share.provider_type = ProviderType::OllamaCloud;
@@ -22674,9 +22698,9 @@ mod tests {
             state.ollama_cloud_share_ids_for_cache_key(&cache_key).await,
             vec!["ollama-share".to_string()]
         );
-        let mut descriptor =
+        let base_descriptor =
             descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
-        assert!(descriptor
+        assert!(base_descriptor
             .app_runtimes
             .codex
             .as_ref()
@@ -22684,7 +22708,25 @@ mod tests {
             .quota
             .is_none());
 
-        state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
+        let initial_ops = build_router_share_upsert_ops_with_policy(
+            &state,
+            &BTreeSet::from([share.id.clone()]),
+            true,
+        )
+        .await
+        .unwrap();
+        let initial_descriptor = initial_ops[0].share.as_ref().unwrap();
+        assert_eq!(
+            initial_descriptor
+                .app_runtimes
+                .codex
+                .as_ref()
+                .and_then(|runtime| runtime.account_email.as_deref()),
+            Some("owner@example.com")
+        );
+
+        let descriptor =
+            state.share_router_runtime_descriptor(&share, &providers, &accounts, &usage);
 
         let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
         let quota = runtime.quota.as_ref().unwrap();
