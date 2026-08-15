@@ -93,6 +93,9 @@ struct MigrationManifest {
 }
 
 pub fn preflight(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationReport> {
+    let runtime_defaults =
+        crate::domain::settings::config::ServerConfig::load_or_default(config_dir)?
+            .provider_runtime_defaults;
     let path = providers_path(config_dir);
     if !path.exists() {
         let existing_key = load_root_key_if_present(config_dir)?;
@@ -120,6 +123,7 @@ pub fn preflight(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationRe
     if super::store_v2::looks_like_s2(&value) {
         let mut store = ProviderStore::load_or_default(config_dir)?;
         let accounts = AccountStore::load_or_default(config_dir)?;
+        store.set_runtime_defaults(runtime_defaults);
         store.rebuild_runtime_index(&accounts)?;
         return Ok(ProviderStorageMigrationReport {
             source_format: ProviderStoreFormat::S2,
@@ -147,6 +151,7 @@ pub fn preflight(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationRe
     let mut source = ProviderStore::load_or_default(config_dir)?;
     source.prepare_legacy_runtime_view();
     let accounts = AccountStore::load_or_default(config_dir)?;
+    source.set_runtime_defaults(runtime_defaults.clone());
     source.validate_for_commit()?;
     source.rebuild_runtime_index(&accounts)?;
 
@@ -203,6 +208,7 @@ pub fn preflight(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationRe
     candidate.store_generation = 1;
     let encoded = super::store_v2::encode_s2(&candidate)?;
     let mut roundtrip = super::store_v2::decode_s2(encoded, resolved)?;
+    roundtrip.set_runtime_defaults(runtime_defaults);
     roundtrip.rebuild_runtime_index(&accounts)?;
     let runtime_plan_parity = runtime_plans(&source) == runtime_plans(&roundtrip);
 
@@ -294,6 +300,10 @@ pub fn apply(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationOutcom
     let accounts = AccountStore::load_or_default(config_dir)?;
     let mut verified = ProviderStore::load_or_default(config_dir)
         .context("reload Provider S2 store after migration")?;
+    verified.set_runtime_defaults(
+        crate::domain::settings::config::ServerConfig::load_or_default(config_dir)?
+            .provider_runtime_defaults,
+    );
     verified
         .rebuild_runtime_index(&accounts)
         .context("compile Provider S2 runtime after migration")?;

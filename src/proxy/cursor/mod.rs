@@ -35,7 +35,7 @@ use request_builder::{build_plan, validate_tool_result_context, AgentRunPlan, In
 
 pub use agent_driver::{forward_agentservice, AgentServiceForwardOptions};
 
-pub(super) fn apply_agentservice_model_selection(
+pub(crate) fn apply_agentservice_model_selection(
     request: &mut AdapterRequest,
 ) -> Result<model::CursorModelResolution, ProxyError> {
     let explicit_selector = request
@@ -189,6 +189,23 @@ pub fn agentservice_driver_requested(stored: &StoredProvider) -> bool {
         return enabled;
     }
     true
+}
+
+pub(crate) fn validate_runtime_configuration(stored: &StoredProvider) -> Result<(), ProxyError> {
+    if !agentservice_driver_requested(stored) {
+        return Err(ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "Cursor {} AgentService rail is disabled for this Provider",
+                match stored.provider_type {
+                    ProviderType::CursorOAuth => "OAuth",
+                    ProviderType::CursorApiKey => "API key",
+                    _ => "unknown",
+                }
+            ),
+        });
+    }
+    agent_driver::validate_cursor_runtime_configuration(stored)
 }
 
 pub fn build_agent_plan_preview(

@@ -522,6 +522,34 @@ pub async fn forward(
     .await
 }
 
+pub(crate) async fn forward_provider_test(
+    state: ServerState,
+    route: ProxyRoute,
+    execution: ProviderExecution,
+    gemini_path: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    if execution.stored.app != route.app() {
+        return Err(ProxyError::bad_request(
+            "Provider test route does not match the Provider app",
+        ));
+    }
+    if route == ProxyRoute::ClaudeCountTokens
+        && !provider_supports_claude_count_tokens(&execution.stored)
+    {
+        return Err(ProxyError::bad_request(
+            "Claude count_tokens requires a native Anthropic provider",
+        ));
+    }
+    let attempt_context = ForwardAttemptContext {
+        execution: Some(execution),
+        provider_binding_pinned: true,
+        ..ForwardAttemptContext::default()
+    };
+    forward_with_attempt(state, route, gemini_path, headers, body, attempt_context).await
+}
+
 #[cfg(test)]
 async fn forward_for_test_surface(
     state: ServerState,
@@ -541,20 +569,9 @@ async fn forward_for_test_surface(
         &provider_id,
         Some(&snapshot),
     )?;
-    if route == ProxyRoute::ClaudeCountTokens
-        && !provider_supports_claude_count_tokens(&selection.execution.stored)
-    {
-        return Err(ProxyError::bad_request(
-            "Claude count_tokens requires a native Anthropic provider",
-        ));
-    }
+    let execution = selection.execution;
     drop(providers);
-    let attempt_context = ForwardAttemptContext {
-        execution: Some(selection.execution),
-        provider_binding_pinned: true,
-        ..ForwardAttemptContext::default()
-    };
-    forward_with_attempt(state, route, gemini_path, headers, body, attempt_context).await
+    forward_provider_test(state, route, execution, gemini_path, headers, body).await
 }
 
 struct CodexAuthContext {

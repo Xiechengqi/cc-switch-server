@@ -96,15 +96,17 @@ use crate::domain::providers::model::{
 };
 use crate::domain::providers::ollama_cloud::{
     snapshot_status as ollama_cloud_snapshot_status, OllamaCloudAccountView, OllamaCloudCache,
-    OllamaCloudCacheKey, OllamaCloudErrorKind, OllamaCloudSection, OllamaCloudSectionState,
-    OllamaCloudSnapshot, OllamaCloudSnapshotSource, OllamaCloudUsageView,
+    OllamaCloudCacheKey, OllamaCloudErrorKind, OllamaCloudObserved, OllamaCloudSection,
+    OllamaCloudSectionState, OllamaCloudSnapshot, OllamaCloudSnapshotSource, OllamaCloudUsageView,
+    OllamaCloudUsageWindowKind,
 };
 use crate::domain::providers::registry::{
     profile_by_id, resolve_custom_binding, CreationPolicy, CredentialPolicy, CustomBindingInput,
     DriverBinding, ProfileId, ProviderFieldScope, ProviderKey,
 };
 use crate::domain::providers::runtime::{
-    compile_runtime_plan, managed_account_binding, managed_account_provider_type,
+    compile_runtime_plan_with_defaults, managed_account_binding, managed_account_provider_type,
+    ProviderRuntimeDefaults,
 };
 use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
 use crate::domain::router::{ClientSubdomain, PROTOCOL_EPOCH};
@@ -118,8 +120,9 @@ use crate::domain::sharing::previous_response_cache::{
     PreviousResponseCache, PreviousResponseCacheScope,
 };
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint, ShareDescriptor,
-    ShareRequestLogEntry, ShareSyncOperation,
+    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint, ShareAppProvider,
+    ShareDescriptor, ShareRequestLogEntry, ShareSyncOperation, ShareUpstreamProvider,
+    ShareUpstreamQuota, ShareUpstreamQuotaTier,
 };
 use crate::domain::sharing::shares::{
     RouterDescriptorSyncMode, Share, ShareConcurrencyLimit, ShareDeleteTombstone, ShareInvocation,
@@ -1419,6 +1422,92 @@ struct OllamaCloudTarget {
 }
 
 #[derive(Debug, Clone)]
+struct OllamaCloudShareProjection {
+    account_email: Option<String>,
+    quota: ShareUpstreamQuota,
+}
+
+fn trimmed_ollama_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn ollama_cloud_share_projection(
+    account: Option<&OllamaCloudObserved<OllamaCloudAccountView>>,
+    usage: Option<&OllamaCloudObserved<OllamaCloudUsageView>>,
+) -> Option<OllamaCloudShareProjection> {
+    if account.is_none() && usage.is_none() {
+        return None;
+    }
+    let account_email = account.and_then(|item| trimmed_ollama_value(item.data.email.as_deref()));
+    let plan = account.and_then(|item| trimmed_ollama_value(item.data.plan.as_deref()));
+    let activity_cost = usage.and_then(|item| {
+        item.data
+            .activity
+            .as_ref()
+            .and_then(|activity| trimmed_ollama_value(activity.cost.as_deref()))
+    });
+    let queried_at = account
+        .into_iter()
+        .map(|item| item.observed_at_ms)
+        .chain(usage.into_iter().map(|item| item.observed_at_ms))
+        .max();
+    let tiers = usage
+        .map(|item| {
+            item.data
+                .limits
+                .iter()
+                .map(|window| ShareUpstreamQuotaTier {
+                    label: match window.kind {
+                        OllamaCloudUsageWindowKind::Session => "session",
+                        OllamaCloudUsageWindowKind::Weekly => "weekly",
+                    }
+                    .to_string(),
+                    utilization: window.utilization,
+                    resets_at: None,
+                    used: None,
+                    limit: None,
+                    unit: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(OllamaCloudShareProjection {
+        account_email,
+        quota: ShareUpstreamQuota {
+            status: "ok".to_string(),
+            plan,
+            activity_cost,
+            queried_at,
+            subscription_period_end: None,
+            availability: None,
+            blocked_until: None,
+            blocked_reason: None,
+            blocked_scope: None,
+            tiers,
+        },
+    })
+}
+
+fn apply_ollama_projection_to_upstream(
+    provider: &mut ShareUpstreamProvider,
+    projection: &OllamaCloudShareProjection,
+) {
+    provider.account_email = projection.account_email.clone();
+    provider.quota = Some(projection.quota.clone());
+}
+
+fn apply_ollama_projection_to_app_provider(
+    provider: &mut ShareAppProvider,
+    projection: &OllamaCloudShareProjection,
+) {
+    provider.account_email = projection.account_email.clone();
+    provider.quota = Some(projection.quota.clone());
+}
+
+#[derive(Debug, Clone)]
 struct OllamaCloudRefreshResult {
     source: OllamaCloudSnapshotSource,
     account: OllamaCloudSection<OllamaCloudAccountView>,
@@ -2460,6 +2549,7 @@ fn prepare_codex_workspace_rebind_transaction(
             .context("validate staged workspace rebind accounts")?;
         let mut staged_providers = ProviderStore::load_runtime_or_default(&stage_dir)
             .context("validate staged workspace rebind Providers")?;
+        staged_providers.set_runtime_defaults(current_providers.runtime_defaults().clone());
         staged_providers
             .rebuild_runtime_index(&staged_accounts)
             .context("compile staged workspace rebind Provider runtime index")?;
@@ -2645,9 +2735,11 @@ fn validate_server_backup_restore_stage(
         })
         .transpose()?;
 
-    if includes("server.json") {
-        ServerConfig::load_or_default(stage_dir).context("validate staged server.json")?;
-    }
+    let effective_config = if includes("server.json") {
+        ServerConfig::load_or_default(stage_dir).context("validate staged server.json")?
+    } else {
+        ServerConfig::load_or_default(config_dir).context("load current server.json")?
+    };
     if includes("email-auth.json") {
         crate::clients::router::email_auth::load_state(stage_dir)
             .context("validate staged email-auth.json")?;
@@ -2665,6 +2757,7 @@ fn validate_server_backup_restore_stage(
             providers.prepare_legacy_runtime_view();
         }
         providers.validate_for_commit()?;
+        providers.set_runtime_defaults(effective_config.provider_runtime_defaults.clone());
         providers
             .rebuild_runtime_index(
                 staged_accounts
@@ -3408,7 +3501,8 @@ fn provider_bundle_views_from_store(
             .push(ProviderView::from_stored_with_order_and_runtime(
                 &stored,
                 store.provider_order_index(&stored),
-                compile_runtime_plan(&stored, accounts).ok(),
+                compile_runtime_plan_with_defaults(&stored, accounts, store.runtime_defaults())
+                    .ok(),
             ));
     }
     let mut bundles = grouped
@@ -3446,6 +3540,7 @@ fn validate_provider_bundle_field_scopes(
     family: &crate::domain::providers::registry::ProviderFamilySpec,
     surfaces: &[StoredProvider],
     accounts: &AccountStore,
+    defaults: &ProviderRuntimeDefaults,
 ) -> Result<(), ProviderCommandError> {
     let enabled_surfaces = surfaces
         .iter()
@@ -3457,7 +3552,7 @@ fn validate_provider_bundle_field_scopes(
     let plans = enabled_surfaces
         .iter()
         .map(|surface| {
-            compile_runtime_plan(surface, accounts)
+            compile_runtime_plan_with_defaults(surface, accounts, defaults)
                 .map_err(|error| ProviderCommandError::Invalid(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -4256,6 +4351,11 @@ fn provider_action_preview_token(
             .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
     );
     digest.update(&[0]);
+    digest.update(
+        &serde_json::to_vec(current.runtime_defaults())
+            .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?,
+    );
+    digest.update(&[0]);
     let account_identity = accounts
         .accounts
         .iter()
@@ -4283,10 +4383,11 @@ fn provider_runtime_transition(
     before: &StoredProvider,
     after: &StoredProvider,
     accounts: &AccountStore,
+    defaults: &ProviderRuntimeDefaults,
 ) -> Result<(ProviderRuntimeTransitionPreview, Vec<String>), ProviderCommandError> {
-    let before_plan = crate::domain::providers::runtime::compile_runtime_plan(before, accounts)
+    let before_plan = compile_runtime_plan_with_defaults(before, accounts, defaults)
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
-    let after_plan = crate::domain::providers::runtime::compile_runtime_plan(after, accounts)
+    let after_plan = compile_runtime_plan_with_defaults(after, accounts, defaults)
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
     let mut warnings = after_plan.warnings.clone();
     if before_plan.driver_id != after_plan.driver_id {
@@ -4312,7 +4413,7 @@ fn provider_share_projection_signature(
     store: &ProviderStore,
     app: AppKind,
     provider_id: &str,
-) -> Option<(String, String, String, String)> {
+) -> Option<(u64, String, String, String, String, String)> {
     let stored = store
         .providers
         .iter()
@@ -4320,6 +4421,10 @@ fn provider_share_projection_signature(
     let runtime_fingerprint = store
         .runtime_plan(app, provider_id)
         .map(|plan| plan.runtime_fingerprint.clone())
+        .unwrap_or_else(|| "missing-runtime-plan".to_string());
+    let health_fingerprint = store
+        .runtime_plan(app, provider_id)
+        .map(|plan| plan.health_fingerprint())
         .unwrap_or_else(|| "missing-runtime-plan".to_string());
     let model_policy_scope = match bundle_model_policy_scope(&stored.provider) {
         Ok(Some(scope)) => scope.as_str().to_string(),
@@ -4340,7 +4445,9 @@ fn provider_share_projection_signature(
         Err(error) => format!("invalid:{error}"),
     };
     Some((
+        stored.resource.revision,
         runtime_fingerprint,
+        health_fingerprint,
         model_policy_scope,
         model_policy_source,
         test_app,
@@ -4489,7 +4596,8 @@ fn prepare_adopt_provider_profile(
     candidate
         .rebuild_runtime_index(accounts)
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
-    let (runtime, warnings) = provider_runtime_transition(&source, &target, accounts)?;
+    let (runtime, warnings) =
+        provider_runtime_transition(&source, &target, accounts, current.runtime_defaults())?;
     let preview = ProviderIdentityChangePreview {
         preview_token,
         action: ProviderIdentityAction::AdoptProfile,
@@ -4593,7 +4701,8 @@ fn prepare_rebind_custom_provider(
     candidate
         .rebuild_runtime_index(accounts)
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
-    let (runtime, warnings) = provider_runtime_transition(&source, &target, accounts)?;
+    let (runtime, warnings) =
+        provider_runtime_transition(&source, &target, accounts, current.runtime_defaults())?;
     let preview = ProviderIdentityChangePreview {
         preview_token,
         action: ProviderIdentityAction::RebindCustom,
@@ -4727,7 +4836,8 @@ fn prepare_clone_provider_as_custom(
     candidate
         .rebuild_runtime_index(accounts)
         .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
-    let (runtime, warnings) = provider_runtime_transition(&source, &target, accounts)?;
+    let (runtime, warnings) =
+        provider_runtime_transition(&source, &target, accounts, current.runtime_defaults())?;
     let preview = ProviderIdentityChangePreview {
         preview_token,
         action: ProviderIdentityAction::CloneAsCustom,
@@ -5346,6 +5456,7 @@ impl ServerStateInner {
         let reasoning_root_key = crate::infra::credentials::load_or_create_root_key(&config_dir)
             .context("resolve proxy reasoning bridge root key")?;
         crate::proxy::reasoning_bridge::initialize(&reasoning_root_key.key)?;
+        providers.set_runtime_defaults(config.provider_runtime_defaults.clone());
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
@@ -5690,6 +5801,7 @@ impl ServerStateInner {
         preserve_setup_completion_from_stale_snapshot(&current, &mut config);
         preserve_client_tunnel_claim_from_stale_snapshot(&current, &mut config);
         preserve_client_subdomain_adoption_from_stale_snapshot(&current, &mut config);
+        config.provider_runtime_defaults = current.provider_runtime_defaults.clone();
         let http_client = build_http_client()?;
         persist_state_snapshot(&self.config_dir, config.clone()).await?;
         *self.http_client.write().await = http_client;
@@ -5722,6 +5834,88 @@ impl ServerStateInner {
             Ok(())
         })
         .await
+    }
+
+    pub async fn set_provider_runtime_defaults(
+        self: &Arc<Self>,
+        defaults: ProviderRuntimeDefaults,
+    ) -> anyhow::Result<()> {
+        defaults.validate()?;
+        let _references = self.reference_mutations.lock().await;
+        let _provider_commit = self.provider_commits.lock().await;
+        let provider_keys = {
+            let _config_commit = self.config_persistence.gate.lock().await;
+            let mut candidate_config = self.config.read().await.clone();
+            candidate_config.provider_runtime_defaults = defaults.clone();
+            let mut candidate_providers = self.providers.read().await.clone();
+            let accounts = self.accounts.read().await.clone();
+            candidate_providers.set_runtime_defaults(defaults);
+            candidate_providers
+                .rebuild_runtime_index(&accounts)
+                .context("compile Provider runtime index for Server defaults")?;
+            let provider_keys = candidate_providers
+                .providers
+                .iter()
+                .map(|provider| (provider.app, provider.provider.id.clone()))
+                .collect::<BTreeSet<_>>();
+
+            persist_state_snapshot(&self.config_dir, candidate_config.clone()).await?;
+            *self.config.write().await = candidate_config;
+            *self.providers.write().await = candidate_providers;
+            self.config_persistence.mark_published();
+            provider_keys
+        };
+
+        let providers = self.providers.read().await.clone();
+        let accounts = self.accounts.read().await.clone();
+        let usage = self.usage.read().await.clone();
+        let refreshed_share_ids = self
+            .mutate_shares_immediate(|shares| {
+                shares.reconcile_runtime_snapshots_for_providers(
+                    &provider_keys,
+                    &providers,
+                    Some(&accounts),
+                    &usage,
+                )
+            })
+            .await?;
+        let share_ids = {
+            let shares = self.shares.read().await;
+            provider_keys
+                .iter()
+                .flat_map(|(app, provider_id)| shares.share_ids_for_provider(*app, provider_id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        if !refreshed_share_ids.is_empty() {
+            self.emit_event(
+                ServerEvent::new("share.changed", "share")
+                    .message("provider_runtime_defaults_updated"),
+            );
+        }
+        let router_registered = self
+            .config_snapshot()
+            .await
+            .has_registered_router_identity();
+        let force_router_sync = !refreshed_share_ids.is_empty();
+        drop(_provider_commit);
+        drop(_references);
+        if router_registered && !share_ids.is_empty() {
+            let state = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    sync_shares_to_router_with_policy(&state, &share_ids, force_router_sync).await
+                {
+                    tracing::warn!(
+                        share_count = share_ids.len(),
+                        %error,
+                        "Provider runtime defaults Share projection sync remains pending"
+                    );
+                }
+            });
+        }
+        Ok(())
     }
 
     pub async fn config_snapshot(&self) -> ServerConfig {
@@ -6455,6 +6649,7 @@ impl ServerStateInner {
             .context("resolve proxy reasoning bridge root key")?;
         let mut providers = ProviderStore::load_runtime_or_default(&self.config_dir)?;
         let accounts = AccountStore::load_or_default(&self.config_dir)?;
+        providers.set_runtime_defaults(config.provider_runtime_defaults.clone());
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
@@ -6845,8 +7040,128 @@ impl ServerStateInner {
             .invalidate(key);
     }
 
-    pub async fn ollama_cloud_snapshot(
+    fn ollama_cloud_share_projection_for_provider(
         &self,
+        providers: &ProviderStore,
+        app: AppKind,
+        provider_id: &str,
+        now_ms: i64,
+    ) -> Option<OllamaCloudShareProjection> {
+        let provider_key = ProviderKey::new(app, provider_id.to_string()).ok()?;
+        let target = ollama_cloud_target_from_store(providers, &provider_key).ok()?;
+        let cache = self
+            .ollama_cloud_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let account = cache.stale_account(&target.cache_key, now_ms);
+        let usage = cache.stale_usage(&target.cache_key, now_ms);
+        ollama_cloud_share_projection(account.as_ref(), usage.as_ref())
+    }
+
+    fn apply_ollama_cloud_share_projections(
+        &self,
+        descriptor: &mut ShareDescriptor,
+        share: &Share,
+        providers: &ProviderStore,
+    ) {
+        let now_ms = now_ms_i64();
+        let bindings = descriptor
+            .bindings
+            .iter()
+            .map(|(app, provider_id)| (*app, provider_id.clone()))
+            .collect::<Vec<_>>();
+        for (app, provider_id) in bindings {
+            let Some(projection) = self.ollama_cloud_share_projection_for_provider(
+                providers,
+                app,
+                &provider_id,
+                now_ms,
+            ) else {
+                continue;
+            };
+            let runtime = match app {
+                AppKind::Claude => descriptor.app_runtimes.claude.as_mut(),
+                AppKind::Codex => descriptor.app_runtimes.codex.as_mut(),
+                AppKind::Gemini => descriptor.app_runtimes.gemini.as_mut(),
+            };
+            if let Some(runtime) = runtime {
+                apply_ollama_projection_to_upstream(runtime, &projection);
+            }
+            let app_providers = match app {
+                AppKind::Claude => &mut descriptor.app_providers.claude,
+                AppKind::Codex => &mut descriptor.app_providers.codex,
+                AppKind::Gemini => &mut descriptor.app_providers.gemini,
+            };
+            if let Some(provider) = app_providers
+                .iter_mut()
+                .find(|provider| provider.id == provider_id)
+            {
+                apply_ollama_projection_to_app_provider(provider, &projection);
+            }
+            if share.app == app {
+                if let Some(provider) = descriptor.upstream_provider.as_mut() {
+                    apply_ollama_projection_to_upstream(provider, &projection);
+                }
+            }
+        }
+    }
+
+    async fn ollama_cloud_share_ids_for_cache_key(
+        &self,
+        cache_key: &OllamaCloudCacheKey,
+    ) -> Vec<String> {
+        let providers = self.providers.read().await;
+        let provider_keys = providers
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                let provider_key =
+                    ProviderKey::new(provider.app, provider.provider.id.clone()).ok()?;
+                let target = ollama_cloud_target_from_store(&providers, &provider_key).ok()?;
+                (target.cache_key == *cache_key).then_some(provider_key)
+            })
+            .collect::<Vec<_>>();
+        drop(providers);
+        let shares = self.shares.read().await;
+        provider_keys
+            .iter()
+            .flat_map(|provider_key| {
+                shares.share_ids_for_provider(provider_key.app, &provider_key.provider_id)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn schedule_ollama_cloud_share_projection_sync(
+        self: &Arc<Self>,
+        cache_key: OllamaCloudCacheKey,
+    ) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if !state
+                .config_snapshot()
+                .await
+                .has_registered_router_identity()
+            {
+                return;
+            }
+            let share_ids = state.ollama_cloud_share_ids_for_cache_key(&cache_key).await;
+            if share_ids.is_empty() {
+                return;
+            }
+            if let Err(error) = sync_shares_to_router_with_policy(&state, &share_ids, true).await {
+                tracing::warn!(
+                    share_count = share_ids.len(),
+                    %error,
+                    "Ollama account display projection sync to Router failed"
+                );
+            }
+        });
+    }
+
+    pub async fn ollama_cloud_snapshot(
+        self: &Arc<Self>,
         provider_key: ProviderKey,
         force_refresh: bool,
     ) -> anyhow::Result<Result<OllamaCloudSnapshot, ProviderCommandError>> {
@@ -6923,12 +7238,14 @@ impl ServerStateInner {
                             account.clone(),
                             usage.clone(),
                         );
-                        return Ok(Ok(ollama_cloud_snapshot(
+                        let snapshot = ollama_cloud_snapshot(
                             &current,
                             OllamaCloudSnapshotSource::Configuration,
                             account,
                             usage,
-                        )));
+                        );
+                        self.schedule_ollama_cloud_share_projection_sync(target.cache_key.clone());
+                        return Ok(Ok(snapshot));
                     }
                 }
             };
@@ -6989,7 +7306,9 @@ impl ServerStateInner {
                 OllamaCloudSnapshotSource::Live
             };
             refresh_flight.complete(source, account.clone(), usage.clone());
-            return Ok(Ok(ollama_cloud_snapshot(&current, source, account, usage)));
+            let snapshot = ollama_cloud_snapshot(&current, source, account, usage);
+            self.schedule_ollama_cloud_share_projection_sync(target.cache_key.clone());
+            return Ok(Ok(snapshot));
         }
 
         Ok(Err(ProviderCommandError::Conflict {
@@ -7190,7 +7509,8 @@ impl ServerStateInner {
                 ProviderView::from_stored_with_order_and_runtime(
                     stored,
                     store.provider_order_index(stored),
-                    compile_runtime_plan(stored, &accounts).ok(),
+                    compile_runtime_plan_with_defaults(stored, &accounts, store.runtime_defaults())
+                        .ok(),
                 )
             })
             .collect()
@@ -7710,7 +8030,12 @@ impl ServerStateInner {
                     );
                 }
             }
-            validate_provider_bundle_field_scopes(family, &result.0, &accounts)?;
+            validate_provider_bundle_field_scopes(
+                family,
+                &result.0,
+                &accounts,
+                store.runtime_defaults(),
+            )?;
             if result.1 {
                 validate_ordinary_provider_subscription_change(
                     &current, store, &accounts, &shares,
@@ -7723,7 +8048,12 @@ impl ServerStateInner {
                     ProviderView::from_stored_with_order_and_runtime(
                         stored,
                         store.provider_order_index(stored),
-                        compile_runtime_plan(stored, &accounts).ok(),
+                        compile_runtime_plan_with_defaults(
+                            stored,
+                            &accounts,
+                            store.runtime_defaults(),
+                        )
+                        .ok(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -8420,8 +8750,16 @@ impl ServerStateInner {
                 self.refresh_ollama_cloud_after_provider_commit(provider_key);
             }
         }
-        let changed_capacity_share_ids = self
-            .apply_share_capacity_pool_updates_under_provider_commit(&capacity_pool_updates)
+        let published_providers = self.providers.read().await.clone();
+        let usage = self.usage.read().await.clone();
+        let (changed_capacity_share_ids, changed_runtime_share_ids) = self
+            .apply_share_provider_updates_under_provider_commit(
+                &capacity_pool_updates,
+                &changed_projection_keys,
+                &published_providers,
+                &accounts,
+                &usage,
+            )
             .await?;
         if let Err(error) = self.prune_provider_health_snapshots().await {
             tracing::warn!(
@@ -8429,7 +8767,11 @@ impl ServerStateInner {
                 "Provider commit succeeded but stale health snapshots could not be pruned"
             );
         }
-        if !changed_projection_keys.is_empty() || !changed_capacity_share_ids.is_empty() {
+        if !changed_runtime_share_ids.is_empty() || !changed_capacity_share_ids.is_empty() {
+            self.emit_event(
+                ServerEvent::new("share.changed", "share")
+                    .message("provider_runtime_metadata_updated"),
+            );
             let mut share_ids = {
                 let shares = self.shares.read().await;
                 changed_projection_keys
@@ -8440,8 +8782,10 @@ impl ServerStateInner {
                     .collect::<Vec<_>>()
             };
             share_ids.extend(changed_capacity_share_ids);
+            share_ids.extend(changed_runtime_share_ids.iter().cloned());
             share_ids.sort();
             share_ids.dedup();
+            let force_router_sync = !changed_runtime_share_ids.is_empty();
             if !share_ids.is_empty()
                 && self
                     .config_snapshot()
@@ -8450,7 +8794,10 @@ impl ServerStateInner {
             {
                 let state = Arc::clone(self);
                 tokio::spawn(async move {
-                    if let Err(error) = sync_shares_to_router(&state, &share_ids).await {
+                    if let Err(error) =
+                        sync_shares_to_router_with_policy(&state, &share_ids, force_router_sync)
+                            .await
+                    {
                         tracing::warn!(
                             share_count = share_ids.len(),
                             %error,
@@ -8463,23 +8810,33 @@ impl ServerStateInner {
         Ok(Ok(result))
     }
 
-    async fn apply_share_capacity_pool_updates_under_provider_commit(
+    async fn apply_share_provider_updates_under_provider_commit(
         &self,
         capacity_pool_updates: &BTreeMap<String, String>,
-    ) -> anyhow::Result<Vec<String>> {
-        if capacity_pool_updates.is_empty() {
-            return Ok(Vec::new());
+        runtime_provider_keys: &BTreeSet<(AppKind, String)>,
+        providers: &ProviderStore,
+        accounts: &AccountStore,
+        usage: &UsageStore,
+    ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+        if capacity_pool_updates.is_empty() && runtime_provider_keys.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
         }
         let _commit = self.shares_persistence.gate.lock().await;
         let mut candidate = self.shares.read().await.clone();
-        let updated_ids = candidate.apply_capacity_pool_ids(capacity_pool_updates);
-        if updated_ids.is_empty() {
-            return Ok(updated_ids);
+        let capacity_ids = candidate.apply_capacity_pool_ids(capacity_pool_updates);
+        let runtime_ids = candidate.reconcile_runtime_snapshots_for_providers(
+            runtime_provider_keys,
+            providers,
+            Some(accounts),
+            usage,
+        );
+        if capacity_ids.is_empty() && runtime_ids.is_empty() {
+            return Ok((capacity_ids, runtime_ids));
         }
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
         *self.shares.write().await = candidate;
         self.shares_persistence.mark_published();
-        Ok(updated_ids)
+        Ok((capacity_ids, runtime_ids))
     }
 
     pub async fn save_accounts(&self) -> anyhow::Result<()> {
@@ -10201,7 +10558,7 @@ impl ServerStateInner {
             }
             let runtime_matches =
                 match providers.runtime_plan(observation.app, &observation.provider_id) {
-                    Some(plan) => plan.runtime_fingerprint == observation.runtime_fingerprint,
+                    Some(plan) => plan.health_fingerprint() == observation.runtime_fingerprint,
                     None => observation.runtime_fingerprint.is_empty(),
                 };
             if !runtime_matches {
@@ -16503,6 +16860,7 @@ pub(crate) async fn authoritative_share_descriptor(
         );
         let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
         let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+        state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
         let share_id = share_id.to_string();
         let prepared = state
             .try_mutate_shares_immediate(|store| {
@@ -17079,6 +17437,14 @@ pub(crate) async fn sync_shares_to_router(
     state: &ServerState,
     share_ids: &[String],
 ) -> anyhow::Result<()> {
+    sync_shares_to_router_with_policy(state, share_ids, false).await
+}
+
+async fn sync_shares_to_router_with_policy(
+    state: &ServerState,
+    share_ids: &[String],
+    force: bool,
+) -> anyhow::Result<()> {
     if share_ids.is_empty() {
         return Ok(());
     }
@@ -17098,7 +17464,7 @@ pub(crate) async fn sync_shares_to_router(
             })
             .collect::<BTreeSet<_>>()
     };
-    let operations = build_router_share_upsert_ops(state, &active_ids).await?;
+    let operations = build_router_share_upsert_ops_with_policy(state, &active_ids, force).await?;
     if operations.is_empty() {
         return Ok(());
     }
@@ -17349,8 +17715,9 @@ async fn build_router_share_upsert_ops_with_policy(
                 Some(&accounts),
                 Some(&usage),
             );
-            let descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
+            let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
             let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+            state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
             Ok((share.id.clone(), descriptor, fingerprint))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -18080,6 +18447,7 @@ async fn issue_share_tunnel_lease(
         Some(&usage),
     );
     let mut descriptor = descriptor;
+    state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
     descriptor.subdomain = client::canonicalize_share_subdomain(&config, &descriptor.subdomain)?;
     let requested_subdomain = descriptor.subdomain.clone();
     let http_client = state.http_client().await;
@@ -22225,6 +22593,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ollama_cached_identity_and_usage_project_only_into_router_descriptor() {
+        let state = test_state();
+        let provider_id = "ollama-share-display";
+        install_ollama_bundle(&state, provider_id, "display-key").await;
+        let provider_key = ProviderKey::new(AppKind::Codex, provider_id).unwrap();
+        let target = {
+            let providers = state.providers.read().await;
+            ollama_cloud_target_from_store(&providers, &provider_key).unwrap()
+        };
+        let cache_key = target.cache_key.clone();
+        let observed_at_ms = now_ms_i64();
+        {
+            let mut cache = state
+                .ollama_cloud_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert_account(
+                target.cache_key.clone(),
+                OllamaCloudAccountView {
+                    id: Some("account-1".to_string()),
+                    email: Some("owner@example.com".to_string()),
+                    name: Some("owner".to_string()),
+                    first_name: None,
+                    last_name: None,
+                    avatar_url: None,
+                    plan: Some("free".to_string()),
+                    created_at_ms: None,
+                },
+                observed_at_ms,
+            );
+            cache.insert_usage(
+                cache_key.clone(),
+                OllamaCloudUsageView {
+                    limits: vec![
+                        crate::domain::providers::ollama_cloud::OllamaCloudUsageWindow {
+                            kind: OllamaCloudUsageWindowKind::Session,
+                            utilization: 0.1,
+                            models: Vec::new(),
+                            models_truncated: false,
+                        },
+                        crate::domain::providers::ollama_cloud::OllamaCloudUsageWindow {
+                            kind: OllamaCloudUsageWindowKind::Weekly,
+                            utilization: 0.1,
+                            models: Vec::new(),
+                            models_truncated: false,
+                        },
+                    ],
+                    activity: Some(
+                        crate::domain::providers::ollama_cloud::OllamaCloudActivityView {
+                            cost: Some("0.00000".to_string()),
+                            period: None,
+                            models: Vec::new(),
+                            models_truncated: false,
+                        },
+                    ),
+                },
+                observed_at_ms,
+            );
+        }
+
+        let providers = state.providers.read().await.clone();
+        let accounts = state.accounts.read().await.clone();
+        let mut share = share("ollama-share", false, true, "active");
+        share.provider_id = "legacy-provider-id".to_string();
+        share.provider_type = ProviderType::OllamaCloud;
+        share.bindings = vec![crate::domain::sharing::shares::ShareBinding {
+            app: AppKind::Codex,
+            provider_id: provider_id.to_string(),
+            provider_type: ProviderType::OllamaCloud,
+        }];
+        state
+            .mutate_shares_immediate({
+                let share = share.clone();
+                move |shares| shares.shares.push(share)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state.ollama_cloud_share_ids_for_cache_key(&cache_key).await,
+            vec!["ollama-share".to_string()]
+        );
+        let mut descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        assert!(descriptor
+            .app_runtimes
+            .codex
+            .as_ref()
+            .unwrap()
+            .quota
+            .is_none());
+
+        state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
+
+        let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
+        let quota = runtime.quota.as_ref().unwrap();
+        assert_eq!(runtime.account_email.as_deref(), Some("owner@example.com"));
+        assert_eq!(quota.plan.as_deref(), Some("free"));
+        assert_eq!(quota.activity_cost.as_deref(), Some("0.00000"));
+        assert_eq!(quota.queried_at, Some(observed_at_ms));
+        assert_eq!(quota.tiers[0].label, "session");
+        assert_eq!(quota.tiers[0].utilization, 0.1);
+        assert_eq!(quota.tiers[1].label, "weekly");
+        assert_eq!(quota.tiers[1].utilization, 0.1);
+        assert_eq!(runtime.quota_percent, None);
+        assert_eq!(runtime.quota_blocked, None);
+        let app_provider = &descriptor.app_providers.codex[0];
+        assert_eq!(
+            app_provider.account_email.as_deref(),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            app_provider
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.activity_cost.as_deref()),
+            Some("0.00000")
+        );
+        assert_eq!(
+            descriptor
+                .upstream_provider
+                .as_ref()
+                .and_then(|provider| provider.account_email.as_deref()),
+            Some("owner@example.com")
+        );
+        assert!(state.accounts.read().await.accounts.is_empty());
+    }
+
+    #[tokio::test]
     async fn ollama_cloud_partial_refresh_preserves_each_successful_section_as_stale() {
         let state = test_state();
         install_ollama_bundle(&state, "ollama-partial", "partial-key").await;
@@ -22699,7 +23195,10 @@ mod tests {
 
     #[test]
     fn provider_share_projection_changes_track_bundle_runtime_metadata() {
-        let before = colliding_bundle_store("scope-change-bundle");
+        let mut before = colliding_bundle_store("scope-change-bundle");
+        before
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
         let mut after = before.clone();
         for stored in &mut after.providers {
             if crate::domain::providers::bundle::bundle_id(&stored.provider)
@@ -22711,6 +23210,9 @@ mod tests {
                     .insert("modelPolicyScope".to_string(), json!("per_app"));
             }
         }
+        after
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
 
         assert_eq!(
             provider_share_projection_changes(&before, &after),
@@ -22731,8 +23233,33 @@ mod tests {
                     .insert("testApp".to_string(), json!("codex"));
             }
         }
+        test_app_changed
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
         assert_eq!(
             provider_share_projection_changes(&before, &test_app_changed),
+            BTreeSet::from([
+                (AppKind::Claude, "scope-change-bundle".to_string()),
+                (AppKind::Codex, "scope-change-bundle".to_string()),
+            ])
+        );
+
+        let mut test_model_changed = before.clone();
+        for stored in &mut test_model_changed.providers {
+            if crate::domain::providers::bundle::bundle_id(&stored.provider)
+                == Some("scope-change-bundle")
+            {
+                stored
+                    .provider
+                    .extra
+                    .insert("testModel".to_string(), json!("next-health-model"));
+            }
+        }
+        test_model_changed
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        assert_eq!(
+            provider_share_projection_changes(&before, &test_model_changed),
             BTreeSet::from([
                 (AppKind::Claude, "scope-change-bundle".to_string()),
                 (AppKind::Codex, "scope-change-bundle".to_string()),
@@ -23088,8 +23615,7 @@ mod tests {
             .provider_runtime_plan(AppKind::Codex, &created.provider.id)
             .await
             .unwrap()
-            .runtime_fingerprint
-            .clone();
+            .health_fingerprint();
         let original = healthy_provider_observation(&created, &original_fingerprint, 1_000);
         assert!(state
             .record_provider_health_observation(original.clone())
@@ -23140,6 +23666,334 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_runtime_defaults_refresh_share_health_and_router_projection() {
+        let state = test_state();
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("runtime-defaults-provider", "Runtime defaults"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("runtime-defaults-provider-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut share_input =
+            router_sync_share_input("runtime-defaults-share", &created.provider.id);
+        share_input.provider_type = created.provider_type;
+        state
+            .mutate_shares_immediate(|shares| shares.upsert(share_input))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let initial_defaults = state.config_snapshot().await.provider_runtime_defaults;
+        state
+            .set_provider_runtime_defaults(initial_defaults.clone())
+            .await
+            .unwrap();
+        let initial_share = state
+            .shares
+            .read()
+            .await
+            .get("runtime-defaults-share")
+            .cloned()
+            .unwrap();
+        let initial_runtime_metadata_fingerprint = initial_share
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot["runtimeMetadataFingerprint"].as_str())
+            .unwrap()
+            .to_string();
+
+        let (router_url, router, server) =
+            spawn_share_prune_mock_router(Vec::<String>::new(), StatusCode::OK).await;
+        configure_registered_test_router(&state, &router_url, "inst-runtime-defaults").await;
+        sync_shares_to_router(&state, &["runtime-defaults-share".to_string()])
+            .await
+            .unwrap();
+        let synced_before = state
+            .shares
+            .read()
+            .await
+            .get("runtime-defaults-share")
+            .cloned()
+            .unwrap();
+        assert_eq!(router.batch_sizes.lock().await.as_slice(), &[1]);
+
+        let provider_before = state
+            .providers_snapshot()
+            .await
+            .providers
+            .into_iter()
+            .find(|provider| {
+                provider.app == AppKind::Codex && provider.provider.id == created.provider.id
+            })
+            .unwrap();
+        let health_fingerprint_before = state
+            .provider_runtime_plan(AppKind::Codex, &created.provider.id)
+            .await
+            .unwrap()
+            .health_fingerprint();
+        state
+            .record_provider_health_observation(healthy_provider_observation(
+                &provider_before,
+                &health_fingerprint_before,
+                crate::infra::time::now_ms(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut changed_defaults = initial_defaults;
+        changed_defaults.transport.timeout_ms = 310_000;
+        changed_defaults.test_models.codex = "gpt-runtime-defaults-test".to_string();
+        state
+            .set_provider_runtime_defaults(changed_defaults.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let router_received = router.batch_sizes.lock().await.len() >= 2;
+                let projection_synced = {
+                    let shares = state.shares.read().await;
+                    shares.get("runtime-defaults-share").is_some_and(|share| {
+                        share.router_synced_descriptor_generation == share.descriptor_generation
+                            && share.router_synced_revision == share.config_revision
+                    })
+                };
+                if router_received && projection_synced {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime defaults Router projection did not sync");
+
+        let plan = state
+            .provider_runtime_plan(AppKind::Codex, &created.provider.id)
+            .await
+            .unwrap();
+        assert_eq!(plan.transport_policy.timeout_ms, 310_000);
+        assert_eq!(
+            plan.test_model.as_deref(),
+            Some("gpt-runtime-defaults-test")
+        );
+        let providers = state.providers_snapshot().await;
+        let stored = providers
+            .providers
+            .iter()
+            .find(|provider| {
+                provider.app == AppKind::Codex && provider.provider.id == created.provider.id
+            })
+            .unwrap();
+        assert!(stored.provider.settings_config.get("transport").is_none());
+        assert!(stored.provider.settings_config.get("testModel").is_none());
+        assert!(!stored.provider.extra.contains_key("testModel"));
+        let usage = state.usage_snapshot().await;
+        let health = crate::domain::health::provider_health_for_plan(
+            stored,
+            &usage,
+            providers
+                .runtime_plan(AppKind::Codex, &created.provider.id)
+                .as_deref(),
+        );
+        assert_eq!(health.status, ProviderHealthStatus::Unknown);
+
+        let changed_share = state
+            .shares
+            .read()
+            .await
+            .get("runtime-defaults-share")
+            .cloned()
+            .unwrap();
+        assert_eq!(changed_share.config_revision, synced_before.config_revision);
+        assert!(changed_share.descriptor_generation > synced_before.descriptor_generation);
+        assert_eq!(
+            changed_share.router_synced_descriptor_generation,
+            changed_share.descriptor_generation
+        );
+        assert_ne!(
+            changed_share
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot["runtimeMetadataFingerprint"].as_str()),
+            Some(initial_runtime_metadata_fingerprint.as_str())
+        );
+        assert_eq!(
+            ServerConfig::load_or_default(&state.config_dir)
+                .unwrap()
+                .provider_runtime_defaults,
+            changed_defaults
+        );
+
+        state
+            .mutate_shares_immediate(|shares| {
+                shares
+                    .shares
+                    .iter_mut()
+                    .find(|share| share.id == "runtime-defaults-share")
+                    .unwrap()
+                    .runtime_snapshot = None;
+            })
+            .await
+            .unwrap();
+        let revision_before_repair = state
+            .shares
+            .read()
+            .await
+            .get("runtime-defaults-share")
+            .unwrap()
+            .config_revision;
+        state
+            .set_provider_runtime_defaults(changed_defaults)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let router_received = router.batch_sizes.lock().await.len() >= 3;
+                let projection_synced = {
+                    let shares = state.shares.read().await;
+                    shares.get("runtime-defaults-share").is_some_and(|share| {
+                        share.router_synced_descriptor_generation == share.descriptor_generation
+                            && share.router_synced_revision == share.config_revision
+                    })
+                };
+                if router_received && projection_synced {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-value runtime defaults save did not repair Share projection");
+        let repaired_share = state
+            .shares
+            .read()
+            .await
+            .get("runtime-defaults-share")
+            .cloned()
+            .unwrap();
+        assert_eq!(repaired_share.config_revision, revision_before_repair);
+        assert!(repaired_share.runtime_snapshot.is_some());
+        assert_eq!(
+            repaired_share.router_synced_descriptor_generation,
+            repaired_share.descriptor_generation
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_overrides_refresh_the_bound_share_snapshot() {
+        let state = test_state();
+        let created = state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("runtime-overrides-provider", "Runtime overrides"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                Some("runtime-overrides-provider-create".to_string()),
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut share_input =
+            router_sync_share_input("runtime-overrides-share", &created.provider.id);
+        share_input.provider_type = created.provider_type;
+        state
+            .mutate_shares_immediate(|shares| shares.upsert(share_input))
+            .await
+            .unwrap()
+            .unwrap();
+        let defaults = state.config_snapshot().await.provider_runtime_defaults;
+        state.set_provider_runtime_defaults(defaults).await.unwrap();
+        let providers = state.providers_snapshot().await;
+        let accounts = state.accounts_snapshot().await;
+        let capacity_key = crate::infra::credentials::load_root_key(&state.config_dir)
+            .unwrap()
+            .key;
+        assert_eq!(
+            state
+                .mutate_shares_immediate(move |shares| {
+                    shares
+                        .refresh_capacity_pool_ids(&providers, &accounts, &capacity_key)
+                        .unwrap()
+                })
+                .await
+                .unwrap(),
+            vec!["runtime-overrides-share"]
+        );
+        let before = state
+            .shares
+            .read()
+            .await
+            .get("runtime-overrides-share")
+            .cloned()
+            .unwrap();
+        let before_fingerprint = before
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot["runtimeMetadataFingerprint"].as_str())
+            .unwrap()
+            .to_string();
+        let provider_id = created.provider.id.clone();
+
+        state
+            .mutate_providers_immediate(move |providers| {
+                let stored = providers
+                    .providers
+                    .iter_mut()
+                    .find(|provider| {
+                        provider.app == AppKind::Codex && provider.provider.id == provider_id
+                    })
+                    .unwrap();
+                stored
+                    .provider
+                    .extra
+                    .insert("testModel".to_string(), json!("provider-health-model"));
+                stored.provider.settings_config["transport"] = json!({
+                    "timeoutMs": 75_000,
+                    "streamFirstByteTimeoutMs": 15_000,
+                    "streamIdleTimeoutMs": 45_000,
+                });
+                stored.resource.revision = stored.resource.revision.saturating_add(1);
+            })
+            .await
+            .unwrap();
+
+        let plan = state
+            .provider_runtime_plan(AppKind::Codex, &created.provider.id)
+            .await
+            .unwrap();
+        assert_eq!(plan.test_model.as_deref(), Some("provider-health-model"));
+        assert_eq!(plan.transport_policy.timeout_ms, 75_000);
+        assert_eq!(
+            plan.transport_policy.stream_first_byte_timeout_ms,
+            Some(15_000)
+        );
+        assert_eq!(plan.transport_policy.stream_idle_timeout_ms, Some(45_000));
+        let after = state
+            .shares
+            .read()
+            .await
+            .get("runtime-overrides-share")
+            .cloned()
+            .unwrap();
+        assert_eq!(after.config_revision, before.config_revision);
+        assert_ne!(
+            after
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot["runtimeMetadataFingerprint"].as_str()),
+            Some(before_fingerprint.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn provider_delete_prunes_persisted_health_snapshot() {
         let state = test_state();
         let created = state
@@ -23158,8 +24012,7 @@ mod tests {
             .provider_runtime_plan(AppKind::Codex, &created.provider.id)
             .await
             .unwrap()
-            .runtime_fingerprint
-            .clone();
+            .health_fingerprint();
         state
             .record_provider_health_observation(healthy_provider_observation(
                 &created,

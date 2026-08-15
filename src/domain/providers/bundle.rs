@@ -20,6 +20,7 @@ const FAMILY_ID_FIELD: &str = "familyId";
 const SURFACE_ENABLED_FIELD: &str = "surfaceEnabled";
 const MODEL_POLICY_SCOPE_FIELD: &str = "modelPolicyScope";
 const TEST_APP_FIELD: &str = "testApp";
+const TEST_MODEL_FIELD: &str = "testModel";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +84,8 @@ pub struct ProviderBundleView {
     pub test_app: AppKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_model: Option<String>,
+    pub surface_test_models: BTreeMap<AppKind, String>,
+    pub transport: ProviderTransportWriteDraft,
     pub supported_apps: Vec<AppKind>,
     pub enabled_apps: Vec<AppKind>,
     pub credential_configured: bool,
@@ -123,6 +126,10 @@ pub struct ProviderBundleWriteDraft {
     #[serde(default)]
     pub test_model: Option<String>,
     #[serde(default)]
+    pub surface_test_models: BTreeMap<AppKind, String>,
+    #[serde(default)]
+    pub transport: ProviderTransportWriteDraft,
+    #[serde(default)]
     pub managed_account: Option<ProviderBundleManagedAccountWriteDraft>,
     #[serde(default)]
     pub aws_region: Option<String>,
@@ -142,7 +149,7 @@ pub struct ProviderBundleManagedAccountWriteDraft {
     pub auth_identity_generation: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderTransportWriteDraft {
     #[serde(default)]
@@ -180,8 +187,6 @@ pub struct ProviderBundleSurfaceWriteDraft {
     pub upstream_model: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default)]
-    pub transport: ProviderTransportWriteDraft,
     #[serde(default)]
     pub driver_options: ProviderDriverOptionsWriteDraft,
     #[serde(default)]
@@ -281,6 +286,7 @@ impl ProviderBundleWriteDraft {
             TEST_APP_FIELD.to_string(),
             Value::String(self.test_app.as_str().to_string()),
         );
+        insert_optional_string(&mut extra, TEST_MODEL_FIELD, self.test_model.as_deref());
         let mut settings = Map::new();
         settings.insert(
             "modelMapping".to_string(),
@@ -307,12 +313,10 @@ impl ProviderBundleWriteDraft {
         if !env.is_empty() || needs_env_credential_parent {
             settings.insert("env".to_string(), Value::Object(env));
         }
-        if surface.app == self.test_app {
-            if let Some(test_model) = normalized_optional_string(self.test_model.as_deref()) {
-                settings.insert("testModel".to_string(), Value::String(test_model));
-            }
+        if let Some(test_model) = self.surface_test_models.get(&surface.app) {
+            settings.insert("testModel".to_string(), Value::String(test_model.clone()));
         }
-        let transport = transport_value(&surface.transport);
+        let transport = transport_value(&self.transport);
         if !transport.is_empty() {
             settings.insert("transport".to_string(), Value::Object(transport));
         }
@@ -372,6 +376,7 @@ impl ProviderBundleWriteDraft {
     fn validate_shared_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
         self.validate_model_configuration(family)?;
         self.validate_test_configuration(family)?;
+        validate_transport(&self.transport)?;
 
         let credential_profile = profile_by_id(family.credential_profile_id.as_str())
             .expect("Provider family credential profile is registry-validated");
@@ -428,6 +433,21 @@ impl ProviderBundleWriteDraft {
             .is_some_and(|test_model| test_model.len() > 256)
         {
             bail!("Provider test model must be at most 256 characters");
+        }
+        for (app, model) in &self.surface_test_models {
+            if !family.surfaces.iter().any(|surface| surface.app == *app) {
+                bail!(
+                    "Provider family {} does not support a test-model override for {}",
+                    family.family_id,
+                    app.as_str()
+                );
+            }
+            if model.trim().is_empty() || model != model.trim() || model.len() > 256 {
+                bail!(
+                    "Provider Surface test model for {} must be non-empty, trimmed, and at most 256 characters",
+                    app.as_str()
+                );
+            }
         }
         Ok(())
     }
@@ -539,7 +559,6 @@ impl ProviderBundleWriteDraft {
         if let Some(endpoint) = endpoint.as_deref() {
             validate_endpoint(endpoint)?;
         }
-        validate_transport(&surface.transport)?;
         if surface.extra_headers.len() > 32 {
             bail!("custom Provider cannot define more than 32 extra headers");
         }
@@ -852,6 +871,8 @@ impl ProviderBundleView {
             .context("Provider Bundle Surface has no model policy scope")?;
         let test_app =
             bundle_test_app(&first.provider)?.context("Provider Bundle Surface has no test App")?;
+        let test_model = bundle_test_model_override(&first.provider).map(str::to_string);
+        let transport = provider_transport_override(&first.provider)?;
         let mut revision = 0u64;
         let mut surfaces = BTreeMap::new();
         let mut enabled_apps = Vec::new();
@@ -863,6 +884,8 @@ impl ProviderBundleView {
                 || view.provider.name != name
                 || bundle_model_policy_scope(&view.provider)? != Some(model_policy_scope)
                 || bundle_test_app(&view.provider)? != Some(test_app)
+                || bundle_test_model_override(&view.provider) != test_model.as_deref()
+                || provider_transport_override(&view.provider)? != transport
             {
                 bail!("Provider Bundle Surface metadata is inconsistent");
             }
@@ -922,13 +945,13 @@ impl ProviderBundleView {
             .next()
             .expect("surfaces is non-empty")
             .provider;
-        let test_model = surfaces
-            .get(&test_app)
-            .and_then(|view| view.provider.settings_config.get("testModel"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
+        let surface_test_models = surfaces
+            .iter()
+            .filter_map(|(app, view)| {
+                non_empty_string(view.provider.settings_config.get("testModel"))
+                    .map(|model| (*app, model))
+            })
+            .collect();
         Ok(Self {
             id,
             family_id,
@@ -941,6 +964,8 @@ impl ProviderBundleView {
             model_policy_scope,
             test_app,
             test_model,
+            surface_test_models,
+            transport,
             supported_apps,
             enabled_apps,
             credential_configured,
@@ -987,6 +1012,25 @@ pub fn bundle_test_app(provider: &Provider) -> anyhow::Result<Option<AppKind>> {
         "gemini" => Ok(Some(AppKind::Gemini)),
         _ => bail!("invalid Provider Bundle test App {value}"),
     }
+}
+
+pub fn bundle_test_model_override(provider: &Provider) -> Option<&str> {
+    extra_string_ref(provider, TEST_MODEL_FIELD)
+}
+
+fn provider_transport_override(provider: &Provider) -> anyhow::Result<ProviderTransportWriteDraft> {
+    let Some(value) = provider.settings_config.get("transport") else {
+        return Ok(ProviderTransportWriteDraft::default());
+    };
+    serde_json::from_value(value.clone()).context("Provider transport override is invalid")
+}
+
+fn non_empty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 pub fn bundle_model_policy_source(
@@ -1125,7 +1169,6 @@ mod tests {
             model_policy: None,
             upstream_model: None,
             endpoint: None,
-            transport: ProviderTransportWriteDraft::default(),
             driver_options: ProviderDriverOptionsWriteDraft::default(),
             extra_headers: Vec::new(),
             custom_binding: None,
@@ -1147,6 +1190,8 @@ mod tests {
             upstream_model: Some("grok-4.5".to_string()),
             test_app: AppKind::Claude,
             test_model: None,
+            surface_test_models: BTreeMap::new(),
+            transport: ProviderTransportWriteDraft::default(),
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "grok-account".to_string(),
                 auth_identity_generation: 1,
@@ -1180,6 +1225,8 @@ mod tests {
             upstream_model: None,
             test_app: AppKind::Codex,
             test_model: None,
+            surface_test_models: BTreeMap::new(),
+            transport: ProviderTransportWriteDraft::default(),
             managed_account: Some(ProviderBundleManagedAccountWriteDraft {
                 account_id: "openai-account".to_string(),
                 auth_identity_generation: 1,
@@ -1205,20 +1252,30 @@ mod tests {
     }
 
     #[test]
-    fn bundle_materializes_the_test_model_only_for_the_selected_app() {
+    fn bundle_materializes_provider_and_surface_test_model_overrides() {
         let mut draft = grok_bundle();
         draft.test_app = AppKind::Codex;
         draft.test_model = Some("grok-health".to_string());
+        draft
+            .surface_test_models
+            .insert(AppKind::Claude, "claude-health".to_string());
+        draft.transport.timeout_ms = Some(75_000);
+        draft.transport.stream_idle_timeout_ms = Some(90_000);
 
         assert!(draft.validate().is_ok());
         for surface in &draft.surfaces {
             let provider = draft.provider_for_surface(surface).unwrap();
-            if surface.app == AppKind::Codex {
-                assert_eq!(provider.settings_config["testModel"], "grok-health");
+            if surface.app == AppKind::Claude {
+                assert_eq!(provider.settings_config["testModel"], "claude-health");
             } else {
                 assert!(provider.settings_config.get("testModel").is_none());
             }
             assert_eq!(provider.extra[TEST_APP_FIELD], "codex");
+            assert_eq!(provider.extra[TEST_MODEL_FIELD], "grok-health");
+            assert_eq!(
+                provider.settings_config["transport"],
+                json!({"timeoutMs": 75_000, "streamIdleTimeoutMs": 90_000})
+            );
         }
     }
 

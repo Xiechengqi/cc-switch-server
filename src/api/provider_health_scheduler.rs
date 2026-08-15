@@ -25,7 +25,7 @@ use crate::state::ServerState;
 use super::{
     map_provider_test_to_stream_check_result, provider_test_model, redact_provider_test_error,
     resolve_provider_execution_by_key, test_provider_inner, web_stream_check_config,
-    TestProviderQuery, TestProviderResponse,
+    ProviderOperationOutcome, TestProviderQuery, TestProviderResponse,
 };
 
 const FIRST_HEALTH_CHECK_DELAY: Duration = Duration::from_secs(120);
@@ -328,11 +328,15 @@ pub(crate) async fn probe_provider_and_record(
         });
     };
     let support = provider_probe_support(&plan);
+    let model = plan
+        .test_model
+        .clone()
+        .unwrap_or_else(|| provider_test_model(provider.app, provider, None, Some(config)));
     if support == ProviderProbeSupport::Unsupported {
         return Ok(RecordedProviderProbe {
             result: failed_probe_result(
                 provider,
-                provider_test_model(provider.app, provider, None, Some(config)),
+                model,
                 format!("driver {} does not support test", plan.driver_id),
                 "unsupported",
                 None,
@@ -343,26 +347,20 @@ pub(crate) async fn probe_provider_and_record(
         });
     }
 
-    let model = provider_test_model(provider.app, provider, None, Some(config));
     let query = TestProviderQuery {
         app: provider.app,
         network: Some(true),
         timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
         model: Some(model.clone()),
+        test_prompt: Some(config.test_prompt.clone()),
         stream: Some(true),
     };
-    let (result, runtime_fingerprint) = run_probe_with_retries(
-        state,
-        provider,
-        &query,
-        config,
-        &model,
-        &plan.runtime_fingerprint,
-    )
-    .await;
+    let health_fingerprint = plan.health_fingerprint();
+    let (result, runtime_fingerprint) =
+        run_probe_with_retries(state, provider, &query, config, &model, &health_fingerprint).await;
     if !probe_matches_target_generation(
         provider.resource.revision,
-        &plan.runtime_fingerprint,
+        &health_fingerprint,
         &result,
         &runtime_fingerprint,
     ) {
@@ -430,14 +428,20 @@ pub(crate) async fn record_provider_test_response(
         return Ok(None);
     }
     let result = map_provider_test_to_stream_check_result(response, config);
-    let snapshot = record_probe_observation(
-        state,
-        provider,
-        &response.runtime_fingerprint,
-        &result,
-        source,
-    )
-    .await?;
+    let Some(plan) = state
+        .provider_runtime_plan(provider.app, &provider.provider.id)
+        .await
+    else {
+        return Ok(None);
+    };
+    if response.runtime_fingerprint != plan.runtime_fingerprint
+        || plan.test_model.as_deref() != Some(result.model_used.as_str())
+    {
+        return Ok(None);
+    }
+    let snapshot =
+        record_probe_observation(state, provider, &plan.health_fingerprint(), &result, source)
+            .await?;
     if snapshot.is_some() {
         project_accepted_probe_to_active_shares(state, provider, &result, source).await?;
     }
@@ -564,16 +568,12 @@ async fn run_probe_with_retries(
                 );
             }
         };
-    let runtime_fingerprint = execution.plan.runtime_fingerprint.clone();
+    let runtime_fingerprint = execution.plan.health_fingerprint();
     for attempt in 0..=config.max_retries {
         match test_provider_inner(state, execution.clone(), query).await {
             Ok(response) => {
                 let retry = !probe_succeeded(&response)
-                    && retryable_probe(
-                        response.network_status_code,
-                        response.network_stream_completed,
-                        response.network_error.is_some(),
-                    )
+                    && retryable_probe(response.outcome)
                     && attempt < config.max_retries;
                 let mut result = map_provider_test_to_stream_check_result(&response, config);
                 result.retry_count = attempt;
@@ -659,7 +659,11 @@ async fn record_quota_block(
     config: &StreamCheckConfig,
     block: &AccountUsageBlock,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
-    let model = provider_test_model(provider.app, provider, None, Some(config));
+    let model = state
+        .provider_runtime_plan(provider.app, &provider.provider.id)
+        .await
+        .and_then(|plan| plan.test_model.clone())
+        .unwrap_or_else(|| provider_test_model(provider.app, provider, None, Some(config)));
     let result = StreamCheckResult {
         status: HealthStatus::Failed,
         success: false,
@@ -744,16 +748,14 @@ fn probe_succeeded(response: &TestProviderResponse) -> bool {
         && response.network_stream_completed.unwrap_or(true)
 }
 
-fn retryable_probe(
-    status: Option<u16>,
-    stream_completed: Option<bool>,
-    has_network_error: bool,
-) -> bool {
-    stream_completed == Some(false)
-        || status == Some(408)
-        || status == Some(429)
-        || status.is_some_and(|status| status >= 500)
-        || (status.is_none() && has_network_error)
+fn retryable_probe(outcome: ProviderOperationOutcome) -> bool {
+    matches!(
+        outcome,
+        ProviderOperationOutcome::RateLimit
+            | ProviderOperationOutcome::Timeout
+            | ProviderOperationOutcome::Network
+            | ProviderOperationOutcome::Upstream
+    )
 }
 
 fn probe_error_category(status: Option<u16>, stream_completed: Option<bool>) -> Option<String> {
@@ -886,13 +888,25 @@ mod tests {
 
     #[test]
     fn retries_only_transient_or_incomplete_probe_failures() {
-        assert!(retryable_probe(None, None, true));
-        assert!(retryable_probe(Some(408), None, true));
-        assert!(retryable_probe(Some(429), None, true));
-        assert!(retryable_probe(Some(503), None, true));
-        assert!(retryable_probe(Some(200), Some(false), true));
-        assert!(!retryable_probe(Some(401), None, true));
-        assert!(!retryable_probe(Some(404), None, true));
+        for outcome in [
+            ProviderOperationOutcome::RateLimit,
+            ProviderOperationOutcome::Timeout,
+            ProviderOperationOutcome::Network,
+            ProviderOperationOutcome::Upstream,
+        ] {
+            assert!(retryable_probe(outcome));
+        }
+        for outcome in [
+            ProviderOperationOutcome::Success,
+            ProviderOperationOutcome::Unsupported,
+            ProviderOperationOutcome::InvalidConfig,
+            ProviderOperationOutcome::MissingCredential,
+            ProviderOperationOutcome::Auth,
+            ProviderOperationOutcome::Quota,
+            ProviderOperationOutcome::Protocol,
+        ] {
+            assert!(!retryable_probe(outcome));
+        }
     }
 
     #[test]

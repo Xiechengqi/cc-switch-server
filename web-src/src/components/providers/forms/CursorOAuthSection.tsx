@@ -5,6 +5,13 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Check,
   Copy,
   Download,
@@ -24,6 +31,18 @@ interface CursorOAuthSectionProps {
   selectedAccountId?: string | null;
   onAccountSelect?: (accountId: string | null) => void;
   showLoggedInAccounts?: boolean;
+}
+
+export function resolveCursorAccountSelection(
+  accounts: ReadonlyArray<{ id: string }>,
+  selectedAccountId?: string | null,
+): string | null | undefined {
+  if (selectedAccountId) {
+    return accounts.some((account) => account.id === selectedAccountId)
+      ? undefined
+      : null;
+  }
+  return accounts.length === 1 ? accounts[0].id : undefined;
 }
 
 export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
@@ -56,11 +75,12 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
 
   React.useEffect(() => {
     if (!authStatus) return;
-    const account = accounts.length === 1 ? accounts[0] : undefined;
-    if (account && selectedAccountId !== account.id) {
-      onAccountSelect?.(account.id);
-    } else if (!account && selectedAccountId) {
-      onAccountSelect?.(null);
+    const nextSelection = resolveCursorAccountSelection(
+      accounts,
+      selectedAccountId,
+    );
+    if (nextSelection !== undefined) {
+      onAccountSelect?.(nextSelection);
     }
   }, [accounts, authStatus, onAccountSelect, selectedAccountId]);
 
@@ -132,15 +152,6 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
         </Badge>
       </div>
 
-      {accounts.length > 1 && (
-        <p className="text-sm text-destructive">
-          {t("cursorOauth.multipleAccountsConflict", {
-            defaultValue:
-              "检测到旧版多账号配置。请移除多余账号，只保留一个 Cursor 反代账号。",
-          })}
-        </p>
-      )}
-
       {hasAnyAccount && showLoggedInAccounts && (
         <div className="space-y-2">
           <Label className="text-sm text-muted-foreground">
@@ -188,41 +199,76 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
         </div>
       )}
 
-      {!hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={addAccount}
-          className="w-full"
-          variant="outline"
-        >
-          <Sparkles className="mr-2 h-4 w-4" />
-          {t("cursorOauth.loginWithCursor", {
-            defaultValue: "使用 Cursor 登录",
-          })}
-        </Button>
+      {hasAnyAccount && onAccountSelect && (
+        <div className="space-y-2">
+          <Label className="text-sm text-muted-foreground">
+            {t("cursorOauth.selectAccount", {
+              defaultValue: "选择供应商绑定账号",
+            })}
+          </Label>
+          <Select
+            value={selectedAccountId ?? undefined}
+            onValueChange={onAccountSelect}
+          >
+            <SelectTrigger>
+              <SelectValue
+                placeholder={t("cursorOauth.selectAccountPlaceholder", {
+                  defaultValue: "选择一个 Cursor 账号",
+                })}
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {accounts.map((account) => (
+                <SelectItem key={account.id} value={account.id}>
+                  <span className="flex items-center gap-2">
+                    <User className="h-4 w-4 text-muted-foreground" />
+                    <span>{accountDisplayName(account)}</span>
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       )}
 
-      {!hasAnyAccount && pollingState === "idle" && (
-        <Button
-          type="button"
-          onClick={importCursorLocalAuth}
-          className="w-full"
-          variant="secondary"
-          disabled={isImportingCursorLocalAuth}
-          title={t("cursorOauth.importLocalServerTitle", {
-            defaultValue:
-              "从运行 cc-switch-server 的这台机器读取 Cursor IDE 或 cursor-agent 登录状态",
-          })}
-        >
-          {isImportingCursorLocalAuth ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <Download className="mr-2 h-4 w-4" />
-          )}
-          {t("cursorOauth.importLocalServer", {
-            defaultValue: "从本机 Cursor 导入",
-          })}
-        </Button>
+      {pollingState === "idle" && (
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Button
+            type="button"
+            onClick={addAccount}
+            className="w-full"
+            variant="outline"
+          >
+            <Sparkles className="mr-2 h-4 w-4" />
+            {hasAnyAccount
+              ? t("cursorOauth.addAnotherAccount", {
+                  defaultValue: "添加其他账号",
+                })
+              : t("cursorOauth.loginWithCursor", {
+                  defaultValue: "使用 Cursor 登录",
+                })}
+          </Button>
+          <Button
+            type="button"
+            onClick={importCursorLocalAuth}
+            className="w-full"
+            variant="secondary"
+            disabled={isImportingCursorLocalAuth}
+            title={t("cursorOauth.importLocalServerTitle", {
+              defaultValue:
+                "从运行 cc-switch-server 的这台机器读取 Cursor IDE 或 cursor-agent 登录状态",
+            })}
+          >
+            {isImportingCursorLocalAuth ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Download className="mr-2 h-4 w-4" />
+            )}
+            {t("cursorOauth.importLocalServer", {
+              defaultValue: "从本机 Cursor 导入",
+            })}
+          </Button>
+        </div>
       )}
 
       {isPolling && deviceCode && (

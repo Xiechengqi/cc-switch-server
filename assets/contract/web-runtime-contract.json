@@ -1209,6 +1209,14 @@
       "notes": "Returns the authoritative Profile/Driver registry used by Server Provider controls."
     },
     {
+      "name": "get_provider_runtime_defaults",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/get_provider_runtime_defaults",
+      "notes": "Returns Server-owned Provider timeout defaults and per-App default test models from server.json."
+    },
+    {
       "name": "get_provider_bundles",
       "support": "native",
       "implemented": true,
@@ -1337,7 +1345,7 @@
       "support": "shim",
       "implemented": true,
       "feature": "settings",
-      "notes": "Persisted in ui-settings.json streamCheckConfig with Server-owned defaults."
+      "notes": "Returns only real-model probe timing, retry, degradation-threshold, and prompt settings from ui-settings.json; test-model defaults are owned by providerRuntimeDefaults in server.json."
     },
     {
       "name": "get_subscription_quota",
@@ -1717,6 +1725,14 @@
       "notes": "Server-native Web compatibility command."
     },
     {
+      "name": "save_provider_runtime_defaults",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/save_provider_runtime_defaults",
+      "notes": "Validates and persists Server-owned Provider timeout defaults and per-App default test models in server.json."
+    },
+    {
       "name": "save_settings",
       "support": "native",
       "implemented": true,
@@ -1729,7 +1745,7 @@
       "support": "shim",
       "implemented": true,
       "feature": "settings",
-      "notes": "Persisted in ui-settings.json streamCheckConfig."
+      "notes": "Validates and persists only real-model probe timing, retry, degradation-threshold, and prompt settings in ui-settings.json; it never writes test models."
     },
     {
       "name": "set_app_config_dir_override",

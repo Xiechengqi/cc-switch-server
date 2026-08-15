@@ -83,6 +83,7 @@
     "credential": "凭据",
     "credentialMissing": "缺少凭据",
     "credentialReady": "凭据已配置",
+    "connectionTimeouts": "连接与超时",
     "deleteBlocked": "请先删除或解绑该供应商的远程分享",
     "deleted": "供应商已删除",
     "driverOptions": "驱动选项",
@@ -102,6 +103,7 @@
     "modelScopePerApp": "按 App 独立",
     "modelSummarySingle": "固定：{{model}}",
     "modelSingle": "固定上游模型",
+    "providerTestModel": "供应商测试模型覆盖",
     "queryParameter": "API Key 查询参数名",
     "queryCredential": "Query 值",
     "quickPreset": "快捷预设",
@@ -113,6 +115,7 @@
     "surfaceEnabled": "启用 API",
     "surfaces": "应用接口",
     "streamIdleTimeout": "流空闲超时（毫秒）",
+    "surfaceTestModelOverrides": "按 App 测试模型特例",
     "testApp": "测试 App",
     "testModel": "测试模型",
     "title": "供应商"
@@ -292,6 +295,13 @@
       "deepseekAccountDescription": "管理 DeepSeek 账号"
     },
     "advanced": {
+      "providerDefaults": {
+        "title": "供应商运行默认值",
+        "description": "设置供应商请求超时与各 App 测试模型的 Server 继承起点",
+        "transportTitle": "请求超时默认值",
+        "modelsTitle": "测试模型默认值",
+        "invalid": "请检查超时范围和测试模型"
+      },
       "apiManagement": {
         "revokeTokenConfirm": "撤销后，当前调试令牌将立即失效。"
       },

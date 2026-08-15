@@ -567,9 +567,16 @@
         "running": "运行中",
         "stopped": "已停止"
       },
+      "providerDefaults": {
+        "title": "供应商运行默认值",
+        "description": "设置供应商请求超时与各 App 测试模型的 Server 继承起点",
+        "transportTitle": "请求超时默认值",
+        "modelsTitle": "测试模型默认值",
+        "invalid": "请检查超时范围和测试模型"
+      },
       "modelTest": {
         "title": "模型测试配置",
-        "description": "配置模型测试使用的默认模型和提示词"
+        "description": "配置模型测试的超时、重试、降级阈值和提示词"
       },
       "backup": {
         "title": "备份与恢复",
@@ -2751,7 +2758,7 @@
     "rejected": "{{providerName}} 检查被拒: {{message}}",
     "error": "{{providerName}} 检查出错: {{error}}",
     "modelNotFound": "{{providerName}} 测试模型 {{model}} 不存在或已下架",
-    "modelNotFoundHint": "该模型可能已被供应商弃用。请在\"模型测试配置\"中更新默认测试模型。",
+    "modelNotFoundHint": "该模型可能已被供应商弃用。请更新 Server 默认值或供应商测试模型覆盖。",
     "quotaExceeded": "{{providerName}} Coding Plan 额度已用尽",
     "quotaExceededHint": "百度千帆返回了 Coding Plan 超额错误。请等待 5 小时/每周/每月额度刷新，或在千帆控制台切换套餐。",
     "codexOauthTokenInvalidated": "{{providerName}} OAuth token 已被服务端废止",
@@ -3315,6 +3322,9 @@
     "loggedInAccounts": "已登录账号",
     "selected": "已选中",
     "removeAccount": "移除账号",
+    "selectAccount": "选择供应商绑定账号",
+    "selectAccountPlaceholder": "选择一个 Cursor 账号",
+    "addAnotherAccount": "添加其他账号",
     "loginWithCursor": "使用 Cursor 登录",
     "importLocalServerTitle": "从运行 cc-switch-server 的这台机器读取 Cursor IDE 或 cursor-agent 登录状态",
     "importLocalServer": "从本机 Cursor 导入",
@@ -3323,7 +3333,6 @@
     "copyLink": "复制链接",
     "openManually": "打开链接",
     "retry": "重试",
-    "multipleAccountsConflict": "检测到旧版多账号配置。请移除多余账号，只保留一个 Cursor 反代账号。",
     "loginRequired": "请先登录 Cursor 账号",
     "selectAccountRequired": "Cursor OAuth 必须绑定一个 Cursor 账号"
   },

@@ -89,6 +89,8 @@ function bundle(
       familyId === "family.openai_oauth" && supportedApps.includes("codex")
         ? "codex"
         : (supportedApps[0] ?? "claude"),
+    surfaceTestModels: {},
+    transport: {},
     supportedApps,
     enabledApps: supportedApps,
     credentialConfigured: true,

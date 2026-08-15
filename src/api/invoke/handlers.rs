@@ -149,7 +149,13 @@ pub(in crate::api) async fn web_stream_check_config(
 ) -> crate::domain::stream_check::StreamCheckConfig {
     let store = state.ui_settings.read().await;
     let value = ui_settings::stream_check_config_for_frontend(&store);
-    crate::domain::stream_check::stream_check_config_from_value(&value)
+    drop(store);
+    let mut config = crate::domain::stream_check::stream_check_config_from_value(&value);
+    let defaults = state.config.read().await.provider_runtime_defaults.clone();
+    config.claude_model = defaults.test_models.claude;
+    config.codex_model = defaults.test_models.codex;
+    config.gemini_model = defaults.test_models.gemini;
+    config
 }
 
 pub(in crate::api) async fn web_proxy_target_provider_ids(

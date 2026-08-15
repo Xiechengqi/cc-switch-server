@@ -664,8 +664,7 @@ async fn share_router_runtime_reports_health_for_requested_share_binding() {
         .provider_runtime_plan(AppKind::Codex, "provider-bound")
         .await
         .unwrap()
-        .runtime_fingerprint
-        .clone();
+        .health_fingerprint();
     let checked_at_ms = cc_switch_server::infra::time::now_ms();
     for (checked_at_ms, source) in [
         (
@@ -762,7 +761,8 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
                     "OPENAI_BASE_URL": format!("http://{upstream_addr}"),
                     "OPENAI_API_KEY": "sk-local-secret"
                 },
-                "models": ["gpt-5.5"]
+                "models": ["gpt-5.5"],
+                "testModel": "gpt-5.5"
             }),
             category: None,
             meta: None,
@@ -7685,14 +7685,10 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
             created["surfaces"][provider_app]["runtime"]["modelPolicy"],
             json!({"mode": "single", "upstreamModel": "grok-4.5"})
         );
-        if provider_app == "claude" {
-            assert_eq!(
-                created["surfaces"][provider_app]["runtime"]["testModel"],
-                "grok-4.5"
-            );
-        } else {
-            assert!(created["surfaces"][provider_app]["runtime"]["testModel"].is_null());
-        }
+        assert_eq!(
+            created["surfaces"][provider_app]["runtime"]["testModel"],
+            "grok-4.5"
+        );
         assert!(
             !serde_json::to_string(&created["surfaces"][provider_app]["runtime"])
                 .unwrap()

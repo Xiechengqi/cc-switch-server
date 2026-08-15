@@ -83,6 +83,7 @@
     "credential": "憑證",
     "credentialMissing": "缺少憑證",
     "credentialReady": "憑證已設定",
+    "connectionTimeouts": "連線與逾時",
     "deleteBlocked": "請先刪除或解除綁定此供應商的遠端分享",
     "deleted": "供應商已刪除",
     "driverOptions": "驅動程式選項",
@@ -102,6 +103,7 @@
     "modelScopePerApp": "依 App 獨立",
     "modelSummarySingle": "固定：{{model}}",
     "modelSingle": "固定上游模型",
+    "providerTestModel": "供應商測試模型覆寫",
     "queryParameter": "API Key 查詢參數名稱",
     "queryCredential": "Query 值",
     "quickPreset": "快速預設",
@@ -113,6 +115,7 @@
     "surfaceEnabled": "啟用 API",
     "surfaces": "應用介面",
     "streamIdleTimeout": "串流閒置逾時（毫秒）",
+    "surfaceTestModelOverrides": "按 App 測試模型特例",
     "testApp": "測試 App",
     "testModel": "測試模型",
     "title": "供應商"
@@ -293,6 +296,13 @@
       "deepseekAccountDescription": "管理 DeepSeek 帳號"
     },
     "advanced": {
+      "providerDefaults": {
+        "title": "供應商執行預設值",
+        "description": "設定供應商請求逾時與各 App 測試模型的 Server 繼承起點",
+        "transportTitle": "請求逾時預設值",
+        "modelsTitle": "測試模型預設值",
+        "invalid": "請檢查逾時範圍和測試模型"
+      },
       "apiManagement": {
         "revokeTokenConfirm": "撤銷後，目前的偵錯權杖將立即失效。"
       },

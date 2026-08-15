@@ -563,9 +563,16 @@
         "running": "Running",
         "stopped": "Stopped"
       },
+      "providerDefaults": {
+        "title": "Provider Runtime Defaults",
+        "description": "Set the Server inheritance defaults for Provider timeouts and per-App model tests",
+        "transportTitle": "Request Timeout Defaults",
+        "modelsTitle": "Test Model Defaults",
+        "invalid": "Check the timeout ranges and test models"
+      },
       "modelTest": {
         "title": "Model Test Config",
-        "description": "Configure default models and prompts for model testing"
+        "description": "Configure model-test timeouts, retries, degradation threshold, and prompt"
       },
       "backup": {
         "title": "Backup & Restore",
@@ -2747,7 +2754,7 @@
     "rejected": "{{providerName}} check rejected: {{message}}",
     "error": "{{providerName}} check error: {{error}}",
     "modelNotFound": "{{providerName}} test model {{model}} does not exist or has been deprecated",
-    "modelNotFoundHint": "This model may have been retired by the provider. Update the default test model in \"Model Test Config\".",
+    "modelNotFoundHint": "This model may have been retired by the provider. Update the Server default or the Provider test-model override.",
     "quotaExceeded": "{{providerName}} Coding Plan quota has been exceeded",
     "quotaExceededHint": "Baidu Qianfan returned a Coding Plan quota-limit error. Wait for the 5-hour, weekly, or monthly quota refresh, or adjust the plan in the Qianfan console.",
     "codexOauthTokenInvalidated": "{{providerName}} OAuth token has been invalidated",
@@ -3311,6 +3318,9 @@
     "loggedInAccounts": "Signed-in accounts",
     "selected": "Selected",
     "removeAccount": "Remove account",
+    "selectAccount": "Select Provider account",
+    "selectAccountPlaceholder": "Choose a Cursor account",
+    "addAnotherAccount": "Add another account",
     "loginWithCursor": "Sign in with Cursor",
     "importLocalServerTitle": "Read the Cursor IDE or cursor-agent sign-in from the machine running cc-switch-server",
     "importLocalServer": "Import local Cursor account",
@@ -3319,7 +3329,6 @@
     "copyLink": "Copy link",
     "openManually": "Open link",
     "retry": "Retry",
-    "multipleAccountsConflict": "Legacy multiple-account data was found. Remove the extra accounts and keep one Cursor proxy account.",
     "loginRequired": "Sign in to a Cursor account first",
     "selectAccountRequired": "Cursor OAuth must be bound to a Cursor account"
   },

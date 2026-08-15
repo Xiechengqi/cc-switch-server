@@ -7,6 +7,7 @@ use chrono::{Datelike, TimeZone, Utc, Weekday};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
@@ -2287,6 +2288,44 @@ impl ShareStore {
         updated_ids
     }
 
+    pub fn reconcile_runtime_snapshots_for_providers(
+        &mut self,
+        provider_keys: &BTreeSet<(AppKind, String)>,
+        providers: &ProviderStore,
+        accounts: Option<&AccountStore>,
+        usage: &UsageStore,
+    ) -> Vec<String> {
+        let mut updated_ids = Vec::new();
+        for share in &mut self.shares {
+            let uses_provider = if share.bindings.is_empty() {
+                provider_keys.contains(&(share.app, share.provider_id.clone()))
+            } else {
+                share.bindings.iter().any(|binding| {
+                    provider_keys.contains(&(binding.app, binding.provider_id.clone()))
+                })
+            };
+            if !uses_provider {
+                continue;
+            }
+
+            let fingerprint = runtime_metadata_fingerprint_for_share(share, providers);
+            let current_fingerprint = share
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("runtimeMetadataFingerprint"))
+                .and_then(Value::as_str);
+            if current_fingerprint == Some(fingerprint.as_str()) {
+                continue;
+            }
+
+            share.runtime_snapshot = Some(runtime_snapshot_for_share(
+                share, providers, accounts, usage,
+            ));
+            updated_ids.push(share.id.clone());
+        }
+        updated_ids
+    }
+
     pub fn refresh_subscription_expiry_snapshots_for_providers(
         &mut self,
         provider_keys: &BTreeSet<(AppKind, String)>,
@@ -2490,8 +2529,50 @@ fn runtime_snapshot_for_share(
         "appProviders": descriptor.app_providers,
         "appAvailability": descriptor.app_availability,
         "modelHealth": descriptor.model_health,
+        "runtimeMetadataFingerprint": runtime_metadata_fingerprint_for_share(share, providers),
         "updatedAtMs": now_ms(),
     })
+}
+
+fn runtime_metadata_fingerprint_for_share(share: &Share, providers: &ProviderStore) -> String {
+    let mut bindings = if share.bindings.is_empty() {
+        vec![(share.app, share.provider_id.clone())]
+    } else {
+        share
+            .bindings
+            .iter()
+            .map(|binding| (binding.app, binding.provider_id.clone()))
+            .collect::<Vec<_>>()
+    };
+    bindings.sort();
+    let signatures = bindings
+        .into_iter()
+        .map(|(app, provider_id)| {
+            let plan = providers.runtime_plan(app, &provider_id);
+            let provider_revision = plan
+                .as_ref()
+                .map(|plan| plan.provider_revision)
+                .or_else(|| {
+                    providers
+                        .providers
+                        .iter()
+                        .find(|provider| {
+                            provider.app == app && provider.provider.id == provider_id
+                        })
+                        .map(|provider| provider.resource.revision)
+                });
+            json!({
+                "app": app,
+                "providerId": provider_id,
+                "providerRevision": provider_revision,
+                "runtimeFingerprint": plan.as_ref().map(|plan| plan.runtime_fingerprint.as_str()).unwrap_or("missing-runtime-plan"),
+                "healthFingerprint": plan.as_ref().map(|plan| plan.health_fingerprint()).unwrap_or_else(|| "missing-runtime-plan".to_string()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&signatures)
+        .expect("Share runtime metadata fingerprint input is serializable");
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn subscription_expiry_fingerprint(snapshot: Option<&Value>) -> Vec<String> {
@@ -3855,6 +3936,98 @@ mod tests {
 
         assert_eq!(updated, vec!["share-multi-app"]);
         assert!(store.get("share-multi-app").unwrap().config_revision > original.config_revision);
+    }
+
+    #[test]
+    fn provider_runtime_snapshot_reconciliation_is_idempotent_and_tracks_defaults() {
+        let mut providers = ProviderStore::default();
+        providers.upsert_with_resource(
+            AppKind::Codex,
+            crate::domain::providers::model::Provider {
+                id: "runtime-defaults-provider".to_string(),
+                name: "Runtime defaults Provider".to_string(),
+                settings_config: json!({
+                    "apiKey": "test-key",
+                    "modelMapping": {"mode": "passthrough"}
+                }),
+                category: None,
+                meta: None,
+                extra: BTreeMap::new(),
+            },
+            crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse("codex.openai_api_key")
+                        .unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        );
+        let accounts = AccountStore::default();
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let mut input = codex_share_input("runtime-defaults-share");
+        input.provider_id = "runtime-defaults-provider".to_string();
+        let mut store = ShareStore::default();
+        let original = store.upsert(input).unwrap();
+        let provider_keys =
+            BTreeSet::from([(AppKind::Codex, "runtime-defaults-provider".to_string())]);
+        let usage = UsageStore::default();
+
+        let first = store.reconcile_runtime_snapshots_for_providers(
+            &provider_keys,
+            &providers,
+            Some(&accounts),
+            &usage,
+        );
+        assert_eq!(first, vec!["runtime-defaults-share"]);
+        let first_share = store.get("runtime-defaults-share").unwrap().clone();
+        let first_fingerprint = first_share
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot["runtimeMetadataFingerprint"].as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(first_share.config_revision, original.config_revision);
+
+        let repeated = store.reconcile_runtime_snapshots_for_providers(
+            &provider_keys,
+            &providers,
+            Some(&accounts),
+            &usage,
+        );
+        assert!(repeated.is_empty());
+        assert_eq!(
+            store.get("runtime-defaults-share").unwrap().config_revision,
+            first_share.config_revision
+        );
+
+        let mut defaults = providers.runtime_defaults().clone();
+        defaults.transport.timeout_ms = 310_000;
+        defaults.test_models.codex = "gpt-runtime-defaults-test".to_string();
+        providers.set_runtime_defaults(defaults);
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let changed = store.reconcile_runtime_snapshots_for_providers(
+            &provider_keys,
+            &providers,
+            Some(&accounts),
+            &usage,
+        );
+        assert_eq!(changed, vec!["runtime-defaults-share"]);
+        let changed_share = store.get("runtime-defaults-share").unwrap();
+        assert_ne!(
+            changed_share
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot["runtimeMetadataFingerprint"].as_str()),
+            Some(first_fingerprint.as_str())
+        );
+        assert_eq!(changed_share.config_revision, first_share.config_revision);
+        let stored = &providers.providers[0].provider;
+        assert!(stored.settings_config.get("transport").is_none());
+        assert!(stored.settings_config.get("testModel").is_none());
+        assert!(!stored.extra.contains_key("testModel"));
     }
 
     #[test]

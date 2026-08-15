@@ -390,6 +390,7 @@ pub(crate) fn decode_s2(
         order: persisted.order_by_app,
         bundle_order: persisted.bundle_order,
         runtime_index: Default::default(),
+        runtime_defaults: Default::default(),
         format: ProviderStoreFormat::S2,
         store_generation: persisted.store_generation,
         credential_vault: Arc::new(ProviderCredentialVault {

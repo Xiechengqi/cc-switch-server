@@ -356,9 +356,6 @@ pub fn default_stream_check_config() -> Value {
         "timeoutSecs": 45,
         "maxRetries": 2,
         "degradedThresholdMs": 6000,
-        "claudeModel": "claude-haiku-4-5-20251001",
-        "codexModel": "gpt-5.6-sol@low",
-        "geminiModel": "gemini-3.5-flash",
         "testPrompt": "Who are you?",
     })
 }
@@ -457,6 +454,7 @@ mod tests {
             client: Default::default(),
             setup_completion_notification: None,
             upgrade_policy: Default::default(),
+            provider_runtime_defaults: Default::default(),
             enable_web_terminal: false,
         };
         let settings = store.settings_for_frontend(&config);
@@ -691,14 +689,16 @@ mod tests {
     fn stream_check_config_merge_defaults() {
         let store = UiSettingsStore {
             value: json!({
-                "streamCheckConfig": { "timeoutSecs": 30, "claudeModel": "custom-model" }
+                "streamCheckConfig": { "timeoutSecs": 30 }
             }),
         };
         let stream = stream_check_config_for_frontend(&store);
         assert_eq!(stream["timeoutSecs"], json!(30));
-        assert_eq!(stream["claudeModel"], json!("custom-model"));
         assert_eq!(stream["maxRetries"], json!(2));
-        assert_eq!(stream["geminiModel"], json!("gemini-3.5-flash"));
+        assert_eq!(stream["testPrompt"], json!("Who are you?"));
+        assert!(stream.get("claudeModel").is_none());
+        assert!(stream.get("codexModel").is_none());
+        assert!(stream.get("geminiModel").is_none());
     }
 
     #[test]

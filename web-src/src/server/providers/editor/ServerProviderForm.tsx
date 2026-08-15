@@ -270,6 +270,46 @@ export function resolveManagedAccountSelection({
   };
 }
 
+interface ReconcileManagedAccountBindingGenerationInput {
+  accountId: string;
+  currentBinding?: ProviderMeta["authBinding"];
+  authProvider: string;
+  accounts?: readonly {
+    id: string;
+    provider: string;
+    authIdentityGeneration: number;
+  }[];
+}
+
+export function reconcileManagedAccountBindingGeneration({
+  accountId,
+  currentBinding,
+  authProvider,
+  accounts,
+}: ReconcileManagedAccountBindingGenerationInput):
+  | NonNullable<ProviderMeta["authBinding"]>
+  | undefined {
+  if (
+    !accountId ||
+    currentBinding?.accountId !== accountId ||
+    currentBinding.authIdentityGeneration != null
+  ) {
+    return undefined;
+  }
+  const account = accounts?.find(
+    (candidate) =>
+      candidate.id === accountId && candidate.provider === authProvider,
+  );
+  if (!account) return undefined;
+  return {
+    ...currentBinding,
+    source: "managed_account",
+    authProvider,
+    accountId,
+    authIdentityGeneration: account.authIdentityGeneration,
+  };
+}
+
 const CUSTOM_DEFAULT_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
   {
     claude: { upstreamProtocol: "anthropic_messages", authScheme: "api_key" },
@@ -1171,6 +1211,32 @@ export function ServerProviderForm({
     "missing",
     "stale",
   ].includes(managedAccountBindingState);
+
+  useEffect(() => {
+    if (
+      profile.credentialPolicy.mode !== "managed_account" ||
+      managedAccountsQuery.status !== "success"
+    ) {
+      return;
+    }
+    const authProvider = profile.credentialPolicy.accountProviderType;
+    setState((current) => {
+      const authBinding = reconcileManagedAccountBindingGeneration({
+        accountId: current.accountId,
+        currentBinding: current.draft.meta.authBinding,
+        authProvider,
+        accounts: managedAccountsQuery.data,
+      });
+      if (!authBinding) return current;
+      return {
+        ...current,
+        draft: {
+          ...current.draft,
+          meta: { ...current.draft.meta, authBinding },
+        },
+      };
+    });
+  }, [managedAccountsQuery.data, managedAccountsQuery.status, profile]);
 
   useEffect(() => {
     onDirtyChange?.(dirty);

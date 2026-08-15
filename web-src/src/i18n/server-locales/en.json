@@ -83,6 +83,7 @@
     "credential": "Credential",
     "credentialMissing": "Credential missing",
     "credentialReady": "Credential configured",
+    "connectionTimeouts": "Connection and timeouts",
     "deleteBlocked": "Remove or detach this provider's remote Share first",
     "deleted": "Provider deleted",
     "driverOptions": "Driver options",
@@ -102,6 +103,7 @@
     "modelScopePerApp": "Per App",
     "modelSummarySingle": "Fixed: {{model}}",
     "modelSingle": "Fixed model",
+    "providerTestModel": "Provider test model override",
     "queryParameter": "API key query parameter",
     "queryCredential": "Query value",
     "quickPreset": "Quick preset",
@@ -113,6 +115,7 @@
     "surfaceEnabled": "Enable API",
     "surfaces": "API Surfaces",
     "streamIdleTimeout": "Stream idle timeout (milliseconds)",
+    "surfaceTestModelOverrides": "Per-App test model overrides",
     "testApp": "Test App",
     "testModel": "Test model",
     "title": "Providers"
@@ -292,6 +295,13 @@
       "deepseekAccountDescription": "Manage DeepSeek accounts"
     },
     "advanced": {
+      "providerDefaults": {
+        "title": "Provider Runtime Defaults",
+        "description": "Set the Server inheritance defaults for Provider timeouts and per-App model tests",
+        "transportTitle": "Request Timeout Defaults",
+        "modelsTitle": "Test Model Defaults",
+        "invalid": "Check the timeout ranges and test models"
+      },
       "apiManagement": {
         "revokeTokenConfirm": "Revoking immediately invalidates the current debug token."
       },

@@ -36,6 +36,11 @@ function compactNumber(value: number): string {
   }).format(value);
 }
 
+function activityCost(value: string): string {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toFixed(1) : value;
+}
+
 function usageWindowLabel(
   window: OllamaCloudUsageWindow,
   t: TFunction,
@@ -48,12 +53,9 @@ function usageWindowLabel(
 function accountLabel(snapshot: OllamaCloudSnapshot): string | null {
   const account = snapshot.account.data;
   if (!account) return null;
-  const identities = [account.name, account.email].filter(
-    (value, index, values): value is string =>
-      Boolean(value) && values.indexOf(value) === index,
-  );
-  if (identities.length === 0 && account.id) identities.push(account.id);
-  const parts = [account.plan, ...identities].filter(Boolean);
+  const identity =
+    account.email?.trim() || account.name?.trim() || account.id?.trim();
+  const parts = [account.plan?.trim(), identity].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
@@ -72,7 +74,9 @@ export function formatOllamaCloudSummary(
   const cost = snapshot.usage.data?.activity?.cost;
   const usage = [
     ...windows,
-    cost !== undefined ? t("provider.ollama.cost", { value: cost }) : undefined,
+    cost !== undefined
+      ? t("provider.ollama.cost", { value: activityCost(cost) })
+      : undefined,
   ].filter(Boolean);
   const reason = firstSectionReason(snapshot);
   return [
@@ -163,6 +167,8 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
     : query.isError
       ? t("provider.ollama.error")
       : t(`provider.ollama.${status}`);
+  const showStatusLabel =
+    query.isPending || query.isError || status !== "complete";
   const summary = snapshot
     ? formatOllamaCloudSummary(snapshot, t)
     : query.isError
@@ -208,11 +214,16 @@ const OllamaQuotaFooter: React.FC<OllamaQuotaFooterProps> = ({
         }}
         refreshTitle={t("provider.ollama.refresh")}
         leading={
-          <span
-            className={cn("text-[10px] font-semibold", STATUS_CLASSES[status])}
-          >
-            {statusLabel}
-          </span>
+          showStatusLabel ? (
+            <span
+              className={cn(
+                "text-[10px] font-semibold",
+                STATUS_CLASSES[status],
+              )}
+            >
+              {statusLabel}
+            </span>
+          ) : undefined
         }
       />
       <div className="min-w-0 max-w-full text-right text-[10px] font-medium text-foreground break-words">

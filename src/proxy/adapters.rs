@@ -485,7 +485,7 @@ fn runtime_upstream_format(plan: &ProviderRuntimePlan) -> Option<UpstreamFormat>
     }
 }
 
-pub(super) fn cursor_agentservice_request(
+pub(crate) fn cursor_agentservice_request(
     body: Bytes,
     stored: &StoredProvider,
     route: ProxyRoute,

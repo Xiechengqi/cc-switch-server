@@ -311,11 +311,12 @@ pub fn provider_health_for_plan(
     let probe_support = plan
         .map(provider_probe_support)
         .unwrap_or(ProviderProbeSupport::Supported);
+    let health_fingerprint = plan.map(ProviderRuntimePlan::health_fingerprint);
     provider_health_with_runtime(
         provider,
         usage,
         probe_support,
-        plan.map(|plan| plan.runtime_fingerprint.as_str()),
+        health_fingerprint.as_deref(),
     )
 }
 

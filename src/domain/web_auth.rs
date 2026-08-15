@@ -451,6 +451,7 @@ mod tests {
             },
             setup_completion_notification: None,
             upgrade_policy: Default::default(),
+            provider_runtime_defaults: Default::default(),
             enable_web_terminal: false,
         };
         if let Some(password) = password {

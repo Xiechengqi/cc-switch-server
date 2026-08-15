@@ -108,6 +108,30 @@ async fn web_invoke_dispatch(
                 crate::api::settings::save_upgrade_policy(state, headers.clone(), policy).await?
             ))
         }
+        "get_provider_runtime_defaults" => Ok(json!(
+            state
+                .config
+                .read()
+                .await
+                .provider_runtime_defaults
+                .clone()
+        )),
+        "save_provider_runtime_defaults" => {
+            let value = args
+                .get("defaults")
+                .cloned()
+                .ok_or_else(|| ApiError::bad_request("defaults payload is required"))?;
+            let defaults = serde_json::from_value::<
+                crate::domain::providers::runtime::ProviderRuntimeDefaults,
+            >(value)
+            .map_err(ApiError::bad_request)?;
+            defaults.validate().map_err(ApiError::bad_request)?;
+            state
+                .set_provider_runtime_defaults(defaults)
+                .await
+                .map_err(ApiError::internal)?;
+            Ok(json!(true))
+        }
         "complete_server_setup" => {
             let password = web_arg_string_any(&args, &["password"])?;
             let owner_email = web_arg_string_any(&args, &["ownerEmail", "owner_email"])?;
@@ -223,11 +247,29 @@ async fn web_invoke_dispatch(
         }
         "revoke_debug_token" => crate::api::debug::revoke_debug_token(state).await,
         "get_stream_check_config" => {
-            let store = state.ui_settings.read().await;
-            Ok(ui_settings::stream_check_config_for_frontend(&store))
+            let config = web_stream_check_config(state).await;
+            Ok(json!({
+                "timeoutSecs": config.timeout_secs,
+                "maxRetries": config.max_retries,
+                "degradedThresholdMs": config.degraded_threshold_ms,
+                "testPrompt": config.test_prompt,
+            }))
         }
         "save_stream_check_config" => {
             let config: Value = web_arg_value(&args, "config")?;
+            let parsed = serde_json::from_value::<crate::domain::stream_check::StreamCheckConfig>(
+                config,
+            )
+            .map_err(ApiError::bad_request)?;
+            parsed
+                .validate_probe_settings()
+                .map_err(ApiError::bad_request)?;
+            let config = json!({
+                "timeoutSecs": parsed.timeout_secs,
+                "maxRetries": parsed.max_retries,
+                "degradedThresholdMs": parsed.degraded_threshold_ms,
+                "testPrompt": parsed.test_prompt,
+            });
             state
                 .apply_ui_settings_patch_immediate(json!({ "streamCheckConfig": config }))
                 .await

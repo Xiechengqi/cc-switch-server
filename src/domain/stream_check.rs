@@ -27,11 +27,11 @@ pub struct StreamCheckConfig {
 }
 
 fn default_timeout_secs() -> u64 {
-    8
+    45
 }
 
 fn default_max_retries() -> u32 {
-    1
+    2
 }
 
 fn default_degraded_threshold_ms() -> u64 {
@@ -65,6 +65,30 @@ impl Default for StreamCheckConfig {
             gemini_model: default_gemini_model(),
             test_prompt: default_test_prompt(),
         }
+    }
+}
+
+impl StreamCheckConfig {
+    pub fn validate_probe_settings(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (2..=60).contains(&self.timeout_secs),
+            "stream-check timeoutSecs must be between 2 and 60"
+        );
+        anyhow::ensure!(
+            self.max_retries <= 5,
+            "stream-check maxRetries must be between 0 and 5"
+        );
+        anyhow::ensure!(
+            (1_000..=30_000).contains(&self.degraded_threshold_ms),
+            "stream-check degradedThresholdMs must be between 1000 and 30000"
+        );
+        anyhow::ensure!(
+            !self.test_prompt.trim().is_empty()
+                && self.test_prompt == self.test_prompt.trim()
+                && self.test_prompt.len() <= 1_000,
+            "stream-check testPrompt must be non-empty, trimmed, and at most 1000 characters"
+        );
+        Ok(())
     }
 }
 

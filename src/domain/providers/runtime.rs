@@ -22,6 +22,116 @@ use super::registry::{
 };
 use super::store::{ProviderStore, StoredProvider};
 
+pub const MIN_PROVIDER_TIMEOUT_MS: u64 = 1_000;
+pub const MAX_PROVIDER_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
+pub const MAX_PROVIDER_FIRST_BYTE_TIMEOUT_MS: u64 = 600_000;
+pub const MAX_PROVIDER_IDLE_TIMEOUT_MS: u64 = 3_600_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderTransportDefaults {
+    pub timeout_ms: u64,
+    pub stream_first_byte_timeout_ms: u64,
+    pub stream_idle_timeout_ms: u64,
+}
+
+impl Default for ProviderTransportDefaults {
+    fn default() -> Self {
+        Self {
+            timeout_ms: 300_000,
+            stream_first_byte_timeout_ms: 120_000,
+            stream_idle_timeout_ms: 300_000,
+        }
+    }
+}
+
+impl ProviderTransportDefaults {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_timeout_range(
+            "request timeout",
+            self.timeout_ms,
+            MAX_PROVIDER_REQUEST_TIMEOUT_MS,
+        )?;
+        validate_timeout_range(
+            "stream first-byte timeout",
+            self.stream_first_byte_timeout_ms,
+            MAX_PROVIDER_FIRST_BYTE_TIMEOUT_MS,
+        )?;
+        validate_timeout_range(
+            "stream idle timeout",
+            self.stream_idle_timeout_ms,
+            MAX_PROVIDER_IDLE_TIMEOUT_MS,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderTestModelDefaults {
+    pub claude: String,
+    pub codex: String,
+    pub gemini: String,
+}
+
+impl Default for ProviderTestModelDefaults {
+    fn default() -> Self {
+        Self {
+            claude: "claude-haiku-4-5-20251001".to_string(),
+            codex: "gpt-5.6-sol@low".to_string(),
+            gemini: "gemini-3.5-flash".to_string(),
+        }
+    }
+}
+
+impl ProviderTestModelDefaults {
+    pub fn for_app(&self, app: AppKind) -> &str {
+        match app {
+            AppKind::Claude => &self.claude,
+            AppKind::Codex => &self.codex,
+            AppKind::Gemini => &self.gemini,
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (app, model) in [
+            (AppKind::Claude, self.claude.as_str()),
+            (AppKind::Codex, self.codex.as_str()),
+            (AppKind::Gemini, self.gemini.as_str()),
+        ] {
+            if model.trim().is_empty() || model != model.trim() || model.len() > 256 {
+                bail!(
+                    "default test model for {} must be non-empty, trimmed, and at most 256 characters",
+                    app.as_str()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRuntimeDefaults {
+    #[serde(default)]
+    pub transport: ProviderTransportDefaults,
+    #[serde(default)]
+    pub test_models: ProviderTestModelDefaults,
+}
+
+impl ProviderRuntimeDefaults {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.transport.validate()?;
+        self.test_models.validate()
+    }
+}
+
+fn validate_timeout_range(label: &str, value: u64, max: u64) -> anyhow::Result<()> {
+    if !(MIN_PROVIDER_TIMEOUT_MS..=max).contains(&value) {
+        bail!("{label} must be between {MIN_PROVIDER_TIMEOUT_MS} and {max} milliseconds");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeConfigurationState {
@@ -95,10 +205,11 @@ pub struct RuntimeTransportPolicy {
 
 impl Default for RuntimeTransportPolicy {
     fn default() -> Self {
+        let defaults = ProviderTransportDefaults::default();
         Self {
-            timeout_ms: 300_000,
-            stream_first_byte_timeout_ms: Some(120_000),
-            stream_idle_timeout_ms: Some(300_000),
+            timeout_ms: defaults.timeout_ms,
+            stream_first_byte_timeout_ms: Some(defaults.stream_first_byte_timeout_ms),
+            stream_idle_timeout_ms: Some(defaults.stream_idle_timeout_ms),
             redirect_policy: "same_origin".to_string(),
             direct_connection: true,
         }
@@ -138,6 +249,16 @@ pub struct ProviderRuntimePlan {
     pub runtime_fingerprint: String,
 }
 
+impl ProviderRuntimePlan {
+    pub fn health_fingerprint(&self) -> String {
+        runtime_fingerprint(&json!({
+            "runtimeFingerprint": self.runtime_fingerprint,
+            "testModel": self.test_model,
+        }))
+        .expect("Provider health fingerprint input is serializable")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProviderRuntimeIndex {
     plans: BTreeMap<super::registry::ProviderKey, Arc<ProviderRuntimePlan>>,
@@ -150,7 +271,11 @@ impl ProviderRuntimeIndex {
             if !super::bundle::surface_enabled(&stored.provider) {
                 continue;
             }
-            let plan = Arc::new(compile_runtime_plan(stored, accounts)?);
+            let plan = Arc::new(compile_runtime_plan_with_defaults(
+                stored,
+                accounts,
+                store.runtime_defaults(),
+            )?);
             if plans.insert(plan.provider_key.clone(), plan).is_some() {
                 bail!("duplicate Provider key while compiling runtime index");
             }
@@ -180,6 +305,14 @@ impl ProviderRuntimeIndex {
 pub fn compile_runtime_plan(
     stored: &StoredProvider,
     accounts: &AccountStore,
+) -> anyhow::Result<ProviderRuntimePlan> {
+    compile_runtime_plan_with_defaults(stored, accounts, &ProviderRuntimeDefaults::default())
+}
+
+pub fn compile_runtime_plan_with_defaults(
+    stored: &StoredProvider,
+    accounts: &AccountStore,
+    defaults: &ProviderRuntimeDefaults,
 ) -> anyhow::Result<ProviderRuntimePlan> {
     let mut warnings = Vec::new();
     let mut configuration_state = RuntimeConfigurationState::Ready;
@@ -315,10 +448,14 @@ pub fn compile_runtime_plan(
             BTreeMap::new()
         }
     };
-    let test_model = runtime_test_model(&stored.provider, profile_policy.is_some());
+    let test_model = runtime_test_model(stored, profile_policy.is_some(), defaults);
     let aws_region = configured_setting(&stored.provider, "AWS_REGION");
     let media_policy = runtime_media_policy(&stored.provider, profile_policy.is_none());
-    let transport_policy = runtime_transport_policy(&stored.provider, profile_policy.is_some());
+    let transport_policy = runtime_transport_policy(
+        &stored.provider,
+        profile_policy.is_some(),
+        &defaults.transport,
+    );
     let extra_headers = match runtime_extra_headers(stored, profile_policy) {
         Ok(headers) => headers,
         Err(error) => {
@@ -340,7 +477,6 @@ pub fn compile_runtime_plan(
         "authRef": &auth_ref,
         "modelPolicy": &model_policy,
         "codingPlan": &coding_plan,
-        "testModel": &test_model,
         "awsRegion": &aws_region,
         "mediaPolicy": &media_policy,
         "transportPolicy": &transport_policy,
@@ -816,16 +952,30 @@ pub fn validate_custom_user_agent(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-fn runtime_test_model(provider: &Provider, profiled: bool) -> Option<String> {
-    non_empty_value(provider.settings_config.get("testModel")).or_else(|| {
-        (!profiled)
-            .then(|| {
-                non_empty_value(provider.settings_config.pointer("/testConfig/testModel"))
+fn runtime_test_model(
+    stored: &StoredProvider,
+    profiled: bool,
+    defaults: &ProviderRuntimeDefaults,
+) -> Option<String> {
+    let model = non_empty_value(stored.provider.settings_config.get("testModel"))
+        .or_else(|| super::bundle::bundle_test_model_override(&stored.provider).map(str::to_string))
+        .or_else(|| {
+            (!profiled)
+                .then(|| {
+                    non_empty_value(
+                        stored
+                            .provider
+                            .settings_config
+                            .pointer("/testConfig/testModel"),
+                    )
                     .or_else(|| {
-                        non_empty_value(provider.settings_config.pointer("/testConfig/model"))
+                        non_empty_value(
+                            stored.provider.settings_config.pointer("/testConfig/model"),
+                        )
                     })
                     .or_else(|| {
-                        provider
+                        stored
+                            .provider
                             .meta
                             .as_ref()
                             .and_then(|meta| meta.test_config.as_ref())
@@ -835,9 +985,20 @@ fn runtime_test_model(provider: &Provider, profiled: bool) -> Option<String> {
                                 )
                             })
                     })
-            })
-            .flatten()
-    })
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| defaults.test_models.for_app(stored.app).to_string());
+    if stored.app == AppKind::Codex && stored.provider_type == ProviderType::CodexOAuth {
+        let model = model.trim();
+        if model.contains('@') || model.contains('#') {
+            Some(model.to_string())
+        } else {
+            Some(format!("{model}@low"))
+        }
+    } else {
+        Some(model)
+    }
 }
 
 fn runtime_media_policy(provider: &Provider, legacy: bool) -> Option<Value> {
@@ -854,16 +1015,22 @@ fn runtime_media_policy(provider: &Provider, legacy: bool) -> Option<Value> {
     })
 }
 
-fn runtime_transport_policy(provider: &Provider, profiled: bool) -> RuntimeTransportPolicy {
+fn runtime_transport_policy(
+    provider: &Provider,
+    profiled: bool,
+    defaults: &ProviderTransportDefaults,
+) -> RuntimeTransportPolicy {
     if profiled {
         return RuntimeTransportPolicy {
-            timeout_ms: typed_timeout_ms(provider, "/transport/timeoutMs").unwrap_or(300_000),
+            timeout_ms: typed_timeout_ms(provider, "/transport/timeoutMs")
+                .unwrap_or(defaults.timeout_ms),
             stream_first_byte_timeout_ms: Some(
                 typed_timeout_ms(provider, "/transport/streamFirstByteTimeoutMs")
-                    .unwrap_or(120_000),
+                    .unwrap_or(defaults.stream_first_byte_timeout_ms),
             ),
             stream_idle_timeout_ms: Some(
-                typed_timeout_ms(provider, "/transport/streamIdleTimeoutMs").unwrap_or(300_000),
+                typed_timeout_ms(provider, "/transport/streamIdleTimeoutMs")
+                    .unwrap_or(defaults.stream_idle_timeout_ms),
             ),
             ..RuntimeTransportPolicy::default()
         };
@@ -876,9 +1043,9 @@ fn runtime_transport_policy(provider: &Provider, profiled: bool) -> RuntimeTrans
                 "PROXY_TIMEOUT_MS",
                 "REQUEST_TIMEOUT_MS",
             ],
-            300_000,
+            defaults.timeout_ms,
         )
-        .unwrap_or(300_000),
+        .unwrap_or(defaults.timeout_ms),
         stream_first_byte_timeout_ms: configured_timeout_ms(
             provider,
             &[
@@ -886,7 +1053,7 @@ fn runtime_transport_policy(provider: &Provider, profiled: bool) -> RuntimeTrans
                 "UPSTREAM_STREAM_FIRST_BYTE_TIMEOUT_MS",
                 "FIRST_BYTE_TIMEOUT_MS",
             ],
-            120_000,
+            defaults.stream_first_byte_timeout_ms,
         ),
         stream_idle_timeout_ms: configured_timeout_ms(
             provider,
@@ -895,7 +1062,7 @@ fn runtime_transport_policy(provider: &Provider, profiled: bool) -> RuntimeTrans
                 "UPSTREAM_STREAM_IDLE_TIMEOUT_MS",
                 "IDLE_TIMEOUT_MS",
             ],
-            300_000,
+            defaults.stream_idle_timeout_ms,
         ),
         ..RuntimeTransportPolicy::default()
     }
@@ -1464,7 +1631,69 @@ mod tests {
 
         stored.provider.settings_config["testModel"] = json!("next-health-model");
         let changed = compile_runtime_plan(&stored, &accounts).unwrap();
-        assert_ne!(first.runtime_fingerprint, changed.runtime_fingerprint);
+        assert_eq!(first.runtime_fingerprint, changed.runtime_fingerprint);
+        assert_ne!(first.health_fingerprint(), changed.health_fingerprint());
+    }
+
+    #[test]
+    fn profiled_runtime_resolves_server_provider_and_surface_overrides() {
+        let accounts = AccountStore::default();
+        let mut stored = provider("codex.openrouter", ProviderType::OpenRouter);
+        stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
+        stored.provider.settings_config["transport"] = json!({
+            "timeoutMs": 75_000,
+        });
+        let defaults = ProviderRuntimeDefaults {
+            transport: ProviderTransportDefaults {
+                timeout_ms: 310_000,
+                stream_first_byte_timeout_ms: 130_000,
+                stream_idle_timeout_ms: 320_000,
+            },
+            test_models: ProviderTestModelDefaults {
+                claude: "server-claude".to_string(),
+                codex: "server-codex".to_string(),
+                gemini: "server-gemini".to_string(),
+            },
+        };
+
+        let inherited = compile_runtime_plan_with_defaults(&stored, &accounts, &defaults).unwrap();
+        assert_eq!(inherited.test_model.as_deref(), Some("server-codex"));
+        assert_eq!(inherited.transport_policy.timeout_ms, 75_000);
+        assert_eq!(
+            inherited.transport_policy.stream_first_byte_timeout_ms,
+            Some(130_000)
+        );
+        assert_eq!(
+            inherited.transport_policy.stream_idle_timeout_ms,
+            Some(320_000)
+        );
+
+        stored
+            .provider
+            .extra
+            .insert("testModel".to_string(), json!("provider-codex"));
+        let provider_override =
+            compile_runtime_plan_with_defaults(&stored, &accounts, &defaults).unwrap();
+        assert_eq!(
+            provider_override.test_model.as_deref(),
+            Some("provider-codex")
+        );
+        assert_eq!(
+            inherited.runtime_fingerprint,
+            provider_override.runtime_fingerprint
+        );
+        assert_ne!(
+            inherited.health_fingerprint(),
+            provider_override.health_fingerprint()
+        );
+
+        stored.provider.settings_config["testModel"] = json!("surface-codex");
+        let surface_override =
+            compile_runtime_plan_with_defaults(&stored, &accounts, &defaults).unwrap();
+        assert_eq!(
+            surface_override.test_model.as_deref(),
+            Some("surface-codex")
+        );
     }
 
     #[test]

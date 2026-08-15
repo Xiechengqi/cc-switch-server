@@ -13,12 +13,6 @@ export interface StreamCheckConfig {
   maxRetries: number;
   /** 降级阈值（毫秒）：可达但 TTFB 超过该值判定为"较慢" */
   degradedThresholdMs: number;
-  /** Claude 真实模型测试使用的模型 */
-  claudeModel: string;
-  /** Codex 真实模型测试使用的模型 */
-  codexModel: string;
-  /** Gemini 真实模型测试使用的模型 */
-  geminiModel: string;
   /** 真实模型测试提示词 */
   testPrompt: string;
 }

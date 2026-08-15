@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  reconcileManagedAccountBindingGeneration,
   resolveManagedAccountBindingState,
   resolveManagedAccountSelection,
 } from "./ServerProviderForm";
@@ -123,5 +124,64 @@ describe("resolveManagedAccountSelection", () => {
       authProvider: "codex_oauth",
       accountId: "missing-account",
     });
+  });
+});
+
+describe("reconcileManagedAccountBindingGeneration", () => {
+  const account = {
+    id: "cursor-account-1",
+    provider: "cursor_oauth",
+    authIdentityGeneration: 7,
+  };
+
+  it("fills a missing generation after the authoritative account query arrives", () => {
+    expect(
+      reconcileManagedAccountBindingGeneration({
+        accountId: account.id,
+        currentBinding: {
+          source: "managed_account",
+          authProvider: "cursor_oauth",
+          accountId: account.id,
+        },
+        authProvider: "cursor_oauth",
+        accounts: [account],
+      }),
+    ).toEqual({
+      source: "managed_account",
+      authProvider: "cursor_oauth",
+      accountId: account.id,
+      authIdentityGeneration: 7,
+    });
+  });
+
+  it("does not silently replace an existing stale generation", () => {
+    expect(
+      reconcileManagedAccountBindingGeneration({
+        accountId: account.id,
+        currentBinding: {
+          source: "managed_account",
+          authProvider: "cursor_oauth",
+          accountId: account.id,
+          authIdentityGeneration: 6,
+        },
+        authProvider: "cursor_oauth",
+        accounts: [account],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("does not use an account from another credential provider", () => {
+    expect(
+      reconcileManagedAccountBindingGeneration({
+        accountId: account.id,
+        currentBinding: {
+          source: "managed_account",
+          authProvider: "cursor_oauth",
+          accountId: account.id,
+        },
+        authProvider: "cursor_oauth",
+        accounts: [{ ...account, provider: "codex_oauth" }],
+      }),
+    ).toBeUndefined();
   });
 });

@@ -376,6 +376,8 @@ pub struct ShareUpstreamQuota {
     )]
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queried_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_period_end: Option<String>,
@@ -1227,6 +1229,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
                 account.provider_type,
                 account.subscription_level.as_deref(),
             ),
+            activity_cost: None,
             queried_at: None,
             subscription_period_end,
             availability: Some(availability),
@@ -1260,6 +1263,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
             "failed".to_string()
         },
         plan,
+        activity_cost: None,
         queried_at: account.quota_refreshed_at,
         subscription_period_end,
         availability: Some(availability),

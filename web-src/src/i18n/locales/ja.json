@@ -494,9 +494,16 @@
         "running": "実行中",
         "stopped": "停止中"
       },
+      "providerDefaults": {
+        "title": "プロバイダー実行時の既定値",
+        "description": "プロバイダーのタイムアウトと App ごとのモデルテストに対する Server の継承元を設定します",
+        "transportTitle": "リクエストタイムアウトの既定値",
+        "modelsTitle": "テストモデルの既定値",
+        "invalid": "タイムアウト範囲とテストモデルを確認してください"
+      },
       "modelTest": {
         "title": "モデルテスト設定",
-        "description": "モデルテストで使用するデフォルトモデルとプロンプトを設定"
+        "description": "モデルテストのタイムアウト、再試行、低速判定しきい値、プロンプトを設定"
       },
       "backup": {
         "title": "バックアップと復元",
@@ -2676,7 +2683,7 @@
     "rejected": "{{providerName}} のチェックが拒否されました: {{message}}",
     "error": "{{providerName}} のチェックでエラーが発生しました: {{error}}",
     "modelNotFound": "{{providerName}} のテストモデル {{model}} は存在しないか廃止されています",
-    "modelNotFoundHint": "このモデルはプロバイダーにより廃止された可能性があります。「モデルテスト設定」でデフォルトのテストモデルを更新してください。",
+    "modelNotFoundHint": "このモデルはプロバイダーにより廃止された可能性があります。Server の既定値またはプロバイダーのテストモデル上書きを更新してください。",
     "quotaExceeded": "{{providerName}} の Coding Plan 利用枠を超過しました",
     "quotaExceededHint": "Baidu Qianfan が Coding Plan の利用枠超過エラーを返しました。5時間・週次・月次の利用枠更新を待つか、Qianfan コンソールでプランを確認してください。",
     "codexOauthTokenInvalidated": "{{providerName}} の OAuth token はサーバー側で無効化されています",
@@ -3240,6 +3247,9 @@
     "loggedInAccounts": "ログイン済みアカウント",
     "selected": "選択済み",
     "removeAccount": "アカウントを削除",
+    "selectAccount": "Provider に関連付けるアカウント",
+    "selectAccountPlaceholder": "Cursor アカウントを選択",
+    "addAnotherAccount": "別のアカウントを追加",
     "loginWithCursor": "Cursor でログイン",
     "importLocalServerTitle": "cc-switch-server を実行しているマシンから Cursor IDE または cursor-agent のログイン状態を読み取ります",
     "importLocalServer": "ローカルの Cursor からインポート",
@@ -3248,7 +3258,6 @@
     "copyLink": "リンクをコピー",
     "openManually": "リンクを開く",
     "retry": "再試行",
-    "multipleAccountsConflict": "従来の複数アカウント設定が見つかりました。不要なアカウントを削除し、Cursor プロキシアカウントを 1 つだけ残してください。",
     "loginRequired": "先に Cursor アカウントへログインしてください",
     "selectAccountRequired": "Cursor OAuth を Cursor アカウントに関連付けてください"
   },

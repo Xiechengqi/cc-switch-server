@@ -3183,7 +3183,9 @@ fn cursor_api_key_exchange_url(stored: &StoredProvider) -> Result<String, ProxyE
     )
 }
 
-fn validate_cursor_runtime_configuration(stored: &StoredProvider) -> Result<(), ProxyError> {
+pub(super) fn validate_cursor_runtime_configuration(
+    stored: &StoredProvider,
+) -> Result<(), ProxyError> {
     let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
         cursor_configuration_error("Cursor AgentService driver requires a Cursor provider")
     })?;

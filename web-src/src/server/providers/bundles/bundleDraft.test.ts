@@ -96,6 +96,8 @@ function openAiOAuthBundle(
     name: family.label,
     modelPolicyScope: "global",
     testApp: "codex",
+    surfaceTestModels: {},
+    transport: {},
     supportedApps: family.surfaces.map((surface) => surface.app),
     enabledApps: family.surfaces.map((surface) => surface.app),
     credentialConfigured: false,
@@ -523,6 +525,8 @@ describe("Provider Bundle drafts", () => {
       name: "OpenAI OAuth",
       modelPolicyScope: "per_app",
       testApp: "codex",
+      surfaceTestModels: {},
+      transport: {},
       supportedApps: ["claude", "codex"],
       enabledApps: ["claude", "codex"],
       credentialConfigured: true,
@@ -567,16 +571,16 @@ describe("Provider Bundle drafts", () => {
   it("keeps Custom HTTP endpoint, credentials, auth field, and transport typed", () => {
     const family = familyById("family.custom_http")!;
     const draft = createProviderBundleDraft(family);
+    draft.transport = {
+      timeoutMs: "60000",
+      streamFirstByteTimeoutMs: "15000",
+      streamIdleTimeoutMs: "45000",
+    };
     draft.surfaces = draft.surfaces.map((surface, index) => ({
       ...updateSurfaceEndpoint(
         surface,
         `https://${surface.app}.example/v${index + 1}`,
       ),
-      transport: {
-        timeoutMs: "60000",
-        streamFirstByteTimeoutMs: "15000",
-        streamIdleTimeoutMs: "45000",
-      },
       secret: {
         configured: false,
         value: `${surface.app}-secret`,
@@ -597,14 +601,14 @@ describe("Provider Bundle drafts", () => {
     expect(write).toMatchObject({
       testApp: "claude",
       testModel: "claude-health-model",
-    });
-    expect(write.surfaces[0]).toMatchObject({
-      endpoint: "https://claude.example/v1",
       transport: {
         timeoutMs: 60000,
         streamFirstByteTimeoutMs: 15000,
         streamIdleTimeoutMs: 45000,
       },
+    });
+    expect(write.surfaces[0]).toMatchObject({
+      endpoint: "https://claude.example/v1",
       driverOptions: { apiKeyField: "x-api-key" },
       credentialPatches: {
         "/settingsConfig/apiKey": {
@@ -633,12 +637,12 @@ describe("Provider Bundle drafts", () => {
     );
 
     surface.driverOptions.apiKeyField = "x-api-key";
-    surface.transport.timeoutMs = "999";
+    draft.transport.timeoutMs = "999";
     expect(validateProviderBundleDraft(draft)).toBe(
-      "claude request timeout is invalid",
+      "Provider request timeout is invalid",
     );
 
-    surface.transport.timeoutMs = "60000";
+    draft.transport.timeoutMs = "60000";
     surface.driverOptions.apiKeyField = "Host";
     expect(validateProviderBundleDraft(draft)).toBe(
       "claude authentication header name is invalid",
@@ -779,6 +783,12 @@ describe("Provider Bundle drafts", () => {
       modelPolicyScope: "global",
       testApp: "codex",
       testModel: "persisted-health-model",
+      surfaceTestModels: { gemini: "persisted-gemini-health-model" },
+      transport: {
+        timeoutMs: 61_000,
+        streamFirstByteTimeoutMs: 16_000,
+        streamIdleTimeoutMs: 46_000,
+      },
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: ["codex", "gemini"],
       credentialConfigured: true,
@@ -795,7 +805,12 @@ describe("Provider Bundle drafts", () => {
     expect(edited.surfaces[0]?.runtime).toBeUndefined();
     expect(edited.testApp).toBe("codex");
     expect(edited.testModel).toBe("persisted-health-model");
-    expect(edited.surfaces[0]?.transport).toEqual({
+    expect(edited.surfaceTestModels).toEqual({
+      claude: "",
+      codex: "",
+      gemini: "persisted-gemini-health-model",
+    });
+    expect(edited.transport).toEqual({
       timeoutMs: "61000",
       streamFirstByteTimeoutMs: "16000",
       streamIdleTimeoutMs: "46000",
@@ -846,6 +861,8 @@ describe("Provider Bundle drafts", () => {
       modelPolicyScope: "global",
       testApp: "claude",
       testModel: "health-model",
+      surfaceTestModels: {},
+      transport: {},
       supportedApps: family.surfaces.map((surface) => surface.app),
       enabledApps: family.surfaces.map((surface) => surface.app),
       credentialConfigured: true,
@@ -865,7 +882,7 @@ describe("Provider Bundle drafts", () => {
     expect(edited.surfaces[0]?.runtime?.runtimeFingerprint).toBe("fixture");
     expect(edited.testApp).toBe("claude");
     expect(edited.testModel).toBe("health-model");
-    expect(edited.surfaces[0]?.transport.timeoutMs).toBe("45000");
+    expect(edited.transport.timeoutMs).toBe("");
 
     const duplicate = duplicateProviderBundleDraft(view);
     expect(duplicate.id).not.toBe(source.id);

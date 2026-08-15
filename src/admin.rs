@@ -11,6 +11,8 @@ use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::{Cli, ConfigCommand, PasswordCommand};
 use crate::clients::router::tunnel::{tunnels_path, TunnelRuntimeStatus};
 use crate::domain::accounts::store::{accounts_path, AccountStore};
+use crate::domain::providers::bundle::surface_enabled;
+use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::store::{providers_path, ProviderStore};
 use crate::domain::settings::config::{config_path, RouterIdentity, ServerConfig};
 use crate::domain::sharing::shares::{shares_path, ShareStore};
@@ -175,6 +177,7 @@ pub(crate) fn validate_config_stores(cli: &Cli) -> anyhow::Result<ConfigSnapshot
         providers.prepare_legacy_runtime_view();
     }
     let accounts = AccountStore::load_or_default(&config_dir)?;
+    providers.set_runtime_defaults(config.provider_runtime_defaults.clone());
     providers.rebuild_runtime_index(&accounts)?;
     let shares = ShareStore::load_or_default(&config_dir)?;
     let usage = UsageStore::load_or_default(&config_dir)?;
@@ -280,6 +283,7 @@ fn doctor_report(cli: &Cli, check_port: bool) -> DoctorReport {
             );
             check_setup(&mut report, &snapshot.config);
             check_share_provider_links(&mut report, &snapshot);
+            check_cursor_runtime_configuration(&mut report, &snapshot.providers);
         }
         Err(error) => {
             report.fail("stores", error.to_string());
@@ -446,6 +450,58 @@ fn check_share_provider_links(report: &mut DoctorReport, snapshot: &ConfigSnapsh
             "share-provider-links",
             format!("missing provider references: {}", missing.join(", ")),
         );
+    }
+}
+
+fn check_cursor_runtime_configuration(report: &mut DoctorReport, providers: &ProviderStore) {
+    for (provider_type, check_name, rail_label) in [
+        (
+            ProviderType::CursorOAuth,
+            "cursor-oauth-runtime",
+            "Cursor OAuth",
+        ),
+        (
+            ProviderType::CursorApiKey,
+            "cursor-api-key-runtime",
+            "Cursor API key",
+        ),
+    ] {
+        let configured = providers
+            .providers
+            .iter()
+            .filter(|stored| {
+                stored.provider_type == provider_type && surface_enabled(&stored.provider)
+            })
+            .collect::<Vec<_>>();
+        if configured.is_empty() {
+            continue;
+        }
+        let failures = configured
+            .iter()
+            .filter_map(|stored| {
+                crate::proxy::cursor::validate_runtime_configuration(stored)
+                    .err()
+                    .map(|error| {
+                        format!(
+                            "{}:{}: {}",
+                            stored.app.as_str(),
+                            stored.provider.id,
+                            error.message
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            report.ok(
+                check_name,
+                format!(
+                    "runtime secret configuration is valid for {} enabled {rail_label} Provider surface(s)",
+                    configured.len()
+                ),
+            );
+        } else {
+            report.fail(check_name, failures.join("; "));
+        }
     }
 }
 
@@ -873,6 +929,76 @@ mod tests {
             .checks
             .iter()
             .all(|check| check.level != DoctorLevel::Fail));
+    }
+
+    #[test]
+    fn doctor_validates_only_configured_cursor_runtime_rails_without_printing_endpoints() {
+        let cursor_provider =
+            |provider_type: ProviderType, id: &str, settings_config: serde_json::Value| {
+                crate::domain::providers::store::StoredProvider {
+                    app: crate::domain::providers::model::AppKind::Codex,
+                    provider: crate::domain::providers::model::Provider {
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        settings_config,
+                        category: None,
+                        meta: Some(crate::domain::providers::model::ProviderMeta {
+                            provider_type: Some(provider_type.as_str().to_string()),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                    provider_type,
+                    provider_type_id: provider_type.as_str().to_string(),
+                    resource: Default::default(),
+                }
+            };
+        let providers = ProviderStore {
+            providers: vec![
+                cursor_provider(
+                    ProviderType::CursorOAuth,
+                    "cursor-oauth-doctor",
+                    json!({
+                        "CURSOR_OAUTH_AGENT_ENDPOINT": "http://127.0.0.1:8787/oauth/test"
+                    }),
+                ),
+                cursor_provider(
+                    ProviderType::CursorApiKey,
+                    "cursor-api-key-doctor",
+                    json!({
+                        "CURSOR_APIKEY_AGENT_ENDPOINT": "http://127.0.0.1:8787/api-key/test",
+                        "CURSOR_APIKEY_EXCHANGE_ENDPOINT": "http://127.0.0.1:8787/api-key/exchange"
+                    }),
+                ),
+            ],
+            ..ProviderStore::default()
+        };
+        let mut report = DoctorReport::default();
+
+        check_cursor_runtime_configuration(&mut report, &providers);
+
+        assert_eq!(report.checks.len(), 2);
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| check.level == DoctorLevel::Ok));
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| !check.message.contains("127.0.0.1")));
+
+        let invalid = ProviderStore {
+            providers: vec![cursor_provider(
+                ProviderType::CursorOAuth,
+                "cursor-oauth-invalid-doctor",
+                json!({"CURSOR_OAUTH_AGENT_ENDPOINT": "not-a-url"}),
+            )],
+            ..ProviderStore::default()
+        };
+        let mut invalid_report = DoctorReport::default();
+        check_cursor_runtime_configuration(&mut invalid_report, &invalid);
+        assert_eq!(invalid_report.checks[0].level, DoctorLevel::Fail);
+        assert!(!invalid_report.checks[0].message.contains("not-a-url"));
     }
 
     fn test_cli(config_dir: PathBuf) -> Cli {

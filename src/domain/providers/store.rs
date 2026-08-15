@@ -15,7 +15,9 @@ use crate::domain::providers::registry::{
     custom_binding_compatibility_provider_type, profile_by_id, resolve_custom_binding,
     CustomBindingInput, DriverBinding, ProfileId,
 };
-use crate::domain::providers::runtime::{ProviderRuntimeIndex, ProviderRuntimePlan};
+use crate::domain::providers::runtime::{
+    ProviderRuntimeDefaults, ProviderRuntimeIndex, ProviderRuntimePlan,
+};
 
 const PROVIDERS_FILE_NAME: &str = "providers.json";
 
@@ -48,6 +50,8 @@ pub struct ProviderStore {
     pub bundle_order: Vec<String>,
     #[serde(skip)]
     pub(crate) runtime_index: Arc<ProviderRuntimeIndex>,
+    #[serde(skip)]
+    pub(crate) runtime_defaults: ProviderRuntimeDefaults,
     #[serde(skip)]
     pub(crate) format: ProviderStoreFormat,
     #[serde(skip)]
@@ -218,6 +222,14 @@ impl ProviderStore {
     pub fn rebuild_runtime_index(&mut self, accounts: &AccountStore) -> anyhow::Result<()> {
         self.runtime_index = Arc::new(ProviderRuntimeIndex::compile(self, accounts)?);
         Ok(())
+    }
+
+    pub fn set_runtime_defaults(&mut self, defaults: ProviderRuntimeDefaults) {
+        self.runtime_defaults = defaults;
+    }
+
+    pub fn runtime_defaults(&self) -> &ProviderRuntimeDefaults {
+        &self.runtime_defaults
     }
 
     pub fn runtime_plan(

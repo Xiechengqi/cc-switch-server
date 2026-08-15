@@ -335,6 +335,8 @@ pub(in crate::api) struct TestProviderQuery {
     #[serde(default)]
     pub(in crate::api) model: Option<String>,
     #[serde(default)]
+    pub(in crate::api) test_prompt: Option<String>,
+    #[serde(default)]
     pub(in crate::api) stream: Option<bool>,
 }
 
@@ -351,6 +353,8 @@ pub(in crate::api) struct TestProvidersRequest {
     pub(in crate::api) timeout_ms: Option<u64>,
     #[serde(default)]
     pub(in crate::api) model: Option<String>,
+    #[serde(default)]
+    pub(in crate::api) test_prompt: Option<String>,
     #[serde(default)]
     pub(in crate::api) stream: Option<bool>,
 }

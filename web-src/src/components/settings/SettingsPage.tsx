@@ -18,6 +18,7 @@ import {
   ScrollText,
   HardDriveDownload,
   FlaskConical,
+  Gauge,
   ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -53,6 +54,7 @@ import { BackupListSection } from "@/components/settings/BackupListSection";
 import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
 import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
 import { ModelTestConfigPanel } from "@/components/usage/ModelTestConfigPanel";
+import { ProviderRuntimeDefaultsPanel } from "@/components/settings/ProviderRuntimeDefaultsPanel";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { ApiManagementPanel } from "@/components/settings/ApiManagementPanel";
@@ -483,6 +485,38 @@ export const SettingsPage = forwardRef<
                       defaultValue={[]}
                       className="w-full space-y-4"
                     >
+                      {serverMode ? (
+                        <AccordionItem
+                          value="providerDefaults"
+                          className="rounded-xl glass-card overflow-hidden"
+                        >
+                          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                              <Gauge className="h-5 w-5 shrink-0 text-sky-500" />
+                              <div className="min-w-0 space-y-1 text-left">
+                                <h3 className="text-sm font-medium leading-none">
+                                  {t("settings.advanced.providerDefaults.title", {
+                                    defaultValue: "供应商默认值",
+                                  })}
+                                </h3>
+                                <p className="text-xs font-normal text-muted-foreground">
+                                  {t(
+                                    "settings.advanced.providerDefaults.description",
+                                    {
+                                      defaultValue:
+                                        "设置供应商请求超时和各 App 测试模型的继承起点",
+                                    },
+                                  )}
+                                </p>
+                              </div>
+                            </div>
+                          </AccordionTrigger>
+                          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                            <ProviderRuntimeDefaultsPanel />
+                          </AccordionContent>
+                        </AccordionItem>
+                      ) : null}
+
                       <AccordionItem
                         value="directory"
                         className="rounded-xl glass-card overflow-hidden"

@@ -39,6 +39,18 @@ describe("providerResourceSupportsOperation", () => {
     expect(providerResourceSupportsOperation(kiro, "connectivity")).toBe(true);
   });
 
+  it("enables native model tests for Cursor OAuth and API key profiles", () => {
+    expect(
+      providerResourceSupportsOperation(resource("claude.cursor_oauth"), "test"),
+    ).toBe(true);
+    expect(
+      providerResourceSupportsOperation(
+        resource("claude.cursor_api_key"),
+        "test",
+      ),
+    ).toBe(true);
+  });
+
   it("resolves Custom HTTP operations from its protocol and auth binding", () => {
     const custom = resource("claude.custom_http", {
       upstreamProtocol: "anthropic_messages",

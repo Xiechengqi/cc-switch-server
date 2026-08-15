@@ -83,6 +83,7 @@
     "credential": "認証情報",
     "credentialMissing": "認証情報が未設定",
     "credentialReady": "認証情報を設定済み",
+    "connectionTimeouts": "接続とタイムアウト",
     "deleteBlocked": "先にこの Provider のリモート共有を削除または解除してください",
     "deleted": "Provider を削除しました",
     "driverOptions": "ドライバーオプション",
@@ -102,6 +103,7 @@
     "modelScopePerApp": "App ごと",
     "modelSummarySingle": "固定：{{model}}",
     "modelSingle": "固定モデル",
+    "providerTestModel": "プロバイダーのテストモデル上書き",
     "queryParameter": "API Key クエリパラメーター名",
     "queryCredential": "クエリ値",
     "quickPreset": "クイックプリセット",
@@ -113,6 +115,7 @@
     "surfaceEnabled": "API を有効化",
     "surfaces": "API Surface",
     "streamIdleTimeout": "ストリームアイドルタイムアウト（ミリ秒）",
+    "surfaceTestModelOverrides": "App ごとのテストモデル上書き",
     "testApp": "テスト App",
     "testModel": "テストモデル",
     "title": "Providers"
@@ -293,6 +296,13 @@
       "deepseekAccountDescription": "DeepSeek アカウントを管理"
     },
     "advanced": {
+      "providerDefaults": {
+        "title": "プロバイダー実行時の既定値",
+        "description": "プロバイダーのタイムアウトと App ごとのモデルテストに対する Server の継承元を設定します",
+        "transportTitle": "リクエストタイムアウトの既定値",
+        "modelsTitle": "テストモデルの既定値",
+        "invalid": "タイムアウト範囲とテストモデルを確認してください"
+      },
       "apiManagement": {
         "revokeTokenConfirm": "取り消すと、現在のデバッグトークンは直ちに無効になります。"
       },

@@ -96,11 +96,6 @@ export interface BundleSurfaceEditorDraft {
   modelPolicy: ProviderModelPolicy;
   upstreamModel: string;
   endpoint: string;
-  transport: {
-    timeoutMs: string;
-    streamFirstByteTimeoutMs: string;
-    streamIdleTimeoutMs: string;
-  };
   driverOptions: {
     apiKeyField?: string;
     customUserAgent?: string;
@@ -133,6 +128,12 @@ export interface ProviderBundleEditorDraft {
   upstreamModel: string;
   testApp: CoreProviderApp;
   testModel: string;
+  surfaceTestModels: Record<CoreProviderApp, string>;
+  transport: {
+    timeoutMs: string;
+    streamFirstByteTimeoutMs: string;
+    streamIdleTimeoutMs: string;
+  };
   secrets: Record<string, BundleSecretDraft>;
   surfaces: BundleSurfaceEditorDraft[];
 }
@@ -412,7 +413,6 @@ function surfaceFromResource(
     (driverForProfile(profile)?.driverId === "oauth.openai_codex"
       ? true
       : undefined);
-  const configuredTransport = objectOption(settings.transport);
   const endpoint = runtime?.endpoint ?? readEndpoint(settings, app);
   const modelPolicy =
     runtime?.modelPolicy.mode ?? readModelPolicy(settings, profile);
@@ -427,19 +427,6 @@ function surfaceFromResource(
     modelPolicy,
     upstreamModel,
     endpoint,
-    transport: {
-      timeoutMs: runtime
-        ? String(runtime.transportPolicy.timeoutMs)
-        : numberOption(configuredTransport?.timeoutMs),
-      streamFirstByteTimeoutMs:
-        runtime?.transportPolicy.streamFirstByteTimeoutMs == null
-          ? numberOption(configuredTransport?.streamFirstByteTimeoutMs)
-          : String(runtime.transportPolicy.streamFirstByteTimeoutMs),
-      streamIdleTimeoutMs:
-        runtime?.transportPolicy.streamIdleTimeoutMs == null
-          ? numberOption(configuredTransport?.streamIdleTimeoutMs)
-          : String(runtime.transportPolicy.streamIdleTimeoutMs),
-    },
     driverOptions: {
       apiKeyField:
         stringOption(runtimeOptions.apiKeyField) ?? configuredMeta.apiKeyField,
@@ -481,18 +468,6 @@ function booleanOption(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-function numberOption(value: unknown): string {
-  return typeof value === "number" && Number.isSafeInteger(value)
-    ? String(value)
-    : "";
-}
-
-function objectOption(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 export function createProviderBundleDraft(
   family: ProviderFamilySpec,
 ): ProviderBundleEditorDraft {
@@ -510,15 +485,6 @@ export function createProviderBundleDraft(
   const sourcePreset = createDraftForProfile(sourceProfile);
   const model = initialBundleModel(family, surfaces);
   const testApp = defaultBundleTestApp(family, surfaces);
-  const testSurface = surfaces.find((surface) => surface.app === testApp);
-  const testProfile = testSurface
-    ? profileById(testSurface.profileId)
-    : undefined;
-  const testModel = testProfile
-    ? (stringOption(
-        createDraftForProfile(testProfile).settingsConfig.testModel,
-      ) ?? "")
-    : "";
   const secrets = Object.fromEntries(
     credentialSlotsForFamily(family).map(({ pointer }) => [
       pointer,
@@ -545,7 +511,13 @@ export function createProviderBundleDraft(
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
     testApp,
-    testModel,
+    testModel: "",
+    surfaceTestModels: { claude: "", codex: "", gemini: "" },
+    transport: {
+      timeoutMs: "",
+      streamFirstByteTimeoutMs: "",
+      streamIdleTimeoutMs: "",
+    },
     secrets,
     surfaces,
   };
@@ -681,6 +653,25 @@ export function editProviderBundleDraft(
     upstreamModel: model.upstreamModel,
     testApp: bundle.testApp,
     testModel: bundle.testModel ?? "",
+    surfaceTestModels: {
+      claude: bundle.surfaceTestModels.claude ?? "",
+      codex: bundle.surfaceTestModels.codex ?? "",
+      gemini: bundle.surfaceTestModels.gemini ?? "",
+    },
+    transport: {
+      timeoutMs:
+        bundle.transport.timeoutMs == null
+          ? ""
+          : String(bundle.transport.timeoutMs),
+      streamFirstByteTimeoutMs:
+        bundle.transport.streamFirstByteTimeoutMs == null
+          ? ""
+          : String(bundle.transport.streamFirstByteTimeoutMs),
+      streamIdleTimeoutMs:
+        bundle.transport.streamIdleTimeoutMs == null
+          ? ""
+          : String(bundle.transport.streamIdleTimeoutMs),
+    },
     secrets,
     surfaces,
   };
@@ -953,15 +944,6 @@ function surfaceWriteDraft(
         ? surface.upstreamModel.trim()
         : undefined,
     endpoint: endpoint || undefined,
-    transport: {
-      timeoutMs: optionalDuration(surface.transport.timeoutMs),
-      streamFirstByteTimeoutMs: optionalDuration(
-        surface.transport.streamFirstByteTimeoutMs,
-      ),
-      streamIdleTimeoutMs: optionalDuration(
-        surface.transport.streamIdleTimeoutMs,
-      ),
-    },
     driverOptions: typedDriverOptions(surface),
     extraHeaders:
       profile.formComposition === "custom"
@@ -1017,6 +999,34 @@ export function validateProviderBundleDraft(
   }
   if (draft.testModel.trim().length > 256) {
     return "Test model is too long";
+  }
+  if (
+    Object.values(draft.surfaceTestModels).some(
+      (model) => model.trim().length > 256,
+    )
+  ) {
+    return "Surface test model is too long";
+  }
+  if (!validateDuration(draft.transport.timeoutMs, 1_000, 3_600_000)) {
+    return "Provider request timeout is invalid";
+  }
+  if (
+    !validateDuration(
+      draft.transport.streamFirstByteTimeoutMs,
+      1_000,
+      600_000,
+    )
+  ) {
+    return "Provider first-byte timeout is invalid";
+  }
+  if (
+    !validateDuration(
+      draft.transport.streamIdleTimeoutMs,
+      1_000,
+      3_600_000,
+    )
+  ) {
+    return "Provider stream idle timeout is invalid";
   }
   const credentialProfile = profileById(family.credentialProfileId);
   if (!credentialProfile) return "Credential profile is unavailable";
@@ -1079,23 +1089,6 @@ export function validateProviderBundleDraft(
       if (surface.modelPolicy === "single" && !surface.upstreamModel.trim()) {
         return `${surface.app} upstream model is required`;
       }
-    }
-    if (!validateDuration(surface.transport.timeoutMs, 1_000, 3_600_000)) {
-      return `${surface.app} request timeout is invalid`;
-    }
-    if (
-      !validateDuration(
-        surface.transport.streamFirstByteTimeoutMs,
-        1_000,
-        600_000,
-      )
-    ) {
-      return `${surface.app} first-byte timeout is invalid`;
-    }
-    if (
-      !validateDuration(surface.transport.streamIdleTimeoutMs, 1_000, 3_600_000)
-    ) {
-      return `${surface.app} stream idle timeout is invalid`;
     }
     if (profileAllowsEndpointEditing(profile)) {
       const endpoint =
@@ -1193,6 +1186,20 @@ export function toProviderBundleWriteDraft(
         : undefined,
     testApp: draft.testApp,
     testModel: draft.testModel.trim() || undefined,
+    surfaceTestModels: Object.fromEntries(
+      Object.entries(draft.surfaceTestModels)
+        .map(([app, model]) => [app, model.trim()])
+        .filter(([, model]) => model),
+    ),
+    transport: {
+      timeoutMs: optionalDuration(draft.transport.timeoutMs),
+      streamFirstByteTimeoutMs: optionalDuration(
+        draft.transport.streamFirstByteTimeoutMs,
+      ),
+      streamIdleTimeoutMs: optionalDuration(
+        draft.transport.streamIdleTimeoutMs,
+      ),
+    },
     managedAccount:
       credentialProfileForFamily(family)?.credentialPolicy.mode ===
         "managed_account" && draft.accountGeneration != null

@@ -25,6 +25,21 @@ export type ProviderModelPolicyScope = "global" | "per_app";
 export type ProviderModelPolicySource =
   "bundle_global" | "app_independent" | "profile_fixed";
 
+export interface ProviderTransportOverrides {
+  timeoutMs?: number;
+  streamFirstByteTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
+}
+
+export interface ProviderRuntimeDefaults {
+  transport: {
+    timeoutMs: number;
+    streamFirstByteTimeoutMs: number;
+    streamIdleTimeoutMs: number;
+  };
+  testModels: Record<CoreProviderApp, string>;
+}
+
 export interface ProviderCustomBinding {
   upstreamProtocol: ProviderUpstreamProtocol;
   authScheme: ProviderAuthScheme;
@@ -256,6 +271,8 @@ export interface ProviderBundleView {
   modelPolicyScope: ProviderModelPolicyScope;
   testApp: CoreProviderApp;
   testModel?: string;
+  surfaceTestModels: Partial<Record<CoreProviderApp, string>>;
+  transport: ProviderTransportOverrides;
   supportedApps: CoreProviderApp[];
   enabledApps: CoreProviderApp[];
   credentialConfigured: boolean;
@@ -270,11 +287,6 @@ export interface ProviderBundleSurfaceWriteDraft {
   modelPolicy?: ProviderModelPolicy;
   upstreamModel?: string;
   endpoint?: string;
-  transport?: {
-    timeoutMs?: number;
-    streamFirstByteTimeoutMs?: number;
-    streamIdleTimeoutMs?: number;
-  };
   driverOptions?: {
     apiKeyField?: string;
     customUserAgent?: string;
@@ -300,6 +312,8 @@ export interface ProviderBundleWriteDraft {
   upstreamModel?: string;
   testApp: CoreProviderApp;
   testModel?: string;
+  surfaceTestModels?: Partial<Record<CoreProviderApp, string>>;
+  transport?: ProviderTransportOverrides;
   managedAccount?: {
     accountId: string;
     authIdentityGeneration: number;
@@ -393,6 +407,16 @@ export interface ClaudeDesktopDefaultRoute {
 }
 
 export const providersApi = {
+  async getRuntimeDefaults(): Promise<ProviderRuntimeDefaults> {
+    return await invokeCommand("get_provider_runtime_defaults");
+  },
+
+  async saveRuntimeDefaults(
+    defaults: ProviderRuntimeDefaults,
+  ): Promise<boolean> {
+    return await invokeCommand("save_provider_runtime_defaults", { defaults });
+  },
+
   async getBundles(): Promise<ProviderBundleView[]> {
     return await invokeCommand("get_provider_bundles");
   },

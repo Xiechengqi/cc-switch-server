@@ -51,6 +51,7 @@ import { Textarea } from "@/components/ui/textarea";
 import type {
   ProviderBundleView,
   ProviderCustomBinding,
+  ProviderRuntimeDefaults,
 } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
 import { shareApi, type ShareUserPolicy } from "@/lib/api/share";
@@ -615,52 +616,6 @@ function SurfaceEditor({
           </div>
         </div>
       ) : null}
-
-      <div className="grid gap-4 md:grid-cols-2">
-        {[
-          {
-            key: "timeoutMs" as const,
-            label: t("providerBundle.requestTimeout", {
-              defaultValue: "请求超时（毫秒）",
-            }),
-            max: 3_600_000,
-          },
-          {
-            key: "streamFirstByteTimeoutMs" as const,
-            label: t("providerBundle.firstByteTimeout", {
-              defaultValue: "首字节超时（毫秒）",
-            }),
-            max: 600_000,
-          },
-          {
-            key: "streamIdleTimeoutMs" as const,
-            label: t("providerBundle.streamIdleTimeout", {
-              defaultValue: "流空闲超时（毫秒）",
-            }),
-            max: 3_600_000,
-          },
-        ].map(({ key, label, max }) => (
-          <div key={key} className="space-y-2">
-            <Label>{label}</Label>
-            <Input
-              type="number"
-              min={1_000}
-              max={max}
-              step={1_000}
-              value={surface.transport[key]}
-              onChange={(event) =>
-                onChange({
-                  ...surface,
-                  transport: {
-                    ...surface.transport,
-                    [key]: event.target.value,
-                  },
-                })
-              }
-            />
-          </div>
-        ))}
-      </div>
 
       {surface.runtime ? (
         <Collapsible className="pt-4">
@@ -1231,6 +1186,8 @@ export function ProviderBundleEditor({
     draft.surfaces[0]?.app ?? "claude",
   );
   const [saving, setSaving] = useState(false);
+  const [runtimeDefaults, setRuntimeDefaults] =
+    useState<ProviderRuntimeDefaults | null>(null);
   const [modelScopeConfirmOpen, setModelScopeConfirmOpen] = useState(false);
   const [revealedCredentialValues, setRevealedCredentialValues] = useState<
     Record<string, string>
@@ -1304,6 +1261,23 @@ export function ProviderBundleEditor({
     existingShare?.ownerEmail ??
     clientTunnelQuery.data?.config.ownerEmail ??
     "";
+
+  useEffect(() => {
+    let active = true;
+    void providersApi
+      .getRuntimeDefaults()
+      .then((defaults) => {
+        if (active) setRuntimeDefaults(defaults);
+      })
+      .catch((error) => {
+        if (active) {
+          toast.error(error instanceof Error ? error.message : String(error));
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!draft.accountId || draft.accountGeneration != null) return;
@@ -1997,7 +1971,7 @@ export function ProviderBundleEditor({
             defaultValue: "测试模型",
           })}
         >
-          <div className="grid max-w-xl gap-4 md:grid-cols-2">
+          <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
               <Label>{t("providerBundle.testApp")}</Label>
               <Select
@@ -2026,13 +2000,15 @@ export function ProviderBundleEditor({
             </div>
             <div className="space-y-2">
               <Label htmlFor="provider-bundle-test-model">
-                {t("providerBundle.testModel", {
-                  defaultValue: "测试模型",
+                {t("providerBundle.providerTestModel", {
+                  defaultValue: "供应商默认测试模型",
                 })}
               </Label>
               <Input
                 id="provider-bundle-test-model"
                 value={draft.testModel}
+                placeholder={runtimeDefaults?.testModels[draft.testApp]}
+                className="focus:placeholder:text-transparent"
                 onChange={(event) =>
                   setDraft((current) => ({
                     ...current,
@@ -2040,6 +2016,44 @@ export function ProviderBundleEditor({
                   }))
                 }
               />
+            </div>
+            <div className="space-y-3 md:col-span-2">
+              <Label>
+                {t("providerBundle.surfaceTestModelOverrides", {
+                  defaultValue: "App 特例",
+                })}
+              </Label>
+              <div className="grid gap-4 md:grid-cols-3">
+                {enabledTestApps.map((app) => (
+                  <div key={app} className="space-y-2">
+                    <Label
+                      htmlFor={`provider-bundle-${app}-test-model`}
+                      className="flex items-center gap-2 text-xs text-muted-foreground"
+                    >
+                      <AppLogo app={app} />
+                      {APP_LABELS[app]}
+                    </Label>
+                    <Input
+                      id={`provider-bundle-${app}-test-model`}
+                      value={draft.surfaceTestModels[app]}
+                      placeholder={
+                        draft.testModel.trim() ||
+                        runtimeDefaults?.testModels[app]
+                      }
+                      className="focus:placeholder:text-transparent"
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          surfaceTestModels: {
+                            ...current.surfaceTestModels,
+                            [app]: event.target.value,
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </Section>
@@ -2055,6 +2069,64 @@ export function ProviderBundleEditor({
             />
           </Section>
         ) : null}
+
+        <Section
+          title={t("providerBundle.connectionTimeouts", {
+            defaultValue: "连接与超时",
+          })}
+        >
+          <div className="grid gap-4 md:grid-cols-3">
+            {[
+              {
+                key: "timeoutMs" as const,
+                label: t("providerBundle.requestTimeout", {
+                  defaultValue: "请求超时（毫秒）",
+                }),
+                max: 3_600_000,
+              },
+              {
+                key: "streamFirstByteTimeoutMs" as const,
+                label: t("providerBundle.firstByteTimeout", {
+                  defaultValue: "首字节超时（毫秒）",
+                }),
+                max: 600_000,
+              },
+              {
+                key: "streamIdleTimeoutMs" as const,
+                label: t("providerBundle.streamIdleTimeout", {
+                  defaultValue: "流空闲超时（毫秒）",
+                }),
+                max: 3_600_000,
+              },
+            ].map(({ key, label, max }) => (
+              <div key={key} className="space-y-2">
+                <Label>{label}</Label>
+                <Input
+                  type="number"
+                  min={1_000}
+                  max={max}
+                  step={1_000}
+                  value={draft.transport[key]}
+                  placeholder={
+                    runtimeDefaults
+                      ? String(runtimeDefaults.transport[key])
+                      : undefined
+                  }
+                  className="focus:placeholder:text-transparent"
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      transport: {
+                        ...current.transport,
+                        [key]: event.target.value,
+                      },
+                    }))
+                  }
+                />
+              </div>
+            ))}
+          </div>
+        </Section>
 
         {codexDriverOptions ? (
           <Section title={t("codexOauth.featureOptionsTitle")}>

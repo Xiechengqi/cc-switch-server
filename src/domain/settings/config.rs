@@ -13,6 +13,8 @@ use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
+use crate::domain::providers::runtime::ProviderRuntimeDefaults;
+
 const CONFIG_FILE_NAME: &str = "server.json";
 pub const ROUTER_CONTROL_DB_FILE_NAME: &str = "router-control.sqlite";
 
@@ -27,6 +29,8 @@ pub struct ServerConfig {
     pub setup_completion_notification: Option<SetupCompletionNotificationState>,
     #[serde(default)]
     pub upgrade_policy: UpgradePolicyConfig,
+    #[serde(default)]
+    pub provider_runtime_defaults: ProviderRuntimeDefaults,
     /// Web ops terminal entry. Default on; PTY still lazy-created on first attach.
     /// Disable via `enableWebTerminal: false` or `CC_SWITCH_ENABLE_WEB_TERMINAL=0|false|off`.
     #[serde(default = "default_true")]
@@ -316,6 +320,7 @@ impl ServerConfig {
             client: ClientConfig::default(),
             setup_completion_notification: None,
             upgrade_policy: UpgradePolicyConfig::default(),
+            provider_runtime_defaults: ProviderRuntimeDefaults::default(),
             enable_web_terminal: true,
         }
     }
@@ -342,11 +347,19 @@ impl ServerConfig {
 
         let content = fs::read_to_string(&config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("parse config {}", config_path.display()))
+        let config: Self = serde_json::from_str(&content)
+            .with_context(|| format!("parse config {}", config_path.display()))?;
+        config
+            .provider_runtime_defaults
+            .validate()
+            .with_context(|| format!("validate config {}", config_path.display()))?;
+        Ok(config)
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
+        self.provider_runtime_defaults
+            .validate()
+            .context("validate Provider runtime defaults")?;
         fs::create_dir_all(config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
 
@@ -525,6 +538,7 @@ impl ServerConfig {
             },
             setup_completion_notification: None,
             upgrade_policy: UpgradePolicyConfig::default(),
+            provider_runtime_defaults: ProviderRuntimeDefaults::default(),
             enable_web_terminal: true,
         })
     }
@@ -749,6 +763,21 @@ mod tests {
         assert_eq!(
             config.client.tunnel_subdomain.as_deref(),
             Some("route-abc12")
+        );
+    }
+
+    #[test]
+    fn provider_runtime_defaults_round_trip_in_server_config() {
+        let mut config = ServerConfig::empty();
+        config.provider_runtime_defaults.transport.timeout_ms = 75_000;
+        config.provider_runtime_defaults.test_models.codex = "test-codex".to_string();
+
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: ServerConfig = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(
+            decoded.provider_runtime_defaults,
+            config.provider_runtime_defaults
         );
     }
 

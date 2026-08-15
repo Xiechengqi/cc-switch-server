@@ -129,6 +129,7 @@ import {
   presetProviderTestConfig,
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
+import { resolveCursorAccountSelection } from "./CursorOAuthSection";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { stableStringify } from "@/lib/stableStringify";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
@@ -662,7 +663,6 @@ function ProviderFormFull({
   const {
     isAuthenticated: isCursorOauthAuthenticated,
     accounts: cursorOauthAccounts,
-    defaultAccountId: defaultCursorAccountId,
   } = useCursorOauth();
   const {
     isAuthenticated: isKiroOauthAuthenticated,
@@ -1159,15 +1159,16 @@ function ProviderFormFull({
       return;
     }
 
-    const preferredAccountId =
-      defaultCursorAccountId ?? cursorOauthAccounts[0]?.id ?? null;
-    if (preferredAccountId) {
+    const preferredAccountId = resolveCursorAccountSelection(
+      cursorOauthAccounts,
+      null,
+    );
+    if (typeof preferredAccountId === "string") {
       setSelectedCursorAccountId(preferredAccountId);
     }
   }, [
     currentProviderType,
     cursorOauthAccounts,
-    defaultCursorAccountId,
     selectedCursorAccountId,
   ]);
 

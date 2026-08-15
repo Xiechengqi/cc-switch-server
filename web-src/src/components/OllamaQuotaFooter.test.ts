@@ -66,11 +66,33 @@ function snapshot(): OllamaCloudSnapshot {
 describe("Ollama quota formatting", () => {
   it("keeps zero utilization and upstream model names visible", () => {
     expect(formatOllamaCloudSummary(snapshot(), t)).toBe(
-      "free · owner · owner@example.com · Session 0% · Weekly 0% · Activity $0.00000",
+      "free · owner@example.com · Session 0% · Weekly 0% · Activity $0.0",
     );
     expect(formatOllamaCloudModels(snapshot(), t)).toBe(
       "Session: gpt-oss:120b 1 · Weekly: gpt-oss:120b 6",
     );
+  });
+
+  it("formats activity cost with one fractional digit", () => {
+    const value = snapshot();
+    const usage = value.usage.data;
+    expect(usage?.activity).toBeDefined();
+    if (usage?.activity) usage.activity.cost = "1.26";
+    expect(formatOllamaCloudSummary(value, t)).toContain("Activity $1.3");
+  });
+
+  it("prefers email and falls back to one account identifier", () => {
+    const value = snapshot();
+    const account = value.account.data;
+    expect(account).toBeDefined();
+    delete account?.email;
+    expect(formatOllamaCloudSummary(value, t)).toContain("free · owner ·");
+
+    delete account?.name;
+    expect(formatOllamaCloudSummary(value, t)).toContain("free · account-1 ·");
+
+    delete account?.id;
+    expect(formatOllamaCloudSummary(value, t)).toMatch(/^free · Session/);
   });
 
   it("keeps stale data visible and surfaces a partial endpoint failure", () => {

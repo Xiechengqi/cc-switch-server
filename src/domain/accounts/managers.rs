@@ -502,10 +502,7 @@ impl AccountManager for AccountProviderDriver {
                 }
             }
         }
-        if matches!(
-            input.provider_type,
-            ProviderType::CursorOAuth | ProviderType::CursorApiKey
-        ) {
+        if input.provider_type == ProviderType::CursorApiKey {
             if let Some(existing) = store.accounts.iter().find(|account| {
                 account.provider_type == input.provider_type
                     && input.id.as_deref() != Some(account.id.as_str())
@@ -1210,25 +1207,44 @@ mod tests {
     }
 
     #[test]
-    fn cursor_account_manager_rejects_a_second_proxy_credential() {
-        for provider_type in [ProviderType::CursorOAuth, ProviderType::CursorApiKey] {
-            let manager = manager_for(provider_type);
-            let mut store = AccountStore::default();
-            let mut first = codex_account_input("cursor-1", "refresh-1");
-            first.provider_type = provider_type;
-            first.api_key =
-                (provider_type == ProviderType::CursorApiKey).then(|| "cursor-key-1".to_string());
-            manager.finish_login(&mut store, first.clone()).unwrap();
+    fn cursor_api_key_manager_rejects_a_second_proxy_credential_and_allows_update() {
+        let manager = manager_for(ProviderType::CursorApiKey);
+        let mut store = AccountStore::default();
+        let mut first = codex_account_input("cursor-key-1", "unused-refresh-1");
+        first.provider_type = ProviderType::CursorApiKey;
+        first.api_key = Some("cursor-api-key-1".to_string());
+        manager.finish_login(&mut store, first.clone()).unwrap();
 
-            let mut second = first.clone();
-            second.id = Some("cursor-2".to_string());
-            let error = manager.finish_login(&mut store, second).unwrap_err();
-            assert!(error.to_string().contains("supports one proxy credential"));
+        let mut second = first.clone();
+        second.id = Some("cursor-key-2".to_string());
+        second.api_key = Some("cursor-api-key-2".to_string());
+        let error = manager.finish_login(&mut store, second).unwrap_err();
+        assert!(error.to_string().contains("supports one proxy credential"));
 
-            first.email = Some("updated@example.com".to_string());
-            let updated = manager.finish_login(&mut store, first).unwrap();
-            assert_eq!(updated.email.as_deref(), Some("updated@example.com"));
-        }
+        first.email = Some("updated@example.com".to_string());
+        let updated = manager.finish_login(&mut store, first).unwrap();
+        assert_eq!(updated.email.as_deref(), Some("updated@example.com"));
+        assert_eq!(store.accounts.len(), 1);
+    }
+
+    #[test]
+    fn cursor_oauth_manager_allows_multiple_accounts_and_updates_the_same_identity() {
+        let manager = manager_for(ProviderType::CursorOAuth);
+        let mut store = AccountStore::default();
+        let mut first = codex_account_input("cursor-oauth-1", "refresh-1");
+        first.provider_type = ProviderType::CursorOAuth;
+        let mut second = codex_account_input("cursor-oauth-2", "refresh-2");
+        second.provider_type = ProviderType::CursorOAuth;
+
+        manager.finish_login(&mut store, first.clone()).unwrap();
+        manager.finish_login(&mut store, second).unwrap();
+        assert_eq!(store.accounts.len(), 2);
+
+        first.email = Some("updated@example.com".to_string());
+        let updated = manager.finish_login(&mut store, first).unwrap();
+        assert_eq!(updated.id, "cursor-oauth-1");
+        assert_eq!(updated.email.as_deref(), Some("updated@example.com"));
+        assert_eq!(store.accounts.len(), 2);
     }
 
     #[test]

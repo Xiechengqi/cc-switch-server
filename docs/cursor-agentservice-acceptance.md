@@ -4,13 +4,14 @@ Cursor Provider profiles remain `experimental` until OAuth and API-key credentia
 
 ## Typed credential contract
 
-- A Cursor credential type has at most one stored proxy credential.
-- Every OAuth Provider binds one explicit Cursor OAuth account. Every API-key Provider uses one Provider-owned static key.
+- Cursor OAuth may store multiple accounts. Every OAuth Provider binds one explicit Cursor OAuth account and its exact identity generation. Every API-key Provider uses one Provider-owned static key.
 - A request never switches Provider, account, or key because of load, cooldown, 401, 429, quota, or network failure.
 - OAuth may force-refresh the same account once after an initial 401. API key may invalidate and exchange the same key once. No committed stream is replayed.
 - OAuth always uses the CLI wire rail: CLI headers, CLI RunRequest, empty RequestContext, and CLI completion policy. API key always uses the SDK wire rail: SDK headers, SDK RunRequest, rich RequestContext, and SDK completion policy. Session scope includes the rail and its protocol revision.
 - Production inference/exchange endpoints have no source default. Configure complete HTTPS URLs through `CC_SWITCH_CURSOR_OAUTH_AGENT_ENDPOINT`, `CC_SWITCH_CURSOR_APIKEY_AGENT_ENDPOINT`, and `CC_SWITCH_CURSOR_APIKEY_EXCHANGE_ENDPOINT`; keep their values in runtime secrets only. Userinfo, fragments, missing paths, and non-HTTPS production URLs fail closed before credential/network work.
 - `CC_SWITCH_CURSOR_OAUTH_AGENT_ENABLED` and `CC_SWITCH_CURSOR_APIKEY_AGENT_ENABLED` independently disable a rail. A disabled or failed rail never falls back to the other.
+- Provider model-test dry-run validates the selected rail, required runtime secrets, exact credential binding, request conversion, and model policy without making an outbound request. Network mode uses the normal native AgentService forwarder pinned to that Provider and requires the downstream protocol's terminal event. Test responses expose only a runtime-secret placeholder for the endpoint.
+- `cc-switch-server doctor` validates only rails that have enabled Cursor Provider surfaces. A missing, invalid, or disabled runtime rail is a failing check and diagnostics never print endpoint or secret values.
 
 ## Completion contract
 

@@ -637,19 +637,28 @@ pub(in crate::api) async fn test_provider(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<TestProviderQuery>,
+    Query(mut query): Query<TestProviderQuery>,
 ) -> Result<Json<TestProviderResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    let health_config = if query.network.unwrap_or(false) {
+        Some(web_stream_check_config(&state).await)
+    } else {
+        None
+    };
+    if query.test_prompt.is_none() {
+        query.test_prompt = health_config
+            .as_ref()
+            .map(|config| config.test_prompt.clone());
+    }
     let execution = resolve_provider_execution_by_key(&state, query.app, &id).await?;
     let provider = execution.runtime_stored_view();
     let response = test_provider_inner(&state, execution, &query).await?;
-    if query.network.unwrap_or(false) {
-        let config = web_stream_check_config(&state).await;
+    if let Some(config) = health_config.as_ref() {
         if let Err(error) = crate::api::provider_health_scheduler::record_provider_test_response(
             &state,
             &provider,
             &response,
-            &config,
+            config,
             "cc-switch-manual",
         )
         .await
@@ -784,6 +793,11 @@ pub(in crate::api) async fn test_providers(
             network: input.network,
             timeout_ms: input.timeout_ms,
             model: input.model.clone(),
+            test_prompt: input.test_prompt.clone().or_else(|| {
+                health_config
+                    .as_ref()
+                    .map(|config| config.test_prompt.clone())
+            }),
             stream: input.stream,
         };
         let response = test_provider_inner(&state, execution, &query).await?;
@@ -818,12 +832,27 @@ pub(in crate::api) async fn test_provider_inner(
 ) -> Result<TestProviderResponse, ApiError> {
     let runtime_stored = execution.runtime_stored_view();
     let stored = &runtime_stored;
-    let defaults = crate::domain::stream_check::StreamCheckConfig::default();
     let adapter = proxy::adapters::adapter_for(stored.app, stored.provider_type);
     let capability = adapter.capability(stored.app, stored.provider_type);
     let route = default_test_route(stored.app);
     let requested_stream = query.stream.unwrap_or(false);
-    let model = provider_test_model(stored.app, stored, query.model.as_deref(), Some(&defaults));
+    let test_prompt = query.test_prompt.as_deref().unwrap_or("ping");
+    if test_prompt.trim().is_empty()
+        || test_prompt != test_prompt.trim()
+        || test_prompt.len() > 1_000
+    {
+        return Err(ApiError::bad_request(
+            "testPrompt must be non-empty, trimmed, and at most 1000 characters",
+        ));
+    }
+    let model = query
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .or_else(|| execution.plan.test_model.clone())
+        .unwrap_or_else(|| provider_test_model(stored.app, stored, None, None));
     let gemini_path = default_gemini_test_path(stored.app, &model, requested_stream);
     let grok_reconciliation_before = grok_reconciliation_snapshot(state, &execution).await;
     if let Err(error) =
@@ -965,6 +994,19 @@ pub(in crate::api) async fn test_provider_inner(
         }
     }
 
+    if execution.driver_is("special.cursor") {
+        return test_cursor_provider_inner(
+            state,
+            execution,
+            query,
+            route,
+            gemini_path,
+            model,
+            requested_stream,
+        )
+        .await;
+    }
+
     if query.network.unwrap_or(false) {
         ensure_provider_outbound_allowed(state, &execution).await?;
         if let Some((provider_type, account_id, expected_generation)) =
@@ -981,7 +1023,7 @@ pub(in crate::api) async fn test_provider_inner(
                 if provider_type != ProviderType::GrokOAuth {
                     return Err(map_managed_account_refresh_error(error));
                 }
-                let outcome = grok_refresh_failure_outcome(&error);
+                let outcome = managed_account_refresh_failure_outcome(&error);
                 let public_error = map_managed_account_refresh_error(error);
                 let message = public_error.message;
                 let status = public_error.status.as_u16();
@@ -1038,7 +1080,13 @@ pub(in crate::api) async fn test_provider_inner(
         ensure_provider_outbound_allowed(state, &execution).await?;
     }
     let accounts = state.accounts_snapshot().await;
-    let body = provider_test_body(stored.app, stored, Some(&model), requested_stream);
+    let body = provider_test_body(
+        stored.app,
+        stored,
+        Some(&model),
+        test_prompt,
+        requested_stream,
+    );
     let (adapter_request, endpoint, mut target_headers) = if execution
         .driver_is("oauth.claude_messages")
     {
@@ -1249,6 +1297,365 @@ pub(in crate::api) async fn test_provider_inner(
         reconciliation,
         message,
     })
+}
+
+async fn test_cursor_provider_inner(
+    state: &ServerState,
+    execution: proxy::provider_ops::ProviderExecution,
+    query: &TestProviderQuery,
+    route: ProxyRoute,
+    gemini_path: Option<String>,
+    model: String,
+    requested_stream: bool,
+) -> Result<TestProviderResponse, ApiError> {
+    let stored = execution.runtime_stored_view();
+    let body = provider_test_body(
+        stored.app,
+        &stored,
+        Some(&model),
+        query.test_prompt.as_deref().unwrap_or("ping"),
+        requested_stream,
+    );
+    let accounts = state.accounts_snapshot().await;
+    if let Err(error) = validate_cursor_provider_test_configuration(
+        &execution,
+        &accounts,
+        route,
+        gemini_path.as_deref(),
+        &body,
+    ) {
+        let message = redact_provider_test_error(&error.message);
+        return Ok(cursor_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            cursor_provider_preflight_outcome(error.status),
+            message,
+        ));
+    }
+
+    if !query.network.unwrap_or(false) {
+        return Ok(cursor_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            None,
+            ProviderOperationOutcome::Success,
+            "configuration check passed; Cursor runtime secrets and exact credential binding are valid; upstream network/model call is not executed".to_string(),
+        ));
+    }
+
+    if let Err(error) = ensure_provider_outbound_allowed(state, &execution).await {
+        let message = redact_provider_test_error(&error.message);
+        return Ok(cursor_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            ProviderOperationOutcome::InvalidConfig,
+            message,
+        ));
+    }
+    if let Some((provider_type, account_id, expected_generation)) =
+        execution.managed_account_identity_target()
+    {
+        if let Err(error) = state
+            .refresh_managed_account_if_needed_for_generation(
+                provider_type,
+                account_id,
+                expected_generation,
+            )
+            .await
+        {
+            let outcome = managed_account_refresh_failure_outcome(&error);
+            let error = map_managed_account_refresh_error(error);
+            let message = redact_provider_test_error(&error.message);
+            return Ok(cursor_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                false,
+                None,
+                None,
+                None,
+                Some(message.clone()),
+                outcome,
+                message,
+            ));
+        }
+    }
+    if let Err(error) = ensure_provider_outbound_allowed(state, &execution).await {
+        let message = redact_provider_test_error(&error.message);
+        return Ok(cursor_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            ProviderOperationOutcome::InvalidConfig,
+            message,
+        ));
+    }
+
+    let refreshed_accounts = state.accounts_snapshot().await;
+    if let Err(error) = execution.materialize_auth(&refreshed_accounts) {
+        let message = redact_provider_test_error(&error.message);
+        return Ok(cursor_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            cursor_provider_preflight_outcome(error.status),
+            message,
+        ));
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if requested_stream {
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    let timeout = query
+        .timeout_ms
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let deadline = tokio::time::Instant::now() + timeout;
+    let started = std::time::Instant::now();
+    let forward = proxy::forward_provider_test(
+        state.clone(),
+        route,
+        execution.clone(),
+        gemini_path,
+        headers,
+        Bytes::from(body),
+    );
+    let response = match tokio::time::timeout_at(deadline, forward).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let status = error.status.as_u16();
+            let message = redact_provider_test_error(&error.message);
+            let outcome = provider_test_outcome(true, Some(status), Some(&message));
+            return Ok(cursor_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                None,
+                Some(message.clone()),
+                outcome,
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = "Cursor provider test timed out".to_string();
+            return Ok(cursor_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                None,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                ProviderOperationOutcome::Timeout,
+                message,
+            ));
+        }
+    };
+    let status = response.status().as_u16();
+    let response_body = match tokio::time::timeout_at(
+        deadline,
+        axum::body::to_bytes(
+            response.into_body(),
+            PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
+            let message = redact_provider_test_error(&format!(
+                "failed to read Cursor provider test response: {error}"
+            ));
+            let outcome = provider_test_outcome(true, Some(status), Some(&message));
+            return Ok(cursor_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                outcome,
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = "Cursor provider test timed out while reading the response".to_string();
+            return Ok(cursor_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                ProviderOperationOutcome::Timeout,
+                message,
+            ));
+        }
+    };
+
+    let mut network_error = None;
+    let mut network_stream_completed = None;
+    if !(200..=399).contains(&status) {
+        let detail = redact_provider_test_error(&String::from_utf8_lossy(&response_body));
+        network_error = Some(if detail.trim().is_empty() {
+            format!("Cursor provider returned HTTP {status}")
+        } else {
+            detail
+        });
+    } else if requested_stream {
+        let completed =
+            provider_test_stream_completed(stored.app, &String::from_utf8_lossy(&response_body));
+        network_stream_completed = Some(completed);
+        if !completed {
+            network_error =
+                Some("stream probe did not observe a provider completion marker".to_string());
+        }
+    }
+    let outcome = provider_test_outcome(true, Some(status), network_error.as_deref());
+    let ok = outcome == ProviderOperationOutcome::Success;
+    let message = if ok {
+        "configuration check passed; Cursor native upstream network/model call executed".to_string()
+    } else {
+        network_error
+            .clone()
+            .unwrap_or_else(|| format!("provider test outcome: {outcome:?}"))
+    };
+    Ok(cursor_provider_test_response(
+        &execution,
+        &model,
+        requested_stream,
+        true,
+        Some(status),
+        Some(started.elapsed().as_millis()),
+        network_stream_completed,
+        network_error,
+        outcome,
+        message,
+    ))
+}
+
+fn validate_cursor_provider_test_configuration(
+    execution: &proxy::provider_ops::ProviderExecution,
+    accounts: &crate::domain::accounts::store::AccountStore,
+    route: ProxyRoute,
+    gemini_path: Option<&str>,
+    body: &str,
+) -> Result<(), proxy::ProxyError> {
+    let stored = execution.runtime_stored_view();
+    proxy::cursor::validate_runtime_configuration(&stored)?;
+    let _auth = execution.materialize_auth(accounts)?;
+    let mut request = proxy::adapters::cursor_agentservice_request(
+        Bytes::copy_from_slice(body.as_bytes()),
+        &stored,
+        route,
+        gemini_path,
+    )?;
+    execution.enforce_model_policy(&mut request)?;
+    proxy::cursor::apply_agentservice_model_selection(&mut request)?;
+    if proxy::cursor::build_agent_plan_preview(route, &stored, &request.body)?.is_none() {
+        return Err(proxy::ProxyError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: "Cursor AgentService driver does not support the Provider test route"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cursor_provider_test_response(
+    execution: &proxy::provider_ops::ProviderExecution,
+    model: &str,
+    stream: bool,
+    network_checked: bool,
+    network_status_code: Option<u16>,
+    network_latency_ms: Option<u128>,
+    network_stream_completed: Option<bool>,
+    network_error: Option<String>,
+    outcome: ProviderOperationOutcome,
+    message: String,
+) -> TestProviderResponse {
+    let stored = execution.runtime_stored_view();
+    let capability = proxy::adapters::adapter_for(stored.app, stored.provider_type)
+        .capability(stored.app, stored.provider_type);
+    TestProviderResponse {
+        ok: outcome == ProviderOperationOutcome::Success,
+        outcome,
+        driver_id: execution.plan.driver_id.to_string(),
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        provider_id: stored.provider.id.clone(),
+        app: stored.app,
+        provider_type: stored.provider_type,
+        provider_revision: stored.resource.revision,
+        adapter: capability.adapter,
+        support: capability.support,
+        endpoint: "[runtime secret]".to_string(),
+        model: model.to_string(),
+        stream,
+        header_names: Vec::new(),
+        network_checked,
+        network_status_code,
+        network_latency_ms,
+        network_stream_completed,
+        network_error,
+        reconciliation: None,
+        message,
+    }
+}
+
+fn cursor_provider_preflight_outcome(status: StatusCode) -> ProviderOperationOutcome {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderOperationOutcome::Auth,
+        StatusCode::TOO_MANY_REQUESTS => ProviderOperationOutcome::RateLimit,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
+            ProviderOperationOutcome::Timeout
+        }
+        _ => ProviderOperationOutcome::InvalidConfig,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1499,7 +1906,7 @@ fn grok_probe_model_rejected(status: u16, body: &[u8]) -> bool {
     })
 }
 
-fn grok_refresh_failure_outcome(
+fn managed_account_refresh_failure_outcome(
     error: &crate::state::ManagedAccountRefreshError,
 ) -> ProviderOperationOutcome {
     use crate::state::ManagedAccountRefreshError;
@@ -1514,7 +1921,7 @@ fn grok_refresh_failure_outcome(
         }
         ManagedAccountRefreshError::Refresh { status_code, .. } => match status_code {
             400 | 401 | 403 => ProviderOperationOutcome::Auth,
-            408 => ProviderOperationOutcome::Timeout,
+            408 | 504 => ProviderOperationOutcome::Timeout,
             429 => ProviderOperationOutcome::RateLimit,
             500..=599 => ProviderOperationOutcome::Upstream,
             _ => ProviderOperationOutcome::Protocol,
@@ -1535,7 +1942,7 @@ fn provider_test_outcome(
             200..=399 if error.is_none() => ProviderOperationOutcome::Success,
             401 | 403 => ProviderOperationOutcome::Auth,
             402 => ProviderOperationOutcome::Quota,
-            408 => ProviderOperationOutcome::Timeout,
+            408 | 504 => ProviderOperationOutcome::Timeout,
             429 if error.is_some_and(provider_error_mentions_quota) => {
                 ProviderOperationOutcome::Quota
             }
@@ -2476,6 +2883,36 @@ pub(in crate::api) fn provider_test_model(
     defaults: Option<&crate::domain::stream_check::StreamCheckConfig>,
 ) -> String {
     let defaults = defaults.cloned().unwrap_or_default();
+    if crate::domain::providers::bundle::is_explicit_bundle_surface(&stored.provider) {
+        let resolved = override_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                stored
+                    .provider
+                    .settings_config
+                    .get("testModel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                crate::domain::providers::bundle::bundle_test_model_override(&stored.provider)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| match app {
+                AppKind::Claude => defaults.claude_model,
+                AppKind::Codex => defaults.codex_model,
+                AppKind::Gemini => defaults.gemini_model,
+            });
+        return if stored.provider_type == ProviderType::CodexOAuth && app == AppKind::Codex {
+            normalize_codex_oauth_test_model(&resolved)
+        } else {
+            resolved
+        };
+    }
     let resolved = override_model
         .map(str::trim)
         .filter(|model| !model.is_empty())
@@ -2597,6 +3034,7 @@ pub(in crate::api) fn provider_test_body(
     app: AppKind,
     stored: &StoredProvider,
     override_model: Option<&str>,
+    test_prompt: &str,
     stream: bool,
 ) -> String {
     let model = provider_test_model(app, stored, override_model, None);
@@ -2604,7 +3042,7 @@ pub(in crate::api) fn provider_test_body(
         AppKind::Claude => serde_json::json!({
             "model": model,
             "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}],
+            "messages": [{"role": "user", "content": test_prompt}],
             "stream": stream
         }),
         AppKind::Codex => {
@@ -2613,7 +3051,7 @@ pub(in crate::api) fn provider_test_body(
                 "model": actual_model,
                 "input": [{
                     "role": "user",
-                    "content": "ping"
+                    "content": test_prompt
                 }],
                 "stream": stream
             });
@@ -2634,7 +3072,7 @@ pub(in crate::api) fn provider_test_body(
             body
         }
         AppKind::Gemini => serde_json::json!({
-            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            "contents": [{"role": "user", "parts": [{"text": test_prompt}]}],
             "generationConfig": {"maxOutputTokens": 1}
         }),
     };
@@ -2777,6 +3215,164 @@ mod tests {
         .unwrap()
     }
 
+    async fn install_cursor_provider_test_execution(
+        state: &ServerState,
+        provider_type: ProviderType,
+        rail_enabled: bool,
+    ) -> proxy::provider_ops::ProviderExecution {
+        let account_id = "cursor-provider-test-account";
+        if provider_type == ProviderType::CursorOAuth {
+            state
+                .mutate_accounts_immediate(move |accounts| {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": account_id,
+                            "providerType": "cursor_oauth",
+                            "email": "cursor-provider-test@example.com",
+                            "accessToken": "cursor-provider-test-access",
+                            "refreshToken": "cursor-provider-test-refresh",
+                            "expiresAt": i64::MAX / 2
+                        }))
+                        .unwrap(),
+                    );
+                })
+                .await
+                .unwrap();
+        }
+        let (profile_id, settings_config) = match provider_type {
+            ProviderType::CursorOAuth => (
+                "codex.cursor_oauth",
+                json!({
+                    "CURSOR_OAUTH_AGENT_ENDPOINT": "http://127.0.0.1:8787/oauth/test",
+                    "cursorAgentService": {"oauthEnabled": rail_enabled},
+                    "modelMapping": {"mode": "single", "upstreamModel": "gpt-5.5"}
+                }),
+            ),
+            ProviderType::CursorApiKey => (
+                "codex.cursor_api_key",
+                json!({
+                    "apiKey": "cursor-provider-test-api-key",
+                    "CURSOR_APIKEY_AGENT_ENDPOINT": "http://127.0.0.1:8787/api-key/test",
+                    "CURSOR_APIKEY_EXCHANGE_ENDPOINT": "http://127.0.0.1:8787/api-key/exchange",
+                    "cursorAgentService": {"apiKeyEnabled": rail_enabled},
+                    "modelMapping": {"mode": "single", "upstreamModel": "gpt-5.5"}
+                }),
+            ),
+            _ => unreachable!("Cursor Provider test helper requires a Cursor type"),
+        };
+        let stored = StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: format!("{}-provider-test", provider_type.as_str()),
+                name: "Cursor Provider test".to_string(),
+                settings_config,
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some(provider_type.as_str().to_string()),
+                    auth_binding: (provider_type == ProviderType::CursorOAuth).then(|| {
+                        AuthBinding {
+                            source: Some("account_store".to_string()),
+                            auth_provider: Some("cursor_oauth".to_string()),
+                            account_id: Some(account_id.to_string()),
+                            auth_identity_generation: Some(1),
+                        }
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
+            resource: crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let execution =
+            proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    #[tokio::test]
+    async fn cursor_provider_test_dry_run_validates_both_rails_without_exposing_endpoints() {
+        for provider_type in [ProviderType::CursorOAuth, ProviderType::CursorApiKey] {
+            let state = provider_api_test_state(provider_type.as_str());
+            let config_dir = state.config_dir.clone();
+            let execution =
+                install_cursor_provider_test_execution(&state, provider_type, true).await;
+
+            let response = test_provider_inner(
+                &state,
+                execution,
+                &TestProviderQuery {
+                    app: AppKind::Codex,
+                    network: Some(false),
+                    timeout_ms: Some(2_000),
+                    model: Some("gpt-5.5".to_string()),
+                    test_prompt: None,
+                    stream: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                response.ok,
+                "{}: {}",
+                provider_type.as_str(),
+                response.message
+            );
+            assert_eq!(response.outcome, ProviderOperationOutcome::Success);
+            assert!(!response.network_checked);
+            assert_eq!(response.endpoint, "[runtime secret]");
+            assert!(!response.message.contains("127.0.0.1"));
+            drop(state);
+            std::fs::remove_dir_all(config_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_provider_test_reports_a_disabled_rail_as_invalid_configuration() {
+        let state = provider_api_test_state("cursor-disabled-rail");
+        let config_dir = state.config_dir.clone();
+        let execution =
+            install_cursor_provider_test_execution(&state, ProviderType::CursorApiKey, false).await;
+
+        let response = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(false),
+                timeout_ms: Some(2_000),
+                model: Some("gpt-5.5".to_string()),
+                test_prompt: None,
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!response.ok);
+        assert_eq!(response.outcome, ProviderOperationOutcome::InvalidConfig);
+        assert!(response.message.contains("disabled"));
+        assert!(!response.message.contains("127.0.0.1"));
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn provider_control_response_body_limit_is_enforced() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2833,7 +3429,13 @@ mod tests {
             resource: Default::default(),
         };
 
-        let body = provider_test_body(AppKind::Codex, &stored, None, false);
+        let body = provider_test_body(
+            AppKind::Codex,
+            &stored,
+            None,
+            "configured probe prompt",
+            false,
+        );
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
 
         assert_eq!(
@@ -2844,8 +3446,20 @@ mod tests {
             value.get("stream").and_then(serde_json::Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            value
+                .pointer("/input/0/content")
+                .and_then(serde_json::Value::as_str),
+            Some("configured probe prompt")
+        );
 
-        let stream_body = provider_test_body(AppKind::Codex, &stored, Some("override-model"), true);
+        let stream_body = provider_test_body(
+            AppKind::Codex,
+            &stored,
+            Some("override-model"),
+            "ping",
+            true,
+        );
         let stream_value: serde_json::Value = serde_json::from_str(&stream_body).unwrap();
         assert_eq!(
             stream_value
@@ -3069,6 +3683,7 @@ mod tests {
                 network: Some(false),
                 timeout_ms: Some(2_000),
                 model: Some("grok-4.5".to_string()),
+                test_prompt: None,
                 stream: Some(false),
             },
         )
@@ -3105,6 +3720,7 @@ mod tests {
                 network: Some(true),
                 timeout_ms: Some(2_000),
                 model: Some("grok-4.5".to_string()),
+                test_prompt: None,
                 stream: Some(false),
             },
         )
@@ -3218,6 +3834,7 @@ mod tests {
                 network: Some(true),
                 timeout_ms: Some(2_000),
                 model: Some("grok-4.5".to_string()),
+                test_prompt: None,
                 stream: Some(false),
             },
         )
@@ -3310,6 +3927,7 @@ mod tests {
                 network: Some(true),
                 timeout_ms: Some(100),
                 model: Some("grok-4.5".to_string()),
+                test_prompt: None,
                 stream: Some(false),
             },
         )
@@ -4139,8 +4757,14 @@ mod tests {
             resource: Default::default(),
         };
 
-        let value: serde_json::Value =
-            serde_json::from_str(&provider_test_body(AppKind::Codex, &stored, None, true)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&provider_test_body(
+            AppKind::Codex,
+            &stored,
+            None,
+            "ping",
+            true,
+        ))
+        .unwrap();
 
         assert_eq!(
             value.get("model").and_then(serde_json::Value::as_str),
@@ -4214,6 +4838,34 @@ mod tests {
         assert_eq!(
             provider_test_outcome(true, Some(408), Some("request timeout")),
             ProviderOperationOutcome::Timeout
+        );
+    }
+
+    #[test]
+    fn managed_account_refresh_outcome_preserves_retryable_failures_without_a_model_probe() {
+        use crate::state::ManagedAccountRefreshError;
+
+        assert_eq!(
+            managed_account_refresh_failure_outcome(&ManagedAccountRefreshError::Refresh {
+                status_code: 503,
+                message: "upstream unavailable".to_string(),
+                retry_after_ms: None,
+            }),
+            ProviderOperationOutcome::Upstream
+        );
+        assert_eq!(
+            managed_account_refresh_failure_outcome(&ManagedAccountRefreshError::Refresh {
+                status_code: 504,
+                message: "upstream timeout".to_string(),
+                retry_after_ms: None,
+            }),
+            ProviderOperationOutcome::Timeout
+        );
+        assert_eq!(
+            managed_account_refresh_failure_outcome(&ManagedAccountRefreshError::IdentityChanged {
+                provider_type: ProviderType::CursorOAuth,
+            }),
+            ProviderOperationOutcome::InvalidConfig
         );
     }
 }
