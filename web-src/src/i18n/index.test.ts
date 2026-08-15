@@ -55,6 +55,16 @@ const codexFeatureKeys = [
   "websocketDescription",
 ] as const;
 
+const providerBundleKeys = [
+  "advanced",
+  "familySearchPlaceholder",
+  "groupOfficialOauth",
+  "stepFamily",
+  "stepSupply",
+  "stepShare",
+  "validation.accountRequired",
+] as const;
+
 describe("language normalization", () => {
   it.each([
     ["zh", "zh"],
@@ -94,6 +104,24 @@ describe("i18n resources", () => {
       expect(i18n.t("provider.name", { lng: language })).toBe(
         locales[language].provider.name,
       );
+    }
+  });
+
+  it("provides Server Provider Bundle editor copy in every supported language", () => {
+    for (const language of languages) {
+      for (const key of providerBundleKeys) {
+        const path = key.split(".");
+        const expected = path.reduce<unknown>(
+          (value, segment) =>
+            value && typeof value === "object"
+              ? (value as Record<string, unknown>)[segment]
+              : undefined,
+          serverLocales[language].providerBundle,
+        );
+        expect(i18n.t(`providerBundle.${key}`, { lng: language })).toBe(
+          expected,
+        );
+      }
     }
   });
 

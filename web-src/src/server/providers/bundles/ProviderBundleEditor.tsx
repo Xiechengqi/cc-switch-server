@@ -20,7 +20,6 @@ import { toast } from "sonner";
 
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { ProviderIcon } from "@/components/ProviderIcon";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { MarketSelectorField } from "@/components/providers/ProviderShareSection";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
@@ -73,18 +72,13 @@ import {
   driverForProfile,
   familyById,
   profileById,
-  providerRegistry,
   type CoreProviderApp,
-  type ProviderFamilySpec,
 } from "@/server/providerRegistry";
 import {
   CodexFeatureOptions,
   type CodexFeatureOptionKey,
 } from "@/server/providers/CodexFeatureOptions";
-import {
-  createDraftForProfile,
-  profileAllowsEndpointEditing,
-} from "@/server/providers/editor/providerDraft";
+import { profileAllowsEndpointEditing } from "@/server/providers/editor/providerDraft";
 import {
   credentialInputValue,
   updateCredentialInput,
@@ -112,7 +106,6 @@ import {
   applyCustomRecipeToBundleDraft,
   BUNDLE_TEST_APP_ORDER,
   changeModelPolicyScope,
-  createProviderBundleDraft,
   customRecipeMatchesBundleDraft,
   defaultUpstreamModelForFamily,
   duplicateProviderBundleDraft,
@@ -129,11 +122,19 @@ import {
   updateBundleModel,
   updateSurfaceEndpoint,
   updateSurfaceModel,
-  validateProviderBundleDraft,
   type BundleSecretDraft,
   type BundleSurfaceEditorDraft,
+  type BundleValidationIssue,
   type ProviderBundleEditorDraft,
 } from "./bundleDraft";
+import { createDraftForSelectedFamily } from "./bundleDefaults";
+import {
+  bundleValidationFieldId,
+  firstBundleValidationIssue,
+  matchesBundleValidationIssue,
+} from "./bundleValidation";
+import { preferredManagedAccount, recommendedFamily } from "./familyCatalog";
+import { FamilyPicker } from "./FamilyPicker";
 
 interface ProviderBundleEditorProps {
   bundle?: ProviderBundleView;
@@ -142,6 +143,13 @@ interface ProviderBundleEditorProps {
   onCancel: () => void;
   onSaved: (bundle: ProviderBundleView) => void;
   onOpenShareSettings?: () => void;
+}
+
+type CreateStep = "family" | "supply" | "share";
+const CREATE_STEPS: CreateStep[] = ["family", "supply", "share"];
+
+function fieldErrorClass(invalid: boolean): string {
+  return invalid ? "border-destructive focus-visible:ring-destructive" : "";
 }
 
 const APP_LABELS: Record<CoreProviderApp, string> = {
@@ -154,21 +162,6 @@ function AppLogo({ app, size = 16 }: { app: CoreProviderApp; size?: number }) {
   if (app === "claude") return <ClaudeIcon size={size} />;
   if (app === "codex") return <CodexIcon size={size} />;
   return <GeminiIcon size={size} />;
-}
-
-function FamilyLogo({ family }: { family: ProviderFamilySpec }) {
-  const profile = profileById(family.credentialProfileId);
-  const preset = profile ? createDraftForProfile(profile) : undefined;
-  return (
-    <ProviderIcon
-      icon={preset?.icon}
-      name={family.label}
-      color={preset?.iconColor}
-      size={16}
-      className="shrink-0"
-      showFallback
-    />
-  );
 }
 
 function Section({
@@ -238,13 +231,45 @@ function bundleSecretFromCredentialEdit(
   };
 }
 
+function protocolLabel(protocol: string): string {
+  switch (protocol) {
+    case "anthropic_messages":
+      return "Claude / Anthropic Messages";
+    case "open_ai_chat":
+      return "OpenAI Chat Completions";
+    case "open_ai_responses":
+      return "OpenAI Responses";
+    case "gemini_native":
+      return "Gemini Native";
+    default:
+      return protocol;
+  }
+}
+
+function authSchemeLabel(scheme: string): string {
+  switch (scheme) {
+    case "api_key":
+      return "API Key";
+    case "bearer":
+      return "Bearer Token";
+    case "custom_header":
+      return "Custom Header";
+    case "query":
+      return "Query parameter";
+    default:
+      return scheme;
+  }
+}
+
 function SurfaceEditor({
   surface,
   modelPolicyScope,
+  validation,
   onChange,
 }: {
   surface: BundleSurfaceEditorDraft;
   modelPolicyScope: ProviderBundleEditorDraft["modelPolicyScope"];
+  validation: BundleValidationIssue | null;
   onChange: (surface: BundleSurfaceEditorDraft) => void;
 }) {
   const { t } = useTranslation();
@@ -288,9 +313,6 @@ function SurfaceEditor({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <Badge variant="outline">{profile.label}</Badge>
-          <span className="text-xs text-muted-foreground">
-            {profile.profileId}
-          </span>
         </div>
         <div className="flex items-center gap-2">
           <Label htmlFor={`surface-${surface.app}-enabled`}>
@@ -357,7 +379,19 @@ function SurfaceEditor({
                     {t("serverProviderForm.model.upstreamModel")}
                   </Label>
                   <Input
-                    id={`surface-${surface.app}-model`}
+                    id={bundleValidationFieldId({
+                      code: "surfaceUpstreamModelRequired",
+                      field: "upstreamModel",
+                      message: "",
+                      surface: surface.app,
+                    })}
+                    className={fieldErrorClass(
+                      matchesBundleValidationIssue(
+                        validation,
+                        "upstreamModel",
+                        surface.app,
+                      ),
+                    )}
                     value={surface.upstreamModel}
                     onChange={(event) =>
                       onChange(
@@ -398,7 +432,20 @@ function SurfaceEditor({
             <div className="space-y-2 md:col-span-2">
               <Label>{t("serverProviderForm.endpoint.url")}</Label>
               <Input
+                id={bundleValidationFieldId({
+                  code: "endpointInvalid",
+                  field: "endpoint",
+                  message: "",
+                  surface: surface.app,
+                })}
                 type="url"
+                className={fieldErrorClass(
+                  matchesBundleValidationIssue(
+                    validation,
+                    "endpoint",
+                    surface.app,
+                  ),
+                )}
                 value={surface.endpoint}
                 onChange={(event) =>
                   onChange(updateSurfaceEndpoint(surface, event.target.value))
@@ -429,7 +476,7 @@ function SurfaceEditor({
                 <SelectContent>
                   {customPolicy.protocols.map((protocol) => (
                     <SelectItem key={protocol} value={protocol}>
-                      {protocol}
+                      {protocolLabel(protocol)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -470,7 +517,7 @@ function SurfaceEditor({
                 <SelectContent>
                   {customPolicy.authSchemes.map((scheme) => (
                     <SelectItem key={scheme} value={scheme}>
-                      {scheme}
+                      {authSchemeLabel(scheme)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -506,6 +553,19 @@ function SurfaceEditor({
           <div className="space-y-2">
             <Label>{customCredentialLabel}</Label>
             <SecretInput
+              id={bundleValidationFieldId({
+                code: "surfaceCredentialRequired",
+                field: "surfaceSecret",
+                message: "",
+                surface: surface.app,
+              })}
+              className={fieldErrorClass(
+                matchesBundleValidationIssue(
+                  validation,
+                  "surfaceSecret",
+                  surface.app,
+                ),
+              )}
               value={surface.secret.value}
               placeholder={surface.secret.configured ? "••••••••" : undefined}
               onChange={(event) =>
@@ -1124,31 +1184,6 @@ function BundleShareEditor({
                 ))}
               </SelectContent>
             </Select>
-            <div className="flex flex-wrap gap-1.5">
-              <Button
-                type="button"
-                variant={draft.expiry === "permanent" ? "secondary" : "outline"}
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={() => onChange({ ...draft, expiry: "permanent" })}
-              >
-                {t("share.expiry.permanent", { defaultValue: "永久有效" })}
-              </Button>
-              {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
-                <Button
-                  key={preset.value}
-                  type="button"
-                  variant={
-                    draft.expiry === preset.value ? "secondary" : "outline"
-                  }
-                  size="sm"
-                  className="h-7 px-2 text-xs"
-                  onClick={() => onChange({ ...draft, expiry: preset.value })}
-                >
-                  {t(preset.labelKey)}
-                </Button>
-              ))}
-            </div>
           </div>
         </div>
       ) : null}
@@ -1166,13 +1201,13 @@ export function ProviderBundleEditor({
 }: ProviderBundleEditorProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const initialFamily = providerRegistry.families[0]!;
+  const initialFamily = recommendedFamily();
   const [draft, setDraft] = useState<ProviderBundleEditorDraft>(() =>
     bundle
       ? duplicate
         ? duplicateProviderBundleDraft(bundle)
         : editProviderBundleDraft(bundle)
-      : createProviderBundleDraft(initialFamily),
+      : createDraftForSelectedFamily(initialFamily),
   );
   const persisted =
     (Boolean(bundle) && !duplicate) || draft.expectedRevision !== undefined;
@@ -1185,6 +1220,13 @@ export function ProviderBundleEditor({
   const [activeApp, setActiveApp] = useState<CoreProviderApp>(
     draft.surfaces[0]?.app ?? "claude",
   );
+  const [createStep, setCreateStep] = useState<CreateStep>(
+    persisted ? "supply" : "family",
+  );
+  const [validation, setValidation] = useState<BundleValidationIssue | null>(
+    null,
+  );
+  const [pendingFamilyId, setPendingFamilyId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [runtimeDefaults, setRuntimeDefaults] =
     useState<ProviderRuntimeDefaults | null>(null);
@@ -1280,22 +1322,41 @@ export function ProviderBundleEditor({
   }, []);
 
   useEffect(() => {
-    if (!draft.accountId || draft.accountGeneration != null) return;
-    const account = accounts.find((item) => item.id === draft.accountId);
-    if (account?.authIdentityGeneration == null) return;
+    if (credentialProfile?.credentialPolicy.mode !== "managed_account") return;
+    if (draft.accountId) {
+      if (draft.accountGeneration != null) return;
+      const account = accounts.find((item) => item.id === draft.accountId);
+      if (account?.authIdentityGeneration == null) return;
+      setDraft((current) => {
+        if (
+          current.accountId !== account.id ||
+          current.accountGeneration != null
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          accountGeneration: account.authIdentityGeneration,
+        };
+      });
+      return;
+    }
+    const preferred = preferredManagedAccount(accounts);
+    if (!preferred) return;
     setDraft((current) => {
-      if (
-        current.accountId !== account.id ||
-        current.accountGeneration != null
-      ) {
-        return current;
-      }
+      if (current.accountId) return current;
       return {
         ...current,
-        accountGeneration: account.authIdentityGeneration,
+        accountId: preferred.id,
+        accountGeneration: preferred.authIdentityGeneration,
       };
     });
-  }, [accounts, draft.accountGeneration, draft.accountId]);
+  }, [
+    accounts,
+    credentialProfile?.credentialPolicy.mode,
+    draft.accountGeneration,
+    draft.accountId,
+  ]);
 
   useEffect(() => {
     const generation = credentialRevealGeneration.current + 1;
@@ -1387,14 +1448,44 @@ export function ProviderBundleEditor({
     };
   }, [existingShare, shareDraft.enabled, shareDraft.subdomain]);
 
-  const changeFamily = (familyId: string) => {
+  const applyFamily = (familyId: string) => {
     if (persisted) return;
     const next = familyById(familyId);
     if (!next) return;
-    const nextDraft = createProviderBundleDraft(next);
+    const nextDraft = createDraftForSelectedFamily(next);
     setDraft(nextDraft);
     setActiveApp(nextDraft.surfaces[0]?.app ?? "claude");
     setShareDraft(createBundleShareDraft());
+    setValidation(null);
+  };
+
+  const changeFamily = (familyId: string) => {
+    if (persisted || familyId === draft.familyId) return;
+    if (dirty) {
+      setPendingFamilyId(familyId);
+      return;
+    }
+    applyFamily(familyId);
+  };
+
+  const validationMessage = (issue: BundleValidationIssue): string =>
+    t(`providerBundle.validation.${issue.code}`, {
+      defaultValue: issue.message,
+      app: issue.surface ? APP_LABELS[issue.surface] : undefined,
+    });
+
+  const focusIssue = (issue: BundleValidationIssue) => {
+    if (issue.surface) setActiveApp(issue.surface);
+    if (!persisted) {
+      setCreateStep(
+        issue.field === "family" ? "family" : "supply",
+      );
+    }
+    requestAnimationFrame(() => {
+      document
+        .getElementById(bundleValidationFieldId(issue))
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
   };
 
   const retryCredentialReveal = async (slot: string) => {
@@ -1453,9 +1544,11 @@ export function ProviderBundleEditor({
     }));
 
   const submit = async () => {
-    const validation = validateProviderBundleDraft(draft);
-    if (validation) {
-      toast.error(validation);
+    const nextValidation = firstBundleValidationIssue(draft);
+    setValidation(nextValidation);
+    if (nextValidation) {
+      toast.error(validationMessage(nextValidation));
+      focusIssue(nextValidation);
       return;
     }
     if (
@@ -1463,6 +1556,7 @@ export function ProviderBundleEditor({
       shareDraft.subdomain.trim() &&
       !isValidShareSlug(shareDraft.subdomain)
     ) {
+      if (!persisted) setCreateStep("share");
       toast.error(
         t("share.validation.invalidShareSlug", {
           defaultValue:
@@ -1474,6 +1568,7 @@ export function ProviderBundleEditor({
     if (
       shareDraft.sharedWithEmails.some((email) => !isValidShareEmail(email))
     ) {
+      if (!persisted) setCreateStep("share");
       toast.error(
         t("share.validation.invalidEmail", {
           defaultValue: "邮箱格式无效",
@@ -1520,6 +1615,14 @@ export function ProviderBundleEditor({
   };
 
   const shareUrl = existingShare?.tunnelUrl ?? existingShare?.subdomain;
+  const showFamilyStep = !persisted && createStep === "family";
+  const showSupplyStep = persisted || createStep === "supply";
+  const showShareStep = persisted || createStep === "share";
+  const showSurfaceTabs =
+    draft.surfaces.length > 1 || family.endpointScope === "surface";
+  const activeSurface =
+    draft.surfaces.find((surface) => surface.app === activeApp) ??
+    draft.surfaces[0];
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 pb-24">
@@ -1533,79 +1636,120 @@ export function ProviderBundleEditor({
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <div className="min-w-0">
+        <div className="min-w-0 flex-1">
           <h1 className="truncate text-lg font-semibold">
             {persisted
               ? t("providerBundle.edit", { defaultValue: "编辑供应商" })
               : t("providerBundle.create", { defaultValue: "新建供应商" })}
           </h1>
-          <div className="mt-1 flex items-center gap-2">
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
             {family.surfaces.map((surface) => (
               <AppLogo key={surface.app} app={surface.app} />
             ))}
+            <span className="truncate">{family.label}</span>
+            {dirty ? (
+              <Badge variant="outline">
+                {t("providerBundle.unsaved", { defaultValue: "未保存" })}
+              </Badge>
+            ) : null}
           </div>
         </div>
       </div>
 
+      {!persisted ? (
+        <div className="grid grid-cols-3 gap-2">
+          {CREATE_STEPS.map((step, index) => (
+            <button
+              key={step}
+              type="button"
+              className={cn(
+                "rounded-md border px-3 py-2 text-left text-xs font-medium sm:text-sm",
+                createStep === step
+                  ? "border-primary bg-primary/5 text-foreground"
+                  : "border-border text-muted-foreground",
+              )}
+              onClick={() => setCreateStep(step)}
+            >
+              {index + 1}.{" "}
+              {step === "family"
+                ? t("providerBundle.stepFamily", { defaultValue: "选择类型" })
+                : step === "supply"
+                  ? t("providerBundle.stepSupply", { defaultValue: "完成供给" })
+                  : t("providerBundle.stepShare", { defaultValue: "远程分享" })}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="flex flex-wrap gap-2 text-xs">
+          {(
+            [
+              ["supply", t("providerBundle.stepSupply", { defaultValue: "供给" })],
+              ["share", t("providerBundle.stepShare", { defaultValue: "远程分享" })],
+            ] as const
+          ).map(([section, label]) => (
+            <Button
+              key={section}
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                document
+                  .getElementById(`bundle-section-${section}`)
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" })
+              }
+            >
+              {label}
+            </Button>
+          ))}
+        </div>
+      )}
+
       <div className="space-y-6">
+        {showFamilyStep ? (
+          <Section
+            title={t("providerBundle.family", { defaultValue: "供应商类型" })}
+          >
+            <FamilyPicker
+              selectedFamilyId={draft.familyId}
+              onSelect={changeFamily}
+              onAutoSelect={applyFamily}
+            />
+          </Section>
+        ) : null}
+
+        {showSupplyStep ? (
+          <div id="bundle-section-supply" className="space-y-6">
         <Section
           title={t("providerBundle.basic", { defaultValue: "基本信息" })}
         >
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2 md:col-span-2">
+              <div className="flex items-center justify-center">
+                <ProviderIconControl
+                  icon={draft.icon}
+                  iconColor={draft.iconColor}
+                  providerName={draft.name}
+                  onChange={(icon, iconColor) =>
+                    setDraft((current) => ({
+                      ...current,
+                      icon,
+                      iconColor,
+                    }))
+                  }
+                />
+              </div>
               {persisted ? (
-                <div className="flex justify-center">
-                  <ProviderIconControl
-                    icon={draft.icon}
-                    iconColor={draft.iconColor}
-                    providerName={draft.name}
-                    onChange={(icon, iconColor) =>
-                      setDraft((current) => ({
-                        ...current,
-                        icon,
-                        iconColor,
-                      }))
-                    }
-                  />
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <Label>
-                    {t("providerBundle.family", {
-                      defaultValue: "供应商类型",
-                    })}
-                  </Label>
-                  <div
-                    role="radiogroup"
-                    aria-label={t("providerBundle.family", {
-                      defaultValue: "供应商类型",
-                    })}
-                    className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2"
-                  >
-                    {providerRegistry.families.map((item) => {
-                      const selected = item.familyId === draft.familyId;
-                      return (
-                        <button
-                          key={item.familyId}
-                          type="button"
-                          role="radio"
-                          aria-checked={selected}
-                          onClick={() => changeFamily(item.familyId)}
-                          className={cn(
-                            "inline-flex min-h-10 w-full items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm font-medium transition-colors",
-                            selected
-                              ? "bg-primary text-primary-foreground"
-                              : "bg-accent text-muted-foreground hover:bg-accent/80 hover:text-foreground",
-                          )}
-                        >
-                          <FamilyLogo family={item} />
-                          <span className="truncate">{item.label}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
+                <p className="text-center text-sm text-muted-foreground">
+                  {family.label}
+                </p>
+              ) : null}
+              {duplicate ? (
+                <p className="text-center text-sm text-muted-foreground">
+                  {t("providerBundle.duplicateSecretsCleared", {
+                    defaultValue: "Credentials are not copied. Enter them again before saving.",
+                  })}
+                </p>
+              ) : null}
             </div>
             {customRecipes.length ? (
               <div className="space-y-2 md:col-span-2">
@@ -1642,12 +1786,20 @@ export function ProviderBundleEditor({
             <div className="space-y-2">
               <Label>{t("serverProviderForm.basic.name")}</Label>
               <Input
+                id={bundleValidationFieldId({
+                  code: "nameRequired",
+                  field: "name",
+                  message: "",
+                })}
                 value={draft.name}
-                readOnly={!identityEditable}
                 className={cn(
+                  fieldErrorClass(
+                    matchesBundleValidationIssue(validation, "name"),
+                  ),
                   !identityEditable &&
                     "cursor-default bg-muted/40 text-muted-foreground",
                 )}
+                readOnly={!identityEditable}
                 onChange={(event) =>
                   identityEditable &&
                   setDraft({ ...draft, name: event.target.value })
@@ -1688,6 +1840,17 @@ export function ProviderBundleEditor({
             title={t("providerBundle.account", { defaultValue: "OAuth 账号" })}
             icon={<KeyRound className="h-4 w-4" />}
           >
+            <div
+              id={bundleValidationFieldId({
+                code: "accountRequired",
+                field: "account",
+                message: "",
+              })}
+              className={cn(
+                matchesBundleValidationIssue(validation, "account") &&
+                  "rounded-md border border-destructive p-3",
+              )}
+            >
             <ManagedAccountSection
               providerType={
                 credentialProfile.credentialPolicy.accountProviderType
@@ -1702,6 +1865,13 @@ export function ProviderBundleEditor({
                 }));
               }}
             />
+            {matchesBundleValidationIssue(validation, "account") &&
+            validation ? (
+              <p className="mt-2 text-xs text-destructive">
+                {validationMessage(validation)}
+              </p>
+            ) : null}
+            </div>
           </Section>
         ) : null}
 
@@ -1762,6 +1932,14 @@ export function ProviderBundleEditor({
                       ) : null}
                     </div>
                     <SecretInput
+                      id={bundleValidationFieldId({
+                        code: "credentialRequired",
+                        field: "credential",
+                        message: "",
+                      })}
+                      className={fieldErrorClass(
+                        matchesBundleValidationIssue(validation, "credential"),
+                      )}
                       value={value}
                       disabled={loadingCurrent || edit.action === "clear"}
                       autoComplete="new-password"
@@ -1806,6 +1984,14 @@ export function ProviderBundleEditor({
                 <div className="space-y-2">
                   <Label>AWS Region</Label>
                   <Input
+                    id={bundleValidationFieldId({
+                      code: "awsRegionRequired",
+                      field: "awsRegion",
+                      message: "",
+                    })}
+                    className={fieldErrorClass(
+                      matchesBundleValidationIssue(validation, "awsRegion"),
+                    )}
                     value={draft.awsRegion}
                     onChange={(event) =>
                       setDraft({ ...draft, awsRegion: event.target.value })
@@ -1819,6 +2005,12 @@ export function ProviderBundleEditor({
 
         <Section title={t("serverProviderForm.model.title")}>
           <div className="max-w-xl space-y-4">
+            <p className="text-sm text-muted-foreground">
+              {t("providerBundle.modelScopeHint", {
+                defaultValue:
+                  "Global uses one upstream model for every configurable App. Per App lets each Surface keep its own model.",
+              })}
+            </p>
             <div className="space-y-2">
               <Label>{t("providerBundle.modelScope")}</Label>
               {perAppModelPolicyRequired ? (
@@ -1918,7 +2110,17 @@ export function ProviderBundleEditor({
                       {t("serverProviderForm.model.upstreamModel")}
                     </Label>
                     <Input
-                      id="provider-bundle-model"
+                      id={bundleValidationFieldId({
+                        code: "upstreamModelRequired",
+                        field: "upstreamModel",
+                        message: "",
+                      })}
+                      className={fieldErrorClass(
+                        matchesBundleValidationIssue(
+                          validation,
+                          "upstreamModel",
+                        ),
+                      )}
                       value={draft.upstreamModel}
                       onChange={(event) =>
                         setDraft((current) =>
@@ -1966,6 +2168,14 @@ export function ProviderBundleEditor({
           </div>
         </Section>
 
+        <Collapsible>
+          <CollapsibleTrigger asChild>
+            <Button type="button" variant="ghost" size="sm">
+              <ChevronDown className="mr-2 h-4 w-4" />
+              {t("providerBundle.advanced", { defaultValue: "高级设置" })}
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="space-y-6 pt-4">
         <Section
           title={t("providerBundle.testModel", {
             defaultValue: "测试模型",
@@ -2061,7 +2271,15 @@ export function ProviderBundleEditor({
         {commonEndpointEditable ? (
           <Section title={t("serverProviderForm.endpoint.title")}>
             <Input
+              id={bundleValidationFieldId({
+                code: "endpointInvalid",
+                field: "endpoint",
+                message: "",
+              })}
               type="url"
+              className={fieldErrorClass(
+                matchesBundleValidationIssue(validation, "endpoint"),
+              )}
               value={draft.endpoint}
               onChange={(event) =>
                 setDraft({ ...draft, endpoint: event.target.value })
@@ -2160,10 +2378,14 @@ export function ProviderBundleEditor({
             />
           </Section>
         ) : null}
+          </CollapsibleContent>
+        </Collapsible>
 
+        {showSurfaceTabs || family.endpointScope === "surface" ? (
         <Section
           title={t("providerBundle.surfaces", { defaultValue: "应用接口" })}
         >
+          {showSurfaceTabs ? (
           <Tabs
             value={activeApp}
             onValueChange={(value) => setActiveApp(value as CoreProviderApp)}
@@ -2182,7 +2404,13 @@ export function ProviderBundleEditor({
                 >
                   <AppLogo app={surface.app} />
                   <span className="truncate">{APP_LABELS[surface.app]}</span>
-                  {surface.enabled ? <Check className="h-3.5 w-3.5" /> : null}
+                  {surface.enabled ? (
+                    <Check className="h-3.5 w-3.5" />
+                  ) : (
+                    <span className="text-[10px] text-muted-foreground">
+                      {t("providerBundle.surfaceOff", { defaultValue: "关" })}
+                    </span>
+                  )}
                 </TabsTrigger>
               ))}
             </TabsList>
@@ -2191,14 +2419,27 @@ export function ProviderBundleEditor({
                 <SurfaceEditor
                   surface={surface}
                   modelPolicyScope={draft.modelPolicyScope}
+                  validation={validation}
                   onChange={updateSurface}
                 />
               </TabsContent>
             ))}
           </Tabs>
+          ) : activeSurface ? (
+            <SurfaceEditor
+              surface={activeSurface}
+              modelPolicyScope={draft.modelPolicyScope}
+              validation={validation}
+              onChange={updateSurface}
+            />
+          ) : null}
         </Section>
+        ) : null}
+          </div>
+        ) : null}
 
-        <div ref={shareSectionRef}>
+        {showShareStep ? (
+        <div id="bundle-section-share" ref={shareSectionRef}>
           <BundleShareEditor
             draft={shareDraft}
             onChange={setShareDraft}
@@ -2208,9 +2449,10 @@ export function ProviderBundleEditor({
             showCodexExecutionPolicy={codexDriverOptions}
           />
         </div>
+        ) : null}
       </div>
 
-      <div className="sticky bottom-0 z-20 flex items-center justify-end gap-2 bg-background/95 py-4 backdrop-blur">
+      <div className="sticky bottom-0 z-20 flex flex-wrap items-center justify-end gap-2 bg-background/95 py-4 backdrop-blur">
         <Button
           type="button"
           variant="outline"
@@ -2219,15 +2461,63 @@ export function ProviderBundleEditor({
         >
           {t("common.cancel")}
         </Button>
-        <Button type="button" onClick={() => void submit()} disabled={saving}>
-          {saving ? (
-            <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <Save className="mr-2 h-4 w-4" />
-          )}
-          {t("common.save")}
-        </Button>
+        {!persisted && createStep !== "family" ? (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              setCreateStep(createStep === "share" ? "supply" : "family")
+            }
+            disabled={saving}
+          >
+            {t("common.previous")}
+          </Button>
+        ) : null}
+        {!persisted && createStep !== "share" ? (
+          <Button
+            type="button"
+            onClick={() =>
+              setCreateStep(createStep === "family" ? "supply" : "share")
+            }
+            disabled={saving}
+          >
+            {t("common.next")}
+          </Button>
+        ) : (
+          <Button
+            type="button"
+            onClick={() => void submit()}
+            disabled={saving || (persisted && !dirty)}
+          >
+            {saving ? (
+              <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Save className="mr-2 h-4 w-4" />
+            )}
+            {t("common.save")}
+          </Button>
+        )}
       </div>
+      <ConfirmDialog
+        isOpen={pendingFamilyId !== null}
+        title={t("providerBundle.changeFamilyTitle", {
+          defaultValue: "更换供应商类型？",
+        })}
+        message={t("providerBundle.changeFamilyMessage", {
+          defaultValue: "未保存的供给和分享设置将被新的类型默认值替换。",
+        })}
+        confirmText={t("providerBundle.changeFamilyConfirm", {
+          defaultValue: "更换类型",
+        })}
+        cancelText={t("common.cancel")}
+        variant="destructive"
+        zIndex="top"
+        onConfirm={() => {
+          if (pendingFamilyId) applyFamily(pendingFamilyId);
+          setPendingFamilyId(null);
+        }}
+        onCancel={() => setPendingFamilyId(null)}
+      />
       <ConfirmDialog
         isOpen={modelScopeConfirmOpen}
         title={t("providerBundle.modelScopeMergeTitle")}

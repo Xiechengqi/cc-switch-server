@@ -1,3 +1,4 @@
+// Unused by Server Web runtime. Provider Bundles use ProviderBundleEditor.
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Plus } from "lucide-react";

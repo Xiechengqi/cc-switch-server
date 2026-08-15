@@ -396,6 +396,13 @@ export function ProviderBundlesPage({
                   share={sharesByBundle.get(bundle.id)}
                   accounts={accountsQuery.data ?? []}
                   onEdit={() => setEditing({ mode: "edit", bundle })}
+                  onEditShare={() =>
+                    setEditing({
+                      mode: "edit",
+                      bundle,
+                      initialSection: "share",
+                    })
+                  }
                   onDuplicate={() => setEditing({ mode: "duplicate", bundle })}
                   sharePending={sharePendingBundleId === bundle.id}
                   shareActionDisabled={

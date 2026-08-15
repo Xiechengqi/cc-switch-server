@@ -24,7 +24,9 @@ import {
   updateBundleModel,
   updateSurfaceEndpoint,
   validateProviderBundleDraft,
+  validateProviderBundleDraftIssue,
 } from "./bundleDraft";
+import { createDraftForSelectedFamily } from "./bundleDefaults";
 
 function runtime(
   resource: Pick<ProviderResource, "app" | "profileId" | "revision">,
@@ -454,6 +456,10 @@ describe("Provider Bundle drafts", () => {
     expect(validateProviderBundleDraft(claudeDraft)).toBe(
       "Provider model policy is invalid",
     );
+    expect(validateProviderBundleDraftIssue(claudeDraft)).toMatchObject({
+      code: "modelPolicyInvalid",
+      field: "modelPolicy",
+    });
 
     const openaiFamily = familyById("family.openai_oauth")!;
     expect(supportsPerAppModelPolicy(openaiFamily)).toBe(true);
@@ -894,5 +900,26 @@ describe("Provider Bundle drafts", () => {
     expect(validateProviderBundleDraft(duplicate)).toBe(
       "Configure the required credential",
     );
+    expect(validateProviderBundleDraftIssue(duplicate)).toMatchObject({
+      code: "credentialRequired",
+      field: "credential",
+    });
+  });
+
+  it("applies the first Custom HTTP recipe when creating a selected Family", () => {
+    const draft = createDraftForSelectedFamily(
+      familyById("family.custom_http")!,
+    );
+    expect(customRecipeMatchesBundleDraft(draft, providerRegistry.customRecipes[0]!)).toBe(
+      true,
+    );
+    expect(draft.surfaces.find((surface) => surface.app === "claude")?.enabled).toBe(
+      true,
+    );
+    expect(
+      draft.surfaces
+        .filter((surface) => surface.app !== "claude")
+        .every((surface) => !surface.enabled),
+    ).toBe(true);
   });
 });

@@ -154,6 +154,7 @@ interface ProviderBundleCardProps {
   share?: ShareRecord;
   accounts: ManagedAuthAccount[];
   onEdit: () => void;
+  onEditShare?: () => void;
   onDuplicate: () => void;
   sharePending?: boolean;
   shareActionDisabled?: boolean;
@@ -172,6 +173,7 @@ export function ProviderBundleCard({
   share,
   accounts,
   onEdit,
+  onEditShare,
   onDuplicate,
   sharePending = false,
   shareActionDisabled = false,
@@ -345,7 +347,22 @@ export function ProviderBundleCard({
                   </span>
                 ))}
               </div>
-              {share ? <ProviderShareStatusTag share={share} /> : null}
+              {share ? (
+                onEditShare ? (
+                  <button
+                    type="button"
+                    className="inline-flex"
+                    title={t("providerBundle.editShare", {
+                      defaultValue: "编辑远程分享",
+                    })}
+                    onClick={onEditShare}
+                  >
+                    <ProviderShareStatusTag share={share} />
+                  </button>
+                ) : (
+                  <ProviderShareStatusTag share={share} />
+                )
+              ) : null}
               {health ? <ProviderHealthBadge health={health} /> : null}
               <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
                 {bundle.modelPolicyScope === "global"

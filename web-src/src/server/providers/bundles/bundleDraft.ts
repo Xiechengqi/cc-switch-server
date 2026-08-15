@@ -687,9 +687,7 @@ export function duplicateProviderBundleDraft(
   return {
     ...source,
     id,
-    name: providerBundleIdentityEditable(family)
-      ? `${source.name} copy`
-      : source.name,
+    name: `${source.name} copy`,
     expectedRevision: undefined,
     clientRequestId: crypto.randomUUID(),
     secrets: Object.fromEntries(
@@ -981,34 +979,92 @@ function validateDuration(value: string, min: number, max: number): boolean {
   return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max;
 }
 
-export function validateProviderBundleDraft(
+export type BundleValidationField =
+  | "family"
+  | "name"
+  | "surfaces"
+  | "testApp"
+  | "testModel"
+  | "surfaceTestModel"
+  | "timeoutMs"
+  | "streamFirstByteTimeoutMs"
+  | "streamIdleTimeoutMs"
+  | "account"
+  | "credential"
+  | "awsRegion"
+  | "modelScope"
+  | "modelPolicy"
+  | "upstreamModel"
+  | "endpoint"
+  | "customBinding"
+  | "authField"
+  | "surfaceSecret"
+  | "headers";
+
+export interface BundleValidationIssue {
+  code: string;
+  field: BundleValidationField;
+  message: string;
+  surface?: CoreProviderApp;
+}
+
+function issue(
+  code: string,
+  field: BundleValidationField,
+  message: string,
+  surface?: CoreProviderApp,
+): BundleValidationIssue {
+  return surface ? { code, field, message, surface } : { code, field, message };
+}
+
+export function validateProviderBundleDraftIssue(
   draft: ProviderBundleEditorDraft,
-): string | null {
+): BundleValidationIssue | null {
   const family = familyById(draft.familyId);
-  if (!family) return "Provider family is unavailable";
-  if (!draft.name.trim()) return "Provider name is required";
+  if (!family) {
+    return issue(
+      "familyUnavailable",
+      "family",
+      "Provider family is unavailable",
+    );
+  }
+  if (!draft.name.trim()) {
+    return issue("nameRequired", "name", "Provider name is required");
+  }
   if (!draft.surfaces.some((surface) => surface.enabled)) {
-    return "Enable at least one API Surface";
+    return issue(
+      "surfaceRequired",
+      "surfaces",
+      "Enable at least one API Surface",
+    );
   }
   if (
     !draft.surfaces.some(
       (surface) => surface.app === draft.testApp && surface.enabled,
     )
   ) {
-    return "Test App must be enabled";
+    return issue("testAppDisabled", "testApp", "Test App must be enabled");
   }
   if (draft.testModel.trim().length > 256) {
-    return "Test model is too long";
+    return issue("testModelTooLong", "testModel", "Test model is too long");
   }
-  if (
-    Object.values(draft.surfaceTestModels).some(
-      (model) => model.trim().length > 256,
-    )
-  ) {
-    return "Surface test model is too long";
+  const longSurfaceTest = (
+    Object.entries(draft.surfaceTestModels) as Array<[CoreProviderApp, string]>
+  ).find(([, model]) => model.trim().length > 256);
+  if (longSurfaceTest) {
+    return issue(
+      "surfaceTestModelTooLong",
+      "surfaceTestModel",
+      "Surface test model is too long",
+      longSurfaceTest[0],
+    );
   }
   if (!validateDuration(draft.transport.timeoutMs, 1_000, 3_600_000)) {
-    return "Provider request timeout is invalid";
+    return issue(
+      "timeoutInvalid",
+      "timeoutMs",
+      "Provider request timeout is invalid",
+    );
   }
   if (
     !validateDuration(
@@ -1017,77 +1073,133 @@ export function validateProviderBundleDraft(
       600_000,
     )
   ) {
-    return "Provider first-byte timeout is invalid";
+    return issue(
+      "firstByteTimeoutInvalid",
+      "streamFirstByteTimeoutMs",
+      "Provider first-byte timeout is invalid",
+    );
   }
   if (
-    !validateDuration(
-      draft.transport.streamIdleTimeoutMs,
-      1_000,
-      3_600_000,
-    )
+    !validateDuration(draft.transport.streamIdleTimeoutMs, 1_000, 3_600_000)
   ) {
-    return "Provider stream idle timeout is invalid";
+    return issue(
+      "idleTimeoutInvalid",
+      "streamIdleTimeoutMs",
+      "Provider stream idle timeout is invalid",
+    );
   }
   const credentialProfile = profileById(family.credentialProfileId);
-  if (!credentialProfile) return "Credential profile is unavailable";
+  if (!credentialProfile) {
+    return issue(
+      "credentialProfileUnavailable",
+      "credential",
+      "Credential profile is unavailable",
+    );
+  }
   if (
     credentialProfile.credentialPolicy.mode === "managed_account" &&
     !draft.accountId
   ) {
-    return "Select an OAuth account";
+    return issue("accountRequired", "account", "Select an OAuth account");
   }
   if (
     credentialProfile.credentialPolicy.mode === "managed_account" &&
     draft.accountGeneration == null
   ) {
-    return "OAuth account identity is unavailable";
+    return issue(
+      "accountIdentityUnavailable",
+      "account",
+      "OAuth account identity is unavailable",
+    );
   }
   for (const [slot, secret] of Object.entries(draft.secrets)) {
     const optional = slot.endsWith("/AWS_SESSION_TOKEN");
     if (!optional && !secret.configured && !secret.value.trim()) {
-      return "Configure the required credential";
+      return issue(
+        "credentialRequired",
+        "credential",
+        "Configure the required credential",
+      );
     }
-    if (!optional && secret.clear)
-      return "A required credential cannot be cleared";
+    if (!optional && secret.clear) {
+      return issue(
+        "requiredCredentialCannotClear",
+        "credential",
+        "A required credential cannot be cleared",
+      );
+    }
   }
   if (credentialProfile.formComposition === "aws" && !draft.awsRegion.trim()) {
-    return "AWS region is required";
+    return issue("awsRegionRequired", "awsRegion", "AWS region is required");
   }
   if (
     credentialProfile.formComposition === "aws" &&
     !/^[A-Za-z0-9-]{1,64}$/.test(draft.awsRegion.trim())
   ) {
-    return "AWS region is invalid";
+    return issue("awsRegionInvalid", "awsRegion", "AWS region is invalid");
   }
   if (
     requiresPerAppModelPolicy(family) &&
     draft.modelPolicyScope !== "per_app"
   ) {
-    return "This Provider requires independent App model policies";
+    return issue(
+      "perAppModelRequired",
+      "modelScope",
+      "This Provider requires independent App model policies",
+    );
   }
   if (draft.modelPolicyScope === "global") {
     const allowedModelPolicies = modelPoliciesForFamily(family);
     if (!allowedModelPolicies.includes(draft.modelPolicy)) {
-      return "Provider model policy is invalid";
+      return issue(
+        "modelPolicyInvalid",
+        "modelPolicy",
+        "Provider model policy is invalid",
+      );
     }
     if (draft.modelPolicy === "single" && !draft.upstreamModel.trim()) {
-      return "Upstream model is required";
+      return issue(
+        "upstreamModelRequired",
+        "upstreamModel",
+        "Upstream model is required",
+      );
     }
   } else if (!supportsPerAppModelPolicy(family)) {
-    return "This Provider does not support independent App model policies";
+    return issue(
+      "perAppModelUnsupported",
+      "modelScope",
+      "This Provider does not support independent App model policies",
+    );
   }
   for (const surface of draft.surfaces) {
     const profile = profileById(surface.profileId);
-    if (!profile) return `Profile ${surface.profileId} is unavailable`;
+    if (!profile) {
+      return issue(
+        "profileUnavailable",
+        "surfaces",
+        `Profile ${surface.profileId} is unavailable`,
+        surface.app,
+      );
+    }
     if (
       draft.modelPolicyScope === "per_app" &&
       profileHasConfigurableModelPolicy(profile)
     ) {
       if (!modelPoliciesForProfile(profile).includes(surface.modelPolicy)) {
-        return `${surface.app} model policy is invalid`;
+        return issue(
+          "surfaceModelPolicyInvalid",
+          "modelPolicy",
+          `${surface.app} model policy is invalid`,
+          surface.app,
+        );
       }
       if (surface.modelPolicy === "single" && !surface.upstreamModel.trim()) {
-        return `${surface.app} upstream model is required`;
+        return issue(
+          "surfaceUpstreamModelRequired",
+          "upstreamModel",
+          `${surface.app} upstream model is required`,
+          surface.app,
+        );
       }
     }
     if (profileAllowsEndpointEditing(profile)) {
@@ -1099,7 +1211,12 @@ export function validateProviderBundleDraft(
           profile.endpointPolicy === "custom" && surface.enabled,
         )
       ) {
-        return `${surface.app} endpoint is invalid`;
+        return issue(
+          "endpointInvalid",
+          "endpoint",
+          `${surface.app} endpoint is invalid`,
+          surface.app,
+        );
       }
     }
     if (profile.formComposition === "custom") {
@@ -1109,7 +1226,12 @@ export function validateProviderBundleDraft(
         !policy?.protocols.includes(surface.customBinding.upstreamProtocol) ||
         !policy.authSchemes.includes(surface.customBinding.authScheme)
       ) {
-        return `${surface.app} custom protocol binding is invalid`;
+        return issue(
+          "customBindingInvalid",
+          "customBinding",
+          `${surface.app} custom protocol binding is invalid`,
+          surface.app,
+        );
       }
       const authScheme = surface.customBinding.authScheme;
       const apiKeyField = surface.driverOptions.apiKeyField?.trim();
@@ -1117,21 +1239,36 @@ export function validateProviderBundleDraft(
         (authScheme === "custom_header" || authScheme === "query") &&
         !apiKeyField
       ) {
-        return `${surface.app} authentication field is required`;
+        return issue(
+          "authFieldRequired",
+          "authField",
+          `${surface.app} authentication field is required`,
+          surface.app,
+        );
       }
       if (
         authScheme === "custom_header" &&
         (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(apiKeyField ?? "") ||
           CUSTOM_AUTH_HEADER_DENYLIST.has(apiKeyField?.toLowerCase() ?? ""))
       ) {
-        return `${surface.app} authentication header name is invalid`;
+        return issue(
+          "authHeaderInvalid",
+          "authField",
+          `${surface.app} authentication header name is invalid`,
+          surface.app,
+        );
       }
       if (
         surface.enabled &&
         !surface.secret.configured &&
         !surface.secret.value.trim()
       ) {
-        return `${surface.app} authentication credential is required`;
+        return issue(
+          "surfaceCredentialRequired",
+          "surfaceSecret",
+          `${surface.app} authentication credential is required`,
+          surface.app,
+        );
       }
       const names = new Set<string>();
       for (const header of surface.headers.filter((item) => !item.removed)) {
@@ -1142,7 +1279,12 @@ export function validateProviderBundleDraft(
           EXTRA_HEADER_DENYLIST.has(name) ||
           names.has(name)
         ) {
-          return `${surface.app} custom header name is invalid or repeated`;
+          return issue(
+            "headerNameInvalid",
+            "headers",
+            `${surface.app} custom header name is invalid or repeated`,
+            surface.app,
+          );
         }
         names.add(name);
         if (
@@ -1150,15 +1292,31 @@ export function validateProviderBundleDraft(
           header.originalName !== trimmedName &&
           !header.value.trim()
         ) {
-          return `${surface.app} custom header value must be re-entered after renaming`;
+          return issue(
+            "headerRenameRequiresValue",
+            "headers",
+            `${surface.app} custom header value must be re-entered after renaming`,
+            surface.app,
+          );
         }
         if (!header.configured && !header.value.trim()) {
-          return `${surface.app} custom header value is required`;
+          return issue(
+            "headerValueRequired",
+            "headers",
+            `${surface.app} custom header value is required`,
+            surface.app,
+          );
         }
       }
     }
   }
   return null;
+}
+
+export function validateProviderBundleDraft(
+  draft: ProviderBundleEditorDraft,
+): string | null {
+  return validateProviderBundleDraftIssue(draft)?.message ?? null;
 }
 
 export function toProviderBundleWriteDraft(
