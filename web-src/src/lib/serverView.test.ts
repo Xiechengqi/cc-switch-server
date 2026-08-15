@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   clientWebTerminalUrl,
+  isEmbeddedServerView,
   preferredServerView,
   requestedServerView,
   resolveInitialServerView,
@@ -33,15 +34,23 @@ describe("serverView", () => {
     );
   });
 
+  it("detects an embedded visit", () => {
+    expect(isEmbeddedServerView("?view=terminal&embed=1")).toBe(true);
+    expect(isEmbeddedServerView("embed=true")).toBe(true);
+    expect(isEmbeddedServerView("?view=terminal")).toBe(false);
+    expect(isEmbeddedServerView("?embed=0")).toBe(false);
+    expect(isEmbeddedServerView("")).toBe(false);
+  });
+
   it("appends the terminal view to a client URL", () => {
     expect(clientWebTerminalUrl("https://alpha.example.com")).toBe(
-      "https://alpha.example.com/?view=terminal",
+      "https://alpha.example.com/?view=terminal&embed=1",
     );
     expect(clientWebTerminalUrl("https://alpha.example.com/")).toBe(
-      "https://alpha.example.com/?view=terminal",
+      "https://alpha.example.com/?view=terminal&embed=1",
     );
     expect(clientWebTerminalUrl("https://alpha.example.com/?foo=1")).toBe(
-      "https://alpha.example.com/?foo=1&view=terminal",
+      "https://alpha.example.com/?foo=1&view=terminal&embed=1",
     );
   });
 });

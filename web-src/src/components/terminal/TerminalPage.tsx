@@ -139,7 +139,7 @@ function readableError(error: unknown, fallback: string): string {
   return message;
 }
 
-export default function TerminalPage() {
+export default function TerminalPage({ bare = false }: { bare?: boolean } = {}) {
   const { t } = useTranslation();
   const isDarkMode = useDarkMode();
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -201,6 +201,8 @@ export default function TerminalPage() {
     term.open(host);
     termRef.current = term;
     fitRef.current = fit;
+    // No surrounding UI to click in bare mode, so hand over the keyboard now.
+    if (bare) term.focus();
 
     const controller = new AbortController();
     streamAbortRef.current = controller;
@@ -337,7 +339,17 @@ export default function TerminalPage() {
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [fitAndResize, t]);
+  }, [bare, fitAndResize, t]);
+
+  useEffect(() => {
+    // Bare mode has no banner to host an error, so report it the way a shell
+    // would — as a line in the session itself.
+    if (!bare || !error) return;
+    const term = termRef.current;
+    if (!term) return;
+    term.writeln("");
+    term.writeln(`\u001b[31m${error}\u001b[0m`);
+  }, [bare, error]);
 
   const endSession = useCallback(async () => {
     setEnding(true);
@@ -371,6 +383,15 @@ export default function TerminalPage() {
         return "";
     }
   })();
+
+  if (bare) {
+    return (
+      <div
+        ref={hostRef}
+        className="h-full min-h-0 w-full overflow-hidden bg-[#f6f8fa] p-2 dark:bg-[#0d1117]"
+      />
+    );
+  }
 
   return (
     <div

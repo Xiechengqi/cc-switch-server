@@ -35,6 +35,7 @@ import {
 import { clearRouterSessionTokens } from "@/lib/routerAuth";
 import { writeToken } from "@/lib/runtime";
 import {
+  isEmbeddedServerView,
   resolveInitialServerView,
   SERVER_VIEW_STORAGE_KEY,
   type ServerView,
@@ -70,10 +71,21 @@ export default function ServerApp({
   const [settingsDefaultTab, setSettingsDefaultTab] =
     useState<SettingsTab>("general");
   const settingsPageRef = useRef<SettingsPageHandle>(null);
+  const [embedded] = useState(() =>
+    typeof window === "undefined"
+      ? false
+      : isEmbeddedServerView(window.location.search),
+  );
+  // Embedded terminal: the host window supplies the title bar and the close
+  // control, so ours would only repeat it. Drop every frame around xterm.
+  const bareTerminal = embedded && currentView === "terminal";
 
   useEffect(() => {
+    // An embedded visit is driven by the query string; letting it write the
+    // stored view would change what a standalone tab opens next.
+    if (embedded) return;
     localStorage.setItem(SERVER_VIEW_STORAGE_KEY, currentView);
-  }, [currentView]);
+  }, [currentView, embedded]);
 
   useEffect(() => {
     if (!enableWebTerminal && currentView === "terminal") {
@@ -138,7 +150,7 @@ export default function ServerApp({
             </div>
           }
         >
-          <TerminalPage />
+          <TerminalPage bare={bareTerminal} />
         </Suspense>
       );
     }
@@ -198,11 +210,11 @@ export default function ServerApp({
     <div
       className={cn(
         "flex h-screen flex-col overflow-hidden bg-background text-foreground selection:bg-primary/30",
-        APP_VIEWPORT_PADDING_Y,
-        PAGE_HEADER_CONTENT_GAP,
+        !bareTerminal && APP_VIEWPORT_PADDING_Y,
+        !bareTerminal && PAGE_HEADER_CONTENT_GAP,
       )}
     >
-      {currentView !== "providers" ? (
+      {currentView !== "providers" && !bareTerminal ? (
         <header className="sticky top-0 z-50 w-full shrink-0 bg-background/90 backdrop-blur-md">
           <div
             className={cn(
@@ -232,7 +244,7 @@ export default function ServerApp({
         <AnimatePresence mode="wait">
           <motion.div
             key={currentView}
-            className={cn(PAGE_SHELL_CLASS, "h-full")}
+            className={cn(!bareTerminal && PAGE_SHELL_CLASS, "h-full")}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
