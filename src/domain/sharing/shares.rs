@@ -1947,7 +1947,9 @@ impl ShareStore {
         }
 
         if let Some(description) = patch.description {
-            share.description = description.map(|value| value.trim().to_string());
+            share.description = description
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
         }
         if let Some(for_sale) = patch.for_sale {
             apply_router_for_sale_patch(&mut share, &for_sale);

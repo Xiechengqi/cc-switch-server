@@ -26,12 +26,28 @@ use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
 use crate::domain::usage::store::UsageStore;
 
+/// Distinguishes a missing JSON field (`None`) from an explicit `null`
+/// (`Some(None)`). `Option<Option<T>>` with only `default` treats both as
+/// absent, so `"description": null` would never clear the stored value.
+fn deserialize_optional_nullable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nullable_string"
+    )]
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_sale: Option<String>,
@@ -1583,6 +1599,17 @@ mod tests {
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
+
+    #[test]
+    fn explicit_null_description_clears_instead_of_being_absent() {
+        let patch: ShareSettingsPatch =
+            serde_json::from_str(r#"{"description":null}"#).expect("parse null description");
+        assert_eq!(patch.description, Some(None));
+
+        let omitted: ShareSettingsPatch =
+            serde_json::from_str(r#"{}"#).expect("parse omitted description");
+        assert_eq!(omitted.description, None);
+    }
 
     #[test]
     fn descriptor_maps_free_for_sale_label() {
