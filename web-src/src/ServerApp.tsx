@@ -34,24 +34,17 @@ import {
 } from "@/lib/layout";
 import { clearRouterSessionTokens } from "@/lib/routerAuth";
 import { writeToken } from "@/lib/runtime";
+import {
+  resolveInitialServerView,
+  SERVER_VIEW_STORAGE_KEY,
+  type ServerView,
+} from "@/lib/serverView";
 import { cn } from "@/lib/utils";
 import { ProviderBundlesPage } from "@/server/providers/bundles/ProviderBundlesPage";
 
 const TerminalPage = lazy(() => import("@/components/terminal/TerminalPage"));
 
-type View = "providers" | "shares" | "settings" | "terminal";
-
-const VIEW_STORAGE_KEY = "cc-switch-server-view";
-
-function getInitialView(enableWebTerminal: boolean): View {
-  const stored = localStorage.getItem(VIEW_STORAGE_KEY);
-  if (stored === "terminal")
-    return enableWebTerminal ? "terminal" : "providers";
-  if (stored === "providers" || stored === "shares" || stored === "settings") {
-    return stored;
-  }
-  return "providers";
-}
+type View = ServerView;
 
 interface ServerAppProps {
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
@@ -66,14 +59,20 @@ export default function ServerApp({
   useOauthQuotaRefreshBridge();
   useProviderHealthRefreshBridge();
   const [currentView, setCurrentView] = useState<View>(() =>
-    getInitialView(enableWebTerminal),
+    resolveInitialServerView(
+      enableWebTerminal,
+      typeof window === "undefined" ? "" : window.location.search,
+      typeof window === "undefined"
+        ? null
+        : localStorage.getItem(SERVER_VIEW_STORAGE_KEY),
+    ),
   );
   const [settingsDefaultTab, setSettingsDefaultTab] =
     useState<SettingsTab>("general");
   const settingsPageRef = useRef<SettingsPageHandle>(null);
 
   useEffect(() => {
-    localStorage.setItem(VIEW_STORAGE_KEY, currentView);
+    localStorage.setItem(SERVER_VIEW_STORAGE_KEY, currentView);
   }, [currentView]);
 
   useEffect(() => {
