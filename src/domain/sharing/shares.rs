@@ -363,7 +363,7 @@ impl Default for SharePolicy {
             allow_personal_credits: false,
             auto_consume_banked_reset: false,
             banked_reset_expiry_lead_minutes: DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
-            previous_response_cache_enabled: false,
+            previous_response_cache_enabled: true,
         }
     }
 }

@@ -25,7 +25,6 @@ import { MarketSelectorField } from "@/components/providers/ProviderShareSection
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
 import { CodexReferralPanel } from "@/components/providers/forms/CodexReferralPanel";
-import { CodexShareExecutionPolicyFields } from "@/components/providers/forms/CodexShareExecutionPolicyFields";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -738,14 +737,12 @@ function BundleShareEditor({
   ownerEmail,
   shareUrl,
   onOpenShareSettings,
-  showCodexExecutionPolicy,
 }: {
   draft: ProviderBundleShareDraft;
   onChange: (draft: ProviderBundleShareDraft) => void;
   ownerEmail: string;
   shareUrl?: string | null;
   onOpenShareSettings?: () => void;
-  showCodexExecutionPolicy: boolean;
 }) {
   const { t } = useTranslation();
   const [marketSelectKey, setMarketSelectKey] = useState(0);
@@ -1051,139 +1048,121 @@ function BundleShareEditor({
             protectedEmails={protectedGrantEmails}
             onChange={updateUserGrants}
           />
-          <div className="space-y-2">
-            <Label>
-              {t("provider.share.tokenLimit", { defaultValue: "Token 限额" })}
-            </Label>
-            <Input
-              type="number"
-              min={0}
-              placeholder={t("share.unlimited", { defaultValue: "无上限" })}
-              value={draft.tokenLimit}
-              onChange={(event) =>
-                onChange({ ...draft, tokenLimit: event.target.value })
-              }
-            />
-            <div className="flex flex-wrap gap-1.5">
-              <Button
-                type="button"
-                variant={draft.tokenLimit === "" ? "secondary" : "outline"}
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={() => onChange({ ...draft, tokenLimit: "" })}
-              >
-                {t("share.unlimited", { defaultValue: "无上限" })}
-              </Button>
-              {SHARE_TOKEN_PRESETS.map((preset) => (
+          <div className="grid gap-4 md:col-span-2 md:grid-cols-3">
+            <div className="space-y-2">
+              <Label>
+                {t("provider.share.tokenLimit", { defaultValue: "Token 限额" })}
+              </Label>
+              <Input
+                type="number"
+                min={0}
+                placeholder={t("share.unlimited", { defaultValue: "无上限" })}
+                value={draft.tokenLimit}
+                onChange={(event) =>
+                  onChange({ ...draft, tokenLimit: event.target.value })
+                }
+              />
+              <div className="flex flex-wrap gap-1.5">
                 <Button
-                  key={preset}
+                  type="button"
+                  variant={draft.tokenLimit === "" ? "secondary" : "outline"}
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => onChange({ ...draft, tokenLimit: "" })}
+                >
+                  {t("share.unlimited", { defaultValue: "无上限" })}
+                </Button>
+                {SHARE_TOKEN_PRESETS.map((preset) => (
+                  <Button
+                    key={preset}
+                    type="button"
+                    variant={
+                      draft.tokenLimit === String(preset)
+                        ? "secondary"
+                        : "outline"
+                    }
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() =>
+                      onChange({ ...draft, tokenLimit: String(preset) })
+                    }
+                  >
+                    {preset.toLocaleString()}
+                  </Button>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label>
+                {t("provider.share.parallelLimit", { defaultValue: "并发限额" })}
+              </Label>
+              <Input
+                type="number"
+                min={1}
+                placeholder={t("share.unlimited", { defaultValue: "无上限" })}
+                value={draft.parallelLimit}
+                onChange={(event) =>
+                  onChange({ ...draft, parallelLimit: event.target.value })
+                }
+              />
+              <div className="flex flex-wrap gap-1.5">
+                <Button
+                  type="button"
+                  variant={draft.parallelLimit === "" ? "secondary" : "outline"}
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => onChange({ ...draft, parallelLimit: "" })}
+                >
+                  {t("share.unlimited", { defaultValue: "无上限" })}
+                </Button>
+                <Button
                   type="button"
                   variant={
-                    draft.tokenLimit === String(preset)
+                    draft.parallelLimit === String(DEFAULT_PARALLEL_LIMIT)
                       ? "secondary"
                       : "outline"
                   }
                   size="sm"
                   className="h-7 px-2 text-xs"
                   onClick={() =>
-                    onChange({ ...draft, tokenLimit: String(preset) })
+                    onChange({
+                      ...draft,
+                      parallelLimit: String(DEFAULT_PARALLEL_LIMIT),
+                    })
                   }
                 >
-                  {preset.toLocaleString()}
+                  {DEFAULT_PARALLEL_LIMIT}
                 </Button>
-              ))}
+              </div>
             </div>
-          </div>
-          <div className="space-y-2">
-            <Label>
-              {t("provider.share.parallelLimit", { defaultValue: "并发限额" })}
-            </Label>
-            <Input
-              type="number"
-              min={1}
-              placeholder={t("share.unlimited", { defaultValue: "无上限" })}
-              value={draft.parallelLimit}
-              onChange={(event) =>
-                onChange({ ...draft, parallelLimit: event.target.value })
-              }
-            />
-            <div className="flex flex-wrap gap-1.5">
-              <Button
-                type="button"
-                variant={draft.parallelLimit === "" ? "secondary" : "outline"}
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={() => onChange({ ...draft, parallelLimit: "" })}
-              >
-                {t("share.unlimited", { defaultValue: "无上限" })}
-              </Button>
-              <Button
-                type="button"
-                variant={
-                  draft.parallelLimit === String(DEFAULT_PARALLEL_LIMIT)
-                    ? "secondary"
-                    : "outline"
-                }
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={() =>
+            <div className="space-y-2">
+              <Label>
+                {t("provider.share.expiry", { defaultValue: "有效期" })}
+              </Label>
+              <Select
+                value={draft.expiry}
+                onValueChange={(expiry) =>
                   onChange({
                     ...draft,
-                    parallelLimit: String(DEFAULT_PARALLEL_LIMIT),
+                    expiry: expiry as ProviderBundleShareDraft["expiry"],
                   })
                 }
               >
-                {DEFAULT_PARALLEL_LIMIT}
-              </Button>
-            </div>
-          </div>
-          {showCodexExecutionPolicy ? (
-            <CodexShareExecutionPolicyFields
-              allowPersonalCredits={draft.allowPersonalCredits}
-              autoConsumeBankedReset={draft.autoConsumeBankedReset}
-              bankedResetExpiryLeadMinutes={draft.bankedResetExpiryLeadMinutes}
-              previousResponseCacheEnabled={draft.previousResponseCacheEnabled}
-              onAllowPersonalCreditsChange={(allowPersonalCredits) =>
-                onChange({ ...draft, allowPersonalCredits })
-              }
-              onAutoConsumeBankedResetChange={(autoConsumeBankedReset) =>
-                onChange({ ...draft, autoConsumeBankedReset })
-              }
-              onBankedResetExpiryLeadMinutesChange={(
-                bankedResetExpiryLeadMinutes,
-              ) => onChange({ ...draft, bankedResetExpiryLeadMinutes })}
-              onPreviousResponseCacheEnabledChange={(
-                previousResponseCacheEnabled,
-              ) => onChange({ ...draft, previousResponseCacheEnabled })}
-            />
-          ) : null}
-          <div className="space-y-2 md:col-span-2">
-            <Label>
-              {t("provider.share.expiry", { defaultValue: "有效期" })}
-            </Label>
-            <Select
-              value={draft.expiry}
-              onValueChange={(expiry) =>
-                onChange({
-                  ...draft,
-                  expiry: expiry as ProviderBundleShareDraft["expiry"],
-                })
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="permanent">
-                  {t("share.expiry.permanent", { defaultValue: "永久有效" })}
-                </SelectItem>
-                {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
-                  <SelectItem key={preset.value} value={preset.value}>
-                    {t(preset.labelKey)}
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="permanent">
+                    {t("share.expiry.permanent", { defaultValue: "永久有效" })}
                   </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+                  {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
+                    <SelectItem key={preset.value} value={preset.value}>
+                      {t(preset.labelKey)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
         </div>
       ) : null}
@@ -2446,7 +2425,6 @@ export function ProviderBundleEditor({
             ownerEmail={ownerEmail}
             shareUrl={shareUrl}
             onOpenShareSettings={onOpenShareSettings}
-            showCodexExecutionPolicy={codexDriverOptions}
           />
         </div>
         ) : null}

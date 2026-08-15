@@ -1022,7 +1022,7 @@ struct SaveProviderBundleShareCommand {
     auto_consume_banked_reset: bool,
     #[serde(default = "default_provider_bundle_banked_reset_expiry_lead_minutes")]
     banked_reset_expiry_lead_minutes: u32,
-    #[serde(default)]
+    #[serde(default = "default_provider_bundle_previous_response_cache_enabled")]
     previous_response_cache_enabled: bool,
 }
 
@@ -1032,6 +1032,10 @@ fn default_provider_bundle_market_access_mode() -> String {
 
 fn default_provider_bundle_banked_reset_expiry_lead_minutes() -> u32 {
     crate::domain::sharing::shares::DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
+}
+
+fn default_provider_bundle_previous_response_cache_enabled() -> bool {
+    true
 }
 
 fn provider_bundle_share_conflict(message: impl Into<String>) -> ApiError {

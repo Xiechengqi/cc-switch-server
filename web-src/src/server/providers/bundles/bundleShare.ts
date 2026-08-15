@@ -131,7 +131,9 @@ export function createBundleShareDraft(
     bankedResetExpiryLeadMinutes: String(
       share?.bankedResetExpiryLeadMinutes ?? 60,
     ),
-    previousResponseCacheEnabled: share?.previousResponseCacheEnabled ?? false,
+    previousResponseCacheEnabled: share
+      ? Boolean(share.previousResponseCacheEnabled)
+      : true,
   };
 }
 

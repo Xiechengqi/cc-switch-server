@@ -30,7 +30,6 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ProviderShareReuseDialog } from "@/components/providers/ProviderShareReuseDialog";
-import { CodexShareExecutionPolicyFields } from "@/components/providers/forms/CodexShareExecutionPolicyFields";
 import { shareApi } from "@/lib/api/share";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
@@ -125,7 +124,6 @@ interface ProviderShareSectionProps {
   providerName: string;
   onOpenShareSettings?: () => void;
   onDirtyChange?: (dirty: boolean) => void;
-  showCodexExecutionPolicy?: boolean;
 }
 
 function shareStateLabel(
@@ -166,7 +164,6 @@ export function ProviderShareSection({
   providerName,
   onOpenShareSettings,
   onDirtyChange,
-  showCodexExecutionPolicy = false,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
   const { share, state } = useProviderShare(appId, providerId);
@@ -226,7 +223,7 @@ export function ProviderShareSection({
   const [bankedResetExpiryLeadMinutes, setBankedResetExpiryLeadMinutes] =
     useState("60");
   const [previousResponseCacheEnabled, setPreviousResponseCacheEnabled] =
-    useState(false);
+    useState(true);
 
   const subdomainManualRef = useRef(false);
   const shareInitRef = useRef<string | null>(null);
@@ -290,7 +287,7 @@ export function ProviderShareSection({
       String(share?.bankedResetExpiryLeadMinutes ?? 60),
     );
     setPreviousResponseCacheEnabled(
-      share?.previousResponseCacheEnabled ?? false,
+      share ? Boolean(share.previousResponseCacheEnabled) : true,
     );
     subdomainManualRef.current = Boolean(share?.shareSlug?.trim());
 
@@ -1176,43 +1173,28 @@ export function ProviderShareSection({
                   onChange={handleUserGrantsChange}
                 />
 
-                <div className="space-y-2">
-                  <Label htmlFor="provider-share-token-limit">
-                    {t("share.tokenLimit", { defaultValue: "Token 限额" })}
-                  </Label>
-                  <Input
-                    id="provider-share-token-limit"
-                    type="number"
-                    min={0}
-                    disabled={busy}
-                    placeholder={t("share.unlimited", {
-                      defaultValue: "无上限",
-                    })}
-                    value={tokenLimitInput}
-                    onChange={(event) => {
-                      tokenLimitTouchedRef.current = true;
-                      setTokenLimitInput(event.target.value);
-                      markShareDraftChanged();
-                    }}
-                  />
-                  <div className="flex flex-wrap gap-1.5">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
+                <div className="grid gap-4 md:col-span-2 md:grid-cols-3">
+                  <div className="space-y-2">
+                    <Label htmlFor="provider-share-token-limit">
+                      {t("share.tokenLimit", { defaultValue: "Token 限额" })}
+                    </Label>
+                    <Input
+                      id="provider-share-token-limit"
+                      type="number"
+                      min={0}
                       disabled={busy}
-                      onClick={() => {
+                      placeholder={t("share.unlimited", {
+                        defaultValue: "无上限",
+                      })}
+                      value={tokenLimitInput}
+                      onChange={(event) => {
                         tokenLimitTouchedRef.current = true;
-                        setTokenLimitInput("");
+                        setTokenLimitInput(event.target.value);
                         markShareDraftChanged();
                       }}
-                    >
-                      {t("share.unlimited", { defaultValue: "无上限" })}
-                    </Button>
-                    {SHARE_TOKEN_PRESETS.map((preset) => (
+                    />
+                    <div className="flex flex-wrap gap-1.5">
                       <Button
-                        key={preset}
                         type="button"
                         variant="outline"
                         size="sm"
@@ -1220,156 +1202,145 @@ export function ProviderShareSection({
                         disabled={busy}
                         onClick={() => {
                           tokenLimitTouchedRef.current = true;
-                          setTokenLimitInput(String(preset));
+                          setTokenLimitInput("");
                           markShareDraftChanged();
                         }}
                       >
-                        {preset.toLocaleString()}
+                        {t("share.unlimited", { defaultValue: "无上限" })}
                       </Button>
-                    ))}
+                      {SHARE_TOKEN_PRESETS.map((preset) => (
+                        <Button
+                          key={preset}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          disabled={busy}
+                          onClick={() => {
+                            tokenLimitTouchedRef.current = true;
+                            setTokenLimitInput(String(preset));
+                            markShareDraftChanged();
+                          }}
+                        >
+                          {preset.toLocaleString()}
+                        </Button>
+                      ))}
+                    </div>
                   </div>
-                </div>
 
-                <div className="space-y-2">
-                  <Label htmlFor="provider-share-parallel-limit">
-                    {t("share.parallelLimit", { defaultValue: "并发限额" })}
-                  </Label>
-                  <Input
-                    id="provider-share-parallel-limit"
-                    type="number"
-                    min={1}
-                    disabled={busy}
-                    placeholder={t("share.unlimited", {
-                      defaultValue: "无上限",
-                    })}
-                    value={parallelLimitInput}
-                    onChange={(event) => {
-                      parallelLimitTouchedRef.current = true;
-                      setParallelLimitInput(event.target.value);
-                      markShareDraftChanged();
-                    }}
-                  />
-                  <div className="flex flex-wrap gap-1.5">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
+                  <div className="space-y-2">
+                    <Label htmlFor="provider-share-parallel-limit">
+                      {t("share.parallelLimit", { defaultValue: "并发限额" })}
+                    </Label>
+                    <Input
+                      id="provider-share-parallel-limit"
+                      type="number"
+                      min={1}
                       disabled={busy}
-                      onClick={() => {
+                      placeholder={t("share.unlimited", {
+                        defaultValue: "无上限",
+                      })}
+                      value={parallelLimitInput}
+                      onChange={(event) => {
                         parallelLimitTouchedRef.current = true;
-                        setParallelLimitInput("");
+                        setParallelLimitInput(event.target.value);
                         markShareDraftChanged();
                       }}
-                    >
-                      {t("share.unlimited", { defaultValue: "无上限" })}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
-                      disabled={busy}
-                      onClick={() => {
-                        parallelLimitTouchedRef.current = true;
-                        setParallelLimitInput(String(DEFAULT_PARALLEL_LIMIT));
-                        markShareDraftChanged();
-                      }}
-                    >
-                      {DEFAULT_PARALLEL_LIMIT}
-                    </Button>
-                  </div>
-                </div>
-
-                {showCodexExecutionPolicy ? (
-                  <CodexShareExecutionPolicyFields
-                    allowPersonalCredits={allowPersonalCredits}
-                    autoConsumeBankedReset={autoConsumeBankedReset}
-                    bankedResetExpiryLeadMinutes={bankedResetExpiryLeadMinutes}
-                    previousResponseCacheEnabled={
-                      previousResponseCacheEnabled
-                    }
-                    disabled={busy}
-                    onAllowPersonalCreditsChange={(checked) => {
-                      setAllowPersonalCredits(checked);
-                      markShareDraftChanged();
-                    }}
-                    onAutoConsumeBankedResetChange={(checked) => {
-                      setAutoConsumeBankedReset(checked);
-                      markShareDraftChanged();
-                    }}
-                    onBankedResetExpiryLeadMinutesChange={(value) => {
-                      setBankedResetExpiryLeadMinutes(value);
-                      markShareDraftChanged();
-                    }}
-                    onPreviousResponseCacheEnabledChange={(checked) => {
-                      setPreviousResponseCacheEnabled(checked);
-                      markShareDraftChanged();
-                    }}
-                  />
-                ) : null}
-
-                <div className="space-y-2 md:col-span-2">
-                  <Label htmlFor="provider-share-expires">
-                    {t("share.expiresIn", { defaultValue: "有效期（秒）" })}
-                  </Label>
-                  <Input
-                    id="provider-share-expires"
-                    type="number"
-                    disabled={busy || isPermanent}
-                    value={expiresInSecsInput}
-                    onChange={(event) => {
-                      expiresTouchedRef.current = true;
-                      setExpiresInSecsInput(event.target.value);
-                      markShareDraftChanged();
-                    }}
-                  />
-                  <div className="flex flex-wrap gap-1.5">
-                    {SHARE_EXPIRY_PRESETS.map((preset) => (
+                    />
+                    <div className="flex flex-wrap gap-1.5">
                       <Button
-                        key={preset.value}
                         type="button"
                         variant="outline"
                         size="sm"
                         className="h-7 px-2 text-xs"
-                        disabled={busy || isPermanent}
+                        disabled={busy}
                         onClick={() => {
-                          expiresTouchedRef.current = true;
-                          setExpiresInSecsInput(String(preset.value));
+                          parallelLimitTouchedRef.current = true;
+                          setParallelLimitInput("");
                           markShareDraftChanged();
                         }}
                       >
-                        {t(preset.labelKey)}
+                        {t("share.unlimited", { defaultValue: "无上限" })}
                       </Button>
-                    ))}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        disabled={busy}
+                        onClick={() => {
+                          parallelLimitTouchedRef.current = true;
+                          setParallelLimitInput(String(DEFAULT_PARALLEL_LIMIT));
+                          markShareDraftChanged();
+                        }}
+                      >
+                        {DEFAULT_PARALLEL_LIMIT}
+                      </Button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="provider-share-expires-permanent"
-                      checked={isPermanent}
-                      disabled={busy}
-                      onCheckedChange={(checked) => {
+
+                  <div className="space-y-2">
+                    <Label htmlFor="provider-share-expires">
+                      {t("provider.share.expiry", { defaultValue: "有效期" })}
+                    </Label>
+                    <Input
+                      id="provider-share-expires"
+                      type="number"
+                      disabled={busy || isPermanent}
+                      value={expiresInSecsInput}
+                      onChange={(event) => {
                         expiresTouchedRef.current = true;
+                        setExpiresInSecsInput(event.target.value);
                         markShareDraftChanged();
-                        const next = checked === true;
-                        setIsPermanent(next);
-                        if (next) {
-                          setExpiresInSecsInput(
-                            String(permanentExpiresInSecs()),
-                          );
-                        } else {
-                          setExpiresInSecsInput(String(24 * 3600));
-                        }
                       }}
                     />
-                    <Label
-                      htmlFor="provider-share-expires-permanent"
-                      className="cursor-pointer text-sm font-normal"
-                    >
-                      {t("share.expiry.permanent", {
-                        defaultValue: "永久有效",
-                      })}
-                    </Label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {SHARE_EXPIRY_PRESETS.map((preset) => (
+                        <Button
+                          key={preset.value}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          disabled={busy || isPermanent}
+                          onClick={() => {
+                            expiresTouchedRef.current = true;
+                            setExpiresInSecsInput(String(preset.value));
+                            markShareDraftChanged();
+                          }}
+                        >
+                          {t(preset.labelKey)}
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="provider-share-expires-permanent"
+                        checked={isPermanent}
+                        disabled={busy}
+                        onCheckedChange={(checked) => {
+                          expiresTouchedRef.current = true;
+                          markShareDraftChanged();
+                          const next = checked === true;
+                          setIsPermanent(next);
+                          if (next) {
+                            setExpiresInSecsInput(
+                              String(permanentExpiresInSecs()),
+                            );
+                          } else {
+                            setExpiresInSecsInput(String(24 * 3600));
+                          }
+                        }}
+                      />
+                      <Label
+                        htmlFor="provider-share-expires-permanent"
+                        className="cursor-pointer text-sm font-normal"
+                      >
+                        {t("share.expiry.permanent", {
+                          defaultValue: "永久有效",
+                        })}
+                      </Label>
+                    </div>
                   </div>
                 </div>
               </div>

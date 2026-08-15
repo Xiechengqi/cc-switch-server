@@ -2507,7 +2507,6 @@ export function ServerProviderForm({
           providerName={state.draft.name}
           onOpenShareSettings={onOpenShareSettings}
           onDirtyChange={setShareDirty}
-          showCodexExecutionPolicy={showCodexOptions}
         />
       ) : (
         <ProviderSharePlaceholder />

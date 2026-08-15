@@ -79,6 +79,9 @@ describe("Provider Bundle sharing", () => {
       expiry: "permanent",
       sharedWithEmails: [],
       userGrants: {},
+      allowPersonalCredits: false,
+      autoConsumeBankedReset: false,
+      previousResponseCacheEnabled: true,
     });
   });
 
