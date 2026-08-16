@@ -35,6 +35,11 @@ pub struct ServerConfig {
     /// Disable via `enableWebTerminal: false` or `CC_SWITCH_ENABLE_WEB_TERMINAL=0|false|off`.
     #[serde(default = "default_true")]
     pub enable_web_terminal: bool,
+    /// 本地请求体上限（MB）。生效值是 `min(本地上限, Router 声明上限)`；
+    /// 默认取 Router 允许的最大档位，因此默认由 Router settings 决定实际天花板。
+    /// 改动需要重启进程（路由层的 `DefaultBodyLimit` 是静态 layer）。
+    #[serde(default)]
+    pub request_body_limits: RequestBodyLimitsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +304,161 @@ fn default_true() -> bool {
     true
 }
 
+// ── 请求体上限（本地主权上限） ───────────────────────────────────────────────
+//
+// Router 会在每个 ingress 请求上声明它自己对该请求应用的上限
+// (`x-cc-switch-ingress-body-limit`)。Client 的生效值是
+// `min(本地上限, Router 声明上限)`：Router 只能在本地上限之内放宽，
+// 卖家永远保留一个自己说了算的天花板。
+//
+// 默认值取 Router 允许配置的最大档位，因此**开箱即用时 Router settings 直接生效**，
+// 不会出现第二道隐藏的 413。只有明确希望限制内存占用的卖家才需要调小它。
+// 注意：请求体整体驻留内存，峰值 ≈ 上限 × 并发请求数（重试路径还会额外持有一份原始 body）。
+
+/// 单档上限的最小值（MB）。
+pub const MIN_REQUEST_BODY_LIMIT_MB: u64 = 1;
+/// 普通 API（`/v1/responses`、`/v1/messages` 等）的上限区间上界（MB）。
+pub const MAX_REQUEST_BODY_LIMIT_MB: u64 = 64;
+/// 视频/图片档的上限区间上界（MB）。
+pub const MAX_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = 256;
+
+const DEFAULT_REQUEST_BODY_LIMIT_MB: u64 = MAX_REQUEST_BODY_LIMIT_MB;
+const DEFAULT_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = MAX_MEDIA_REQUEST_BODY_LIMIT_MB;
+const DEFAULT_IMAGE_REQUEST_BODY_LIMIT_MB: u64 = MAX_MEDIA_REQUEST_BODY_LIMIT_MB;
+
+const REQUEST_BODY_LIMIT_ENV: &str = "CC_SWITCH_REQUEST_BODY_LIMIT_MB";
+const MEDIA_REQUEST_BODY_LIMIT_ENV: &str = "CC_SWITCH_MEDIA_REQUEST_BODY_LIMIT_MB";
+const IMAGE_REQUEST_BODY_LIMIT_ENV: &str = "CC_SWITCH_IMAGE_REQUEST_BODY_LIMIT_MB";
+
+fn default_request_body_limit_mb() -> u64 {
+    DEFAULT_REQUEST_BODY_LIMIT_MB
+}
+
+fn default_media_request_body_limit_mb() -> u64 {
+    DEFAULT_MEDIA_REQUEST_BODY_LIMIT_MB
+}
+
+fn default_image_request_body_limit_mb() -> u64 {
+    DEFAULT_IMAGE_REQUEST_BODY_LIMIT_MB
+}
+
+/// `server.json` 中 `requestBodyLimits` 的持久化形态，单位 MB。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestBodyLimitsConfig {
+    /// 普通 API 档。
+    #[serde(default = "default_request_body_limit_mb")]
+    pub default_mb: u64,
+    /// `/v1/videos/generations` 档。
+    #[serde(default = "default_media_request_body_limit_mb")]
+    pub media_mb: u64,
+    /// `/v1/images/{generations,edits}` 档。
+    #[serde(default = "default_image_request_body_limit_mb")]
+    pub image_mb: u64,
+}
+
+impl Default for RequestBodyLimitsConfig {
+    fn default() -> Self {
+        Self {
+            default_mb: DEFAULT_REQUEST_BODY_LIMIT_MB,
+            media_mb: DEFAULT_MEDIA_REQUEST_BODY_LIMIT_MB,
+            image_mb: DEFAULT_IMAGE_REQUEST_BODY_LIMIT_MB,
+        }
+    }
+}
+
+/// 已解析为字节的本地上限快照。启动时定格一次：路由层的
+/// `DefaultBodyLimit` 是静态 layer，改这些值需要重启进程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBodyLimits {
+    pub default_bytes: usize,
+    pub media_bytes: usize,
+    pub image_bytes: usize,
+}
+
+impl RequestBodyLimits {
+    /// 按请求路径挑选所属档位。路径匹配规则与 Router 的
+    /// `proxy_request_body_limit()` 保持一致。
+    pub fn for_path(&self, path: &str) -> usize {
+        match path.split_once('?').map_or(path, |(path, _)| path) {
+            "/v1/images/generations"
+            | "/images/generations"
+            | "/v1/images/edits"
+            | "/images/edits" => self.image_bytes,
+            "/v1/videos/generations" | "/videos/generations" => self.media_bytes,
+            _ => self.default_bytes,
+        }
+    }
+}
+
+impl Default for RequestBodyLimits {
+    fn default() -> Self {
+        RequestBodyLimitsConfig::default().resolve()
+    }
+}
+
+/// 读取一个 MB 环境变量覆盖；非法值忽略并告警，避免打错一个字符就把上限压到 1 MB。
+fn env_limit_mb_override(key: &str, min: u64, max: u64) -> Option<u64> {
+    let raw = std::env::var(key).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(value) if (min..=max).contains(&value) => Some(value),
+        _ => {
+            tracing::warn!(
+                env = key,
+                value = trimmed,
+                min,
+                max,
+                "ignoring out-of-range request body limit override"
+            );
+            None
+        }
+    }
+}
+
+fn mb_to_bytes(megabytes: u64) -> usize {
+    usize::try_from(megabytes.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+}
+
+impl RequestBodyLimitsConfig {
+    /// 解析为字节，并应用 env 覆盖与区间钳制。
+    ///
+    /// 越界的 `server.json` 值被钳制而不是拒绝启动：这是一个内存旋钮，
+    /// 不值得让一台已经在跑的卖家机器因为手改配置而起不来。
+    pub fn resolve(&self) -> RequestBodyLimits {
+        let default_mb = env_limit_mb_override(
+            REQUEST_BODY_LIMIT_ENV,
+            MIN_REQUEST_BODY_LIMIT_MB,
+            MAX_REQUEST_BODY_LIMIT_MB,
+        )
+        .unwrap_or(self.default_mb)
+        .clamp(MIN_REQUEST_BODY_LIMIT_MB, MAX_REQUEST_BODY_LIMIT_MB);
+        let media_mb = env_limit_mb_override(
+            MEDIA_REQUEST_BODY_LIMIT_ENV,
+            MIN_REQUEST_BODY_LIMIT_MB,
+            MAX_MEDIA_REQUEST_BODY_LIMIT_MB,
+        )
+        .unwrap_or(self.media_mb)
+        .clamp(MIN_REQUEST_BODY_LIMIT_MB, MAX_MEDIA_REQUEST_BODY_LIMIT_MB);
+        let image_mb = env_limit_mb_override(
+            IMAGE_REQUEST_BODY_LIMIT_ENV,
+            MIN_REQUEST_BODY_LIMIT_MB,
+            MAX_MEDIA_REQUEST_BODY_LIMIT_MB,
+        )
+        .unwrap_or(self.image_mb)
+        .clamp(MIN_REQUEST_BODY_LIMIT_MB, MAX_MEDIA_REQUEST_BODY_LIMIT_MB);
+        // 媒体档不得低于普通档：否则一个图片请求会比同样大小的文本请求先被拒。
+        RequestBodyLimits {
+            default_bytes: mb_to_bytes(default_mb),
+            media_bytes: mb_to_bytes(media_mb.max(default_mb)),
+            image_bytes: mb_to_bytes(image_mb.max(default_mb)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupInput {
@@ -322,6 +482,7 @@ impl ServerConfig {
             upgrade_policy: UpgradePolicyConfig::default(),
             provider_runtime_defaults: ProviderRuntimeDefaults::default(),
             enable_web_terminal: true,
+            request_body_limits: RequestBodyLimitsConfig::default(),
         }
     }
 
@@ -540,6 +701,7 @@ impl ServerConfig {
             upgrade_policy: UpgradePolicyConfig::default(),
             provider_runtime_defaults: ProviderRuntimeDefaults::default(),
             enable_web_terminal: true,
+            request_body_limits: RequestBodyLimitsConfig::default(),
         })
     }
 
@@ -721,6 +883,86 @@ fn hash_secret(secret: &str, min_len: usize) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_body_limits_default_to_the_router_ceiling() {
+        // 默认不引入第二道隐藏闸门：本地上限取 Router 允许配置的最大档位，
+        // 因此 `min(本地, Router 声明)` 恒等于 Router 声明。
+        let limits = RequestBodyLimitsConfig::default().resolve();
+        assert_eq!(limits.default_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.media_bytes, 256 * 1024 * 1024);
+        assert_eq!(limits.image_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_body_limits_clamp_out_of_range_values_instead_of_failing() {
+        let limits = RequestBodyLimitsConfig {
+            default_mb: 0,
+            media_mb: 100_000,
+            image_mb: 100_000,
+        }
+        .resolve();
+        assert_eq!(limits.default_bytes, 1024 * 1024);
+        assert_eq!(limits.media_bytes, 256 * 1024 * 1024);
+        assert_eq!(limits.image_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn media_lanes_never_fall_below_the_default_lane() {
+        let limits = RequestBodyLimitsConfig {
+            default_mb: 64,
+            media_mb: 8,
+            image_mb: 8,
+        }
+        .resolve();
+        assert_eq!(limits.default_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.media_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.image_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_body_limit_lane_selection_matches_the_router_path_table() {
+        let limits = RequestBodyLimits {
+            default_bytes: 1,
+            media_bytes: 2,
+            image_bytes: 3,
+        };
+        for path in [
+            "/v1/images/generations",
+            "/images/generations",
+            "/v1/images/edits",
+            "/images/edits",
+            "/v1/images/edits?mask=true",
+        ] {
+            assert_eq!(limits.for_path(path), 3, "{path}");
+        }
+        for path in ["/v1/videos/generations", "/videos/generations"] {
+            assert_eq!(limits.for_path(path), 2, "{path}");
+        }
+        for path in ["/v1/responses", "/v1/messages?beta=true", "/v1beta/models"] {
+            assert_eq!(limits.for_path(path), 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn request_body_limits_deserialize_field_by_field() {
+        // 老的 server.json 没有这一段：整段缺失走 `#[serde(default)]`，
+        // 单个字段缺失走各自的 `default_*` 函数。
+        let full: RequestBodyLimitsConfig = serde_json::from_str("{}").expect("parse empty object");
+        assert_eq!(full, RequestBodyLimitsConfig::default());
+
+        let partial: RequestBodyLimitsConfig =
+            serde_json::from_str(r#"{"defaultMb":8}"#).expect("parse partial object");
+        assert_eq!(partial.default_mb, 8);
+        assert_eq!(
+            partial.media_mb,
+            RequestBodyLimitsConfig::default().media_mb
+        );
+        assert_eq!(
+            partial.image_mb,
+            RequestBodyLimitsConfig::default().image_mb
+        );
+    }
 
     #[test]
     fn setup_generates_memorable_subdomain_when_blank() {

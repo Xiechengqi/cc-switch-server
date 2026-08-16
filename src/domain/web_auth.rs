@@ -453,6 +453,7 @@ mod tests {
             upgrade_policy: Default::default(),
             provider_runtime_defaults: Default::default(),
             enable_web_terminal: false,
+            request_body_limits: Default::default(),
         };
         if let Some(password) = password {
             config.set_password(password).expect("hash password");

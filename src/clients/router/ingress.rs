@@ -8,6 +8,12 @@ use std::collections::{HashMap, VecDeque};
 pub const PROTOCOL_EPOCH: &str = "namespace-flat-1";
 pub const INGRESS_CONTEXT_HEADER: &str = "x-cc-switch-ingress-context";
 pub const INGRESS_SIGNATURE_HEADER: &str = "x-cc-switch-ingress-signature";
+/// Router 为本次请求实际应用的请求体上限（字节，十进制）。
+///
+/// 该头**不参与签名**，也无需参与：本端永远取 `min(本地上限, 声明值)`，
+/// 伪造只能把上限压低。Router 侧会剥离来自公网的同名头。
+/// 旧版 Router 不发送该头，此时回退到历史硬编码档位。
+pub const INGRESS_BODY_LIMIT_HEADER: &str = "x-cc-switch-ingress-body-limit";
 pub const INTERNAL_INGRESS_ERROR_HEADER: &str = "x-cc-switch-internal-ingress-error";
 pub const INTERNAL_INGRESS_AGE_MS_HEADER: &str = "x-cc-switch-internal-ingress-age-ms";
 pub const INTERNAL_INGRESS_SERVER_TIME_MS_HEADER: &str =

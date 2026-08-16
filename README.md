@@ -286,6 +286,9 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
 | Managed OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
 | Streaming 超时 | Provider 默认首业务事件超时 120 秒、后续事件空闲超时 300 秒；`STREAM_FIRST_BYTE_TIMEOUT_MS` / `UPSTREAM_STREAM_FIRST_BYTE_TIMEOUT_MS` 和 `STREAM_IDLE_TIMEOUT_MS` / `UPSTREAM_STREAM_IDLE_TIMEOUT_MS` 可覆盖，设为 `0` 关闭对应超时 |
+| 请求体上限 | Router ingress 请求的生效上限是 `min(本地上限, Router 声明上限)`；Router 通过不参与签名的 `x-cc-switch-ingress-body-limit`（十进制字节）声明本次档位，伪造只能压低不能抬高。本地三档由 `server.json` 的 `requestBodyLimits.{defaultMb,mediaMb,imageMb}` 或 `CC_SWITCH_REQUEST_BODY_LIMIT_MB` / `CC_SWITCH_MEDIA_REQUEST_BODY_LIMIT_MB` / `CC_SWITCH_IMAGE_REQUEST_BODY_LIMIT_MB` 配置（普通档 1-64 MB，视频/图片档 1-256 MB 且不低于普通档），默认取上限 64/256/256 MB，即默认由 Router settings 决定实际天花板；改动需重启进程。旧版 Router 不发送该头时回退到历史值（普通 2 MiB / 视频 32 MiB / 图片 48 MiB）。请求体整体驻留内存，收紧本地上限即可为本机内存兜底 |
+| 图片内容层上限 | 请求体档位之外，图片内容另有独立的语义上限，且**返回 400 而非 413**：multipart `/v1/images/edits` 每张 20 MiB、合计 32 MiB、最多 16 张（`src/proxy/remote_image.rs`）。因此 multipart 图片编辑的实际天花板恒为 32 MiB，把 Router / 本地图片档调到 32 MiB 以上不会放宽它。JSON / data-URL 形式的 `/v1/images/edits` 只校验 16 张上限。Claude / Cursor 通道内联远程图片 URL 时单张上限 1 MiB |
+| 媒体响应上限 | 响应侧上限独立于请求体档位且不可配：Grok 媒体响应 64 MiB（超限 502）、Codex Images 输出 48 MiB / 上游 72 MiB / 8294400 像素。视频结果偏大时先撞的是这一条，不是请求体上限 |
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
@@ -298,7 +301,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 
 主要本地 store：
 
-- `server.json`：owner、password hash、router、client tunnel subdomain 和 installation identity。
+- `server.json`：owner、password hash、router、client tunnel subdomain、installation identity 和 `requestBodyLimits` 本地请求体上限。
 - `providers.json`：Provider Bundle 及其 Claude / Codex / Gemini Surface 配置。
 - `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
 - `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。

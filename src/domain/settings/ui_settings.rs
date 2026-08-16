@@ -456,6 +456,7 @@ mod tests {
             upgrade_policy: Default::default(),
             provider_runtime_defaults: Default::default(),
             enable_web_terminal: false,
+            request_body_limits: Default::default(),
         };
         let settings = store.settings_for_frontend(&config);
         assert_eq!(

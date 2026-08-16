@@ -661,6 +661,9 @@ pub fn app_router(state: ServerState) -> Router {
 }
 
 fn inference_router(state: ServerState) -> Router<ServerState> {
+    // 启动时定格的本地上限。它只是内存兜底：Router ingress 请求的真正策略闸门是
+    // `verify_router_ingress` 里的 `min(本地上限, Router 声明上限)`。
+    let limits = state.request_body_limits;
     Router::new()
         .route("/v1/models", get(proxy_models_or_manifest))
         .route("/models", get(proxy_models_or_manifest))
@@ -742,43 +745,36 @@ fn inference_router(state: ServerState) -> Router<ServerState> {
         )
         .route(
             "/v1/images/generations",
-            post(proxy_images_generations).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
+            post(proxy_images_generations).layer(DefaultBodyLimit::max(limits.image_bytes)),
         )
         .route(
             "/images/generations",
-            post(proxy_images_generations).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
+            post(proxy_images_generations).layer(DefaultBodyLimit::max(limits.image_bytes)),
         )
         .route(
             "/v1/images/edits",
-            post(proxy_images_edits).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
+            post(proxy_images_edits).layer(DefaultBodyLimit::max(limits.image_bytes)),
         )
         .route(
             "/images/edits",
-            post(proxy_images_edits).layer(DefaultBodyLimit::max(
-                proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
-            )),
+            post(proxy_images_edits).layer(DefaultBodyLimit::max(limits.image_bytes)),
         )
         .route(
             "/v1/videos/generations",
-            post(proxy_grok_videos_generations)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+            post(proxy_grok_videos_generations).layer(DefaultBodyLimit::max(limits.media_bytes)),
         )
         .route(
             "/videos/generations",
-            post(proxy_grok_videos_generations)
-                .layer(DefaultBodyLimit::max(proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES)),
+            post(proxy_grok_videos_generations).layer(DefaultBodyLimit::max(limits.media_bytes)),
         )
         .route("/v1/videos/:request_id", get(proxy_grok_video_status))
         .route("/videos/:request_id", get(proxy_grok_video_status))
         .route("/v1beta/*path", any(proxy_gemini))
         .route("/gemini/v1/*path", any(proxy_gemini))
         .route("/gemini/v1beta/*path", any(proxy_gemini))
+        // 兜底内存上限：覆盖所有上面未单独放宽的推理路由（`/v1/responses`、
+        // `/v1/messages` 等）。路由级 layer 更靠内，因此图片/视频档仍然生效。
+        .layer(DefaultBodyLimit::max(limits.default_bytes))
         .layer(middleware::from_fn(require_router_share_ingress))
         .layer(middleware::from_fn_with_state(
             state,
@@ -823,9 +819,12 @@ async fn verify_router_ingress(
         .get(INGRESS_SIGNATURE_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    // Router 声明的请求体上限。必须在下面的剥离循环之前读取。
+    let router_declared = router_declared_body_limit(request.headers());
     for name in [
         INGRESS_CONTEXT_HEADER,
         INGRESS_SIGNATURE_HEADER,
+        crate::clients::router::ingress::INGRESS_BODY_LIMIT_HEADER,
         "x-cc-switch-share-id",
         "x-cc-switch-share-subdomain",
         "x-cc-switch-share-host",
@@ -935,12 +934,21 @@ async fn verify_router_ingress(
             .path_and_query()
             .map(|target| target.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let body_limit = router_ingress_body_limit(request.uri().path());
+        let body_limit = resolve_router_ingress_body_limit(
+            &state.request_body_limits,
+            request.uri().path(),
+            router_declared,
+        );
         let (parts, body) = request.into_parts();
         let body = match axum::body::to_bytes(body, body_limit).await {
             Ok(body) => body,
             Err(error) => {
-                tracing::warn!(body_limit, error = %error, "router ingress request body rejected");
+                tracing::warn!(
+                    body_limit,
+                    router_declared = router_declared.unwrap_or(0),
+                    error = %error,
+                    "router ingress request body rejected"
+                );
                 record_ingress_rejection(
                     &state,
                     &audit_method,
@@ -1069,13 +1077,45 @@ fn audited_router_ingress_rejection(
     router_ingress_rejection(code, timing)
 }
 
-fn router_ingress_body_limit(path: &str) -> usize {
+/// Router 未声明上限时的兜底档位。等于本特性上线前的硬编码值，
+/// 因此旧版 Router 转发过来的请求行为完全不变。
+fn legacy_router_ingress_body_limit(path: &str) -> usize {
     match path {
         "/v1/images/generations" | "/images/generations" | "/v1/images/edits" | "/images/edits" => {
             proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
         }
         "/v1/videos/generations" | "/videos/generations" => proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES,
-        _ => 2 * 1024 * 1024,
+        _ => proxy::LEGACY_REQUEST_BODY_LIMIT_BYTES,
+    }
+}
+
+/// 解析 Router 声明的上限。缺失、空、非数字、为 0 都视为"未声明"。
+///
+/// 该头不参与 ingress 签名，但也无需参与：调用方永远取 `min(本地上限, 声明值)`，
+/// 伪造只能把自己的上限压低。Router 侧还会剥离来自公网的同名头。
+fn router_declared_body_limit(headers: &axum::http::HeaderMap) -> Option<usize> {
+    headers
+        .get(crate::clients::router::ingress::INGRESS_BODY_LIMIT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+}
+
+/// 本次 ingress 请求的生效上限。
+///
+/// - Router 声明了 → `min(本地上限, 声明值)`。Router 调大后 Client 自动跟随，
+///   卖家的本地上限仍是不可逾越的天花板。
+/// - Router 未声明（旧版 Router）→ 沿用历史硬编码档位，行为不变。
+fn resolve_router_ingress_body_limit(
+    limits: &crate::domain::settings::config::RequestBodyLimits,
+    path: &str,
+    declared: Option<usize>,
+) -> usize {
+    match declared {
+        Some(declared) => limits.for_path(path).min(declared),
+        None => legacy_router_ingress_body_limit(path),
     }
 }
 
@@ -1966,15 +2006,23 @@ async fn proxy_responses_input_tokens(
             .map_err(|error| {
                 InferenceApiError::proxy(InferenceSurface::OpenAi, request_id.clone(), error)
             })?;
-    responses_input_tokens_response(&headers, body)
+    responses_input_tokens_response(&headers, body, state.request_body_limits.default_bytes)
         .map_err(|error| InferenceApiError::api(InferenceSurface::OpenAi, request_id, error))
 }
 
-fn responses_input_tokens_response(headers: &HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    const BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
-    let body =
-        crate::proxy::decode_request_body_for_proxy_with_limit(headers, body, BODY_LIMIT_BYTES)
-            .map_err(ApiError::proxy)?;
+/// Estimates input tokens for `/v1/responses/input_tokens`.
+///
+/// `decoded_limit` is the default-lane cap from [`ServerState::request_body_limits`], so this
+/// endpoint tracks the Router-driven ceiling instead of a private constant. Wire bytes were
+/// already bounded by the ingress gate and the route's `DefaultBodyLimit`; this check only
+/// backstops post-decompression growth.
+fn responses_input_tokens_response(
+    headers: &HeaderMap,
+    body: Bytes,
+    decoded_limit: usize,
+) -> Result<Response, ApiError> {
+    let body = crate::proxy::decode_request_body_for_proxy_with_limit(headers, body, decoded_limit)
+        .map_err(ApiError::proxy)?;
     let request = serde_json::from_slice::<Value>(&body)
         .map_err(|error| ApiError::bad_request(format!("invalid token count JSON: {error}")))?;
     let payload = json!({
@@ -2015,7 +2063,8 @@ mod responses_input_token_tests {
 
     #[tokio::test]
     async fn compressed_input_token_request_is_bounded_after_decode() {
-        let oversized = json!({"input": "x".repeat(2 * 1024 * 1024)}).to_string();
+        let limit = 2 * 1024 * 1024;
+        let oversized = json!({"input": "x".repeat(limit)}).to_string();
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(oversized.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
@@ -2025,10 +2074,28 @@ mod responses_input_token_tests {
             HeaderValue::from_static("gzip"),
         );
 
-        let error = responses_input_tokens_response(&headers, Bytes::from(compressed)).unwrap_err();
+        let error =
+            responses_input_tokens_response(&headers, Bytes::from(compressed), limit).unwrap_err();
 
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(error.message.contains("2097152 byte limit"));
+    }
+
+    #[tokio::test]
+    async fn input_token_limit_follows_the_configured_default_lane() {
+        let payload = json!({"input": "x".repeat(4 * 1024)}).to_string();
+        let body = Bytes::from(payload);
+        let headers = HeaderMap::new();
+
+        // The legacy hardcoded ceiling was 2 MiB; a smaller configured lane must now bind.
+        let error = responses_input_tokens_response(&headers, body.clone(), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.message.contains("1024 byte limit"));
+
+        // ...and a larger configured lane must let the same body through.
+        let response =
+            responses_input_tokens_response(&headers, body, 8 * 1024 * 1024).expect("within limit");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 
@@ -3081,6 +3148,135 @@ mod grok_catalog_provider_tests {
         .await;
         let rejected = app.oneshot(above_images_envelope).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn router_declared_body_limit_ignores_absent_and_malformed_headers() {
+        let name = axum::http::HeaderName::from_static(
+            crate::clients::router::ingress::INGRESS_BODY_LIMIT_HEADER,
+        );
+        assert_eq!(router_declared_body_limit(&HeaderMap::new()), None);
+        for raw in ["", "   ", "abc", "0", "-1", "1.5", "12mb"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name.clone(), raw.parse().unwrap());
+            assert_eq!(router_declared_body_limit(&headers), None, "{raw:?}");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(name, " 10485760 ".parse().unwrap());
+        assert_eq!(router_declared_body_limit(&headers), Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn effective_ingress_body_limit_is_the_minimum_of_local_and_declared() {
+        let limits = crate::domain::settings::config::RequestBodyLimits {
+            default_bytes: 16 * 1024 * 1024,
+            media_bytes: 64 * 1024 * 1024,
+            image_bytes: 48 * 1024 * 1024,
+        };
+
+        // Router 声明更低 → 跟随 Router。
+        assert_eq!(
+            resolve_router_ingress_body_limit(&limits, "/v1/responses", Some(4 * 1024 * 1024)),
+            4 * 1024 * 1024
+        );
+        // Router 声明更高 → 被本地上限封顶，卖家仍握有天花板。
+        assert_eq!(
+            resolve_router_ingress_body_limit(&limits, "/v1/responses", Some(512 * 1024 * 1024)),
+            16 * 1024 * 1024
+        );
+        // 按档位取本地上限。
+        assert_eq!(
+            resolve_router_ingress_body_limit(
+                &limits,
+                "/v1/videos/generations",
+                Some(512 * 1024 * 1024)
+            ),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            resolve_router_ingress_body_limit(&limits, "/v1/images/edits", Some(512 * 1024 * 1024)),
+            48 * 1024 * 1024
+        );
+        // 旧版 Router 未声明 → 历史硬编码档位，行为不变。
+        assert_eq!(
+            resolve_router_ingress_body_limit(&limits, "/v1/responses", None),
+            proxy::LEGACY_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            resolve_router_ingress_body_limit(&limits, "/v1/videos/generations", None),
+            proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            resolve_router_ingress_body_limit(&limits, "/v1/images/generations", None),
+            proxy::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn router_declared_body_limit_replaces_the_legacy_ingress_ceiling() {
+        let state = catalog_test_state("declared-body-limit");
+        configure_test_router(&state).await;
+        let app = app_router(state);
+        let declared = 4 * 1024 * 1024;
+        let header_name = axum::http::HeaderName::from_static(
+            crate::clients::router::ingress::INGRESS_BODY_LIMIT_HEADER,
+        );
+
+        // 声明值高于历史 2 MiB 兜底：本地默认档是 Router 的最大档位，
+        // 因此 min() 落在声明值上，请求不再被 ingress 闸门拒绝。
+        let mut within = router_ingress_request(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(vec![b' '; declared - 1]))
+                .unwrap(),
+            "declared-within",
+            Some("share-declared"),
+        )
+        .await;
+        within
+            .headers_mut()
+            .insert(header_name.clone(), declared.to_string().parse().unwrap());
+        let accepted = app.clone().oneshot(within).await.unwrap();
+        assert_ne!(accepted.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 超过声明值 → 在占用 Share 并发之前就 413。
+        let mut oversized = router_ingress_request(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(vec![b' '; declared + 1]))
+                .unwrap(),
+            "declared-oversized",
+            Some("share-declared"),
+        )
+        .await;
+        oversized
+            .headers_mut()
+            .insert(header_name, declared.to_string().parse().unwrap());
+        let rejected = app.clone().oneshot(oversized).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 同样大小、但 Router 未声明（旧版 Router）→ 沿用 2 MiB 兜底，仍然 413。
+        let legacy = router_ingress_request(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(vec![
+                    b' ';
+                    proxy::LEGACY_REQUEST_BODY_LIMIT_BYTES + 1
+                ]))
+                .unwrap(),
+            "declared-legacy",
+            Some("share-declared"),
+        )
+        .await;
+        let rejected_legacy = app.oneshot(legacy).await.unwrap();
+        assert_eq!(rejected_legacy.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

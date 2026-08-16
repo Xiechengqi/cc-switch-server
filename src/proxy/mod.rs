@@ -57,7 +57,11 @@ pub(crate) use forwarder::validate_and_acquire_share_invocation;
 pub(crate) use request_governance::decode_request_body_for_proxy_with_limit;
 pub use router::ProxyRoute;
 
+/// Router 未声明上限时，普通 API 档的兜底值。等于本特性上线前的硬编码值。
+pub const LEGACY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Router 未声明上限时，视频档的兜底值。
 pub const MEDIA_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// Router 未声明上限时，图片档的兜底值。
 pub const CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES: usize = 48 * 1024 * 1024;
 pub const MEDIA_RESPONSE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 

@@ -68,7 +68,7 @@ Server Web UI 以本仓库的产品需求、Server API 和 `assets/contract/web-
 
 当前可用的 server-native 持久化文件：
 
-- `server.json`：password hash、owner email、router、client tunnel subdomain。
+- `server.json`：password hash、owner email、router、client tunnel subdomain、`requestBodyLimits`（本地请求体上限，生效值为 `min(本地, Router 声明)`）。
 - `providers.json`：Claude/Codex/Gemini provider 配置和分类后的 ProviderType。
 
 不要把这些文件的存在误判为最终 DB 迁移完成；SQLite 兼容和旧 cc-switch DB 读取必须另行设计和验收。

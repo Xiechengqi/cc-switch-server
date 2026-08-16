@@ -125,6 +125,9 @@ const CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_ALPHA_SEARCH_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_OVERFLOW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+/// 兜底解码上限。用于没有 `ServerState` 的纯函数路径（如 Codex alpha search，
+/// 那里 2 MiB 是语义上限而不是内存上限）。带 state 的转发路径改用
+/// `state.request_body_limits`，从而跟随本地配置与 Router 声明。
 const PROXY_REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1260,7 +1263,7 @@ async fn forward_with_attempt(
         let body = decode_request_body_for_proxy_with_limit(
             &headers,
             raw_body_for_retry.clone(),
-            PROXY_REQUEST_BODY_LIMIT_BYTES,
+            state.request_body_limits.default_bytes,
         )?;
         let app = route.app();
         let claude_body_retry_stage = attempt_context.body_retry_stage;
@@ -4251,10 +4254,17 @@ async fn forward_grok_media_for_test_surface(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     super::grok::validate_media_request(&method, &upstream_path)?;
+    let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
         body,
-        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        state.request_body_limits.media_bytes,
+    )?;
+    ensure_grok_request_body_limit(
+        "media",
+        state.request_body_limits.media_bytes,
+        wire_body_len,
+        body.len(),
     )?;
     let request_context = request_context_from_headers(&headers);
     let test_share_id = request_context
@@ -4319,10 +4329,17 @@ pub async fn forward_grok_media(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     super::grok::validate_media_request(&method, &upstream_path)?;
+    let wire_body_len = body.len();
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
         body,
-        super::MEDIA_REQUEST_BODY_LIMIT_BYTES,
+        state.request_body_limits.media_bytes,
+    )?;
+    ensure_grok_request_body_limit(
+        "media",
+        state.request_body_limits.media_bytes,
+        wire_body_len,
+        body.len(),
     )?;
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
@@ -4408,7 +4425,7 @@ pub async fn forward_images_generations(
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
         body,
-        super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+        state.request_body_limits.image_bytes,
     )?;
     let mut request_context = request_context_from_headers(&headers);
     request_context.session_id =
@@ -4453,7 +4470,12 @@ pub async fn forward_images_generations(
     drop(providers);
 
     if execution.driver_is("oauth.grok_responses") {
-        ensure_grok_media_request_body_limit(wire_body_len, body.len())?;
+        ensure_grok_request_body_limit(
+            "image",
+            state.request_body_limits.image_bytes,
+            wire_body_len,
+            body.len(),
+        )?;
         forward_grok_media_with_execution(
             state,
             execution,
@@ -4495,7 +4517,7 @@ pub async fn forward_images_edits(
     let body = decode_request_body_for_proxy_with_limit(
         &headers,
         body,
-        super::CODEX_IMAGES_REQUEST_BODY_LIMIT_BYTES,
+        state.request_body_limits.image_bytes,
     )?;
     let mut request_context = request_context_from_headers(&headers);
     request_context.session_id =
@@ -4540,7 +4562,12 @@ pub async fn forward_images_edits(
     drop(providers);
 
     if execution.driver_is("oauth.grok_responses") {
-        ensure_grok_media_request_body_limit(wire_body_len, body.len())?;
+        ensure_grok_request_body_limit(
+            "image",
+            state.request_body_limits.image_bytes,
+            wire_body_len,
+            body.len(),
+        )?;
         forward_grok_media_with_execution(
             state,
             execution,
@@ -4573,19 +4600,16 @@ pub async fn forward_images_edits(
     }
 }
 
-fn ensure_grok_media_request_body_limit(
+fn ensure_grok_request_body_limit(
+    lane: &str,
+    limit: usize,
     wire_body_len: usize,
     decoded_body_len: usize,
 ) -> Result<(), ProxyError> {
-    if wire_body_len > super::MEDIA_REQUEST_BODY_LIMIT_BYTES
-        || decoded_body_len > super::MEDIA_REQUEST_BODY_LIMIT_BYTES
-    {
+    if wire_body_len > limit || decoded_body_len > limit {
         return Err(ProxyError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: format!(
-                "Grok media request body exceeds the {} byte limit",
-                super::MEDIA_REQUEST_BODY_LIMIT_BYTES
-            ),
+            message: format!("Grok {lane} request body exceeds the {limit} byte limit"),
         });
     }
     Ok(())
@@ -27351,19 +27375,51 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
 
     #[test]
     fn codex_images_shared_routes_preserve_grok_media_body_limit() {
-        assert!(ensure_grok_media_request_body_limit(
-            crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES,
-            crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES,
-        )
-        .is_ok());
-        for (wire_body_len, decoded_body_len) in [
-            (crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1, 1),
-            (1, crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES + 1),
-        ] {
+        let limit = crate::proxy::MEDIA_REQUEST_BODY_LIMIT_BYTES;
+        assert!(ensure_grok_request_body_limit("media", limit, limit, limit).is_ok());
+        for (wire_body_len, decoded_body_len) in [(limit + 1, 1), (1, limit + 1)] {
             let error =
-                ensure_grok_media_request_body_limit(wire_body_len, decoded_body_len).unwrap_err();
+                ensure_grok_request_body_limit("media", limit, wire_body_len, decoded_body_len)
+                    .unwrap_err();
             assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         }
+    }
+
+    #[test]
+    fn grok_body_limit_names_the_lane_it_enforced() {
+        let error = ensure_grok_request_body_limit("image", 1024, 2048, 0).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error.message,
+            "Grok image request body exceeds the 1024 byte limit"
+        );
+
+        let error = ensure_grok_request_body_limit("media", 1024, 0, 2048).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Grok media request body exceeds the 1024 byte limit"
+        );
+    }
+
+    #[test]
+    fn image_routes_are_checked_against_the_image_lane_not_the_media_lane() {
+        // Regression: both image handlers used to pass `media_bytes` here, so a Client whose
+        // media lane sat below its image lane rejected image requests that ingress had already
+        // admitted — with a message that never mentioned images.
+        let limits = crate::domain::settings::config::RequestBodyLimits {
+            default_bytes: 4 * 1024 * 1024,
+            media_bytes: 8 * 1024 * 1024,
+            image_bytes: 32 * 1024 * 1024,
+        };
+        let body_len = 16 * 1024 * 1024;
+
+        assert!(
+            ensure_grok_request_body_limit("image", limits.image_bytes, body_len, body_len).is_ok()
+        );
+        assert!(
+            ensure_grok_request_body_limit("media", limits.media_bytes, body_len, body_len)
+                .is_err()
+        );
     }
 
     #[test]

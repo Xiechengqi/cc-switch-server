@@ -112,7 +112,7 @@ use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, S
 use crate::domain::router::{ClientSubdomain, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
     ClientSubdomainAdoption, ClientSubdomainAdoptionStatus, ClientTunnelClaimIntent,
-    RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
+    RequestBodyLimits, RouterIdentity, ServerConfig, SetupCompletionNotificationStatus,
 };
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::credential_source::resolve_provider_credential_source;
@@ -690,6 +690,9 @@ pub struct ServerStateInner {
     _data_directory_lock: crate::infra::storage::DataDirectoryLock,
     pub web_dist_dir: Option<PathBuf>,
     pub provider_coverage: ProviderCoverage,
+    /// 启动时定格的本地请求体上限。路由层的 `DefaultBodyLimit` 是静态 layer，
+    /// 因此这份快照不跟随 `config` 热更新；改动需要重启进程。
+    pub request_body_limits: RequestBodyLimits,
     // Persistent store locks and commit gates follow:
     // config -> providers -> accounts -> usage -> shares -> ui_settings.
     config_persistence: StorePersistenceCoordinator,
@@ -5567,12 +5570,21 @@ impl ServerStateInner {
                 .context("initialize image capability store")?,
         );
 
+        let request_body_limits = config.request_body_limits.resolve();
+        tracing::info!(
+            default_bytes = request_body_limits.default_bytes,
+            media_bytes = request_body_limits.media_bytes,
+            image_bytes = request_body_limits.image_bytes,
+            "resolved local request body limits (effective limit is min(local, router-declared))"
+        );
+
         Ok(Arc::new(Self {
             bind_addr,
             config_dir,
             _data_directory_lock: data_directory_lock,
             web_dist_dir: cli.resolved_web_dist_dir(),
             provider_coverage,
+            request_body_limits,
             config_persistence: StorePersistenceCoordinator::default(),
             config: RwLock::new(config),
             providers: RwLock::new(providers),
