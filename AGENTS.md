@@ -52,6 +52,16 @@ Server Web UI 以本仓库的产品需求、Server API 和 `assets/contract/web-
 
 本地-only 工作索引（已 gitignore，不提交）：`docs/remaining-work-index.md`。
 
+## 管理员密码修改
+
+「设置 - 密码修改」**设计如此：不用输入旧密码，直接修改**。UI 固定为一行 —— 左侧标题「密码修改 / 修改管理员登录密码」，右侧只有「新密码」输入框 + 「保存」按钮。
+
+- 前端只走 `POST /web-api/auth/password/set`（`web-src/src/lib/server-legacy-api.ts` 的 `changeServerPassword`），请求体只有 `{ newPassword }`。
+- 授权凭据是**当前这个管理员会话本身**：后端 `web_password_set` 先 `require_web_admin_session`，再 `set_admin_password`，其中会 `state.clear_sessions()`；前端随即清 token 并派发 `SERVER_AUTH_EXPIRED_EVENT`，强制用新密码重新登录。这层「改完必须重新登录」不能去掉。
+- 不要改用 `POST /web-api/auth/password/change`。那条路径要求 `currentPassword`，而邮箱验证码 / API Token / Router SSO 登录时前端根本没有明文密码可填，会让这些登录方式无法改密码。`/change` 端点本身保留（供其他调用方和契约测试使用），只是设置页不用它。
+- 因此**禁止**在设置页加回「当前密码」「确认新密码」输入框，或把布局改成多列表单。历史教训：`e9dc404` 因 Router 白名单缺失把 UI 改成调 `/change`（Router 侧真正的修复 `ddc49c5` 在一秒后就合入了），`2dbef0d` 进一步把「当前密码」做成真实输入框并改成三列布局——两次都是误改，已回退。
+- Router 侧 `is_allowed_client_web_path()` 放行整个 `/web-api/` 前缀，`/set` 经隧道可达，不需要为它单独加白名单条目。
+
 ## 验证
 
 完成代码改动后优先运行：

@@ -4,7 +4,6 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import { changeServerPassword } from "@/lib/server-legacy-api";
 import {
@@ -14,26 +13,25 @@ import {
 import { writeToken } from "@/lib/runtime";
 import { SecretInput } from "@/server/ui/SecretInput";
 
+/**
+ * 管理员密码修改。
+ *
+ * 设计如此：**不要求输入旧密码**，只填新密码即可直接改。凭据是当前这个管理员
+ * 会话本身（后端 `/web-api/auth/password/set` 用 `require_web_admin_session`
+ * 校验），因此邮箱验证码 / API Token / Router SSO 等没有本地明文密码的登录方式
+ * 也能改密码。改完后端会清空所有会话，前端随即清 token 并要求重新登录。
+ *
+ * 详见 AGENTS.md「管理员密码修改」一节，不要再加回「当前密码」「确认新密码」。
+ */
 export function ServerSecuritySettings() {
   const { t } = useTranslation();
-  const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function handleChangePassword(event: FormEvent) {
     event.preventDefault();
 
-    const trimmedCurrent = currentPassword.trim();
     const trimmedNew = newPassword.trim();
-    if (!trimmedCurrent) {
-      toast.error(
-        t("settings.serverSecurity.currentPasswordRequired", {
-          defaultValue: "请输入当前密码",
-        }),
-      );
-      return;
-    }
     if (trimmedNew.length < 8) {
       toast.error(
         t("settings.serverSecurity.passwordMinLength", {
@@ -42,24 +40,11 @@ export function ServerSecuritySettings() {
       );
       return;
     }
-    if (trimmedNew !== confirmPassword.trim()) {
-      toast.error(
-        t("settings.serverSecurity.passwordMismatch", {
-          defaultValue: "两次输入的新密码不一致",
-        }),
-      );
-      return;
-    }
 
     setBusy(true);
     try {
-      await changeServerPassword({
-        currentPassword: trimmedCurrent,
-        newPassword: trimmedNew,
-      });
-      setCurrentPassword("");
+      await changeServerPassword(trimmedNew);
       setNewPassword("");
-      setConfirmPassword("");
       writeToken(null);
       if (isRemoteWebMode()) {
         clearRouterSessionTokens();
@@ -80,7 +65,7 @@ export function ServerSecuritySettings() {
   return (
     <section className="space-y-4">
       <form
-        className="flex flex-col gap-4 rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50 sm:flex-row sm:items-end sm:justify-between"
+        className="flex items-center justify-between gap-4 rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50"
         onSubmit={handleChangePassword}
       >
         <input
@@ -93,7 +78,7 @@ export function ServerSecuritySettings() {
           className="sr-only"
           readOnly
         />
-        <div className="flex min-w-0 items-start gap-3">
+        <div className="flex min-w-0 items-center gap-3">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
             <Shield className="h-4 w-4 text-amber-500" />
           </div>
@@ -111,62 +96,26 @@ export function ServerSecuritySettings() {
           </div>
         </div>
 
-        <div className="grid w-full shrink-0 gap-3 sm:w-auto sm:grid-cols-3 sm:items-end">
-          <div className="space-y-1.5">
-            <Label htmlFor="server-current-password" className="text-xs">
-              {t("settings.serverSecurity.currentPassword", {
-                defaultValue: "当前密码",
-              })}
-            </Label>
-            <SecretInput
-              id="server-current-password"
-              type="password"
-              autoComplete="current-password"
-              className="h-9 w-full sm:w-44"
-              value={currentPassword}
-              onChange={(event) => setCurrentPassword(event.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="server-new-password" className="text-xs">
-              {t("settings.serverSecurity.newPassword", {
-                defaultValue: "新密码",
-              })}
-            </Label>
-            <SecretInput
-              id="server-new-password"
-              type="password"
-              autoComplete="new-password"
-              className="h-9 w-full sm:w-44"
-              value={newPassword}
-              onChange={(event) => setNewPassword(event.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="server-confirm-password" className="text-xs">
-              {t("settings.serverSecurity.confirmPassword", {
-                defaultValue: "确认新密码",
-              })}
-            </Label>
-            <SecretInput
-              id="server-confirm-password"
-              type="password"
-              autoComplete="new-password"
-              className="h-9 w-full sm:w-44"
-              value={confirmPassword}
-              onChange={(event) => setConfirmPassword(event.target.value)}
-            />
-          </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <SecretInput
+            id="server-new-password"
+            type="password"
+            autoComplete="new-password"
+            aria-label={t("settings.serverSecurity.newPassword", {
+              defaultValue: "新密码",
+            })}
+            placeholder={t("settings.serverSecurity.newPassword", {
+              defaultValue: "新密码",
+            })}
+            className="h-9 w-44 placeholder:text-muted-foreground/50 sm:w-52"
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+          />
           <Button
             type="submit"
             size="sm"
-            className="h-9 shrink-0 sm:col-start-3"
-            disabled={
-              busy ||
-              !currentPassword.trim() ||
-              !newPassword.trim() ||
-              !confirmPassword.trim()
-            }
+            className="h-9 shrink-0"
+            disabled={busy || !newPassword.trim()}
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             {t("common.save", { defaultValue: "保存" })}

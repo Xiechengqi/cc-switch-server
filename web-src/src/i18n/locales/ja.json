@@ -433,11 +433,8 @@
     "serverSecurity": {
       "changePasswordTitle": "パスワード変更",
       "changePasswordDescription": "管理者ログインパスワードを変更します。",
-      "currentPassword": "現在のパスワード",
       "newPassword": "新しいパスワード",
-      "confirmPassword": "新しいパスワード（確認）",
       "changePassword": "パスワードを変更",
-      "passwordMismatch": "新しいパスワードが一致しません",
       "passwordMinLength": "新しいパスワードは 8 文字以上である必要があります",
       "passwordChanged": "パスワードを変更しました",
       "passwordChangedSignOut": "パスワードを変更しました。新しいパスワードで再ログインしてください。",

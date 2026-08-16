@@ -1244,22 +1244,25 @@ export async function loginWithApiToken(apiToken: string): Promise<LoginResponse
   return invokeCommand<LoginResponse>("login_with_api_token", { apiToken });
 }
 
-export async function changeServerPassword(input: {
-  currentPassword: string;
-  newPassword: string;
-}): Promise<void> {
-  const currentPassword = input.currentPassword.trim();
-  const newPassword = input.newPassword.trim();
-  if (!currentPassword) {
-    throw new Error("请输入当前密码");
-  }
-  if (newPassword.length < 8) {
+/**
+ * 直接设置管理员密码，**不需要旧密码**（设计如此，见 AGENTS.md）。
+ *
+ * `/web-api/auth/password/set` 只校验当前请求携带的管理员会话，改完后端会清空
+ * 全部会话。不要改成 `/web-api/auth/password/change`——那条路径要求
+ * `currentPassword`，而邮箱验证码 / API Token / Router SSO 登录时前端没有明文
+ * 密码可填。
+ */
+export async function changeServerPassword(
+  newPassword: string,
+): Promise<void> {
+  const trimmed = newPassword.trim();
+  if (trimmed.length < 8) {
     throw new Error("新密码至少 8 位");
   }
-  await jsonFetch<{ ok: boolean }>("/web-api/auth/password/change", {
+  await jsonFetch<{ ok: boolean }>("/web-api/auth/password/set", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ currentPassword, newPassword }),
+    body: JSON.stringify({ newPassword: trimmed }),
   });
 }
 
