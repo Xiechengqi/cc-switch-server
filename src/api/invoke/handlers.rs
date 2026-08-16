@@ -6,7 +6,7 @@ use crate::domain::providers::runtime::authoritative_managed_account;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareUserGrant,
+    ShareSettingsPatch, ShareUserGrant, descriptor_for_share_with_accounts_and_usage,
 };
 
 pub(in crate::api) async fn web_provider_health_json(
@@ -1103,7 +1103,7 @@ fn provider_bundle_share_limits(
         _ => {
             return Err(ApiError::bad_request(
                 "tokenLimit must be -1 or a non-negative integer",
-            ))
+            ));
         }
     };
     let parallel_limit = match command.parallel_limit {
@@ -1115,7 +1115,7 @@ fn provider_bundle_share_limits(
         _ => {
             return Err(ApiError::bad_request(
                 "parallelLimit must be -1 or a non-negative integer",
-            ))
+            ));
         }
     };
     Ok((token_limit, parallel_limit))
@@ -1161,6 +1161,7 @@ fn stage_provider_bundle_share(
     store: &mut ShareStore,
     bundle_keys: &BTreeSet<(AppKind, String)>,
     bindings: &[ShareBinding],
+    enabled_apps: &BTreeSet<AppKind>,
     capacity_pool_id: &str,
     bundle_name: &str,
     owner_email: &str,
@@ -1209,6 +1210,9 @@ fn stage_provider_bundle_share(
                         command.banked_reset_expiry_lead_minutes,
                     ),
                     previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
+                    support: Some(crate::domain::sharing::shares::support_from_enabled_apps(
+                        enabled_apps,
+                    )),
                     user_grants: command.user_grants.clone(),
                     ..ShareSettingsPatch::default()
                 },
@@ -1221,8 +1225,10 @@ fn stage_provider_bundle_share(
     }
 
     let primary = bindings
-        .first()
-        .expect("Provider Bundle has at least one enabled Surface");
+        .iter()
+        .find(|binding| enabled_apps.contains(&binding.app))
+        .or(bindings.first())
+        .expect("Provider Bundle has at least one Surface");
     let share = store
         .upsert_with_capacity(
             UpsertShareInput {
@@ -1258,7 +1264,17 @@ fn stage_provider_bundle_share(
                 previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
                 auto_start: Some(true),
                 description,
-                enabled_apps: None,
+                enabled_apps: {
+                    let bound = bindings
+                        .iter()
+                        .map(|binding| binding.app)
+                        .collect::<BTreeSet<_>>();
+                    if *enabled_apps == bound {
+                        None
+                    } else {
+                        Some(enabled_apps.clone())
+                    }
+                },
                 bindings: bindings.to_vec(),
                 runtime_snapshot: None,
                 user_grants: command.user_grants.clone().unwrap_or_default(),
@@ -1342,7 +1358,6 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         .collect::<BTreeSet<_>>();
     let mut bindings = surfaces
         .iter()
-        .filter(|stored| crate::domain::providers::bundle::surface_enabled(&stored.provider))
         .map(|stored| ShareBinding {
             app: stored.app,
             provider_id: stored.provider.id.clone(),
@@ -1350,7 +1365,12 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         })
         .collect::<Vec<_>>();
     bindings.sort_by_key(|binding| binding.app);
-    if bindings.is_empty() {
+    let enabled_apps = surfaces
+        .iter()
+        .filter(|stored| crate::domain::providers::bundle::surface_enabled(&stored.provider))
+        .map(|stored| stored.app)
+        .collect::<BTreeSet<_>>();
+    if enabled_apps.is_empty() {
         return Err(provider_bundle_share_conflict(
             "Provider Bundle has no enabled Surface",
         ));
@@ -1372,6 +1392,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         &mut staged,
         &bundle_keys,
         &bindings,
+        &enabled_apps,
         &capacity_pool_id,
         &bundle_name,
         &owner_email,
@@ -1446,6 +1467,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     let command_for_commit = command.clone();
     let bundle_keys_for_commit = bundle_keys.clone();
     let bindings_for_commit = bindings.clone();
+    let enabled_apps_for_commit = enabled_apps.clone();
     let capacity_pool_id_for_commit = capacity_pool_id.clone();
     let bundle_name_for_commit = bundle_name.clone();
     let owner_email_for_commit = owner_email.clone();
@@ -1458,6 +1480,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                 store,
                 &bundle_keys_for_commit,
                 &bindings_for_commit,
+                &enabled_apps_for_commit,
                 &capacity_pool_id_for_commit,
                 &bundle_name_for_commit,
                 &owner_email_for_commit,
@@ -2639,8 +2662,9 @@ pub(in crate::api) fn map_managed_auth_account(
     let selected_workspace_id =
         crate::domain::accounts::store::effective_codex_workspace_id(account);
     use crate::domain::accounts::subscription_expiry::{
-        automatic_subscription_expires_at_ms, recurring_subscription_expires_at_ms,
-        resolved_subscription_expiry_at, supports_manual_expiry, SubscriptionExpirySource,
+        SubscriptionExpirySource, automatic_subscription_expires_at_ms,
+        recurring_subscription_expires_at_ms, resolved_subscription_expiry_at,
+        supports_manual_expiry,
     };
 
     let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;

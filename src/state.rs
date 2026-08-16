@@ -12,20 +12,20 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify, RwLock};
-use tokio::time::{sleep, timeout_at, Duration, Instant};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, broadcast, watch};
+use tokio::time::{Duration, Instant, sleep, timeout_at};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
 use crate::clients::coding_plan_quota::{
-    build_coding_plan_quota_client, fetch_coding_plan_quota, CodingPlanQuotaCredentials,
+    CodingPlanQuotaCredentials, build_coding_plan_quota_client, fetch_coding_plan_quota,
 };
 use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
 use crate::clients::oauth::codex_reset_credits::{
-    select_auto_reset_credit, stable_auto_reset_redeem_request_id, AutoResetCreditCandidate,
-    BankedResetActionError,
+    AutoResetCreditCandidate, BankedResetActionError, select_auto_reset_credit,
+    stable_auto_reset_redeem_request_id,
 };
 use crate::clients::oauth::copilot_device;
 use crate::clients::oauth::grok_device::{
@@ -41,14 +41,14 @@ use crate::clients::oauth::qoder::{
     PendingQoderDeviceFlow, QoderDeviceFlowStore, QoderDevicePollLease, QoderDevicePollResult,
 };
 use crate::clients::oauth::quota::{
-    load_gemini_v1internal_project, refresh_account_quota, QuotaRefreshResult,
-    QUOTA_FAILURE_COOLDOWN_MS,
+    QUOTA_FAILURE_COOLDOWN_MS, QuotaRefreshResult, load_gemini_v1internal_project,
+    refresh_account_quota,
 };
 use crate::clients::oauth::refresh::{
-    account_has_refresh_token, account_needs_native_refresh,
+    AccountRefreshFailure, account_has_refresh_token, account_needs_native_refresh,
     execute_native_account_refresh_with_receipt_hook as execute_native_account_refresh_client,
     provider_native_refresh_available, record_refresh_flight_failure,
-    validate_native_account_refresh_receipt, AccountRefreshFailure,
+    validate_native_account_refresh_receipt,
 };
 use crate::clients::ollama_cloud::{OllamaCloudClient, OllamaCloudFetchError};
 use crate::clients::router::client::{
@@ -61,22 +61,23 @@ use crate::clients::router::tunnel::{
 };
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::{
-    account_credential_ownership, AccountCredentialOwnership, AccountRefreshFlightFailure,
-    AccountRefreshFlightFailureDetails, AccountRefreshFlightStage, AccountRefreshGuard,
-    AccountRefreshLocks,
+    AccountCredentialOwnership, AccountRefreshFlightFailure, AccountRefreshFlightFailureDetails,
+    AccountRefreshFlightStage, AccountRefreshGuard, AccountRefreshLocks,
+    account_credential_ownership,
 };
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
+    Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
     active_account_usage_block, effective_codex_workspace_id, gemini_v1internal_project_id,
-    native_refresh_snapshot_matches, Account, AccountRefreshUpdate, AccountStore,
-    ManualSubscriptionExpiryError,
+    native_refresh_snapshot_matches,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
-    bundle_id as provider_bundle_id, bundle_model_policy_scope, bundle_model_policy_source,
-    bundle_test_app, credential_source_app, has_bundle_managed_metadata,
-    is_explicit_bundle_surface, shared_credential_source_key, surface_enabled, ModelPolicyScope,
-    ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
+    ModelPolicyScope, ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
+    bundle_family_id, bundle_id as provider_bundle_id, bundle_model_policy_scope,
+    bundle_model_policy_source, bundle_test_app, credential_source_app, default_enabled_test_app,
+    has_bundle_managed_metadata, is_explicit_bundle_surface, set_bundle_test_app,
+    set_surface_enabled, shared_credential_source_key, surface_enabled,
 };
 use crate::domain::providers::coding_plan::{
     CodingPlanQuotaAdapter, CodingPlanQuotaCache, CodingPlanQuotaCacheKey,
@@ -84,29 +85,28 @@ use crate::domain::providers::coding_plan::{
     CodingPlanQuotaSpec, CodingPlanQuotaView,
 };
 use crate::domain::providers::credentials::{
-    merge_provider_credentials, reveal_provider_credential, CredentialPatch,
-    ProviderAccountBindingMigrationItem, ProviderAccountBindingMigrationPreview,
+    CredentialPatch, ProviderAccountBindingMigrationItem, ProviderAccountBindingMigrationPreview,
     ProviderAccountBindingMigrationStatus, ProviderCommandError, ProviderIdentityAction,
     ProviderIdentityChangePreview, ProviderImportAction, ProviderImportItemPreview,
     ProviderImportPreview, ProviderReferencePreview, ProviderRuntimeTransitionPreview,
-    ProviderView, ProviderWriteDraft,
+    ProviderView, ProviderWriteDraft, merge_provider_credentials, reveal_provider_credential,
 };
 use crate::domain::providers::model::{
-    AppKind, AuthBinding, Provider, ProviderMeta, ProviderType, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE,
+    AppKind, AuthBinding, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE, Provider, ProviderMeta, ProviderType,
 };
 use crate::domain::providers::ollama_cloud::{
-    snapshot_status as ollama_cloud_snapshot_status, OllamaCloudAccountView, OllamaCloudCache,
-    OllamaCloudCacheKey, OllamaCloudErrorKind, OllamaCloudObserved, OllamaCloudSection,
-    OllamaCloudSectionState, OllamaCloudSnapshot, OllamaCloudSnapshotSource, OllamaCloudUsageView,
-    OllamaCloudUsageWindowKind,
+    OllamaCloudAccountView, OllamaCloudCache, OllamaCloudCacheKey, OllamaCloudErrorKind,
+    OllamaCloudObserved, OllamaCloudSection, OllamaCloudSectionState, OllamaCloudSnapshot,
+    OllamaCloudSnapshotSource, OllamaCloudUsageView, OllamaCloudUsageWindowKind,
+    snapshot_status as ollama_cloud_snapshot_status,
 };
 use crate::domain::providers::registry::{
-    profile_by_id, resolve_custom_binding, CreationPolicy, CredentialPolicy, CustomBindingInput,
-    DriverBinding, ProfileId, ProviderFieldScope, ProviderKey,
+    CreationPolicy, CredentialPolicy, CustomBindingInput, DriverBinding, ProfileId,
+    ProviderFieldScope, ProviderKey, profile_by_id, resolve_custom_binding,
 };
 use crate::domain::providers::runtime::{
-    compile_runtime_plan_with_defaults, managed_account_binding, managed_account_provider_type,
-    ProviderRuntimeDefaults,
+    ProviderRuntimeDefaults, compile_runtime_plan_with_defaults, managed_account_binding,
+    managed_account_provider_type,
 };
 use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
 use crate::domain::router::{ClientSubdomain, PROTOCOL_EPOCH};
@@ -120,22 +120,22 @@ use crate::domain::sharing::previous_response_cache::{
     PreviousResponseCache, PreviousResponseCacheScope,
 };
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint, ShareAppProvider,
-    ShareDescriptor, ShareRequestLogEntry, ShareSyncOperation, ShareUpstreamProvider,
-    ShareUpstreamQuota, ShareUpstreamQuotaTier,
+    ShareAppProvider, ShareDescriptor, ShareRequestLogEntry, ShareSyncOperation,
+    ShareUpstreamProvider, ShareUpstreamQuota, ShareUpstreamQuotaTier,
+    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint,
 };
 use crate::domain::sharing::shares::{
-    RouterDescriptorSyncMode, Share, ShareConcurrencyLimit, ShareDeleteTombstone, ShareInvocation,
-    ShareInvocationRejection, ShareRejectReason, ShareStore,
+    RouterDescriptorSyncMode, Share, ShareBinding, ShareConcurrencyLimit, ShareDeleteTombstone,
+    ShareInvocation, ShareInvocationRejection, SharePatchError, ShareRejectReason, ShareStore,
 };
 use crate::domain::usage::store::{
     PreparedUsageAppend, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageOutcome,
     UsageState, UsageStore,
 };
 use crate::logging::{
-    classify_network_error, error_fingerprint, opaque_ref, AuditCursor, AuditEvent, AuditLog,
-    AuditRequestDetails, AuditUploadCursor, AuditWriteError, LogTailAccessError, LogTailResponse,
-    SharedAuditLog, SharedLogCapture,
+    AuditCursor, AuditEvent, AuditLog, AuditRequestDetails, AuditUploadCursor, AuditWriteError,
+    LogTailAccessError, LogTailResponse, SharedAuditLog, SharedLogCapture, classify_network_error,
+    error_fingerprint, opaque_ref,
 };
 use crate::proxy::cursor::session::CursorSessionManager;
 
@@ -1848,11 +1848,11 @@ impl GrokMediaTaskStore {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
+                return Ok(Self::default());
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("read Grok media task store {}", path.display()))
+                    .with_context(|| format!("read Grok media task store {}", path.display()));
             }
         };
         let mut store: Self = serde_json::from_slice(&bytes)
@@ -2216,7 +2216,7 @@ fn prune_native_refresh_quarantine(config_dir: &Path) -> anyhow::Result<usize> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("read OAuth refresh quarantine {}", directory.display()))
+                .with_context(|| format!("read OAuth refresh quarantine {}", directory.display()));
         }
     };
     let mut files = Vec::new();
@@ -2329,7 +2329,7 @@ fn recover_pending_native_refresh_journals(
                     "read native refresh recovery directory {}",
                     directory.display()
                 )
-            })
+            });
         }
     };
     let mut paths = entries
@@ -2417,7 +2417,7 @@ fn remove_superseded_native_refresh_journals(
                     "read native refresh recovery directory {}",
                     directory.display()
                 )
-            })
+            });
         }
     };
     for entry in entries {
@@ -4457,6 +4457,105 @@ fn provider_share_projection_signature(
     ))
 }
 
+fn share_bundle_id(providers: &ProviderStore, share: &Share) -> Option<String> {
+    share.bindings.iter().find_map(|binding| {
+        providers.providers.iter().find_map(|stored| {
+            (stored.app == binding.app && stored.provider.id == binding.provider_id)
+                .then(|| provider_bundle_id(&stored.provider))
+                .flatten()
+                .map(str::to_string)
+        })
+    })
+}
+
+fn enabled_apps_from_share_support(
+    support: &crate::domain::sharing::router_contract::ShareSupport,
+) -> BTreeSet<AppKind> {
+    let mut enabled = BTreeSet::new();
+    if support.claude {
+        enabled.insert(AppKind::Claude);
+    }
+    if support.codex {
+        enabled.insert(AppKind::Codex);
+    }
+    if support.gemini {
+        enabled.insert(AppKind::Gemini);
+    }
+    enabled
+}
+
+fn missing_family_share_bindings(
+    share: &Share,
+    family_surfaces: &[StoredProvider],
+) -> Vec<ShareBinding> {
+    let bound = share
+        .bindings
+        .iter()
+        .map(|binding| binding.app)
+        .collect::<BTreeSet<_>>();
+    family_surfaces
+        .iter()
+        .filter(|stored| !bound.contains(&stored.app))
+        .map(|stored| ShareBinding {
+            app: stored.app,
+            provider_id: stored.provider.id.clone(),
+            provider_type: stored.provider_type,
+        })
+        .collect()
+}
+
+fn apply_bundle_surface_support(
+    store: &mut ProviderStore,
+    bundle_id: &str,
+    enabled: &BTreeSet<AppKind>,
+) -> Result<((), bool), SharePatchError> {
+    let family_id = store.providers.iter().find_map(|stored| {
+        (provider_bundle_id(&stored.provider) == Some(bundle_id))
+            .then(|| bundle_family_id(&stored.provider).map(str::to_string))
+            .flatten()
+    });
+    let current_test_app = store.providers.iter().find_map(|stored| {
+        (provider_bundle_id(&stored.provider) == Some(bundle_id))
+            .then(|| bundle_test_app(&stored.provider).ok().flatten())
+            .flatten()
+    });
+    let next_test_app = match current_test_app {
+        Some(app) if enabled.contains(&app) => Some(app),
+        _ => family_id.as_deref().and_then(|family_id| {
+            default_enabled_test_app(family_id, &enabled.iter().copied().collect::<Vec<_>>())
+        }),
+    };
+    let mut next_revision = 0u64;
+    let mut needs_write = false;
+    for stored in &store.providers {
+        if provider_bundle_id(&stored.provider) != Some(bundle_id) {
+            continue;
+        }
+        next_revision = next_revision.max(stored.resource.revision);
+        if surface_enabled(&stored.provider) != enabled.contains(&stored.app)
+            || next_test_app
+                .is_some_and(|app| bundle_test_app(&stored.provider).ok().flatten() != Some(app))
+        {
+            needs_write = true;
+        }
+    }
+    if !needs_write {
+        return Ok(((), false));
+    }
+    next_revision = next_revision.saturating_add(1);
+    for stored in &mut store.providers {
+        if provider_bundle_id(&stored.provider) != Some(bundle_id) {
+            continue;
+        }
+        set_surface_enabled(&mut stored.provider, enabled.contains(&stored.app));
+        if let Some(next_test_app) = next_test_app {
+            set_bundle_test_app(&mut stored.provider, next_test_app);
+        }
+        stored.resource.revision = next_revision;
+    }
+    Ok(((), true))
+}
+
 fn provider_share_projection_changes(
     before: &ProviderStore,
     after: &ProviderStore,
@@ -6266,14 +6365,14 @@ impl ServerStateInner {
                 SetupCompletionNotificationStatus::Acknowledged
                 | SetupCompletionNotificationStatus::TerminalFailed => return Ok(()),
                 SetupCompletionNotificationStatus::WaitingForClaim if !authoritative_claim => {
-                    return Ok(())
+                    return Ok(());
                 }
                 SetupCompletionNotificationStatus::Pending
                     if notification
                         .next_attempt_at_ms
                         .is_some_and(|next_attempt_at_ms| next_attempt_at_ms > now_ms) =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 SetupCompletionNotificationStatus::WaitingForClaim
                 | SetupCompletionNotificationStatus::Pending => {}
@@ -9826,7 +9925,7 @@ impl ServerStateInner {
         Result<Account, crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError>,
     > {
         use crate::domain::sharing::subscription_identity::{
-            validate_subscription_reference_graph_transition, CodexWorkspaceRebindError,
+            CodexWorkspaceRebindError, validate_subscription_reference_graph_transition,
         };
 
         let account_id = account_id.as_str();
@@ -10012,8 +10111,8 @@ impl ServerStateInner {
         >,
     > {
         use crate::domain::sharing::subscription_identity::{
-            validate_share_subscription_binding, validate_subscription_reference_graph_transition,
-            CodexWorkspaceRebindError,
+            CodexWorkspaceRebindError, validate_share_subscription_binding,
+            validate_subscription_reference_graph_transition,
         };
 
         let share_id = share_id.as_str();
@@ -10040,7 +10139,7 @@ impl ServerStateInner {
             None => {
                 return Ok(Err(CodexWorkspaceRebindError::ShareNotFound(
                     share_id.to_string(),
-                )))
+                )));
             }
         };
         if current_share.config_revision != expected_config_revision {
@@ -10168,10 +10267,10 @@ impl ServerStateInner {
                 Err(crate::domain::sharing::shares::ShareUpdateError::NotFound) => {
                     return Ok(Err(CodexWorkspaceRebindError::ShareNotFound(
                         share_id.to_string(),
-                    )))
+                    )));
                 }
                 Err(crate::domain::sharing::shares::ShareUpdateError::MustBePaused) => {
-                    return Ok(Err(CodexWorkspaceRebindError::MustBePaused))
+                    return Ok(Err(CodexWorkspaceRebindError::MustBePaused));
                 }
                 Err(_) => return Ok(Err(CodexWorkspaceRebindError::AccountBindingMismatch)),
             }
@@ -11626,7 +11725,7 @@ impl ServerStateInner {
                                 live.auth_identity_generation == expected
                             }) && gemini_v1internal_project_id(&live).is_some() =>
                         {
-                            return Ok(())
+                            return Ok(());
                         }
                         Ok(Err(GeminiProjectCommitSkip::Stale(_))) => {
                             return Err(ManagedAccountRefreshError::Refresh {
@@ -11634,10 +11733,10 @@ impl ServerStateInner {
                                 message: "managed account changed during project discovery"
                                     .to_string(),
                                 retry_after_ms: None,
-                            })
+                            });
                         }
                         Ok(Err(GeminiProjectCommitSkip::NotFound)) => {
-                            return Err(ManagedAccountRefreshError::NotFound)
+                            return Err(ManagedAccountRefreshError::NotFound);
                         }
                         Err(error) => {
                             let retry_after_ms = QUOTA_FAILURE_COOLDOWN_MS;
@@ -13195,8 +13294,8 @@ impl ServerStateInner {
         #[cfg(test)] models_url_override: Option<&str>,
     ) -> crate::proxy::kimi_runtime::KimiModelCatalog {
         use crate::proxy::kimi_runtime::{
-            fetch_kimi_models, reviewed_fallback_catalog, unavailable_catalog,
-            KimiModelCatalogScope,
+            KimiModelCatalogScope, fetch_kimi_models, reviewed_fallback_catalog,
+            unavailable_catalog,
         };
 
         if self.credential_persistence_degraded()
@@ -13505,10 +13604,10 @@ impl ServerStateInner {
         request_timeout: Duration,
     ) -> Result<crate::proxy::qoder_runtime::PreparedQoderRuntime, QoderRuntimeError> {
         use crate::domain::qoder::{
-            machine_token_from_raw, QoderAccountProfile, QoderCosySession, QoderCredentialRail,
+            QoderAccountProfile, QoderCosySession, QoderCredentialRail, machine_token_from_raw,
         };
         use crate::proxy::qoder_runtime::{
-            parse_qoder_model_catalog, PreparedQoderRuntime, QoderCachedSession, QoderRuntimeScope,
+            PreparedQoderRuntime, QoderCachedSession, QoderRuntimeScope, parse_qoder_model_catalog,
         };
 
         if self.credential_persistence_degraded() {
@@ -13974,10 +14073,10 @@ impl ServerStateInner {
                 }
                 Err(error) => {
                     tracing::debug!(
-                    "failed to discover GitHub Copilot API endpoint for account {}: {}; falling back",
-                    account_id,
-                    error
-                );
+                        "failed to discover GitHub Copilot API endpoint for account {}: {}; falling back",
+                        account_id,
+                        error
+                    );
                     copilot_device::validate_copilot_api_endpoint(
                         &copilot_device::copilot_api_base(domain),
                         domain,
@@ -14088,7 +14187,7 @@ impl ServerStateInner {
     }
 
     pub async fn apply_share_settings_patch_immediate(
-        &self,
+        self: &Arc<Self>,
         share_id: &str,
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
@@ -14104,11 +14203,90 @@ impl ServerStateInner {
     }
 
     pub(crate) async fn apply_router_share_settings_patch_immediate(
-        &self,
+        self: &Arc<Self>,
         share_id: &str,
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
-        self.try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
+        let Some(support) = patch.support.clone() else {
+            return self
+                .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
+                    shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
+                })
+                .await;
+        };
+
+        let share = self.shares.read().await.get(share_id).cloned();
+        let Some(share) = share else {
+            return Ok(Err(SharePatchError::NotFound));
+        };
+        let providers = self.providers.read().await.clone();
+        let Some(bundle_id) = share_bundle_id(&providers, &share) else {
+            return self
+                .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
+                    shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
+                })
+                .await;
+        };
+
+        let enabled = enabled_apps_from_share_support(&support);
+        if enabled.is_empty() {
+            return Ok(Err(SharePatchError::Invalid(
+                "at least one bound app API must stay enabled".to_string(),
+            )));
+        }
+        let family_surfaces = providers
+            .providers
+            .iter()
+            .filter(|stored| provider_bundle_id(&stored.provider) == Some(bundle_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if family_surfaces.is_empty() {
+            return self
+                .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
+                    shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
+                })
+                .await;
+        }
+        let supported = family_surfaces
+            .iter()
+            .map(|stored| stored.app)
+            .collect::<BTreeSet<_>>();
+        if let Some(app) = enabled.iter().find(|app| !supported.contains(app)) {
+            return Ok(Err(SharePatchError::Invalid(format!(
+                "support contains unbound app {}",
+                app.as_str()
+            ))));
+        }
+
+        let missing_bindings = missing_family_share_bindings(&share, &family_surfaces);
+        if !missing_bindings.is_empty() && self.share_in_flight.has_in_flight(share_id) {
+            return Ok(Err(SharePatchError::Invalid("share is busy".to_string())));
+        }
+
+        if let Err(error) = self
+            .try_mutate_providers_immediate_if_changed({
+                let bundle_id = bundle_id.clone();
+                let enabled = enabled.clone();
+                move |store| apply_bundle_surface_support(store, &bundle_id, &enabled)
+            })
+            .await?
+        {
+            return Ok(Err(error));
+        }
+
+        let _binding_mutation = if missing_bindings.is_empty() {
+            None
+        } else {
+            match self.lock_share_binding_mutation(share_id).await {
+                Some(guard) => Some(guard),
+                None => return Ok(Err(SharePatchError::Invalid("share is busy".to_string()))),
+            }
+        };
+
+        self.try_mutate_share_quota_immediate(move |shares, usage, applied_at_ms| {
+            for binding in &missing_bindings {
+                shares.add_binding(share_id, binding.clone())?;
+            }
             shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
         })
         .await
@@ -18511,7 +18689,7 @@ mod tests {
 
     use crate::cli::Cli;
     use crate::clients::router::tunnel::TunnelRuntimeStatus;
-    use crate::domain::accounts::store::{accounts_path, Account};
+    use crate::domain::accounts::store::{Account, accounts_path};
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
@@ -18524,7 +18702,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use base64::Engine;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
@@ -19086,20 +19264,24 @@ mod tests {
 
         assert_eq!(router.batch_sizes.lock().await.as_slice(), &[1, 1]);
         assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 0);
-        assert!(state
-            .shares
-            .read()
-            .await
-            .get("erroronly0")
-            .unwrap()
-            .router_last_sync_error
-            .is_none());
-        assert!(ShareStore::load_or_default(&state.config_dir)
-            .unwrap()
-            .get("erroronly0")
-            .unwrap()
-            .router_last_sync_error
-            .is_none());
+        assert!(
+            state
+                .shares
+                .read()
+                .await
+                .get("erroronly0")
+                .unwrap()
+                .router_last_sync_error
+                .is_none()
+        );
+        assert!(
+            ShareStore::load_or_default(&state.config_dir)
+                .unwrap()
+                .get("erroronly0")
+                .unwrap()
+                .router_last_sync_error
+                .is_none()
+        );
         server.abort();
     }
 
@@ -19167,9 +19349,11 @@ mod tests {
         assert_eq!(cached.expires_at_ms, Some(now_ms + 120_000));
 
         let expiring = copilot_account_fixture(Some(now_ms + 59_000));
-        assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms)
-            .unwrap()
-            .is_none());
+        assert!(
+            cached_copilot_auth_from_account(&expiring, &domain, now_ms)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -19411,9 +19595,11 @@ mod tests {
                 ..
             })
         ));
-        assert!(!after
-            .capability_observations
-            .contains_key("github_copilot_code_plan:model_catalog"));
+        assert!(
+            !after
+                .capability_observations
+                .contains_key("github_copilot_code_plan:model_catalog")
+        );
         server.abort();
         drop(state);
         fs::remove_dir_all(config_dir).unwrap();
@@ -20375,10 +20561,12 @@ mod tests {
             if expected_failures < ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
                 assert!(failed.last_router_error.is_none());
             } else {
-                assert!(failed
-                    .last_router_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("temporarily unavailable")));
+                assert!(
+                    failed
+                        .last_router_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("temporarily unavailable"))
+                );
             }
             assert_eq!(consecutive_failures, expected_failures);
         }
@@ -20430,10 +20618,12 @@ mod tests {
 
         let shares = state.shares.read().await;
         assert!(!shares.router_registered);
-        assert!(shares
-            .last_router_error
-            .as_deref()
-            .is_some_and(|error| error.contains("404 Not Found")));
+        assert!(
+            shares
+                .last_router_error
+                .as_deref()
+                .is_some_and(|error| error.contains("404 Not Found"))
+        );
         assert_eq!(shares.last_router_heartbeat_ms, Some(123));
         assert_eq!(consecutive_failures, ROUTER_HEARTBEAT_SUSTAINED_FAILURES);
         server.abort();
@@ -20652,10 +20842,12 @@ mod tests {
         drop(share_syncs);
         let shares = state.shares.read().await;
         assert!(!shares.router_registered);
-        assert!(shares
-            .last_router_error
-            .as_deref()
-            .is_some_and(|error| error.contains("requires registration")));
+        assert!(
+            shares
+                .last_router_error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires registration"))
+        );
         server.abort();
     }
 
@@ -20994,14 +21186,18 @@ mod tests {
             SetupCompletionNotificationStatus::Pending
         );
         assert_eq!(notification.attempt_count, 1);
-        assert!(notification
-            .next_attempt_at_ms
-            .zip(notification.last_attempt_at_ms)
-            .is_some_and(|(next, last)| next.saturating_sub(last) >= 60 * 60 * 1_000));
-        assert!(notification
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("429")));
+        assert!(
+            notification
+                .next_attempt_at_ms
+                .zip(notification.last_attempt_at_ms)
+                .is_some_and(|(next, last)| next.saturating_sub(last) >= 60 * 60 * 1_000)
+        );
+        assert!(
+            notification
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("429"))
+        );
         let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
             &state.config_dir,
         ))
@@ -21056,10 +21252,12 @@ mod tests {
         );
         assert!(notification.password_hint.is_none());
         assert!(notification.next_attempt_at_ms.is_none());
-        assert!(notification
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("422")));
+        assert!(
+            notification
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("422"))
+        );
         let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
             &state.config_dir,
         ))
@@ -21760,14 +21958,16 @@ mod tests {
         assert!(error.to_string().contains("401 Unauthorized"));
         assert!(!crate::client_tunnel_provision::is_router_unreachable_error(&error));
         assert_eq!(requests.lock().await.len(), 1);
-        assert!(state
-            .config_snapshot()
-            .await
-            .router
-            .identity
-            .unwrap()
-            .installation_id
-            .is_empty());
+        assert!(
+            state
+                .config_snapshot()
+                .await
+                .router
+                .identity
+                .unwrap()
+                .installation_id
+                .is_empty()
+        );
         server.abort();
     }
 
@@ -21837,16 +22037,20 @@ mod tests {
         );
 
         assert_eq!(router.prune_requests.load(AtomicOrdering::SeqCst), 2);
-        assert!(state
-            .shares
-            .read()
-            .await
-            .router_share_prune_marker
-            .is_none());
-        assert!(ShareStore::load_or_default(&state.config_dir)
-            .unwrap()
-            .router_share_prune_marker
-            .is_none());
+        assert!(
+            state
+                .shares
+                .read()
+                .await
+                .router_share_prune_marker
+                .is_none()
+        );
+        assert!(
+            ShareStore::load_or_default(&state.config_dir)
+                .unwrap()
+                .router_share_prune_marker
+                .is_none()
+        );
         assert!(router.remote_share_ids.lock().await.contains("ghost-share"));
         server.abort();
     }
@@ -21872,11 +22076,13 @@ mod tests {
             vec!["localshare0".to_string()]
         );
         assert_eq!(first_router.prune_requests.load(AtomicOrdering::SeqCst), 1);
-        assert!(state
-            .shares
-            .read()
-            .await
-            .router_share_prune_applied_for(&first_url, "inst-prune-target"));
+        assert!(
+            state
+                .shares
+                .read()
+                .await
+                .router_share_prune_applied_for(&first_url, "inst-prune-target")
+        );
 
         reconcile_all_shares_to_router(state.clone()).await.unwrap();
         assert_eq!(
@@ -21945,11 +22151,13 @@ mod tests {
             ]
         );
         assert_eq!(router.remote_share_ids.lock().await.len(), share_count);
-        assert!(state
-            .shares
-            .read()
-            .await
-            .router_share_prune_applied_for(&router_url, "inst-prune-chunks"));
+        assert!(
+            state
+                .shares
+                .read()
+                .await
+                .router_share_prune_applied_for(&router_url, "inst-prune-chunks")
+        );
         server.abort();
     }
 
@@ -21989,11 +22197,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["retryshare0".to_string(), "retryshare1".to_string()]
         );
-        assert!(state
-            .shares
-            .read()
-            .await
-            .router_share_prune_applied_for(&router_url, "inst-prune-retry"));
+        assert!(
+            state
+                .shares
+                .read()
+                .await
+                .router_share_prune_applied_for(&router_url, "inst-prune-retry")
+        );
 
         run_periodic_share_sync_retry_once(&state).await;
         assert_eq!(router.prune_requests.load(AtomicOrdering::SeqCst), 2);
@@ -22073,16 +22283,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(restarted
-            .shares
-            .read()
-            .await
-            .pending_router_deletes
-            .is_empty());
-        assert!(ShareStore::load_or_default(&config_dir)
-            .unwrap()
-            .pending_router_deletes
-            .is_empty());
+        assert!(
+            restarted
+                .shares
+                .read()
+                .await
+                .pending_router_deletes
+                .is_empty()
+        );
+        assert!(
+            ShareStore::load_or_default(&config_dir)
+                .unwrap()
+                .pending_router_deletes
+                .is_empty()
+        );
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
         server.abort();
     }
@@ -22202,10 +22416,12 @@ mod tests {
             }
         );
         assert!(state.shares.read().await.get("conditionaldelete").is_some());
-        assert!(ShareStore::load_or_default(&config_dir)
-            .unwrap()
-            .get("conditionaldelete")
-            .is_some());
+        assert!(
+            ShareStore::load_or_default(&config_dir)
+                .unwrap()
+                .get("conditionaldelete")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -22257,10 +22473,12 @@ mod tests {
                 3
             ]
         );
-        assert!(requests
-            .iter()
-            .flat_map(|request| request["ops"].as_array().unwrap())
-            .all(|operation| operation["kind"] == "delete"));
+        assert!(
+            requests
+                .iter()
+                .flat_map(|request| request["ops"].as_array().unwrap())
+                .all(|operation| operation["kind"] == "delete")
+        );
         assert!(state.shares.read().await.pending_router_deletes.is_empty());
         server.abort();
     }
@@ -22715,13 +22933,15 @@ mod tests {
         );
         let base_descriptor =
             descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
-        assert!(base_descriptor
-            .app_runtimes
-            .codex
-            .as_ref()
-            .unwrap()
-            .quota
-            .is_none());
+        assert!(
+            base_descriptor
+                .app_runtimes
+                .codex
+                .as_ref()
+                .unwrap()
+                .quota
+                .is_none()
+        );
 
         let initial_ops = build_router_share_upsert_ops_with_policy(
             &state,
@@ -22869,15 +23089,17 @@ mod tests {
         assert_eq!(failed.usage.state, OllamaCloudSectionState::Error);
         assert!(failed.account.data.is_none());
         assert!(failed.usage.data.is_none());
-        assert!(state
-            .fresh_ollama_cloud_sections(
-                &OllamaCloudCacheKey {
-                    credential_source_key: key,
-                    credential_generation: failed.credential_generation,
-                },
-                now_ms_i64(),
-            )
-            .is_none());
+        assert!(
+            state
+                .fresh_ollama_cloud_sections(
+                    &OllamaCloudCacheKey {
+                        credential_source_key: key,
+                        credential_generation: failed.credential_generation,
+                    },
+                    now_ms_i64(),
+                )
+                .is_none()
+        );
         server.abort();
     }
 
@@ -22925,9 +23147,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(state
-            .fresh_ollama_cloud_sections(&old_cache_key, now_ms_i64())
-            .is_none());
+        assert!(
+            state
+                .fresh_ollama_cloud_sections(&old_cache_key, now_ms_i64())
+                .is_none()
+        );
         assert!(matches!(
             state.ollama_cloud_snapshot(codex_key, false).await.unwrap(),
             Err(ProviderCommandError::NotFound)
@@ -23337,21 +23561,25 @@ mod tests {
             .unwrap();
         assert_eq!(preview.revision, 1);
 
-        assert!(state
-            .delete_provider_bundle_command("historical-collision".to_string(), 1)
-            .await
-            .unwrap()
-            .unwrap());
+        assert!(
+            state
+                .delete_provider_bundle_command("historical-collision".to_string(), 1)
+                .await
+                .unwrap()
+                .unwrap()
+        );
         let remaining = state.providers_snapshot().await;
         assert_eq!(remaining.providers.len(), 1);
         assert_eq!(remaining.providers[0].app, AppKind::Gemini);
         assert_eq!(remaining.providers[0].resource.revision, 7);
 
-        assert!(state
-            .delete_provider_command(AppKind::Gemini, "historical-collision".to_string(), 7)
-            .await
-            .unwrap()
-            .unwrap());
+        assert!(
+            state
+                .delete_provider_command(AppKind::Gemini, "historical-collision".to_string(), 7)
+                .await
+                .unwrap()
+                .unwrap()
+        );
         assert!(state.providers_snapshot().await.providers.is_empty());
     }
 
@@ -23486,13 +23714,15 @@ mod tests {
         let existing = stored_provider_with_user_agent("codex.openai_api_key", "legacy-agent/1");
         let mut carried = existing.clone();
         normalize_provider_outbound_identity(&mut carried, Some(&existing), profile).unwrap();
-        assert!(carried
-            .provider
-            .meta
-            .as_ref()
-            .unwrap()
-            .custom_user_agent
-            .is_none());
+        assert!(
+            carried
+                .provider
+                .meta
+                .as_ref()
+                .unwrap()
+                .custom_user_agent
+                .is_none()
+        );
     }
 
     #[test]
@@ -23674,11 +23904,13 @@ mod tests {
             .unwrap()
             .health_fingerprint();
         let original = healthy_provider_observation(&created, &original_fingerprint, 1_000);
-        assert!(state
-            .record_provider_health_observation(original.clone())
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            state
+                .record_provider_health_observation(original.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let updated = state
             .upsert_provider_command(
@@ -23696,20 +23928,24 @@ mod tests {
 
         let mut stale_revision = original;
         stale_revision.checked_at_ms = 2_000;
-        assert!(state
-            .record_provider_health_observation(stale_revision)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            state
+                .record_provider_health_observation(stale_revision)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let mut stale_fingerprint =
             healthy_provider_observation(&updated, "stale-runtime-fingerprint", 3_000);
         stale_fingerprint.provider_revision = updated.resource.revision;
-        assert!(state
-            .record_provider_health_observation(stale_fingerprint)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            state
+                .record_provider_health_observation(stale_fingerprint)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let snapshot = state
             .usage_snapshot()
@@ -24080,21 +24316,25 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(state
-            .delete_provider_command(
-                AppKind::Codex,
-                created.provider.id.clone(),
-                created.resource.revision,
-            )
-            .await
-            .unwrap()
-            .unwrap());
-        assert!(state
-            .usage_snapshot()
-            .await
-            .provider_health
-            .get(AppKind::Codex, &created.provider.id)
-            .is_none());
+        assert!(
+            state
+                .delete_provider_command(
+                    AppKind::Codex,
+                    created.provider.id.clone(),
+                    created.resource.revision,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(
+            state
+                .usage_snapshot()
+                .await
+                .provider_health
+                .get(AppKind::Codex, &created.provider.id)
+                .is_none()
+        );
         assert!(
             crate::domain::health::ProviderHealthStore::load_or_default(&state.config_dir)
                 .unwrap()
@@ -24315,10 +24555,12 @@ mod tests {
             stored.app == AppKind::Codex && stored.provider.id == "provider-cancelled-caller"
         }));
         let on_disk = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
-        assert!(on_disk
-            .providers
-            .iter()
-            .any(|stored| stored.provider.id == "provider-cancelled-caller"));
+        assert!(
+            on_disk
+                .providers
+                .iter()
+                .any(|stored| stored.provider.id == "provider-cancelled-caller")
+        );
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -24436,11 +24678,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(provider_account_id(&stored), Some("provider-selection-a"));
-        assert!(state
-            .accounts_snapshot()
-            .await
-            .active_codex_oauth_account_id
-            .is_none());
+        assert!(
+            state
+                .accounts_snapshot()
+                .await
+                .active_codex_oauth_account_id
+                .is_none()
+        );
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -24703,11 +24947,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(stored
-            .provider
-            .meta
-            .as_ref()
-            .is_none_or(|meta| meta.auth_binding.is_none()));
+        assert!(
+            stored
+                .provider
+                .meta
+                .as_ref()
+                .is_none_or(|meta| meta.auth_binding.is_none())
+        );
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -25473,9 +25719,11 @@ mod tests {
             )
             .unwrap();
         assert!(pending_path.exists());
-        assert!(!fs::read_to_string(&pending_path)
-            .unwrap()
-            .contains("restart-refresh-rotated"));
+        assert!(
+            !fs::read_to_string(&pending_path)
+                .unwrap()
+                .contains("restart-refresh-rotated")
+        );
 
         drop(state);
         let restarted = test_state_at(config_dir.clone());
@@ -25922,10 +26170,12 @@ mod tests {
             .unwrap();
         assert!(account.needs_relogin);
         assert_eq!(account.token_refresh_generation, 1);
-        assert!(account
-            .last_refresh_error
-            .as_deref()
-            .is_some_and(|error| error.contains("outcome is unknown")));
+        assert!(
+            account
+                .last_refresh_error
+                .as_deref()
+                .is_some_and(|error| error.contains("outcome is unknown"))
+        );
 
         let persisted = AccountStore::load_or_default(&config_dir).unwrap();
         assert!(
@@ -26716,24 +26966,30 @@ mod tests {
                 .unwrap();
         });
 
-        assert!(tokio::time::timeout(Duration::from_millis(25), &mut commit)
-            .await
-            .is_err());
-        assert!(state
-            .providers_snapshot()
-            .await
-            .providers
-            .iter()
-            .all(|stored| stored.provider.id != "provider-reference-guard"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut commit)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .providers_snapshot()
+                .await
+                .providers
+                .iter()
+                .all(|stored| stored.provider.id != "provider-reference-guard")
+        );
 
         drop(reference_guard);
         commit.await.unwrap();
-        assert!(state
-            .providers_snapshot()
-            .await
-            .providers
-            .iter()
-            .any(|stored| stored.provider.id == "provider-reference-guard"));
+        assert!(
+            state
+                .providers_snapshot()
+                .await
+                .providers
+                .iter()
+                .any(|stored| stored.provider.id == "provider-reference-guard")
+        );
     }
 
     #[tokio::test]
@@ -26779,10 +27035,12 @@ mod tests {
 
         let snapshot = state.providers_snapshot().await;
         for provider_id in ["provider-concurrent-a", "provider-concurrent-b"] {
-            assert!(snapshot
-                .providers
-                .iter()
-                .any(|stored| stored.provider.id == provider_id));
+            assert!(
+                snapshot
+                    .providers
+                    .iter()
+                    .any(|stored| stored.provider.id == provider_id)
+            );
         }
         let on_disk = ProviderStore::load_runtime_or_default(&state.config_dir).unwrap();
         assert_eq!(
@@ -27118,10 +27376,12 @@ mod tests {
         assert!(!codex_workspace_rebind_transaction_path(&config_dir).exists());
         assert!(!codex_workspace_rebind_stage_path(&config_dir).exists());
         let persisted = AccountStore::load_or_default(&config_dir).unwrap();
-        assert!(persisted
-            .accounts
-            .iter()
-            .any(|account| account.id == "pending-transaction-account"));
+        assert!(
+            persisted
+                .accounts
+                .iter()
+                .any(|account| account.id == "pending-transaction-account")
+        );
 
         drop(state);
         fs::remove_dir_all(config_dir).unwrap();
@@ -27549,16 +27809,20 @@ mod tests {
                 .unwrap(),
             Some(binding)
         );
-        assert!(restored
-            .grok_media_task_binding("share-b", Some("owner@example.com"), "video-1")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(restored
-            .grok_media_task_binding("share-a", Some("other@example.com"), "video-1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            restored
+                .grok_media_task_binding("share-b", Some("owner@example.com"), "video-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restored
+                .grok_media_task_binding("share-a", Some("other@example.com"), "video-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -27734,9 +27998,11 @@ mod tests {
         let diagnostic = failed.last_refresh_error.as_deref().unwrap();
         assert!(!diagnostic.contains("new-refresh"));
         assert!(diagnostic.contains("[REDACTED]"));
-        assert!(!fs::read_to_string(accounts_path(&state.config_dir))
-            .unwrap()
-            .contains("new-refresh"));
+        assert!(
+            !fs::read_to_string(accounts_path(&state.config_dir))
+                .unwrap()
+                .contains("new-refresh")
+        );
     }
 
     #[tokio::test]
@@ -27987,12 +28253,14 @@ mod tests {
             .await;
 
         assert!(result.is_none());
-        assert!(state
-            .find_account_by_id(&stale.id)
-            .await
-            .unwrap()
-            .rate_limited_until
-            .is_none());
+        assert!(
+            state
+                .find_account_by_id(&stale.id)
+                .await
+                .unwrap()
+                .rate_limited_until
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -28067,37 +28335,43 @@ mod tests {
             .unwrap();
         assert!(relogged.auth_identity_generation > stale.auth_identity_generation);
 
-        assert!(state
-            .mark_account_rate_limited_until_if_current(
-                &stale.id,
-                stale.provider_type,
-                stale.auth_identity_generation,
-                i64::MAX / 2,
-                Some("stale 429".to_string()),
-            )
-            .await
-            .is_none());
-        assert!(state
-            .update_account_entitlement_snapshot_if_current(
-                &stale.id,
-                stale.provider_type,
-                stale.auth_identity_generation,
-                Some("stale-tier".to_string()),
-                Some("stale-entitlement".to_string()),
-                123,
-            )
-            .await
-            .is_none());
-        assert!(!state
-            .record_grok_capability_evidence_if_current(
-                &stale.id,
-                stale.provider_type,
-                stale.auth_identity_generation,
-                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
-                "stale_response",
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .mark_account_rate_limited_until_if_current(
+                    &stale.id,
+                    stale.provider_type,
+                    stale.auth_identity_generation,
+                    i64::MAX / 2,
+                    Some("stale 429".to_string()),
+                )
+                .await
+                .is_none()
+        );
+        assert!(
+            state
+                .update_account_entitlement_snapshot_if_current(
+                    &stale.id,
+                    stale.provider_type,
+                    stale.auth_identity_generation,
+                    Some("stale-tier".to_string()),
+                    Some("stale-entitlement".to_string()),
+                    123,
+                )
+                .await
+                .is_none()
+        );
+        assert!(
+            !state
+                .record_grok_capability_evidence_if_current(
+                    &stale.id,
+                    stale.provider_type,
+                    stale.auth_identity_generation,
+                    crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+                    "stale_response",
+                )
+                .await
+                .unwrap()
+        );
         assert!(!state
             .record_grok_capability_observation_if_current(
                 &stale.id,
@@ -28126,37 +28400,43 @@ mod tests {
         );
 
         let cooldown_until = i64::MAX / 2;
-        assert!(state
-            .mark_account_rate_limited_until_if_current(
-                &relogged.id,
-                relogged.provider_type,
-                relogged.auth_identity_generation,
-                cooldown_until,
-                Some("current 429".to_string()),
-            )
-            .await
-            .is_some());
-        assert!(state
-            .update_account_entitlement_snapshot_if_current(
-                &relogged.id,
-                relogged.provider_type,
-                relogged.auth_identity_generation,
-                Some("current-tier".to_string()),
-                Some("current-entitlement".to_string()),
-                456,
-            )
-            .await
-            .is_some());
-        assert!(state
-            .record_grok_capability_evidence_if_current(
-                &relogged.id,
-                relogged.provider_type,
-                relogged.auth_identity_generation,
-                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
-                "current_response",
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .mark_account_rate_limited_until_if_current(
+                    &relogged.id,
+                    relogged.provider_type,
+                    relogged.auth_identity_generation,
+                    cooldown_until,
+                    Some("current 429".to_string()),
+                )
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .update_account_entitlement_snapshot_if_current(
+                    &relogged.id,
+                    relogged.provider_type,
+                    relogged.auth_identity_generation,
+                    Some("current-tier".to_string()),
+                    Some("current-entitlement".to_string()),
+                    456,
+                )
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .record_grok_capability_evidence_if_current(
+                    &relogged.id,
+                    relogged.provider_type,
+                    relogged.auth_identity_generation,
+                    crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+                    "current_response",
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -28179,46 +28459,52 @@ mod tests {
         let unsupported =
             crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported;
 
-        assert!(state
-            .record_grok_capability_observation_if_current(
-                &account.id,
-                capability,
-                CurrentAccountCapabilityObservation {
-                    provider_type: account.provider_type,
-                    auth_identity_generation: account.auth_identity_generation,
-                    state: unsupported,
-                    source: "media_response",
-                    reason: Some("endpoint_not_supported"),
-                    expires_at_ms: None,
-                },
-            )
-            .await
-            .unwrap());
-        assert!(!state
-            .record_grok_capability_observation_if_current(
-                &account.id,
-                capability,
-                CurrentAccountCapabilityObservation {
-                    provider_type: account.provider_type,
-                    auth_identity_generation: account.auth_identity_generation,
-                    state: unsupported,
-                    source: "media_response",
-                    reason: Some("endpoint_not_supported"),
-                    expires_at_ms: None,
-                },
-            )
-            .await
-            .unwrap());
-        assert!(state
-            .record_grok_capability_evidence_if_current(
-                &account.id,
-                account.provider_type,
-                account.auth_identity_generation,
-                capability,
-                "upstream_success",
-            )
-            .await
-            .unwrap());
+        assert!(
+            state
+                .record_grok_capability_observation_if_current(
+                    &account.id,
+                    capability,
+                    CurrentAccountCapabilityObservation {
+                        provider_type: account.provider_type,
+                        auth_identity_generation: account.auth_identity_generation,
+                        state: unsupported,
+                        source: "media_response",
+                        reason: Some("endpoint_not_supported"),
+                        expires_at_ms: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .record_grok_capability_observation_if_current(
+                    &account.id,
+                    capability,
+                    CurrentAccountCapabilityObservation {
+                        provider_type: account.provider_type,
+                        auth_identity_generation: account.auth_identity_generation,
+                        state: unsupported,
+                        source: "media_response",
+                        reason: Some("endpoint_not_supported"),
+                        expires_at_ms: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .record_grok_capability_evidence_if_current(
+                    &account.id,
+                    account.provider_type,
+                    account.auth_identity_generation,
+                    capability,
+                    "upstream_success",
+                )
+                .await
+                .unwrap()
+        );
 
         let current = state.find_account_by_id(&account.id).await.unwrap();
         let observation = current
@@ -28671,9 +28957,11 @@ mod tests {
         ));
 
         drop(alice);
-        assert!(tracker
-            .try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(1))
-            .is_ok());
+        assert!(
+            tracker
+                .try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(1))
+                .is_ok()
+        );
         drop(bob);
     }
 
@@ -28743,15 +29031,17 @@ mod tests {
         );
 
         drop(guard);
-        assert!(state
-            .validate_and_acquire_share_invocation(
-                &share.id,
-                AppKind::Codex,
-                Some("owner@example.com"),
-                crate::infra::time::now_ms() as i64,
-            )
-            .await
-            .is_ok());
+        assert!(
+            state
+                .validate_and_acquire_share_invocation(
+                    &share.id,
+                    AppKind::Codex,
+                    Some("owner@example.com"),
+                    crate::infra::time::now_ms() as i64,
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -28798,21 +29088,25 @@ mod tests {
             Some(&1)
         );
         drop(other_account_guard);
-        assert!(!tracker
-            .counts
-            .lock()
-            .unwrap()
-            .by_provider_type
-            .contains_key(ProviderType::ClaudeOAuth.as_str()));
+        assert!(
+            !tracker
+                .counts
+                .lock()
+                .unwrap()
+                .by_provider_type
+                .contains_key(ProviderType::ClaudeOAuth.as_str())
+        );
         assert_eq!(
             tracker
                 .snapshot()
                 .current(ProviderType::ClaudeOAuth, "acct-1"),
             0
         );
-        assert!(tracker
-            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
-            .is_ok());
+        assert!(
+            tracker
+                .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -29088,9 +29382,11 @@ mod tests {
             &includes,
         )
         .unwrap_err();
-        assert!(share_error
-            .to_string()
-            .contains("backup Share adoption-full"));
+        assert!(
+            share_error
+                .to_string()
+                .contains("backup Share adoption-full")
+        );
 
         stale_shares.save(&restore_stage).unwrap();
         validate_client_subdomain_adoption_restore_stage(
@@ -29118,10 +29414,12 @@ mod tests {
             .await
             .unwrap();
         let stale_prepared = state.config_snapshot().await;
-        assert!(state
-            .abort_client_subdomain_adoption("takeover-abort")
-            .await
-            .unwrap());
+        assert!(
+            state
+                .abort_client_subdomain_adoption("takeover-abort")
+                .await
+                .unwrap()
+        );
         let config = state.config_snapshot().await;
         assert_eq!(config.client.tunnel_subdomain.as_deref(), Some("targeta"));
         assert!(config.client.subdomain_adoption.is_none());
@@ -29196,18 +29494,26 @@ mod tests {
                 reason: "model_capacity".to_string(),
             })
         );
-        assert!(tracker
-            .get("share-b", "runtime-a", "gpt-5.4", 1_500)
-            .is_none());
-        assert!(tracker
-            .get("share-a", "runtime-b", "gpt-5.4", 1_500)
-            .is_none());
-        assert!(tracker
-            .get("share-a", "runtime-a", "gpt-5.3", 1_500)
-            .is_none());
-        assert!(tracker
-            .get("share-a", "runtime-a", "gpt-5.4", 2_000)
-            .is_none());
+        assert!(
+            tracker
+                .get("share-b", "runtime-a", "gpt-5.4", 1_500)
+                .is_none()
+        );
+        assert!(
+            tracker
+                .get("share-a", "runtime-b", "gpt-5.4", 1_500)
+                .is_none()
+        );
+        assert!(
+            tracker
+                .get("share-a", "runtime-a", "gpt-5.3", 1_500)
+                .is_none()
+        );
+        assert!(
+            tracker
+                .get("share-a", "runtime-a", "gpt-5.4", 2_000)
+                .is_none()
+        );
 
         for index in 0..=MAX_SHARE_MODEL_COOLDOWNS {
             tracker.mark(

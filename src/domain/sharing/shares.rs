@@ -6,7 +6,7 @@ use anyhow::Context;
 use chrono::{Datelike, TimeZone, Utc, Weekday};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::AccountStore;
@@ -14,10 +14,10 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::router::{ClientSubdomain, ShareSlug};
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareAnchoredUsageBucket, ShareAppAccess,
-    ShareAppSettings, ShareGrantManager, ShareManagedGrantAction, ShareManagedGrantOperation,
-    ShareSettingsPatch, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy, ShareUserUsage,
-    ShareUserUsageBucket,
+    ShareAnchoredUsageBucket, ShareAppAccess, ShareAppSettings, ShareGrantManager,
+    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareTokenPeriod,
+    ShareUserGrant, ShareUserPolicy, ShareUserUsage, ShareUserUsageBucket,
+    descriptor_for_share_with_accounts_and_usage,
 };
 use crate::domain::sharing::token_period::{token_period_window, validate_user_policy};
 use crate::domain::usage::store::UsageStore;
@@ -3549,7 +3549,7 @@ fn normalize_projected_share_policy_patch(
     bound_apps: &BTreeSet<AppKind>,
 ) -> Result<(), SharePatchError> {
     if let Some(access_by_app) = patch.access_by_app.take() {
-        ensure_projected_apps_are_bound(&access_by_app, bound_apps, "accessByApp")?;
+        ensure_projected_apps_are_supported(&access_by_app, bound_apps, "accessByApp")?;
         let normalized = normalize_access_by_app(access_by_app, owner_email);
         let access = one_projected_value(normalized.values(), "accessByApp")?;
         if let Some(access) = access {
@@ -3574,7 +3574,7 @@ fn normalize_projected_share_policy_patch(
     }
 
     if let Some(app_settings) = patch.app_settings.take() {
-        ensure_projected_apps_are_bound(&app_settings, bound_apps, "appSettings")?;
+        ensure_projected_apps_are_supported(&app_settings, bound_apps, "appSettings")?;
         let normalized = normalize_app_settings(app_settings, owner_email);
         let settings = one_projected_value(normalized.values(), "appSettings")?;
         if let Some(settings) = settings {
@@ -3619,7 +3619,11 @@ fn normalize_projected_share_policy_patch(
     }
 
     if let Some(pricing) = patch.for_sale_official_price_percent_by_app.take() {
-        ensure_projected_apps_are_bound(&pricing, bound_apps, "forSaleOfficialPricePercentByApp")?;
+        ensure_projected_apps_are_supported(
+            &pricing,
+            bound_apps,
+            "forSaleOfficialPricePercentByApp",
+        )?;
         if pricing.values().any(|percent| !(1..=100).contains(percent)) {
             return Err(SharePatchError::Invalid(
                 "share official price percent must be between 1 and 100".to_string(),
@@ -3639,7 +3643,7 @@ fn normalize_projected_share_policy_patch(
     Ok(())
 }
 
-fn ensure_projected_apps_are_bound<T>(
+fn ensure_projected_apps_are_supported<T>(
     values: &BTreeMap<AppKind, T>,
     bound_apps: &BTreeSet<AppKind>,
     field: &str,
@@ -3735,10 +3739,12 @@ mod tests {
         assert_eq!(grant.manager, ShareGrantManager::RouterShareMarket);
         assert_eq!(grant.entitlement_id.as_deref(), Some("entitlement-1"));
         assert_eq!(grant.policy.token_limit, Some(10_000));
-        assert!(updated
-            .acl
-            .shared_with_emails
-            .contains(&"renter@example.com".to_string()));
+        assert!(
+            updated
+                .acl
+                .shared_with_emails
+                .contains(&"renter@example.com".to_string())
+        );
 
         let persisted = serde_json::to_string(&store).unwrap();
         let mut store: ShareStore = serde_json::from_str(&persisted).unwrap();
@@ -3763,10 +3769,12 @@ mod tests {
             )
             .unwrap();
         assert!(acl_edit.user_grants["renter@example.com"].active);
-        assert!(acl_edit
-            .acl
-            .shared_with_emails
-            .contains(&"renter@example.com".to_string()));
+        assert!(
+            acl_edit
+                .acl
+                .shared_with_emails
+                .contains(&"renter@example.com".to_string())
+        );
 
         let mut reused = operation;
         reused.action = ShareManagedGrantAction::Revoke;
@@ -3781,9 +3789,11 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("reused with a different payload"));
+        assert!(
+            error
+                .to_string()
+                .contains("reused with a different payload")
+        );
 
         let mut ordinary_grants = repeated.user_grants.clone();
         ordinary_grants
@@ -3849,9 +3859,11 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("reused with a different payload"));
+        assert!(
+            error
+                .to_string()
+                .contains("reused with a different payload")
+        );
         let second = store.get("managed-second").unwrap();
         assert_eq!(second.config_revision, 1);
         assert!(!second.user_grants.contains_key("renter@example.com"));
@@ -3920,10 +3932,12 @@ mod tests {
             .unwrap();
         let grant = revoked.user_grants.get("renter@example.com").unwrap();
         assert!(!grant.active);
-        assert!(!revoked
-            .acl
-            .shared_with_emails
-            .contains(&"renter@example.com".to_string()));
+        assert!(
+            !revoked
+                .acl
+                .shared_with_emails
+                .contains(&"renter@example.com".to_string())
+        );
 
         let ordinary = store
             .apply_settings_patch(
@@ -3952,10 +3966,12 @@ mod tests {
             )
             .unwrap();
         assert!(!acl_attempt.user_grants["renter@example.com"].active);
-        assert!(!acl_attempt
-            .acl
-            .shared_with_emails
-            .contains(&"renter@example.com".to_string()));
+        assert!(
+            !acl_attempt
+                .acl
+                .shared_with_emails
+                .contains(&"renter@example.com".to_string())
+        );
 
         let mut reactivated = acl_attempt.user_grants.clone();
         reactivated.get_mut("renter@example.com").unwrap().active = true;
@@ -4184,15 +4200,31 @@ mod tests {
             " https://router.example.test/api/// ",
             " installation-a "
         ));
-        assert!(store
-            .router_share_prune_applied_for("https://router.example.test/api", "installation-a"));
-        assert!(!store
-            .mark_router_share_prune_applied("https://router.example.test/api/", "installation-a"));
+        assert!(
+            store.router_share_prune_applied_for(
+                "https://router.example.test/api",
+                "installation-a"
+            )
+        );
+        assert!(
+            !store.mark_router_share_prune_applied(
+                "https://router.example.test/api/",
+                "installation-a"
+            )
+        );
 
-        assert!(!store
-            .router_share_prune_applied_for("https://router.example.test/api", "installation-b"));
-        assert!(store
-            .mark_router_share_prune_applied("https://router.example.test/api", "installation-b"));
+        assert!(
+            !store.router_share_prune_applied_for(
+                "https://router.example.test/api",
+                "installation-b"
+            )
+        );
+        assert!(
+            store.mark_router_share_prune_applied(
+                "https://router.example.test/api",
+                "installation-b"
+            )
+        );
     }
 
     #[test]
@@ -4200,9 +4232,11 @@ mod tests {
         let mut store = ShareStore::default();
         store.upsert(codex_share_input("share-recreated")).unwrap();
         let tombstone = store.delete("share-recreated").unwrap();
-        assert!(store
-            .pending_router_delete("share-recreated", &tombstone.operation_id)
-            .is_some());
+        assert!(
+            store
+                .pending_router_delete("share-recreated", &tombstone.operation_id)
+                .is_some()
+        );
 
         let recreated = store.upsert(codex_share_input("share-recreated")).unwrap();
 
@@ -4736,9 +4770,16 @@ mod tests {
                 .tokens_for(ShareTokenPeriod::Lifetime, now),
             0
         );
-        assert!(store
-            .validate_for_invocation("user-quota", AppKind::Codex, Some("alice@example.com"), now,)
-            .is_ok());
+        assert!(
+            store
+                .validate_for_invocation(
+                    "user-quota",
+                    AppKind::Codex,
+                    Some("alice@example.com"),
+                    now,
+                )
+                .is_ok()
+        );
 
         store.record_user_invocation_result("user-quota", Some("bob@example.com"), 95, now);
         store.record_user_invocation_result("user-quota", Some("alice@example.com"), 5, now);
@@ -4769,14 +4810,16 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(rejection.reason, ShareRejectReason::Unauthorized);
-        assert!(store
-            .validate_for_invocation(
-                "private-acl",
-                AppKind::Codex,
-                Some("ALLOWED@EXAMPLE.COM"),
-                now,
-            )
-            .is_ok());
+        assert!(
+            store
+                .validate_for_invocation(
+                    "private-acl",
+                    AppKind::Codex,
+                    Some("ALLOWED@EXAMPLE.COM"),
+                    now,
+                )
+                .is_ok()
+        );
         let missing_identity = store
             .validate_for_invocation("private-acl", AppKind::Codex, None, now)
             .unwrap_err();
@@ -4790,9 +4833,16 @@ mod tests {
         free_input.for_sale = Some(false);
         free_input.free_access = Some(true);
         store.upsert(free_input).unwrap();
-        assert!(store
-            .validate_for_invocation("free-acl", AppKind::Codex, Some("anyone@example.com"), now,)
-            .is_ok());
+        assert!(
+            store
+                .validate_for_invocation(
+                    "free-acl",
+                    AppKind::Codex,
+                    Some("anyone@example.com"),
+                    now,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -5276,14 +5326,16 @@ mod tests {
         assert_eq!(updated.token_limit, Some(42));
         assert_eq!(updated.parallel_limit, Some(3));
         assert_eq!(updated.official_price_percent, Some(80));
-        assert!(store
-            .validate_for_invocation(
-                "multi-app",
-                AppKind::Claude,
-                Some("user@example.com"),
-                1_000,
-            )
-            .is_ok());
+        assert!(
+            store
+                .validate_for_invocation(
+                    "multi-app",
+                    AppKind::Claude,
+                    Some("user@example.com"),
+                    1_000,
+                )
+                .is_ok()
+        );
         let rejection = store
             .validate_for_invocation("multi-app", AppKind::Gemini, None, 1_000)
             .unwrap_err();
@@ -5296,10 +5348,12 @@ mod tests {
         assert_eq!(retained.provider_id, "claude-provider");
         assert_eq!(retained.bindings.len(), 1);
         assert_eq!(store.shares.len(), 1);
-        assert!(!retained
-            .bindings
-            .iter()
-            .any(|binding| binding.app == AppKind::Codex));
+        assert!(
+            !retained
+                .bindings
+                .iter()
+                .any(|binding| binding.app == AppKind::Codex)
+        );
     }
 
     #[test]
@@ -6018,23 +6072,29 @@ mod tests {
         assert_eq!(updated.len(), 1);
         let share = store.get("owner-bind").unwrap();
         assert_eq!(share.owner_email.as_deref(), Some("client@example.com"));
-        assert!(share
-            .acl
-            .shared_with_emails
-            .iter()
-            .any(|email| email == "previous@example.com"));
+        assert!(
+            share
+                .acl
+                .shared_with_emails
+                .iter()
+                .any(|email| email == "previous@example.com")
+        );
         let descriptor = crate::domain::sharing::router_contract::descriptor_for_share(
             share,
             &ProviderStore::default(),
         );
-        assert!(descriptor.access_by_app[&AppKind::Codex]
-            .shared_with_emails
-            .iter()
-            .any(|email| email == "previous@example.com"));
-        assert!(descriptor.app_settings[&AppKind::Codex]
-            .shared_with_emails
-            .iter()
-            .any(|email| email == "previous@example.com"));
+        assert!(
+            descriptor.access_by_app[&AppKind::Codex]
+                .shared_with_emails
+                .iter()
+                .any(|email| email == "previous@example.com")
+        );
+        assert!(
+            descriptor.app_settings[&AppKind::Codex]
+                .shared_with_emails
+                .iter()
+                .any(|email| email == "previous@example.com")
+        );
         assert_eq!(
             share
                 .user_grants
@@ -6048,10 +6108,12 @@ mod tests {
         assert_eq!(previous_owner.role, "shareto");
         assert!(previous_owner.active);
         let revision = share.config_revision;
-        assert!(store
-            .bind_all_to_client_owner("client@example.com")
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .bind_all_to_client_owner("client@example.com")
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.migrate_user_grants_from_acl().is_empty());
         assert_eq!(store.get("owner-bind").unwrap().config_revision, revision);
     }
@@ -6145,11 +6207,13 @@ mod tests {
             .unwrap();
         let share = store.get("invalid-owner-bind").unwrap();
         assert_eq!(share.owner_email.as_deref(), Some("client@example.com"));
-        assert!(!share
-            .acl
-            .shared_with_emails
-            .iter()
-            .any(|email| email == "invalid-owner"));
+        assert!(
+            !share
+                .acl
+                .shared_with_emails
+                .iter()
+                .any(|email| email == "invalid-owner")
+        );
     }
 
     #[test]
@@ -6263,15 +6327,19 @@ mod tests {
         let updated = store.bind_all_to_client_owner("buyer@example.com").unwrap();
         let updated = &updated[0];
         assert_eq!(updated.owner_email.as_deref(), Some("buyer@example.com"));
-        assert!(updated
-            .acl
-            .shared_with_emails
-            .iter()
-            .any(|email| email == "owner@example.com"));
-        assert!(!updated
-            .acl
-            .shared_with_emails
-            .iter()
-            .any(|email| email == "buyer@example.com"));
+        assert!(
+            updated
+                .acl
+                .shared_with_emails
+                .iter()
+                .any(|email| email == "owner@example.com")
+        );
+        assert!(
+            !updated
+                .acl
+                .shared_with_emails
+                .iter()
+                .any(|email| email == "buyer@example.com")
+        );
     }
 }

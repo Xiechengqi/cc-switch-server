@@ -5,27 +5,27 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::{to_bytes, Body, Bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tower::ServiceExt;
 
 use cc_switch_server::api::*;
@@ -959,10 +959,12 @@ async fn control_apply_share_settings_rejects_replayed_nonce() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let body = json_body(response).await;
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("replay control request"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("replay control request")
+    );
 }
 
 #[tokio::test]
@@ -1165,9 +1167,11 @@ async fn ordinary_share_settings_entrypoint_rejects_managed_grants() {
         .await
         .unwrap()
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("reserved for Router Share Market"));
+    assert!(
+        error
+            .to_string()
+            .contains("reserved for Router Share Market")
+    );
     let has_managed_grant = state
         .mutate_shares_immediate(|store| {
             store
@@ -1950,10 +1954,12 @@ async fn managed_auth_logout_preflights_all_accounts_before_deleting_any() {
 
     let remaining = state.accounts_snapshot().await;
     for account_id in ["logout-claude-unbound", "logout-claude-bound"] {
-        assert!(remaining
-            .accounts
-            .iter()
-            .any(|account| account.id == account_id));
+        assert!(
+            remaining
+                .accounts
+                .iter()
+                .any(|account| account.id == account_id)
+        );
     }
 }
 
@@ -2016,12 +2022,14 @@ async fn managed_auth_logout_cancels_in_flight_exchange_and_deletes_accounts_tog
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!state
-        .accounts_snapshot()
-        .await
-        .accounts
-        .iter()
-        .any(|account| account.provider_type == ProviderType::ClaudeOAuth));
+    assert!(
+        !state
+            .accounts_snapshot()
+            .await
+            .accounts
+            .iter()
+            .any(|account| account.provider_type == ProviderType::ClaudeOAuth)
+    );
     let commit = state
         .mutate_oauth_logins(|store| {
             store.ensure_exchange_commit_allowed(
@@ -2387,9 +2395,11 @@ async fn remote_manual_codex_login_uses_fixed_localhost_redirect_and_https_gate(
     assert_eq!(response.status(), StatusCode::OK);
     let login = json_body(response).await;
     assert_eq!(login["flow"], "cli_manual");
-    assert!(login["device_code"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("manual:")));
+    assert!(
+        login["device_code"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("manual:"))
+    );
     assert!(login["session_id"].as_str().is_some());
     let authorize_url = url::Url::parse(login["verification_uri"].as_str().unwrap()).unwrap();
     let redirect_uri = authorize_url
@@ -3525,27 +3535,35 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
         assert_eq!(authorization.len(), 1);
         assert_eq!(authorization[0], "Bearer legacy-forward-access-token");
         assert!(headers.get("x-api-key").is_none());
-        assert!(headers
-            .get("anthropic-beta")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value.contains("context-1m") && !value.contains("unknown-client-beta")
-            }));
-        assert!(headers
-            .get("anthropic-dangerous-direct-browser-access")
-            .is_none());
+        assert!(
+            headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value.contains("context-1m") && !value.contains("unknown-client-beta")
+                })
+        );
+        assert!(
+            headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .is_none()
+        );
         assert!(headers.get("sec-fetch-mode").is_none());
         assert_eq!(body["model"], "claude-sonnet-4-6");
-        assert!(body["system"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("cch=") && !text.contains("cch=00000")));
+        assert!(
+            body["system"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("cch=") && !text.contains("cch=00000"))
+        );
         if path_and_query.starts_with("/v1/messages/count_tokens") {
             assert!(body.get("stream").is_none());
             assert!(body.get("max_tokens").is_none());
-            assert!(headers
-                .get("anthropic-beta")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains("token-counting")));
+            assert!(
+                headers
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("token-counting"))
+            );
         }
     }
 }
@@ -3611,9 +3629,11 @@ async fn legacy_claude_oauth_missing_credential_fails_before_upstream() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = json_body(response).await;
     assert_eq!(body["error"]["code"], "cc_switch_no_available_provider");
-    assert!(body["error"]["message"]
-        .as_str()
-        .is_some_and(|error| error.contains("explicit account binding")));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|error| error.contains("explicit account binding"))
+    );
     assert_eq!(upstream_requests.load(Ordering::SeqCst), 0);
 }
 
@@ -3727,15 +3747,19 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
     ] {
         assert!(body.get(field).is_none(), "unexpected field: {field}");
     }
-    assert!(body["system"][0]["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("cch=")));
-    assert!(state
-        .usage_snapshot()
-        .await
-        .logs
-        .iter()
-        .all(|log| log.provider_id != "claude-count-oauth"));
+    assert!(
+        body["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("cch="))
+    );
+    assert!(
+        state
+            .usage_snapshot()
+            .await
+            .logs
+            .iter()
+            .all(|log| log.provider_id != "claude-count-oauth")
+    );
 
     let response = app_router(state.clone())
         .oneshot(provider_share_request(
@@ -3755,12 +3779,14 @@ async fn claude_count_tokens_uses_oauth_contract_without_generation_usage() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(state
-        .usage_snapshot()
-        .await
-        .logs
-        .iter()
-        .all(|log| log.provider_id != "claude-count-oauth"));
+    assert!(
+        state
+            .usage_snapshot()
+            .await
+            .logs
+            .iter()
+            .all(|log| log.provider_id != "claude-count-oauth")
+    );
 }
 
 #[tokio::test]
@@ -4010,10 +4036,12 @@ async fn claude_client_disconnect_cancels_upstream_without_provider_failure() {
                     && log.stream_status.as_deref() == Some("client_cancelled")
             });
             if cancelled && upstream_dropped.load(Ordering::SeqCst) > 0 {
-                assert!(usage
-                    .provider_health
-                    .get(AppKind::Claude, "claude-client-cancel")
-                    .is_none());
+                assert!(
+                    usage
+                        .provider_health
+                        .get(AppKind::Claude, "claude-client-cancel")
+                        .is_none()
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4110,9 +4138,11 @@ async fn claude_message_stop_finishes_without_waiting_for_upstream_eof() {
     })
     .await
     .expect("upstream body must be dropped after message_stop");
-    assert!(!state
-        .share_in_flight
-        .has_in_flight(&test_provider_share_id(AppKind::Claude, provider_id)));
+    assert!(
+        !state
+            .share_in_flight
+            .has_in_flight(&test_provider_share_id(AppKind::Claude, provider_id))
+    );
     assert!(state.usage_snapshot().await.logs.iter().any(|log| {
         log.provider_id == provider_id && log.stream_status.as_deref() == Some("completed")
     }));
@@ -4223,9 +4253,11 @@ async fn claude_message_stop_is_accounted_before_downstream_drops_body() {
     })
     .await
     .expect("upstream body must be dropped with the downstream body");
-    assert!(!state
-        .share_in_flight
-        .has_in_flight(&test_provider_share_id(AppKind::Claude, provider_id)));
+    assert!(
+        !state
+            .share_in_flight
+            .has_in_flight(&test_provider_share_id(AppKind::Claude, provider_id))
+    );
     upstream_server.abort();
 }
 
@@ -5124,9 +5156,11 @@ async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(body_text(response)
-        .await
-        .contains("invalid thinking signature"));
+    assert!(
+        body_text(response)
+            .await
+            .contains("invalid thinking signature")
+    );
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 }
 
@@ -5333,12 +5367,14 @@ async fn router_heartbeat_probes_router_before_marking_online() {
     assert!(body["lastError"].is_null());
     assert!(body["lastHeartbeatMs"].as_u64().is_some());
     assert_eq!(seen.load(Ordering::SeqCst), 1);
-    assert!(state
-        .config_snapshot()
-        .await
-        .client
-        .last_heartbeat_ms
-        .is_some());
+    assert!(
+        state
+            .config_snapshot()
+            .await
+            .client
+            .last_heartbeat_ms
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -5387,10 +5423,12 @@ async fn router_heartbeat_records_probe_failure_without_marking_online() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = json_body(response).await;
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("router heartbeat probe failed"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("router heartbeat probe failed")
+    );
 
     let status = app
         .oneshot(json_request(
@@ -5404,10 +5442,12 @@ async fn router_heartbeat_records_probe_failure_without_marking_online() {
     assert_eq!(status.status(), StatusCode::OK);
     let body = json_body(status).await;
     assert_eq!(body["registered"].as_bool(), Some(false));
-    assert!(body["lastError"]
-        .as_str()
-        .unwrap()
-        .contains("router pending share edits failed"));
+    assert!(
+        body["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("router pending share edits failed")
+    );
     assert!(body["lastHeartbeatMs"].is_null());
 }
 
@@ -6214,11 +6254,13 @@ async fn web_terminal_uses_authenticated_http_stream_and_controls() {
         .await
         .unwrap();
     assert_eq!(stream.status(), StatusCode::OK);
-    assert!(stream
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream")));
+    assert!(
+        stream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+    );
 
     let input = app
         .clone()
@@ -6338,9 +6380,11 @@ async fn setup_bootstrap_issues_session_token_without_prior_login() {
         .unwrap();
     let body = json_body(response).await;
     assert_eq!(body["ok"].as_bool(), Some(true));
-    assert!(body["sessionToken"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
+    assert!(
+        body["sessionToken"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
 }
 
 #[tokio::test]
@@ -6373,11 +6417,13 @@ async fn offline_setup_exposes_waiting_notification_without_persisting_plaintext
         body["setupCompletionNotificationStatus"],
         "waiting_for_claim"
     );
-    assert!(body["warnings"]
-        .as_array()
-        .is_some_and(|warnings| warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|warning| warning.contains("authoritative Router client claim")))));
+    assert!(
+        body["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("authoritative Router client claim"))))
+    );
 
     let persisted = std::fs::read_to_string(config_dir.join("server.json")).unwrap();
     assert!(!persisted.contains("setup-secret-9"));
@@ -6392,10 +6438,12 @@ async fn offline_setup_exposes_waiting_notification_without_persisting_plaintext
     assert_eq!(notification["attemptCount"], 0);
     assert!(notification["lastAttemptAtMs"].is_null());
     assert!(notification["nextAttemptAtMs"].is_null());
-    assert!(state
-        .config_snapshot()
-        .await
-        .verify_password("setup-secret-9"));
+    assert!(
+        state
+            .config_snapshot()
+            .await
+            .verify_password("setup-secret-9")
+    );
 }
 
 #[tokio::test]
@@ -6487,10 +6535,12 @@ async fn setup_completed_delivery_failure_does_not_fail_authoritative_setup() {
     let notification = config.setup_completion_notification.unwrap();
     assert_eq!(notification.status.as_str(), "pending");
     assert_eq!(notification.attempt_count, 1);
-    assert!(notification
-        .last_error
-        .as_deref()
-        .is_some_and(|error| error.contains("503")));
+    assert!(
+        notification
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("503"))
+    );
     router_server.abort();
 }
 
@@ -6519,11 +6569,13 @@ async fn setup_validate_is_dry_run_without_persisting_config() {
     let body = json_body(response).await;
     assert_eq!(body["dryRun"].as_bool(), Some(true));
     assert!(body["setupCompletionNotificationStatus"].is_null());
-    assert!(state
-        .config_snapshot()
-        .await
-        .setup_completion_notification
-        .is_none());
+    assert!(
+        state
+            .config_snapshot()
+            .await
+            .setup_completion_notification
+            .is_none()
+    );
 
     let status = json_body(
         app.oneshot(
@@ -7052,11 +7104,13 @@ async fn web_usage_rest_aggregates_bundles_surfaces_models_and_share_users() {
     )
     .await;
     assert_eq!(models["data"].as_array().map(Vec::len), Some(2));
-    assert!(models["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|model| model["actualModel"] == "actual-upstream"));
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model["actualModel"] == "actual-upstream")
+    );
 
     let shares = json_body(
         app.clone()
@@ -7213,16 +7267,20 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["profiles"].as_array().unwrap().len(),
         65
     );
-    assert!(registry["registry"]["families"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|family| family["familyId"] != "family.claude_bearer_relay"));
-    assert!(registry["registry"]["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|profile| profile["profileId"] != "claude.bearer_relay"));
+    assert!(
+        registry["registry"]["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|family| family["familyId"] != "family.claude_bearer_relay")
+    );
+    assert!(
+        registry["registry"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|profile| profile["profileId"] != "claude.bearer_relay")
+    );
     assert_eq!(
         registry["registry"]["customRecipes"],
         json!([{
@@ -7273,24 +7331,36 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
     assert_eq!(presets.len(), 22);
-    assert!(presets
-        .iter()
-        .all(|preset| preset["profileId"].as_str().is_some()));
-    assert!(presets
-        .iter()
-        .any(|preset| preset["profileId"] == "codex.openai_api_key"));
-    assert!(presets
-        .iter()
-        .any(|preset| preset["profileId"] == "codex.custom_http"));
-    assert!(presets
-        .iter()
-        .any(|preset| preset["profileId"] == "codex.kimi_code"));
-    assert!(presets
-        .iter()
-        .any(|preset| preset["profileId"] == "codex.kiro_oauth"));
-    assert!(presets
-        .iter()
-        .any(|preset| preset["profileId"] == "codex.github_copilot"));
+    assert!(
+        presets
+            .iter()
+            .all(|preset| preset["profileId"].as_str().is_some())
+    );
+    assert!(
+        presets
+            .iter()
+            .any(|preset| preset["profileId"] == "codex.openai_api_key")
+    );
+    assert!(
+        presets
+            .iter()
+            .any(|preset| preset["profileId"] == "codex.custom_http")
+    );
+    assert!(
+        presets
+            .iter()
+            .any(|preset| preset["profileId"] == "codex.kimi_code")
+    );
+    assert!(
+        presets
+            .iter()
+            .any(|preset| preset["profileId"] == "codex.kiro_oauth")
+    );
+    assert!(
+        presets
+            .iter()
+            .any(|preset| preset["profileId"] == "codex.github_copilot")
+    );
 
     let created = app
         .clone()
@@ -7337,9 +7407,11 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         resources[0]["runtime"]["transportPolicy"]["timeoutMs"],
         300_000
     );
-    assert!(!serde_json::to_string(&resources[0]["runtime"])
-        .unwrap()
-        .contains("api-contract-openai-key"));
+    assert!(
+        !serde_json::to_string(&resources[0]["runtime"])
+            .unwrap()
+            .contains("api-contract-openai-key")
+    );
 }
 
 #[tokio::test]
@@ -7501,12 +7573,14 @@ async fn ollama_account_usage_is_session_scoped_provider_owned_and_secret_free()
         "{}",
         body_text(created).await
     );
-    assert!(state
-        .accounts_snapshot()
-        .await
-        .accounts
-        .iter()
-        .all(|account| account.provider_type != ProviderType::OllamaCloud));
+    assert!(
+        state
+            .accounts_snapshot()
+            .await
+            .accounts
+            .iter()
+            .all(|account| account.provider_type != ProviderType::OllamaCloud)
+    );
 
     let path = format!("/api/providers/{provider_id}/account-usage?app=codex");
     let unauthorized = app
@@ -7678,9 +7752,11 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
             created["surfaces"][provider_app]["provider"]["id"],
             "bundle-grok"
         );
-        assert!(created["surfaces"][provider_app]["provider"]["extra"]
-            .get("routeKey")
-            .is_none());
+        assert!(
+            created["surfaces"][provider_app]["provider"]["extra"]
+                .get("routeKey")
+                .is_none()
+        );
         assert_eq!(
             created["surfaces"][provider_app]["runtime"]["modelPolicy"],
             json!({"mode": "single", "upstreamModel": "grok-4.5"})
@@ -7760,11 +7836,13 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         .unwrap();
     assert_eq!(updated.status(), StatusCode::OK);
     assert_eq!(json_body(updated).await["bundle"]["revision"], 2);
-    assert!(providers_snapshot(&state)
-        .await
-        .providers
-        .iter()
-        .all(|provider| provider.resource.revision == 2));
+    assert!(
+        providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .all(|provider| provider.resource.revision == 2)
+    );
 
     let stale = app
         .clone()
@@ -7796,11 +7874,13 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         .unwrap();
     assert_eq!(updated.status(), StatusCode::OK);
     assert_eq!(json_body(updated).await["bundle"]["revision"], 3);
-    assert!(providers_snapshot(&state)
-        .await
-        .providers
-        .iter()
-        .all(|provider| provider.resource.revision == 3));
+    assert!(
+        providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .all(|provider| provider.resource.revision == 3)
+    );
 
     let claude_surface = app
         .clone()
@@ -7848,11 +7928,13 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         json_body(single_surface_delete).await["code"],
         "cc_switch_provider_bundle_surface_managed"
     );
-    assert!(providers_snapshot(&state)
-        .await
-        .providers
-        .iter()
-        .all(|provider| provider.resource.revision == 3));
+    assert!(
+        providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .all(|provider| provider.resource.revision == 3)
+    );
 
     let single_surface_delete_preview = app
         .clone()
@@ -7972,11 +8054,13 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         .unwrap();
     assert_eq!(migration.status(), StatusCode::OK);
     assert_eq!(json_body(migration).await["preview"]["items"], json!([]));
-    assert!(providers_snapshot(&state)
-        .await
-        .providers
-        .iter()
-        .all(|provider| provider.resource.revision == 3));
+    assert!(
+        providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .all(|provider| provider.resource.revision == 3)
+    );
 
     let second_bundle = grok_provider_bundle_draft(
         "bundle-grok-other",
@@ -8304,18 +8388,24 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
     assert_eq!(bundle["surfaces"]["codex"]["credentialConfigured"], false);
     assert_eq!(bundle["surfaces"]["gemini"]["credentialConfigured"], false);
 
-    assert!(state
-        .provider_runtime_plan(AppKind::Claude, "bundle-custom-claude-only")
-        .await
-        .is_some());
-    assert!(state
-        .provider_runtime_plan(AppKind::Codex, "bundle-custom-claude-only")
-        .await
-        .is_none());
-    assert!(state
-        .provider_runtime_plan(AppKind::Gemini, "bundle-custom-claude-only")
-        .await
-        .is_none());
+    assert!(
+        state
+            .provider_runtime_plan(AppKind::Claude, "bundle-custom-claude-only")
+            .await
+            .is_some()
+    );
+    assert!(
+        state
+            .provider_runtime_plan(AppKind::Codex, "bundle-custom-claude-only")
+            .await
+            .is_none()
+    );
+    assert!(
+        state
+            .provider_runtime_plan(AppKind::Gemini, "bundle-custom-claude-only")
+            .await
+            .is_none()
+    );
 
     let status = app
         .clone()
@@ -8434,11 +8524,13 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     assert_eq!(created_share["configRevision"], 1);
     assert_eq!(created_share["acl"]["marketAccessMode"], "all");
     assert_eq!(created_share["bindings"].as_array().map(Vec::len), Some(3));
-    assert!(created_share["bindings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|binding| binding["providerId"] == "bundle-share-grok"));
+    assert!(
+        created_share["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|binding| binding["providerId"] == "bundle-share-grok")
+    );
     assert_eq!(
         created_share["userGrants"]["friend@example.com"]["policy"]["parallelLimit"],
         2
@@ -8531,9 +8623,11 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     assert_eq!(status, StatusCode::OK, "response body: {reconciled}");
     assert_eq!(reconciled["configRevision"], 2);
     assert_eq!(reconciled["status"], "paused");
-    assert_eq!(reconciled["bindings"].as_array().map(Vec::len), Some(2));
+    assert_eq!(reconciled["bindings"].as_array().map(Vec::len), Some(3));
     assert_eq!(reconciled["bindings"][0]["app"], "claude");
     assert_eq!(reconciled["bindings"][1]["app"], "codex");
+    assert_eq!(reconciled["bindings"][2]["app"], "gemini");
+    assert_eq!(reconciled["enabledApps"], json!(["claude", "codex"]));
     assert_eq!(reconciled["description"], "Saved while paused");
     assert_eq!(reconciled["tokenLimit"], 250);
     assert_eq!(
@@ -8597,7 +8691,7 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
         .await
         .unwrap();
     assert_eq!(unchanged.config_revision, 2);
-    assert_eq!(unchanged.bindings.len(), 2);
+    assert_eq!(unchanged.bindings.len(), 3);
     assert_eq!(unchanged.description.as_deref(), Some("Saved while paused"));
 
     let stale = app
@@ -8715,7 +8809,7 @@ async fn provider_credential_reveal_is_authenticated_and_slot_scoped() {
 #[tokio::test]
 async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
     use cc_switch_server::domain::providers::registry::{
-        provider_registry, CreationPolicy, CredentialPolicy,
+        CreationPolicy, CredentialPolicy, provider_registry,
     };
 
     let state = test_state_with_cursor_api_key_verifier();
@@ -8983,9 +9077,11 @@ async fn provider_rest_resource_uses_redacted_views_and_shared_write_command() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
-    assert!(!serde_json::to_string(&body)
-        .unwrap()
-        .contains("rest-secret"));
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains("rest-secret")
+    );
     let mut provider = body["stored"]["provider"].clone();
     let revision = body["stored"]["revision"].as_u64().unwrap();
     provider["name"] = json!("REST Provider Renamed");
@@ -9042,9 +9138,11 @@ async fn provider_rest_resource_uses_redacted_views_and_shared_write_command() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!serde_json::to_string(&json_body(response).await)
-        .unwrap()
-        .contains("rest-secret"));
+    assert!(
+        !serde_json::to_string(&json_body(response).await)
+            .unwrap()
+            .contains("rest-secret")
+    );
 
     for uri in [
         "/api/providers?app=claude",
@@ -9160,11 +9258,13 @@ async fn provider_delete_preview_blocks_referenced_provider_without_cascading_sh
         json_body(response).await["code"],
         "cc_switch_provider_in_use"
     );
-    assert!(providers_snapshot(&state)
-        .await
-        .providers
-        .iter()
-        .any(|provider| provider.provider.id == "referenced-provider"));
+    assert!(
+        providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .any(|provider| provider.provider.id == "referenced-provider")
+    );
     assert_eq!(
         state
             .mutate_shares(|shares| shares.get(&share.id).cloned())
@@ -9839,12 +9939,14 @@ async fn account_delete_preview_blocks_bound_account() {
         json_body(response).await["code"],
         "cc_switch_account_in_use"
     );
-    assert!(state
-        .accounts_snapshot()
-        .await
-        .accounts
-        .iter()
-        .any(|account| account.id == "bound-claude-account"));
+    assert!(
+        state
+            .accounts_snapshot()
+            .await
+            .accounts
+            .iter()
+            .any(|account| account.id == "bound-claude-account")
+    );
 }
 
 #[tokio::test]
@@ -9958,9 +10060,11 @@ async fn provider_import_requires_preview_and_applies_atomically_without_secret_
     assert_eq!(preview["preview"]["createCount"], 1);
     assert_eq!(preview["preview"]["updateCount"], 0);
     assert!(providers_snapshot(&state).await.providers.is_empty());
-    assert!(!serde_json::to_string(&preview)
-        .unwrap()
-        .contains("import-secret"));
+    assert!(
+        !serde_json::to_string(&preview)
+            .unwrap()
+            .contains("import-secret")
+    );
     let preview_token = preview["preview"]["previewToken"]
         .as_str()
         .unwrap()
@@ -9983,9 +10087,11 @@ async fn provider_import_requires_preview_and_applies_atomically_without_secret_
     assert_eq!(response.status(), StatusCode::OK);
     let applied = json_body(response).await;
     assert_eq!(applied["imported"], 1);
-    assert!(!serde_json::to_string(&applied)
-        .unwrap()
-        .contains("import-secret"));
+    assert!(
+        !serde_json::to_string(&applied)
+            .unwrap()
+            .contains("import-secret")
+    );
     let stored = providers_snapshot(&state).await;
     assert_eq!(stored.providers.len(), 1);
     assert_eq!(
@@ -10435,9 +10541,11 @@ async fn managed_auth_manual_subscription_expiry_updates_account_and_share_metad
         stored.manual_subscription_expires_at_ms,
         Some(1_786_924_800_000)
     );
-    assert!(stored
-        .manual_subscription_expiry_updated_at_ms
-        .is_some_and(|value| value > 0));
+    assert!(
+        stored
+            .manual_subscription_expiry_updated_at_ms
+            .is_some_and(|value| value > 0)
+    );
     let updated_share = state
         .mutate_shares(|shares| shares.get("share-claude-expiry").cloned().unwrap())
         .await;
@@ -10943,9 +11051,11 @@ async fn deepseek_account_write_paths_reject_missing_access_token_without_mutati
         .await
         .unwrap();
     assert_eq!(missing_create.status(), StatusCode::BAD_REQUEST);
-    assert!(json_body(missing_create).await["error"]
-        .as_str()
-        .is_some_and(|message| message.contains("non-empty accessToken")));
+    assert!(
+        json_body(missing_create).await["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-empty accessToken"))
+    );
     assert!(state.accounts_snapshot().await.accounts.is_empty());
 
     let created = app
@@ -10981,9 +11091,11 @@ async fn deepseek_account_write_paths_reject_missing_access_token_without_mutati
         .await
         .unwrap();
     assert_eq!(missing_update.status(), StatusCode::BAD_REQUEST);
-    assert!(json_body(missing_update).await["error"]
-        .as_str()
-        .is_some_and(|message| message.contains("non-empty accessToken")));
+    assert!(
+        json_body(missing_update).await["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("non-empty accessToken"))
+    );
 
     let accounts = state.accounts_snapshot().await;
     assert_eq!(accounts.accounts.len(), 1);
@@ -11028,9 +11140,11 @@ async fn managed_oauth_quota_rejects_cross_provider_account_binding() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = json_body(response).await;
-    assert!(body["error"]
-        .as_str()
-        .is_some_and(|message| message.contains("account does not belong to grok_oauth")));
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("account does not belong to grok_oauth"))
+    );
 }
 
 #[tokio::test]
@@ -11153,9 +11267,11 @@ async fn managed_oauth_manual_refresh_defaults_to_forcing_the_upstream_strategy(
     assert_eq!(response.status(), StatusCode::OK);
     let refreshed = json_body(response).await;
     assert_eq!(refreshed["source"], "refresh");
-    assert!(refreshed["refreshedAt"]
-        .as_i64()
-        .is_some_and(|value| value > previous_refresh_at));
+    assert!(
+        refreshed["refreshedAt"]
+            .as_i64()
+            .is_some_and(|value| value > previous_refresh_at)
+    );
     assert_eq!(refreshed["quota"]["credentialMessage"], "Cursor Pro+");
     assert_eq!(refreshed["quota"]["tiers"][0]["utilization"], 25.0);
 }
@@ -11194,10 +11310,12 @@ async fn managed_auth_manual_subscription_expiry_rejects_non_manual_accounts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(json_body(response).await["error"]
-        .as_str()
-        .unwrap()
-        .contains("not supported"));
+    assert!(
+        json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("not supported")
+    );
 
     let response = app
         .oneshot(json_request(
@@ -11213,10 +11331,12 @@ async fn managed_auth_manual_subscription_expiry_rejects_non_manual_accounts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(json_body(response).await["error"]
-        .as_str()
-        .unwrap()
-        .contains("not supported"));
+    assert!(
+        json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("not supported")
+    );
 }
 
 #[tokio::test]
@@ -11338,10 +11458,12 @@ async fn managed_auth_account_removal_does_not_refresh_unbound_provider_shares()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(state
-        .find_account_by_id("acct-claude-removed")
-        .await
-        .is_none());
+    assert!(
+        state
+            .find_account_by_id("acct-claude-removed")
+            .await
+            .is_none()
+    );
     let revision_after = state
         .mutate_shares(|shares| {
             shares
@@ -11427,10 +11549,12 @@ async fn account_runtime_metadata_refreshes_share_only_when_effective_value_chan
         .await
         .unwrap();
 
-    assert!(state
-        .refresh_account_runtime_metadata_if_changed(&before, &after)
-        .await
-        .unwrap());
+    assert!(
+        state
+            .refresh_account_runtime_metadata_if_changed(&before, &after)
+            .await
+            .unwrap()
+    );
     let changed_revision = state
         .mutate_shares(|shares| {
             shares
@@ -11441,10 +11565,12 @@ async fn account_runtime_metadata_refreshes_share_only_when_effective_value_chan
         .await;
     assert!(changed_revision > share.config_revision);
 
-    assert!(!state
-        .refresh_account_runtime_metadata_if_changed(&after, &after)
-        .await
-        .unwrap());
+    assert!(
+        !state
+            .refresh_account_runtime_metadata_if_changed(&after, &after)
+            .await
+            .unwrap()
+    );
     let unchanged_revision = state
         .mutate_shares(|shares| {
             shares
@@ -12613,12 +12739,16 @@ async fn web_invoke_email_auth_owner_change_updates_config_and_shares() {
                     assert_eq!(body["oldEmail"].as_str(), Some("owner@example.com"));
                     assert_eq!(body["newEmail"].as_str(), Some("new-owner@example.com"));
                     assert!(body["timestampMs"].is_number());
-                    assert!(body["nonce"]
-                        .as_str()
-                        .is_some_and(|value| !value.is_empty()));
-                    assert!(body["signature"]
-                        .as_str()
-                        .is_some_and(|value| !value.is_empty()));
+                    assert!(
+                        body["nonce"]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty())
+                    );
+                    assert!(
+                        body["signature"]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty())
+                    );
                     change_seen.fetch_add(1, Ordering::SeqCst);
                     axum::Json(json!({
                         "ok": true,
@@ -13178,15 +13308,21 @@ async fn qoder_web_managed_auth_preserves_site_state_and_cancel_contract() {
     assert!(!flow_state.is_empty());
     let verification_uri = url::Url::parse(login["verification_uri"].as_str().unwrap()).unwrap();
     assert_eq!(verification_uri.host_str(), Some("qoder.com.cn"));
-    assert!(verification_uri
-        .query_pairs()
-        .any(|(key, value)| key == "nonce" && !value.is_empty()));
-    assert!(verification_uri
-        .query_pairs()
-        .any(|(key, value)| key == "challenge" && !value.is_empty()));
-    assert!(!verification_uri
-        .query_pairs()
-        .any(|(key, value)| key == "state" || value == flow_state));
+    assert!(
+        verification_uri
+            .query_pairs()
+            .any(|(key, value)| key == "nonce" && !value.is_empty())
+    );
+    assert!(
+        verification_uri
+            .query_pairs()
+            .any(|(key, value)| key == "challenge" && !value.is_empty())
+    );
+    assert!(
+        !verification_uri
+            .query_pairs()
+            .any(|(key, value)| key == "state" || value == flow_state)
+    );
 
     let response = app
         .clone()

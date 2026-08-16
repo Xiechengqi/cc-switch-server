@@ -7,23 +7,24 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
-    active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
-    AccountUsageBlock,
+    Account, AccountQuotaTier, AccountStore, AccountUsageBlock,
+    active_account_usage_block_for_share,
 };
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::bundle::{
-    bundle_model_policy_scope, bundle_model_policy_source, ModelPolicyScope, ModelPolicySource,
+    ModelPolicyScope, ModelPolicySource, bundle_model_policy_scope, bundle_model_policy_source,
+    surface_enabled,
 };
 use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
+use crate::domain::providers::model_routing::{ModelRoutingMode, policy_from_settings};
 use crate::domain::providers::registry::profile_by_id;
 use crate::domain::providers::runtime::{
-    authoritative_managed_account, ProviderRuntimePlan, RuntimeModelPolicy,
+    ProviderRuntimePlan, RuntimeModelPolicy, authoritative_managed_account,
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
-use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
+use crate::domain::sharing::shares::{Share, share_router_for_sale_label};
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -671,9 +672,20 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         }
     }
 
-    let support = crate::domain::sharing::shares::support_from_enabled_apps(
-        &crate::domain::sharing::shares::share_enabled_apps(share),
-    );
+    let mut enabled_apps = crate::domain::sharing::shares::share_enabled_apps(share);
+    for (app, provider_id) in &bindings {
+        let Some(provider) = providers
+            .providers
+            .iter()
+            .find(|item| item.app == *app && item.provider.id == *provider_id)
+        else {
+            continue;
+        };
+        if !surface_enabled(&provider.provider) {
+            enabled_apps.remove(app);
+        }
+    }
+    let support = crate::domain::sharing::shares::support_from_enabled_apps(&enabled_apps);
 
     let shared_with_emails = share.acl.shared_with_emails.clone();
     let market_access_mode = share.acl.market_access_mode.clone().unwrap_or_else(|| {
@@ -749,6 +761,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                         usage,
                         runtime_plan.as_deref(),
                         true,
+                        surface_enabled(&provider.provider),
                     ));
                     app_availability.claude = Some(availability);
                 }
@@ -762,6 +775,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                         usage,
                         runtime_plan.as_deref(),
                         true,
+                        surface_enabled(&provider.provider),
                     ));
                     app_availability.codex = Some(availability);
                 }
@@ -775,9 +789,89 @@ pub fn descriptor_for_share_with_accounts_and_usage(
                         usage,
                         runtime_plan.as_deref(),
                         true,
+                        surface_enabled(&provider.provider),
                     ));
                     app_availability.gemini = Some(availability);
                 }
+            }
+        }
+    }
+    if let Some(bundle_id) = bindings.values().find_map(|provider_id| {
+        providers.providers.iter().find_map(|stored| {
+            (stored.provider.id == *provider_id)
+                .then(|| crate::domain::providers::bundle::bundle_id(&stored.provider))
+                .flatten()
+                .map(str::to_string)
+        })
+    }) {
+        for stored in &providers.providers {
+            if crate::domain::providers::bundle::bundle_id(&stored.provider)
+                != Some(bundle_id.as_str())
+                || bindings.contains_key(&stored.app)
+            {
+                continue;
+            }
+            let runtime_plan = providers.runtime_plan(stored.app, &stored.provider.id);
+            let upstream = upstream_provider(
+                stored.app.as_str(),
+                stored,
+                share,
+                accounts,
+                usage,
+                runtime_plan.as_deref(),
+            );
+            let availability = provider_availability(
+                stored.app.as_str(),
+                stored,
+                share,
+                accounts,
+                usage,
+                runtime_plan.as_deref(),
+            );
+            match stored.app {
+                AppKind::Claude if app_providers.claude.is_empty() => {
+                    app_runtimes.claude = Some(upstream);
+                    app_providers.claude.push(app_provider(
+                        stored.app.as_str(),
+                        stored,
+                        share,
+                        accounts,
+                        usage,
+                        runtime_plan.as_deref(),
+                        false,
+                        surface_enabled(&stored.provider),
+                    ));
+                    app_availability.claude = Some(availability);
+                }
+                AppKind::Codex if app_providers.codex.is_empty() => {
+                    app_runtimes.codex = Some(upstream);
+                    app_providers.codex.push(app_provider(
+                        stored.app.as_str(),
+                        stored,
+                        share,
+                        accounts,
+                        usage,
+                        runtime_plan.as_deref(),
+                        false,
+                        surface_enabled(&stored.provider),
+                    ));
+                    app_availability.codex = Some(availability);
+                }
+                AppKind::Gemini if app_providers.gemini.is_empty() => {
+                    app_runtimes.gemini = Some(upstream);
+                    app_providers.gemini.push(app_provider(
+                        stored.app.as_str(),
+                        stored,
+                        share,
+                        accounts,
+                        usage,
+                        runtime_plan.as_deref(),
+                        false,
+                        surface_enabled(&stored.provider),
+                    ));
+                    app_availability.gemini = Some(availability);
+                }
+                _ => {}
             }
         }
     }
@@ -1011,6 +1105,7 @@ fn app_provider(
     usage: Option<&UsageStore>,
     runtime_plan: Option<&ProviderRuntimePlan>,
     is_current: bool,
+    enabled: bool,
 ) -> ShareAppProvider {
     let health = usage.map(|usage| provider_health(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
@@ -1038,7 +1133,7 @@ fn app_provider(
         kind: Some(provider_type_id.clone()),
         provider_type: Some(provider_type_id),
         is_current,
-        enabled: true,
+        enabled,
         codex_image_generation_enabled: provider
             .provider
             .meta
@@ -1593,7 +1688,9 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, AccountStore};
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
-    use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
+    use crate::domain::providers::model::{
+        AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
+    };
     use crate::domain::sharing::shares::{ShareAcl, ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
 
@@ -1669,6 +1766,66 @@ mod tests {
         let serialized = serde_json::to_value(provider).unwrap();
         assert_eq!(serialized["modelPolicyScope"], json!("global"));
         assert_eq!(serialized["modelPolicySource"], json!("bundle_global"));
+        assert!(provider.enabled);
+    }
+
+    #[test]
+    fn descriptor_projects_disabled_bundle_surfaces_without_unbinding() {
+        let mut codex = test_provider(ProviderType::GrokOAuth);
+        codex
+            .provider
+            .extra
+            .insert("bundleId".to_string(), json!("p1"));
+        codex
+            .provider
+            .extra
+            .insert("familyId".to_string(), json!("family.grok_oauth"));
+        codex
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(true));
+        codex
+            .provider
+            .extra
+            .insert("modelPolicyScope".to_string(), json!("global"));
+        codex
+            .provider
+            .extra
+            .insert("testApp".to_string(), json!("codex"));
+        codex.resource.profile_id =
+            Some(crate::domain::providers::registry::ProfileId::parse("codex.grok_oauth").unwrap());
+
+        let mut claude = test_provider(ProviderType::GrokOAuth);
+        claude.app = AppKind::Claude;
+        claude.provider.extra = codex.provider.extra.clone();
+        claude
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(false));
+        claude.resource.profile_id = Some(
+            crate::domain::providers::registry::ProfileId::parse("claude.grok_oauth").unwrap(),
+        );
+
+        let providers = ProviderStore {
+            providers: vec![codex, claude],
+            ..ProviderStore::default()
+        };
+        let share = test_share(ProviderType::GrokOAuth, None);
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+
+        assert!(descriptor.support.codex);
+        assert!(!descriptor.support.claude);
+        assert_eq!(
+            descriptor.app_providers.codex.first().unwrap().enabled,
+            true
+        );
+        let claude_provider = descriptor.app_providers.claude.first().unwrap();
+        assert!(!claude_provider.enabled);
+        assert_eq!(
+            claude_provider.supported_apps,
+            ["claude", "codex", "gemini"]
+        );
+        assert!(!claude_provider.is_current);
     }
 
     #[test]
@@ -1882,7 +2039,7 @@ mod tests {
     #[test]
     fn descriptor_derives_recurring_account_expiry_for_router_metadata() {
         use crate::domain::accounts::subscription_expiry::{
-            resolved_subscription_expiry, SubscriptionExpiryCadence, SubscriptionExpiryRuleDraft,
+            SubscriptionExpiryCadence, SubscriptionExpiryRuleDraft, resolved_subscription_expiry,
         };
 
         let share = test_share(ProviderType::ClaudeOAuth, Some(5.0));
@@ -2107,12 +2264,14 @@ mod tests {
         );
         let confirmed = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
         assert!(!confirmed.app_availability.codex.unwrap().available);
-        assert!(!confirmed
-            .upstream_provider
-            .as_ref()
-            .unwrap()
-            .available
-            .unwrap());
+        assert!(
+            !confirmed
+                .upstream_provider
+                .as_ref()
+                .unwrap()
+                .available
+                .unwrap()
+        );
         assert!(!confirmed.app_providers.codex[0].available.unwrap());
         assert!(
             !confirmed.app_providers.codex[0]
@@ -2169,11 +2328,13 @@ mod tests {
                 .and_then(|quota| quota.availability.as_deref()),
             Some("quota_exhausted")
         );
-        assert!(provider
-            .quota
-            .as_ref()
-            .and_then(|quota| quota.blocked_until.as_deref())
-            .is_some());
+        assert!(
+            provider
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.blocked_until.as_deref())
+                .is_some()
+        );
     }
 
     #[test]
@@ -2269,14 +2430,18 @@ mod tests {
         let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
 
         assert_eq!(provider.models.len(), 2);
-        assert!(provider
-            .models
-            .iter()
-            .all(|model| model.slot == "available"));
-        assert!(provider
-            .models
-            .iter()
-            .all(|model| model.actual_model != "stale-fixed-model"));
+        assert!(
+            provider
+                .models
+                .iter()
+                .all(|model| model.slot == "available")
+        );
+        assert!(
+            provider
+                .models
+                .iter()
+                .all(|model| model.actual_model != "stale-fixed-model")
+        );
         let runtime_models = runtime
             .models
             .iter()

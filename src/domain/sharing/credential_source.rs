@@ -2,10 +2,11 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::AccountStore;
+use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::credentials::split_provider_credentials;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::registry::{
-    family_for_profile, profile_by_id, CredentialPolicy, CredentialSourceScope,
+    CredentialPolicy, CredentialSourceScope, family_for_profile, profile_by_id,
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
@@ -128,8 +129,25 @@ pub fn shared_credential_source_for_bindings(
         });
     }
 
+    let enabled_bindings = bindings
+        .iter()
+        .filter(|binding| {
+            providers
+                .providers
+                .iter()
+                .find(|stored| {
+                    stored.app == binding.app && stored.provider.id == binding.provider_id
+                })
+                .map(|stored| surface_enabled(&stored.provider))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if enabled_bindings.is_empty() {
+        return Err(CredentialSourceError::InvalidBindingCount { count: 0 });
+    }
+
     let mut source: Option<(CredentialSourceIdentity, &ShareBinding)> = None;
-    for binding in bindings {
+    for binding in &enabled_bindings {
         let candidate = resolve_provider_credential_source(
             providers,
             accounts,
@@ -141,7 +159,7 @@ pub fn shared_credential_source_for_bindings(
             provider_id: binding.provider_id.clone(),
             message: error.to_string(),
         })?;
-        if bindings.len() > 1 && candidate.is_none() {
+        if enabled_bindings.len() > 1 && candidate.is_none() {
             return Err(CredentialSourceError::ReuseUnsupported {
                 app: binding.app.as_str(),
                 provider_id: binding.provider_id.clone(),
@@ -296,7 +314,7 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::Account;
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::providers::registry::{provider_registry, ProfileId};
+    use crate::domain::providers::registry::{ProfileId, provider_registry};
     use crate::domain::providers::store::ProviderResourceMetadata;
 
     fn account(id: &str) -> Account {
@@ -548,6 +566,39 @@ mod tests {
     }
 
     #[test]
+    fn disabled_surfaces_are_ignored_when_deriving_shared_capacity() {
+        let mut disabled = static_provider(AppKind::Codex, "codex-openrouter", "different-key");
+        disabled
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(false));
+        let providers = ProviderStore {
+            providers: vec![
+                static_provider(AppKind::Claude, "claude-openrouter", "shared-key"),
+                disabled,
+            ],
+            ..ProviderStore::default()
+        };
+        let bindings = vec![
+            ShareBinding {
+                app: AppKind::Claude,
+                provider_id: "claude-openrouter".to_string(),
+                provider_type: ProviderType::OpenRouter,
+            },
+            ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "codex-openrouter".to_string(),
+                provider_type: ProviderType::OpenRouter,
+            },
+        ];
+
+        assert!(
+            shared_credential_source_for_bindings(&providers, &AccountStore::default(), &bindings)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn google_oauth_surfaces_share_one_registry_declared_credential_source() {
         let providers = ProviderStore {
             providers: vec![
@@ -606,14 +657,16 @@ mod tests {
             shared_credential_source_for_bindings(&providers, &AccountStore::default(), &bindings),
             Err(CredentialSourceError::ReuseUnsupported { .. })
         ));
-        assert!(resolve_provider_credential_source(
-            &providers,
-            &AccountStore::default(),
-            AppKind::Claude,
-            "custom-bundle"
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            resolve_provider_credential_source(
+                &providers,
+                &AccountStore::default(),
+                AppKind::Claude,
+                "custom-bundle"
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
