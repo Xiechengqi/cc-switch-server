@@ -504,7 +504,9 @@ pub fn share_app_api_enabled(share: &Share, app: AppKind) -> bool {
     share_enabled_apps(share).contains(&app)
 }
 
-pub fn support_from_enabled_apps(enabled: &BTreeSet<AppKind>) -> crate::domain::sharing::router_contract::ShareSupport {
+pub fn support_from_enabled_apps(
+    enabled: &BTreeSet<AppKind>,
+) -> crate::domain::sharing::router_contract::ShareSupport {
     crate::domain::sharing::router_contract::ShareSupport {
         claude: enabled.contains(&AppKind::Claude),
         codex: enabled.contains(&AppKind::Codex),
@@ -2079,7 +2081,11 @@ impl ShareStore {
         if let Some(support) = patch.support {
             let bound = share_bound_apps(&share);
             let enabled = enabled_apps_from_support(&support, &bound)?;
-            share.enabled_apps = if enabled == bound { None } else { Some(enabled) };
+            share.enabled_apps = if enabled == bound {
+                None
+            } else {
+                Some(enabled)
+            };
         }
 
         let pricing_eligible = share.for_sale && !share.free_access;
