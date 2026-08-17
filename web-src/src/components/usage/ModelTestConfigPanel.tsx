@@ -1,78 +1,119 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
+import { Loader2, Save } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Save, Loader2, Info } from "lucide-react";
-import { toast } from "sonner";
 import {
-  getStreamCheckConfig,
-  saveStreamCheckConfig,
-  type StreamCheckConfig,
-} from "@/lib/api/model-test";
+  providersApi,
+  type ProviderHealthCheckConfig,
+} from "@/lib/api/providers";
+
+type FormState = {
+  timeoutSeconds: string;
+  maxRetries: string;
+  degradedThresholdSeconds: string;
+  claude: string;
+  codex: string;
+  gemini: string;
+};
+
+function formFromConfig(config: ProviderHealthCheckConfig): FormState {
+  return {
+    timeoutSeconds: String(config.timeoutSeconds),
+    maxRetries: String(config.maxRetries),
+    degradedThresholdSeconds: String(config.degradedThresholdSeconds),
+    claude: config.testModels.claude,
+    codex: config.testModels.codex,
+    gemini: config.testModels.gemini,
+  };
+}
+
+function parseInteger(value: string, min: number, max: number): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max
+    ? parsed
+    : null;
+}
 
 export function ModelTestConfigPanel() {
   const { t } = useTranslation();
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // 使用字符串状态以支持完全清空数字输入框
-  const [config, setConfig] = useState({
-    timeoutSecs: "45",
-    maxRetries: "2",
-    degradedThresholdMs: "6000",
-    testPrompt: "Who are you?",
-  });
+  const [form, setForm] = useState<FormState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadGeneration, setReloadGeneration] = useState(0);
 
   useEffect(() => {
-    loadConfig();
-  }, []);
-
-  async function loadConfig() {
-    try {
-      setIsLoading(true);
-      setError(null);
-      const data = await getStreamCheckConfig();
-      setConfig({
-        timeoutSecs: String(data.timeoutSecs),
-        maxRetries: String(data.maxRetries),
-        degradedThresholdMs: String(data.degradedThresholdMs),
-        testPrompt: data.testPrompt || "Who are you?",
+    let active = true;
+    setLoading(true);
+    setLoadError(null);
+    void providersApi
+      .getHealthCheckConfig()
+      .then((config) => {
+        if (active) setForm(formFromConfig(config));
+      })
+      .catch((error) => {
+        if (active) {
+          setForm(null);
+          setLoadError(error instanceof Error ? error.message : String(error));
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false);
       });
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
-  async function handleSave() {
-    // 解析数字，空值使用默认值，0 是有效值
-    const parseNum = (val: string, defaultVal: number) => {
-      const n = parseInt(val);
-      return isNaN(n) ? defaultVal : n;
+    return () => {
+      active = false;
     };
-    try {
-      setIsSaving(true);
-      const parsed: StreamCheckConfig = {
-        timeoutSecs: parseNum(config.timeoutSecs, 45),
-        maxRetries: parseNum(config.maxRetries, 2),
-        degradedThresholdMs: parseNum(config.degradedThresholdMs, 6000),
-        testPrompt: config.testPrompt.trim() || "Who are you?",
-      };
-      await saveStreamCheckConfig(parsed);
-      toast.success(t("streamCheck.configSaved"), {
-        closeButton: true,
-      });
-    } catch (e) {
-      toast.error(t("streamCheck.configSaveFailed") + ": " + String(e));
-    } finally {
-      setIsSaving(false);
-    }
-  }
+  }, [reloadGeneration]);
 
-  if (isLoading) {
+  const save = async () => {
+    if (!form) return;
+    const models = {
+      claude: form.claude.trim(),
+      codex: form.codex.trim(),
+      gemini: form.gemini.trim(),
+    };
+    const config: ProviderHealthCheckConfig = {
+      timeoutSeconds: parseInteger(form.timeoutSeconds, 2, 60) ?? 0,
+      maxRetries: parseInteger(form.maxRetries, 0, 5) ?? 6,
+      degradedThresholdSeconds:
+        parseInteger(form.degradedThresholdSeconds, 1, 30) ?? 0,
+      testModels: models,
+    };
+    if (
+      config.timeoutSeconds === 0 ||
+      config.maxRetries > 5 ||
+      config.degradedThresholdSeconds === 0 ||
+      Object.values(models).some((model) => !model || model.length > 256)
+    ) {
+      toast.error(
+        t("settings.advanced.modelTest.invalid", {
+          defaultValue: "请检查健康检查参数和测试模型",
+        }),
+      );
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await providersApi.saveHealthCheckConfig(config);
+      setForm(formFromConfig(config));
+      toast.success(t("streamCheck.configSaved"), { closeButton: true });
+    } catch (error) {
+      toast.error(
+        `${t("streamCheck.configSaveFailed")}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
     return (
       <div className="flex items-center justify-center p-4">
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
@@ -80,72 +121,78 @@ export function ModelTestConfigPanel() {
     );
   }
 
+  if (loadError || !form) {
+    return (
+      <div className="space-y-3 rounded-md border border-destructive/40 p-4">
+        <p className="text-sm text-destructive">
+          {t("settings.loadFailed", { defaultValue: "加载失败" })}: {loadError}
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => setReloadGeneration((generation) => generation + 1)}
+        >
+          {t("common.retry", { defaultValue: "重试" })}
+        </Button>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
-      {error && (
-        <Alert variant="destructive">
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-
-      {/* 连通检测语义说明：可达 ≠ 配置正确 */}
-      <Alert>
-        <Info className="h-4 w-4" />
-        <AlertDescription>
-          {t("streamCheck.connectivityNote", {
-            defaultValue:
-              "连通检测仅探测供应商地址是否可达，不发送真实模型请求。收到任意响应即视为“可达”——这不代表鉴权或模型配置一定正确。",
-          })}
-        </AlertDescription>
-      </Alert>
-
-      {/* 检查参数配置 */}
       <div className="space-y-4">
         <h4 className="text-sm font-medium text-muted-foreground">
           {t("streamCheck.checkParams")}
         </h4>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid gap-4 md:grid-cols-3">
           <div className="space-y-2">
-            <Label htmlFor="timeoutSecs">{t("streamCheck.timeout")}</Label>
+            <Label htmlFor="health-timeout-seconds">
+              {t("streamCheck.timeout")}
+            </Label>
             <Input
-              id="timeoutSecs"
+              id="health-timeout-seconds"
               type="number"
               min={2}
               max={60}
-              value={config.timeoutSecs}
-              onChange={(e) =>
-                setConfig({ ...config, timeoutSecs: e.target.value })
+              step={1}
+              value={form.timeoutSeconds}
+              onChange={(event) =>
+                setForm({ ...form, timeoutSeconds: event.target.value })
               }
             />
           </div>
-
           <div className="space-y-2">
-            <Label htmlFor="maxRetries">{t("streamCheck.maxRetries")}</Label>
+            <Label htmlFor="health-max-retries">
+              {t("streamCheck.maxRetries")}
+            </Label>
             <Input
-              id="maxRetries"
+              id="health-max-retries"
               type="number"
               min={0}
               max={5}
-              value={config.maxRetries}
-              onChange={(e) =>
-                setConfig({ ...config, maxRetries: e.target.value })
+              step={1}
+              value={form.maxRetries}
+              onChange={(event) =>
+                setForm({ ...form, maxRetries: event.target.value })
               }
             />
           </div>
-
           <div className="space-y-2">
-            <Label htmlFor="degradedThresholdMs">
+            <Label htmlFor="health-degraded-threshold-seconds">
               {t("streamCheck.degradedThreshold")}
             </Label>
             <Input
-              id="degradedThresholdMs"
+              id="health-degraded-threshold-seconds"
               type="number"
-              min={1000}
-              max={30000}
-              step={1000}
-              value={config.degradedThresholdMs}
-              onChange={(e) =>
-                setConfig({ ...config, degradedThresholdMs: e.target.value })
+              min={1}
+              max={30}
+              step={1}
+              value={form.degradedThresholdSeconds}
+              onChange={(event) =>
+                setForm({
+                  ...form,
+                  degradedThresholdSeconds: event.target.value,
+                })
               }
             />
           </div>
@@ -153,31 +200,36 @@ export function ModelTestConfigPanel() {
       </div>
 
       <div className="space-y-4">
-        <div className="space-y-2">
-          <Label htmlFor="testPrompt">{t("streamCheck.testPrompt")}</Label>
-          <Input
-            id="testPrompt"
-            value={config.testPrompt}
-            onChange={(e) =>
-              setConfig({ ...config, testPrompt: e.target.value })
-            }
-          />
+        <h4 className="text-sm font-medium text-muted-foreground">
+          {t("streamCheck.testModels")}
+        </h4>
+        <div className="grid gap-4 md:grid-cols-3">
+          {(["claude", "codex", "gemini"] as const).map((app) => (
+            <div key={app} className="space-y-2">
+              <Label htmlFor={`health-${app}-model`}>
+                {t(`streamCheck.${app}Model`)}
+              </Label>
+              <Input
+                id={`health-${app}-model`}
+                value={form[app]}
+                maxLength={256}
+                onChange={(event) =>
+                  setForm({ ...form, [app]: event.target.value })
+                }
+              />
+            </div>
+          ))}
         </div>
       </div>
 
       <div className="flex justify-end">
-        <Button onClick={handleSave} disabled={isSaving}>
-          {isSaving ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              {t("common.saving")}
-            </>
+        <Button type="button" onClick={() => void save()} disabled={saving}>
+          {saving ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           ) : (
-            <>
-              <Save className="mr-2 h-4 w-4" />
-              {t("common.save")}
-            </>
+            <Save className="mr-2 h-4 w-4" />
           )}
+          {t("common.save")}
         </Button>
       </div>
     </div>

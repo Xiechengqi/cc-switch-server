@@ -1,17 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use super::credentials::{CredentialPatch, ProviderView};
 use super::model::{AppKind, Provider, ProviderMeta};
 use super::model_routing::normalize_and_validate_provider_model_routing;
 use super::registry::{
+    family_by_id, family_for_profile, profile_by_id, provider_registry, resolve_custom_binding,
     AuthScheme, CredentialPolicy, CredentialSourceScope, CustomBindingInput, DriverBinding,
     EndpointPolicy, FormComposition, ModelPolicyKind, ProfileId, ProfileSpec, ProviderFamilySpec,
-    UpstreamProtocol, family_by_id, family_for_profile, profile_by_id, provider_registry,
-    resolve_custom_binding,
+    UpstreamProtocol,
 };
 use super::store::StoredProvider;
 
@@ -1306,13 +1306,11 @@ mod tests {
         let mut draft = grok_bundle();
         draft.surfaces[0].enabled = false;
 
-        assert!(
-            draft
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("test App must be enabled")
-        );
+        assert!(draft
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("test App must be enabled"));
     }
 
     #[test]
@@ -1320,11 +1318,9 @@ mod tests {
         let mut draft = grok_bundle();
         draft.model_policy = Some(ModelPolicyKind::Passthrough);
         let error = draft.validate().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("passthrough Provider Bundle cannot define an upstream model")
-        );
+        assert!(error
+            .to_string()
+            .contains("passthrough Provider Bundle cannot define an upstream model"));
     }
 
     #[test]
@@ -1358,13 +1354,11 @@ mod tests {
 
         draft.model_policy_scope = ModelPolicyScope::Global;
         draft.model_policy = Some(ModelPolicyKind::Passthrough);
-        assert!(
-            draft
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires per-app model policies")
-        );
+        assert!(draft
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires per-app model policies"));
     }
 
     #[test]
@@ -1408,10 +1402,8 @@ mod tests {
         let mut draft = grok_bundle();
         draft.model_policy_scope = ModelPolicyScope::PerApp;
         let error = draft.validate().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("per-app Provider Bundle cannot define a global model policy")
-        );
+        assert!(error
+            .to_string()
+            .contains("per-app Provider Bundle cannot define a global model policy"));
     }
 }

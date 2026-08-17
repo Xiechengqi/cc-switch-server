@@ -107,7 +107,7 @@
     "familySearchEmpty": "没有匹配的供应商类型。",
     "familySearchPlaceholder": "搜索名称、App 或认证方式",
     "familySummary": "将创建 {{apps}}，认证方式为 {{auth}}。{{credential}}",
-    "firstByteTimeout": "首字节超时（毫秒）",
+    "firstByteTimeout": "首字节超时（秒）",
     "groupAggregator": "聚合与云",
     "groupChinaPlan": "国内套餐",
     "groupCustom": "自建",
@@ -132,7 +132,7 @@
     "queryCredential": "Query 值",
     "quickPreset": "快捷预设",
     "recipeAnthropicBearerRelay": "Anthropic 兼容 Bearer 中继",
-    "requestTimeout": "请求超时（毫秒）",
+    "requestTimeout": "请求超时（秒）",
     "saved": "供应商已保存",
     "selectAccount": "选择 OAuth 账号",
     "stepFamily": "选择类型",
@@ -142,7 +142,7 @@
     "surfaceEnabled": "启用 API",
     "surfaceOff": "关",
     "surfaces": "应用接口",
-    "streamIdleTimeout": "流空闲超时（毫秒）",
+    "streamIdleTimeout": "流空闲超时（秒）",
     "surfaceTestModelOverrides": "按 App 测试模型特例",
     "testApp": "测试 App",
     "testModel": "测试模型",
@@ -358,11 +358,10 @@
     },
     "advanced": {
       "providerDefaults": {
-        "title": "供应商运行默认值",
-        "description": "设置供应商请求超时与各 App 测试模型的 Server 继承起点",
+        "title": "供应商请求默认值",
+        "description": "设置供应商请求、首字节和流空闲超时的 Server 默认值",
         "transportTitle": "请求超时默认值",
-        "modelsTitle": "测试模型默认值",
-        "invalid": "请检查超时范围和测试模型"
+        "invalid": "请检查超时范围"
       },
       "apiManagement": {
         "revokeTokenConfirm": "撤销后，当前调试令牌将立即失效。"

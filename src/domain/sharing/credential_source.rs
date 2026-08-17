@@ -6,7 +6,7 @@ use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::credentials::split_provider_credentials;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::registry::{
-    CredentialPolicy, CredentialSourceScope, family_for_profile, profile_by_id,
+    family_for_profile, profile_by_id, CredentialPolicy, CredentialSourceScope,
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
@@ -314,7 +314,7 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::Account;
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::providers::registry::{ProfileId, provider_registry};
+    use crate::domain::providers::registry::{provider_registry, ProfileId};
     use crate::domain::providers::store::ProviderResourceMetadata;
 
     fn account(id: &str) -> Account {
@@ -592,10 +592,12 @@ mod tests {
             },
         ];
 
-        assert!(
-            shared_credential_source_for_bindings(&providers, &AccountStore::default(), &bindings)
-                .is_ok()
-        );
+        assert!(shared_credential_source_for_bindings(
+            &providers,
+            &AccountStore::default(),
+            &bindings
+        )
+        .is_ok());
     }
 
     #[test]
@@ -657,16 +659,14 @@ mod tests {
             shared_credential_source_for_bindings(&providers, &AccountStore::default(), &bindings),
             Err(CredentialSourceError::ReuseUnsupported { .. })
         ));
-        assert!(
-            resolve_provider_credential_source(
-                &providers,
-                &AccountStore::default(),
-                AppKind::Claude,
-                "custom-bundle"
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(resolve_provider_credential_source(
+            &providers,
+            &AccountStore::default(),
+            AppKind::Claude,
+            "custom-bundle"
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

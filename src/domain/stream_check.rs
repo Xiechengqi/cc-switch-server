@@ -2,95 +2,9 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::domain::providers::model::AppKind;
+use crate::domain::providers::runtime::ProviderHealthCheckConfig;
 use crate::domain::providers::store::StoredProvider;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreamCheckConfig {
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_degraded_threshold_ms")]
-    pub degraded_threshold_ms: u64,
-    #[serde(default = "default_claude_model")]
-    pub claude_model: String,
-    #[serde(default = "default_codex_model")]
-    pub codex_model: String,
-    #[serde(default = "default_gemini_model")]
-    pub gemini_model: String,
-    #[serde(default = "default_test_prompt")]
-    pub test_prompt: String,
-}
-
-fn default_timeout_secs() -> u64 {
-    45
-}
-
-fn default_max_retries() -> u32 {
-    2
-}
-
-fn default_degraded_threshold_ms() -> u64 {
-    6000
-}
-
-fn default_claude_model() -> String {
-    "claude-haiku-4-5-20251001".to_string()
-}
-
-fn default_codex_model() -> String {
-    "gpt-5.6-sol@low".to_string()
-}
-
-fn default_gemini_model() -> String {
-    "gemini-3.5-flash".to_string()
-}
-
-fn default_test_prompt() -> String {
-    "Who are you?".to_string()
-}
-
-impl Default for StreamCheckConfig {
-    fn default() -> Self {
-        Self {
-            timeout_secs: default_timeout_secs(),
-            max_retries: default_max_retries(),
-            degraded_threshold_ms: default_degraded_threshold_ms(),
-            claude_model: default_claude_model(),
-            codex_model: default_codex_model(),
-            gemini_model: default_gemini_model(),
-            test_prompt: default_test_prompt(),
-        }
-    }
-}
-
-impl StreamCheckConfig {
-    pub fn validate_probe_settings(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            (2..=60).contains(&self.timeout_secs),
-            "stream-check timeoutSecs must be between 2 and 60"
-        );
-        anyhow::ensure!(
-            self.max_retries <= 5,
-            "stream-check maxRetries must be between 0 and 5"
-        );
-        anyhow::ensure!(
-            (1_000..=30_000).contains(&self.degraded_threshold_ms),
-            "stream-check degradedThresholdMs must be between 1000 and 30000"
-        );
-        anyhow::ensure!(
-            !self.test_prompt.trim().is_empty()
-                && self.test_prompt == self.test_prompt.trim()
-                && self.test_prompt.len() <= 1_000,
-            "stream-check testPrompt must be non-empty, trimmed, and at most 1000 characters"
-        );
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -128,42 +42,17 @@ pub struct StreamCheckResult {
     pub cache_creation_tokens: u32,
 }
 
-pub fn stream_check_config_from_value(value: &Value) -> StreamCheckConfig {
-    serde_json::from_value(value.clone()).unwrap_or_default()
-}
-
-pub fn resolve_test_model(
-    app: AppKind,
-    stored: &StoredProvider,
-    config: &StreamCheckConfig,
-) -> String {
-    stored
-        .provider
-        .extra
-        .get("testModel")
-        .or_else(|| stored.provider.settings_config.get("model"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| match app {
-            AppKind::Claude => config.claude_model.clone(),
-            AppKind::Codex => config.codex_model.clone(),
-            AppKind::Gemini => config.gemini_model.clone(),
-        })
-}
-
 pub async fn check_provider_reachability(
     http_client: &Client,
     stored: &StoredProvider,
-    config: &StreamCheckConfig,
+    model: &str,
+    config: &ProviderHealthCheckConfig,
     resolve_probe_url: impl Fn(&StoredProvider, &str) -> Result<String, String>,
 ) -> StreamCheckResult {
-    let effective = merge_provider_config(stored, config);
     let mut last_result = None;
-    for attempt in 0..=effective.max_retries {
-        let result = check_once(http_client, stored, &effective, &resolve_probe_url).await;
-        if result.success || attempt >= effective.max_retries {
+    for attempt in 0..=config.max_retries {
+        let result = check_once(http_client, stored, model, config, &resolve_probe_url).await;
+        if result.success || attempt >= config.max_retries {
             return StreamCheckResult {
                 retry_count: attempt,
                 ..result
@@ -178,51 +67,27 @@ pub async fn check_provider_reachability(
             ..result
         };
     }
-    last_result.unwrap_or_else(|| failed_result("Check failed", effective.max_retries))
-}
-
-fn merge_provider_config(stored: &StoredProvider, global: &StreamCheckConfig) -> StreamCheckConfig {
-    let test_model = stored
-        .provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.test_config.as_ref())
-        .and_then(|value| {
-            value
-                .get("testModel")
-                .or_else(|| value.get("test_model"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    let mut config = global.clone();
-    if let Some(model) = test_model {
-        match stored.app {
-            AppKind::Claude => config.claude_model = model,
-            AppKind::Codex => config.codex_model = model,
-            AppKind::Gemini => config.gemini_model = model,
-        }
-    }
-    config
+    last_result.unwrap_or_else(|| failed_result("Check failed", config.max_retries))
 }
 
 async fn check_once(
     http_client: &Client,
     stored: &StoredProvider,
-    config: &StreamCheckConfig,
+    model: &str,
+    config: &ProviderHealthCheckConfig,
     resolve_probe_url: &impl Fn(&StoredProvider, &str) -> Result<String, String>,
 ) -> StreamCheckResult {
     let started = Instant::now();
-    let model = resolve_test_model(stored.app, stored, config);
     let probe_url = match resolve_probe_url(stored, &model) {
         Ok(url) => url,
         Err(message) => {
             return failed_result(message, 0);
         }
     };
-    let timeout = Duration::from_secs(config.timeout_secs);
+    let timeout = Duration::from_secs(config.timeout_seconds);
     let result = probe_reachability(http_client, &probe_url, timeout).await;
     let response_time = started.elapsed().as_millis() as u64;
-    build_reachability_result(result, response_time, config.degraded_threshold_ms)
+    build_reachability_result(result, response_time, config.degraded_threshold_ms())
 }
 
 pub fn reachability_origin(endpoint: &str) -> String {

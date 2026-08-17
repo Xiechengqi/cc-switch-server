@@ -107,7 +107,7 @@
     "familySearchEmpty": "一致する Provider タイプがありません。",
     "familySearchPlaceholder": "名前、App、認証方式で検索",
     "familySummary": "{{apps}} を作成し、認証方式は {{auth}} です。{{credential}}",
-    "firstByteTimeout": "最初のバイトのタイムアウト（ミリ秒）",
+    "firstByteTimeout": "最初のバイトのタイムアウト（秒）",
     "groupAggregator": "アグリゲーターとクラウド",
     "groupChinaPlan": "中国プラン",
     "groupCustom": "カスタム",
@@ -132,7 +132,7 @@
     "queryCredential": "クエリ値",
     "quickPreset": "クイックプリセット",
     "recipeAnthropicBearerRelay": "Anthropic 互換 Bearer リレー",
-    "requestTimeout": "リクエストタイムアウト（ミリ秒）",
+    "requestTimeout": "リクエストタイムアウト（秒）",
     "saved": "Provider を保存しました",
     "selectAccount": "OAuth アカウントを選択",
     "stepFamily": "タイプを選択",
@@ -142,7 +142,7 @@
     "surfaceEnabled": "API を有効化",
     "surfaceOff": "オフ",
     "surfaces": "API Surface",
-    "streamIdleTimeout": "ストリームアイドルタイムアウト（ミリ秒）",
+    "streamIdleTimeout": "ストリームアイドルタイムアウト（秒）",
     "surfaceTestModelOverrides": "App ごとのテストモデル上書き",
     "testApp": "テスト App",
     "testModel": "テストモデル",
@@ -359,11 +359,10 @@
     },
     "advanced": {
       "providerDefaults": {
-        "title": "プロバイダー実行時の既定値",
-        "description": "プロバイダーのタイムアウトと App ごとのモデルテストに対する Server の継承元を設定します",
+        "title": "プロバイダーリクエストの既定値",
+        "description": "リクエスト、最初のバイト、ストリームアイドルの各タイムアウトに Server の既定値を設定します",
         "transportTitle": "リクエストタイムアウトの既定値",
-        "modelsTitle": "テストモデルの既定値",
-        "invalid": "タイムアウト範囲とテストモデルを確認してください"
+        "invalid": "タイムアウト範囲を確認してください"
       },
       "apiManagement": {
         "revokeTokenConfirm": "取り消すと、現在のデバッグトークンは直ちに無効になります。"

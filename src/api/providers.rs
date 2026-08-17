@@ -1,5 +1,6 @@
 use super::*;
 use crate::domain::providers::registry::ProviderKey;
+use crate::domain::providers::runtime::PROVIDER_MODEL_PROBE_PROMPT;
 
 const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -641,16 +642,22 @@ pub(in crate::api) async fn test_provider(
 ) -> Result<Json<TestProviderResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let health_config = if query.network.unwrap_or(false) {
-        Some(web_stream_check_config(&state).await)
+        Some(web_provider_health_check_config(&state).await)
     } else {
         None
     };
+    if query.timeout_ms.is_none() {
+        query.timeout_ms = health_config
+            .as_ref()
+            .map(|config| config.timeout_seconds.saturating_mul(1_000));
+    }
     if query.test_prompt.is_none() {
         query.test_prompt = health_config
             .as_ref()
-            .map(|config| config.test_prompt.clone());
+            .map(|_| PROVIDER_MODEL_PROBE_PROMPT.to_string());
     }
     let execution = resolve_provider_execution_by_key(&state, query.app, &id).await?;
+    let expected_health_fingerprint = execution.plan.health_fingerprint();
     let provider = execution.runtime_stored_view();
     let response = test_provider_inner(&state, execution, &query).await?;
     if let Some(config) = health_config.as_ref() {
@@ -659,6 +666,7 @@ pub(in crate::api) async fn test_provider(
             &provider,
             &response,
             config,
+            &expected_health_fingerprint,
             "cc-switch-manual",
         )
         .await
@@ -781,22 +789,27 @@ pub(in crate::api) async fn test_providers(
         .map_err(ApiError::proxy)?;
     drop(providers);
     let health_config = if input.network.unwrap_or(false) {
-        Some(web_stream_check_config(&state).await)
+        Some(web_provider_health_check_config(&state).await)
     } else {
         None
     };
     let mut results = Vec::new();
     for execution in selected {
+        let expected_health_fingerprint = execution.plan.health_fingerprint();
         let provider = execution.runtime_stored_view();
         let query = TestProviderQuery {
             app: execution.stored.app,
             network: input.network,
-            timeout_ms: input.timeout_ms,
+            timeout_ms: input.timeout_ms.or_else(|| {
+                health_config
+                    .as_ref()
+                    .map(|config| config.timeout_seconds.saturating_mul(1_000))
+            }),
             model: input.model.clone(),
             test_prompt: input.test_prompt.clone().or_else(|| {
                 health_config
                     .as_ref()
-                    .map(|config| config.test_prompt.clone())
+                    .map(|_| PROVIDER_MODEL_PROBE_PROMPT.to_string())
             }),
             stream: input.stream,
         };
@@ -808,6 +821,7 @@ pub(in crate::api) async fn test_providers(
                     &provider,
                     &response,
                     config,
+                    &expected_health_fingerprint,
                     "cc-switch-manual",
                 )
                 .await
@@ -2880,7 +2894,7 @@ pub(in crate::api) fn provider_test_model(
     app: AppKind,
     stored: &StoredProvider,
     override_model: Option<&str>,
-    defaults: Option<&crate::domain::stream_check::StreamCheckConfig>,
+    defaults: Option<&crate::domain::providers::runtime::ProviderHealthCheckConfig>,
 ) -> String {
     let defaults = defaults.cloned().unwrap_or_default();
     if crate::domain::providers::bundle::is_explicit_bundle_surface(&stored.provider) {
@@ -2903,9 +2917,9 @@ pub(in crate::api) fn provider_test_model(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| match app {
-                AppKind::Claude => defaults.claude_model,
-                AppKind::Codex => defaults.codex_model,
-                AppKind::Gemini => defaults.gemini_model,
+                AppKind::Claude => defaults.test_models.claude,
+                AppKind::Codex => defaults.test_models.codex,
+                AppKind::Gemini => defaults.test_models.gemini,
             });
         return if stored.provider_type == ProviderType::CodexOAuth && app == AppKind::Codex {
             normalize_codex_oauth_test_model(&resolved)
@@ -2978,9 +2992,9 @@ pub(in crate::api) fn provider_test_model(
         })
         .or_else(|| extract_codex_model_from_settings(&stored.provider.settings_config))
         .unwrap_or_else(|| match app {
-            AppKind::Claude => defaults.claude_model.clone(),
-            AppKind::Codex => defaults.codex_model.clone(),
-            AppKind::Gemini => defaults.gemini_model.clone(),
+            AppKind::Claude => defaults.test_models.claude.clone(),
+            AppKind::Codex => defaults.test_models.codex.clone(),
+            AppKind::Gemini => defaults.test_models.gemini.clone(),
         });
 
     if stored.provider_type == ProviderType::CodexOAuth && app == AppKind::Codex {
@@ -3011,7 +3025,7 @@ fn extract_codex_model_from_settings(settings: &serde_json::Value) -> Option<Str
 fn normalize_codex_oauth_test_model(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
-        return "gpt-5.6-sol@low".to_string();
+        return "gpt-5.6-luna@low".to_string();
     }
     if trimmed.contains('@') || trimmed.contains('#') {
         return trimmed.to_string();
@@ -4735,6 +4749,29 @@ mod tests {
         assert_eq!(
             provider_test_model(AppKind::Codex, &stored, None, None),
             "gpt-5.6-sol@low"
+        );
+    }
+
+    #[test]
+    fn codex_oauth_test_model_defaults_to_luna() {
+        let stored = StoredProvider {
+            app: AppKind::Codex,
+            provider: Provider {
+                id: "p1".to_string(),
+                name: "OpenAI OAuth".to_string(),
+                settings_config: json!({}),
+                category: Some("official".to_string()),
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CodexOAuth,
+            provider_type_id: "codex_oauth".to_string(),
+            resource: Default::default(),
+        };
+
+        assert_eq!(
+            provider_test_model(AppKind::Codex, &stored, None, None),
+            "gpt-5.6-luna@low"
         );
     }
 

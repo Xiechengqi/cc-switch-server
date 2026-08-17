@@ -22,10 +22,60 @@ use super::registry::{
 };
 use super::store::{ProviderStore, StoredProvider};
 
-pub const MIN_PROVIDER_TIMEOUT_MS: u64 = 1_000;
-pub const MAX_PROVIDER_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
-pub const MAX_PROVIDER_FIRST_BYTE_TIMEOUT_MS: u64 = 600_000;
-pub const MAX_PROVIDER_IDLE_TIMEOUT_MS: u64 = 3_600_000;
+pub const MIN_PROVIDER_TIMEOUT_SECONDS: u64 = 1;
+pub const MAX_PROVIDER_REQUEST_TIMEOUT_SECONDS: u64 = 3_600;
+pub const MAX_PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS: u64 = 600;
+pub const MAX_PROVIDER_IDLE_TIMEOUT_SECONDS: u64 = 3_600;
+pub const PROVIDER_MODEL_PROBE_PROMPT: &str = "ping";
+const PROVIDER_MODEL_PROBE_PAYLOAD_REVISION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRequestDefaults {
+    pub request_timeout_seconds: u64,
+    pub stream_first_byte_timeout_seconds: u64,
+    pub stream_idle_timeout_seconds: u64,
+}
+
+impl Default for ProviderRequestDefaults {
+    fn default() -> Self {
+        Self {
+            request_timeout_seconds: 300,
+            stream_first_byte_timeout_seconds: 120,
+            stream_idle_timeout_seconds: 300,
+        }
+    }
+}
+
+impl ProviderRequestDefaults {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_timeout_range(
+            "request timeout",
+            self.request_timeout_seconds,
+            MAX_PROVIDER_REQUEST_TIMEOUT_SECONDS,
+        )?;
+        validate_timeout_range(
+            "stream first-byte timeout",
+            self.stream_first_byte_timeout_seconds,
+            MAX_PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS,
+        )?;
+        validate_timeout_range(
+            "stream idle timeout",
+            self.stream_idle_timeout_seconds,
+            MAX_PROVIDER_IDLE_TIMEOUT_SECONDS,
+        )
+    }
+
+    pub fn transport_defaults(&self) -> ProviderTransportDefaults {
+        ProviderTransportDefaults {
+            timeout_ms: self.request_timeout_seconds.saturating_mul(1_000),
+            stream_first_byte_timeout_ms: self
+                .stream_first_byte_timeout_seconds
+                .saturating_mul(1_000),
+            stream_idle_timeout_ms: self.stream_idle_timeout_seconds.saturating_mul(1_000),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -37,30 +87,22 @@ pub struct ProviderTransportDefaults {
 
 impl Default for ProviderTransportDefaults {
     fn default() -> Self {
-        Self {
-            timeout_ms: 300_000,
-            stream_first_byte_timeout_ms: 120_000,
-            stream_idle_timeout_ms: 300_000,
-        }
+        ProviderRequestDefaults::default().transport_defaults()
     }
 }
 
 impl ProviderTransportDefaults {
     pub fn validate(&self) -> anyhow::Result<()> {
-        validate_timeout_range(
-            "request timeout",
-            self.timeout_ms,
-            MAX_PROVIDER_REQUEST_TIMEOUT_MS,
-        )?;
-        validate_timeout_range(
+        validate_timeout_range_ms("request timeout", self.timeout_ms, 3_600_000)?;
+        validate_timeout_range_ms(
             "stream first-byte timeout",
             self.stream_first_byte_timeout_ms,
-            MAX_PROVIDER_FIRST_BYTE_TIMEOUT_MS,
+            600_000,
         )?;
-        validate_timeout_range(
+        validate_timeout_range_ms(
             "stream idle timeout",
             self.stream_idle_timeout_ms,
-            MAX_PROVIDER_IDLE_TIMEOUT_MS,
+            3_600_000,
         )
     }
 }
@@ -77,7 +119,7 @@ impl Default for ProviderTestModelDefaults {
     fn default() -> Self {
         Self {
             claude: "claude-haiku-4-5-20251001".to_string(),
-            codex: "gpt-5.6-sol@low".to_string(),
+            codex: "gpt-5.6-luna@low".to_string(),
             gemini: "gemini-3.5-flash".to_string(),
         }
     }
@@ -109,16 +151,87 @@ impl ProviderTestModelDefaults {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProviderRuntimeDefaults {
-    #[serde(default)]
-    pub transport: ProviderTransportDefaults,
-    #[serde(default)]
+pub struct ProviderHealthCheckConfig {
+    pub timeout_seconds: u64,
+    pub max_retries: u32,
+    pub degraded_threshold_seconds: u64,
     pub test_models: ProviderTestModelDefaults,
 }
 
+impl Default for ProviderHealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 45,
+            max_retries: 2,
+            degraded_threshold_seconds: 6,
+            test_models: ProviderTestModelDefaults::default(),
+        }
+    }
+}
+
+impl ProviderHealthCheckConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (2..=60).contains(&self.timeout_seconds),
+            "Provider health-check timeoutSeconds must be between 2 and 60"
+        );
+        anyhow::ensure!(
+            self.max_retries <= 5,
+            "Provider health-check maxRetries must be between 0 and 5"
+        );
+        anyhow::ensure!(
+            (1..=30).contains(&self.degraded_threshold_seconds),
+            "Provider health-check degradedThresholdSeconds must be between 1 and 30"
+        );
+        self.test_models.validate()
+    }
+
+    pub fn degraded_threshold_ms(&self) -> u64 {
+        self.degraded_threshold_seconds.saturating_mul(1_000)
+    }
+
+    fn probe_policy_fingerprint(&self) -> String {
+        runtime_fingerprint(&json!({
+            "payloadRevision": PROVIDER_MODEL_PROBE_PAYLOAD_REVISION,
+            "timeoutSeconds": self.timeout_seconds,
+            "maxRetries": self.max_retries,
+            "degradedThresholdSeconds": self.degraded_threshold_seconds,
+        }))
+        .expect("Provider probe policy fingerprint input is serializable")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRuntimeDefaults {
+    pub transport: ProviderTransportDefaults,
+    pub test_models: ProviderTestModelDefaults,
+    pub probe_policy_fingerprint: String,
+}
+
+impl Default for ProviderRuntimeDefaults {
+    fn default() -> Self {
+        Self::from_settings(
+            &ProviderRequestDefaults::default(),
+            &ProviderHealthCheckConfig::default(),
+        )
+    }
+}
+
 impl ProviderRuntimeDefaults {
+    pub fn from_settings(
+        request: &ProviderRequestDefaults,
+        health: &ProviderHealthCheckConfig,
+    ) -> Self {
+        Self {
+            transport: request.transport_defaults(),
+            test_models: health.test_models.clone(),
+            probe_policy_fingerprint: health.probe_policy_fingerprint(),
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         self.transport.validate()?;
         self.test_models.validate()
@@ -126,8 +239,15 @@ impl ProviderRuntimeDefaults {
 }
 
 fn validate_timeout_range(label: &str, value: u64, max: u64) -> anyhow::Result<()> {
-    if !(MIN_PROVIDER_TIMEOUT_MS..=max).contains(&value) {
-        bail!("{label} must be between {MIN_PROVIDER_TIMEOUT_MS} and {max} milliseconds");
+    if !(MIN_PROVIDER_TIMEOUT_SECONDS..=max).contains(&value) {
+        bail!("{label} must be between {MIN_PROVIDER_TIMEOUT_SECONDS} and {max} seconds");
+    }
+    Ok(())
+}
+
+fn validate_timeout_range_ms(label: &str, value: u64, max: u64) -> anyhow::Result<()> {
+    if !(1_000..=max).contains(&value) {
+        bail!("{label} must be between 1000 and {max} milliseconds");
     }
     Ok(())
 }
@@ -234,6 +354,7 @@ pub struct ProviderRuntimePlan {
     pub coding_plan: Option<RuntimeCodingPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_model: Option<String>,
+    pub probe_policy_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +375,7 @@ impl ProviderRuntimePlan {
         runtime_fingerprint(&json!({
             "runtimeFingerprint": self.runtime_fingerprint,
             "testModel": self.test_model,
+            "probePolicyFingerprint": self.probe_policy_fingerprint,
         }))
         .expect("Provider health fingerprint input is serializable")
     }
@@ -498,6 +620,7 @@ pub fn compile_runtime_plan_with_defaults(
         model_policy,
         coding_plan,
         test_model,
+        probe_policy_fingerprint: defaults.probe_policy_fingerprint.clone(),
         aws_region,
         media_policy,
         transport_policy,
@@ -1358,6 +1481,22 @@ mod tests {
     use crate::domain::providers::registry::{CredentialPolicy, DriverBinding, ProfileSpec};
     use crate::domain::providers::store::ProviderResourceMetadata;
 
+    #[test]
+    fn provider_settings_defaults_use_seconds_and_luna() {
+        let request = ProviderRequestDefaults::default();
+        let health = ProviderHealthCheckConfig::default();
+        let runtime = ProviderRuntimeDefaults::from_settings(&request, &health);
+
+        assert_eq!(request.request_timeout_seconds, 300);
+        assert_eq!(request.stream_first_byte_timeout_seconds, 120);
+        assert_eq!(request.stream_idle_timeout_seconds, 300);
+        assert_eq!(health.degraded_threshold_seconds, 6);
+        assert_eq!(health.test_models.codex, "gpt-5.6-luna@low");
+        assert_eq!(runtime.transport.timeout_ms, 300_000);
+        assert_eq!(runtime.transport.stream_first_byte_timeout_ms, 120_000);
+        assert_eq!(runtime.transport.stream_idle_timeout_ms, 300_000);
+    }
+
     fn provider(profile_id: &str, provider_type: ProviderType) -> StoredProvider {
         let profile = profile_by_id(profile_id).unwrap();
         let model_mapping = match profile.model_policy {
@@ -1654,6 +1793,7 @@ mod tests {
                 codex: "server-codex".to_string(),
                 gemini: "server-gemini".to_string(),
             },
+            probe_policy_fingerprint: "probe-policy".to_string(),
         };
 
         let inherited = compile_runtime_plan_with_defaults(&stored, &accounts, &defaults).unwrap();

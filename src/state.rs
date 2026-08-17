@@ -12,20 +12,20 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, broadcast, watch};
-use tokio::time::{Duration, Instant, sleep, timeout_at};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify, RwLock};
+use tokio::time::{sleep, timeout_at, Duration, Instant};
 
 use crate::api::web::coverage::ProviderCoverage;
 use crate::cli::Cli;
 use crate::clients::coding_plan_quota::{
-    CodingPlanQuotaCredentials, build_coding_plan_quota_client, fetch_coding_plan_quota,
+    build_coding_plan_quota_client, fetch_coding_plan_quota, CodingPlanQuotaCredentials,
 };
 use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
 use crate::clients::oauth::codex_reset_credits::{
-    AutoResetCreditCandidate, BankedResetActionError, select_auto_reset_credit,
-    stable_auto_reset_redeem_request_id,
+    select_auto_reset_credit, stable_auto_reset_redeem_request_id, AutoResetCreditCandidate,
+    BankedResetActionError,
 };
 use crate::clients::oauth::copilot_device;
 use crate::clients::oauth::grok_device::{
@@ -41,14 +41,14 @@ use crate::clients::oauth::qoder::{
     PendingQoderDeviceFlow, QoderDeviceFlowStore, QoderDevicePollLease, QoderDevicePollResult,
 };
 use crate::clients::oauth::quota::{
-    QUOTA_FAILURE_COOLDOWN_MS, QuotaRefreshResult, load_gemini_v1internal_project,
-    refresh_account_quota,
+    load_gemini_v1internal_project, refresh_account_quota, QuotaRefreshResult,
+    QUOTA_FAILURE_COOLDOWN_MS,
 };
 use crate::clients::oauth::refresh::{
-    AccountRefreshFailure, account_has_refresh_token, account_needs_native_refresh,
+    account_has_refresh_token, account_needs_native_refresh,
     execute_native_account_refresh_with_receipt_hook as execute_native_account_refresh_client,
     provider_native_refresh_available, record_refresh_flight_failure,
-    validate_native_account_refresh_receipt,
+    validate_native_account_refresh_receipt, AccountRefreshFailure,
 };
 use crate::clients::ollama_cloud::{OllamaCloudClient, OllamaCloudFetchError};
 use crate::clients::router::client::{
@@ -61,23 +61,23 @@ use crate::clients::router::tunnel::{
 };
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::{
-    AccountCredentialOwnership, AccountRefreshFlightFailure, AccountRefreshFlightFailureDetails,
-    AccountRefreshFlightStage, AccountRefreshGuard, AccountRefreshLocks,
-    account_credential_ownership,
+    account_credential_ownership, AccountCredentialOwnership, AccountRefreshFlightFailure,
+    AccountRefreshFlightFailureDetails, AccountRefreshFlightStage, AccountRefreshGuard,
+    AccountRefreshLocks,
 };
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    Account, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
     active_account_usage_block, effective_codex_workspace_id, gemini_v1internal_project_id,
-    native_refresh_snapshot_matches,
+    native_refresh_snapshot_matches, Account, AccountRefreshUpdate, AccountStore,
+    ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
-    ModelPolicyScope, ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
     bundle_family_id, bundle_id as provider_bundle_id, bundle_model_policy_scope,
     bundle_model_policy_source, bundle_test_app, credential_source_app, default_enabled_test_app,
     has_bundle_managed_metadata, is_explicit_bundle_surface, set_bundle_test_app,
-    set_surface_enabled, shared_credential_source_key, surface_enabled,
+    set_surface_enabled, shared_credential_source_key, surface_enabled, ModelPolicyScope,
+    ProviderBundleReferencePreview, ProviderBundleView, ProviderBundleWriteDraft,
 };
 use crate::domain::providers::coding_plan::{
     CodingPlanQuotaAdapter, CodingPlanQuotaCache, CodingPlanQuotaCacheKey,
@@ -85,28 +85,29 @@ use crate::domain::providers::coding_plan::{
     CodingPlanQuotaSpec, CodingPlanQuotaView,
 };
 use crate::domain::providers::credentials::{
-    CredentialPatch, ProviderAccountBindingMigrationItem, ProviderAccountBindingMigrationPreview,
+    merge_provider_credentials, reveal_provider_credential, CredentialPatch,
+    ProviderAccountBindingMigrationItem, ProviderAccountBindingMigrationPreview,
     ProviderAccountBindingMigrationStatus, ProviderCommandError, ProviderIdentityAction,
     ProviderIdentityChangePreview, ProviderImportAction, ProviderImportItemPreview,
     ProviderImportPreview, ProviderReferencePreview, ProviderRuntimeTransitionPreview,
-    ProviderView, ProviderWriteDraft, merge_provider_credentials, reveal_provider_credential,
+    ProviderView, ProviderWriteDraft,
 };
 use crate::domain::providers::model::{
-    AppKind, AuthBinding, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE, Provider, ProviderMeta, ProviderType,
+    AppKind, AuthBinding, Provider, ProviderMeta, ProviderType, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE,
 };
 use crate::domain::providers::ollama_cloud::{
-    OllamaCloudAccountView, OllamaCloudCache, OllamaCloudCacheKey, OllamaCloudErrorKind,
-    OllamaCloudObserved, OllamaCloudSection, OllamaCloudSectionState, OllamaCloudSnapshot,
-    OllamaCloudSnapshotSource, OllamaCloudUsageView, OllamaCloudUsageWindowKind,
-    snapshot_status as ollama_cloud_snapshot_status,
+    snapshot_status as ollama_cloud_snapshot_status, OllamaCloudAccountView, OllamaCloudCache,
+    OllamaCloudCacheKey, OllamaCloudErrorKind, OllamaCloudObserved, OllamaCloudSection,
+    OllamaCloudSectionState, OllamaCloudSnapshot, OllamaCloudSnapshotSource, OllamaCloudUsageView,
+    OllamaCloudUsageWindowKind,
 };
 use crate::domain::providers::registry::{
-    CreationPolicy, CredentialPolicy, CustomBindingInput, DriverBinding, ProfileId,
-    ProviderFieldScope, ProviderKey, profile_by_id, resolve_custom_binding,
+    profile_by_id, resolve_custom_binding, CreationPolicy, CredentialPolicy, CustomBindingInput,
+    DriverBinding, ProfileId, ProviderFieldScope, ProviderKey,
 };
 use crate::domain::providers::runtime::{
-    ProviderRuntimeDefaults, compile_runtime_plan_with_defaults, managed_account_binding,
-    managed_account_provider_type,
+    compile_runtime_plan_with_defaults, managed_account_binding, managed_account_provider_type,
+    ProviderHealthCheckConfig, ProviderRequestDefaults, ProviderRuntimeDefaults,
 };
 use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
 use crate::domain::router::{ClientSubdomain, PROTOCOL_EPOCH};
@@ -120,9 +121,9 @@ use crate::domain::sharing::previous_response_cache::{
     PreviousResponseCache, PreviousResponseCacheScope,
 };
 use crate::domain::sharing::router_contract::{
-    ShareAppProvider, ShareDescriptor, ShareRequestLogEntry, ShareSyncOperation,
-    ShareUpstreamProvider, ShareUpstreamQuota, ShareUpstreamQuotaTier,
-    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint,
+    descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint, ShareAppProvider,
+    ShareDescriptor, ShareRequestLogEntry, ShareSyncOperation, ShareUpstreamProvider,
+    ShareUpstreamQuota, ShareUpstreamQuotaTier,
 };
 use crate::domain::sharing::shares::{
     RouterDescriptorSyncMode, Share, ShareBinding, ShareConcurrencyLimit, ShareDeleteTombstone,
@@ -133,9 +134,9 @@ use crate::domain::usage::store::{
     UsageState, UsageStore,
 };
 use crate::logging::{
-    AuditCursor, AuditEvent, AuditLog, AuditRequestDetails, AuditUploadCursor, AuditWriteError,
-    LogTailAccessError, LogTailResponse, SharedAuditLog, SharedLogCapture, classify_network_error,
-    error_fingerprint, opaque_ref,
+    classify_network_error, error_fingerprint, opaque_ref, AuditCursor, AuditEvent, AuditLog,
+    AuditRequestDetails, AuditUploadCursor, AuditWriteError, LogTailAccessError, LogTailResponse,
+    SharedAuditLog, SharedLogCapture,
 };
 use crate::proxy::cursor::session::CursorSessionManager;
 
@@ -764,6 +765,8 @@ pub struct ServerStateInner {
     setup_flight: AsyncMutex<()>,
     router_share_sync: AsyncMutex<()>,
     share_edit_sync: AsyncMutex<()>,
+    pub(crate) provider_health_cycle: AsyncMutex<()>,
+    pub(crate) provider_health_cycle_pending: std::sync::atomic::AtomicBool,
     router_share_runtime_refreshes: Mutex<BTreeSet<String>>,
     router_request_log_sync_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
@@ -2760,7 +2763,7 @@ fn validate_server_backup_restore_stage(
             providers.prepare_legacy_runtime_view();
         }
         providers.validate_for_commit()?;
-        providers.set_runtime_defaults(effective_config.provider_runtime_defaults.clone());
+        providers.set_runtime_defaults(effective_config.provider_runtime_defaults());
         providers
             .rebuild_runtime_index(
                 staged_accounts
@@ -5558,7 +5561,7 @@ impl ServerStateInner {
         let reasoning_root_key = crate::infra::credentials::load_or_create_root_key(&config_dir)
             .context("resolve proxy reasoning bridge root key")?;
         crate::proxy::reasoning_bridge::initialize(&reasoning_root_key.key)?;
-        providers.set_runtime_defaults(config.provider_runtime_defaults.clone());
+        providers.set_runtime_defaults(config.provider_runtime_defaults());
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
@@ -5756,6 +5759,8 @@ impl ServerStateInner {
             setup_flight: AsyncMutex::new(()),
             router_share_sync: AsyncMutex::new(()),
             share_edit_sync: AsyncMutex::new(()),
+            provider_health_cycle: AsyncMutex::new(()),
+            provider_health_cycle_pending: std::sync::atomic::AtomicBool::new(false),
             router_share_runtime_refreshes: Mutex::new(BTreeSet::new()),
             router_request_log_sync_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
@@ -5912,7 +5917,8 @@ impl ServerStateInner {
         preserve_setup_completion_from_stale_snapshot(&current, &mut config);
         preserve_client_tunnel_claim_from_stale_snapshot(&current, &mut config);
         preserve_client_subdomain_adoption_from_stale_snapshot(&current, &mut config);
-        config.provider_runtime_defaults = current.provider_runtime_defaults.clone();
+        config.provider_request_defaults = current.provider_request_defaults.clone();
+        config.provider_health_check = current.provider_health_check.clone();
         let http_client = build_http_client()?;
         persist_state_snapshot(&self.config_dir, config.clone()).await?;
         *self.http_client.write().await = http_client;
@@ -5947,20 +5953,44 @@ impl ServerStateInner {
         .await
     }
 
-    pub async fn set_provider_runtime_defaults(
+    pub async fn set_provider_request_defaults(
         self: &Arc<Self>,
-        defaults: ProviderRuntimeDefaults,
+        defaults: ProviderRequestDefaults,
     ) -> anyhow::Result<()> {
         defaults.validate()?;
+        self.set_provider_runtime_settings(
+            move |config| config.provider_request_defaults = defaults,
+            "provider_request_defaults_updated",
+        )
+        .await
+    }
+
+    pub async fn set_provider_health_check_config(
+        self: &Arc<Self>,
+        config: ProviderHealthCheckConfig,
+    ) -> anyhow::Result<()> {
+        config.validate()?;
+        self.set_provider_runtime_settings(
+            move |server_config| server_config.provider_health_check = config,
+            "provider_health_check_updated",
+        )
+        .await
+    }
+
+    async fn set_provider_runtime_settings(
+        self: &Arc<Self>,
+        update: impl FnOnce(&mut ServerConfig),
+        event_message: &'static str,
+    ) -> anyhow::Result<()> {
         let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
         let provider_keys = {
             let _config_commit = self.config_persistence.gate.lock().await;
             let mut candidate_config = self.config.read().await.clone();
-            candidate_config.provider_runtime_defaults = defaults.clone();
+            update(&mut candidate_config);
             let mut candidate_providers = self.providers.read().await.clone();
             let accounts = self.accounts.read().await.clone();
-            candidate_providers.set_runtime_defaults(defaults);
+            candidate_providers.set_runtime_defaults(candidate_config.provider_runtime_defaults());
             candidate_providers
                 .rebuild_runtime_index(&accounts)
                 .context("compile Provider runtime index for Server defaults")?;
@@ -6000,10 +6030,7 @@ impl ServerStateInner {
                 .collect::<Vec<_>>()
         };
         if !refreshed_share_ids.is_empty() {
-            self.emit_event(
-                ServerEvent::new("share.changed", "share")
-                    .message("provider_runtime_defaults_updated"),
-            );
+            self.emit_event(ServerEvent::new("share.changed", "share").message(event_message));
         }
         let router_registered = self
             .config_snapshot()
@@ -6021,7 +6048,7 @@ impl ServerStateInner {
                     tracing::warn!(
                         share_count = share_ids.len(),
                         %error,
-                        "Provider runtime defaults Share projection sync remains pending"
+                        "Provider settings Share projection sync remains pending"
                     );
                 }
             });
@@ -6760,7 +6787,7 @@ impl ServerStateInner {
             .context("resolve proxy reasoning bridge root key")?;
         let mut providers = ProviderStore::load_runtime_or_default(&self.config_dir)?;
         let accounts = AccountStore::load_or_default(&self.config_dir)?;
-        providers.set_runtime_defaults(config.provider_runtime_defaults.clone());
+        providers.set_runtime_defaults(config.provider_runtime_defaults());
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
@@ -9925,7 +9952,7 @@ impl ServerStateInner {
         Result<Account, crate::domain::sharing::subscription_identity::CodexWorkspaceRebindError>,
     > {
         use crate::domain::sharing::subscription_identity::{
-            CodexWorkspaceRebindError, validate_subscription_reference_graph_transition,
+            validate_subscription_reference_graph_transition, CodexWorkspaceRebindError,
         };
 
         let account_id = account_id.as_str();
@@ -10111,8 +10138,8 @@ impl ServerStateInner {
         >,
     > {
         use crate::domain::sharing::subscription_identity::{
-            CodexWorkspaceRebindError, validate_share_subscription_binding,
-            validate_subscription_reference_graph_transition,
+            validate_share_subscription_binding, validate_subscription_reference_graph_transition,
+            CodexWorkspaceRebindError,
         };
 
         let share_id = share_id.as_str();
@@ -10677,24 +10704,22 @@ impl ServerStateInner {
     ) -> anyhow::Result<Option<crate::domain::health::ProviderHealthSnapshot>> {
         let event_app = observation.app;
         let event_provider_id = observation.provider_id.clone();
-        {
-            let providers = self.providers.read().await;
-            let Some(provider) = providers.providers.iter().find(|provider| {
-                provider.app == observation.app && provider.provider.id == observation.provider_id
-            }) else {
-                return Ok(None);
+        let providers = self.providers.read().await;
+        let Some(provider) = providers.providers.iter().find(|provider| {
+            provider.app == observation.app && provider.provider.id == observation.provider_id
+        }) else {
+            return Ok(None);
+        };
+        if provider.resource.revision != observation.provider_revision {
+            return Ok(None);
+        }
+        let runtime_matches =
+            match providers.runtime_plan(observation.app, &observation.provider_id) {
+                Some(plan) => plan.health_fingerprint() == observation.runtime_fingerprint,
+                None => observation.runtime_fingerprint.is_empty(),
             };
-            if provider.resource.revision != observation.provider_revision {
-                return Ok(None);
-            }
-            let runtime_matches =
-                match providers.runtime_plan(observation.app, &observation.provider_id) {
-                    Some(plan) => plan.health_fingerprint() == observation.runtime_fingerprint,
-                    None => observation.runtime_fingerprint.is_empty(),
-                };
-            if !runtime_matches {
-                return Ok(None);
-            }
+        if !runtime_matches {
+            return Ok(None);
         }
         let _commit = self.usage_persistence.gate.lock().await;
         let mut candidate = self.usage.read().await.clone();
@@ -10713,6 +10738,7 @@ impl ServerStateInner {
             .context("provider health persistence task panicked")??;
         *self.usage.write().await = candidate;
         self.usage_persistence.mark_published();
+        drop(providers);
         self.emit_event(
             ServerEvent::new("provider-health.changed", "provider_health")
                 .id(event_provider_id.clone())
@@ -13294,8 +13320,8 @@ impl ServerStateInner {
         #[cfg(test)] models_url_override: Option<&str>,
     ) -> crate::proxy::kimi_runtime::KimiModelCatalog {
         use crate::proxy::kimi_runtime::{
-            KimiModelCatalogScope, fetch_kimi_models, reviewed_fallback_catalog,
-            unavailable_catalog,
+            fetch_kimi_models, reviewed_fallback_catalog, unavailable_catalog,
+            KimiModelCatalogScope,
         };
 
         if self.credential_persistence_degraded()
@@ -13604,10 +13630,10 @@ impl ServerStateInner {
         request_timeout: Duration,
     ) -> Result<crate::proxy::qoder_runtime::PreparedQoderRuntime, QoderRuntimeError> {
         use crate::domain::qoder::{
-            QoderAccountProfile, QoderCosySession, QoderCredentialRail, machine_token_from_raw,
+            machine_token_from_raw, QoderAccountProfile, QoderCosySession, QoderCredentialRail,
         };
         use crate::proxy::qoder_runtime::{
-            PreparedQoderRuntime, QoderCachedSession, QoderRuntimeScope, parse_qoder_model_catalog,
+            parse_qoder_model_catalog, PreparedQoderRuntime, QoderCachedSession, QoderRuntimeScope,
         };
 
         if self.credential_persistence_degraded() {
@@ -18689,7 +18715,7 @@ mod tests {
 
     use crate::cli::Cli;
     use crate::clients::router::tunnel::TunnelRuntimeStatus;
-    use crate::domain::accounts::store::{Account, accounts_path};
+    use crate::domain::accounts::store::{accounts_path, Account};
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
@@ -18702,7 +18728,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use base64::Engine;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
@@ -19264,24 +19290,20 @@ mod tests {
 
         assert_eq!(router.batch_sizes.lock().await.as_slice(), &[1, 1]);
         assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 0);
-        assert!(
-            state
-                .shares
-                .read()
-                .await
-                .get("erroronly0")
-                .unwrap()
-                .router_last_sync_error
-                .is_none()
-        );
-        assert!(
-            ShareStore::load_or_default(&state.config_dir)
-                .unwrap()
-                .get("erroronly0")
-                .unwrap()
-                .router_last_sync_error
-                .is_none()
-        );
+        assert!(state
+            .shares
+            .read()
+            .await
+            .get("erroronly0")
+            .unwrap()
+            .router_last_sync_error
+            .is_none());
+        assert!(ShareStore::load_or_default(&state.config_dir)
+            .unwrap()
+            .get("erroronly0")
+            .unwrap()
+            .router_last_sync_error
+            .is_none());
         server.abort();
     }
 
@@ -19349,11 +19371,9 @@ mod tests {
         assert_eq!(cached.expires_at_ms, Some(now_ms + 120_000));
 
         let expiring = copilot_account_fixture(Some(now_ms + 59_000));
-        assert!(
-            cached_copilot_auth_from_account(&expiring, &domain, now_ms)
-                .unwrap()
-                .is_none()
-        );
+        assert!(cached_copilot_auth_from_account(&expiring, &domain, now_ms)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -19595,11 +19615,9 @@ mod tests {
                 ..
             })
         ));
-        assert!(
-            !after
-                .capability_observations
-                .contains_key("github_copilot_code_plan:model_catalog")
-        );
+        assert!(!after
+            .capability_observations
+            .contains_key("github_copilot_code_plan:model_catalog"));
         server.abort();
         drop(state);
         fs::remove_dir_all(config_dir).unwrap();
@@ -20561,12 +20579,10 @@ mod tests {
             if expected_failures < ROUTER_HEARTBEAT_SUSTAINED_FAILURES {
                 assert!(failed.last_router_error.is_none());
             } else {
-                assert!(
-                    failed
-                        .last_router_error
-                        .as_deref()
-                        .is_some_and(|error| error.contains("temporarily unavailable"))
-                );
+                assert!(failed
+                    .last_router_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("temporarily unavailable")));
             }
             assert_eq!(consecutive_failures, expected_failures);
         }
@@ -20618,12 +20634,10 @@ mod tests {
 
         let shares = state.shares.read().await;
         assert!(!shares.router_registered);
-        assert!(
-            shares
-                .last_router_error
-                .as_deref()
-                .is_some_and(|error| error.contains("404 Not Found"))
-        );
+        assert!(shares
+            .last_router_error
+            .as_deref()
+            .is_some_and(|error| error.contains("404 Not Found")));
         assert_eq!(shares.last_router_heartbeat_ms, Some(123));
         assert_eq!(consecutive_failures, ROUTER_HEARTBEAT_SUSTAINED_FAILURES);
         server.abort();
@@ -20842,12 +20856,10 @@ mod tests {
         drop(share_syncs);
         let shares = state.shares.read().await;
         assert!(!shares.router_registered);
-        assert!(
-            shares
-                .last_router_error
-                .as_deref()
-                .is_some_and(|error| error.contains("requires registration"))
-        );
+        assert!(shares
+            .last_router_error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires registration")));
         server.abort();
     }
 
@@ -21186,18 +21198,14 @@ mod tests {
             SetupCompletionNotificationStatus::Pending
         );
         assert_eq!(notification.attempt_count, 1);
-        assert!(
-            notification
-                .next_attempt_at_ms
-                .zip(notification.last_attempt_at_ms)
-                .is_some_and(|(next, last)| next.saturating_sub(last) >= 60 * 60 * 1_000)
-        );
-        assert!(
-            notification
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("429"))
-        );
+        assert!(notification
+            .next_attempt_at_ms
+            .zip(notification.last_attempt_at_ms)
+            .is_some_and(|(next, last)| next.saturating_sub(last) >= 60 * 60 * 1_000));
+        assert!(notification
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("429")));
         let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
             &state.config_dir,
         ))
@@ -21252,12 +21260,10 @@ mod tests {
         );
         assert!(notification.password_hint.is_none());
         assert!(notification.next_attempt_at_ms.is_none());
-        assert!(
-            notification
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("422"))
-        );
+        assert!(notification
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("422")));
         let persisted = std::fs::read_to_string(crate::domain::settings::config::config_path(
             &state.config_dir,
         ))
@@ -21958,16 +21964,14 @@ mod tests {
         assert!(error.to_string().contains("401 Unauthorized"));
         assert!(!crate::client_tunnel_provision::is_router_unreachable_error(&error));
         assert_eq!(requests.lock().await.len(), 1);
-        assert!(
-            state
-                .config_snapshot()
-                .await
-                .router
-                .identity
-                .unwrap()
-                .installation_id
-                .is_empty()
-        );
+        assert!(state
+            .config_snapshot()
+            .await
+            .router
+            .identity
+            .unwrap()
+            .installation_id
+            .is_empty());
         server.abort();
     }
 
@@ -22037,20 +22041,16 @@ mod tests {
         );
 
         assert_eq!(router.prune_requests.load(AtomicOrdering::SeqCst), 2);
-        assert!(
-            state
-                .shares
-                .read()
-                .await
-                .router_share_prune_marker
-                .is_none()
-        );
-        assert!(
-            ShareStore::load_or_default(&state.config_dir)
-                .unwrap()
-                .router_share_prune_marker
-                .is_none()
-        );
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_marker
+            .is_none());
+        assert!(ShareStore::load_or_default(&state.config_dir)
+            .unwrap()
+            .router_share_prune_marker
+            .is_none());
         assert!(router.remote_share_ids.lock().await.contains("ghost-share"));
         server.abort();
     }
@@ -22076,13 +22076,11 @@ mod tests {
             vec!["localshare0".to_string()]
         );
         assert_eq!(first_router.prune_requests.load(AtomicOrdering::SeqCst), 1);
-        assert!(
-            state
-                .shares
-                .read()
-                .await
-                .router_share_prune_applied_for(&first_url, "inst-prune-target")
-        );
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_applied_for(&first_url, "inst-prune-target"));
 
         reconcile_all_shares_to_router(state.clone()).await.unwrap();
         assert_eq!(
@@ -22151,13 +22149,11 @@ mod tests {
             ]
         );
         assert_eq!(router.remote_share_ids.lock().await.len(), share_count);
-        assert!(
-            state
-                .shares
-                .read()
-                .await
-                .router_share_prune_applied_for(&router_url, "inst-prune-chunks")
-        );
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_applied_for(&router_url, "inst-prune-chunks"));
         server.abort();
     }
 
@@ -22197,13 +22193,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["retryshare0".to_string(), "retryshare1".to_string()]
         );
-        assert!(
-            state
-                .shares
-                .read()
-                .await
-                .router_share_prune_applied_for(&router_url, "inst-prune-retry")
-        );
+        assert!(state
+            .shares
+            .read()
+            .await
+            .router_share_prune_applied_for(&router_url, "inst-prune-retry"));
 
         run_periodic_share_sync_retry_once(&state).await;
         assert_eq!(router.prune_requests.load(AtomicOrdering::SeqCst), 2);
@@ -22283,20 +22277,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            restarted
-                .shares
-                .read()
-                .await
-                .pending_router_deletes
-                .is_empty()
-        );
-        assert!(
-            ShareStore::load_or_default(&config_dir)
-                .unwrap()
-                .pending_router_deletes
-                .is_empty()
-        );
+        assert!(restarted
+            .shares
+            .read()
+            .await
+            .pending_router_deletes
+            .is_empty());
+        assert!(ShareStore::load_or_default(&config_dir)
+            .unwrap()
+            .pending_router_deletes
+            .is_empty());
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
         server.abort();
     }
@@ -22416,12 +22406,10 @@ mod tests {
             }
         );
         assert!(state.shares.read().await.get("conditionaldelete").is_some());
-        assert!(
-            ShareStore::load_or_default(&config_dir)
-                .unwrap()
-                .get("conditionaldelete")
-                .is_some()
-        );
+        assert!(ShareStore::load_or_default(&config_dir)
+            .unwrap()
+            .get("conditionaldelete")
+            .is_some());
     }
 
     #[tokio::test]
@@ -22473,12 +22461,10 @@ mod tests {
                 3
             ]
         );
-        assert!(
-            requests
-                .iter()
-                .flat_map(|request| request["ops"].as_array().unwrap())
-                .all(|operation| operation["kind"] == "delete")
-        );
+        assert!(requests
+            .iter()
+            .flat_map(|request| request["ops"].as_array().unwrap())
+            .all(|operation| operation["kind"] == "delete"));
         assert!(state.shares.read().await.pending_router_deletes.is_empty());
         server.abort();
     }
@@ -22933,15 +22919,13 @@ mod tests {
         );
         let base_descriptor =
             descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
-        assert!(
-            base_descriptor
-                .app_runtimes
-                .codex
-                .as_ref()
-                .unwrap()
-                .quota
-                .is_none()
-        );
+        assert!(base_descriptor
+            .app_runtimes
+            .codex
+            .as_ref()
+            .unwrap()
+            .quota
+            .is_none());
 
         let initial_ops = build_router_share_upsert_ops_with_policy(
             &state,
@@ -23089,17 +23073,15 @@ mod tests {
         assert_eq!(failed.usage.state, OllamaCloudSectionState::Error);
         assert!(failed.account.data.is_none());
         assert!(failed.usage.data.is_none());
-        assert!(
-            state
-                .fresh_ollama_cloud_sections(
-                    &OllamaCloudCacheKey {
-                        credential_source_key: key,
-                        credential_generation: failed.credential_generation,
-                    },
-                    now_ms_i64(),
-                )
-                .is_none()
-        );
+        assert!(state
+            .fresh_ollama_cloud_sections(
+                &OllamaCloudCacheKey {
+                    credential_source_key: key,
+                    credential_generation: failed.credential_generation,
+                },
+                now_ms_i64(),
+            )
+            .is_none());
         server.abort();
     }
 
@@ -23147,11 +23129,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            state
-                .fresh_ollama_cloud_sections(&old_cache_key, now_ms_i64())
-                .is_none()
-        );
+        assert!(state
+            .fresh_ollama_cloud_sections(&old_cache_key, now_ms_i64())
+            .is_none());
         assert!(matches!(
             state.ollama_cloud_snapshot(codex_key, false).await.unwrap(),
             Err(ProviderCommandError::NotFound)
@@ -23561,25 +23541,21 @@ mod tests {
             .unwrap();
         assert_eq!(preview.revision, 1);
 
-        assert!(
-            state
-                .delete_provider_bundle_command("historical-collision".to_string(), 1)
-                .await
-                .unwrap()
-                .unwrap()
-        );
+        assert!(state
+            .delete_provider_bundle_command("historical-collision".to_string(), 1)
+            .await
+            .unwrap()
+            .unwrap());
         let remaining = state.providers_snapshot().await;
         assert_eq!(remaining.providers.len(), 1);
         assert_eq!(remaining.providers[0].app, AppKind::Gemini);
         assert_eq!(remaining.providers[0].resource.revision, 7);
 
-        assert!(
-            state
-                .delete_provider_command(AppKind::Gemini, "historical-collision".to_string(), 7)
-                .await
-                .unwrap()
-                .unwrap()
-        );
+        assert!(state
+            .delete_provider_command(AppKind::Gemini, "historical-collision".to_string(), 7)
+            .await
+            .unwrap()
+            .unwrap());
         assert!(state.providers_snapshot().await.providers.is_empty());
     }
 
@@ -23714,15 +23690,13 @@ mod tests {
         let existing = stored_provider_with_user_agent("codex.openai_api_key", "legacy-agent/1");
         let mut carried = existing.clone();
         normalize_provider_outbound_identity(&mut carried, Some(&existing), profile).unwrap();
-        assert!(
-            carried
-                .provider
-                .meta
-                .as_ref()
-                .unwrap()
-                .custom_user_agent
-                .is_none()
-        );
+        assert!(carried
+            .provider
+            .meta
+            .as_ref()
+            .unwrap()
+            .custom_user_agent
+            .is_none());
     }
 
     #[test]
@@ -23904,13 +23878,11 @@ mod tests {
             .unwrap()
             .health_fingerprint();
         let original = healthy_provider_observation(&created, &original_fingerprint, 1_000);
-        assert!(
-            state
-                .record_provider_health_observation(original.clone())
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(state
+            .record_provider_health_observation(original.clone())
+            .await
+            .unwrap()
+            .is_some());
 
         let updated = state
             .upsert_provider_command(
@@ -23928,24 +23900,20 @@ mod tests {
 
         let mut stale_revision = original;
         stale_revision.checked_at_ms = 2_000;
-        assert!(
-            state
-                .record_provider_health_observation(stale_revision)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(state
+            .record_provider_health_observation(stale_revision)
+            .await
+            .unwrap()
+            .is_none());
 
         let mut stale_fingerprint =
             healthy_provider_observation(&updated, "stale-runtime-fingerprint", 3_000);
         stale_fingerprint.provider_revision = updated.resource.revision;
-        assert!(
-            state
-                .record_provider_health_observation(stale_fingerprint)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(state
+            .record_provider_health_observation(stale_fingerprint)
+            .await
+            .unwrap()
+            .is_none());
 
         let snapshot = state
             .usage_snapshot()
@@ -23959,7 +23927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_runtime_defaults_refresh_share_health_and_router_projection() {
+    async fn provider_settings_refresh_share_health_and_router_projection() {
         let state = test_state();
         let created = state
             .upsert_provider_command(
@@ -23982,9 +23950,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let initial_defaults = state.config_snapshot().await.provider_runtime_defaults;
+        let initial_config = state.config_snapshot().await;
+        let initial_request_defaults = initial_config.provider_request_defaults;
+        let initial_health_config = initial_config.provider_health_check;
         state
-            .set_provider_runtime_defaults(initial_defaults.clone())
+            .set_provider_request_defaults(initial_request_defaults.clone())
             .await
             .unwrap();
         let initial_share = state
@@ -24040,16 +24010,21 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let mut changed_defaults = initial_defaults;
-        changed_defaults.transport.timeout_ms = 310_000;
-        changed_defaults.test_models.codex = "gpt-runtime-defaults-test".to_string();
+        let mut changed_request_defaults = initial_request_defaults;
+        changed_request_defaults.request_timeout_seconds = 310;
         state
-            .set_provider_runtime_defaults(changed_defaults.clone())
+            .set_provider_request_defaults(changed_request_defaults.clone())
+            .await
+            .unwrap();
+        let mut changed_health_config = initial_health_config;
+        changed_health_config.test_models.codex = "gpt-runtime-defaults-test".to_string();
+        state
+            .set_provider_health_check_config(changed_health_config.clone())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let router_received = router.batch_sizes.lock().await.len() >= 2;
+                let router_received = router.batch_sizes.lock().await.len() >= 3;
                 let projection_synced = {
                     let shares = state.shares.read().await;
                     shares.get("runtime-defaults-share").is_some_and(|share| {
@@ -24119,8 +24094,14 @@ mod tests {
         assert_eq!(
             ServerConfig::load_or_default(&state.config_dir)
                 .unwrap()
-                .provider_runtime_defaults,
-            changed_defaults
+                .provider_request_defaults,
+            changed_request_defaults
+        );
+        assert_eq!(
+            ServerConfig::load_or_default(&state.config_dir)
+                .unwrap()
+                .provider_health_check,
+            changed_health_config
         );
 
         state
@@ -24142,12 +24123,12 @@ mod tests {
             .unwrap()
             .config_revision;
         state
-            .set_provider_runtime_defaults(changed_defaults)
+            .set_provider_health_check_config(changed_health_config)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let router_received = router.batch_sizes.lock().await.len() >= 3;
+                let router_received = router.batch_sizes.lock().await.len() >= 4;
                 let projection_synced = {
                     let shares = state.shares.read().await;
                     shares.get("runtime-defaults-share").is_some_and(|share| {
@@ -24202,8 +24183,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let defaults = state.config_snapshot().await.provider_runtime_defaults;
-        state.set_provider_runtime_defaults(defaults).await.unwrap();
+        let defaults = state.config_snapshot().await.provider_request_defaults;
+        state.set_provider_request_defaults(defaults).await.unwrap();
         let providers = state.providers_snapshot().await;
         let accounts = state.accounts_snapshot().await;
         let capacity_key = crate::infra::credentials::load_root_key(&state.config_dir)
@@ -24316,25 +24297,21 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(
-            state
-                .delete_provider_command(
-                    AppKind::Codex,
-                    created.provider.id.clone(),
-                    created.resource.revision,
-                )
-                .await
-                .unwrap()
-                .unwrap()
-        );
-        assert!(
-            state
-                .usage_snapshot()
-                .await
-                .provider_health
-                .get(AppKind::Codex, &created.provider.id)
-                .is_none()
-        );
+        assert!(state
+            .delete_provider_command(
+                AppKind::Codex,
+                created.provider.id.clone(),
+                created.resource.revision,
+            )
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(state
+            .usage_snapshot()
+            .await
+            .provider_health
+            .get(AppKind::Codex, &created.provider.id)
+            .is_none());
         assert!(
             crate::domain::health::ProviderHealthStore::load_or_default(&state.config_dir)
                 .unwrap()
@@ -24555,12 +24532,10 @@ mod tests {
             stored.app == AppKind::Codex && stored.provider.id == "provider-cancelled-caller"
         }));
         let on_disk = ProviderStore::load_runtime_or_default(&config_dir).unwrap();
-        assert!(
-            on_disk
-                .providers
-                .iter()
-                .any(|stored| stored.provider.id == "provider-cancelled-caller")
-        );
+        assert!(on_disk
+            .providers
+            .iter()
+            .any(|stored| stored.provider.id == "provider-cancelled-caller"));
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -24678,13 +24653,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(provider_account_id(&stored), Some("provider-selection-a"));
-        assert!(
-            state
-                .accounts_snapshot()
-                .await
-                .active_codex_oauth_account_id
-                .is_none()
-        );
+        assert!(state
+            .accounts_snapshot()
+            .await
+            .active_codex_oauth_account_id
+            .is_none());
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -24947,13 +24920,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(
-            stored
-                .provider
-                .meta
-                .as_ref()
-                .is_none_or(|meta| meta.auth_binding.is_none())
-        );
+        assert!(stored
+            .provider
+            .meta
+            .as_ref()
+            .is_none_or(|meta| meta.auth_binding.is_none()));
         fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -25719,11 +25690,9 @@ mod tests {
             )
             .unwrap();
         assert!(pending_path.exists());
-        assert!(
-            !fs::read_to_string(&pending_path)
-                .unwrap()
-                .contains("restart-refresh-rotated")
-        );
+        assert!(!fs::read_to_string(&pending_path)
+            .unwrap()
+            .contains("restart-refresh-rotated"));
 
         drop(state);
         let restarted = test_state_at(config_dir.clone());
@@ -26170,12 +26139,10 @@ mod tests {
             .unwrap();
         assert!(account.needs_relogin);
         assert_eq!(account.token_refresh_generation, 1);
-        assert!(
-            account
-                .last_refresh_error
-                .as_deref()
-                .is_some_and(|error| error.contains("outcome is unknown"))
-        );
+        assert!(account
+            .last_refresh_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outcome is unknown")));
 
         let persisted = AccountStore::load_or_default(&config_dir).unwrap();
         assert!(
@@ -26966,30 +26933,24 @@ mod tests {
                 .unwrap();
         });
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut commit)
-                .await
-                .is_err()
-        );
-        assert!(
-            state
-                .providers_snapshot()
-                .await
-                .providers
-                .iter()
-                .all(|stored| stored.provider.id != "provider-reference-guard")
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut commit)
+            .await
+            .is_err());
+        assert!(state
+            .providers_snapshot()
+            .await
+            .providers
+            .iter()
+            .all(|stored| stored.provider.id != "provider-reference-guard"));
 
         drop(reference_guard);
         commit.await.unwrap();
-        assert!(
-            state
-                .providers_snapshot()
-                .await
-                .providers
-                .iter()
-                .any(|stored| stored.provider.id == "provider-reference-guard")
-        );
+        assert!(state
+            .providers_snapshot()
+            .await
+            .providers
+            .iter()
+            .any(|stored| stored.provider.id == "provider-reference-guard"));
     }
 
     #[tokio::test]
@@ -27035,12 +26996,10 @@ mod tests {
 
         let snapshot = state.providers_snapshot().await;
         for provider_id in ["provider-concurrent-a", "provider-concurrent-b"] {
-            assert!(
-                snapshot
-                    .providers
-                    .iter()
-                    .any(|stored| stored.provider.id == provider_id)
-            );
+            assert!(snapshot
+                .providers
+                .iter()
+                .any(|stored| stored.provider.id == provider_id));
         }
         let on_disk = ProviderStore::load_runtime_or_default(&state.config_dir).unwrap();
         assert_eq!(
@@ -27376,12 +27335,10 @@ mod tests {
         assert!(!codex_workspace_rebind_transaction_path(&config_dir).exists());
         assert!(!codex_workspace_rebind_stage_path(&config_dir).exists());
         let persisted = AccountStore::load_or_default(&config_dir).unwrap();
-        assert!(
-            persisted
-                .accounts
-                .iter()
-                .any(|account| account.id == "pending-transaction-account")
-        );
+        assert!(persisted
+            .accounts
+            .iter()
+            .any(|account| account.id == "pending-transaction-account"));
 
         drop(state);
         fs::remove_dir_all(config_dir).unwrap();
@@ -27809,20 +27766,16 @@ mod tests {
                 .unwrap(),
             Some(binding)
         );
-        assert!(
-            restored
-                .grok_media_task_binding("share-b", Some("owner@example.com"), "video-1")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            restored
-                .grok_media_task_binding("share-a", Some("other@example.com"), "video-1")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(restored
+            .grok_media_task_binding("share-b", Some("owner@example.com"), "video-1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(restored
+            .grok_media_task_binding("share-a", Some("other@example.com"), "video-1")
+            .await
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(config_dir).unwrap();
     }
 
@@ -27998,11 +27951,9 @@ mod tests {
         let diagnostic = failed.last_refresh_error.as_deref().unwrap();
         assert!(!diagnostic.contains("new-refresh"));
         assert!(diagnostic.contains("[REDACTED]"));
-        assert!(
-            !fs::read_to_string(accounts_path(&state.config_dir))
-                .unwrap()
-                .contains("new-refresh")
-        );
+        assert!(!fs::read_to_string(accounts_path(&state.config_dir))
+            .unwrap()
+            .contains("new-refresh"));
     }
 
     #[tokio::test]
@@ -28253,14 +28204,12 @@ mod tests {
             .await;
 
         assert!(result.is_none());
-        assert!(
-            state
-                .find_account_by_id(&stale.id)
-                .await
-                .unwrap()
-                .rate_limited_until
-                .is_none()
-        );
+        assert!(state
+            .find_account_by_id(&stale.id)
+            .await
+            .unwrap()
+            .rate_limited_until
+            .is_none());
     }
 
     #[tokio::test]
@@ -28335,43 +28284,37 @@ mod tests {
             .unwrap();
         assert!(relogged.auth_identity_generation > stale.auth_identity_generation);
 
-        assert!(
-            state
-                .mark_account_rate_limited_until_if_current(
-                    &stale.id,
-                    stale.provider_type,
-                    stale.auth_identity_generation,
-                    i64::MAX / 2,
-                    Some("stale 429".to_string()),
-                )
-                .await
-                .is_none()
-        );
-        assert!(
-            state
-                .update_account_entitlement_snapshot_if_current(
-                    &stale.id,
-                    stale.provider_type,
-                    stale.auth_identity_generation,
-                    Some("stale-tier".to_string()),
-                    Some("stale-entitlement".to_string()),
-                    123,
-                )
-                .await
-                .is_none()
-        );
-        assert!(
-            !state
-                .record_grok_capability_evidence_if_current(
-                    &stale.id,
-                    stale.provider_type,
-                    stale.auth_identity_generation,
-                    crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
-                    "stale_response",
-                )
-                .await
-                .unwrap()
-        );
+        assert!(state
+            .mark_account_rate_limited_until_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                i64::MAX / 2,
+                Some("stale 429".to_string()),
+            )
+            .await
+            .is_none());
+        assert!(state
+            .update_account_entitlement_snapshot_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                Some("stale-tier".to_string()),
+                Some("stale-entitlement".to_string()),
+                123,
+            )
+            .await
+            .is_none());
+        assert!(!state
+            .record_grok_capability_evidence_if_current(
+                &stale.id,
+                stale.provider_type,
+                stale.auth_identity_generation,
+                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+                "stale_response",
+            )
+            .await
+            .unwrap());
         assert!(!state
             .record_grok_capability_observation_if_current(
                 &stale.id,
@@ -28400,43 +28343,37 @@ mod tests {
         );
 
         let cooldown_until = i64::MAX / 2;
-        assert!(
-            state
-                .mark_account_rate_limited_until_if_current(
-                    &relogged.id,
-                    relogged.provider_type,
-                    relogged.auth_identity_generation,
-                    cooldown_until,
-                    Some("current 429".to_string()),
-                )
-                .await
-                .is_some()
-        );
-        assert!(
-            state
-                .update_account_entitlement_snapshot_if_current(
-                    &relogged.id,
-                    relogged.provider_type,
-                    relogged.auth_identity_generation,
-                    Some("current-tier".to_string()),
-                    Some("current-entitlement".to_string()),
-                    456,
-                )
-                .await
-                .is_some()
-        );
-        assert!(
-            state
-                .record_grok_capability_evidence_if_current(
-                    &relogged.id,
-                    relogged.provider_type,
-                    relogged.auth_identity_generation,
-                    crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
-                    "current_response",
-                )
-                .await
-                .unwrap()
-        );
+        assert!(state
+            .mark_account_rate_limited_until_if_current(
+                &relogged.id,
+                relogged.provider_type,
+                relogged.auth_identity_generation,
+                cooldown_until,
+                Some("current 429".to_string()),
+            )
+            .await
+            .is_some());
+        assert!(state
+            .update_account_entitlement_snapshot_if_current(
+                &relogged.id,
+                relogged.provider_type,
+                relogged.auth_identity_generation,
+                Some("current-tier".to_string()),
+                Some("current-entitlement".to_string()),
+                456,
+            )
+            .await
+            .is_some());
+        assert!(state
+            .record_grok_capability_evidence_if_current(
+                &relogged.id,
+                relogged.provider_type,
+                relogged.auth_identity_generation,
+                crate::domain::accounts::store::GrokAccountCapability::ImageGeneration,
+                "current_response",
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -28459,52 +28396,46 @@ mod tests {
         let unsupported =
             crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported;
 
-        assert!(
-            state
-                .record_grok_capability_observation_if_current(
-                    &account.id,
-                    capability,
-                    CurrentAccountCapabilityObservation {
-                        provider_type: account.provider_type,
-                        auth_identity_generation: account.auth_identity_generation,
-                        state: unsupported,
-                        source: "media_response",
-                        reason: Some("endpoint_not_supported"),
-                        expires_at_ms: None,
-                    },
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !state
-                .record_grok_capability_observation_if_current(
-                    &account.id,
-                    capability,
-                    CurrentAccountCapabilityObservation {
-                        provider_type: account.provider_type,
-                        auth_identity_generation: account.auth_identity_generation,
-                        state: unsupported,
-                        source: "media_response",
-                        reason: Some("endpoint_not_supported"),
-                        expires_at_ms: None,
-                    },
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            state
-                .record_grok_capability_evidence_if_current(
-                    &account.id,
-                    account.provider_type,
-                    account.auth_identity_generation,
-                    capability,
-                    "upstream_success",
-                )
-                .await
-                .unwrap()
-        );
+        assert!(state
+            .record_grok_capability_observation_if_current(
+                &account.id,
+                capability,
+                CurrentAccountCapabilityObservation {
+                    provider_type: account.provider_type,
+                    auth_identity_generation: account.auth_identity_generation,
+                    state: unsupported,
+                    source: "media_response",
+                    reason: Some("endpoint_not_supported"),
+                    expires_at_ms: None,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(!state
+            .record_grok_capability_observation_if_current(
+                &account.id,
+                capability,
+                CurrentAccountCapabilityObservation {
+                    provider_type: account.provider_type,
+                    auth_identity_generation: account.auth_identity_generation,
+                    state: unsupported,
+                    source: "media_response",
+                    reason: Some("endpoint_not_supported"),
+                    expires_at_ms: None,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(state
+            .record_grok_capability_evidence_if_current(
+                &account.id,
+                account.provider_type,
+                account.auth_identity_generation,
+                capability,
+                "upstream_success",
+            )
+            .await
+            .unwrap());
 
         let current = state.find_account_by_id(&account.id).await.unwrap();
         let observation = current
@@ -28957,11 +28888,9 @@ mod tests {
         ));
 
         drop(alice);
-        assert!(
-            tracker
-                .try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(1))
-                .is_ok()
-        );
+        assert!(tracker
+            .try_acquire_for_user("share-1", Some(2), Some("charlie@example.com"), Some(1))
+            .is_ok());
         drop(bob);
     }
 
@@ -29031,17 +28960,15 @@ mod tests {
         );
 
         drop(guard);
-        assert!(
-            state
-                .validate_and_acquire_share_invocation(
-                    &share.id,
-                    AppKind::Codex,
-                    Some("owner@example.com"),
-                    crate::infra::time::now_ms() as i64,
-                )
-                .await
-                .is_ok()
-        );
+        assert!(state
+            .validate_and_acquire_share_invocation(
+                &share.id,
+                AppKind::Codex,
+                Some("owner@example.com"),
+                crate::infra::time::now_ms() as i64,
+            )
+            .await
+            .is_ok());
     }
 
     #[test]
@@ -29088,25 +29015,21 @@ mod tests {
             Some(&1)
         );
         drop(other_account_guard);
-        assert!(
-            !tracker
-                .counts
-                .lock()
-                .unwrap()
-                .by_provider_type
-                .contains_key(ProviderType::ClaudeOAuth.as_str())
-        );
+        assert!(!tracker
+            .counts
+            .lock()
+            .unwrap()
+            .by_provider_type
+            .contains_key(ProviderType::ClaudeOAuth.as_str()));
         assert_eq!(
             tracker
                 .snapshot()
                 .current(ProviderType::ClaudeOAuth, "acct-1"),
             0
         );
-        assert!(
-            tracker
-                .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
-                .is_ok()
-        );
+        assert!(tracker
+            .try_acquire(ProviderType::ClaudeOAuth, "acct-1", 1)
+            .is_ok());
     }
 
     #[test]
@@ -29382,11 +29305,9 @@ mod tests {
             &includes,
         )
         .unwrap_err();
-        assert!(
-            share_error
-                .to_string()
-                .contains("backup Share adoption-full")
-        );
+        assert!(share_error
+            .to_string()
+            .contains("backup Share adoption-full"));
 
         stale_shares.save(&restore_stage).unwrap();
         validate_client_subdomain_adoption_restore_stage(
@@ -29414,12 +29335,10 @@ mod tests {
             .await
             .unwrap();
         let stale_prepared = state.config_snapshot().await;
-        assert!(
-            state
-                .abort_client_subdomain_adoption("takeover-abort")
-                .await
-                .unwrap()
-        );
+        assert!(state
+            .abort_client_subdomain_adoption("takeover-abort")
+            .await
+            .unwrap());
         let config = state.config_snapshot().await;
         assert_eq!(config.client.tunnel_subdomain.as_deref(), Some("targeta"));
         assert!(config.client.subdomain_adoption.is_none());
@@ -29494,26 +29413,18 @@ mod tests {
                 reason: "model_capacity".to_string(),
             })
         );
-        assert!(
-            tracker
-                .get("share-b", "runtime-a", "gpt-5.4", 1_500)
-                .is_none()
-        );
-        assert!(
-            tracker
-                .get("share-a", "runtime-b", "gpt-5.4", 1_500)
-                .is_none()
-        );
-        assert!(
-            tracker
-                .get("share-a", "runtime-a", "gpt-5.3", 1_500)
-                .is_none()
-        );
-        assert!(
-            tracker
-                .get("share-a", "runtime-a", "gpt-5.4", 2_000)
-                .is_none()
-        );
+        assert!(tracker
+            .get("share-b", "runtime-a", "gpt-5.4", 1_500)
+            .is_none());
+        assert!(tracker
+            .get("share-a", "runtime-b", "gpt-5.4", 1_500)
+            .is_none());
+        assert!(tracker
+            .get("share-a", "runtime-a", "gpt-5.3", 1_500)
+            .is_none());
+        assert!(tracker
+            .get("share-a", "runtime-a", "gpt-5.4", 2_000)
+            .is_none());
 
         for index in 0..=MAX_SHARE_MODEL_COOLDOWNS {
             tracker.mark(

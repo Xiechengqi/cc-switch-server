@@ -108,26 +108,18 @@ async fn web_invoke_dispatch(
                 crate::api::settings::save_upgrade_policy(state, headers.clone(), policy).await?
             ))
         }
-        "get_provider_runtime_defaults" => Ok(json!(
-            state
-                .config
-                .read()
-                .await
-                .provider_runtime_defaults
-                .clone()
-        )),
-        "save_provider_runtime_defaults" => {
-            let value = args
-                .get("defaults")
-                .cloned()
-                .ok_or_else(|| ApiError::bad_request("defaults payload is required"))?;
+        "get_provider_request_defaults" => {
+            Ok(json!(state.config.read().await.provider_request_defaults.clone()))
+        }
+        "save_provider_request_defaults" => {
+            let value = web_arg_value(&args, "defaults")?;
             let defaults = serde_json::from_value::<
-                crate::domain::providers::runtime::ProviderRuntimeDefaults,
+                crate::domain::providers::runtime::ProviderRequestDefaults,
             >(value)
             .map_err(ApiError::bad_request)?;
             defaults.validate().map_err(ApiError::bad_request)?;
             state
-                .set_provider_runtime_defaults(defaults)
+                .set_provider_request_defaults(defaults)
                 .await
                 .map_err(ApiError::internal)?;
             Ok(json!(true))
@@ -246,34 +238,25 @@ async fn web_invoke_dispatch(
             crate::api::debug::generate_debug_token(state, ttl_hours).await
         }
         "revoke_debug_token" => crate::api::debug::revoke_debug_token(state).await,
-        "get_stream_check_config" => {
-            let config = web_stream_check_config(state).await;
-            Ok(json!({
-                "timeoutSecs": config.timeout_secs,
-                "maxRetries": config.max_retries,
-                "degradedThresholdMs": config.degraded_threshold_ms,
-                "testPrompt": config.test_prompt,
-            }))
+        "get_provider_health_check_config" => {
+            Ok(json!(state.config.read().await.provider_health_check.clone()))
         }
-        "save_stream_check_config" => {
-            let config: Value = web_arg_value(&args, "config")?;
-            let parsed = serde_json::from_value::<crate::domain::stream_check::StreamCheckConfig>(
-                config,
-            )
+        "save_provider_health_check_config" => {
+            let value = web_arg_value(&args, "config")?;
+            let config = serde_json::from_value::<
+                crate::domain::providers::runtime::ProviderHealthCheckConfig,
+            >(value)
             .map_err(ApiError::bad_request)?;
-            parsed
-                .validate_probe_settings()
-                .map_err(ApiError::bad_request)?;
-            let config = json!({
-                "timeoutSecs": parsed.timeout_secs,
-                "maxRetries": parsed.max_retries,
-                "degradedThresholdMs": parsed.degraded_threshold_ms,
-                "testPrompt": parsed.test_prompt,
-            });
+            config.validate().map_err(ApiError::bad_request)?;
             state
-                .apply_ui_settings_patch_immediate(json!({ "streamCheckConfig": config }))
+                .set_provider_health_check_config(config)
                 .await
                 .map_err(ApiError::internal)?;
+            let refresh_state = state.clone();
+            tokio::spawn(async move {
+                crate::api::provider_health_scheduler::run_share_model_health_cycle(&refresh_state)
+                    .await;
+            });
             Ok(json!(true))
         }
         "save_settings" => {
@@ -1563,11 +1546,13 @@ async fn web_invoke_dispatch(
         "stream_check_provider" => {
             let stored = web_resolve_stored_provider(state, &args).await?;
             ensure_stored_provider_outbound_allowed(state, &stored).await?;
-            let config = web_stream_check_config(state).await;
+            let config = web_provider_health_check_config(state).await;
+            let model = provider_test_model(stored.app, &stored, None, Some(&config));
             let http_client = state.http_client().await;
             let result = crate::domain::stream_check::check_provider_reachability(
                 &http_client,
                 &stored,
+                &model,
                 &config,
                 resolve_stream_check_probe_url,
             )
@@ -1581,7 +1566,7 @@ async fn web_invoke_dispatch(
                 .or_else(|| args.get("proxy_targets_only"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let config = web_stream_check_config(state).await;
+            let config = web_provider_health_check_config(state).await;
             let http_client = state.http_client().await;
             let allowed_ids = if proxy_targets_only {
                 Some(web_proxy_target_provider_ids(state, app).await)
@@ -1606,6 +1591,7 @@ async fn web_invoke_dispatch(
                 let result = crate::domain::stream_check::check_provider_reachability(
                     &http_client,
                     &stored,
+                    &provider_test_model(stored.app, &stored, None, Some(&config)),
                     &config,
                     resolve_stream_check_probe_url,
                 )
@@ -1616,7 +1602,7 @@ async fn web_invoke_dispatch(
         }
         "model_test_provider" => {
             let stored = web_resolve_stored_provider(state, &args).await?;
-            let config = web_stream_check_config(state).await;
+            let config = web_provider_health_check_config(state).await;
             let probe = crate::api::provider_health_scheduler::probe_provider_and_record(
                 state,
                 &stored,
@@ -1650,7 +1636,7 @@ async fn web_invoke_dispatch(
                 .or_else(|| args.get("proxy_targets_only"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let config = web_stream_check_config(state).await;
+            let config = web_provider_health_check_config(state).await;
             let allowed_ids = if proxy_targets_only {
                 Some(web_proxy_target_provider_ids(state, app).await)
             } else {

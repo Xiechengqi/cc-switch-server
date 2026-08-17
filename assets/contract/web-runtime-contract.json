@@ -1209,12 +1209,12 @@
       "notes": "Returns the authoritative Profile/Driver registry used by Server Provider controls."
     },
     {
-      "name": "get_provider_runtime_defaults",
+      "name": "get_provider_request_defaults",
       "support": "native",
       "implemented": true,
       "feature": "settings",
-      "endpoint": "POST /web-api/invoke/get_provider_runtime_defaults",
-      "notes": "Returns Server-owned Provider timeout defaults and per-App default test models from server.json."
+      "endpoint": "POST /web-api/invoke/get_provider_request_defaults",
+      "notes": "Returns Server-owned Provider request, first-byte, and stream-idle timeout defaults in seconds from server.json."
     },
     {
       "name": "get_provider_bundles",
@@ -1341,11 +1341,12 @@
       "notes": "Aggregated Router / Client Tunnel / Share link health for settings UI."
     },
     {
-      "name": "get_stream_check_config",
-      "support": "shim",
+      "name": "get_provider_health_check_config",
+      "support": "native",
       "implemented": true,
       "feature": "settings",
-      "notes": "Returns only real-model probe timing, retry, degradation-threshold, and prompt settings from ui-settings.json; test-model defaults are owned by providerRuntimeDefaults in server.json."
+      "endpoint": "POST /web-api/invoke/get_provider_health_check_config",
+      "notes": "Returns Server-owned model-probe timeout, retry, degradation threshold in seconds, and per-App test models from server.json."
     },
     {
       "name": "get_subscription_quota",
@@ -1725,12 +1726,12 @@
       "notes": "Server-native Web compatibility command."
     },
     {
-      "name": "save_provider_runtime_defaults",
+      "name": "save_provider_request_defaults",
       "support": "native",
       "implemented": true,
       "feature": "settings",
-      "endpoint": "POST /web-api/invoke/save_provider_runtime_defaults",
-      "notes": "Validates and persists Server-owned Provider timeout defaults and per-App default test models in server.json."
+      "endpoint": "POST /web-api/invoke/save_provider_request_defaults",
+      "notes": "Validates and persists Server-owned Provider request, first-byte, and stream-idle timeout defaults in seconds in server.json."
     },
     {
       "name": "save_settings",
@@ -1741,11 +1742,12 @@
       "notes": "Persists legacy-compatible UI settings for Server Web administration."
     },
     {
-      "name": "save_stream_check_config",
-      "support": "shim",
+      "name": "save_provider_health_check_config",
+      "support": "native",
       "implemented": true,
       "feature": "settings",
-      "notes": "Validates and persists only real-model probe timing, retry, degradation-threshold, and prompt settings in ui-settings.json; it never writes test models."
+      "endpoint": "POST /web-api/invoke/save_provider_health_check_config",
+      "notes": "Validates and persists model-probe timeout, retry, degradation threshold in seconds, and per-App test models in server.json, then schedules a bounded health refresh."
     },
     {
       "name": "set_app_config_dir_override",

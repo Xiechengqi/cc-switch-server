@@ -172,7 +172,6 @@ pub fn default_ui_settings() -> Value {
         "optimizerConfig": default_optimizer_config(),
         "logConfig": default_log_config(),
         "apiManagement": default_api_management_config(),
-        "streamCheckConfig": default_stream_check_config(),
     })
 }
 
@@ -351,15 +350,6 @@ pub fn validate_log_config(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-pub fn default_stream_check_config() -> Value {
-    json!({
-        "timeoutSecs": 45,
-        "maxRetries": 2,
-        "degradedThresholdMs": 6000,
-        "testPrompt": "Who are you?",
-    })
-}
-
 pub fn log_config_for_frontend(store: &UiSettingsStore) -> Value {
     let stored = store
         .value
@@ -368,16 +358,6 @@ pub fn log_config_for_frontend(store: &UiSettingsStore) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     merge_json_values(default_log_config(), stored)
-}
-
-pub fn stream_check_config_for_frontend(store: &UiSettingsStore) -> Value {
-    let stored = store
-        .value
-        .get("streamCheckConfig")
-        .filter(|value| value.is_object())
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    merge_json_values(default_stream_check_config(), stored)
 }
 
 pub fn normalize_common_config_app_type(value: &str) -> Option<&'static str> {
@@ -454,7 +434,8 @@ mod tests {
             client: Default::default(),
             setup_completion_notification: None,
             upgrade_policy: Default::default(),
-            provider_runtime_defaults: Default::default(),
+            provider_request_defaults: Default::default(),
+            provider_health_check: Default::default(),
             enable_web_terminal: false,
             request_body_limits: Default::default(),
         };
@@ -582,11 +563,10 @@ mod tests {
     }
 
     #[test]
-    fn log_and_stream_check_configs_merge_defaults() {
+    fn log_config_merges_defaults() {
         let store = UiSettingsStore {
             value: json!({
-                "logConfig": { "level": "debug" },
-                "streamCheckConfig": { "timeoutSecs": 30, "claudeModel": "custom-model" }
+                "logConfig": { "level": "debug" }
             }),
         };
         let log = log_config_for_frontend(&store);
@@ -684,22 +664,6 @@ mod tests {
         let parsed = parse_api_management_config(&api_management_config_for_frontend(&explicit));
         assert!(!parsed.log_enabled);
         assert_eq!(parsed.log_tail_lines, 20);
-    }
-
-    #[test]
-    fn stream_check_config_merge_defaults() {
-        let store = UiSettingsStore {
-            value: json!({
-                "streamCheckConfig": { "timeoutSecs": 30 }
-            }),
-        };
-        let stream = stream_check_config_for_frontend(&store);
-        assert_eq!(stream["timeoutSecs"], json!(30));
-        assert_eq!(stream["maxRetries"], json!(2));
-        assert_eq!(stream["testPrompt"], json!("Who are you?"));
-        assert!(stream.get("claudeModel").is_none());
-        assert!(stream.get("codexModel").is_none());
-        assert!(stream.get("geminiModel").is_none());
     }
 
     #[test]

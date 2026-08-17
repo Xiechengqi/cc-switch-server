@@ -107,7 +107,7 @@
     "familySearchEmpty": "No provider types match this search.",
     "familySearchPlaceholder": "Search name, App, or auth method",
     "familySummary": "Creates {{apps}} using {{auth}}. {{credential}}",
-    "firstByteTimeout": "First-byte timeout (milliseconds)",
+    "firstByteTimeout": "First-byte timeout (seconds)",
     "groupAggregator": "Aggregators and cloud",
     "groupChinaPlan": "China coding plans",
     "groupCustom": "Custom",
@@ -132,7 +132,7 @@
     "queryCredential": "Query value",
     "quickPreset": "Quick preset",
     "recipeAnthropicBearerRelay": "Anthropic Bearer Relay",
-    "requestTimeout": "Request timeout (milliseconds)",
+    "requestTimeout": "Request timeout (seconds)",
     "saved": "Provider saved",
     "selectAccount": "Select an OAuth account",
     "stepFamily": "Choose type",
@@ -142,7 +142,7 @@
     "surfaceEnabled": "Enable API",
     "surfaceOff": "Off",
     "surfaces": "API Surfaces",
-    "streamIdleTimeout": "Stream idle timeout (milliseconds)",
+    "streamIdleTimeout": "Stream idle timeout (seconds)",
     "surfaceTestModelOverrides": "Per-App test model overrides",
     "testApp": "Test App",
     "testModel": "Test model",
@@ -358,11 +358,10 @@
     },
     "advanced": {
       "providerDefaults": {
-        "title": "Provider Runtime Defaults",
-        "description": "Set the Server inheritance defaults for Provider timeouts and per-App model tests",
+        "title": "Provider Request Defaults",
+        "description": "Set Server defaults for request, first-byte, and stream-idle timeouts",
         "transportTitle": "Request Timeout Defaults",
-        "modelsTitle": "Test Model Defaults",
-        "invalid": "Check the timeout ranges and test models"
+        "invalid": "Check the timeout ranges"
       },
       "apiManagement": {
         "revokeTokenConfirm": "Revoking immediately invalidates the current debug token."

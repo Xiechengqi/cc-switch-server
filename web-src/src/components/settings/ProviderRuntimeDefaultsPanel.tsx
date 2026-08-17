@@ -8,41 +8,22 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   providersApi,
-  type ProviderRuntimeDefaults,
+  type ProviderRequestDefaults,
 } from "@/lib/api/providers";
 
-const FALLBACK_DEFAULTS: ProviderRuntimeDefaults = {
-  transport: {
-    timeoutMs: 300_000,
-    streamFirstByteTimeoutMs: 120_000,
-    streamIdleTimeoutMs: 300_000,
-  },
-  testModels: {
-    claude: "claude-haiku-4-5-20251001",
-    codex: "gpt-5.6-sol@low",
-    gemini: "gemini-3.5-flash",
-  },
-};
-
 type FormState = {
-  timeoutMs: string;
-  streamFirstByteTimeoutMs: string;
-  streamIdleTimeoutMs: string;
-  claude: string;
-  codex: string;
-  gemini: string;
+  requestTimeoutSeconds: string;
+  streamFirstByteTimeoutSeconds: string;
+  streamIdleTimeoutSeconds: string;
 };
 
-function formFromDefaults(defaults: ProviderRuntimeDefaults): FormState {
+function formFromDefaults(defaults: ProviderRequestDefaults): FormState {
   return {
-    timeoutMs: String(defaults.transport.timeoutMs),
-    streamFirstByteTimeoutMs: String(
-      defaults.transport.streamFirstByteTimeoutMs,
+    requestTimeoutSeconds: String(defaults.requestTimeoutSeconds),
+    streamFirstByteTimeoutSeconds: String(
+      defaults.streamFirstByteTimeoutSeconds,
     ),
-    streamIdleTimeoutMs: String(defaults.transport.streamIdleTimeoutMs),
-    claude: defaults.testModels.claude,
-    codex: defaults.testModels.codex,
-    gemini: defaults.testModels.gemini,
+    streamIdleTimeoutSeconds: String(defaults.streamIdleTimeoutSeconds),
   };
 }
 
@@ -55,9 +36,7 @@ function parseInteger(value: string, min: number, max: number): number | null {
 
 export function ProviderRuntimeDefaultsPanel() {
   const { t } = useTranslation();
-  const [form, setForm] = useState<FormState>(() =>
-    formFromDefaults(FALLBACK_DEFAULTS),
-  );
+  const [form, setForm] = useState<FormState | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadGeneration, setReloadGeneration] = useState(0);
@@ -68,12 +47,13 @@ export function ProviderRuntimeDefaultsPanel() {
     setLoading(true);
     setLoadError(null);
     void providersApi
-      .getRuntimeDefaults()
+      .getRequestDefaults()
       .then((defaults) => {
         if (active) setForm(formFromDefaults(defaults));
       })
       .catch((error) => {
         if (active) {
+          setForm(null);
           setLoadError(error instanceof Error ? error.message : String(error));
         }
       })
@@ -86,33 +66,19 @@ export function ProviderRuntimeDefaultsPanel() {
   }, [reloadGeneration]);
 
   const save = async () => {
-    const timeoutMs = parseInteger(form.timeoutMs, 1_000, 3_600_000);
-    const streamFirstByteTimeoutMs = parseInteger(
-      form.streamFirstByteTimeoutMs,
-      1_000,
-      600_000,
-    );
-    const streamIdleTimeoutMs = parseInteger(
-      form.streamIdleTimeoutMs,
-      1_000,
-      3_600_000,
-    );
-    const models = {
-      claude: form.claude.trim(),
-      codex: form.codex.trim(),
-      gemini: form.gemini.trim(),
+    if (!form) return;
+    const defaults: ProviderRequestDefaults = {
+      requestTimeoutSeconds:
+        parseInteger(form.requestTimeoutSeconds, 1, 3_600) ?? 0,
+      streamFirstByteTimeoutSeconds:
+        parseInteger(form.streamFirstByteTimeoutSeconds, 1, 600) ?? 0,
+      streamIdleTimeoutSeconds:
+        parseInteger(form.streamIdleTimeoutSeconds, 1, 3_600) ?? 0,
     };
-    if (
-      timeoutMs == null ||
-      streamFirstByteTimeoutMs == null ||
-      streamIdleTimeoutMs == null ||
-      Object.values(models).some(
-        (model) => !model || model.length > 256,
-      )
-    ) {
+    if (Object.values(defaults).some((value) => value === 0)) {
       toast.error(
         t("settings.advanced.providerDefaults.invalid", {
-          defaultValue: "请检查超时范围和测试模型",
+          defaultValue: "请检查超时范围",
         }),
       );
       return;
@@ -120,15 +86,7 @@ export function ProviderRuntimeDefaultsPanel() {
 
     setSaving(true);
     try {
-      const defaults: ProviderRuntimeDefaults = {
-        transport: {
-          timeoutMs,
-          streamFirstByteTimeoutMs,
-          streamIdleTimeoutMs,
-        },
-        testModels: models,
-      };
-      await providersApi.saveRuntimeDefaults(defaults);
+      await providersApi.saveRequestDefaults(defaults);
       setForm(formFromDefaults(defaults));
       toast.success(t("notifications.settingsSaved"), { closeButton: true });
     } catch (error) {
@@ -146,7 +104,7 @@ export function ProviderRuntimeDefaultsPanel() {
     );
   }
 
-  if (loadError) {
+  if (loadError || !form) {
     return (
       <div className="space-y-3 rounded-md border border-destructive/40 p-4">
         <p className="text-sm text-destructive">
@@ -165,77 +123,41 @@ export function ProviderRuntimeDefaultsPanel() {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-4">
-        <h4 className="text-sm font-medium text-muted-foreground">
-          {t("settings.advanced.providerDefaults.transportTitle", {
-            defaultValue: "请求超时默认值",
-          })}
-        </h4>
-        <div className="grid gap-4 md:grid-cols-3">
-          {[
-            {
-              key: "timeoutMs" as const,
-              label: t("providerBundle.requestTimeout"),
-              max: 3_600_000,
-            },
-            {
-              key: "streamFirstByteTimeoutMs" as const,
-              label: t("providerBundle.firstByteTimeout"),
-              max: 600_000,
-            },
-            {
-              key: "streamIdleTimeoutMs" as const,
-              label: t("providerBundle.streamIdleTimeout"),
-              max: 3_600_000,
-            },
-          ].map(({ key, label, max }) => (
-            <div key={key} className="space-y-2">
-              <Label htmlFor={`server-default-${key}`}>{label}</Label>
-              <Input
-                id={`server-default-${key}`}
-                type="number"
-                min={1_000}
-                max={max}
-                step={1_000}
-                value={form[key]}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    [key]: event.target.value,
-                  }))
-                }
-              />
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="space-y-4">
-        <h4 className="text-sm font-medium text-muted-foreground">
-          {t("settings.advanced.providerDefaults.modelsTitle", {
-            defaultValue: "测试模型默认值",
-          })}
-        </h4>
-        <div className="grid gap-4 md:grid-cols-3">
-          {(["claude", "codex", "gemini"] as const).map((app) => (
-            <div key={app} className="space-y-2">
-              <Label htmlFor={`server-default-${app}-model`}>
-                {t(`streamCheck.${app}Model`)}
-              </Label>
-              <Input
-                id={`server-default-${app}-model`}
-                value={form[app]}
-                maxLength={256}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    [app]: event.target.value,
-                  }))
-                }
-              />
-            </div>
-          ))}
-        </div>
+      <div className="grid gap-4 md:grid-cols-3">
+        {[
+          {
+            key: "requestTimeoutSeconds" as const,
+            label: t("providerBundle.requestTimeout"),
+            max: 3_600,
+          },
+          {
+            key: "streamFirstByteTimeoutSeconds" as const,
+            label: t("providerBundle.firstByteTimeout"),
+            max: 600,
+          },
+          {
+            key: "streamIdleTimeoutSeconds" as const,
+            label: t("providerBundle.streamIdleTimeout"),
+            max: 3_600,
+          },
+        ].map(({ key, label, max }) => (
+          <div key={key} className="space-y-2">
+            <Label htmlFor={`server-default-${key}`}>{label}</Label>
+            <Input
+              id={`server-default-${key}`}
+              type="number"
+              min={1}
+              max={max}
+              step={1}
+              value={form[key]}
+              onChange={(event) =>
+                setForm((current) =>
+                  current ? { ...current, [key]: event.target.value } : current,
+                )
+              }
+            />
+          </div>
+        ))}
       </div>
 
       <div className="flex justify-end">

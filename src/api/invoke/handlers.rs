@@ -6,7 +6,7 @@ use crate::domain::providers::runtime::authoritative_managed_account;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::router_contract::{
-    ShareSettingsPatch, ShareUserGrant, descriptor_for_share_with_accounts_and_usage,
+    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareUserGrant,
 };
 
 pub(in crate::api) async fn web_provider_health_json(
@@ -144,18 +144,10 @@ pub(in crate::api) async fn web_resolve_stored_provider(
     resolve_provider_by_key(state, app, &provider_id).await
 }
 
-pub(in crate::api) async fn web_stream_check_config(
+pub(in crate::api) async fn web_provider_health_check_config(
     state: &ServerState,
-) -> crate::domain::stream_check::StreamCheckConfig {
-    let store = state.ui_settings.read().await;
-    let value = ui_settings::stream_check_config_for_frontend(&store);
-    drop(store);
-    let mut config = crate::domain::stream_check::stream_check_config_from_value(&value);
-    let defaults = state.config.read().await.provider_runtime_defaults.clone();
-    config.claude_model = defaults.test_models.claude;
-    config.codex_model = defaults.test_models.codex;
-    config.gemini_model = defaults.test_models.gemini;
-    config
+) -> crate::domain::providers::runtime::ProviderHealthCheckConfig {
+    state.config.read().await.provider_health_check.clone()
 }
 
 pub(in crate::api) async fn web_proxy_target_provider_ids(
@@ -179,7 +171,7 @@ pub(in crate::api) async fn web_proxy_target_provider_ids(
 
 pub(in crate::api) fn map_provider_test_to_stream_check_result(
     response: &TestProviderResponse,
-    config: &crate::domain::stream_check::StreamCheckConfig,
+    config: &crate::domain::providers::runtime::ProviderHealthCheckConfig,
 ) -> crate::domain::stream_check::StreamCheckResult {
     use crate::domain::stream_check::{HealthStatus, StreamCheckResult};
     let success = response.network_checked
@@ -193,7 +185,7 @@ pub(in crate::api) fn map_provider_test_to_stream_check_result(
         .map(|value| value.min(u64::MAX as u128) as u64);
     let status = if !success {
         HealthStatus::Failed
-    } else if latency.unwrap_or(0) > config.degraded_threshold_ms {
+    } else if latency.unwrap_or(0) > config.degraded_threshold_ms() {
         HealthStatus::Degraded
     } else {
         HealthStatus::Operational
@@ -2662,9 +2654,8 @@ pub(in crate::api) fn map_managed_auth_account(
     let selected_workspace_id =
         crate::domain::accounts::store::effective_codex_workspace_id(account);
     use crate::domain::accounts::subscription_expiry::{
-        SubscriptionExpirySource, automatic_subscription_expires_at_ms,
-        recurring_subscription_expires_at_ms, resolved_subscription_expiry_at,
-        supports_manual_expiry,
+        automatic_subscription_expires_at_ms, recurring_subscription_expires_at_ms,
+        resolved_subscription_expiry_at, supports_manual_expiry, SubscriptionExpirySource,
     };
 
     let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;

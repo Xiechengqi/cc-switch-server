@@ -565,15 +565,15 @@
         "stopped": "已停止"
       },
       "providerDefaults": {
-        "title": "供应商运行默认值",
-        "description": "设置供应商请求超时与各 App 测试模型的 Server 继承起点",
+        "title": "供应商请求默认值",
+        "description": "设置供应商请求、首字节和流空闲超时的 Server 默认值",
         "transportTitle": "请求超时默认值",
-        "modelsTitle": "测试模型默认值",
-        "invalid": "请检查超时范围和测试模型"
+        "invalid": "请检查超时范围"
       },
       "modelTest": {
-        "title": "模型测试配置",
-        "description": "配置模型测试的超时、重试、降级阈值和提示词"
+        "title": "健康检查与模型测试",
+        "description": "设置三 App 测试模型及探测超时、重试和降级阈值",
+        "invalid": "请检查健康检查参数和测试模型"
       },
       "backup": {
         "title": "备份与恢复",
@@ -2747,7 +2747,7 @@
     "checkParams": "检查参数",
     "timeout": "超时时间（秒）",
     "maxRetries": "最大重试次数",
-    "degradedThreshold": "降级阈值（毫秒）",
+    "degradedThreshold": "降级阈值（秒）",
     "testPrompt": "检查提示词",
     "operational": "{{providerName}} 运行正常 ({{responseTimeMs}}ms)",
     "degraded": "{{providerName}} 响应较慢 ({{responseTimeMs}}ms)",

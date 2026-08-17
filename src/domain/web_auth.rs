@@ -451,7 +451,8 @@ mod tests {
             },
             setup_completion_notification: None,
             upgrade_policy: Default::default(),
-            provider_runtime_defaults: Default::default(),
+            provider_request_defaults: Default::default(),
+            provider_health_check: Default::default(),
             enable_web_terminal: false,
             request_body_limits: Default::default(),
         };

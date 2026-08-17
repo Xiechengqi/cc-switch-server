@@ -178,7 +178,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     providerType: "codex_oauth",
     testConfig: {
       enabled: true,
-      testModel: "gpt-5.6-sol@low",
+      testModel: "gpt-5.6-luna@low",
     },
     theme: {
       icon: "codex",

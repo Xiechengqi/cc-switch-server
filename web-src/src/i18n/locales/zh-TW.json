@@ -477,15 +477,15 @@
         "stopped": "已停止"
       },
       "providerDefaults": {
-        "title": "供應商執行預設值",
-        "description": "設定供應商請求逾時與各 App 測試模型的 Server 繼承起點",
+        "title": "供應商請求預設值",
+        "description": "設定供應商請求、首位元組和串流閒置逾時的 Server 預設值",
         "transportTitle": "請求逾時預設值",
-        "modelsTitle": "測試模型預設值",
-        "invalid": "請檢查逾時範圍和測試模型"
+        "invalid": "請檢查逾時範圍"
       },
       "modelTest": {
-        "title": "模型測試設定",
-        "description": "設定模型測試的逾時、重試、降級門檻和提示詞"
+        "title": "健康檢查與模型測試",
+        "description": "設定三個 App 的測試模型及探測逾時、重試和降級門檻",
+        "invalid": "請檢查健康檢查參數和測試模型"
       },
       "backup": {
         "title": "備份與還原",
@@ -2629,7 +2629,7 @@
     "checkParams": "檢查參數",
     "timeout": "逾時時間（秒）",
     "maxRetries": "最大重試次數",
-    "degradedThreshold": "降級閾值（毫秒）",
+    "degradedThreshold": "降級閾值（秒）",
     "testPrompt": "檢查提示詞",
     "operational": "{{providerName}} 執行正常 ({{responseTimeMs}}ms)",
     "degraded": "{{providerName}} 回應較慢 ({{responseTimeMs}}ms)",

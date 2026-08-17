@@ -4880,6 +4880,7 @@ mod tests {
             model_policy: crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough,
             coding_plan: None,
             test_model: None,
+            probe_policy_fingerprint: "fixture".to_string(),
             aws_region: None,
             media_policy: None,
             transport_policy: Default::default(),

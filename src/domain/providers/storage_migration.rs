@@ -95,7 +95,7 @@ struct MigrationManifest {
 pub fn preflight(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationReport> {
     let runtime_defaults =
         crate::domain::settings::config::ServerConfig::load_or_default(config_dir)?
-            .provider_runtime_defaults;
+            .provider_runtime_defaults();
     let path = providers_path(config_dir);
     if !path.exists() {
         let existing_key = load_root_key_if_present(config_dir)?;
@@ -302,7 +302,7 @@ pub fn apply(config_dir: &Path) -> anyhow::Result<ProviderStorageMigrationOutcom
         .context("reload Provider S2 store after migration")?;
     verified.set_runtime_defaults(
         crate::domain::settings::config::ServerConfig::load_or_default(config_dir)?
-            .provider_runtime_defaults,
+            .provider_runtime_defaults(),
     );
     verified
         .rebuild_runtime_index(&accounts)

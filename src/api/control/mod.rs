@@ -25,7 +25,7 @@ use crate::domain::sharing::shares::ShareBinding;
 use crate::state::ServerState;
 
 use super::{
-    now_ms, parse_app_kind, web_stream_check_config, ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
+    now_ms, parse_app_kind, web_provider_health_check_config, ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
     APPLY_SHARE_SETTINGS_PATH, CLIENT_LOG_TAIL_PATH, COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
     PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH, REFRESH_SHARE_USAGE_PATH,
 };

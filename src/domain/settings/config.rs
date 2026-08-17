@@ -13,7 +13,9 @@ use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
-use crate::domain::providers::runtime::ProviderRuntimeDefaults;
+use crate::domain::providers::runtime::{
+    ProviderHealthCheckConfig, ProviderRequestDefaults, ProviderRuntimeDefaults,
+};
 
 const CONFIG_FILE_NAME: &str = "server.json";
 pub const ROUTER_CONTROL_DB_FILE_NAME: &str = "router-control.sqlite";
@@ -30,7 +32,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub upgrade_policy: UpgradePolicyConfig,
     #[serde(default)]
-    pub provider_runtime_defaults: ProviderRuntimeDefaults,
+    pub provider_request_defaults: ProviderRequestDefaults,
+    #[serde(default)]
+    pub provider_health_check: ProviderHealthCheckConfig,
     /// Web ops terminal entry. Default on; PTY still lazy-created on first attach.
     /// Disable via `enableWebTerminal: false` or `CC_SWITCH_ENABLE_WEB_TERMINAL=0|false|off`.
     #[serde(default = "default_true")]
@@ -480,10 +484,27 @@ impl ServerConfig {
             client: ClientConfig::default(),
             setup_completion_notification: None,
             upgrade_policy: UpgradePolicyConfig::default(),
-            provider_runtime_defaults: ProviderRuntimeDefaults::default(),
+            provider_request_defaults: ProviderRequestDefaults::default(),
+            provider_health_check: ProviderHealthCheckConfig::default(),
             enable_web_terminal: true,
             request_body_limits: RequestBodyLimitsConfig::default(),
         }
+    }
+
+    pub fn provider_runtime_defaults(&self) -> ProviderRuntimeDefaults {
+        ProviderRuntimeDefaults::from_settings(
+            &self.provider_request_defaults,
+            &self.provider_health_check,
+        )
+    }
+
+    fn validate_provider_settings(&self) -> anyhow::Result<()> {
+        self.provider_request_defaults
+            .validate()
+            .context("validate Provider request defaults")?;
+        self.provider_health_check
+            .validate()
+            .context("validate Provider health-check config")
     }
 
     /// Effective web terminal switch: env overrides `server.json` when set.
@@ -511,16 +532,14 @@ impl ServerConfig {
         let config: Self = serde_json::from_str(&content)
             .with_context(|| format!("parse config {}", config_path.display()))?;
         config
-            .provider_runtime_defaults
-            .validate()
+            .validate_provider_settings()
             .with_context(|| format!("validate config {}", config_path.display()))?;
         Ok(config)
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
-        self.provider_runtime_defaults
-            .validate()
-            .context("validate Provider runtime defaults")?;
+        self.validate_provider_settings()
+            .context("validate Provider settings")?;
         fs::create_dir_all(config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
 
@@ -699,7 +718,8 @@ impl ServerConfig {
             },
             setup_completion_notification: None,
             upgrade_policy: UpgradePolicyConfig::default(),
-            provider_runtime_defaults: ProviderRuntimeDefaults::default(),
+            provider_request_defaults: ProviderRequestDefaults::default(),
+            provider_health_check: ProviderHealthCheckConfig::default(),
             enable_web_terminal: true,
             request_body_limits: RequestBodyLimitsConfig::default(),
         })
@@ -1009,17 +1029,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_runtime_defaults_round_trip_in_server_config() {
+    fn provider_settings_round_trip_in_server_config() {
         let mut config = ServerConfig::empty();
-        config.provider_runtime_defaults.transport.timeout_ms = 75_000;
-        config.provider_runtime_defaults.test_models.codex = "test-codex".to_string();
+        config.provider_request_defaults.request_timeout_seconds = 75;
+        config.provider_health_check.test_models.codex = "test-codex".to_string();
 
         let encoded = serde_json::to_value(&config).unwrap();
         let decoded: ServerConfig = serde_json::from_value(encoded).unwrap();
 
         assert_eq!(
-            decoded.provider_runtime_defaults,
-            config.provider_runtime_defaults
+            decoded.provider_request_defaults,
+            config.provider_request_defaults
+        );
+        assert_eq!(decoded.provider_health_check, config.provider_health_check);
+        assert_eq!(
+            decoded.provider_runtime_defaults(),
+            config.provider_runtime_defaults()
         );
     }
 

@@ -49,7 +49,8 @@ import { Textarea } from "@/components/ui/textarea";
 import type {
   ProviderBundleView,
   ProviderCustomBinding,
-  ProviderRuntimeDefaults,
+  ProviderHealthCheckConfig,
+  ProviderRequestDefaults,
 } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
 import { shareApi, type ShareUserPolicy } from "@/lib/api/share";
@@ -1207,8 +1208,10 @@ export function ProviderBundleEditor({
   );
   const [pendingFamilyId, setPendingFamilyId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [runtimeDefaults, setRuntimeDefaults] =
-    useState<ProviderRuntimeDefaults | null>(null);
+  const [requestDefaults, setRequestDefaults] =
+    useState<ProviderRequestDefaults | null>(null);
+  const [healthCheckConfig, setHealthCheckConfig] =
+    useState<ProviderHealthCheckConfig | null>(null);
   const [modelScopeConfirmOpen, setModelScopeConfirmOpen] = useState(false);
   const [revealedCredentialValues, setRevealedCredentialValues] = useState<
     Record<string, string>
@@ -1285,13 +1288,20 @@ export function ProviderBundleEditor({
 
   useEffect(() => {
     let active = true;
-    void providersApi
-      .getRuntimeDefaults()
-      .then((defaults) => {
-        if (active) setRuntimeDefaults(defaults);
+    void Promise.all([
+      providersApi.getRequestDefaults(),
+      providersApi.getHealthCheckConfig(),
+    ])
+      .then(([request, health]) => {
+        if (active) {
+          setRequestDefaults(request);
+          setHealthCheckConfig(health);
+        }
       })
       .catch((error) => {
         if (active) {
+          setRequestDefaults(null);
+          setHealthCheckConfig(null);
           toast.error(error instanceof Error ? error.message : String(error));
         }
       });
@@ -2196,7 +2206,7 @@ export function ProviderBundleEditor({
               <Input
                 id="provider-bundle-test-model"
                 value={draft.testModel}
-                placeholder={runtimeDefaults?.testModels[draft.testApp]}
+                placeholder={healthCheckConfig?.testModels[draft.testApp]}
                 className="focus:placeholder:text-transparent"
                 onChange={(event) =>
                   setDraft((current) => ({
@@ -2227,7 +2237,7 @@ export function ProviderBundleEditor({
                       value={draft.surfaceTestModels[app]}
                       placeholder={
                         draft.testModel.trim() ||
-                        runtimeDefaults?.testModels[app]
+                        healthCheckConfig?.testModels[app]
                       }
                       className="focus:placeholder:text-transparent"
                       onChange={(event) =>
@@ -2275,38 +2285,41 @@ export function ProviderBundleEditor({
           <div className="grid gap-4 md:grid-cols-3">
             {[
               {
-                key: "timeoutMs" as const,
+                key: "timeoutSeconds" as const,
+                defaultKey: "requestTimeoutSeconds" as const,
                 label: t("providerBundle.requestTimeout", {
-                  defaultValue: "请求超时（毫秒）",
+                  defaultValue: "请求超时（秒）",
                 }),
-                max: 3_600_000,
+                max: 3_600,
               },
               {
-                key: "streamFirstByteTimeoutMs" as const,
+                key: "streamFirstByteTimeoutSeconds" as const,
+                defaultKey: "streamFirstByteTimeoutSeconds" as const,
                 label: t("providerBundle.firstByteTimeout", {
-                  defaultValue: "首字节超时（毫秒）",
+                  defaultValue: "首字节超时（秒）",
                 }),
-                max: 600_000,
+                max: 600,
               },
               {
-                key: "streamIdleTimeoutMs" as const,
+                key: "streamIdleTimeoutSeconds" as const,
+                defaultKey: "streamIdleTimeoutSeconds" as const,
                 label: t("providerBundle.streamIdleTimeout", {
-                  defaultValue: "流空闲超时（毫秒）",
+                  defaultValue: "流空闲超时（秒）",
                 }),
-                max: 3_600_000,
+                max: 3_600,
               },
-            ].map(({ key, label, max }) => (
+            ].map(({ key, defaultKey, label, max }) => (
               <div key={key} className="space-y-2">
                 <Label>{label}</Label>
                 <Input
                   type="number"
-                  min={1_000}
+                  min={1}
                   max={max}
-                  step={1_000}
+                  step={1}
                   value={draft.transport[key]}
                   placeholder={
-                    runtimeDefaults
-                      ? String(runtimeDefaults.transport[key])
+                    requestDefaults
+                      ? String(requestDefaults[defaultKey])
                       : undefined
                   }
                   className="focus:placeholder:text-transparent"

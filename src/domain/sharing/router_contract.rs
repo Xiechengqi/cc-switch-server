@@ -7,24 +7,24 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
-    Account, AccountQuotaTier, AccountStore, AccountUsageBlock,
-    active_account_usage_block_for_share,
+    active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
+    AccountUsageBlock,
 };
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
 use crate::domain::providers::bundle::{
-    ModelPolicyScope, ModelPolicySource, bundle_model_policy_scope, bundle_model_policy_source,
-    surface_enabled,
+    bundle_model_policy_scope, bundle_model_policy_source, surface_enabled, ModelPolicyScope,
+    ModelPolicySource,
 };
 use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::providers::model_routing::{ModelRoutingMode, policy_from_settings};
+use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::registry::profile_by_id;
 use crate::domain::providers::runtime::{
-    ProviderRuntimePlan, RuntimeModelPolicy, authoritative_managed_account,
+    authoritative_managed_account, ProviderRuntimePlan, RuntimeModelPolicy,
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
-use crate::domain::sharing::shares::{Share, share_router_for_sale_label};
+use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -2039,7 +2039,7 @@ mod tests {
     #[test]
     fn descriptor_derives_recurring_account_expiry_for_router_metadata() {
         use crate::domain::accounts::subscription_expiry::{
-            SubscriptionExpiryCadence, SubscriptionExpiryRuleDraft, resolved_subscription_expiry,
+            resolved_subscription_expiry, SubscriptionExpiryCadence, SubscriptionExpiryRuleDraft,
         };
 
         let share = test_share(ProviderType::ClaudeOAuth, Some(5.0));
@@ -2264,14 +2264,12 @@ mod tests {
         );
         let confirmed = descriptor_for_share_with_usage(&share, &providers, Some(&usage));
         assert!(!confirmed.app_availability.codex.unwrap().available);
-        assert!(
-            !confirmed
-                .upstream_provider
-                .as_ref()
-                .unwrap()
-                .available
-                .unwrap()
-        );
+        assert!(!confirmed
+            .upstream_provider
+            .as_ref()
+            .unwrap()
+            .available
+            .unwrap());
         assert!(!confirmed.app_providers.codex[0].available.unwrap());
         assert!(
             !confirmed.app_providers.codex[0]
@@ -2328,13 +2326,11 @@ mod tests {
                 .and_then(|quota| quota.availability.as_deref()),
             Some("quota_exhausted")
         );
-        assert!(
-            provider
-                .quota
-                .as_ref()
-                .and_then(|quota| quota.blocked_until.as_deref())
-                .is_some()
-        );
+        assert!(provider
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.blocked_until.as_deref())
+            .is_some());
     }
 
     #[test]
@@ -2430,18 +2426,14 @@ mod tests {
         let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
 
         assert_eq!(provider.models.len(), 2);
-        assert!(
-            provider
-                .models
-                .iter()
-                .all(|model| model.slot == "available")
-        );
-        assert!(
-            provider
-                .models
-                .iter()
-                .all(|model| model.actual_model != "stale-fixed-model")
-        );
+        assert!(provider
+            .models
+            .iter()
+            .all(|model| model.slot == "available"));
+        assert!(provider
+            .models
+            .iter()
+            .all(|model| model.actual_model != "stale-fixed-model"));
         let runtime_models = runtime
             .models
             .iter()

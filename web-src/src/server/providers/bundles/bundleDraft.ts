@@ -130,9 +130,9 @@ export interface ProviderBundleEditorDraft {
   testModel: string;
   surfaceTestModels: Record<CoreProviderApp, string>;
   transport: {
-    timeoutMs: string;
-    streamFirstByteTimeoutMs: string;
-    streamIdleTimeoutMs: string;
+    timeoutSeconds: string;
+    streamFirstByteTimeoutSeconds: string;
+    streamIdleTimeoutSeconds: string;
   };
   secrets: Record<string, BundleSecretDraft>;
   surfaces: BundleSurfaceEditorDraft[];
@@ -514,9 +514,9 @@ export function createProviderBundleDraft(
     testModel: "",
     surfaceTestModels: { claude: "", codex: "", gemini: "" },
     transport: {
-      timeoutMs: "",
-      streamFirstByteTimeoutMs: "",
-      streamIdleTimeoutMs: "",
+      timeoutSeconds: "",
+      streamFirstByteTimeoutSeconds: "",
+      streamIdleTimeoutSeconds: "",
     },
     secrets,
     surfaces,
@@ -659,18 +659,18 @@ export function editProviderBundleDraft(
       gemini: bundle.surfaceTestModels.gemini ?? "",
     },
     transport: {
-      timeoutMs:
+      timeoutSeconds:
         bundle.transport.timeoutMs == null
           ? ""
-          : String(bundle.transport.timeoutMs),
-      streamFirstByteTimeoutMs:
+          : String(bundle.transport.timeoutMs / 1_000),
+      streamFirstByteTimeoutSeconds:
         bundle.transport.streamFirstByteTimeoutMs == null
           ? ""
-          : String(bundle.transport.streamFirstByteTimeoutMs),
-      streamIdleTimeoutMs:
+          : String(bundle.transport.streamFirstByteTimeoutMs / 1_000),
+      streamIdleTimeoutSeconds:
         bundle.transport.streamIdleTimeoutMs == null
           ? ""
-          : String(bundle.transport.streamIdleTimeoutMs),
+          : String(bundle.transport.streamIdleTimeoutMs / 1_000),
     },
     secrets,
     surfaces,
@@ -877,9 +877,9 @@ function driverForSurface(profileId: string, binding?: ProviderCustomBinding) {
   );
 }
 
-function optionalDuration(value: string): number | undefined {
+function optionalSecondsAsMilliseconds(value: string): number | undefined {
   const trimmed = value.trim();
-  return trimmed ? Number(trimmed) : undefined;
+  return trimmed ? Number(trimmed) * 1_000 : undefined;
 }
 
 function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
@@ -986,9 +986,9 @@ export type BundleValidationField =
   | "testApp"
   | "testModel"
   | "surfaceTestModel"
-  | "timeoutMs"
-  | "streamFirstByteTimeoutMs"
-  | "streamIdleTimeoutMs"
+  | "timeoutSeconds"
+  | "streamFirstByteTimeoutSeconds"
+  | "streamIdleTimeoutSeconds"
   | "account"
   | "credential"
   | "awsRegion"
@@ -1059,32 +1059,32 @@ export function validateProviderBundleDraftIssue(
       longSurfaceTest[0],
     );
   }
-  if (!validateDuration(draft.transport.timeoutMs, 1_000, 3_600_000)) {
+  if (!validateDuration(draft.transport.timeoutSeconds, 1, 3_600)) {
     return issue(
       "timeoutInvalid",
-      "timeoutMs",
+      "timeoutSeconds",
       "Provider request timeout is invalid",
     );
   }
   if (
     !validateDuration(
-      draft.transport.streamFirstByteTimeoutMs,
-      1_000,
-      600_000,
+      draft.transport.streamFirstByteTimeoutSeconds,
+      1,
+      600,
     )
   ) {
     return issue(
       "firstByteTimeoutInvalid",
-      "streamFirstByteTimeoutMs",
+      "streamFirstByteTimeoutSeconds",
       "Provider first-byte timeout is invalid",
     );
   }
   if (
-    !validateDuration(draft.transport.streamIdleTimeoutMs, 1_000, 3_600_000)
+    !validateDuration(draft.transport.streamIdleTimeoutSeconds, 1, 3_600)
   ) {
     return issue(
       "idleTimeoutInvalid",
-      "streamIdleTimeoutMs",
+      "streamIdleTimeoutSeconds",
       "Provider stream idle timeout is invalid",
     );
   }
@@ -1350,12 +1350,12 @@ export function toProviderBundleWriteDraft(
         .filter(([, model]) => model),
     ),
     transport: {
-      timeoutMs: optionalDuration(draft.transport.timeoutMs),
-      streamFirstByteTimeoutMs: optionalDuration(
-        draft.transport.streamFirstByteTimeoutMs,
+      timeoutMs: optionalSecondsAsMilliseconds(draft.transport.timeoutSeconds),
+      streamFirstByteTimeoutMs: optionalSecondsAsMilliseconds(
+        draft.transport.streamFirstByteTimeoutSeconds,
       ),
-      streamIdleTimeoutMs: optionalDuration(
-        draft.transport.streamIdleTimeoutMs,
+      streamIdleTimeoutMs: optionalSecondsAsMilliseconds(
+        draft.transport.streamIdleTimeoutSeconds,
       ),
     },
     managedAccount:

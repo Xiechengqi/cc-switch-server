@@ -578,9 +578,9 @@ describe("Provider Bundle drafts", () => {
     const family = familyById("family.custom_http")!;
     const draft = createProviderBundleDraft(family);
     draft.transport = {
-      timeoutMs: "60000",
-      streamFirstByteTimeoutMs: "15000",
-      streamIdleTimeoutMs: "45000",
+      timeoutSeconds: "60",
+      streamFirstByteTimeoutSeconds: "15",
+      streamIdleTimeoutSeconds: "45",
     };
     draft.surfaces = draft.surfaces.map((surface, index) => ({
       ...updateSurfaceEndpoint(
@@ -643,12 +643,12 @@ describe("Provider Bundle drafts", () => {
     );
 
     surface.driverOptions.apiKeyField = "x-api-key";
-    draft.transport.timeoutMs = "999";
+    draft.transport.timeoutSeconds = "3601";
     expect(validateProviderBundleDraft(draft)).toBe(
       "Provider request timeout is invalid",
     );
 
-    draft.transport.timeoutMs = "60000";
+    draft.transport.timeoutSeconds = "60";
     surface.driverOptions.apiKeyField = "Host";
     expect(validateProviderBundleDraft(draft)).toBe(
       "claude authentication header name is invalid",
@@ -817,9 +817,9 @@ describe("Provider Bundle drafts", () => {
       gemini: "persisted-gemini-health-model",
     });
     expect(edited.transport).toEqual({
-      timeoutMs: "61000",
-      streamFirstByteTimeoutMs: "16000",
-      streamIdleTimeoutMs: "46000",
+      timeoutSeconds: "61",
+      streamFirstByteTimeoutSeconds: "16",
+      streamIdleTimeoutSeconds: "46",
     });
     expect(edited.surfaces[0]?.driverOptions.customUserAgent).toBe(
       "persisted-agent/1",
@@ -888,7 +888,7 @@ describe("Provider Bundle drafts", () => {
     expect(edited.surfaces[0]?.runtime?.runtimeFingerprint).toBe("fixture");
     expect(edited.testApp).toBe("claude");
     expect(edited.testModel).toBe("health-model");
-    expect(edited.transport.timeoutMs).toBe("");
+    expect(edited.transport.timeoutSeconds).toBe("");
 
     const duplicate = duplicateProviderBundleDraft(view);
     expect(duplicate.id).not.toBe(source.id);

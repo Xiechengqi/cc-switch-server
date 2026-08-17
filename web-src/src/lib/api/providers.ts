@@ -31,12 +31,16 @@ export interface ProviderTransportOverrides {
   streamIdleTimeoutMs?: number;
 }
 
-export interface ProviderRuntimeDefaults {
-  transport: {
-    timeoutMs: number;
-    streamFirstByteTimeoutMs: number;
-    streamIdleTimeoutMs: number;
-  };
+export interface ProviderRequestDefaults {
+  requestTimeoutSeconds: number;
+  streamFirstByteTimeoutSeconds: number;
+  streamIdleTimeoutSeconds: number;
+}
+
+export interface ProviderHealthCheckConfig {
+  timeoutSeconds: number;
+  maxRetries: number;
+  degradedThresholdSeconds: number;
   testModels: Record<CoreProviderApp, string>;
 }
 
@@ -124,6 +128,7 @@ export interface ProviderRuntimePlan {
     { mode: "passthrough" } | { mode: "single"; upstreamModel: string };
   codingPlan?: ProviderRuntimeCodingPlan;
   testModel?: string;
+  probePolicyFingerprint: string;
   awsRegion?: string;
   mediaPolicy?: unknown;
   transportPolicy: {
@@ -407,14 +412,24 @@ export interface ClaudeDesktopDefaultRoute {
 }
 
 export const providersApi = {
-  async getRuntimeDefaults(): Promise<ProviderRuntimeDefaults> {
-    return await invokeCommand("get_provider_runtime_defaults");
+  async getRequestDefaults(): Promise<ProviderRequestDefaults> {
+    return await invokeCommand("get_provider_request_defaults");
   },
 
-  async saveRuntimeDefaults(
-    defaults: ProviderRuntimeDefaults,
+  async saveRequestDefaults(
+    defaults: ProviderRequestDefaults,
   ): Promise<boolean> {
-    return await invokeCommand("save_provider_runtime_defaults", { defaults });
+    return await invokeCommand("save_provider_request_defaults", { defaults });
+  },
+
+  async getHealthCheckConfig(): Promise<ProviderHealthCheckConfig> {
+    return await invokeCommand("get_provider_health_check_config");
+  },
+
+  async saveHealthCheckConfig(
+    config: ProviderHealthCheckConfig,
+  ): Promise<boolean> {
+    return await invokeCommand("save_provider_health_check_config", { config });
   },
 
   async getBundles(): Promise<ProviderBundleView[]> {

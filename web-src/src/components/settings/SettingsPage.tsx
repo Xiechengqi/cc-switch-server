@@ -487,7 +487,7 @@ export const SettingsPage = forwardRef<
                     >
                       {serverMode ? (
                         <AccordionItem
-                          value="providerDefaults"
+                          value="providerRequestDefaults"
                           className="rounded-xl glass-card overflow-hidden"
                         >
                           <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
@@ -496,7 +496,7 @@ export const SettingsPage = forwardRef<
                               <div className="min-w-0 space-y-1 text-left">
                                 <h3 className="text-sm font-medium leading-none">
                                   {t("settings.advanced.providerDefaults.title", {
-                                    defaultValue: "供应商默认值",
+                                    defaultValue: "供应商请求默认值",
                                   })}
                                 </h3>
                                 <p className="text-xs font-normal text-muted-foreground">
@@ -504,7 +504,7 @@ export const SettingsPage = forwardRef<
                                     "settings.advanced.providerDefaults.description",
                                     {
                                       defaultValue:
-                                        "设置供应商请求超时和各 App 测试模型的继承起点",
+                                        "设置供应商请求、首字节和流空闲超时的 Server 默认值",
                                     },
                                   )}
                                 </p>

@@ -125,7 +125,7 @@ pub(crate) async fn share_router_model_health(
         }
     }
     let accounts = state.accounts_snapshot().await;
-    let config = web_stream_check_config(&state).await;
+    let config = web_provider_health_check_config(&state).await;
     let check = crate::api::provider_health_scheduler::check_share_binding(
         &state,
         &share,

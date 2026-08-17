@@ -107,7 +107,7 @@
     "familySearchEmpty": "沒有符合的供應商類型。",
     "familySearchPlaceholder": "搜尋名稱、App 或認證方式",
     "familySummary": "將建立 {{apps}}，認證方式為 {{auth}}。{{credential}}",
-    "firstByteTimeout": "首位元組逾時（毫秒）",
+    "firstByteTimeout": "首位元組逾時（秒）",
     "groupAggregator": "聚合與雲",
     "groupChinaPlan": "中國方案",
     "groupCustom": "自建",
@@ -132,7 +132,7 @@
     "queryCredential": "Query 值",
     "quickPreset": "快速預設",
     "recipeAnthropicBearerRelay": "Anthropic 相容 Bearer 中繼",
-    "requestTimeout": "請求逾時（毫秒）",
+    "requestTimeout": "請求逾時（秒）",
     "saved": "供應商已儲存",
     "selectAccount": "選擇 OAuth 帳號",
     "stepFamily": "選擇類型",
@@ -142,7 +142,7 @@
     "surfaceEnabled": "啟用 API",
     "surfaceOff": "關",
     "surfaces": "應用介面",
-    "streamIdleTimeout": "串流閒置逾時（毫秒）",
+    "streamIdleTimeout": "串流閒置逾時（秒）",
     "surfaceTestModelOverrides": "按 App 測試模型特例",
     "testApp": "測試 App",
     "testModel": "測試模型",
@@ -359,11 +359,10 @@
     },
     "advanced": {
       "providerDefaults": {
-        "title": "供應商執行預設值",
-        "description": "設定供應商請求逾時與各 App 測試模型的 Server 繼承起點",
+        "title": "供應商請求預設值",
+        "description": "設定供應商請求、首位元組和串流閒置逾時的 Server 預設值",
         "transportTitle": "請求逾時預設值",
-        "modelsTitle": "測試模型預設值",
-        "invalid": "請檢查逾時範圍和測試模型"
+        "invalid": "請檢查逾時範圍"
       },
       "apiManagement": {
         "revokeTokenConfirm": "撤銷後，目前的偵錯權杖將立即失效。"

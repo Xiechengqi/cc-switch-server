@@ -561,15 +561,15 @@
         "stopped": "Stopped"
       },
       "providerDefaults": {
-        "title": "Provider Runtime Defaults",
-        "description": "Set the Server inheritance defaults for Provider timeouts and per-App model tests",
+        "title": "Provider Request Defaults",
+        "description": "Set Server defaults for request, first-byte, and stream-idle timeouts",
         "transportTitle": "Request Timeout Defaults",
-        "modelsTitle": "Test Model Defaults",
-        "invalid": "Check the timeout ranges and test models"
+        "invalid": "Check the timeout ranges"
       },
       "modelTest": {
-        "title": "Model Test Config",
-        "description": "Configure model-test timeouts, retries, degradation threshold, and prompt"
+        "title": "Health Checks & Model Tests",
+        "description": "Set per-App test models, probe timeout, retries, and degradation threshold",
+        "invalid": "Check the health-check parameters and test models"
       },
       "backup": {
         "title": "Backup & Restore",
@@ -2743,7 +2743,7 @@
     "checkParams": "Check Parameters",
     "timeout": "Timeout (seconds)",
     "maxRetries": "Max Retries",
-    "degradedThreshold": "Degraded Threshold (ms)",
+    "degradedThreshold": "Degraded Threshold (seconds)",
     "testPrompt": "Test Prompt",
     "operational": "{{providerName}} is operational ({{responseTimeMs}}ms)",
     "degraded": "{{providerName}} is slow ({{responseTimeMs}}ms)",

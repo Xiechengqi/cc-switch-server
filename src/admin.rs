@@ -177,7 +177,7 @@ pub(crate) fn validate_config_stores(cli: &Cli) -> anyhow::Result<ConfigSnapshot
         providers.prepare_legacy_runtime_view();
     }
     let accounts = AccountStore::load_or_default(&config_dir)?;
-    providers.set_runtime_defaults(config.provider_runtime_defaults.clone());
+    providers.set_runtime_defaults(config.provider_runtime_defaults());
     providers.rebuild_runtime_index(&accounts)?;
     let shares = ShareStore::load_or_default(&config_dir)?;
     let usage = UsageStore::load_or_default(&config_dir)?;

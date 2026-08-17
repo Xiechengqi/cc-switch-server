@@ -12,19 +12,20 @@ use crate::domain::providers::bundle::{
     bundle_test_app, is_explicit_bundle_surface, surface_enabled,
 };
 use crate::domain::providers::model::AppKind;
+use crate::domain::providers::runtime::{ProviderHealthCheckConfig, PROVIDER_MODEL_PROBE_PROMPT};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::{
     quota_block_for_provider, quota_block_message, share_bindings,
 };
 use crate::domain::sharing::shares::Share;
-use crate::domain::stream_check::{HealthStatus, StreamCheckConfig, StreamCheckResult};
+use crate::domain::stream_check::{HealthStatus, StreamCheckResult};
 use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
 use crate::infra::time::now_ms;
 use crate::state::ServerState;
 
 use super::{
     map_provider_test_to_stream_check_result, provider_test_model, redact_provider_test_error,
-    resolve_provider_execution_by_key, test_provider_inner, web_stream_check_config,
+    resolve_provider_execution_by_key, test_provider_inner, web_provider_health_check_config,
     ProviderOperationOutcome, TestProviderQuery, TestProviderResponse,
 };
 
@@ -71,10 +72,23 @@ pub(in crate::api) fn spawn_share_model_health_scheduler(state: ServerState) {
 }
 
 pub(crate) async fn run_share_model_health_cycle(state: &ServerState) {
+    state
+        .provider_health_cycle_pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    let _cycle = state.provider_health_cycle.lock().await;
+    while state
+        .provider_health_cycle_pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        run_share_model_health_cycle_once(state).await;
+    }
+}
+
+async fn run_share_model_health_cycle_once(state: &ServerState) {
     let shares = state.shares.read().await.shares.clone();
     let providers = state.providers_snapshot().await;
     let accounts = state.accounts_snapshot().await;
-    let config = web_stream_check_config(state).await;
+    let config = web_provider_health_check_config(state).await;
 
     if let Err(error) = state.prune_provider_health_snapshots().await {
         tracing::warn!(error = %error, "failed to prune Provider health snapshots");
@@ -205,7 +219,7 @@ async fn process_initial_health_target(
     state: &ServerState,
     target: HealthTarget,
     accounts: &AccountStore,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
 ) -> anyhow::Result<Option<HealthTarget>> {
     if let Some(block) = quota_block_for_provider(&target.provider, Some(accounts)) {
         let active_shares = current_active_shares_for_provider(state, &target.provider).await;
@@ -256,7 +270,7 @@ async fn process_initial_health_target(
 async fn confirm_health_target(
     state: &ServerState,
     target: HealthTarget,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
 ) -> anyhow::Result<()> {
     let providers = state.providers_snapshot().await;
     let Some(current) = providers
@@ -305,7 +319,7 @@ async fn confirm_health_target(
 pub(crate) async fn probe_provider_and_record(
     state: &ServerState,
     provider: &StoredProvider,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
     source: &str,
 ) -> anyhow::Result<RecordedProviderProbe> {
     let Some(plan) = state
@@ -350,9 +364,9 @@ pub(crate) async fn probe_provider_and_record(
     let query = TestProviderQuery {
         app: provider.app,
         network: Some(true),
-        timeout_ms: Some(config.timeout_secs.saturating_mul(1000)),
+        timeout_ms: Some(config.timeout_seconds.saturating_mul(1_000)),
         model: Some(model.clone()),
-        test_prompt: Some(config.test_prompt.clone()),
+        test_prompt: Some(PROVIDER_MODEL_PROBE_PROMPT.to_string()),
         stream: Some(true),
     };
     let health_fingerprint = plan.health_fingerprint();
@@ -420,7 +434,8 @@ pub(crate) async fn record_provider_test_response(
     state: &ServerState,
     provider: &StoredProvider,
     response: &TestProviderResponse,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
+    expected_health_fingerprint: &str,
     source: &str,
 ) -> anyhow::Result<Option<ProviderHealthSnapshot>> {
     if !response.network_checked || response.outcome == super::ProviderOperationOutcome::Unsupported
@@ -434,14 +449,20 @@ pub(crate) async fn record_provider_test_response(
     else {
         return Ok(None);
     };
-    if response.runtime_fingerprint != plan.runtime_fingerprint
+    if plan.health_fingerprint() != expected_health_fingerprint
+        || response.runtime_fingerprint != plan.runtime_fingerprint
         || plan.test_model.as_deref() != Some(result.model_used.as_str())
     {
         return Ok(None);
     }
-    let snapshot =
-        record_probe_observation(state, provider, &plan.health_fingerprint(), &result, source)
-            .await?;
+    let snapshot = record_probe_observation(
+        state,
+        provider,
+        expected_health_fingerprint,
+        &result,
+        source,
+    )
+    .await?;
     if snapshot.is_some() {
         project_accepted_probe_to_active_shares(state, provider, &result, source).await?;
     }
@@ -465,7 +486,7 @@ pub(crate) async fn check_share_binding(
     share: &Share,
     provider: &StoredProvider,
     accounts: &AccountStore,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
     source: &str,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
     if let Some(block) = quota_block_for_provider(provider, Some(accounts)) {
@@ -547,7 +568,7 @@ async fn run_probe_with_retries(
     state: &ServerState,
     provider: &StoredProvider,
     query: &TestProviderQuery,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
     model: &str,
     fallback_runtime_fingerprint: &str,
 ) -> (StreamCheckResult, String) {
@@ -656,7 +677,7 @@ async fn record_quota_block(
     state: &ServerState,
     share: &Share,
     provider: &StoredProvider,
-    config: &StreamCheckConfig,
+    config: &ProviderHealthCheckConfig,
     block: &AccountUsageBlock,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
     let model = state
