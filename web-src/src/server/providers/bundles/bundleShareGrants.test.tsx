@@ -101,4 +101,66 @@ describe("Provider Bundle share user grants", () => {
     });
     container.remove();
   });
+
+  it("hides row checkboxes until batch edit is started", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    function Harness() {
+      const [draft, setDraft] = useState<ProviderBundleShareDraft>(() => {
+        const next = createBundleShareDraft();
+        next.userGrants = {
+          "owner@example.com": {
+            email: "owner@example.com",
+            role: "owner",
+            active: true,
+            policy: { tokenPeriod: "lifetime" },
+          },
+          "friend@example.com": {
+            email: "friend@example.com",
+            role: "shareto",
+            active: true,
+            policy: { tokenPeriod: "lifetime" },
+          },
+        };
+        return next;
+      });
+      const handlers = bundleShareGrantHandlers(setDraft);
+      return (
+        <ShareUserGrantsEditor
+          value={draft.userGrants}
+          ownerEmail="owner@example.com"
+          defaultPolicy={{ tokenPeriod: "lifetime" }}
+          usageEdits={draft.userUsageEdits}
+          onUsageEditsChange={handlers.onUsageEditsChange}
+          onChange={handlers.onChange}
+        />
+      );
+    }
+
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    expect(
+      document.querySelectorAll('button[role="checkbox"]').length,
+    ).toBe(0);
+
+    await act(async () => {
+      findButton(i18n.t("share.userLimit.batchEdit")).click();
+    });
+    expect(
+      document.querySelectorAll('button[role="checkbox"]').length,
+    ).toBeGreaterThan(0);
+    expect(
+      document.querySelectorAll(
+        `button[aria-label="${i18n.t("common.edit")}"]`,
+      ).length,
+    ).toBeGreaterThan(0);
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
 });

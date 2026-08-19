@@ -228,6 +228,7 @@ export function ShareUserGrantsEditor({
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [editingEmail, setEditingEmail] = useState<string | null>(null);
   const [draft, setDraft] = useState<PolicyDraft | null>(null);
+  const [selecting, setSelecting] = useState(false);
   const [selectedEmails, setSelectedEmails] = useState<Set<string>>(new Set());
   const [batchDraft, setBatchDraft] = useState<BatchPolicyDraft | null>(null);
   const [batchError, setBatchError] = useState("");
@@ -301,7 +302,16 @@ export function ShareUserGrantsEditor({
     });
   };
 
+  const exitSelecting = () => {
+    setSelecting(false);
+    setSelectedEmails(new Set());
+  };
+
   const openBatchEdit = () => {
+    if (!selecting) {
+      setSelecting(true);
+      return;
+    }
     const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
     if (!firstSelected) return;
     setBatchError("");
@@ -475,6 +485,7 @@ export function ShareUserGrantsEditor({
     setSelectedEmails(new Set());
     setBatchDraft(null);
     setBatchError("");
+    setSelecting(false);
   };
 
   const unlimited = t("share.unlimited", { defaultValue: "无限" });
@@ -508,27 +519,39 @@ export function ShareUserGrantsEditor({
   return (
     <div className="space-y-2 md:col-span-2">
       <div className="flex items-center justify-between gap-3">
-        <div>
-          <Label>{t("share.userLimit.title", { defaultValue: "用户限制" })}</Label>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t("share.userLimit.hint", {
-              defaultValue: "总 Share 限制始终生效；每个用户还受自己的限制约束。",
-            })}
-          </p>
-        </div>
+        <Label>{t("share.userLimit.title", { defaultValue: "授权用户与配额" })}</Label>
         <div className="flex flex-wrap items-center justify-end gap-2">
+          {selecting ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={disabled}
+              onClick={exitSelecting}
+            >
+              {t("common.cancel", { defaultValue: "取消" })}
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="outline"
             size="sm"
-            disabled={disabled || selectedEditableEmails.size === 0}
+            disabled={
+              disabled ||
+              selectableEmails.length === 0 ||
+              (selecting && selectedEditableEmails.size === 0)
+            }
             onClick={openBatchEdit}
           >
             <Pencil className="mr-1.5 h-4 w-4" />
-            {t("share.userLimit.batchEdit", {
-              defaultValue: "批量编辑（{{count}}）",
-              count: selectedEditableEmails.size,
-            })}
+            {selecting
+              ? t("share.userLimit.batchEditSelected", {
+                  defaultValue: "编辑已选（{{count}}）",
+                  count: selectedEditableEmails.size,
+                })
+              : t("share.userLimit.batchEdit", {
+                  defaultValue: "批量编辑",
+                })}
           </Button>
           <Button
             type="button"
@@ -544,21 +567,23 @@ export function ShareUserGrantsEditor({
       </div>
 
       <div className="overflow-x-auto rounded-md border border-border-default">
-        <Table className="min-w-[900px]">
+        <Table className={selecting ? "min-w-[900px]" : "min-w-[840px]"}>
           <TableHeader>
             <TableRow>
-              <TableHead className="h-9 w-10 px-3">
-                <Checkbox
-                  checked={allSelected ? true : someSelected ? "indeterminate" : false}
-                  disabled={disabled || selectableEmails.length === 0}
-                  aria-label={t("share.userLimit.selectAll", {
-                    defaultValue: "选择全部可编辑用户",
-                  })}
-                  onCheckedChange={(checked) =>
-                    setSelectedEmails(new Set(checked === true ? selectableEmails : []))
-                  }
-                />
-              </TableHead>
+              {selecting ? (
+                <TableHead className="h-9 w-10 px-3">
+                  <Checkbox
+                    checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                    disabled={disabled || selectableEmails.length === 0}
+                    aria-label={t("share.userLimit.selectAll", {
+                      defaultValue: "选择全部可编辑用户",
+                    })}
+                    onCheckedChange={(checked) =>
+                      setSelectedEmails(new Set(checked === true ? selectableEmails : []))
+                    }
+                  />
+                </TableHead>
+              ) : null}
               <TableHead className="h-9 px-3">Email</TableHead>
               <TableHead className="h-9 px-3">{t("share.parallelLimit", { defaultValue: "并发" })}</TableHead>
               <TableHead className="h-9 px-3">Token</TableHead>
@@ -574,24 +599,26 @@ export function ShareUserGrantsEditor({
           <TableBody>
             {grants.map((grant) => (
               <TableRow key={grant.email}>
-                <TableCell className="w-10 px-3 py-2">
-                  <Checkbox
-                    checked={selectedEmails.has(grant.email)}
-                    disabled={disabled || protectedEmails?.has(grant.email)}
-                    aria-label={t("share.userLimit.selectUser", {
-                      defaultValue: "选择 {{email}}",
-                      email: grant.email,
-                    })}
-                    onCheckedChange={(checked) => {
-                      setSelectedEmails((current) => {
-                        const next = new Set(current);
-                        if (checked === true) next.add(grant.email);
-                        else next.delete(grant.email);
-                        return next;
-                      });
-                    }}
-                  />
-                </TableCell>
+                {selecting ? (
+                  <TableCell className="w-10 px-3 py-2">
+                    <Checkbox
+                      checked={selectedEmails.has(grant.email)}
+                      disabled={disabled || protectedEmails?.has(grant.email)}
+                      aria-label={t("share.userLimit.selectUser", {
+                        defaultValue: "选择 {{email}}",
+                        email: grant.email,
+                      })}
+                      onCheckedChange={(checked) => {
+                        setSelectedEmails((current) => {
+                          const next = new Set(current);
+                          if (checked === true) next.add(grant.email);
+                          else next.delete(grant.email);
+                          return next;
+                        });
+                      }}
+                    />
+                  </TableCell>
+                ) : null}
                 <TableCell className="px-3 py-2">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="truncate">{grant.email}</span>
@@ -629,12 +656,25 @@ export function ShareUserGrantsEditor({
                 <TableCell className="px-3 py-2">
                   <div className="flex justify-end gap-1">
                     {!protectedEmails?.has(grant.email) ? (
-                      <Button type="button" variant="ghost" size="icon" disabled={disabled} onClick={() => openEdit(grant)} title={t("common.edit", { defaultValue: "编辑" })}>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        disabled={disabled}
+                        onClick={() => openEdit(grant)}
+                        title={t("common.edit", { defaultValue: "编辑" })}
+                        aria-label={t("common.edit", { defaultValue: "编辑" })}
+                      >
                         <Pencil className="h-4 w-4" />
                       </Button>
                     ) : null}
                     {grant.role !== "owner" && !protectedEmails?.has(grant.email) ? (
-                      <Button type="button" variant="ghost" size="icon" disabled={disabled} onClick={() => {
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        disabled={disabled}
+                        onClick={() => {
                           const updated = { ...value };
                           delete updated[grant.email];
                           onChange(updated);
@@ -643,7 +683,10 @@ export function ShareUserGrantsEditor({
                             delete nextEdits[grant.email];
                             onUsageEditsChange(nextEdits);
                           }
-                        }} title={t("common.delete", { defaultValue: "删除" })}>
+                        }}
+                        title={t("common.delete", { defaultValue: "删除" })}
+                        aria-label={t("common.delete", { defaultValue: "删除" })}
+                      >
                         <Trash2 className="h-4 w-4 text-destructive" />
                       </Button>
                     ) : null}
