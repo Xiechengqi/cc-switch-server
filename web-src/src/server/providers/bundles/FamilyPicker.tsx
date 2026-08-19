@@ -6,7 +6,6 @@ import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import {
   profileById,
@@ -23,7 +22,7 @@ import {
   groupFamilies,
   recommendedFamilyId,
   type FamilyAuthKind,
-  type FamilyGroupId,
+  type FamilyCategoryId,
 } from "./familyCatalog";
 
 const APP_LABELS: Record<CoreProviderApp, string> = {
@@ -70,39 +69,27 @@ function authKindLabel(
     case "aws":
       return t("providerBundle.authKindAws", { defaultValue: "AWS" });
     case "custom":
-      return t("providerBundle.authKindCustom", { defaultValue: "Custom HTTP" });
+      return t("providerBundle.authKindCustom", {
+        defaultValue: "Custom HTTP",
+      });
     default:
       return t("providerBundle.authKindApiKey", { defaultValue: "API Key" });
   }
 }
 
-function groupLabel(
-  groupId: FamilyGroupId,
+function categoryLabel(
+  categoryId: FamilyCategoryId,
   t: (key: string, options?: { defaultValue: string }) => string,
 ): string {
-  switch (groupId) {
-    case "official_oauth":
-      return t("providerBundle.groupOfficialOauth", {
-        defaultValue: "Official subscriptions",
+  switch (categoryId) {
+    case "subscription":
+      return t("providerBundle.categorySubscription", {
+        defaultValue: "Subscription accounts",
       });
-    case "official_key":
-      return t("providerBundle.groupOfficialKey", {
-        defaultValue: "Official API keys",
+    case "api_key":
+      return t("providerBundle.categoryApiKey", {
+        defaultValue: "API Key",
       });
-    case "china_plan":
-      return t("providerBundle.groupChinaPlan", {
-        defaultValue: "China coding plans",
-      });
-    case "aggregator_cloud":
-      return t("providerBundle.groupAggregator", {
-        defaultValue: "Aggregators and cloud",
-      });
-    case "experimental_bridge":
-      return t("providerBundle.groupExperimental", {
-        defaultValue: "Experimental bridges",
-      });
-    default:
-      return t("providerBundle.groupCustom", { defaultValue: "Custom" });
   }
 }
 
@@ -196,9 +183,9 @@ export function FamilyPicker({
         <div className="space-y-5">
           {groups.map((group) => (
             <div key={group.groupId} className="space-y-2">
-              <Label className="text-xs uppercase tracking-wide text-muted-foreground">
-                {groupLabel(group.groupId, t)}
-              </Label>
+              <h3 className="text-sm font-semibold text-foreground">
+                {categoryLabel(group.groupId, t)}
+              </h3>
               <div
                 role="radiogroup"
                 className="grid grid-cols-1 gap-2 sm:grid-cols-2"
@@ -241,7 +228,10 @@ export function FamilyPicker({
                         </span>
                       </div>
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                        <Badge
+                          variant="outline"
+                          className="h-5 px-1.5 text-[10px]"
+                        >
                           {authKindLabel(familyAuthKind(family), t)}
                         </Badge>
                         {familyIsExperimental(family) ? (
@@ -265,8 +255,7 @@ export function FamilyPicker({
       {selectedFamily ? (
         <p className="rounded-md border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
           {t("providerBundle.familySummary", {
-            defaultValue:
-              "Creates {{apps}} using {{auth}}. {{credential}}",
+            defaultValue: "Creates {{apps}} using {{auth}}. {{credential}}",
             apps: familySupportedApps(selectedFamily)
               .map((app) => APP_LABELS[app])
               .join(" + "),
@@ -282,7 +271,8 @@ export function FamilyPicker({
                         "Each enabled App needs its own URL and credential.",
                     })
                   : t("providerBundle.familyNeedsSecret", {
-                      defaultValue: "Enter the shared credential before saving.",
+                      defaultValue:
+                        "Enter the shared credential before saving.",
                     }),
           })}
         </p>

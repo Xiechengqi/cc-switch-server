@@ -32,6 +32,8 @@ Run the checks manually at:
 
 - The page lists Provider Bundles rather than separate per-App Provider records. Each Bundle title shows the logos for every supported Claude, Codex, and Gemini Surface.
 - Add Provider starts with one Family selector sourced from the Server Provider registry. Selecting a Family automatically creates its complete authoritative Surface set; the operator never adds or removes arbitrary App records.
+- New Provider creation exposes three ordered steps: Choose type, Configure, and Remote share. Future steps stay truly disabled until the operator advances with Next; previously reached steps remain available as shortcuts, and draft values survive backward navigation.
+- The Family selector has exactly two product categories, Subscription accounts and API Key. The explicit subscription allowlist (including Cursor API Key, Ollama API Key, and Kimi For Coding API Key) is honored, Custom HTTP is under API Key, and any future Family not on the allowlist defaults to API Key.
 - Every visible, creatable Family appears exactly once, including Custom HTTP, and the matrix matches the provider coverage audit. OpenCode, OpenClaw, Hermes, Claude Desktop, Universal Providers, raw env/TOML editors, automatic failover, and outbound proxy controls never appear.
 - Selecting Grok OAuth automatically shows Claude, Codex, and Gemini as icon-labelled tabs. Switching tabs does not discard unsaved values or change Bundle-wide fields.
 - Bundle name, Family identity, OAuth/managed account, shared credentials, common endpoint, shared driver options, test configuration, Provider-level timeouts, and Remote Share controls remain outside the Surface tabs.
@@ -53,11 +55,17 @@ Run the checks manually at:
 
 ## Shares
 
-- Share status, owner, tunnel/subdomain, provider binding, ACL, limits, market/grant, pending edits, and connect info are visible.
+- Share status, owner, tunnel/subdomain, provider binding, private/public-free access, authorized users and quotas, Router-managed grants, pending edits, and connect info are visible.
 - One Provider Bundle maps to at most one Share. All enabled Claude, Codex, and Gemini Surface bindings use that same Share record, subdomain, and Share URL; no per-App Share URL is created.
 - The Bundle editor keeps Remote Share outside the Surface tabs and uses the same bottom Save action. The Server derives bindings from enabled Surfaces instead of trusting App/provider binding fields from the browser.
-- Enabling or disabling a Bundle Surface and saving reconciles that one Share's bindings without changing its URL, ACL, limits, sale settings, or tunnel identity.
+- Enabling or disabling a Bundle Surface and saving reconciles that one Share's bindings without changing its URL, access policy, limits, grants, or tunnel identity.
 - Share Owner is read-only and always displays Client Owner; Provider Share create/save requests do not submit an independent owner. Changing Client Owner through verified email ownership updates every Share and preserves a valid previous owner as shared access.
+- A new Share is private by default. Provider quick-enable and Provider Bundle creation never enable public access implicitly.
+- The only public-access control is the “Public free access / 公开免费使用” checkbox. Disabled means private; enabled means any signed-in Router user can invoke for free. The UI has no For Sale, Market access mode, authorized-email text box, Token Market selector, or official-price-percentage input.
+- “Authorized users and quotas” is the only manual ShareTo editor. Adding/removing a user updates `userGrants`; no second email list can diverge. In public-free mode these entries remain individual quota overrides rather than an exclusive allowlist.
+- Router Share Market-managed grants are labelled and read-only. Saving ordinary Share settings preserves them even when other authorized users are added, edited, batch-edited, or removed.
+- Switching to public-free while the Router reports an active Share Market listing/subscription fails visibly and leaves the Share private; after all market entitlements are released, the same save can succeed.
+- Share cards and read-only views summarize access as Private or Public free and derive the authorized-user list from active `userGrants`, not legacy ACL projections.
 - Pause/resume/binding/tunnel actions are disabled or gated consistently with server state.
 - Share connect info can be inspected without exposing excluded client-only features.
 - The full Shares page scrolls vertically to the bottom at both target viewports; expanding settings or request logs does not leave content clipped below the shell.
@@ -65,6 +73,14 @@ Run the checks manually at:
 - After a server restart, requests written since the last usage snapshot still appear, and a completed streaming request keeps its final token and latency values.
 - User Token periods show Lifetime, Daily, UTC calendar week, Every 7 days, Calendar month, and Every 30 days. The two fixed periods require a non-future UTC start time, preserve minute precision, and hide/clear that field for all calendar periods.
 - Two Share users with the same fixed period but different starts show independent current windows and reset countdowns. Changing a user's period or start recomputes the current window from request history instead of resetting usage to zero.
+- Editing one user's quota shows the current-period consumed Token count, the current effective baseline, and the UTC window. Saving an explicit `0` is distinct from leaving the field blank; blank leaves the Server baseline unchanged, while “Clear baseline” removes it.
+- A consumed-token edit accepts a past fixed-period start (including the previous 7/30-day phase), rejects a target below observed history, and after the save the next request is added to the saved target rather than replacing it. Router Share Market-managed grants remain read-only.
+- The consumed-token dialog reads the effective value, the observed history floor, the UTC window, and the standing manual correction from the Server-returned `usageQuota` view. The browser never re-derives them from `usageRebase`, so a Server-side formula change cannot leave the dialog quietly disagreeing with the save it is about to submit.
+- The Share settings form exposes a Share-total consumed-Token field separately from the per-user quota editor. It appears only for an existing Share, submits only when the operator actually edits it, and leaving it untouched never overwrites requests that landed while the form was open.
+- Setting the Share total below its Token limit clears the `exhausted` state to `paused`; the Share stays disabled until the operator resumes it explicitly. Setting it at or above the limit re-exhausts and disables the Share. Clearing sets zero.
+- The Share total is a plain accumulator: unlike a per-user quota it is never rebuilt from Usage history, so an edit is a direct set and later requests continue accumulating on top of it.
+- Provider official quota (upstream subscription/rate-limit state shown on Accounts/OAuth) stays display-only. It is external upstream data the Server cannot rebase; the only supported action is refreshing it from the upstream, never editing it locally.
+- Reset usage on a Share clears both the derived per-user snapshots and their operator baselines. After a reset no previously saved baseline reappears on the next request or reload.
 
 ## Usage
 
@@ -75,7 +91,7 @@ Run the checks manually at:
 - All `/web-api/usage/*` requests require an authenticated Server session, return `{ data, meta }`, reject ranges over the 32-day detail window, and treat the selected range as `[fromMs, toMs)`. Trend queries reject a granularity that would exceed 2,000 points.
 - Restart recovery marks unfinished requests interrupted, and completed streaming requests retain their terminal Token and latency values after reload.
 - No model-cost CRUD, USD totals, cost columns, or provider cost-limit warnings are present.
-- OAuth quota remains display-only unless the upstream reports an explicit, unexpired rate-limit or exhaustion state; Share Token limits and Token Market sale pricing remain available in their owning screens.
+- OAuth quota remains display-only unless the upstream reports an explicit, unexpired rate-limit or exhaustion state; Share Token limits and Share Market seat pricing remain available in their owning screens.
 
 ## Settings, Auth, Router, Backup
 
@@ -125,6 +141,6 @@ Record manual findings in the relevant implementation note or PR/commit summary:
 
 - 2026-08-03 non-browser validation passed: Rust format/check/test, Web typecheck/unit tests/build, Web runtime contract audit, Provider coverage audit, UI Provider matrix audit, and local HTTP smoke.
 - No browser automation, screenshot test, or automated click flow was run.
-- Offline release readiness remains `blocked_inputs`: real Router/Market/OAuth/Share credentials and deployment acceptance were not supplied. `RUN_TESTS=0` also records the readiness script's own local-test phase as skipped; the full local suites were run separately and passed.
+- Offline release readiness remains `blocked_inputs`: real Router/OAuth/Share grant/Client Market credentials and deployment acceptance were not supplied. `RUN_TESTS=0` also records the readiness script's own local-test phase as skipped; the full local suites were run separately and passed.
 - Server-owned zh/zh-TW/en/ja locale coverage remains statically validated. Human reviewers still need to check translated text fit in real viewports.
 - Manual wide and narrow viewport checks remain pending for a human reviewer.

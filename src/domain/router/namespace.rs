@@ -9,8 +9,6 @@ pub const PUBLIC_SLUG_MIN_LEN: usize = 6;
 pub const PUBLIC_SLUG_MAX_LEN: usize = 30;
 pub const SHARE_SLUG_MIN_LEN: usize = PUBLIC_SLUG_MIN_LEN;
 pub const SHARE_SLUG_MAX_LEN: usize = PUBLIC_SLUG_MAX_LEN;
-pub const MARKET_SLUG_MIN_LEN: usize = PUBLIC_SLUG_MIN_LEN;
-pub const MARKET_SLUG_MAX_LEN: usize = PUBLIC_SLUG_MAX_LEN;
 
 const DNS_LABEL_MAX_LEN: usize = 63;
 const DNS_NAME_MAX_LEN: usize = 253;
@@ -22,8 +20,6 @@ pub enum NamespaceError {
     InvalidClientSubdomain,
     #[error("share slug must be {SHARE_SLUG_MIN_LEN}-{SHARE_SLUG_MAX_LEN} lowercase DNS characters without '--'")]
     InvalidShareSlug,
-    #[error("market slug must be {MARKET_SLUG_MIN_LEN}-{MARKET_SLUG_MAX_LEN} lowercase DNS characters without '--'")]
-    InvalidMarketSlug,
     #[error("invalid Router base domain")]
     InvalidBaseDomain,
     #[error("invalid public host")]
@@ -79,27 +75,6 @@ impl ShareSlug {
 }
 
 impl fmt::Display for ShareSlug {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MarketSlug(String);
-
-impl MarketSlug {
-    pub fn parse(value: &str) -> Result<Self, NamespaceError> {
-        let value = value.trim();
-        validate_public_slug(value).map_err(|_| NamespaceError::InvalidMarketSlug)?;
-        Ok(Self(value.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for MarketSlug {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -168,13 +143,6 @@ impl PublicHost {
         )
     }
 
-    pub fn for_market(
-        base_domain: &BaseDomain,
-        market_slug: &MarketSlug,
-    ) -> Result<Self, NamespaceError> {
-        Self::from_label(base_domain, market_slug.as_str())
-    }
-
     fn from_label(base_domain: &BaseDomain, label: &str) -> Result<Self, NamespaceError> {
         if label.len() > DNS_LABEL_MAX_LEN {
             return Err(NamespaceError::HostLabelTooLong);
@@ -206,7 +174,6 @@ impl fmt::Display for PublicHost {
 pub enum PublicHostKind {
     Client,
     Share,
-    Market,
 }
 
 impl PublicHostKind {
@@ -214,7 +181,6 @@ impl PublicHostKind {
         match self {
             Self::Client => "client",
             Self::Share => "share",
-            Self::Market => "market",
         }
     }
 
@@ -222,7 +188,6 @@ impl PublicHostKind {
         match value {
             "client" => Ok(Self::Client),
             "share" => Ok(Self::Share),
-            "market" => Ok(Self::Market),
             _ => Err(NamespaceError::InvalidHostClaim),
         }
     }
@@ -278,21 +243,6 @@ impl PublicHostClaim {
         )
     }
 
-    pub fn market(
-        base_domain: &BaseDomain,
-        market_slug: MarketSlug,
-        subject_id: impl Into<String>,
-    ) -> Result<Self, NamespaceError> {
-        let host = PublicHost::for_market(base_domain, &market_slug)?;
-        Self::new(
-            host,
-            PublicHostKind::Market,
-            subject_id,
-            None,
-            Some(market_slug.to_string()),
-        )
-    }
-
     fn new(
         host: PublicHost,
         kind: PublicHostKind,
@@ -335,14 +285,6 @@ impl PublicHostClaim {
                 self.client_subdomain
                     .as_ref()
                     .ok_or(NamespaceError::InvalidHostClaim)?,
-            )?,
-            PublicHostKind::Market => PublicHost::for_market(
-                base_domain,
-                &MarketSlug::parse(
-                    self.slug
-                        .as_deref()
-                        .ok_or(NamespaceError::InvalidHostClaim)?,
-                )?,
             )?,
         };
         if expected != self.host {
@@ -441,7 +383,6 @@ macro_rules! impl_validated_string_serde {
 
 impl_validated_string_serde!(ClientSubdomain, ClientSubdomain::parse);
 impl_validated_string_serde!(ShareSlug, ShareSlug::parse);
-impl_validated_string_serde!(MarketSlug, MarketSlug::parse);
 impl_validated_string_serde!(BaseDomain, BaseDomain::parse);
 impl_validated_string_serde!(PublicHost, PublicHost::parse);
 
@@ -482,8 +423,6 @@ mod tests {
         let base = BaseDomain::parse("Router.Example.COM.").unwrap();
         let client = ClientSubdomain::parse("edge-main").unwrap();
         let share = ShareSlug::parse("team-pro").unwrap();
-        let market = MarketSlug::parse("official").unwrap();
-
         assert_eq!(
             PublicHost::for_client(&base, &client).unwrap().as_str(),
             "edge-main.router.example.com"
@@ -493,10 +432,6 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "team-pro--edge-main.router.example.com"
-        );
-        assert_eq!(
-            PublicHost::for_market(&base, &market).unwrap().as_str(),
-            "official.router.example.com"
         );
     }
 

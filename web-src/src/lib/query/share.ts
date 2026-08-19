@@ -7,7 +7,6 @@ import {
   type ClientTunnelUpdateParams,
   type ConnectInfo,
   type CreateShareParams,
-  type PublicTokenMarket,
   type SaveProviderShareParams,
   type ShareBindingMutationParams,
   type ShareRecord,
@@ -31,7 +30,6 @@ export const shareKeys = {
     [...shareKeys.all, "tunnel-status", shareId] as const,
   connectInfo: (shareId: string) =>
     [...shareKeys.all, "connect-info", shareId] as const,
-  tokenMarkets: () => [...shareKeys.all, "token-markets"] as const,
   clientTunnel: () => [...shareKeys.all, "client-tunnel"] as const,
   clientTunnelStatus: () => [...shareKeys.all, "client-tunnel-status"] as const,
   health: () => [...shareKeys.all, "health"] as const,
@@ -109,15 +107,6 @@ export function useShareConnectInfoQuery(
       : [...shareKeys.all, "connect-info"],
     queryFn: () => shareApi.getConnectInfo(shareId!),
     enabled: Boolean(shareId) && enabled,
-  });
-}
-
-export function useTokenMarketsQuery(enabled = true) {
-  return useQuery<PublicTokenMarket[]>({
-    queryKey: shareKeys.tokenMarkets(),
-    queryFn: shareApi.listTokenMarkets,
-    enabled,
-    staleTime: 60_000,
   });
 }
 
@@ -612,44 +601,6 @@ export function useUpdateShareDescriptionMutation() {
   );
 }
 
-export function useUpdateShareForSaleMutation() {
-  return useShareActionMutation(
-    ({
-      shareId,
-      forSale,
-    }: {
-      shareId: string;
-      forSale: "Yes" | "No" | "Free";
-    }) => shareApi.updateForSale({ shareId, forSale }),
-    {
-      successKey: "share.toast.updateForSaleSuccess",
-      successDefault: "For Sale 已更新",
-      errorKey: "share.toast.updateForSaleError",
-      errorDefault: "更新 For Sale 失败: {{error}}",
-    },
-    ({ shareId }) => shareId,
-  );
-}
-
-export function useUpdateShareForSaleOfficialPricePercentMutation() {
-  return useShareActionMutation(
-    ({
-      shareId,
-      pricing,
-    }: {
-      shareId: string;
-      pricing: Record<string, number>;
-    }) => shareApi.updateForSaleOfficialPricePercent({ shareId, pricing }),
-    {
-      successKey: "share.toast.updateForSalePricingSuccess",
-      successDefault: "模型定价已更新",
-      errorKey: "share.toast.updateForSalePricingError",
-      errorDefault: "更新模型定价失败: {{error}}",
-    },
-    ({ shareId }) => shareId,
-  );
-}
-
 export function useUpdateShareExpirationMutation() {
   return useShareActionMutation(
     ({ shareId, expiresAt }: { shareId: string; expiresAt: string }) =>
@@ -659,38 +610,6 @@ export function useUpdateShareExpirationMutation() {
       successDefault: "到期时间已更新",
       errorKey: "share.toast.updateExpirationError",
       errorDefault: "更新到期时间失败: {{error}}",
-    },
-    ({ shareId }) => shareId,
-  );
-}
-
-export function useUpdateShareAclMutation() {
-  return useShareActionMutation(
-    ({
-      shareId,
-      sharedWithEmails,
-      marketAccessMode,
-      accessByApp,
-      appSettings,
-    }: {
-      shareId: string;
-      sharedWithEmails: string[];
-      marketAccessMode: "selected" | "all";
-      accessByApp?: import("@/lib/api").ShareAccessByApp;
-      appSettings?: import("@/lib/api").ShareAppSettingsByApp;
-    }) =>
-      shareApi.updateAcl({
-        shareId,
-        sharedWithEmails,
-        marketAccessMode,
-        accessByApp,
-        appSettings,
-      }),
-    {
-      successKey: "share.toast.updateAclSuccess",
-      successDefault: "分享名单已更新",
-      errorKey: "share.toast.updateAclError",
-      errorDefault: "更新分享名单失败: {{error}}",
     },
     ({ shareId }) => shareId,
   );

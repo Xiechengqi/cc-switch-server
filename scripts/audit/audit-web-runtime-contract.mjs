@@ -119,6 +119,202 @@ for (const endpointPath of usageEndpointPaths) {
   }
 }
 
+const usageEdits = contract.shareUserUsageEdits;
+if (!usageEdits) {
+  fail("contract must declare shareUserUsageEdits");
+} else {
+  if (usageEdits.ownership !== "server") {
+    fail("shareUserUsageEdits.ownership must be server");
+  }
+  if (usageEdits.clientSuppliedGrantFieldIgnored !== true) {
+    fail(
+      "shareUserUsageEdits must declare that a client-supplied usageRebase is ignored",
+    );
+  }
+  if (usageEdits.appliedUnderQuotaLock !== true) {
+    fail("shareUserUsageEdits must be applied under the Share quota lock");
+  }
+  if (usageEdits.windowBounds !== contract.shareUserTokenPeriods?.windowBounds) {
+    fail("shareUserUsageEdits.windowBounds must match shareUserTokenPeriods");
+  }
+  for (const commandName of usageEdits.commands || []) {
+    const command = commandByName.get(commandName);
+    if (!command || !command.implemented) {
+      fail(
+        `shareUserUsageEdits references unimplemented command ${commandName}`,
+      );
+    }
+  }
+
+  const contractSource = fs.readFileSync(
+    "src/domain/sharing/router_contract.rs",
+    "utf8",
+  );
+  const grantFieldPattern = new RegExp(
+    `pub usage_rebase: Option<ShareUserUsageRebase>`,
+  );
+  if (!grantFieldPattern.test(contractSource)) {
+    fail(
+      `src/domain/sharing/router_contract.rs is missing the ${usageEdits.grantField} grant field`,
+    );
+  }
+  if (usageEdits.operatorField) {
+    const snake = usageEdits.operatorField.replace(
+      /[A-Z]/g,
+      (c) => `_${c.toLowerCase()}`,
+    );
+    if (!contractSource.includes(`pub ${snake}: Option<String>`)) {
+      fail(
+        `ShareUserUsageRebase is missing the contracted operator field ${usageEdits.operatorField}`,
+      );
+    }
+  }
+  for (const field of usageEdits.setFields || []) {
+    const snake = field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    if (!contractSource.includes(`pub ${snake}:`)) {
+      fail(`ShareUserUsageEdit is missing contracted field ${field}`);
+    }
+  }
+
+  const errorSource = fs.readFileSync("src/api/error.rs", "utf8");
+  for (const code of usageEdits.conflictCodes || []) {
+    if (!errorSource.includes(`"${code}"`)) {
+      fail(`src/api/error.rs does not emit contracted conflict code ${code}`);
+    }
+  }
+
+  const handlerSource = fs.readFileSync("src/api/invoke/handlers.rs", "utf8");
+  if (!handlerSource.includes(`"${usageEdits.field}"`)) {
+    fail(
+      `src/api/invoke/handlers.rs does not parse contracted field ${usageEdits.field}`,
+    );
+  }
+}
+
+const shareUsageEdit = contract.shareTotalUsageEdit;
+if (!shareUsageEdit) {
+  fail("contract must declare shareTotalUsageEdit");
+} else {
+  if (shareUsageEdit.ownership !== "server") {
+    fail("shareTotalUsageEdit.ownership must be server");
+  }
+  if (shareUsageEdit.clientSuppliedShareFieldIgnored !== true) {
+    fail(
+      "shareTotalUsageEdit must declare that a client-supplied tokensUsed is ignored",
+    );
+  }
+  if (shareUsageEdit.appliedUnderQuotaLock !== true) {
+    fail("shareTotalUsageEdit must be applied under the Share quota lock");
+  }
+  if (shareUsageEdit.rebuiltFromHistory !== false) {
+    fail(
+      "shareTotalUsageEdit must declare that the Share total counter is not rebuilt from Usage history",
+    );
+  }
+  for (const commandName of shareUsageEdit.commands || []) {
+    const command = commandByName.get(commandName);
+    if (!command || !command.implemented) {
+      fail(
+        `shareTotalUsageEdit references unimplemented command ${commandName}`,
+      );
+    }
+  }
+
+  const contractSource = fs.readFileSync(
+    "src/domain/sharing/router_contract.rs",
+    "utf8",
+  );
+  if (!contractSource.includes("pub struct ShareTotalUsageEdit")) {
+    fail(
+      "src/domain/sharing/router_contract.rs is missing ShareTotalUsageEdit",
+    );
+  }
+  for (const field of shareUsageEdit.setFields || []) {
+    const snake = field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    if (!contractSource.includes(`pub ${snake}:`)) {
+      fail(`ShareTotalUsageEdit is missing contracted field ${field}`);
+    }
+  }
+
+  const shareSource = fs.readFileSync("src/domain/sharing/shares.rs", "utf8");
+  if (!shareSource.includes("fn apply_share_total_usage_edit(")) {
+    fail(
+      "src/domain/sharing/shares.rs must apply the Share total usage edit in the domain layer",
+    );
+  }
+
+  const handlerSource = fs.readFileSync("src/api/invoke/handlers.rs", "utf8");
+  if (!handlerSource.includes(`"${shareUsageEdit.field}"`)) {
+    fail(
+      `src/api/invoke/handlers.rs does not parse contracted field ${shareUsageEdit.field}`,
+    );
+  }
+}
+
+const quotaView = contract.shareUserQuotaView;
+if (!quotaView) {
+  fail("contract must declare shareUserQuotaView");
+} else {
+  if (quotaView.ownership !== "server") {
+    fail("shareUserQuotaView.ownership must be server");
+  }
+  if (quotaView.clientSuppliedFieldIgnored !== true) {
+    fail(
+      "shareUserQuotaView must declare that a client-supplied usageQuota is ignored",
+    );
+  }
+  if (quotaView.excludedFromDescriptorFingerprint !== true) {
+    fail(
+      "shareUserQuotaView must stay out of the descriptor fingerprint; consumption must not force a Router resync",
+    );
+  }
+  if (quotaView.clientMayRederive !== false) {
+    fail(
+      "shareUserQuotaView must declare that the client reads the Server view instead of re-deriving it",
+    );
+  }
+
+  const contractSource = fs.readFileSync(
+    "src/domain/sharing/router_contract.rs",
+    "utf8",
+  );
+  if (!contractSource.includes("pub struct ShareUserQuotaView")) {
+    fail("src/domain/sharing/router_contract.rs is missing ShareUserQuotaView");
+  }
+  for (const field of quotaView.fields || []) {
+    const snake = field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    if (!contractSource.includes(`pub ${snake}:`)) {
+      fail(`ShareUserQuotaView is missing contracted field ${field}`);
+    }
+  }
+  const fingerprintStart = contractSource.indexOf(
+    "fn static_descriptor_projection(",
+  );
+  const fingerprintSource =
+    fingerprintStart < 0 ? "" : contractSource.slice(fingerprintStart);
+  if (!fingerprintSource.includes(`"${quotaView.field}"`)) {
+    fail(
+      `static_descriptor_projection must strip ${quotaView.field} from the fingerprint`,
+    );
+  }
+
+  const shareSource = fs.readFileSync("src/domain/sharing/shares.rs", "utf8");
+  if (!shareSource.includes("fn quota_view(")) {
+    fail(
+      "src/domain/sharing/shares.rs must derive the per-grant quota view in the domain layer",
+    );
+  }
+
+  const normalizePath = "web-src/src/utils/shareRecordNormalize.ts";
+  if (fs.existsSync(normalizePath)) {
+    const normalizeSource = fs.readFileSync(normalizePath, "utf8");
+    if (!normalizeSource.includes(`"${quotaView.field}"`) &&
+        !normalizeSource.includes(`raw.${quotaView.field}`)) {
+      fail(`${normalizePath} does not read the Server ${quotaView.field} view`);
+    }
+  }
+}
+
 const dispatchPath = "src/api/invoke/dispatch.rs";
 if (fs.existsSync(dispatchPath)) {
   const httpSource = fs.readFileSync(dispatchPath, "utf8");

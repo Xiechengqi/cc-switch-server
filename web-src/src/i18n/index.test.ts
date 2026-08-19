@@ -42,7 +42,8 @@ const criticalKeys = [
   "settings.serverVersion.rollbackConfirmMessage",
   "share.confirmDeleteTitle",
   "share.confirmDeleteMessage",
-  "share.freeConfirm",
+  "share.freeAccess.label",
+  "share.freeAccess.hint",
 ] as const;
 
 const codexFeatureKeys = [
@@ -57,8 +58,10 @@ const codexFeatureKeys = [
 
 const providerBundleKeys = [
   "advanced",
+  "categoryApiKey",
+  "categorySubscription",
   "familySearchPlaceholder",
-  "groupOfficialOauth",
+  "stepNavigation",
   "stepFamily",
   "stepSupply",
   "stepShare",
@@ -83,6 +86,14 @@ describe("language normalization", () => {
 });
 
 describe("i18n resources", () => {
+  it("uses the Server Provider creation wording", () => {
+    expect(serverZh.providerBundle.stepFamily).toBe("选择类型");
+    expect(serverZh.providerBundle.stepSupply).toBe("配置");
+    expect(serverZh.providerBundle.stepShare).toBe("远程分享");
+    expect(serverZh.providerBundle.categorySubscription).toBe("订阅账号");
+    expect(serverZh.providerBundle.categoryApiKey).toBe("API Key");
+  });
+
   it("provides every critical dialog string in all supported languages", () => {
     for (const language of languages) {
       for (const key of criticalKeys) {
@@ -124,6 +135,34 @@ describe("i18n resources", () => {
       }
     }
   });
+
+  it.each(["userLimit", "totalUsageEdit"])(
+    "provides Server Share %s copy in every supported language",
+    (block) => {
+      const keys = Object.keys(
+        serverEn.share[block as keyof typeof serverEn.share] as Record<
+          string,
+          string
+        >,
+      );
+      expect(keys.length).toBeGreaterThan(0);
+      for (const language of languages) {
+        const bundle = serverLocales[language].share[block] as Record<
+          string,
+          string
+        >;
+        expect(Object.keys(bundle).sort(), `${language}:key-set`).toEqual(
+          [...keys].sort(),
+        );
+        for (const key of keys) {
+          expect(
+            i18n.t(`share.${block}.${key}`, { lng: language }),
+            `${language}:share.${block}.${key}`,
+          ).toBe(bundle[key]);
+        }
+      }
+    },
+  );
 
   it("provides Server Codex feature copy in every supported language", () => {
     for (const language of languages) {

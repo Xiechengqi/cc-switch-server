@@ -2019,6 +2019,7 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::usage::store::usage_directory(config_dir),
         crate::domain::health::provider_health_path(config_dir),
         crate::domain::sharing::shares::shares_path(config_dir),
+        crate::domain::sharing::legacy_token_market_migration::retirement_audit_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
         grok_media_tasks_path(config_dir),
     ]
@@ -5570,7 +5571,18 @@ impl ServerStateInner {
         let grok_media_tasks =
             GrokMediaTaskStore::load_or_default(&config_dir, crate::infra::time::now_ms() as i64)
                 .context("load Grok media task store")?;
-        let mut shares = ShareStore::load_or_default(&config_dir)?;
+        let legacy_share_load =
+            crate::domain::sharing::legacy_token_market_migration::load_and_migrate(&config_dir)?;
+        if let Some(migration) = legacy_share_load.migration.as_ref() {
+            tracing::warn!(
+                source_sha256 = migration.source_sha256.as_deref().unwrap_or("none"),
+                affected_fields = migration.affected_fields,
+                retired_archive_files = migration.retired_archive_files,
+                audit_path = %migration.audit_path.display(),
+                "retired legacy capacity binding data during startup"
+            );
+        }
+        let mut shares = legacy_share_load.store;
         let integrity_outcomes =
             shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
         let mut shares_changed = integrity_outcomes.iter().any(|outcome| outcome.changed());
@@ -5628,7 +5640,7 @@ impl ServerStateInner {
                 );
             }
         }
-        let migrated_grants = shares.migrate_user_grants_from_acl();
+        let migrated_grants = shares.normalize_all_user_grants();
         if !migrated_grants.is_empty() {
             shares_changed = true;
             tracing::info!(
@@ -6797,18 +6809,38 @@ impl ServerStateInner {
             &self.config_dir,
             crate::infra::time::now_ms() as i64,
         )?;
-        let mut shares = ShareStore::load_or_default(&self.config_dir)?;
+        let legacy_share_load =
+            crate::domain::sharing::legacy_token_market_migration::load_and_migrate(
+                &self.config_dir,
+            )?;
+        if let Some(migration) = legacy_share_load.migration.as_ref() {
+            tracing::warn!(
+                source_sha256 = migration.source_sha256.as_deref().unwrap_or("none"),
+                affected_fields = migration.affected_fields,
+                retired_archive_files = migration.retired_archive_files,
+                audit_path = %migration.audit_path.display(),
+                "retired legacy capacity binding data during persistent-store reload"
+            );
+        }
+        let mut shares = legacy_share_load.store;
         let (preserved_client_state, rebased_client_share_subdomains) =
             reconcile_client_subdomain_adoption_on_reload(
                 &current_config,
                 &mut config,
                 &mut shares,
             )?;
+        let mut shares_changed = rebased_client_share_subdomains > 0;
+        if let Some(owner_email) = config.owner.email.as_deref() {
+            shares_changed |= !shares
+                .bind_all_to_client_owner(owner_email)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .is_empty();
+        }
+        shares_changed |= !shares.normalize_all_user_grants().is_empty();
         let integrity_outcomes =
             shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
-        if integrity_outcomes.iter().any(|outcome| outcome.changed())
-            || rebased_client_share_subdomains > 0
-        {
+        shares_changed |= integrity_outcomes.iter().any(|outcome| outcome.changed());
+        if shares_changed {
             persist_state_snapshot(&self.config_dir, shares.clone()).await?;
         }
         let ui_settings = UiSettingsStore::load_or_default(&self.config_dir)?;
@@ -18719,9 +18751,7 @@ mod tests {
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AppKind, ProviderType};
     use crate::domain::providers::store::providers_path;
-    use crate::domain::sharing::shares::{
-        Share, ShareAcl, ShareBinding, SharePolicy, UpsertShareInput,
-    };
+    use crate::domain::sharing::shares::{Share, ShareBinding, SharePolicy, UpsertShareInput};
     use crate::domain::usage::store::{TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata};
     use axum::extract::State as AxumState;
     use axum::http::StatusCode;
@@ -18782,16 +18812,10 @@ mod tests {
             account_email: None,
             quota_percent: None,
             tunnel_subdomain: Some(format!("{}sync", share_id.replace('-', ""))),
-            acl: None,
             token_limit: None,
             parallel_limit: None,
             expires_at: None,
-            for_sale: None,
             free_access: None,
-            access_by_app: BTreeMap::new(),
-            app_settings: BTreeMap::new(),
-            for_sale_official_price_percent_by_app: BTreeMap::new(),
-            official_price_percent: None,
             allow_personal_credits: None,
             auto_consume_banked_reset: None,
             banked_reset_expiry_lead_minutes: None,
@@ -20079,16 +20103,10 @@ mod tests {
                 account_email: None,
                 quota_percent: None,
                 tunnel_subdomain: Some("codexshare".to_string()),
-                acl: None,
                 token_limit: None,
                 parallel_limit: None,
                 expires_at: None,
-                for_sale: None,
                 free_access: None,
-                access_by_app: std::collections::BTreeMap::new(),
-                app_settings: std::collections::BTreeMap::new(),
-                for_sale_official_price_percent_by_app: std::collections::BTreeMap::new(),
-                official_price_percent: None,
                 allow_personal_credits: None,
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
@@ -20789,16 +20807,10 @@ mod tests {
                 subscription_level: None,
                 account_email: None,
                 quota_percent: None,
-                acl: None,
                 token_limit: None,
                 parallel_limit: None,
                 expires_at: None,
-                for_sale: None,
                 free_access: None,
-                access_by_app: BTreeMap::new(),
-                app_settings: BTreeMap::new(),
-                for_sale_official_price_percent_by_app: BTreeMap::new(),
-                official_price_percent: None,
                 allow_personal_credits: None,
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
@@ -29455,10 +29467,7 @@ mod tests {
             account_email: None,
             quota_percent: None,
             tunnel_subdomain: None,
-            policy: SharePolicy {
-                acl: ShareAcl::default(),
-                ..SharePolicy::default()
-            },
+            policy: SharePolicy::default(),
             tokens_used: 0,
             requests_count: 0,
             created_at_ms: 0,

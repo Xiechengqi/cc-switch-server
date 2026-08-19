@@ -1,15 +1,8 @@
 import { routerAuthFetch } from "@/lib/routerAuth";
 
 export interface RouterShareSettingsPatch {
-  ownerEmail?: string;
   description?: string | null;
-  forSale?: "Yes" | "No" | "Free";
-  marketAccessMode?: "selected" | "all";
-  sharedWithEmails?: string[];
-  accessByApp?: import("@/lib/api").ShareAccessByApp;
-  appSettings?: import("@/lib/api").ShareAppSettingsByApp;
-  forSaleOfficialPricePercentByApp?: Record<string, number>;
-  officialPricePercent?: number | null;
+  freeAccess?: boolean;
   tokenLimit?: number;
   parallelLimit?: number;
   expiresAt?: string;

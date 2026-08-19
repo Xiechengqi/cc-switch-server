@@ -154,11 +154,7 @@
       "removeBindingSuccess": "Remote sharing stopped for this app",
       "removeBindingError": "Failed to stop remote sharing: {{error}}",
       "ownerNotConfigured": "Configure Client Owner first",
-      "ownerManagedHint": "Share Owner always matches Client Owner. Change it from Settings → Share via installation-signed owner transfer.",
-      "officialPricePercent": "Model pricing (% of official price)",
-      "officialPricePercentPlaceholder": "Leave empty to use Token Market pricing",
-      "officialPricePercentHint": "Enter an integer from 1 to 100.",
-      "officialPricePercentInvalid": "Model pricing must be an integer from 1 to 100."
+      "ownerManagedHint": "Share Owner always matches Client Owner. Change it from Settings → Share via installation-signed owner transfer."
     },
     "unsavedChanges": {
       "title": "Discard unsaved changes?",
@@ -2973,7 +2969,6 @@
       "summaryHeading": "Will be created with these defaults:",
       "apiKeyAuto": "(auto-generated)",
       "subdomainAuto": "(auto)",
-      "marketHint": "After creation you can fine-tune the Market list from the share card.",
       "defaultsConfirm": {
         "title": "Create with default settings?",
         "body": "You did not open \"Advanced settings\". The share will be created with the following defaults:",
@@ -3084,26 +3079,13 @@
     "descriptionHint": "Optional. Shown in the cc-switch-router sidebar. Maximum 200 characters.",
     "descriptionPlaceholder": "Describe what this share is for, who should use it, or any usage notes.",
     "descriptionSettings": "Description Settings",
-    "forSale": "For Sale",
-    "forSaleHint": "Mark whether this share is currently intended to be sold. Synced to the cc-switch-router share list.",
-    "forSaleSettings": "For Sale Settings",
-    "saveForSale": "Save For Sale",
-    "forSaleOptions": {
-      "yes": "Yes",
-      "no": "No",
-      "free": "Free"
+    "authorizedUsers": "Authorized users",
+    "freeAccess": {
+      "label": "Public free access",
+      "hint": "Private by default. When enabled, any signed-in Router user may invoke this Share for free; authorized users below can still have individual quota overrides.",
+      "public": "Public free",
+      "private": "Private"
     },
-    "market": {
-      "title": "Market Selection",
-      "select": "Select Market",
-      "all": "All",
-      "restore": "Restore",
-      "default": "Default, no Market authorized",
-      "description": "Choose one or more markets. Authorization is saved together.",
-      "forSaleRequired": "Set For Sale to Yes before choosing a market."
-    },
-    "forSaleFreeConfirmTitle": "Confirm Free Mode",
-    "forSaleFreeConfirmMessage": "Setting to Free will fully expose the API Key to everyone without masking. Please confirm you understand the risks.",
     "apiKey": "API Key",
     "apiKeyHint": "Optional. Leave blank to auto-generate. Only letters, numbers, ., _, and - are allowed, with length 8 to 128.",
     "apiKeySettings": "API Key Settings",
@@ -3248,12 +3230,10 @@
     },
     "editDialog": {
       "title": "Settings",
-      "save": "Save settings",
-      "forSaleDisableHint": "When For Sale is Free or No, target markets and model pricing cannot be edited."
+      "save": "Save settings"
     },
     "confirmDeleteTitle": "Delete Share",
     "confirmDeleteMessage": "Delete share \"{{name}}\"? Any running tunnel will be stopped first.",
-    "freeConfirm": "Set For Sale to Free?",
     "error": {
       "title": "Failed to load shares"
     },
@@ -3275,8 +3255,6 @@
       "updateApiKeyError": "Failed to update API Key: {{error}}",
       "updateDescriptionSuccess": "Description updated",
       "updateDescriptionError": "Failed to update description: {{error}}",
-      "updateForSaleSuccess": "For Sale updated",
-      "updateForSaleError": "Failed to update For Sale: {{error}}",
       "updateExpirationSuccess": "Expiration updated",
       "updateExpirationError": "Failed to update expiration: {{error}}",
       "updateTokenLimitSuccess": "Token limit updated",

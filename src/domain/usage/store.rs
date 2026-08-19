@@ -402,6 +402,16 @@ impl UsageState {
 }
 
 impl UsageStore {
+    /// Returns the append-only journal waterline used to make quota rebase
+    /// snapshots auditable.  A missing checkpoint is treated as zero for old
+    /// in-memory/test stores.
+    pub fn journal_watermark(&self) -> u64 {
+        self.journal_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.through_sequence)
+            .unwrap_or_default()
+    }
+
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = usage_path(config_dir);
         let provider_health = ProviderHealthStore::load_rebuildable(config_dir);

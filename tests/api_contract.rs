@@ -5788,32 +5788,22 @@ async fn provider_share_settings_are_saved_atomically() {
                     "ownerEmail": "forged@example.com",
                     "subdomain": "after-save",
                     "description": "Provider-scoped share",
-                    "forSale": "Yes",
-                    "marketAccessMode": "selected",
-                    "sharedWithEmails": ["friend@example.com"],
-                    "accessByApp": {
-                        "codex": {
-                            "sharedWithEmails": ["friend@example.com"],
-                            "marketAccessMode": "selected"
-                        }
-                    },
-                    "appSettings": {
-                        "codex": {
-                            "forSale": "Yes",
-                            "marketAccessMode": "selected",
-                            "sharedWithEmails": ["friend@example.com"],
-                            "tokenLimit": 123,
-                            "parallelLimit": 4,
-                            "expiresAt": "2030-01-01T00:00:00Z"
-                        }
-                    },
-                    "forSaleOfficialPricePercentByApp": {
-                        "codex": 80
-                    },
-                    "officialPricePercent": 80,
+                    "freeAccess": false,
                     "tokenLimit": 123,
                     "parallelLimit": 4,
-                    "expiresAt": "2030-01-01T00:00:00Z"
+                    "expiresAt": "2030-01-01T00:00:00Z",
+                    "userGrants": {
+                        "friend@example.com": {
+                            "email": "friend@example.com",
+                            "role": "shareto",
+                            "active": true,
+                            "policy": {
+                                "parallelLimit": 4,
+                                "tokenLimit": 123,
+                                "tokenPeriod": "lifetime"
+                            }
+                        }
+                    }
                 }
             }),
             Some(&token),
@@ -5826,15 +5816,17 @@ async fn provider_share_settings_are_saved_atomically() {
     assert_eq!(saved["ownerEmail"].as_str(), Some("owner@example.com"));
     assert_eq!(saved["tunnelSubdomain"].as_str(), Some("after-save"));
     assert_eq!(saved["description"].as_str(), Some("Provider-scoped share"));
-    assert_eq!(saved["forSale"].as_bool(), Some(true));
+    assert!(saved.get("forSale").is_none());
+    assert_eq!(saved["freeAccess"].as_bool(), Some(false));
     assert_eq!(saved["tokenLimit"].as_u64(), Some(123));
     assert_eq!(saved["parallelLimit"].as_u64(), Some(4));
-    assert_eq!(saved["officialPricePercent"].as_u64(), Some(80));
+    assert!(saved.get("officialPricePercent").is_none());
     assert_eq!(saved["expiresAt"].as_i64(), Some(1_893_456_000_000));
     assert_eq!(
-        saved["acl"]["sharedWithEmails"][0].as_str(),
+        saved["userGrants"]["friend@example.com"]["email"].as_str(),
         Some("friend@example.com")
     );
+    assert!(saved.get("acl").is_none());
     assert_eq!(saved["bindings"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         saved["bindings"][0]["providerId"].as_str(),
@@ -5844,12 +5836,11 @@ async fn provider_share_settings_are_saved_atomically() {
         .mutate_shares(|store| store.get("share-provider-save").cloned())
         .await
         .unwrap();
-    assert_eq!(stored.official_price_percent, Some(80));
     assert_eq!(stored.router_synced_revision, stored.config_revision);
     assert!(stored.router_last_sync_error.is_none());
 
     let saved_revision = saved["configRevision"].as_u64().unwrap();
-    let divergent = app
+    let retired = app
         .clone()
         .oneshot(json_request(
             Method::POST,
@@ -5860,27 +5851,38 @@ async fn provider_share_settings_are_saved_atomically() {
                     "expectedConfigRevision": saved_revision,
                     "subdomain": "after-save",
                     "description": "must not persist",
-                    "forSale": "Yes",
-                    "marketAccessMode": "selected",
-                    "sharedWithEmails": ["friend@example.com"],
-                    "accessByApp": {},
-                    "appSettings": {},
-                    "forSaleOfficialPricePercentByApp": {"codex": 80},
-                    "officialPricePercent": 60,
+                    "freeAccess": false,
+                    "runtimeSnapshot": {
+                        "nested": [{"marketEmail": "retired@example.com"}]
+                    },
                     "tokenLimit": 123,
                     "parallelLimit": 4,
                     "expiresAt": "2030-01-01T00:00:00Z",
-                    "userGrants": {}
+                    "userGrants": {
+                        "friend@example.com": {
+                            "email": "friend@example.com",
+                            "role": "shareto",
+                            "active": true,
+                            "policy": {
+                                "parallelLimit": 4,
+                                "tokenLimit": 123,
+                                "tokenPeriod": "lifetime"
+                            }
+                        }
+                    }
                 }
             }),
             Some(&token),
         ))
         .await
         .unwrap();
-    let divergent_status = divergent.status();
-    let divergent_body = json_body(divergent).await;
-    assert_eq!(divergent_status, StatusCode::CONFLICT);
-    assert_eq!(divergent_body["code"], "cc_switch_share_policy_divergent");
+    let retired_status = retired.status();
+    let retired_body = json_body(retired).await;
+    assert_eq!(retired_status, StatusCode::BAD_REQUEST);
+    assert!(retired_body["error"].as_str().is_some_and(|message| {
+        message.contains("retired Share field")
+            && message.contains("runtimeSnapshot.nested[0].marketEmail")
+    }));
     let unchanged = state
         .mutate_shares(|store| store.get("share-provider-save").cloned())
         .await
@@ -5890,6 +5892,30 @@ async fn provider_share_settings_are_saved_atomically() {
         unchanged.description.as_deref(),
         Some("Provider-scoped share")
     );
+
+    let invoke_import = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/import_shares",
+            json!({
+                "shares": [{
+                    "runtimeSnapshot": {
+                        "nested": [{"marketEmail": "retired@example.com"}]
+                    }
+                }]
+            }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let invoke_import_status = invoke_import.status();
+    let invoke_import_body = json_body(invoke_import).await;
+    assert_eq!(invoke_import_status, StatusCode::BAD_REQUEST);
+    assert!(invoke_import_body["error"].as_str().is_some_and(|message| {
+        message.contains("retired Share field")
+            && message.contains("[0].runtimeSnapshot.nested[0].marketEmail")
+    }));
 
     let pending_app = app.clone();
     let pending_token = token.clone();
@@ -5904,15 +5930,18 @@ async fn provider_share_settings_are_saved_atomically() {
                         "expectedConfigRevision": saved_revision,
                         "subdomain": "stale-save",
                         "description": "stale editor",
-                        "forSale": "No",
-                        "marketAccessMode": "selected",
-                        "sharedWithEmails": [],
-                        "accessByApp": {},
-                        "appSettings": {},
-                        "forSaleOfficialPricePercentByApp": {},
+                        "freeAccess": false,
                         "tokenLimit": -1,
                         "parallelLimit": -1,
-                        "expiresAt": "2031-01-01T00:00:00Z"
+                        "expiresAt": "2031-01-01T00:00:00Z",
+                        "userGrants": {
+                            "friend@example.com": {
+                                "email": "friend@example.com",
+                                "role": "shareto",
+                                "active": true,
+                                "policy": {"tokenPeriod": "lifetime"}
+                            }
+                        }
                     }
                 }),
                 Some(&pending_token),
@@ -8547,12 +8576,10 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
                     "enabled": true,
                     "subdomain": "bundle-share-grok-url",
                     "description": "One Bundle Share",
-                    "forSale": "No",
-                    "marketAccessMode": "all",
+                    "freeAccess": false,
                     "tokenLimit": 500,
                     "parallelLimit": 5,
                     "expiresAt": "2035-01-01T00:00:00Z",
-                    "sharedWithEmails": ["friend@example.com"],
                     "userGrants": {
                         "friend@example.com": {
                             "email": "friend@example.com",
@@ -8575,7 +8602,7 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     let created_share = json_body(created_share).await;
     assert_eq!(status, StatusCode::OK, "response body: {created_share}");
     assert_eq!(created_share["configRevision"], 1);
-    assert_eq!(created_share["acl"]["marketAccessMode"], "all");
+    assert!(created_share.get("acl").is_none());
     assert_eq!(created_share["bindings"].as_array().map(Vec::len), Some(3));
     assert!(created_share["bindings"]
         .as_array()
@@ -8619,11 +8646,10 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
             "enabled": false,
             "subdomain": "bundle-share-grok-url",
             "description": "Saved while paused",
-            "forSale": "Free",
+            "freeAccess": true,
             "tokenLimit": 250,
             "parallelLimit": 3,
             "expiresAt": "2036-01-01T00:00:00Z",
-            "sharedWithEmails": ["friend@example.com", "FRIEND@example.com"],
             "userGrants": {
                 "friend@example.com": {
                     "email": "friend@example.com",
@@ -8642,23 +8668,9 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
         .share_in_flight
         .try_acquire(&share_id, None)
         .expect("test request should acquire the Share slot");
-    let blocked = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/web-api/invoke/save_provider_bundle_share",
-            reconcile_payload.clone(),
-            Some(&token),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(blocked.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(blocked).await["code"],
-        "cc_switch_share_in_flight"
-    );
-    drop(in_flight);
-
+    // Disabling a Bundle surface updates enabledApps but preserves the three
+    // stable bindings, so the policy save does not need the binding-mutation
+    // lock and may complete while an already-routed request drains.
     let reconciled = app
         .clone()
         .oneshot(json_request(
@@ -8669,6 +8681,7 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
         ))
         .await
         .unwrap();
+    drop(in_flight);
     let status = reconciled.status();
     let reconciled = json_body(reconciled).await;
     assert_eq!(status, StatusCode::OK, "response body: {reconciled}");
@@ -8680,11 +8693,9 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     assert_eq!(reconciled["bindings"][2]["app"], "gemini");
     assert_eq!(reconciled["enabledApps"], json!(["claude", "codex"]));
     assert_eq!(reconciled["description"], "Saved while paused");
+    assert_eq!(reconciled["freeAccess"], true);
     assert_eq!(reconciled["tokenLimit"], 250);
-    assert_eq!(
-        reconciled["acl"]["sharedWithEmails"],
-        json!(["friend@example.com"])
-    );
+    assert!(reconciled.get("acl").is_none());
     assert_eq!(
         reconciled["userGrants"]["friend@example.com"]["policy"]["tokenLimit"],
         75
@@ -8725,11 +8736,9 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
                     "enabled": false,
                     "subdomain": "INVALID SUBDOMAIN",
                     "description": "must not persist",
-                    "forSale": "No",
                     "tokenLimit": 1,
                     "parallelLimit": 1,
-                    "expiresAt": "2037-01-01T00:00:00Z",
-                    "sharedWithEmails": []
+                    "expiresAt": "2037-01-01T00:00:00Z"
                 }
             }),
             Some(&token),
@@ -8757,11 +8766,9 @@ async fn provider_bundle_share_save_is_atomic_and_server_derived() {
                     "enabled": false,
                     "subdomain": "bundle-share-grok-url",
                     "description": "stale",
-                    "forSale": "No",
                     "tokenLimit": -1,
                     "parallelLimit": -1,
-                    "expiresAt": "2038-01-01T00:00:00Z",
-                    "sharedWithEmails": []
+                    "expiresAt": "2038-01-01T00:00:00Z"
                 }
             }),
             Some(&token),
@@ -12160,10 +12167,7 @@ async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
     let joined = json_body(joined).await["share"].clone();
     assert_eq!(joined["capacityPoolId"], shared_capacity_pool_id);
     assert_eq!(joined["bindings"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        joined["appSettings"]["claude"],
-        joined["appSettings"]["codex"]
-    );
+    assert!(joined.get("appSettings").is_none());
 
     let mismatch = state
         .mutate_providers_immediate(|providers| {
@@ -12203,30 +12207,22 @@ async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
                 "expectedConfigRevision": joined["configRevision"],
                 "subdomain": "sharereusemulti",
                 "description": "edited from Codex",
-                "forSale": "Yes",
-                "marketAccessMode": "selected",
-                "sharedWithEmails": ["friend@example.com"],
-                "accessByApp": {
-                    "codex": {
-                        "sharedWithEmails": ["friend@example.com"],
-                        "marketAccessMode": "selected"
-                    }
-                },
-                "appSettings": {
-                    "codex": {
-                        "forSale": "Yes",
-                        "marketAccessMode": "selected",
-                        "sharedWithEmails": ["friend@example.com"],
-                        "tokenLimit": 456,
-                        "parallelLimit": 3,
-                        "expiresAt": "2099-12-31T23:59:59Z"
-                    }
-                },
-                "forSaleOfficialPricePercentByApp": {"codex": 75},
+                "freeAccess": true,
                 "tokenLimit": 456,
                 "parallelLimit": 3,
                 "expiresAt": "2099-12-31T23:59:59Z",
-                "userGrants": {}
+                "userGrants": {
+                    "friend@example.com": {
+                        "email": "friend@example.com",
+                        "role": "shareto",
+                        "active": true,
+                        "policy": {
+                            "parallelLimit": 3,
+                            "tokenLimit": 456,
+                            "tokenPeriod": "lifetime"
+                        }
+                    }
+                }
             }),
             Some(&token),
         ))
@@ -12238,7 +12234,12 @@ async fn share_reuse_is_explicit_and_shared_configuration_is_app_agnostic() {
     assert_eq!(saved["description"], "edited from Codex");
     assert_eq!(saved["tokenLimit"], 456);
     assert_eq!(saved["parallelLimit"], 3);
-    assert_eq!(saved["officialPricePercent"], 75);
+    assert_eq!(saved["freeAccess"], true);
+    assert!(saved.get("officialPricePercent").is_none());
+    assert!(saved.get("acl").is_none());
+    assert!(saved["userGrants"]["friend@example.com"]["active"]
+        .as_bool()
+        .unwrap());
     assert!(saved.get("appSettings").is_none());
     assert!(saved.get("forSaleOfficialPricePercentByApp").is_none());
 
@@ -13205,16 +13206,10 @@ fn test_share_input_for_app(
         account_email: None,
         quota_percent: None,
         tunnel_subdomain: None,
-        acl: None,
         token_limit: None,
         parallel_limit: None,
         expires_at: None,
-        for_sale: None,
         free_access: None,
-        access_by_app: BTreeMap::new(),
-        app_settings: BTreeMap::new(),
-        for_sale_official_price_percent_by_app: BTreeMap::new(),
-        official_price_percent: None,
         auto_start: None,
         description: None,
         allow_personal_credits: None,
@@ -13422,4 +13417,478 @@ async fn qoder_web_managed_auth_preserves_site_state_and_cancel_contract() {
     assert_eq!(status["provider"], "qoder_cosy");
     assert_eq!(status["authenticated"], false);
     assert_eq!(status["accounts"], json!([]));
+}
+
+const REBASE_MINUTE_MS: i64 = 60_000;
+const REBASE_DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn share_user_quota_log(share_id: &str, user_email: &str, tokens: u64) -> UsageLog {
+    let mut log = UsageLog::new(
+        AppKind::Codex,
+        "provider-rebase".to_string(),
+        "Rebase Provider".to_string(),
+        ProviderType::Codex,
+        200,
+        10,
+        UsageModelMetadata {
+            model: Some("gpt-5.5".to_string()),
+            requested_model: Some("gpt-5.5".to_string()),
+            actual_model: Some("gpt-5.5".to_string()),
+            actual_model_source: Some("response".to_string()),
+        },
+        TokenUsage {
+            raw_input_tokens: Some(tokens),
+            input_tokens: Some(tokens),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_creation_tokens: Some(0),
+            total_tokens: Some(tokens),
+        },
+    );
+    log.record_kind = UsageRecordKind::UserInference;
+    log.outcome = UsageOutcome::Success;
+    log.apply_context(UsageLogContext {
+        share_id: Some(share_id.to_string()),
+        user_email: Some(user_email.to_string()),
+        data_source: Some("router_share".to_string()),
+        ..Default::default()
+    });
+    log
+}
+
+fn rebase_save_params(
+    share_id: &str,
+    expected_config_revision: u64,
+    anchor_at_ms: i64,
+    grant_extra: Value,
+    usage_edits: Option<Value>,
+) -> Value {
+    let mut grant = json!({
+        "email": "friend@example.com",
+        "role": "shareto",
+        "active": true,
+        "policy": {
+            "parallelLimit": 4,
+            "tokenLimit": 1_000_000,
+            "tokenPeriod": "sevenDays",
+            "tokenPeriodAnchorAtMs": anchor_at_ms
+        }
+    });
+    if let (Some(target), Some(extra)) = (grant.as_object_mut(), grant_extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    let mut params = json!({
+        "shareId": share_id,
+        "expectedConfigRevision": expected_config_revision,
+        "subdomain": "rebase-share",
+        "description": "rebase share",
+        "freeAccess": false,
+        "tokenLimit": 5_000_000,
+        "parallelLimit": 8,
+        "expiresAt": "2030-01-01T00:00:00Z",
+        "userGrants": {"friend@example.com": grant}
+    });
+    if let (Some(target), Some(edits)) = (params.as_object_mut(), usage_edits) {
+        target.insert("userUsageEdits".to_string(), edits);
+    }
+    json!({ "params": params })
+}
+
+fn rebase_save_params_with_share_usage_edit(
+    share_id: &str,
+    expected_config_revision: u64,
+    anchor_at_ms: i64,
+    share_usage_edit: Value,
+) -> Value {
+    let mut body = rebase_save_params(
+        share_id,
+        expected_config_revision,
+        anchor_at_ms,
+        json!({}),
+        None,
+    );
+    body["params"]
+        .as_object_mut()
+        .unwrap()
+        .insert("shareUsageEdit".to_string(), share_usage_edit);
+    body
+}
+
+/// Wire-level coverage for the operator-owned consumed-token rebase:
+/// `userUsageEdits` is accepted only as an explicit `set`/`clear`, a
+/// browser-supplied `usageRebase` is never trusted, later requests accumulate
+/// on top of the operator baseline, and every rejection carries a stable code.
+#[tokio::test]
+async fn share_user_usage_rebase_round_trips_over_the_invoke_wire() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route(
+            "/v1/shares/claim-subdomain",
+            post(|| async { StatusCode::OK }),
+        )
+        .route("/v1/shares/batch-sync", post(|| async { StatusCode::OK }))
+        .route(
+            "/v1/shares/runtime-refresh",
+            post(|| async { StatusCode::OK }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let mut config = state.config_snapshot().await;
+    config.router.url = Some(format!("http://{router_addr}"));
+    config.router.identity = Some(cc_switch_server::domain::settings::config::RouterIdentity {
+        installation_id: "inst-usage-rebase".to_string(),
+        public_key: BASE64_STANDARD.encode([8_u8; 32]),
+        private_key: BASE64_STANDARD.encode([7_u8; 32]),
+        control_secret: Some("control-secret".to_string()),
+    });
+    state.replace_config(config).await.unwrap();
+
+    let now_ms = cc_switch_server::infra::time::now_ms() as i64;
+    // Three days into the past, minute-aligned: a legitimate anchor for a
+    // seven-day period whose current window is still open.
+    let anchor_at_ms = ((now_ms - 3 * REBASE_DAY_MS) / REBASE_MINUTE_MS) * REBASE_MINUTE_MS;
+
+    let created = state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-usage-rebase",
+                    "provider-rebase",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    let save = |body: Value, token: String| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(json_request(
+                    Method::POST,
+                    "/web-api/invoke/save_provider_share",
+                    body,
+                    Some(&token),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, json_body(response).await)
+        }
+    };
+
+    // 1. Establish the grant on a seven-day period anchored in the past.
+    let (status, saved) = save(
+        rebase_save_params(
+            "share-usage-rebase",
+            created.config_revision,
+            anchor_at_ms,
+            json!({}),
+            None,
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response body: {saved}");
+    let grant = &saved["userGrants"]["friend@example.com"];
+    assert_eq!(
+        grant["policy"]["tokenPeriodAnchorAtMs"].as_i64(),
+        Some(anchor_at_ms),
+        "a past anchor is accepted verbatim"
+    );
+    assert!(
+        grant.get("usageRebase").is_none(),
+        "a fresh grant carries no operator baseline"
+    );
+    let grant_revision = grant["revision"].as_u64().unwrap();
+    let mut config_revision = saved["configRevision"].as_u64().unwrap();
+
+    // 2. Real traffic inside the current window.
+    state
+        .push_usage_log(share_user_quota_log(
+            "share-usage-rebase",
+            "friend@example.com",
+            500,
+        ))
+        .await
+        .unwrap();
+
+    // 3. A target below the observed usage is refused with a stable code.
+    let (status, body) = save(
+        rebase_save_params(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({}),
+            Some(json!({
+                "friend@example.com": {
+                    "action": "set",
+                    "targetTokens": 100,
+                    "expectedGrantRevision": grant_revision,
+                    "period": "sevenDays",
+                    "anchorAtMs": anchor_at_ms
+                }
+            })),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "response body: {body}");
+    assert_eq!(body["code"], "cc_switch_share_usage_target_below_observed");
+
+    // 4. A stale grant revision is refused with its own stable code.
+    let (status, body) = save(
+        rebase_save_params(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({}),
+            Some(json!({
+                "friend@example.com": {
+                    "action": "set",
+                    "targetTokens": 12_000,
+                    "expectedGrantRevision": grant_revision + 7,
+                    "period": "sevenDays",
+                    "anchorAtMs": anchor_at_ms
+                }
+            })),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "response body: {body}");
+    assert_eq!(body["code"], "cc_switch_share_user_grant_revision_conflict");
+
+    // Neither rejection may leave a partial write behind.
+    let untouched = state
+        .mutate_shares(|store| store.get("share-usage-rebase").cloned())
+        .await
+        .unwrap();
+    assert_eq!(untouched.config_revision, config_revision);
+    assert!(untouched.user_grants["friend@example.com"]
+        .usage_rebase
+        .is_none());
+
+    // 5. A valid rebase, submitted together with a forged `usageRebase` that
+    //    the Server must ignore in favour of its own observation.
+    let (status, saved) = save(
+        rebase_save_params(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({
+                "usageRebase": {
+                    "period": "sevenDays",
+                    "anchorAtMs": anchor_at_ms,
+                    "targetTokens": 999_999,
+                    "observedTokensAtRebase": 0,
+                    "observedRequestsAtRebase": 0,
+                    "usageWatermark": 0,
+                    "appliedAtMs": 0,
+                    "source": "manual"
+                }
+            }),
+            Some(json!({
+                "friend@example.com": {
+                    "action": "set",
+                    "targetTokens": 12_000,
+                    "expectedGrantRevision": grant_revision,
+                    "period": "sevenDays",
+                    "anchorAtMs": anchor_at_ms
+                }
+            })),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response body: {saved}");
+    let grant = &saved["userGrants"]["friend@example.com"];
+    let rebase = &grant["usageRebase"];
+    assert_eq!(
+        rebase["targetTokens"].as_u64(),
+        Some(12_000),
+        "the operator baseline wins over the browser-submitted value"
+    );
+    assert_eq!(rebase["observedTokensAtRebase"].as_u64(), Some(500));
+    assert_eq!(rebase["observedRequestsAtRebase"].as_u64(), Some(1));
+    assert_eq!(rebase["period"].as_str(), Some("sevenDays"));
+    assert_eq!(rebase["anchorAtMs"].as_i64(), Some(anchor_at_ms));
+    assert_eq!(rebase["windowStartsAtMs"].as_i64(), Some(anchor_at_ms));
+    assert_eq!(
+        rebase["windowEndsAtMs"].as_i64(),
+        Some(anchor_at_ms + 7 * REBASE_DAY_MS)
+    );
+    assert!(rebase["appliedAtMs"]
+        .as_i64()
+        .is_some_and(|value| value > 0));
+    assert_eq!(rebase["source"].as_str(), Some("manual"));
+    assert_eq!(
+        rebase["appliedBy"].as_str(),
+        Some("owner@example.com"),
+        "a manual baseline records the verified admin that applied it"
+    );
+    assert_eq!(
+        grant["usage"]["anchored"]["tokensUsed"].as_u64(),
+        Some(12_000),
+        "the derived snapshot reports the operator baseline"
+    );
+    let quota = &grant["usageQuota"];
+    assert_eq!(
+        quota["effectiveTokensUsed"].as_u64(),
+        Some(12_000),
+        "the Server publishes what the limit is checked against"
+    );
+    assert_eq!(
+        quota["observedTokensUsed"].as_u64(),
+        Some(500),
+        "the Server publishes the history floor so the client need not invert the rebase"
+    );
+    assert_eq!(quota["manualOffsetTokens"].as_i64(), Some(11_500));
+    assert_eq!(quota["period"].as_str(), Some("sevenDays"));
+    assert_eq!(quota["anchorAtMs"].as_i64(), Some(anchor_at_ms));
+    assert_eq!(quota["windowStartsAtMs"].as_i64(), Some(anchor_at_ms));
+    assert_eq!(
+        quota["windowEndsAtMs"].as_i64(),
+        Some(anchor_at_ms + 7 * REBASE_DAY_MS)
+    );
+    assert_eq!(quota["rebaseApplies"].as_bool(), Some(true));
+    let rebased_grant_revision = grant["revision"].as_u64().unwrap();
+    assert!(rebased_grant_revision > grant_revision);
+    config_revision = saved["configRevision"].as_u64().unwrap();
+
+    // 6. New traffic accumulates on top of the baseline, not from zero.
+    state
+        .push_usage_log(share_user_quota_log(
+            "share-usage-rebase",
+            "friend@example.com",
+            300,
+        ))
+        .await
+        .unwrap();
+    state
+        .record_share_invocation_result(
+            "share-usage-rebase",
+            Some("friend@example.com"),
+            300,
+            cc_switch_server::infra::time::now_ms() as i64,
+        )
+        .await;
+    let accumulated = state
+        .mutate_shares(|store| store.get("share-usage-rebase").cloned())
+        .await
+        .unwrap();
+    assert_eq!(
+        accumulated.user_grants["friend@example.com"]
+            .usage
+            .anchored
+            .as_ref()
+            .map(|bucket| bucket.tokens_used),
+        Some(12_300),
+        "effective = target + (observed now - observed at rebase)"
+    );
+
+    // 7. Clearing drops the baseline and falls back to the raw observation.
+    let (status, saved) = save(
+        rebase_save_params(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({}),
+            Some(json!({
+                "friend@example.com": {
+                    "action": "clear",
+                    "expectedGrantRevision": rebased_grant_revision
+                }
+            })),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response body: {saved}");
+    let grant = &saved["userGrants"]["friend@example.com"];
+    assert!(
+        grant.get("usageRebase").is_none(),
+        "clear removes the durable baseline"
+    );
+    assert_eq!(
+        grant["usage"]["anchored"]["tokensUsed"].as_u64(),
+        Some(800),
+        "without a baseline the snapshot is exactly the observed usage"
+    );
+    config_revision = saved["configRevision"].as_u64().unwrap();
+
+    // 8. The Share total counter is a separate layer: it has no window and is
+    //    never rebuilt from history, so an operator correction is a direct set.
+    let before = state
+        .mutate_shares(|store| store.get("share-usage-rebase").cloned())
+        .await
+        .unwrap();
+    assert!(
+        before.tokens_used > 0,
+        "the Share total accumulated from the recorded invocation"
+    );
+    let (status, saved) = save(
+        rebase_save_params_with_share_usage_edit(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({"action": "set", "tokensUsed": 4_242}),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response body: {saved}");
+    assert_eq!(
+        saved["tokensUsed"].as_u64(),
+        Some(4_242),
+        "the Share total counter takes the operator value verbatim"
+    );
+    config_revision = saved["configRevision"].as_u64().unwrap();
+
+    // A `set` without a value is a client error, not a silent zeroing.
+    let (status, body) = save(
+        rebase_save_params_with_share_usage_edit(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({"action": "set"}),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "response body: {body}");
+    assert_eq!(
+        state
+            .mutate_shares(|store| store.get("share-usage-rebase").cloned())
+            .await
+            .unwrap()
+            .tokens_used,
+        4_242,
+        "a rejected edit leaves the counter untouched"
+    );
+
+    // `clear` is the zero shorthand.
+    let (status, saved) = save(
+        rebase_save_params_with_share_usage_edit(
+            "share-usage-rebase",
+            config_revision,
+            anchor_at_ms,
+            json!({"action": "clear"}),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "response body: {saved}");
+    assert_eq!(saved["tokensUsed"].as_u64(), Some(0));
 }

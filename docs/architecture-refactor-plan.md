@@ -1,5 +1,7 @@
 # 架构优化重构计划（Phase R）
 
+> **Historical notice**：本文记录早期 Phase R 的实施过程和历史路径，不能作为当前目录结构、行号、测试数量或完成状态的权威依据。当前三方现状、风险优先级和后续路线图见 [`docs/system-audit-and-normalization-plan.md`](system-audit-and-normalization-plan.md)。
+
 > **来源**：2026-07-06 技术架构评审（基于同日三方代码交叉审计，见 `docs/code-audit-gap-plan.md` 摘要表；本文档所有行数/引用数均为当日 HEAD `6fce8e4` 实测值）。
 > **性质**：纯结构重构——**不改变任何运行时行为、不新增功能、不修 bug**。任何与功能相关的改动一律走 `docs/code-audit-gap-plan.md`（Phase X）。
 > **执行者提示**：本文档面向可以直接开工的实施者（人或 code agent）。每个任务给出前置条件、精确操作、验收命令与提交规范；`cargo check` 的编译错误是重构过程中的**导航工具**而非事故，按提示逐个修复即可。

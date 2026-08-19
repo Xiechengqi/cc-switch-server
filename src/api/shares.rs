@@ -79,16 +79,6 @@ pub(in crate::api) async fn import_shares(
         shares: std::mem::take(&mut input.shares),
         ..ShareStore::default()
     };
-    let imported_share_ids = imported_store
-        .shares
-        .iter()
-        .map(|share| share.id.clone())
-        .collect::<Vec<_>>();
-    for share_id in imported_share_ids {
-        imported_store
-            .canonicalize_primary_app_settings(&share_id)
-            .map_err(map_share_patch_error)?;
-    }
     let owner_normalized = imported_store
         .bind_all_to_client_owner(&owner_email)
         .map_err(map_share_patch_error)?
@@ -1005,35 +995,6 @@ pub(in crate::api) async fn reset_share_usage(
     Ok(Json(UpsertShareResponse { ok: true, share }))
 }
 
-pub(in crate::api) async fn replace_share_acl(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<ReplaceShareAclRequest>,
-) -> Result<Json<UpsertShareResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let share = state
-        .mutate_shares_immediate(|store| {
-            store
-                .replace_acl(&id, input.acl)
-                .ok_or_else(|| ApiError::not_found("share not found"))
-        })
-        .await
-        .map_err(ApiError::internal)??;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(&state, "share.changed", &share, "acl_replaced");
-    Ok(Json(UpsertShareResponse { ok: true, share }))
-}
-
-pub(in crate::api) async fn list_token_markets(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<ListTokenMarketsResponse>, ApiError> {
-    require_session(&state, &headers).await?;
-    let markets = fetch_public_token_markets_from_router(&state).await?;
-    Ok(Json(ListTokenMarketsResponse { ok: true, markets }))
-}
-
 pub(in crate::api) async fn refresh_share_snapshots(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1172,39 +1133,6 @@ pub(in crate::api) fn router_domain_from_url(url: Option<&str>) -> Option<String
         .map(str::trim)
         .filter(|host| !host.is_empty())
         .map(str::to_string)
-}
-
-pub(in crate::api) async fn fetch_public_token_markets_from_router(
-    state: &ServerState,
-) -> Result<Vec<PublicTokenMarket>, ApiError> {
-    let config = state.config.read().await.clone();
-    let api_base = config
-        .router_api_base()
-        .ok_or_else(|| ApiError::conflict("router API base is not configured"))?
-        .trim_end_matches('/')
-        .to_string();
-    let http_client = state.http_client().await;
-    let response = http_client
-        .get(format!("{api_base}/v1/markets"))
-        .send()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("fetch token markets failed: {error}")))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(ApiError::bad_gateway(format!(
-            "fetch token markets failed: {status}: {body}"
-        )));
-    }
-    let response = response
-        .json::<ListTokenMarketsResponse>()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("parse token markets failed: {error}")))?;
-    Ok(response
-        .markets
-        .into_iter()
-        .filter(|market| market.market_kind == "usage")
-        .collect())
 }
 
 #[cfg(test)]

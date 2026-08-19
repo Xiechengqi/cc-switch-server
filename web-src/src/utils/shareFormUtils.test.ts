@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
-import { buildShareUserGrantsForAcl } from "./shareFormUtils";
+import { buildShareUserGrants } from "./shareFormUtils";
 
 const DEFAULT_POLICY: ShareUserPolicy = {
   tokenPeriod: "lifetime",
   tokenLimit: 10_000,
 };
 
-describe("buildShareUserGrantsForAcl", () => {
+describe("buildShareUserGrants", () => {
   it("preserves Router-managed grants while rebuilding ordinary ACL grants", () => {
     const source: ShareUserGrantMap = {
       "owner@example.com": {
@@ -43,7 +43,7 @@ describe("buildShareUserGrantsForAcl", () => {
       },
     };
 
-    const result = buildShareUserGrantsForAcl({
+    const result = buildShareUserGrants({
       source,
       ownerEmail: "OWNER@example.com",
       aclEmails: ["new@example.com", "renter@example.com"],

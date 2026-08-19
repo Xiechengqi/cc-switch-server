@@ -36,11 +36,7 @@ function share(
     capacityPoolId: "pool-1",
     name: "Bundle share",
     ownerEmail: "owner@example.com",
-    sharedWithEmails: [],
-    marketAccessMode: "selected",
-    forSaleOfficialPricePercentByApp: {},
-    officialPricePercent: null,
-    forSale: "No",
+    freeAccess: false,
     bindings,
     apiKey: "redacted",
     tokenLimit: -1,
@@ -69,20 +65,41 @@ describe("Provider Bundle sharing", () => {
     vi.useRealTimers();
   });
 
-  it("restores the original defaults for a new Share", () => {
+  it("creates a new Share as private by default", () => {
     expect(createBundleShareDraft()).toMatchObject({
       enabled: false,
-      forSale: "Yes",
-      marketAccessMode: "all",
+      freeAccess: false,
       tokenLimit: "",
       parallelLimit: "",
       expiry: "permanent",
-      sharedWithEmails: [],
       userGrants: {},
       allowPersonalCredits: false,
       autoConsumeBankedReset: false,
       previousResponseCacheEnabled: true,
     });
+  });
+
+  it("uses canonical user grants", () => {
+    const existing = share({ claude: "bundle-1" });
+    existing.userGrants = {
+      "owner@example.com": {
+        email: "owner@example.com",
+        role: "owner",
+        active: true,
+        policy: {},
+      },
+      "current@example.com": {
+        email: "current@example.com",
+        role: "shareto",
+        active: true,
+        policy: {},
+      },
+    };
+
+    expect(Object.keys(createBundleShareDraft(existing).userGrants).sort()).toEqual([
+      "current@example.com",
+      "owner@example.com",
+    ]);
   });
 
   it("matches the Router share slug contract before saving", () => {
@@ -151,7 +168,7 @@ describe("Provider Bundle sharing", () => {
         bundleId: "bundle-1",
         enabled: true,
         subdomain: "bundle-share",
-        marketAccessMode: "all",
+        freeAccess: false,
       }),
     );
     expect(
@@ -256,7 +273,6 @@ describe("Provider Bundle sharing", () => {
     const draft = createBundleShareDraft();
     draft.enabled = true;
     draft.subdomain = "bundle-share";
-    draft.sharedWithEmails = ["friend@example.com"];
     draft.userGrants = {
       "friend@example.com": {
         email: "friend@example.com",
@@ -274,7 +290,6 @@ describe("Provider Bundle sharing", () => {
 
     expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(
       expect.objectContaining({
-        sharedWithEmails: ["friend@example.com"],
         userGrants: draft.userGrants,
       }),
     );
@@ -303,7 +318,6 @@ describe("Provider Bundle sharing", () => {
         shareId: "share-1",
         expectedConfigRevision: 4,
         description: "Shared Bundle",
-        marketAccessMode: "selected",
       }),
     );
   });

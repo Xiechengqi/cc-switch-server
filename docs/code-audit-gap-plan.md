@@ -1,5 +1,7 @@
 # 代码审计缺口修复计划（Phase X）
 
+> **Historical notice**：本文记录早期 Phase X 审计与实施状态，不能作为当前目录结构、行号、测试数量或完成状态的权威依据。当前三方现状、风险优先级和后续路线图见 [`docs/system-audit-and-normalization-plan.md`](system-audit-and-normalization-plan.md)。
+
 > **来源**：2026-07-06 对外部 Provider/协议证据、Server（本仓库 @ `6fce8e4`）和 Router（`cc-switch-router`）的交叉审计。审计**不采信任何既有规划文档的状态标记**，全部结论来自协议证据与实测（`cargo test` 595 passed / typecheck / Router 契约逐条核对）。
 > **定位约束**：Server 是独立 token 反代服务端；客户端专属功能（Skill/MCP/OpenClaw/Hermes/OMO/prompts/sessions/deeplink 等）维持排除，本计划不涉及。
 > **关联文档**：`assets/contract/web-runtime-contract.json`（Server 功能契约）、`UPSTREAM_IMPORT.md`（外部 Provider 审计台账）。

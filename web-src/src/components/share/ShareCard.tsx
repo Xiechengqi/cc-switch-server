@@ -10,7 +10,6 @@ import {
   Trash2,
 } from "lucide-react";
 import type {
-  PublicTokenMarket,
   ShareRecord,
   TunnelConfig,
   TunnelInfo,
@@ -26,7 +25,6 @@ import { Card, CardContent } from "@/components/ui/card";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { useProviderHealth } from "@/lib/query/providerHealth";
-import { useTokenMarketsQuery } from "@/lib/query";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { formatShareRouterDisplay } from "@/utils/shareRouter";
@@ -84,7 +82,6 @@ export function ShareCard({
   const [connectionExpanded, setConnectionExpanded] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
-  const { data: markets = [] } = useTokenMarketsQuery(settingsExpanded);
   const ratio = getShareUsageRatio(share);
   // P8：多 app share。胸标里渲染每个已绑定 slot 的 chip + 健康色点。
   // primaryApp/primaryProvider 用于摘要标题、健康轮询等仍按"单值"逻辑的入口。
@@ -105,19 +102,7 @@ export function ShareCard({
     tunnelConfigured,
     tunnelStatus,
   );
-  const usageMarkets = markets;
-  const marketEmailSet = new Set<string>(
-    usageMarkets.map((market) => market.email.toLowerCase()),
-  );
-  const currentMarketEmails = Array.from(
-    new Set(
-      (share.sharedWithEmails ?? [])
-        .map((email) => email.trim().toLowerCase())
-        .filter((email) => marketEmailSet.has(email)),
-    ),
-  ).sort();
-  const currentMarketAccessMode = share.marketAccessMode ?? "selected";
-  const shareToSummary = shareAccessSummary(share, marketEmailSet);
+  const shareToSummary = shareToGrantSummary(share);
 
   const canDisable = isShareActionAllowed(
     share,
@@ -369,21 +354,24 @@ export function ShareCard({
                   value={share.ownerEmail || "-"}
                 />
                 <SummaryLine
-                  label={t("share.sharedWithEmails", {
-                    defaultValue: "Share To",
+                  label={t("share.authorizedUsers", {
+                    defaultValue: "授权用户",
                   })}
                   value={shareToSummary || "-"}
                 />
                 <SummaryLine
-                  label={t("share.forSale")}
-                  value={t(
-                    `share.forSaleOptions.${share.forSale.toLowerCase()}`,
-                  )}
-                />
-                <MarketSummary
-                  markets={usageMarkets}
-                  marketAccessMode={currentMarketAccessMode}
-                  selectedMarketEmails={currentMarketEmails}
+                  label={t("share.freeAccess.label", {
+                    defaultValue: "公开免费使用",
+                  })}
+                  value={
+                    share.freeAccess
+                      ? t("share.freeAccess.public", {
+                          defaultValue: "公开免费",
+                        })
+                      : t("share.freeAccess.private", {
+                          defaultValue: "私有",
+                        })
+                  }
                 />
                 <SummaryLine
                   label={t("share.description")}
@@ -459,106 +447,19 @@ function CollapsibleSectionHeader({
   );
 }
 
-function MarketSummary({
-  markets,
-  marketAccessMode,
-  selectedMarketEmails,
-}: {
-  markets: PublicTokenMarket[];
-  marketAccessMode: "selected" | "all";
-  selectedMarketEmails: string[];
-}) {
-  const { t } = useTranslation();
-  const marketByEmail = new Map(
-    markets.map((market) => [market.email.toLowerCase(), market]),
-  );
-
-  return (
-    <div className="min-w-0 rounded-md border border-border-default/70 bg-muted/10 px-3 py-2">
-      <div className="text-xs text-muted-foreground">
-        {t("share.market.title", { defaultValue: "Market" })}
-      </div>
-      <div className="mt-2">
-        {marketAccessMode === "all" ? (
-          <div className="text-sm text-muted-foreground">
-            {t("share.market.allSelected", {
-              defaultValue: "已选中所有 Market",
-            })}
-          </div>
-        ) : selectedMarketEmails.length ? (
-          <div className="flex flex-wrap gap-2">
-            {selectedMarketEmails.map((email) => {
-              const market = marketByEmail.get(email);
-              return (
-                <Badge
-                  key={email}
-                  variant="secondary"
-                  className="max-w-full gap-1 rounded-md px-2 py-1 text-xs"
-                >
-                  <span className="min-w-0 truncate">
-                    {market?.displayName ?? email}
-                  </span>
-                </Badge>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="break-all text-sm">
-            {t("share.market.default", {
-              defaultValue: "默认，不授权 Market",
-            })}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function shareAccessSummary(share: ShareRecord, marketEmailSet: Set<string>) {
-  const accessByApp = share.accessByApp ?? {};
-  const apps = shareSupportedApps(share);
-  const accessApps =
-    Object.keys(accessByApp).length > 0
-      ? apps.length
-        ? apps
-        : Object.keys(accessByApp)
-      : [];
-  if (accessApps.length === 0) {
-    return Array.from(
-      new Set(
-        (share.sharedWithEmails ?? [])
-          .map((email) => email.trim().toLowerCase())
-          .filter((email) => email && !marketEmailSet.has(email)),
-      ),
-    )
-      .sort()
-      .join(", ");
-  }
-
-  return accessApps
-    .map((app) => {
-      const access = (
-        accessByApp as Record<string, { sharedWithEmails?: string[] }>
-      )[app];
-      const emails = Array.from(
-        new Set(
-          (access?.sharedWithEmails ?? [])
-            .map((email) => email.trim().toLowerCase())
-            .filter((email) => email && !marketEmailSet.has(email)),
-        ),
-      ).sort();
-      if (emails.length === 0) return null;
-      return `${shareAppLabel(app)}: ${emails.join(", ")}`;
-    })
-    .filter(Boolean)
-    .join(" / ");
-}
-
-function shareAppLabel(app: string) {
-  if (app === "claude") return "Claude";
-  if (app === "codex") return "Codex";
-  if (app === "gemini") return "Gemini";
-  return app;
+function shareToGrantSummary(share: ShareRecord) {
+  return Array.from(
+    new Set(
+      Object.entries(share.userGrants ?? {})
+        .filter(
+          ([, grant]) => grant.active !== false && grant.role === "shareto",
+        )
+        .map(([key, grant]) => (grant.email || key).trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  )
+    .sort()
+    .join(", ");
 }
 
 function ConnectInlineValue({

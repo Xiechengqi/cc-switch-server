@@ -2851,11 +2851,7 @@
   "share": {
     "title": "Share",
     "confirmDeleteTitle": "刪除 Share",
-    "confirmDeleteMessage": "確認刪除 Share「{{name}}」嗎？若有執行中的 tunnel，會先停止再刪除。",
-    "freeConfirm": "確認將出售方式設為免費嗎？",
-    "forSaleOptions": {
-      "free": "免費"
-    }
+    "confirmDeleteMessage": "確認刪除 Share「{{name}}」嗎？若有執行中的 tunnel，會先停止再刪除。"
   },
   "antigravityOauth": {
     "authStatus": "Antigravity 認證",

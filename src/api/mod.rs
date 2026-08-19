@@ -132,7 +132,7 @@ use crate::domain::settings::config::{
 };
 use crate::domain::settings::ui_settings;
 use crate::domain::sharing::shares::{
-    Share, ShareAcl, ShareBinding, ShareDeleteTombstone, ShareStore, UpsertShareInput,
+    Share, ShareBinding, ShareDeleteTombstone, ShareStore, UpsertShareInput,
 };
 use crate::proxy::adapters::ProviderAdapter;
 use crate::proxy::{self, ProxyRoute};
@@ -523,8 +523,6 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/shares/:id/tunnel/stop", post(stop_share_tunnel))
         .route("/api/shares/tunnels/restore", post(restore_share_tunnels))
         .route("/api/shares/:id/reset-usage", post(reset_share_usage))
-        .route("/api/shares/:id/acl", post(replace_share_acl))
-        .route("/api/token-markets", get(list_token_markets))
         .route(
             "/api/shares/runtime-snapshot",
             post(refresh_share_snapshots),
@@ -2416,16 +2414,10 @@ mod grok_catalog_provider_tests {
                         account_email: None,
                         quota_percent: None,
                         tunnel_subdomain: Some(share_id.to_string()),
-                        acl: None,
                         token_limit: None,
                         parallel_limit: None,
                         expires_at: None,
-                        for_sale: Some(false),
                         free_access: Some(false),
-                        access_by_app: Default::default(),
-                        app_settings: Default::default(),
-                        for_sale_official_price_percent_by_app: Default::default(),
-                        official_price_percent: None,
                         allow_personal_credits: None,
                         auto_consume_banked_reset: None,
                         banked_reset_expiry_lead_minutes: None,
@@ -3489,34 +3481,34 @@ mod grok_catalog_provider_tests {
         let state = catalog_test_state("disabled-share-surface");
         configure_test_router(&state).await;
         configure_test_share(&state, "share-disabled", AppKind::Codex).await;
-        state
-            .mutate_providers_immediate(|providers| {
-                let provider = providers
-                    .providers
-                    .iter_mut()
-                    .find(|stored| {
-                        stored.app == AppKind::Codex
-                            && stored.provider.id == "share-disabled-provider"
-                    })
-                    .unwrap();
-                provider
-                    .provider
-                    .extra
-                    .insert("bundleId".to_string(), json!("share-disabled-provider"));
-                provider
-                    .provider
-                    .extra
-                    .insert("familyId".to_string(), json!("family.grok_oauth"));
-                provider
-                    .provider
-                    .extra
-                    .insert("surfaceEnabled".to_string(), json!(false));
-                providers
-                    .bundle_order
-                    .push("share-disabled-provider".to_string());
+        // Inject historical drift through the test-only replacement hook. A
+        // production Provider commit correctly rejects disabling the last
+        // enabled binding of an active Share; this route still has to fail
+        // closed if such an invalid snapshot is loaded or observed.
+        let mut providers = state.providers_snapshot().await;
+        let provider = providers
+            .providers
+            .iter_mut()
+            .find(|stored| {
+                stored.app == AppKind::Codex && stored.provider.id == "share-disabled-provider"
             })
-            .await
             .unwrap();
+        provider
+            .provider
+            .extra
+            .insert("bundleId".to_string(), json!("share-disabled-provider"));
+        provider
+            .provider
+            .extra
+            .insert("familyId".to_string(), json!("family.grok_oauth"));
+        provider
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(false));
+        providers
+            .bundle_order
+            .push("share-disabled-provider".to_string());
+        state.replace_provider_store_for_test(providers).await;
         let app = app_router(state);
 
         let response = app

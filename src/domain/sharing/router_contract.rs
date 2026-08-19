@@ -24,7 +24,9 @@ use crate::domain::providers::runtime::{
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
-use crate::domain::sharing::shares::{share_router_for_sale_label, Share};
+use crate::domain::sharing::shares::Share;
+
+pub const SHARE_CONTRACT_VERSION: u16 = 2;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -51,19 +53,7 @@ pub struct ShareSettingsPatch {
     )]
     pub description: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub market_access_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared_with_emails: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access_by_app: Option<BTreeMap<AppKind, ShareAppAccess>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_settings: Option<BTreeMap<AppKind, ShareAppSettings>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_sale_official_price_percent_by_app: Option<BTreeMap<AppKind, u16>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub official_price_percent: Option<Option<u16>>,
+    pub free_access: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +162,89 @@ pub struct ShareUserUsage {
     pub anchored: Option<ShareAnchoredUsageBucket>,
 }
 
+/// The persisted, Server-owned baseline used when an operator reconciles a
+/// user's quota with an external Provider reset.  `ShareUserUsage` remains a
+/// derived snapshot; this record is the durable input used to rebuild it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareUserUsageRebase {
+    pub period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_starts_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_ends_at_ms: Option<i64>,
+    pub target_tokens: u64,
+    #[serde(default)]
+    pub observed_tokens_at_rebase: u64,
+    #[serde(default)]
+    pub observed_requests_at_rebase: u64,
+    /// Usage journal waterline captured together with the observed snapshot.
+    /// It is diagnostic/concurrency metadata; the raw Usage log is never
+    /// rewritten by a rebase.
+    #[serde(default)]
+    pub usage_watermark: u64,
+    pub applied_at_ms: i64,
+    /// Verified admin identity that applied the baseline.  Accountability for
+    /// a manual quota correction has to survive in the record itself: the
+    /// derived snapshot it produces is indistinguishable from real traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_by: Option<String>,
+    #[serde(default)]
+    pub source: ShareUsageRebaseSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareUsageRebaseSource {
+    #[default]
+    Manual,
+    ProviderReset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareUserUsageEditAction {
+    Set,
+    Clear,
+}
+
+/// Explicit usage edit input.  It is intentionally separate from
+/// `ShareUserGrant.usage`: client supplied usage snapshots are never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserUsageEdit {
+    pub action: ShareUserUsageEditAction,
+    #[serde(default)]
+    pub target_tokens: Option<u64>,
+    #[serde(default)]
+    pub expected_grant_revision: Option<u64>,
+    #[serde(default)]
+    pub period: Option<ShareTokenPeriod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_at_ms: Option<i64>,
+    #[serde(default)]
+    pub source: ShareUsageRebaseSource,
+}
+
+/// Explicit Share-total consumed-token edit.
+///
+/// The Share total counter has no window and no anchor: it is a plain
+/// accumulator that only `reset_usage` ever moved backwards.  An operator
+/// correction is therefore a direct set, and needs none of the rebase
+/// bookkeeping the per-user quota requires.  It is kept out of
+/// [`ShareSettingsPatch`] on purpose so no Router settings sync can rewrite
+/// consumption counters as a side effect of pushing configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareTotalUsageEdit {
+    pub action: ShareUserUsageEditAction,
+    /// Required for `set`; ignored for `clear`, which means zero.
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareAnchoredUsageBucket {
@@ -196,6 +269,17 @@ pub struct ShareUserGrant {
     pub policy: ShareUserPolicy,
     #[serde(default)]
     pub usage: ShareUserUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_rebase: Option<ShareUserUsageRebase>,
+    /// Server-derived quota view for the grant's current window.
+    ///
+    /// Recomputed from the Usage history on every rebuild and never accepted
+    /// from a browser or Router patch.  It exists so a client can show the
+    /// effective/observed split and the window bounds without re-deriving
+    /// them by inverting the rebase formula, which would silently disagree
+    /// with the Server the moment the formula changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_quota: Option<ShareUserQuotaView>,
     #[serde(default)]
     pub created_at_ms: u128,
     #[serde(default)]
@@ -208,6 +292,37 @@ pub struct ShareUserGrant {
     pub manager: ShareGrantManager,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_id: Option<String>,
+}
+
+/// Derived per-grant quota view.
+///
+/// Every field is computed by the Server from the append-only Usage history
+/// plus the durable rebase record; nothing here is authoritative state.  It is
+/// excluded from the descriptor fingerprint for the same reason `usage` is —
+/// consumption moves constantly and must not force a Router descriptor resync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserQuotaView {
+    pub period: ShareTokenPeriod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_at_ms: Option<i64>,
+    /// Inclusive window start; absent for `lifetime`, which has no window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_starts_at_ms: Option<i64>,
+    /// Exclusive window end; absent for `lifetime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_ends_at_ms: Option<i64>,
+    /// What the limit is actually checked against.
+    pub effective_tokens_used: u64,
+    /// What the Usage history alone reports for this window.
+    pub observed_tokens_used: u64,
+    /// `effective - observed`; the standing operator correction, which is
+    /// negative when the baseline was set below what was already observed.
+    pub manual_offset_tokens: i64,
+    pub observed_requests_count: u64,
+    /// False when a rebase exists but belongs to a window that has since
+    /// rolled over, so the client can explain why the offset disappeared.
+    pub rebase_applies: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,28 +339,19 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareDescriptor {
+    pub contract_version: u16,
     pub share_id: String,
     #[serde(default)]
     pub capacity_pool_id: String,
     pub share_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub access_by_app: BTreeMap<AppKind, ShareAppAccess>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub app_settings: BTreeMap<AppKind, ShareAppSettings>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub for_sale_official_price_percent_by_app: BTreeMap<AppKind, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
-    pub for_sale: String,
+    pub free_access: bool,
     pub subdomain: String,
     pub app_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,45 +422,6 @@ fn default_banked_reset_expiry_lead_minutes() -> u32 {
 
 fn is_default_banked_reset_expiry_lead_minutes(value: &u32) -> bool {
     *value == default_banked_reset_expiry_lead_minutes()
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShareAppAccess {
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShareAppSettings {
-    #[serde(default)]
-    pub for_sale: String,
-    #[serde(default = "default_market_access_mode")]
-    pub market_access_mode: String,
-    #[serde(default)]
-    pub shared_with_emails: Vec<String>,
-    #[serde(default)]
-    pub token_limit: i64,
-    #[serde(default = "default_parallel_limit")]
-    pub parallel_limit: i64,
-    #[serde(default)]
-    pub expires_at: String,
-}
-
-impl Default for ShareAppSettings {
-    fn default() -> Self {
-        Self {
-            for_sale: default_share_for_sale(),
-            market_access_mode: default_market_access_mode(),
-            shared_with_emails: Vec::new(),
-            token_limit: -1,
-            parallel_limit: default_parallel_limit(),
-            expires_at: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -687,39 +754,6 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     }
     let support = crate::domain::sharing::shares::support_from_enabled_apps(&enabled_apps);
 
-    let shared_with_emails = share.acl.shared_with_emails.clone();
-    let market_access_mode = share.acl.market_access_mode.clone().unwrap_or_else(|| {
-        if share.acl.public_market_email.is_some() {
-            "selected".to_string()
-        } else if shared_with_emails.is_empty() {
-            "all".to_string()
-        } else {
-            "selected".to_string()
-        }
-    });
-    let mut access_by_app = BTreeMap::new();
-    let mut app_settings = BTreeMap::new();
-    for app in bindings.keys() {
-        access_by_app.insert(
-            *app,
-            ShareAppAccess {
-                shared_with_emails: shared_with_emails.clone(),
-                market_access_mode: market_access_mode.clone(),
-            },
-        );
-        app_settings.insert(
-            *app,
-            ShareAppSettings {
-                for_sale: share_router_for_sale_label(share),
-                market_access_mode: market_access_mode.clone(),
-                shared_with_emails: shared_with_emails.clone(),
-                token_limit: share.token_limit.map(|value| value as i64).unwrap_or(-1),
-                parallel_limit: share.parallel_limit.map(i64::from).unwrap_or(-1),
-                expires_at: share_expires_at_rfc3339(share.expires_at),
-            },
-        );
-    }
-
     let mut app_runtimes = ShareAppRuntimes::default();
     let mut app_providers = ShareAppProviders::default();
     let mut app_availability = ShareAppAvailability::default();
@@ -753,44 +787,44 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             match app {
                 AppKind::Claude => {
                     app_runtimes.claude = Some(upstream.clone());
-                    app_providers.claude.push(app_provider(
-                        app.as_str(),
+                    app_providers.claude.push(app_provider(AppProviderInput {
+                        app: app.as_str(),
                         provider,
                         share,
                         accounts,
                         usage,
-                        runtime_plan.as_deref(),
-                        true,
-                        surface_enabled(&provider.provider),
-                    ));
+                        runtime_plan: runtime_plan.as_deref(),
+                        is_current: true,
+                        enabled: surface_enabled(&provider.provider),
+                    }));
                     app_availability.claude = Some(availability);
                 }
                 AppKind::Codex => {
                     app_runtimes.codex = Some(upstream.clone());
-                    app_providers.codex.push(app_provider(
-                        app.as_str(),
+                    app_providers.codex.push(app_provider(AppProviderInput {
+                        app: app.as_str(),
                         provider,
                         share,
                         accounts,
                         usage,
-                        runtime_plan.as_deref(),
-                        true,
-                        surface_enabled(&provider.provider),
-                    ));
+                        runtime_plan: runtime_plan.as_deref(),
+                        is_current: true,
+                        enabled: surface_enabled(&provider.provider),
+                    }));
                     app_availability.codex = Some(availability);
                 }
                 AppKind::Gemini => {
                     app_runtimes.gemini = Some(upstream.clone());
-                    app_providers.gemini.push(app_provider(
-                        app.as_str(),
+                    app_providers.gemini.push(app_provider(AppProviderInput {
+                        app: app.as_str(),
                         provider,
                         share,
                         accounts,
                         usage,
-                        runtime_plan.as_deref(),
-                        true,
-                        surface_enabled(&provider.provider),
-                    ));
+                        runtime_plan: runtime_plan.as_deref(),
+                        is_current: true,
+                        enabled: surface_enabled(&provider.provider),
+                    }));
                     app_availability.gemini = Some(availability);
                 }
             }
@@ -831,44 +865,44 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             match stored.app {
                 AppKind::Claude if app_providers.claude.is_empty() => {
                     app_runtimes.claude = Some(upstream);
-                    app_providers.claude.push(app_provider(
-                        stored.app.as_str(),
-                        stored,
+                    app_providers.claude.push(app_provider(AppProviderInput {
+                        app: stored.app.as_str(),
+                        provider: stored,
                         share,
                         accounts,
                         usage,
-                        runtime_plan.as_deref(),
-                        false,
-                        surface_enabled(&stored.provider),
-                    ));
+                        runtime_plan: runtime_plan.as_deref(),
+                        is_current: false,
+                        enabled: surface_enabled(&stored.provider),
+                    }));
                     app_availability.claude = Some(availability);
                 }
                 AppKind::Codex if app_providers.codex.is_empty() => {
                     app_runtimes.codex = Some(upstream);
-                    app_providers.codex.push(app_provider(
-                        stored.app.as_str(),
-                        stored,
+                    app_providers.codex.push(app_provider(AppProviderInput {
+                        app: stored.app.as_str(),
+                        provider: stored,
                         share,
                         accounts,
                         usage,
-                        runtime_plan.as_deref(),
-                        false,
-                        surface_enabled(&stored.provider),
-                    ));
+                        runtime_plan: runtime_plan.as_deref(),
+                        is_current: false,
+                        enabled: surface_enabled(&stored.provider),
+                    }));
                     app_availability.codex = Some(availability);
                 }
                 AppKind::Gemini if app_providers.gemini.is_empty() => {
                     app_runtimes.gemini = Some(upstream);
-                    app_providers.gemini.push(app_provider(
-                        stored.app.as_str(),
-                        stored,
+                    app_providers.gemini.push(app_provider(AppProviderInput {
+                        app: stored.app.as_str(),
+                        provider: stored,
                         share,
                         accounts,
                         usage,
-                        runtime_plan.as_deref(),
-                        false,
-                        surface_enabled(&stored.provider),
-                    ));
+                        runtime_plan: runtime_plan.as_deref(),
+                        is_current: false,
+                        enabled: surface_enabled(&stored.provider),
+                    }));
                     app_availability.gemini = Some(availability);
                 }
                 _ => {}
@@ -879,6 +913,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         crate::domain::sharing::model_health::summary_for_share(share, providers, accounts, usage);
 
     ShareDescriptor {
+        contract_version: SHARE_CONTRACT_VERSION,
         share_id: share.id.clone(),
         capacity_pool_id: if share.capacity_pool_id.is_empty() {
             share.id.clone()
@@ -890,20 +925,8 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             .clone()
             .unwrap_or_else(|| share.id.clone()),
         owner_email: share.owner_email.clone(),
-        shared_with_emails,
-        market_access_mode,
-        access_by_app,
-        app_settings,
-        for_sale_official_price_percent_by_app: if share.for_sale && !share.free_access {
-            share
-                .official_price_percent
-                .map(|price| bindings.keys().map(|app| (*app, price)).collect())
-                .unwrap_or_default()
-        } else {
-            BTreeMap::new()
-        },
         description: share.description.clone(),
-        for_sale: share_router_for_sale_label(share),
+        free_access: share.free_access,
         subdomain: share
             .tunnel_subdomain
             .clone()
@@ -991,6 +1014,7 @@ fn static_descriptor_projection(
         for grant in grants.values_mut().filter_map(Value::as_object_mut) {
             for field in [
                 "usage",
+                "usageQuota",
                 "createdAtMs",
                 "updatedAtMs",
                 "revokedAtMs",
@@ -1097,16 +1121,32 @@ fn upstream_provider(
     }
 }
 
-fn app_provider(
-    app: &str,
-    provider: &StoredProvider,
-    share: &Share,
-    accounts: Option<&AccountStore>,
-    usage: Option<&UsageStore>,
-    runtime_plan: Option<&ProviderRuntimePlan>,
+/// Inputs for [`app_provider`].
+///
+/// Grouped into a struct so the descriptor builder keeps readable call sites
+/// instead of a long positional argument list.
+struct AppProviderInput<'a> {
+    app: &'a str,
+    provider: &'a StoredProvider,
+    share: &'a Share,
+    accounts: Option<&'a AccountStore>,
+    usage: Option<&'a UsageStore>,
+    runtime_plan: Option<&'a ProviderRuntimePlan>,
     is_current: bool,
     enabled: bool,
-) -> ShareAppProvider {
+}
+
+fn app_provider(input: AppProviderInput<'_>) -> ShareAppProvider {
+    let AppProviderInput {
+        app,
+        provider,
+        share,
+        accounts,
+        usage,
+        runtime_plan,
+        is_current,
+        enabled,
+    } = input;
     let health = usage.map(|usage| provider_health(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let account_context = account_context_for_share(provider, share, accounts);
@@ -1667,16 +1707,8 @@ fn provider_type_default_api_url(provider_type: ProviderType) -> Option<String> 
     Some(url.to_string())
 }
 
-fn default_market_access_mode() -> String {
-    "selected".to_string()
-}
-
 fn default_parallel_limit() -> i64 {
     -1
-}
-
-fn default_share_for_sale() -> String {
-    "No".to_string()
 }
 
 #[cfg(test)]
@@ -1691,7 +1723,7 @@ mod tests {
     use crate::domain::providers::model::{
         AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
     };
-    use crate::domain::sharing::shares::{ShareAcl, ShareBinding, SharePolicy};
+    use crate::domain::sharing::shares::{ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
 
     #[test]
@@ -1703,22 +1735,6 @@ mod tests {
         let omitted: ShareSettingsPatch =
             serde_json::from_str(r#"{}"#).expect("parse omitted description");
         assert_eq!(omitted.description, None);
-    }
-
-    #[test]
-    fn descriptor_maps_free_for_sale_label() {
-        let mut share = test_share(ProviderType::OllamaCloud, None);
-        share.free_access = true;
-        share.for_sale = false;
-        let providers = ProviderStore {
-            providers: vec![test_provider(ProviderType::OllamaCloud)],
-            ..Default::default()
-        };
-        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
-        assert_eq!(descriptor.for_sale, "Free");
-        for settings in descriptor.app_settings.values() {
-            assert_eq!(settings.for_sale, "Free");
-        }
     }
 
     #[test]
@@ -1815,10 +1831,7 @@ mod tests {
 
         assert!(descriptor.support.codex);
         assert!(!descriptor.support.claude);
-        assert_eq!(
-            descriptor.app_providers.codex.first().unwrap().enabled,
-            true
-        );
+        assert!(descriptor.app_providers.codex.first().unwrap().enabled);
         let claude_provider = descriptor.app_providers.claude.first().unwrap();
         assert!(!claude_provider.enabled);
         assert_eq!(
@@ -1859,6 +1872,81 @@ mod tests {
         assert_eq!(
             baseline,
             static_descriptor_fingerprint(&display_descriptor, &display_providers).unwrap()
+        );
+
+        // Every proxied request rewrites the per-grant usage bucket.  If that
+        // bucket reached the projection, ordinary traffic would bump the
+        // descriptor generation and produce a Router sync storm.
+        let mut grant_usage_share = share.clone();
+        grant_usage_share.user_grants.insert(
+            "owner@example.com".to_string(),
+            ShareUserGrant {
+                email: "owner@example.com".to_string(),
+                role: "owner".to_string(),
+                active: true,
+                usage: ShareUserUsage {
+                    lifetime: ShareUserUsageBucket {
+                        started_at_ms: 1,
+                        tokens_used: 123_456,
+                        requests_count: 789,
+                    },
+                    ..ShareUserUsage::default()
+                },
+                created_at_ms: 11,
+                updated_at_ms: 22,
+                revision: 9,
+                ..ShareUserGrant::default()
+            },
+        );
+        let mut grant_baseline_share = share.clone();
+        grant_baseline_share.user_grants.insert(
+            "owner@example.com".to_string(),
+            ShareUserGrant {
+                email: "owner@example.com".to_string(),
+                role: "owner".to_string(),
+                active: true,
+                ..ShareUserGrant::default()
+            },
+        );
+        let grant_usage_descriptor =
+            descriptor_for_share_with_usage(&grant_usage_share, &providers, None);
+        let grant_baseline_descriptor =
+            descriptor_for_share_with_usage(&grant_baseline_share, &providers, None);
+        assert_eq!(
+            static_descriptor_fingerprint(&grant_baseline_descriptor, &providers).unwrap(),
+            static_descriptor_fingerprint(&grant_usage_descriptor, &providers).unwrap(),
+            "per-grant usage counters must stay out of the static projection"
+        );
+
+        let mut rebase_share = share.clone();
+        rebase_share.user_grants.insert(
+            "owner@example.com".to_string(),
+            ShareUserGrant {
+                email: "owner@example.com".to_string(),
+                role: "owner".to_string(),
+                active: true,
+                policy: ShareUserPolicy::default(),
+                usage: ShareUserUsage::default(),
+                usage_rebase: Some(ShareUserUsageRebase {
+                    period: ShareTokenPeriod::Lifetime,
+                    anchor_at_ms: None,
+                    window_starts_at_ms: None,
+                    window_ends_at_ms: None,
+                    target_tokens: 42,
+                    observed_tokens_at_rebase: 10,
+                    observed_requests_at_rebase: 1,
+                    usage_watermark: 7,
+                    applied_at_ms: 1,
+                    applied_by: Some("admin@example.com".to_string()),
+                    source: ShareUsageRebaseSource::ProviderReset,
+                }),
+                ..ShareUserGrant::default()
+            },
+        );
+        let rebase_descriptor = descriptor_for_share_with_usage(&rebase_share, &providers, None);
+        assert_ne!(
+            baseline,
+            static_descriptor_fingerprint(&rebase_descriptor, &providers).unwrap()
         );
 
         let mut scope_descriptor = descriptor.clone();
@@ -1909,9 +1997,6 @@ mod tests {
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
 
         assert_eq!(descriptor.parallel_limit, -1);
-        for settings in descriptor.app_settings.values() {
-            assert_eq!(settings.parallel_limit, -1);
-        }
     }
 
     #[test]
@@ -2496,10 +2581,7 @@ mod tests {
             account_email: Some("owner@example.com".to_string()),
             quota_percent,
             tunnel_subdomain: Some("codex-share".to_string()),
-            policy: SharePolicy {
-                acl: ShareAcl::default(),
-                ..SharePolicy::default()
-            },
+            policy: SharePolicy::default(),
             tokens_used: 0,
             requests_count: 0,
             created_at_ms: 0,

@@ -32,7 +32,7 @@ Provider 基线仓库出现以下路径变更时必须审查。其中带 † 的
 ## 可选审计
 
 - router/share/tunnel 相关协议。
-- model catalog，以及 Share/Token Market 自有的售价协议。
+- model catalog，以及 Share 配额、Router Share Market listing/seat 报价协议；不审计或恢复已退役旧 Token Market 的售价协议。
 
 ## 禁止作为实现来源
 
@@ -103,7 +103,7 @@ Provider 基线仓库出现以下路径变更时必须审查。其中带 † 的
 | 2026-07-02 | `e6d40d0a` OpenCode Go referral/promo preset copy | Must Review / presets | 已独立实现(A6) | 固定 Provider 审计快照记录 OpenCode Go referral/promo 元数据；Server 不复制外部前端 promo 文案组件。 |
 | 2026-07-02 | `d1f6c74b` usage_script credentials as explicit overrides | Must Review / provider service | 明确跳过 | Server 当前只保留 `ProviderMeta.usage_script` 原始 JSON，不执行外部 usage script，也不写 live provider config；未来只有出现明确 Server 需求时才可按本仓库契约重新设计。 |
 | 2026-07-02 | `05da23e1` model-test Share path Codex stream false-positive fix | Must Review / model health | 已独立实现(A5) | `src/core/model_health.rs` 从 health-check usage 派生 summary，流式记录必须 `streamStatus=completed` 才计 `success`，避免 Share 路径 Codex stream false-positive |
-| 2026-07-02 | `778d5b92` Claude Sonnet 5 pricing | Optional Review / pricing | 已拒绝并从产品边界删除 | Server 不计算模型成本，不保留默认模型定价或促销价；Token Market 售价由 Share/Market 自有协议维护。 |
+| 2026-07-02 | `778d5b92` Claude Sonnet 5 pricing | Optional Review / pricing | 已拒绝并从产品边界删除 | Server 不计算模型成本，不保留默认模型定价或促销价；Router Share Market 只维护 listing/seat 报价，未来外部 Token Market 的下游售价由其自身协议维护。 |
 | 2026-07-02 | `cd9e025b` `76b8620f` Sonnet tier default/test alignment | Must Review / presets | 已按证据独立实现(G6) | 固定 Provider 审计快照记录 `claude-sonnet-5` 默认档；Server registry 和 fixture 按本仓库契约维护。 |
 | 2026-07-02 | `9079935d` NekoCode, `a8657d22` Code0.ai, `332a3c16` Amux presets | Must Review / presets | 已按证据独立实现(G6) | 固定 Provider 审计快照记录 NekoCode/Code0.ai/Amux；Server coverage 由 `audit-upstream-provider-baseline.mjs` 的受控 AST 证据和本仓库 registry 共同校验。 |
 | 2026-07-02 | `52a0fb4c` external merge evidence | Mixed / historical review | 已登记(G6) | Server 不整仓 merge；模型成本已从产品边界删除，其他差异只有形成明确 Server 需求和协议证据后才单独实现。 |

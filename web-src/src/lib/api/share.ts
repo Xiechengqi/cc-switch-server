@@ -9,15 +9,6 @@ export type ShareBindings = Partial<
   Record<"claude" | "codex" | "gemini", string>
 >;
 
-export type ShareAppAccess = {
-  sharedWithEmails: string[];
-  marketAccessMode: "selected" | "all";
-};
-
-export type ShareAccessByApp = Partial<
-  Record<keyof ShareBindings, ShareAppAccess>
->;
-
 export type ShareTokenPeriod =
   "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays";
 
@@ -48,12 +39,76 @@ export type ShareUserUsage = {
   anchored?: ShareAnchoredUsageBucket;
 };
 
+/** Server-owned baseline captured when an operator reconciles a Provider reset. */
+export type ShareUserUsageRebase = {
+  period: ShareTokenPeriod;
+  anchorAtMs?: number;
+  windowStartsAtMs?: number;
+  windowEndsAtMs?: number;
+  targetTokens: number;
+  observedTokensAtRebase: number;
+  observedRequestsAtRebase: number;
+  usageWatermark: number;
+  appliedAtMs: number;
+  /** Verified admin identity that applied the baseline, when attributable. */
+  appliedBy?: string;
+  source: "manual" | "providerReset";
+};
+
+/**
+ * Server-derived quota view for one grant's current window.  Read-only: the
+ * Server recomputes it from Usage history on every rebuild, and a client that
+ * re-derived it would disagree the moment the rebase arithmetic changes.
+ */
+export type ShareUserQuotaView = {
+  period: ShareTokenPeriod;
+  anchorAtMs?: number;
+  /** Inclusive window start; absent for `lifetime`. */
+  windowStartsAtMs?: number;
+  /** Exclusive window end; absent for `lifetime`. */
+  windowEndsAtMs?: number;
+  /** What the limit is checked against. */
+  effectiveTokensUsed: number;
+  /** What the Usage history alone reports for this window. */
+  observedTokensUsed: number;
+  /** `effective - observed`; negative when a baseline was set below history. */
+  manualOffsetTokens: number;
+  observedRequestsCount: number;
+  /** False once the rebase's window has rolled over. */
+  rebaseApplies: boolean;
+};
+
+export type ShareUserUsageEdit = {
+  action: "set" | "clear";
+  /** Final effective token count desired at save time. */
+  targetTokens?: number;
+  expectedGrantRevision?: number;
+  period?: ShareTokenPeriod;
+  anchorAtMs?: number;
+  source?: "manual" | "providerReset";
+};
+
+export type ShareUserUsageEditMap = Record<string, ShareUserUsageEdit>;
+
+/**
+ * Share-total consumed-token correction.  The Share total counter has no
+ * window and is never rebuilt from Usage history, so this is a direct set
+ * rather than the per-user rebase record.
+ */
+export type ShareTotalUsageEdit = {
+  action: "set" | "clear";
+  /** Required for `set`; `clear` means zero. */
+  tokensUsed?: number;
+};
+
 export type ShareUserGrant = {
   email: string;
   role: "owner" | "shareto";
   active: boolean;
   policy: ShareUserPolicy;
   usage?: ShareUserUsage;
+  usageRebase?: ShareUserUsageRebase;
+  usageQuota?: ShareUserQuotaView;
   createdAtMs?: number;
   updatedAtMs?: number;
   revokedAtMs?: number;
@@ -64,32 +119,13 @@ export type ShareUserGrant = {
 
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 
-export type ShareAppSettings = {
-  forSale: "Yes" | "No" | "Free";
-  marketAccessMode: "selected" | "all";
-  sharedWithEmails: string[];
-  tokenLimit: number;
-  parallelLimit: number;
-  expiresAt: string;
-};
-
-export type ShareAppSettingsByApp = Partial<
-  Record<keyof ShareBindings, ShareAppSettings>
->;
-
 export interface ShareRecord {
   id: string;
   capacityPoolId: string;
   name: string;
   ownerEmail: string;
-  sharedWithEmails: string[];
-  marketAccessMode: "selected" | "all";
-  accessByApp?: ShareAccessByApp;
-  appSettings?: ShareAppSettingsByApp;
-  forSaleOfficialPricePercentByApp: Record<string, number>;
-  officialPricePercent: number | null;
   description?: string | null;
-  forSale: "Yes" | "No" | "Free";
+  freeAccess: boolean;
   /** One to three entries, with at most one provider per app. */
   bindings: ShareBindings;
   apiKey: string;
@@ -125,17 +161,11 @@ export interface CreateShareParams {
   expectedConfigRevision?: number;
   bindings: ShareBindings;
   description?: string;
-  forSale: "Yes" | "No" | "Free";
+  freeAccess: boolean;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: number;
   subdomain?: string;
-  sharedWithEmails?: string[];
-  marketAccessMode?: "selected" | "all";
-  accessByApp?: ShareAccessByApp;
-  appSettings?: ShareAppSettingsByApp;
-  forSaleOfficialPricePercentByApp?: Record<string, number>;
-  officialPricePercent?: number | null;
   allowPersonalCredits?: boolean;
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
@@ -198,38 +228,13 @@ export function sharePrimaryProviderId(
   return app ? (share?.bindings?.[app] ?? null) : null;
 }
 
-export interface PublicTokenMarket {
-  id: string;
-  displayName: string;
-  email: string;
-  subdomain: string;
-  publicBaseUrl: string;
-  marketKind: "usage";
-  status: string;
-}
-
-export interface UpdateShareAclParams {
-  shareId: string;
-  sharedWithEmails: string[];
-  marketAccessMode: "selected" | "all";
-  accessByApp?: ShareAccessByApp;
-  appSettings?: ShareAppSettingsByApp;
-  userGrants?: ShareUserGrantMap;
-}
-
 /** Complete settings payload saved atomically from a Provider edit page. */
 export interface SaveProviderShareParams {
   shareId: string;
   expectedConfigRevision: number;
   subdomain: string;
   description?: string;
-  forSale: "Yes" | "No" | "Free";
-  marketAccessMode: "selected" | "all";
-  sharedWithEmails: string[];
-  accessByApp: ShareAccessByApp;
-  appSettings: ShareAppSettingsByApp;
-  forSaleOfficialPricePercentByApp: Record<string, number>;
-  officialPricePercent: number | null;
+  freeAccess: boolean;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;
@@ -238,6 +243,8 @@ export interface SaveProviderShareParams {
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
   userGrants: ShareUserGrantMap;
+  userUsageEdits?: ShareUserUsageEditMap;
+  shareUsageEdit?: ShareTotalUsageEdit;
 }
 
 /** Bundle-scoped Share payload; enabled Surface bindings are derived by the Server. */
@@ -248,17 +255,17 @@ export interface SaveProviderBundleShareParams {
   enabled: boolean;
   subdomain: string;
   description?: string;
-  forSale: "Yes" | "No" | "Free";
-  marketAccessMode: "selected" | "all";
+  freeAccess: boolean;
   tokenLimit: number;
   parallelLimit: number;
   expiresAt: string;
-  sharedWithEmails: string[];
   allowPersonalCredits: boolean;
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
   userGrants?: ShareUserGrantMap;
+  userUsageEdits?: ShareUserUsageEditMap;
+  shareUsageEdit?: ShareTotalUsageEdit;
 }
 
 export interface UpdateShareTokenLimitParams {
@@ -279,16 +286,6 @@ export interface UpdateShareSubdomainParams {
 export interface UpdateShareDescriptionParams {
   shareId: string;
   description?: string;
-}
-
-export interface UpdateShareForSaleParams {
-  shareId: string;
-  forSale: "Yes" | "No" | "Free";
-}
-
-export interface UpdateShareForSaleOfficialPricePercentParams {
-  shareId: string;
-  pricing: Record<string, number>;
 }
 
 export interface UpdateShareExpirationParams {
@@ -479,28 +476,10 @@ async function updateDescription(
   return invokeShareRecord("update_share_description", { params });
 }
 
-async function updateForSale(
-  params: UpdateShareForSaleParams,
-): Promise<ShareRecord> {
-  return invokeShareRecord("update_share_for_sale", { params });
-}
-
-async function updateForSaleOfficialPricePercent(
-  params: UpdateShareForSaleOfficialPricePercentParams,
-): Promise<ShareRecord> {
-  return invokeShareRecord("update_share_for_sale_official_price_percent", {
-    params,
-  });
-}
-
 async function updateExpiration(
   params: UpdateShareExpirationParams,
 ): Promise<ShareRecord> {
   return invokeShareRecord("update_share_expiration", { params });
-}
-
-async function updateAcl(params: UpdateShareAclParams): Promise<ShareRecord> {
-  return invokeShareRecord("update_share_acl", { params });
 }
 
 async function saveProviderShare(
@@ -534,10 +513,6 @@ async function exportAll(): Promise<ShareRecord[]> {
 
 async function importMany(shares: ShareRecord[]): Promise<ImportSharesResult> {
   return invokeCommand<ImportSharesResult>("import_shares", { shares });
-}
-
-async function listTokenMarkets(): Promise<PublicTokenMarket[]> {
-  return invokeCommand<PublicTokenMarket[]>("list_token_markets");
 }
 
 async function list(): Promise<ShareRecord[]> {
@@ -696,15 +671,11 @@ export const shareApi = {
   updateParallelLimit,
   updateSubdomain,
   updateDescription,
-  updateForSale,
-  updateForSaleOfficialPricePercent,
   updateExpiration,
-  updateAcl,
   saveProviderShare,
   saveProviderBundleShare,
   exportAll,
   importMany,
-  listTokenMarkets,
   list,
   getDetail,
   startTunnel,

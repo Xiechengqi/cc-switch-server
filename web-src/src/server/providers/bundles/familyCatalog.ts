@@ -8,80 +8,58 @@ import {
 import { createDraftForProfile } from "@/server/providers/editor/providerDraft";
 import { BUNDLE_TEST_APP_ORDER } from "./bundleDraft";
 
-export type FamilyGroupId =
-  | "official_oauth"
-  | "official_key"
-  | "china_plan"
-  | "aggregator_cloud"
-  | "experimental_bridge"
-  | "custom";
+export type FamilyCategoryId = "subscription" | "api_key";
+
+// Keep the historical Group name as an alias so existing callers do not need
+// to change just because the picker now has two product-facing categories.
+export type FamilyGroupId = FamilyCategoryId;
 
 export type FamilyAuthKind = "oauth" | "api_key" | "aws" | "custom";
 
-export const FAMILY_GROUP_ORDER: FamilyGroupId[] = [
-  "official_oauth",
-  "official_key",
-  "china_plan",
-  "aggregator_cloud",
-  "experimental_bridge",
-  "custom",
+export const FAMILY_GROUP_ORDER: FamilyCategoryId[] = [
+  "subscription",
+  "api_key",
 ];
 
-const FAMILY_GROUP_MEMBERS: Record<FamilyGroupId, readonly string[]> = {
-  official_oauth: [
-    "family.claude_oauth",
-    "family.openai_oauth",
-    "family.google_oauth",
-    "family.grok_oauth",
-  ],
-  official_key: [
-    "family.anthropic_api_key",
-    "family.openai_api_key",
-    "family.gemini_api_key",
-  ],
-  china_plan: [
-    "family.kimi_code",
-    "family.kimi_coding_api_key",
-    "family.zhipu_glm_cn",
-    "family.zhipu_glm_global",
-    "family.minimax_cn",
-    "family.minimax_global",
-    "family.volcengine_coding_plan",
-    "family.xiaomi_mimo_token_plan",
-    "family.xiaomi_mimo_token_plan_sgp",
-  ],
-  aggregator_cloud: [
-    "family.openrouter",
-    "family.nvidia",
-    "family.ollama_cloud",
-    "family.aws_bedrock_aksk",
-    "family.aws_bedrock_api_key",
-    "family.github_copilot",
-    "family.deepseek_api",
-  ],
-  experimental_bridge: [
-    "family.cursor_oauth",
-    "family.cursor_api_key",
-    "family.kiro_oauth",
-    "family.antigravity_oauth",
-    "family.antigravity_cli",
-    "family.deepseek_account",
-    "family.qoder_cosy",
-  ],
-  custom: ["family.custom_http"],
-};
+/**
+ * Product-facing order and membership. This is intentionally explicit: a
+ * few API-key-looking providers are subscription accounts in the product,
+ * while some managed-account providers belong in the API Key fallback group.
+ */
+export const SUBSCRIPTION_FAMILY_IDS = [
+  "family.claude_oauth",
+  "family.openai_oauth",
+  "family.google_oauth",
+  "family.antigravity_oauth",
+  "family.antigravity_cli",
+  "family.grok_oauth",
+  "family.cursor_oauth",
+  "family.cursor_api_key",
+  "family.ollama_cloud",
+  "family.kiro_oauth",
+  "family.github_copilot",
+  "family.kimi_code",
+  "family.qoder_cosy",
+  "family.kimi_coding_api_key",
+  "family.zhipu_glm_cn",
+  "family.zhipu_glm_global",
+  "family.minimax_cn",
+  "family.minimax_global",
+  "family.volcengine_coding_plan",
+  "family.xiaomi_mimo_token_plan",
+  "family.xiaomi_mimo_token_plan_sgp",
+] as const;
 
-const FAMILY_GROUP_BY_ID = new Map(
-  FAMILY_GROUP_ORDER.flatMap((groupId) =>
-    FAMILY_GROUP_MEMBERS[groupId].map((familyId) => [familyId, groupId]),
-  ),
+const SUBSCRIPTION_FAMILY_ID_SET = new Set<string>(SUBSCRIPTION_FAMILY_IDS);
+const SUBSCRIPTION_FAMILY_ORDER = new Map<string, number>(
+  SUBSCRIPTION_FAMILY_IDS.map((familyId, index) => [familyId, index]),
 );
 
 export function recommendedFamilyId(
   families: readonly ProviderFamilySpec[] = providerRegistry.families,
 ): string {
   return (
-    FAMILY_GROUP_MEMBERS.official_oauth.find((familyId) =>
+    SUBSCRIPTION_FAMILY_IDS.find((familyId) =>
       families.some((family) => family.familyId === familyId),
     ) ??
     families[0]?.familyId ??
@@ -99,8 +77,12 @@ export function recommendedFamily(
   );
 }
 
+export function familyCategoryId(familyId: string): FamilyCategoryId {
+  return SUBSCRIPTION_FAMILY_ID_SET.has(familyId) ? "subscription" : "api_key";
+}
+
 export function familyGroupId(familyId: string): FamilyGroupId {
-  return FAMILY_GROUP_BY_ID.get(familyId) ?? "aggregator_cloud";
+  return familyCategoryId(familyId);
 }
 
 export function familyAuthKind(family: ProviderFamilySpec): FamilyAuthKind {
@@ -167,6 +149,15 @@ export function groupFamilies(
     const grouped = families.filter(
       (family) => familyGroupId(family.familyId) === groupId,
     );
+    if (groupId === "subscription") {
+      grouped.sort(
+        (left, right) =>
+          (SUBSCRIPTION_FAMILY_ORDER.get(left.familyId) ??
+            Number.MAX_SAFE_INTEGER) -
+          (SUBSCRIPTION_FAMILY_ORDER.get(right.familyId) ??
+            Number.MAX_SAFE_INTEGER),
+      );
+    }
     return grouped.length ? [{ groupId, families: grouped }] : [];
   });
 }

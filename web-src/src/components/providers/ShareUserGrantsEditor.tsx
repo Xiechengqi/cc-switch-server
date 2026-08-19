@@ -34,6 +34,8 @@ import type {
   ShareUserGrant,
   ShareUserGrantMap,
   ShareUserPolicy,
+  ShareUserUsageEdit,
+  ShareUserUsageEditMap,
 } from "@/lib/api/share";
 import { isValidShareEmail } from "@/utils/shareFormUtils";
 import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
@@ -45,21 +47,35 @@ type PolicyDraft = {
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchor: string;
   expiresAt: string;
+  consumedTokens: string;
+  usageAction: "unchanged" | "set" | "clear";
 };
 
-type BatchPolicyDraft = Omit<PolicyDraft, "email"> & {
+type BatchPolicyDraft = Omit<
+  PolicyDraft,
+  "email" | "consumedTokens" | "usageAction"
+> & {
   applyParallelLimit: boolean;
   applyTokenLimit: boolean;
   applyExpiresAt: boolean;
 };
 
 const ANCHORED_PERIODS: ReadonlySet<ShareTokenPeriod> = new Set(["sevenDays", "thirtyDays"]);
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function fixedPeriodDurationMs(period: ShareTokenPeriod): number | undefined {
+  if (period === "sevenDays") return 7 * DAY_MS;
+  if (period === "thirtyDays") return 30 * DAY_MS;
+  return undefined;
+}
 
 type ShareUserGrantsEditorProps = {
   value: ShareUserGrantMap;
   ownerEmail: string;
   defaultPolicy: ShareUserPolicy;
   protectedEmails?: ReadonlySet<string>;
+  usageEdits?: ShareUserUsageEditMap;
+  onUsageEditsChange?: (value: ShareUserUsageEditMap) => void;
   disabled?: boolean;
   onChange: (value: ShareUserGrantMap) => void;
 };
@@ -83,6 +99,24 @@ function parseUtcDateTime(value: string) {
   return value ? new Date(`${value}:00Z`).getTime() : undefined;
 }
 
+function fixedPeriodWindow(
+  period: ShareTokenPeriod,
+  anchorAtMs: number | undefined,
+  nowMs = Date.now(),
+): { start: number; end: number } | undefined {
+  const duration = fixedPeriodDurationMs(period);
+  if (duration == null || anchorAtMs == null || !Number.isFinite(anchorAtMs)) {
+    return undefined;
+  }
+  const index = Math.floor((nowMs - anchorAtMs) / duration);
+  const start = anchorAtMs + index * duration;
+  return { start, end: start + duration };
+}
+
+function formatUtcWindow(value: number): string {
+  return new Date(value).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+}
+
 function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
   return {
     email,
@@ -91,6 +125,64 @@ function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
     tokenPeriod: policy.tokenPeriod ?? "lifetime",
     tokenPeriodAnchor: toUtcDateTime(policy.tokenPeriodAnchorAtMs),
     expiresAt: toLocalDateTime(policy.expiresAt),
+    consumedTokens: "",
+    usageAction: "unchanged",
+  };
+}
+
+function currentGrantTokens(grant: ShareUserGrant): number {
+  // The Server-derived view is authoritative when present.  The bucket read
+  // below only covers grants persisted before the view existed.
+  if (grant.usageQuota) return grant.usageQuota.effectiveTokensUsed;
+  const usage = grant.usage;
+  if (!usage) return 0;
+  switch (grant.policy.tokenPeriod) {
+    case "day":
+      return usage.day?.tokensUsed ?? 0;
+    case "week":
+      return usage.week?.tokensUsed ?? 0;
+    case "calendarMonth":
+      return usage.calendarMonth?.tokensUsed ?? 0;
+    case "sevenDays":
+    case "thirtyDays":
+      return usage.anchored?.period === grant.policy.tokenPeriod
+        ? usage.anchored.tokensUsed
+        : 0;
+    case "lifetime":
+    default:
+      return usage.lifetime?.tokensUsed ?? 0;
+  }
+}
+
+/**
+ * What the Usage history alone reports, which is the floor a new baseline may
+ * not go below.  Read straight from the Server view rather than re-derived:
+ * inverting the rebase formula here would disagree with the Server the moment
+ * that formula changes, and the disagreement would only surface as a rejected
+ * save.
+ */
+function observedGrantTokens(grant: ShareUserGrant): number {
+  return grant.usageQuota?.observedTokensUsed ?? currentGrantTokens(grant);
+}
+
+function usageEditForGrant(
+  grant: ShareUserGrant,
+  usageEdits: ShareUserUsageEditMap,
+): Pick<PolicyDraft, "consumedTokens" | "usageAction"> {
+  const edit = usageEdits[grant.email.trim().toLowerCase()];
+  if (edit?.action === "clear") {
+    return { consumedTokens: "", usageAction: "clear" };
+  }
+  if (edit?.action === "set") {
+    return {
+      consumedTokens:
+        edit.targetTokens == null ? "" : String(edit.targetTokens),
+      usageAction: "set",
+    };
+  }
+  return {
+    consumedTokens: String(currentGrantTokens(grant)),
+    usageAction: "unchanged",
   };
 }
 
@@ -121,6 +213,8 @@ export function ShareUserGrantsEditor({
   ownerEmail,
   defaultPolicy,
   protectedEmails,
+  usageEdits = {},
+  onUsageEditsChange,
   disabled,
   onChange,
 }: ShareUserGrantsEditorProps) {
@@ -131,6 +225,7 @@ export function ShareUserGrantsEditor({
   const [selectedEmails, setSelectedEmails] = useState<Set<string>>(new Set());
   const [batchDraft, setBatchDraft] = useState<BatchPolicyDraft | null>(null);
   const [batchError, setBatchError] = useState("");
+  const [draftError, setDraftError] = useState("");
 
   const grants = useMemo(
     () =>
@@ -183,12 +278,21 @@ export function ShareUserGrantsEditor({
 
   const openAdd = () => {
     setEditingEmail(null);
-    setDraft(policyDraft("", defaultPolicy));
+    setDraftError("");
+    setDraft({
+      ...policyDraft("", defaultPolicy),
+      consumedTokens: "",
+      usageAction: "unchanged",
+    });
   };
 
   const openEdit = (grant: ShareUserGrant) => {
     setEditingEmail(grant.email);
-    setDraft(policyDraft(grant.email, grant.policy));
+    setDraftError("");
+    setDraft({
+      ...policyDraft(grant.email, grant.policy),
+      ...usageEditForGrant(grant, usageEdits),
+    });
   };
 
   const openBatchEdit = () => {
@@ -214,6 +318,17 @@ export function ShareUserGrantsEditor({
     const tokenPeriodAnchorAtMs = anchored
       ? parseUtcDateTime(draft.tokenPeriodAnchor)
       : undefined;
+    const consumedTokens = draft.consumedTokens.trim()
+      ? Number(draft.consumedTokens)
+      : undefined;
+    const previous = value[editingEmail ?? email];
+    const observedTokens = previous ? observedGrantTokens(previous) : 0;
+    const usageInvalid =
+      draft.usageAction === "set" &&
+      (consumedTokens == null ||
+        !Number.isSafeInteger(consumedTokens) ||
+        consumedTokens < 0 ||
+        consumedTokens < observedTokens);
     if (
       !isValidShareEmail(email) ||
       (editingEmail == null && (Boolean(value[email]?.active) || protectedEmails?.has(email))) ||
@@ -226,11 +341,25 @@ export function ShareUserGrantsEditor({
         tokenPeriodAnchorAtMs == null ||
           !Number.isFinite(tokenPeriodAnchorAtMs) ||
         tokenPeriodAnchorAtMs > Math.floor(Date.now() / 60_000) * 60_000
-      ))
+      )) ||
+      usageInvalid
     ) {
+      if (usageInvalid) {
+        setDraftError(
+          consumedTokens != null && consumedTokens < observedTokens
+            ? t("share.userLimit.consumedBelowObserved", {
+                defaultValue:
+                  "已消耗 Token 不能低于当前观测值（{{observed}}）。",
+                observed: observedTokens.toLocaleString(),
+              })
+            : t("share.userLimit.invalidUsage", {
+                defaultValue: "已消耗 Token 必须是大于等于 0 的整数。",
+              }),
+        );
+      }
       return;
     }
-    const previous = value[editingEmail ?? email];
+    setDraftError("");
     const next: ShareUserGrant = {
       ...previous,
       email,
@@ -248,6 +377,30 @@ export function ShareUserGrantsEditor({
     if (editingEmail && editingEmail !== email) delete updated[editingEmail];
     updated[email] = next;
     onChange(updated);
+    if (onUsageEditsChange) {
+      const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
+      if (editingEmail && editingEmail !== email) delete nextEdits[editingEmail];
+      if (draft.usageAction === "set" && consumedTokens != null) {
+        nextEdits[email] = {
+          action: "set",
+          targetTokens: consumedTokens,
+          expectedGrantRevision: previous?.revision,
+          period: draft.tokenPeriod,
+          anchorAtMs: tokenPeriodAnchorAtMs,
+          source: usageEdits[editingEmail ?? email]?.source ?? "manual",
+        };
+      } else if (draft.usageAction === "clear" && previous?.usageRebase) {
+        nextEdits[email] = {
+          action: "clear",
+          expectedGrantRevision: previous.revision,
+          period: draft.tokenPeriod,
+          anchorAtMs: tokenPeriodAnchorAtMs,
+        };
+      } else if (draft.usageAction === "unchanged") {
+        delete nextEdits[email];
+      }
+      onUsageEditsChange(nextEdits);
+    }
     setDraft(null);
   };
 
@@ -308,6 +461,11 @@ export function ShareUserGrantsEditor({
         ? { expiresAt: { value: expiresAt } }
         : {}),
     }));
+    if (onUsageEditsChange && batchDraft.applyTokenLimit) {
+      const nextEdits = { ...usageEdits };
+      for (const email of selectedEditableEmails) delete nextEdits[email];
+      onUsageEditsChange(nextEdits);
+    }
     setSelectedEmails(new Set());
     setBatchDraft(null);
     setBatchError("");
@@ -323,6 +481,23 @@ export function ShareUserGrantsEditor({
     calendarMonth: t("share.userLimit.periodMonth", { defaultValue: "每月" }),
     thirtyDays: t("share.userLimit.periodThirtyDays", { defaultValue: "每 30 天" }),
   };
+  const draftAnchorAtMs = draft
+    ? parseUtcDateTime(draft.tokenPeriodAnchor)
+    : undefined;
+  const draftWindow = draft
+    ? fixedPeriodWindow(draft.tokenPeriod, draftAnchorAtMs)
+    : undefined;
+  const batchAnchorAtMs = batchDraft
+    ? parseUtcDateTime(batchDraft.tokenPeriodAnchor)
+    : undefined;
+  const batchWindow = batchDraft
+    ? fixedPeriodWindow(batchDraft.tokenPeriod, batchAnchorAtMs)
+    : undefined;
+  // Server-derived window and standing correction for the grant being edited.
+  const editingQuota =
+    editingEmail && value[editingEmail]?.usageQuota?.rebaseApplies
+      ? value[editingEmail].usageQuota
+      : undefined;
 
   return (
     <div className="space-y-2 md:col-span-2">
@@ -363,7 +538,7 @@ export function ShareUserGrantsEditor({
       </div>
 
       <div className="overflow-x-auto rounded-md border border-border-default">
-        <Table className="min-w-[760px]">
+        <Table className="min-w-[900px]">
           <TableHeader>
             <TableRow>
               <TableHead className="h-9 w-10 px-3">
@@ -381,6 +556,11 @@ export function ShareUserGrantsEditor({
               <TableHead className="h-9 px-3">Email</TableHead>
               <TableHead className="h-9 px-3">{t("share.parallelLimit", { defaultValue: "并发" })}</TableHead>
               <TableHead className="h-9 px-3">Token</TableHead>
+              <TableHead className="h-9 px-3">
+                {t("share.userLimit.consumedTokens", {
+                  defaultValue: "已消耗 Token（当前周期）",
+                })}
+              </TableHead>
               <TableHead className="h-9 px-3">{t("share.expiration", { defaultValue: "到期" })}</TableHead>
               <TableHead className="h-9 w-20 px-3" />
             </TableRow>
@@ -419,6 +599,26 @@ export function ShareUserGrantsEditor({
                 <TableCell className="px-3 py-2">
                   {displayLimit(grant.policy.tokenLimit, unlimited)} · {periodLabels[grant.policy.tokenPeriod]}
                 </TableCell>
+                <TableCell className="px-3 py-2">
+                  <div className="font-mono text-xs">
+                    {currentGrantTokens(grant).toLocaleString()}
+                  </div>
+                  {grant.usageRebase ? (
+                    <div className="text-[11px] text-muted-foreground">
+                      {t("share.userLimit.rebaseTarget", {
+                        defaultValue: "基线 {{value}}",
+                        value: grant.usageRebase.targetTokens.toLocaleString(),
+                      })}
+                    </div>
+                  ) : null}
+                  {grant.manager === "routerShareMarket" ? (
+                    <div className="text-[11px] text-muted-foreground">
+                      {t("share.userLimit.readOnly", {
+                        defaultValue: "Share Market 管理，只读",
+                      })}
+                    </div>
+                  ) : null}
+                </TableCell>
                 <TableCell className="px-3 py-2">{displayExpiry(grant.policy.expiresAt, permanent)}</TableCell>
                 <TableCell className="px-3 py-2">
                   <div className="flex justify-end gap-1">
@@ -432,6 +632,11 @@ export function ShareUserGrantsEditor({
                           const updated = { ...value };
                           delete updated[grant.email];
                           onChange(updated);
+                          if (onUsageEditsChange) {
+                            const nextEdits = { ...usageEdits };
+                            delete nextEdits[grant.email];
+                            onUsageEditsChange(nextEdits);
+                          }
                         }} title={t("common.delete", { defaultValue: "删除" })}>
                         <Trash2 className="h-4 w-4 text-destructive" />
                       </Button>
@@ -468,6 +673,89 @@ export function ShareUserGrantsEditor({
                 <Label htmlFor="share-user-token">{t("share.tokenLimit", { defaultValue: "Token 限额" })}</Label>
                 <Input id="share-user-token" type="number" min={1} placeholder={unlimited} value={draft.tokenLimit} onChange={(event) => setDraft({ ...draft, tokenLimit: event.target.value })} />
               </div>
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="share-user-consumed-tokens">
+                  {t("share.userLimit.consumedTokens", {
+                    defaultValue: "已消耗 Token（当前周期）",
+                  })}
+                </Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="share-user-consumed-tokens"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={draft.consumedTokens}
+                    placeholder="0"
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        consumedTokens: event.target.value,
+                        usageAction: "set",
+                      })
+                    }
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      !editingEmail ||
+                      (!value[editingEmail]?.usageRebase &&
+                        usageEdits[editingEmail]?.action !== "set")
+                    }
+                    onClick={() =>
+                      setDraft({
+                        ...draft,
+                        consumedTokens: "",
+                        usageAction: "clear",
+                      })
+                    }
+                  >
+                    {t("share.userLimit.clearRebase", {
+                      defaultValue: "清除重基线",
+                    })}
+                  </Button>
+                </div>
+                {editingEmail && value[editingEmail] ? (
+                  <>
+                    <p className="text-xs text-muted-foreground">
+                      {t("share.userLimit.consumedHint", {
+                        defaultValue:
+                          "当前有效 {{effective}}；保存后以该值为基线，并继续累加新请求。当前观测值 {{observed}}。",
+                        effective: currentGrantTokens(value[editingEmail]).toLocaleString(),
+                        observed: observedGrantTokens(value[editingEmail]).toLocaleString(),
+                      })}
+                    </p>
+                    {editingQuota ? (
+                      <p className="text-xs text-muted-foreground">
+                        {t("share.userLimit.savedQuotaHint", {
+                          defaultValue:
+                            "服务端统计周期：{{start}} 至 {{end}}；手工修正 {{offset}}。",
+                          start: editingQuota.windowStartsAtMs
+                            ? formatUtcWindow(editingQuota.windowStartsAtMs)
+                            : t("share.userLimit.periodLifetime", {
+                                defaultValue: "累计",
+                              }),
+                          end: editingQuota.windowEndsAtMs
+                            ? formatUtcWindow(editingQuota.windowEndsAtMs)
+                            : "—",
+                          offset: editingQuota.manualOffsetTokens.toLocaleString(),
+                        })}
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    {t("share.userLimit.newConsumedHint", {
+                      defaultValue: "可填写 0；留空表示不创建手工重基线。",
+                    })}
+                  </p>
+                )}
+                {draftError ? (
+                  <p className="text-xs text-destructive">{draftError}</p>
+                ) : null}
+              </div>
               <div className="space-y-2">
                 <Label>{t("share.userLimit.period", { defaultValue: "Token 周期" })}</Label>
                 <Select value={draft.tokenPeriod} onValueChange={(tokenPeriod: ShareTokenPeriod) => setDraft({
@@ -492,12 +780,26 @@ export function ShareUserGrantsEditor({
                     id="share-user-period-anchor"
                     type="datetime-local"
                     step={60}
+                    min={toUtcDateTime(
+                      Date.now() -
+                        (fixedPeriodDurationMs(draft.tokenPeriod) ?? 0),
+                    )}
+                    max={toUtcDateTime()}
                     value={draft.tokenPeriodAnchor}
                     onChange={(event) => setDraft({ ...draft, tokenPeriodAnchor: event.target.value })}
                   />
                   <p className="text-xs text-muted-foreground">
                     {t("share.userLimit.anchorHint", { defaultValue: "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。" })}
                   </p>
+                  {draftWindow ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("share.userLimit.currentWindow", {
+                        defaultValue: "当前周期：{{start}} 至 {{end}}",
+                        start: formatUtcWindow(draftWindow.start),
+                        end: formatUtcWindow(draftWindow.end),
+                      })}
+                    </p>
+                  ) : null}
                 </div>
               ) : null}
               <div className="space-y-2">
@@ -615,6 +917,11 @@ export function ShareUserGrantsEditor({
                     id="share-user-batch-period-anchor"
                     type="datetime-local"
                     step={60}
+                    min={toUtcDateTime(
+                      Date.now() -
+                        (fixedPeriodDurationMs(batchDraft.tokenPeriod) ?? 0),
+                    )}
+                    max={toUtcDateTime()}
                     value={batchDraft.tokenPeriodAnchor}
                     onChange={(event) => setBatchDraft({
                       ...batchDraft,
@@ -626,6 +933,15 @@ export function ShareUserGrantsEditor({
                       defaultValue: "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
                     })}
                   </p>
+                  {batchWindow ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("share.userLimit.currentWindow", {
+                        defaultValue: "当前周期：{{start}} 至 {{end}}",
+                        start: formatUtcWindow(batchWindow.start),
+                        end: formatUtcWindow(batchWindow.end),
+                      })}
+                    </p>
+                  ) : null}
                 </div>
               ) : null}
               <div className="space-y-2 sm:col-span-2">

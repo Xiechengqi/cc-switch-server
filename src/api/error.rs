@@ -518,6 +518,33 @@ pub(crate) fn map_share_patch_error(
             ),
         )
         .with_retryable(true),
+        crate::domain::sharing::shares::SharePatchError::GrantRevisionConflict {
+            email,
+            expected,
+            current,
+        } => ApiError::conflict_code(
+            "cc_switch_share_user_grant_revision_conflict",
+            format!(
+                "user grant {email} changed since this editor was opened (expected revision {expected}, current revision {current})"
+            ),
+        )
+        .with_retryable(true),
+        crate::domain::sharing::shares::SharePatchError::UsageTargetBelowObserved {
+            email,
+            target,
+            observed,
+        } => ApiError::conflict_code(
+            "cc_switch_share_usage_target_below_observed",
+            format!(
+                "usage target for {email} ({target}) cannot be below observed usage ({observed})"
+            ),
+        ),
+        crate::domain::sharing::shares::SharePatchError::ManagedGrantReadOnly(email) => {
+            ApiError::conflict_code(
+                "cc_switch_share_market_grant_read_only",
+                format!("Share Market managed user {email} is read-only"),
+            )
+        }
         crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
             ApiError::bad_request(message)
         }

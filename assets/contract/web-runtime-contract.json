@@ -12,10 +12,92 @@
       "thirtyDays"
     ],
     "weekSemantics": "utc_calendar_week_monday",
-    "anchoredPeriods": ["sevenDays", "thirtyDays"],
+    "anchoredPeriods": [
+      "sevenDays",
+      "thirtyDays"
+    ],
     "anchorField": "tokenPeriodAnchorAtMs",
     "anchorPrecision": "utc_epoch_milliseconds_minute",
     "windowBounds": "half_open"
+  },
+  "shareUserUsageEdits": {
+    "field": "userUsageEdits",
+    "ownership": "server",
+    "commands": [
+      "save_provider_share",
+      "save_provider_bundle_share"
+    ],
+    "keyedBy": "verified_user_email",
+    "actions": [
+      "set",
+      "clear"
+    ],
+    "setFields": [
+      "targetTokens",
+      "expectedGrantRevision",
+      "period",
+      "anchorAtMs",
+      "source"
+    ],
+    "sources": [
+      "manual",
+      "providerReset"
+    ],
+    "grantField": "usageRebase",
+    "clientSuppliedGrantFieldIgnored": true,
+    "operatorField": "appliedBy",
+    "operatorSource": "verified_web_admin_session",
+    "effectiveTokensFormula": "targetTokens + max(observedTokensNow - observedTokensAtRebase, 0)",
+    "windowBounds": "half_open",
+    "appliedUnderQuotaLock": true,
+    "conflictCodes": [
+      "cc_switch_share_user_grant_revision_conflict",
+      "cc_switch_share_usage_target_below_observed",
+      "cc_switch_share_market_grant_read_only"
+    ]
+  },
+  "shareTotalUsageEdit": {
+    "field": "shareUsageEdit",
+    "ownership": "server",
+    "commands": [
+      "save_provider_share",
+      "save_provider_bundle_share"
+    ],
+    "actions": [
+      "set",
+      "clear"
+    ],
+    "setFields": [
+      "tokensUsed"
+    ],
+    "shareField": "tokensUsed",
+    "clientSuppliedShareFieldIgnored": true,
+    "rebuiltFromHistory": false,
+    "reconcilesExhaustedState": true,
+    "resumeRequiresExplicitAction": true,
+    "appliedUnderQuotaLock": true
+  },
+  "shareUserQuotaView": {
+    "field": "usageQuota",
+    "ownership": "server",
+    "derivedFrom": [
+      "usage_history",
+      "usageRebase"
+    ],
+    "clientSuppliedFieldIgnored": true,
+    "excludedFromDescriptorFingerprint": true,
+    "fields": [
+      "period",
+      "anchorAtMs",
+      "windowStartsAtMs",
+      "windowEndsAtMs",
+      "effectiveTokensUsed",
+      "observedTokensUsed",
+      "manualOffsetTokens",
+      "observedRequestsCount",
+      "rebaseApplies"
+    ],
+    "clientMayRederive": false
   },
   "clientWebTransport": {
     "privatePrefix": "/web-api/",
@@ -45,7 +127,12 @@
       "/web-api/admin/upgrade/stream",
       "/web-api/debug/upgrade/stream"
     ],
-    "deniedPrefixes": ["/api/", "/v1/", "/_ctl/", "/_share-router/"],
+    "deniedPrefixes": [
+      "/api/",
+      "/v1/",
+      "/_ctl/",
+      "/_share-router/"
+    ],
     "authentication": "authorization_header",
     "queryTokensAllowed": false
   },
@@ -671,7 +758,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /api/shares",
-      "notes": "Creates a Share with owner derived from the configured Client Owner; payload owner values are ignored."
+      "notes": "Creates a private-by-default Share with owner derived from the configured Client Owner. freeAccess is canonical; userGrants is the editable ShareTo source. Payload owner values are ignored."
     },
     {
       "name": "deepseek_account_add",
@@ -1470,14 +1557,6 @@
       "notes": "Server-native Web compatibility command."
     },
     {
-      "name": "list_token_markets",
-      "support": "native",
-      "implemented": true,
-      "feature": "shares",
-      "endpoint": "GET /api/token-markets",
-      "notes": "Lists registered Token Usage Markets for share sale settings."
-    },
-    {
       "name": "list_shares",
       "support": "native",
       "implemented": true,
@@ -1762,7 +1841,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_bundle_share",
-      "notes": "Atomically reconciles every enabled Provider Bundle Surface binding and the shared URL settings in one Share commit."
+      "notes": "Atomically reconciles every enabled Provider Bundle Surface binding, canonical freeAccess, userGrants-derived ACL projection, limits, URL settings, and optional Server-owned userUsageEdits (consumed-token rebase) in one Share commit."
     },
     {
       "name": "save_provider_share",
@@ -1770,7 +1849,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_share",
-      "notes": "Atomically persists Provider Share configuration while keeping Share Owner derived from Client Owner."
+      "notes": "Atomically persists canonical freeAccess and userGrants-derived ShareTo configuration plus optional Server-owned userUsageEdits (target tokens and period anchor), while preserving Router Share Market-managed grants and keeping Share Owner derived from Client Owner."
     },
     {
       "name": "set_auto_launch",
@@ -1955,14 +2034,6 @@
       "notes": "Server persists legacy-compatible sortIndex on Provider JSON and sorts Provider lists by that value."
     },
     {
-      "name": "update_share_acl",
-      "support": "native",
-      "implemented": true,
-      "feature": "shares",
-      "endpoint": "POST /api/shares/:id/acl",
-      "notes": "Server-native Web compatibility command."
-    },
-    {
       "name": "update_share_description",
       "support": "shim",
       "implemented": true,
@@ -1971,20 +2042,6 @@
     },
     {
       "name": "update_share_expiration",
-      "support": "shim",
-      "implemented": true,
-      "feature": "shares",
-      "notes": "Server web runtime shim."
-    },
-    {
-      "name": "update_share_for_sale",
-      "support": "shim",
-      "implemented": true,
-      "feature": "shares",
-      "notes": "Server web runtime shim."
-    },
-    {
-      "name": "update_share_for_sale_official_price_percent",
       "support": "shim",
       "implemented": true,
       "feature": "shares",

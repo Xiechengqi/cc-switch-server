@@ -85,13 +85,6 @@ function missingFor(testCase) {
     missing.push("ROUTER_API_TOKEN");
   }
   if (
-    testCase.requiresMarketOrRouterToken &&
-    !present("ROUTER_API_TOKEN") &&
-    !present("MARKET_API_TOKEN")
-  ) {
-    missing.push("ROUTER_API_TOKEN|MARKET_API_TOKEN");
-  }
-  if (
     testCase.shareEnv &&
     !valueFor(testCase.shareEnv, testCase.shareFallbackEnv)
   ) {

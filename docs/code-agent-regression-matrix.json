@@ -258,37 +258,6 @@
       "requiresRouterToken": true,
       "supportsStream": true,
       "adapterStatus": "mixed"
-    },
-    {
-      "id": "claude-market-messages",
-      "app": "claude",
-      "entryPath": "/v1/messages",
-      "source": "market",
-      "urlEnv": "MARKET_CLAUDE_API_URL",
-      "requiresMarketOrRouterToken": true,
-      "supportsStream": true,
-      "adapterStatus": "real_required"
-    },
-    {
-      "id": "codex-market-responses",
-      "app": "codex",
-      "entryPath": "/v1/responses",
-      "source": "market",
-      "urlEnv": "MARKET_CODEX_API_URL",
-      "urlFallbackEnv": "MARKET_API_URL",
-      "requiresMarketOrRouterToken": true,
-      "supportsStream": true,
-      "adapterStatus": "real_required"
-    },
-    {
-      "id": "gemini-market-generate-content",
-      "app": "gemini",
-      "entryPath": "/v1beta/models/probe:generateContent",
-      "source": "market",
-      "urlEnv": "MARKET_GEMINI_API_URL",
-      "requiresMarketOrRouterToken": true,
-      "supportsStream": true,
-      "adapterStatus": "real_required"
     }
   ]
 }

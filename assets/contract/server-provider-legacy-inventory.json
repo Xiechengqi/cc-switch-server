@@ -105,7 +105,7 @@
     {
       "app": "codex",
       "path": "web-src/src/config/codexProviderPresets.ts",
-      "sha256": "0734abc96c12e03f31048f7585e2e7ec17a65390ce32b644b4f1531c9f672b59"
+      "sha256": "18549032793a8173eb944f850456237a26653d315e324952904e65296c30c851"
     },
     {
       "app": "gemini",

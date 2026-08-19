@@ -1,5 +1,6 @@
 use crate::domain::providers::model::{AppKind, ProviderType};
-use crate::domain::sharing::shares::{Share, ShareAcl};
+use crate::domain::sharing::retired_fields::find_retired_share_field;
+use crate::domain::sharing::shares::Share;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -10,10 +11,104 @@ pub(in crate::api) struct ListSharesResponse {
     pub(in crate::api) shares: Vec<Share>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub(in crate::api) struct ImportSharesRequest {
     pub(in crate::api) shares: Vec<Share>,
+}
+
+impl<'de> Deserialize<'de> for ImportSharesRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct CanonicalImport {
+            shares: Vec<Share>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(field) = find_retired_share_field(&value) {
+            return Err(serde::de::Error::custom(format!(
+                "retired Share field `{field}` is not accepted; use freeAccess/userGrants"
+            )));
+        }
+        let shares = value
+            .get("shares")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| serde::de::Error::custom("shares must be an array"))?;
+        for share in shares {
+            if !share.is_object() {
+                return Err(serde::de::Error::custom("each Share must be an object"));
+            }
+        }
+        let input: CanonicalImport =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            shares: input.shares,
+        })
+    }
+}
+
+#[cfg(test)]
+mod import_shares_request_tests {
+    use super::*;
+
+    #[test]
+    fn import_rejects_retired_share_fields_in_both_naming_styles() {
+        for field in [
+            "forSale",
+            "for_sale",
+            "officialPricePercent",
+            "official_price_percent",
+            "forSaleOfficialPricePercentByApp",
+            "for_sale_official_price_percent_by_app",
+            "sharedWithEmails",
+            "shared_with_emails",
+            "marketAccessMode",
+            "market_access_mode",
+            "accessByApp",
+            "access_by_app",
+            "appSettings",
+            "app_settings",
+            "publicMarketEmail",
+            "public_market_email",
+            "marketEmail",
+            "market_email",
+            "marketSubdomain",
+            "market_subdomain",
+            "marketUrl",
+            "market_url",
+            "marketId",
+            "market_id",
+            "saleMarketKind",
+            "sale_market_kind",
+        ] {
+            let mut share = serde_json::Map::new();
+            share.insert(field.to_string(), serde_json::Value::Null);
+            let value = serde_json::json!({"shares": [share]});
+            let error = serde_json::from_value::<ImportSharesRequest>(value)
+                .expect_err("retired Share field must be rejected");
+            assert!(error.to_string().contains(field), "field={field}: {error}");
+        }
+    }
+
+    #[test]
+    fn import_rejects_retired_fields_nested_in_runtime_snapshot() {
+        let value = serde_json::json!({
+            "shares": [{
+                "id": "share-nested",
+                "runtimeSnapshot": {
+                    "nested": [{"marketEmail": "retired@example.com"}]
+                }
+            }]
+        });
+        let error = serde_json::from_value::<ImportSharesRequest>(value)
+            .expect_err("nested retired Share field must be rejected");
+        assert!(error
+            .to_string()
+            .contains("runtimeSnapshot.nested[0].marketEmail"));
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -121,32 +216,4 @@ pub(in crate::api) struct UpdateShareSubdomainResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) remote_claimed: bool,
     pub(in crate::api) share: Share,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ReplaceShareAclRequest {
-    pub(in crate::api) acl: ShareAcl,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct PublicTokenMarket {
-    pub(in crate::api) id: String,
-    pub(in crate::api) display_name: String,
-    pub(in crate::api) email: String,
-    pub(in crate::api) subdomain: String,
-    pub(in crate::api) public_base_url: Option<String>,
-    pub(in crate::api) market_kind: String,
-    pub(in crate::api) status: String,
-    #[serde(default)]
-    pub(in crate::api) scopes: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::api) struct ListTokenMarketsResponse {
-    #[serde(default)]
-    pub(in crate::api) ok: bool,
-    pub(in crate::api) markets: Vec<PublicTokenMarket>,
 }

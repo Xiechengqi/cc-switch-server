@@ -36,6 +36,16 @@ describe("shareUtils limits", () => {
     expect(share?.tokenLimit).toBe(UNLIMITED_TOKEN_LIMIT);
     expect(share?.parallelLimit).toBe(UNLIMITED_TOKEN_LIMIT);
   });
+
+  it("reads canonical freeAccess without legacy sale projection", () => {
+    const share = normalizeShareRecord({
+      id: "share-private",
+      bindings: { codex: "provider-1" },
+      freeAccess: false,
+    });
+
+    expect(share?.freeAccess).toBe(false);
+  });
 });
 
 describe("getShareDisplayStatus", () => {

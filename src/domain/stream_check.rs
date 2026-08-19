@@ -78,7 +78,7 @@ async fn check_once(
     resolve_probe_url: &impl Fn(&StoredProvider, &str) -> Result<String, String>,
 ) -> StreamCheckResult {
     let started = Instant::now();
-    let probe_url = match resolve_probe_url(stored, &model) {
+    let probe_url = match resolve_probe_url(stored, model) {
         Ok(url) => url,
         Err(message) => {
             return failed_result(message, 0);

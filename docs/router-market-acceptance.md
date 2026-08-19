@@ -1,129 +1,54 @@
-# Router/Market 真实闭环验收
+# Router Share/Gateway acceptance (legacy filename)
 
-本流程只描述 `cc-switch-server` 侧操作和验收，不修改 router、market 或 cc-switch 代码。
+> The filename is retained for bookmark compatibility. This document no longer
+> tests or requires the retired standalone Token Market. “Market” below means
+> Router-built Share Market/Client Market only.
 
-## 前置条件
-
-- server 已启动，能访问 `SERVER_URL`。
-- 已完成 setup，并通过 password 登录拿到 bearer token。
-- 真实 router/market 可访问。
-- 允许创建测试 client、share、subdomain。
-- 至少准备一个可用 Codex provider，或明确使用会返回可诊断错误的测试 provider。
-
-## 环境变量
+## Inputs
 
 ```bash
 export SERVER_URL=http://127.0.0.1:15721
-export CC_SWITCH_SERVER_TOKEN=...
-export SHARE_ID=...
-export CC_SWITCH_SHARE_URL=https://share-subdomain.example.com
-export MARKET_API_URL=https://market-api.example.com
-export MARKET_URL=https://market.example.com
-export ROUTER_API_TOKEN=...
-export ROUTER_API_TOKEN_HEADER=Authorization
-export STREAM_PROBE=0
+export CC_SWITCH_SERVER_TOKEN=<server-session-token>
+export ROUTER_BASE_URL=https://router.example.com
+export ROUTER_API_TOKEN=<router-share-token>
+export CC_SWITCH_SHARE_URL=https://share.example.com
+export SHARE_ID=<share-id>
 ```
 
-`ROUTER_API_TOKEN_HEADER` 可选 `Authorization`、`x-api-key`、`x-goog-api-key`。默认使用 `Authorization: Bearer ...`。
-`STREAM_PROBE=1` 时会额外执行 Router Share/market stream 请求；没有真实 provider/token 时保持默认 `0`。
+Do not set or introduce a standalone Market URL, Market bearer, or external
+Token Market credential. Missing real Router/Share/Gateway inputs are recorded
+as `blocked-inputs`; fixtures are not live acceptance.
 
-## 执行顺序
+## Checks
 
-1. `GET /health` 和 `GET /version`。
-2. `GET /api/router/status` 和 `GET /api/router/diagnostics`。
-3. `POST /api/router/register`。
-4. `POST /api/router/client-tunnel/lease`。
-5. 等待启动/注册后的自动 share reconcile，并通过 `GET /api/router/diagnostics` 验证同步状态。
-6. `POST /api/router/share-edits/pull`，拉取并应用 pending share edits。
-7. `POST /api/shares/runtime-snapshot`。
-8. Router Share URL 调 `/v1/responses`。
-9. market api URL 调 `/v1/responses`。
-10. `POST /api/usage/router-sync/retry`。
-11. 导出 shares、provider health、Usage 请求记录。
+1. `GET /v1/healthz` on Router returns healthy database status.
+2. A Gateway fixture signs `GET /v1/gateway/shares` with its Ed25519 private
+   key and the exact wire-body hash; a normal Router API token is not a
+   Gateway credential. Before the future neutral grant contract exists, the
+   ordinary Share inventory is empty: self-reported owner email, `freeAccess`
+   and email ShareTo grants never authorize a Gateway.
+3. Router Share URL dispatches Claude, Codex, and Gemini protocol probes through
+   the signed ingress to the expected Server Share binding.
+4. Duplicate request observations with the same request id are idempotent and
+   do not double-count usage; cross-Gateway takeover, unauthorized Share IDs,
+   legacy downstream identity/API-key/USD/settlement fields and `settled`
+   status all fail closed.
+5. Share Market grant/revoke pending edits apply once, acknowledge once, and
+   preserve descriptor revision/fingerprint.
+6. Client Market host provisioning/cleanup remains independent of Gateway
+   observations and Share entitlements.
+7. Retired `/v1/markets*`, `/v1/market/*`, and `/_market/proxy/*` routes return
+   `410 Gone` and never fall through to a tunnel or UI handler.
 
-推荐直接运行：
+## Commands
 
 ```bash
-scripts/smoke/router-market-smoke.sh
+scripts/smoke/router-share-smoke.sh
+RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 ```
 
-## 字段对照
-
-### Share descriptor
-
-对照 server `/api/shares` 中 `runtimeSnapshot` 与 router/market 表格：
-
-- `shareId`
-- `app`
-- `providerId`
-- `providerType`
-- `providerName`
-- `accountEmail`
-- `subscriptionLevel`
-- `quotaPercent`
-- `health`
-- `appRuntimes`
-- `appProviders`
-- `appAvailability`
-
-Ollama Cloud 等无百分比 quota 的 provider 不应显示伪造 `0%`，也不应按百分比参与排序或健康判断。
-
-### Request log
-
-同一请求三侧对照：
-
-- `requestId`
-- `shareId`
-- `source` / `dataSource`
-- `country` / `countryIso3`
-- `userEmail`
-- `requestedModel`
-- `actualModel`
-- `actualModelSource`
-- `statusCode`
-- `inputTokens`
-- `outputTokens`
-- `cacheReadTokens`
-- `cacheCreationTokens`
-- `totalTokens`
-
-server 只自动同步 Router Share 来源的 request log 到 router；market source 日志应由 market 侧负责，避免重复。
-
-### Share edit / managed grant
-
-Router 内建 Share Market 会将单个 entitlement 的增删转换成 pending share edit。server 侧通过两种方式处理：
-
-- 后台监听 `/v1/shares/edit-events`。
-- 手动调用 `POST /api/router/share-edits/pull`。
-
-处理流程：
-
-1. 用 installation identity 签名请求 `/v1/shares/pending-edits`。
-2. 将 `ShareSettingsPatch` 应用到本地 share 的 ACL、appSettings、forSale、price、limits、expiresAt、autoStart；`ownerEmail` patch 必须由 router 和 server 双方拒绝。
-3. 同步更新后的 share descriptor 到 router。
-4. 回写 `/v1/shares/edit-ack` 为 `applied` 或 `rejected`。
-5. 以 `operationId` 幂等记录已执行操作；`routerShareMarket` grant 只能由 managed grant 修改，普通 Share 编辑不能覆盖。
-
-## 通过标准
-
-- router client 表中 0 share client 也显示在线/健康。
-- `clientSubdomain.routerDomain` 能打开 server Web。
-- router share 表字段与 server runtime snapshot 一致。
-- router 强制每个 Share Owner 等于 Installation Owner；不匹配的单条/批量同步被拒绝，已验证的 Installation Owner 变更会原子重绑全部 Share 并保留旧 owner 的共享访问。
-- Client Tunnel claim/update 只能携带当前 Installation Owner，不能借由 tunnel payload 创建或修改 Installation Owner。
-- market admin Shares 页能看到 app runtime、provider、model、quota、health。
-- Router Share URL 和 market API URL 都能命中正确 binding。
-- request log 国家/IP/source 不丢，`dataSource=direct` 与 market 计费日志不重复。
-- 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 server share，并回写 ack。
-
-## 阻断记录
-
-如果失败，记录：
-
-- 失败步骤。
-- server 脚本输出。
-- `/api/router/diagnostics`。
-- `/api/router/tunnels`。
-- `/api/shares`。
-- 已登录 Server Web 会话下的 `/web-api/usage/requests?fromMs=<start>&toMs=<end>&limit=20`。
-- router/market 对应错误响应或后台日志摘要。
+The standalone `cc-switch-market` repository is not part of this acceptance
+path. Migration 21 physically retires the old Router live/archive tables after
+checksum verification; only non-identifying aggregate receipts and eligible
+canonical Share usage remain. No old Market writer or runtime dependency is
+accepted.

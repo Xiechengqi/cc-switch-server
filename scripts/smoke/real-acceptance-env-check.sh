@@ -196,9 +196,7 @@ if should_run "AB2" || should_run "AB3" || should_run "AB4" || should_run "AB8";
   echo "== baseline =="
   check_group "server auth" SERVER_URL CC_SWITCH_SERVER_TOKEN
   check_optional ROUTER_BASE_URL
-  check_optional MARKET_URL
   check_header ROUTER_API_TOKEN_HEADER
-  check_header MARKET_API_TOKEN_HEADER
   check_stream_probe
 fi
 
@@ -208,9 +206,8 @@ if should_run "AB2"; then
 fi
 
 if should_run "AB3"; then
-  echo "== AB3 market API URL =="
-  check_group "AB3 market dispatch base" SERVER_URL CC_SWITCH_SERVER_TOKEN MARKET_API_URL
-  check_any "AB3 market auth token" ROUTER_API_TOKEN MARKET_API_TOKEN
+  echo "== AB3 Client + Router Gateway/Share =="
+  check_group "AB3 Router Gateway/Share base" SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN
 fi
 
 if should_run "AB4"; then
@@ -276,7 +273,7 @@ fi
 if should_run "AB8"; then
   echo "== AB8 release readiness =="
   check_group "AB8 Router Share acceptance" SERVER_URL CC_SWITCH_SERVER_TOKEN SHARE_ID CC_SWITCH_SHARE_URL
-  check_group "AB8 router/market acceptance" ROUTER_API_TOKEN MARKET_API_URL
+  check_group "AB8 Router Gateway/Share acceptance" ROUTER_API_TOKEN CC_SWITCH_SHARE_URL
   check_group "AB8 real provider tokens" CLAUDE_PROVIDER_TOKEN CODEX_PROVIDER_TOKEN GEMINI_PROVIDER_TOKEN
 fi
 

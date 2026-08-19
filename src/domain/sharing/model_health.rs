@@ -402,7 +402,7 @@ mod tests {
     use crate::domain::accounts::store::AccountQuota;
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::sharing::shares::{ShareAcl, ShareBinding, SharePolicy};
+    use crate::domain::sharing::shares::{ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLogContext, UsageModelMetadata};
 
     #[test]
@@ -890,10 +890,7 @@ mod tests {
             account_email: None,
             quota_percent,
             tunnel_subdomain: Some(id.to_string()),
-            policy: SharePolicy {
-                acl: ShareAcl::default(),
-                ..SharePolicy::default()
-            },
+            policy: SharePolicy::default(),
             tokens_used: 0,
             requests_count: 0,
             created_at_ms: 0,

@@ -2916,7 +2916,7 @@ pub(in crate::api) fn provider_test_model(
                 crate::domain::providers::bundle::bundle_test_model_override(&stored.provider)
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| match app {
+            .unwrap_or(match app {
                 AppKind::Claude => defaults.test_models.claude,
                 AppKind::Codex => defaults.test_models.codex,
                 AppKind::Gemini => defaults.test_models.gemini,

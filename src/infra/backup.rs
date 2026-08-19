@@ -74,6 +74,9 @@ fn create_backup_inner(
             .to_str()
             .context("backup source path must be valid UTF-8")?;
         validate_backup_file_name(file_name)?;
+        if is_legacy_token_market_archive_path(relative) {
+            continue;
+        }
         let destination = backup_dir.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)
@@ -157,7 +160,7 @@ pub fn restore_backup_with_validator(
     validate: impl FnOnce(&Path, &BackupManifest) -> anyhow::Result<()>,
 ) -> anyhow::Result<BackupRestoreResult> {
     validate_backup_id(backup_id)?;
-    let restored = read_manifest(config_dir, backup_id)?;
+    let restored = restorable_manifest(read_manifest(config_dir, backup_id)?);
     let source_dir = backup_dir(config_dir, backup_id)?;
     let staged = stage_restore_files(&source_dir, &restored)?;
     validate_restore_stage(config_dir, &staged, &restored, validate)?;
@@ -194,6 +197,13 @@ pub fn restore_backup_with_validator(
         restored,
         pre_restore,
     })
+}
+
+fn restorable_manifest(mut manifest: BackupManifest) -> BackupManifest {
+    manifest
+        .files
+        .retain(|file| !is_legacy_token_market_archive_path(Path::new(&file.file_name)));
+    manifest
 }
 
 fn stage_restore_files(
@@ -441,18 +451,35 @@ fn validate_backup_file_name(value: &str) -> anyhow::Result<()> {
     let normal_components = components
         .iter()
         .all(|component| matches!(component, Component::Normal(_)));
-    let nested_usage_path = components.len() <= 1
-        || matches!(components.first(), Some(Component::Normal(value)) if *value == "usage");
+    let allowed_nested_path = components.len() <= 1
+        || matches!(components.first(), Some(Component::Normal(value)) if *value == "usage")
+        || is_legacy_token_market_archive_path(path);
     let valid = !value.is_empty()
         && !value.contains('\\')
         && !path.is_absolute()
         && normal_components
-        && nested_usage_path
+        && allowed_nested_path
         && (value.ends_with(".json") || value.ends_with(".jsonl") || value == "accounts.key");
     if !valid {
         bail!("invalid backup file name");
     }
     Ok(())
+}
+
+fn is_legacy_token_market_archive_path(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    components.len() == 4
+        && components[0] == "legacy-token-market-archive"
+        && components[1] == "shares"
+        && components[2].len() == 64
+        && components[2].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && matches!(components[3], "shares.json" | "manifest.json")
 }
 
 #[cfg(test)]
@@ -530,6 +557,55 @@ mod tests {
             .contains("before"));
         assert!(events.join("2026-08-10.jsonl").exists());
         assert!(!events.join("2026-08-11.jsonl").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backup_and_restore_exclude_retired_legacy_share_archive_payloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-backup-legacy-share-archive-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let digest = "a".repeat(64);
+        let archive_root = dir.join("legacy-token-market-archive");
+        let entry = archive_root.join("shares").join(&digest);
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(entry.join("shares.json"), br#"{"shares":[]}"#).unwrap();
+        fs::write(
+            entry.join("manifest.json"),
+            format!(r#"{{"sourceSha256":"{digest}"}}"#),
+        )
+        .unwrap();
+        let shares = dir.join("shares.json");
+        fs::write(&shares, br#"{"shares":[]}"#).unwrap();
+
+        let backup = create_backup(&dir, &[shares.clone(), archive_root.clone()], None).unwrap();
+        assert_eq!(
+            backup
+                .files
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shares.json"]
+        );
+
+        let mut historical_manifest = backup.clone();
+        historical_manifest.files.push(BackupFile {
+            file_name: format!("legacy-token-market-archive/shares/{digest}/shares.json"),
+            size_bytes: br#"{"shares":[]}"#.len() as u64,
+        });
+        assert_eq!(restorable_manifest(historical_manifest).files.len(), 1);
+
+        fs::remove_dir_all(&archive_root).unwrap();
+        fs::write(&shares, br#"{"shares":[{"id":"new"}]}"#).unwrap();
+
+        restore_backup(&dir, &backup.id).unwrap();
+
+        assert_eq!(fs::read(&shares).unwrap(), br#"{"shares":[]}"#);
+        assert!(!archive_root.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

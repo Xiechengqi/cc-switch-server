@@ -149,7 +149,7 @@ healthcheck:
   retries: 3
 ```
 
-## Router/Market 联调
+## Client/Router Share 联调
 
 在 server 已启动并登录拿到 bearer token 后：
 
@@ -157,10 +157,10 @@ healthcheck:
 CC_SWITCH_SERVER_TOKEN=... \
 SERVER_URL=http://127.0.0.1:15721 \
 SHARE_ID=share-id \
-scripts/smoke/router-market-smoke.sh
+scripts/smoke/router-share-smoke.sh
 ```
 
-脚本只通过 server/market HTTP API 探测，不修改 router、market 或 cc-switch 代码。
+脚本只通过 Server/Router HTTP API 探测，不修改 Router、Server 或其他仓库代码。
 
 ## TLS/反代
 

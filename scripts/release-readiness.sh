@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep the release gate on the same test stack used by the repository's full
+# test instructions; otherwise protocol fixtures can abort with SIGABRT before
+# the gate reports a meaningful result.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"
+
 RUN_TESTS="${RUN_TESTS:-1}"
 RUN_REAL="${RUN_REAL:-0}"
 RUN_DEPLOYMENT_TESTS="${RUN_DEPLOYMENT_TESTS:-0}"
@@ -27,6 +32,7 @@ need_var() {
 
 echo "== local release checks =="
 node scripts/audit/audit-proxy-bridge-contract.mjs --check || FAILURES=$((FAILURES + 1))
+node scripts/audit/audit-token-market-decoupling.mjs --check || FAILURES=$((FAILURES + 1))
 if [[ "$RUN_TESTS" == "1" ]]; then
   LOCAL_FAILURES_BEFORE="$FAILURES"
   cargo fmt --check || FAILURES=$((FAILURES + 1))
@@ -47,8 +53,8 @@ echo "== AB env gates =="
 need_var CC_SWITCH_SERVER_TOKEN
 need_var SHARE_ID
 need_var CC_SWITCH_SHARE_URL
+need_var ROUTER_BASE_URL
 need_var ROUTER_API_TOKEN
-need_var MARKET_API_URL
 need_var CLAUDE_PROVIDER_TOKEN
 need_var CODEX_PROVIDER_TOKEN
 need_var GEMINI_PROVIDER_TOKEN
@@ -71,7 +77,7 @@ esac
 
 if [[ "$RUN_REAL" == "1" && "${#BLOCKERS[@]}" -eq 0 ]]; then
   echo "== real smoke =="
-  scripts/smoke/router-market-smoke.sh || FAILURES=$((FAILURES + 1))
+  scripts/smoke/router-share-smoke.sh || FAILURES=$((FAILURES + 1))
   scripts/smoke/code-agent-regression.sh || FAILURES=$((FAILURES + 1))
   if [[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]]; then
     if node scripts/smoke/codex-images-real.mjs; then

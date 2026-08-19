@@ -3,10 +3,11 @@ import {
   type ShareRecord,
   type ShareUserGrantMap,
   type ShareUserPolicy,
+  type ShareUserUsageEditMap,
+  type ShareTotalUsageEdit,
 } from "@/lib/api/share";
 import {
-  buildShareUserGrantsForAcl,
-  isValidShareEmail,
+  buildShareUserGrants,
   normalizeShareEmails,
 } from "@/utils/shareFormUtils";
 import {
@@ -20,13 +21,14 @@ export interface ProviderBundleShareDraft {
   enabled: boolean;
   subdomain: string;
   description: string;
-  forSale: "Yes" | "No" | "Free";
-  marketAccessMode: "selected" | "all";
+  freeAccess: boolean;
   tokenLimit: string;
+  /** Share-total consumed tokens; an operator correction, not a limit. */
+  tokensUsed: string;
   parallelLimit: string;
   expiry: ProviderBundleShareExpiry;
-  sharedWithEmails: string[];
   userGrants: ShareUserGrantMap;
+  userUsageEdits: ShareUserUsageEditMap;
   allowPersonalCredits: boolean;
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: string;
@@ -94,7 +96,12 @@ export function createBundleShareDraft(
             ? preset
             : closest,
         ).value;
-  const sharedWithEmails = normalizeShareEmails(share?.sharedWithEmails ?? []);
+  const canonicalUserGrants = share?.userGrants ?? {};
+  const shareToEmails = normalizeShareEmails(
+    Object.values(canonicalUserGrants)
+      .filter((grant) => grant.active !== false && grant.role === "shareto")
+      .map((grant) => grant.email),
+  );
   const defaultPolicy: ShareUserPolicy = {
     parallelLimit:
       share && share.parallelLimit > 0 ? share.parallelLimit : undefined,
@@ -111,21 +118,21 @@ export function createBundleShareDraft(
     ),
     subdomain: share?.shareSlug ?? "",
     description: share?.description ?? "",
-    forSale: share?.forSale ?? "Yes",
-    marketAccessMode: share?.marketAccessMode ?? "all",
+    freeAccess: share?.freeAccess ?? false,
     tokenLimit: share && share.tokenLimit >= 0 ? String(share.tokenLimit) : "",
+    tokensUsed: String(Math.max(0, share?.tokensUsed ?? 0)),
     parallelLimit:
       share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "",
     expiry,
-    sharedWithEmails,
     userGrants: share
-      ? buildShareUserGrantsForAcl({
-          source: share.userGrants,
+      ? buildShareUserGrants({
+          source: canonicalUserGrants,
           ownerEmail: share.ownerEmail,
-          aclEmails: sharedWithEmails,
+          aclEmails: shareToEmails,
           defaultPolicy,
         })
       : {},
+    userUsageEdits: {},
     allowPersonalCredits: share?.allowPersonalCredits ?? false,
     autoConsumeBankedReset: share?.autoConsumeBankedReset ?? false,
     bankedResetExpiryLeadMinutes: String(
@@ -164,19 +171,42 @@ export async function saveBundleShare(
   if (draft.enabled && subdomain && !isValidShareSlug(subdomain)) {
     throw new Error("Share slug is invalid");
   }
-  if (draft.sharedWithEmails.some((email) => !isValidShareEmail(email))) {
-    throw new Error("Share email is invalid");
-  }
   const tokenLimit = limitValue(draft.tokenLimit, UNLIMITED_TOKEN_LIMIT);
   const parallelLimit = limitValue(
     draft.parallelLimit,
     UNLIMITED_PARALLEL_LIMIT,
   );
   const expiry = expiresAt(draft);
-  const sharedWithEmails = normalizeShareEmails(draft.sharedWithEmails);
   const userGrants = Object.keys(draft.userGrants).length
     ? draft.userGrants
     : undefined;
+  const allowedUsageEmails = new Set(
+    Object.values(draft.userGrants)
+      .filter(
+        (grant) =>
+          grant.active !== false && grant.manager !== "routerShareMarket",
+      )
+      .map((grant) => grant.email.trim().toLowerCase()),
+  );
+  const userUsageEdits = Object.fromEntries(
+    Object.entries(draft.userUsageEdits).filter(([email]) =>
+      allowedUsageEmails.has(email.trim().toLowerCase()),
+    ),
+  );
+  // Only an actual edit is sent.  Resending the value the editor was opened
+  // with would silently erase requests that landed in the meantime.
+  let shareUsageEdit: ShareTotalUsageEdit | undefined;
+  const tokensUsedRaw = draft.tokensUsed.trim();
+  if (existing && tokensUsedRaw) {
+    const tokensUsed = Number(tokensUsedRaw);
+    if (!Number.isSafeInteger(tokensUsed) || tokensUsed < 0) {
+      throw new Error("Consumed tokens must be a non-negative integer");
+    }
+    if (tokensUsed !== existing.tokensUsed) {
+      shareUsageEdit =
+        tokensUsed === 0 ? { action: "clear" } : { action: "set", tokensUsed };
+    }
+  }
   const bankedResetExpiryLeadMinutes = limitValue(
     draft.bankedResetExpiryLeadMinutes,
     60,
@@ -196,17 +226,17 @@ export async function saveBundleShare(
     enabled: draft.enabled,
     subdomain: subdomain || existing?.shareSlug || "",
     description: draft.description.trim() || undefined,
-    forSale: draft.forSale,
-    marketAccessMode: draft.marketAccessMode,
+    freeAccess: draft.freeAccess,
     tokenLimit,
     parallelLimit,
     expiresAt: expiry,
-    sharedWithEmails,
     allowPersonalCredits: draft.allowPersonalCredits,
     autoConsumeBankedReset: draft.autoConsumeBankedReset,
     bankedResetExpiryLeadMinutes,
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
     userGrants,
+    userUsageEdits,
+    shareUsageEdit,
   });
 }
 

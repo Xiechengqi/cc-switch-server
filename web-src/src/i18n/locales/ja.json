@@ -149,11 +149,7 @@
       "deleteShort": "Share を削除",
       "deleteConfirmTitle": "Share を削除",
       "deleteConfirmMessage": "削除すると Share ページから取り除かれ、元に戻せません。",
-      "deleteRemember": "選択を記憶し、次回から確認しない",
-      "officialPricePercent": "モデル価格（公式価格に対する割合）",
-      "officialPricePercentPlaceholder": "空欄の場合は Token Market の価格を使用",
-      "officialPricePercentHint": "1 から 100 の整数のみ入力できます。",
-      "officialPricePercentInvalid": "モデル価格は 1 から 100 の整数で入力してください。"
+      "deleteRemember": "選択を記憶し、次回から確認しない"
     },
     "unsavedChanges": {
       "title": "未保存の変更を破棄しますか？",
@@ -2902,7 +2898,6 @@
       "summaryHeading": "以下のデフォルト値で作成されます：",
       "apiKeyAuto": "(自動生成)",
       "subdomainAuto": "(バックエンド生成)",
-      "marketHint": "作成後、share カードで Market リストを細かく調整できます。",
       "defaultsConfirm": {
         "title": "デフォルト設定で作成しますか？",
         "body": "「詳細設定」を展開していません。次のデフォルト値で作成します：",
@@ -3013,26 +3008,13 @@
     "descriptionHint": "任意。cc-switch-router のサイドバーに表示されます。最大 200 文字。",
     "descriptionPlaceholder": "この share の用途、対象ユーザー、利用上の注意などを入力します。",
     "descriptionSettings": "説明設定",
-    "forSale": "販売可否",
-    "forSaleHint": "この share に販売意向があるかを示します。cc-switch-router の share 一覧に同期されます。",
-    "forSaleSettings": "販売可否設定",
-    "saveForSale": "販売可否を保存",
-    "forSaleOptions": {
-      "yes": "Yes",
-      "no": "No",
-      "free": "Free"
+    "authorizedUsers": "許可ユーザー",
+    "freeAccess": {
+      "label": "公開無料アクセス",
+      "hint": "デフォルトは非公開です。有効にすると、Router にログイン済みのすべてのユーザーが無料で呼び出せます。下の許可ユーザーには個別クォータを設定できます。",
+      "public": "公開・無料",
+      "private": "非公開"
     },
-    "market": {
-      "title": "Market 選択",
-      "select": "Market を選択",
-      "all": "All",
-      "restore": "復元",
-      "default": "デフォルト、Market には許可しない",
-      "description": "1 つ以上の Market を選択します。許可は保存時にまとめて反映されます。",
-      "forSaleRequired": "Market を選択するには販売可否を Yes にしてください。"
-    },
-    "forSaleFreeConfirmTitle": "Free モードの確認",
-    "forSaleFreeConfirmMessage": "Free に設定すると、API Key がマスクされずに全員に公開されます。リスクを理解した上で確認してください。",
     "apiKey": "API Key",
     "apiKeyHint": "任意です。空欄なら自動生成します。使用できるのは英数字、.、_、- で、長さは 8 から 128 です。",
     "apiKeySettings": "API Key 設定",
@@ -3177,12 +3159,10 @@
     },
     "editDialog": {
       "title": "設定オプション",
-      "save": "設定を保存",
-      "forSaleDisableHint": "For Sale が Free または No の場合、ターゲット市場とモデル価格は編集できません。"
+      "save": "設定を保存"
     },
     "confirmDeleteTitle": "Share を削除",
     "confirmDeleteMessage": "「{{name}}」を削除しますか？ 実行中の tunnel があれば先に停止します。",
-    "freeConfirm": "販売設定を無料に変更しますか？",
     "error": {
       "title": "Share の読み込みに失敗しました"
     },
@@ -3204,8 +3184,6 @@
       "updateApiKeyError": "API Key の更新に失敗しました: {{error}}",
       "updateDescriptionSuccess": "説明を更新しました",
       "updateDescriptionError": "説明の更新に失敗しました: {{error}}",
-      "updateForSaleSuccess": "販売可否を更新しました",
-      "updateForSaleError": "販売可否の更新に失敗しました: {{error}}",
       "updateExpirationSuccess": "期限を更新しました",
       "updateExpirationError": "期限の更新に失敗しました: {{error}}",
       "updateTokenLimitSuccess": "Token 上限を更新しました",

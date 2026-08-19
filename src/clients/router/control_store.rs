@@ -11,6 +11,7 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::domain::router::{
     BaseDomain, ClientSubdomain, NamespaceError, PublicHost, PublicHostClaim, PublicHostKind,
@@ -18,7 +19,10 @@ use crate::domain::router::{
 };
 use crate::domain::settings::config::router_control_db_path;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+const LEGACY_ARCHIVE_SCHEMA_VERSION: i64 = 2;
+const LEGACY_TOKEN_MARKET_HOST_ARCHIVE_FORMAT: &str =
+    "cc-switch-server-router-control-legacy-token-market-hosts-v1";
 const MAX_OUTBOX_CLAIM: usize = 1_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -264,9 +268,9 @@ impl RouterControlStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         configure_connection(&connection)?;
-        initialize_schema(&connection)?;
+        initialize_schema(&mut connection)?;
         harden_database_permissions(path)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
@@ -275,9 +279,9 @@ impl RouterControlStore {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let connection = Connection::open_in_memory()?;
+        let mut connection = Connection::open_in_memory()?;
         configure_connection(&connection)?;
-        initialize_schema(&connection)?;
+        initialize_schema(&mut connection)?;
         Ok(Self {
             path: None,
             connection: Mutex::new(connection),
@@ -909,12 +913,10 @@ impl RouterControlStore {
         let profile = load_router_profile(&transaction, &router_id)?
             .ok_or_else(|| RouterControlStoreError::RouterNotFound(router_id.clone()))?;
         claim.validate_for(&profile.base_domain)?;
-        if claim.kind() != PublicHostKind::Market {
-            let identity = load_device_identity(&transaction)?
-                .ok_or(RouterControlStoreError::DeviceIdentityMissing)?;
-            if claim.client_subdomain() != Some(&identity.client_subdomain) {
-                return Err(RouterControlStoreError::HostClientSubdomainMismatch);
-            }
+        let identity = load_device_identity(&transaction)?
+            .ok_or(RouterControlStoreError::DeviceIdentityMissing)?;
+        if claim.client_subdomain() != Some(&identity.client_subdomain) {
+            return Err(RouterControlStoreError::HostClientSubdomainMismatch);
         }
         if let Some(existing) = load_host_claim(&transaction, claim.host())? {
             if existing.router_id == router_id
@@ -1016,9 +1018,12 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn initialize_schema(connection: &Connection) -> Result<()> {
+fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if found != 0 && found != SCHEMA_VERSION {
+    if !matches!(
+        found,
+        0 | 1 | LEGACY_ARCHIVE_SCHEMA_VERSION | SCHEMA_VERSION
+    ) {
         return Err(RouterControlStoreError::UnsupportedSchema {
             found,
             expected: SCHEMA_VERSION,
@@ -1113,7 +1118,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
              host TEXT PRIMARY KEY COLLATE NOCASE,
              protocol_epoch TEXT NOT NULL CHECK (protocol_epoch = 'namespace-flat-1'),
              router_id TEXT NOT NULL REFERENCES router_profiles(router_id) ON DELETE CASCADE,
-             kind TEXT NOT NULL CHECK (kind IN ('client', 'share', 'market')),
+             kind TEXT NOT NULL CHECK (kind IN ('client', 'share')),
              subject_id TEXT NOT NULL,
              client_subdomain TEXT,
              slug TEXT,
@@ -1122,7 +1127,6 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
              CHECK (
                  (kind = 'client' AND client_subdomain IS NOT NULL AND slug IS NULL)
                  OR (kind = 'share' AND client_subdomain IS NOT NULL AND slug IS NOT NULL)
-                 OR (kind = 'market' AND client_subdomain IS NULL AND slug IS NOT NULL)
              )
          ) STRICT;
 
@@ -1131,6 +1135,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
          INSERT OR IGNORE INTO control_state(singleton, primary_router_id, controller_epoch)
          VALUES (1, NULL, 0);",
     )?;
+    if found == 1 {
+        migrate_schema_v1_to_v2(connection)?;
+    }
+    if matches!(found, 1 | LEGACY_ARCHIVE_SCHEMA_VERSION) {
+        migrate_schema_v2_to_v3(connection)?;
+    }
     let epoch: String = connection.query_row(
         "SELECT value FROM schema_meta WHERE key = 'protocol_epoch'",
         [],
@@ -1144,6 +1154,207 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
+}
+
+fn migrate_schema_v1_to_v2(connection: &mut Connection) -> Result<()> {
+    let archived_at_ms = i64::try_from(crate::infra::time::now_ms()).map_err(|_| {
+        RouterControlStoreError::DatabaseInvariant(
+            "legacy Token Market host archive timestamp overflow".to_string(),
+        )
+    })?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE legacy_token_market_public_hosts (
+             host TEXT PRIMARY KEY COLLATE NOCASE,
+             protocol_epoch TEXT NOT NULL,
+             router_id TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK (kind = 'market'),
+             subject_id TEXT NOT NULL,
+             client_subdomain TEXT,
+             slug TEXT,
+             created_at_ms INTEGER NOT NULL,
+             archived_at_ms INTEGER NOT NULL CHECK (archived_at_ms >= 0)
+         ) STRICT;
+         CREATE TABLE legacy_token_market_archive_manifest (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             format TEXT NOT NULL,
+             source_table TEXT NOT NULL,
+             archive_table TEXT NOT NULL,
+             row_count INTEGER NOT NULL CHECK (row_count >= 0),
+             checksum_sha256 TEXT NOT NULL,
+             archived_at_ms INTEGER NOT NULL CHECK (archived_at_ms >= 0)
+         ) STRICT;",
+    )?;
+    let existing_archive_rows: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM legacy_token_market_public_hosts",
+        [],
+        |row| row.get(0),
+    )?;
+    let existing_manifest_rows: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM legacy_token_market_archive_manifest",
+        [],
+        |row| row.get(0),
+    )?;
+    if existing_archive_rows != 0 || existing_manifest_rows != 0 {
+        return Err(RouterControlStoreError::DatabaseInvariant(
+            "schema v1 migration found a pre-existing legacy Token Market host archive".to_string(),
+        ));
+    }
+
+    transaction.execute(
+        "INSERT INTO legacy_token_market_public_hosts (
+             host, protocol_epoch, router_id, kind, subject_id,
+             client_subdomain, slug, created_at_ms, archived_at_ms
+         )
+         SELECT host, protocol_epoch, router_id, kind, subject_id,
+                client_subdomain, slug, created_at_ms, ?1
+           FROM public_hosts
+          WHERE kind = 'market'",
+        params![archived_at_ms],
+    )?;
+    let row_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM legacy_token_market_public_hosts",
+        [],
+        |row| row.get(0),
+    )?;
+    let checksum = legacy_token_market_host_archive_checksum(&transaction)?;
+    transaction.execute(
+        "INSERT INTO legacy_token_market_archive_manifest (
+             singleton, format, source_table, archive_table,
+             row_count, checksum_sha256, archived_at_ms
+         ) VALUES (1, ?1, 'public_hosts(kind=market)',
+                   'legacy_token_market_public_hosts', ?2, ?3, ?4)",
+        params![
+            LEGACY_TOKEN_MARKET_HOST_ARCHIVE_FORMAT,
+            row_count,
+            checksum,
+            archived_at_ms
+        ],
+    )?;
+
+    transaction.execute_batch(
+        "CREATE TABLE public_hosts_v2 (
+             host TEXT PRIMARY KEY COLLATE NOCASE,
+             protocol_epoch TEXT NOT NULL CHECK (protocol_epoch = 'namespace-flat-1'),
+             router_id TEXT NOT NULL REFERENCES router_profiles(router_id) ON DELETE CASCADE,
+             kind TEXT NOT NULL CHECK (kind IN ('client', 'share')),
+             subject_id TEXT NOT NULL,
+             client_subdomain TEXT,
+             slug TEXT,
+             created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+             UNIQUE (router_id, kind, subject_id),
+             CHECK (
+                 (kind = 'client' AND client_subdomain IS NOT NULL AND slug IS NULL)
+                 OR (kind = 'share' AND client_subdomain IS NOT NULL AND slug IS NOT NULL)
+             )
+         ) STRICT;
+         INSERT INTO public_hosts_v2 (
+             host, protocol_epoch, router_id, kind, subject_id,
+             client_subdomain, slug, created_at_ms
+         )
+         SELECT host, protocol_epoch, router_id, kind, subject_id,
+                client_subdomain, slug, created_at_ms
+           FROM public_hosts
+          WHERE kind IN ('client', 'share');
+         DROP TABLE public_hosts;
+         ALTER TABLE public_hosts_v2 RENAME TO public_hosts;",
+    )?;
+    transaction.pragma_update(None, "user_version", LEGACY_ARCHIVE_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_schema_v2_to_v3(connection: &mut Connection) -> Result<()> {
+    validate_legacy_token_market_host_archive(connection)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "DROP TABLE legacy_token_market_public_hosts;
+         DROP TABLE legacy_token_market_archive_manifest;",
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_legacy_token_market_host_archive(connection: &Connection) -> Result<()> {
+    let manifest = connection
+        .query_row(
+            "SELECT format, source_table, archive_table, row_count, checksum_sha256
+               FROM legacy_token_market_archive_manifest
+              WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let archived_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM legacy_token_market_public_hosts",
+        [],
+        |row| row.get(0),
+    )?;
+    let Some((format, source_table, archive_table, row_count, expected_checksum)) = manifest else {
+        if archived_rows != 0 {
+            return Err(RouterControlStoreError::DatabaseInvariant(
+                "legacy Token Market host archive has rows without a manifest".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    if format != LEGACY_TOKEN_MARKET_HOST_ARCHIVE_FORMAT
+        || source_table != "public_hosts(kind=market)"
+        || archive_table != "legacy_token_market_public_hosts"
+        || row_count != archived_rows
+    {
+        return Err(RouterControlStoreError::DatabaseInvariant(
+            "legacy Token Market host archive manifest does not match the archive".to_string(),
+        ));
+    }
+    let observed_checksum = legacy_token_market_host_archive_checksum(connection)?;
+    if observed_checksum != expected_checksum {
+        return Err(RouterControlStoreError::DatabaseInvariant(
+            "legacy Token Market host archive checksum mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_token_market_host_archive_checksum(connection: &Connection) -> Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT host, protocol_epoch, router_id, kind, subject_id,
+                client_subdomain, slug, created_at_ms
+           FROM legacy_token_market_public_hosts
+          ORDER BY host COLLATE NOCASE",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let encoded = serde_json::to_vec(&rows).map_err(|error| {
+        RouterControlStoreError::DatabaseInvariant(format!(
+            "serialize legacy Token Market host archive for checksum: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"cc-switch-server:legacy-token-market-public-hosts:v1\0");
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -1492,7 +1703,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::router::{MarketSlug, ShareSlug};
+    use crate::domain::router::ShareSlug;
 
     fn primary(router_id: &str, domain: &str) -> NewRouterProfile {
         NewRouterProfile {
@@ -1508,6 +1719,61 @@ mod tests {
             role: RouterRole::Auxiliary,
             ..primary(router_id, domain)
         }
+    }
+
+    fn install_legacy_market_control_fixture(path: &Path) {
+        {
+            let store = RouterControlStore::open_path(path).unwrap();
+            let identity = store.load_or_create_device_identity("edge01", 1).unwrap();
+            let base = BaseDomain::parse("one.example.com").unwrap();
+            store
+                .insert_router_profile(primary("r1", base.as_str()), 2)
+                .unwrap();
+            let client =
+                PublicHostClaim::client(&base, identity.client_subdomain.clone(), "device")
+                    .unwrap();
+            let share = PublicHostClaim::share(
+                &base,
+                ShareSlug::parse("shared").unwrap(),
+                identity.client_subdomain,
+                "share-1",
+            )
+            .unwrap();
+            store.claim_public_host("r1", &client, 3).unwrap();
+            store.claim_public_host("r1", &share, 4).unwrap();
+        }
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE public_hosts RENAME TO public_hosts_v2_source;
+                 CREATE TABLE public_hosts (
+                     host TEXT PRIMARY KEY COLLATE NOCASE,
+                     protocol_epoch TEXT NOT NULL CHECK (protocol_epoch = 'namespace-flat-1'),
+                     router_id TEXT NOT NULL REFERENCES router_profiles(router_id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK (kind IN ('client', 'share', 'market')),
+                     subject_id TEXT NOT NULL,
+                     client_subdomain TEXT,
+                     slug TEXT,
+                     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                     UNIQUE (router_id, kind, subject_id),
+                     CHECK (
+                         (kind = 'client' AND client_subdomain IS NOT NULL AND slug IS NULL)
+                         OR (kind = 'share' AND client_subdomain IS NOT NULL AND slug IS NOT NULL)
+                         OR (kind = 'market' AND client_subdomain IS NULL AND slug IS NOT NULL)
+                     )
+                 ) STRICT;
+                 INSERT INTO public_hosts SELECT * FROM public_hosts_v2_source;
+                 DROP TABLE public_hosts_v2_source;
+                 INSERT INTO public_hosts (
+                     host, protocol_epoch, router_id, kind, subject_id,
+                     client_subdomain, slug, created_at_ms
+                 ) VALUES (
+                     'legacy.one.example.com', 'namespace-flat-1', 'r1', 'market',
+                     'legacy-market', NULL, 'legacy', 5
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1676,20 +1942,104 @@ mod tests {
             "share-1",
         )
         .unwrap();
-        let market =
-            PublicHostClaim::market(&base, MarketSlug::parse("official").unwrap(), "market-1")
-                .unwrap();
         assert!(store.claim_public_host("r1", &client, 3).unwrap());
         assert!(!store.claim_public_host("r1", &client, 4).unwrap());
         assert!(store.claim_public_host("r1", &share, 5).unwrap());
-        assert!(store.claim_public_host("r1", &market, 6).unwrap());
-        assert_eq!(store.public_hosts("r1").unwrap().len(), 3);
+        assert_eq!(store.public_hosts("r1").unwrap().len(), 2);
         let resolved = store
             .resolve_public_host(&share.host().to_string().to_ascii_uppercase())
             .unwrap()
             .unwrap();
         assert_eq!(resolved.kind, PublicHostKind::Share);
         assert_eq!(resolved.subject_id, "share-1");
+    }
+
+    #[test]
+    fn schema_v3_physically_retires_market_hosts_and_rejects_future_market_rows() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-control-market-migration-{}-{suffix}.sqlite",
+            std::process::id()
+        ));
+        install_legacy_market_control_fixture(&path);
+
+        {
+            let store = RouterControlStore::open_path(&path).unwrap();
+            assert_eq!(store.public_hosts("r1").unwrap().len(), 2);
+            let connection = store.connection().unwrap();
+            let version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            let retired_tables: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name IN (
+                           'legacy_token_market_public_hosts',
+                           'legacy_token_market_archive_manifest'
+                       )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retired_tables, 0);
+            assert!(connection
+                .execute(
+                    "INSERT INTO public_hosts (
+                         host, protocol_epoch, router_id, kind, subject_id,
+                         client_subdomain, slug, created_at_ms
+                     ) VALUES (
+                         'other.one.example.com', 'namespace-flat-1', 'r1', 'market',
+                         'other-market', NULL, 'other', 6
+                     )",
+                    [],
+                )
+                .is_err());
+        }
+
+        // Reopening is idempotent after the verified archive has been removed.
+        drop(RouterControlStore::open_path(&path).unwrap());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn schema_v3_rejects_a_tampered_v2_archive_before_physical_retirement() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cc-switch-router-control-market-tamper-{}-{suffix}.sqlite",
+            std::process::id()
+        ));
+        install_legacy_market_control_fixture(&path);
+
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            migrate_schema_v1_to_v2(&mut connection).unwrap();
+            connection
+                .execute(
+                    "UPDATE legacy_token_market_public_hosts SET slug = 'tampered'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            RouterControlStore::open_path(&path),
+            Err(RouterControlStoreError::DatabaseInvariant(message))
+                if message.contains("checksum mismatch")
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[test]

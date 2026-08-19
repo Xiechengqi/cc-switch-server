@@ -5,8 +5,10 @@ use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::runtime::authoritative_managed_account;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
+use crate::domain::sharing::retired_fields::find_retired_share_field;
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareUserGrant,
+    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareTotalUsageEdit,
+    ShareUserGrant, ShareUserUsageEdit, ShareUserUsageEditAction,
 };
 
 pub(in crate::api) async fn web_provider_health_json(
@@ -517,6 +519,7 @@ pub(in crate::api) async fn web_share_upsert_input(
     args: &Value,
 ) -> Result<UpsertShareInput, ApiError> {
     let value = web_payload(args, &["params", "input", "share"]);
+    reject_retired_share_input_fields(value)?;
     if let Ok(input) = serde_json::from_value::<UpsertShareInput>(value.clone()) {
         return Ok(input);
     }
@@ -566,21 +569,9 @@ pub(in crate::api) async fn web_share_upsert_input(
         })
     });
 
-    let shared_with_emails =
-        web_optional_deserialize::<Vec<String>>(value, "sharedWithEmails")?.unwrap_or_default();
-    let market_access_mode =
-        web_optional_string_any(value, &["marketAccessMode", "market_access_mode"]);
-    let access_by_app = web_optional_deserialize(value, "accessByApp")?.unwrap_or_default();
-    let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
-    let for_sale_official_price_percent_by_app =
-        web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
-    let official_price_percent =
-        web_optional_i64(value, &["officialPricePercent", "official_price_percent"])
-            .and_then(|value| u16::try_from(value).ok());
     let user_grants =
         web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
             .unwrap_or_default();
-
     Ok(UpsertShareInput {
         id: web_optional_string_any(value, &["id", "shareId", "share_id"]),
         owner_email: web_optional_string_any(value, &["ownerEmail", "owner_email"]),
@@ -594,26 +585,10 @@ pub(in crate::api) async fn web_share_upsert_input(
         account_email: None,
         quota_percent: None,
         tunnel_subdomain: web_optional_string_any(value, &["tunnelSubdomain", "subdomain"]),
-        acl: Some(ShareAcl {
-            shared_with_emails,
-            public_market_email: None,
-            market_access_mode,
-        }),
         token_limit: web_optional_u64(value, &["tokenLimit", "token_limit"]),
         parallel_limit: web_optional_u32(value, &["parallelLimit", "parallel_limit"]),
         expires_at,
-        for_sale: {
-            let (for_sale, _) = web_share_for_sale_flags(value);
-            for_sale
-        },
-        free_access: {
-            let (_, free_access) = web_share_for_sale_flags(value);
-            free_access
-        },
-        access_by_app,
-        app_settings,
-        for_sale_official_price_percent_by_app,
-        official_price_percent,
+        free_access: web_share_free_access(value)?,
         allow_personal_credits: web_optional_bool(
             value,
             &["allowPersonalCredits", "allow_personal_credits"],
@@ -946,46 +921,6 @@ fn ensure_router_domain_matches(
     }
 }
 
-pub(in crate::api) async fn web_update_share_acl(
-    state: &ServerState,
-    args: &Value,
-) -> Result<Share, ApiError> {
-    let value = web_payload(args, &["params", "input"]);
-    let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
-    if let Some(acl_value) = value.get("acl") {
-        let acl =
-            serde_json::from_value::<ShareAcl>(acl_value.clone()).map_err(ApiError::bad_request)?;
-        let share = state
-            .try_mutate_shares_immediate(|store| {
-                store
-                    .replace_acl(&share_id, acl)
-                    .ok_or_else(|| ApiError::not_found("share not found"))
-            })
-            .await
-            .map_err(ApiError::internal)??;
-        spawn_share_upsert_sync(state.clone(), share.clone());
-        emit_share_event(state, "share.changed", &share, "acl_replaced");
-        return Ok(share);
-    }
-
-    let patch = ShareSettingsPatch {
-        shared_with_emails: web_optional_deserialize(value, "sharedWithEmails")?,
-        user_grants: web_optional_deserialize(value, "userGrants")?,
-        market_access_mode: web_optional_string_any(value, &["marketAccessMode"]),
-        access_by_app: web_optional_deserialize(value, "accessByApp")?,
-        app_settings: web_optional_deserialize(value, "appSettings")?,
-        ..ShareSettingsPatch::default()
-    };
-    let share = state
-        .apply_share_settings_patch_immediate(&share_id, patch)
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(map_share_patch_error)?;
-    spawn_share_upsert_sync(state.clone(), share.clone());
-    emit_share_event(state, "share.changed", &share, "acl_replaced");
-    Ok(share)
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveProviderBundleShareCommand {
@@ -998,16 +933,17 @@ struct SaveProviderBundleShareCommand {
     subdomain: String,
     #[serde(default)]
     description: Option<String>,
-    for_sale: String,
-    #[serde(default = "default_provider_bundle_market_access_mode")]
-    market_access_mode: String,
+    #[serde(default)]
+    free_access: Option<bool>,
     token_limit: i64,
     parallel_limit: i64,
     expires_at: String,
     #[serde(default)]
-    shared_with_emails: Vec<String>,
-    #[serde(default)]
     user_grants: Option<BTreeMap<String, ShareUserGrant>>,
+    #[serde(default)]
+    user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
+    #[serde(default)]
+    share_usage_edit: Option<ShareTotalUsageEdit>,
     #[serde(default)]
     allow_personal_credits: bool,
     #[serde(default)]
@@ -1016,10 +952,6 @@ struct SaveProviderBundleShareCommand {
     banked_reset_expiry_lead_minutes: u32,
     #[serde(default = "default_provider_bundle_previous_response_cache_enabled")]
     previous_response_cache_enabled: bool,
-}
-
-fn default_provider_bundle_market_access_mode() -> String {
-    "all".to_string()
 }
 
 fn default_provider_bundle_banked_reset_expiry_lead_minutes() -> u32 {
@@ -1119,33 +1051,36 @@ fn provider_bundle_share_expiration(value: &str) -> Result<i64, ApiError> {
         .map_err(|_| ApiError::bad_request("expiresAt must be an RFC3339 timestamp"))
 }
 
-fn provider_bundle_share_sale(value: &str) -> Result<(bool, bool), ApiError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "yes" => Ok((true, false)),
-        "no" => Ok((false, false)),
-        "free" => Ok((false, true)),
-        _ => Err(ApiError::bad_request("forSale must be Yes, No, or Free")),
+/// Operator-attributable trail for manual quota corrections.
+///
+/// The snapshot a rebase produces is indistinguishable from real traffic, so
+/// who changed what has to be recorded at the moment it is applied.
+fn log_share_usage_edits(
+    share_id: &str,
+    operator: Option<&str>,
+    edits: &BTreeMap<String, ShareUserUsageEdit>,
+) {
+    for (email, edit) in edits {
+        tracing::info!(
+            share_id,
+            operator = operator.unwrap_or("unattributed"),
+            user_email = email.as_str(),
+            action = ?edit.action,
+            target_tokens = edit.target_tokens,
+            source = ?edit.source,
+            "Share user consumed-token baseline changed by an operator"
+        );
     }
 }
 
-fn provider_bundle_market_access_mode(value: &str) -> Result<String, ApiError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "all" => Ok("all".to_string()),
-        "selected" => Ok("selected".to_string()),
-        _ => Err(ApiError::bad_request(
-            "marketAccessMode must be all or selected",
-        )),
-    }
-}
-
-fn normalized_provider_bundle_share_emails(emails: &[String], owner_email: &str) -> Vec<String> {
-    emails
-        .iter()
-        .map(|email| email.trim().to_ascii_lowercase())
-        .filter(|email| !email.is_empty() && !email.eq_ignore_ascii_case(owner_email))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+fn log_share_total_usage_edit(share_id: &str, operator: Option<&str>, edit: &ShareTotalUsageEdit) {
+    tracing::info!(
+        share_id,
+        operator = operator.unwrap_or("unattributed"),
+        action = ?edit.action,
+        tokens_used = edit.tokens_used,
+        "Share total consumed-token counter changed by an operator"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1161,6 +1096,7 @@ fn stage_provider_bundle_share(
     create_share_id: Option<&str>,
     usage: &crate::domain::usage::store::UsageStore,
     applied_at_ms: i64,
+    operator: Option<&str>,
 ) -> Result<Option<Share>, ApiError> {
     let current = provider_bundle_share_target(store, bundle_keys, command)?.cloned();
     if current.is_none() && !command.enabled {
@@ -1168,12 +1104,9 @@ fn stage_provider_bundle_share(
     }
     let (token_limit, parallel_limit) = provider_bundle_share_limits(command)?;
     let expires_at = provider_bundle_share_expiration(&command.expires_at)?;
-    let (for_sale, free_access) = provider_bundle_share_sale(&command.for_sale)?;
-    let market_access_mode = provider_bundle_market_access_mode(&command.market_access_mode)?;
+    let free_access = command.free_access.unwrap_or(false);
     let subdomain =
         (!command.subdomain.trim().is_empty()).then(|| command.subdomain.trim().to_string());
-    let shared_with_emails =
-        normalized_provider_bundle_share_emails(&command.shared_with_emails, owner_email);
     let description = command
         .description
         .as_deref()
@@ -1190,9 +1123,7 @@ fn stage_provider_bundle_share(
                 subdomain,
                 ShareSettingsPatch {
                     description: Some(description),
-                    for_sale: Some(command.for_sale.clone()),
-                    market_access_mode: Some(market_access_mode),
-                    shared_with_emails: Some(shared_with_emails),
+                    free_access: Some(free_access),
                     token_limit: Some(command.token_limit),
                     parallel_limit: Some(command.parallel_limit),
                     expires_at: Some(command.expires_at.clone()),
@@ -1208,11 +1139,28 @@ fn stage_provider_bundle_share(
                     user_grants: command.user_grants.clone(),
                     ..ShareSettingsPatch::default()
                 },
+                command.user_usage_edits.as_ref(),
                 command.enabled,
                 usage,
                 applied_at_ms,
+                operator,
             )
             .map_err(map_share_patch_error)?;
+        if let Some(edits) = command.user_usage_edits.as_ref() {
+            log_share_usage_edits(&share.id, operator, edits);
+        }
+        if let Some(edit) = command.share_usage_edit.as_ref() {
+            store
+                .apply_share_total_usage_edit(&share.id, edit, applied_at_ms)
+                .map_err(map_share_patch_error)?;
+            log_share_total_usage_edit(&share.id, operator, edit);
+            return Ok(Some(
+                store
+                    .get(&share.id)
+                    .cloned()
+                    .expect("Provider Bundle Share remains in the candidate store"),
+            ));
+        }
         return Ok(Some(share));
     }
 
@@ -1236,20 +1184,10 @@ fn stage_provider_bundle_share(
                 account_email: None,
                 quota_percent: None,
                 tunnel_subdomain: subdomain,
-                acl: Some(ShareAcl {
-                    shared_with_emails,
-                    public_market_email: None,
-                    market_access_mode: Some(market_access_mode),
-                }),
                 token_limit,
                 parallel_limit,
                 expires_at: Some(expires_at),
-                for_sale: Some(for_sale),
                 free_access: Some(free_access),
-                access_by_app: BTreeMap::new(),
-                app_settings: BTreeMap::new(),
-                for_sale_official_price_percent_by_app: BTreeMap::new(),
-                official_price_percent: None,
                 allow_personal_credits: Some(command.allow_personal_credits),
                 auto_consume_banked_reset: Some(command.auto_consume_banked_reset),
                 banked_reset_expiry_lead_minutes: Some(command.banked_reset_expiry_lead_minutes),
@@ -1274,8 +1212,24 @@ fn stage_provider_bundle_share(
             Some(capacity_pool_id.to_string()),
         )
         .map_err(map_share_patch_error)?;
+    if let Some(edits) = command.user_usage_edits.as_ref() {
+        let original = store
+            .get(&share.id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("share not found"))?;
+        store
+            .apply_user_usage_edits(&share.id, &original, edits, usage, applied_at_ms, operator)
+            .map_err(map_share_patch_error)?;
+        log_share_usage_edits(&share.id, operator, edits);
+    }
+    if let Some(edit) = command.share_usage_edit.as_ref() {
+        store
+            .apply_share_total_usage_edit(&share.id, edit, applied_at_ms)
+            .map_err(map_share_patch_error)?;
+        log_share_total_usage_edit(&share.id, operator, edit);
+    }
     store
-        .rebuild_user_anchored_usage(&share.id, usage, applied_at_ms)
+        .rebuild_user_usage_from_history(&share.id, usage, applied_at_ms)
         .map_err(map_share_patch_error)?;
     Ok(Some(store.get(&share.id).cloned().expect(
         "new Provider Bundle Share remains in the candidate store",
@@ -1285,8 +1239,10 @@ fn stage_provider_bundle_share(
 pub(in crate::api) async fn web_save_provider_bundle_share(
     state: &ServerState,
     args: &Value,
+    operator: Option<String>,
 ) -> Result<Option<Share>, ApiError> {
     let value = web_payload(args, &["params", "input"]);
+    reject_retired_share_input_fields(value)?;
     let command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
         .map_err(ApiError::bad_request)?;
     if command.bundle_id.trim().is_empty() || command.bundle_id != command.bundle_id.trim() {
@@ -1305,8 +1261,6 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     }
     provider_bundle_share_limits(&command)?;
     provider_bundle_share_expiration(&command.expires_at)?;
-    provider_bundle_share_sale(&command.for_sale)?;
-    provider_bundle_market_access_mode(&command.market_access_mode)?;
     if !(crate::domain::sharing::shares::MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES
         ..=crate::domain::sharing::shares::MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES)
         .contains(&command.banked_reset_expiry_lead_minutes)
@@ -1392,6 +1346,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         None,
         &usage,
         crate::infra::time::now_ms() as i64,
+        operator.as_deref(),
     )?;
     if staged_share.is_none() {
         return Ok(None);
@@ -1480,6 +1435,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                 create_share_id.as_deref(),
                 current_usage,
                 applied_at_ms,
+                operator.as_deref(),
             )?;
             crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
                 &providers_for_commit,
@@ -1577,8 +1533,10 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
 pub(in crate::api) async fn web_save_provider_share(
     state: &ServerState,
     args: &Value,
+    operator: Option<String>,
 ) -> Result<Share, ApiError> {
     let value = web_payload(args, &["params", "input"]);
+    reject_retired_share_input_fields(value)?;
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     let expected_config_revision = web_optional_i64(
         value,
@@ -1588,34 +1546,24 @@ pub(in crate::api) async fn web_save_provider_share(
     .ok_or_else(|| ApiError::bad_request("expectedConfigRevision is required"))?;
     let subdomain = web_arg_string_any(value, &["subdomain"])?;
     let description = web_optional_string_any(value, &["description"]);
-    let for_sale = web_arg_string_any(value, &["forSale", "for_sale"])?;
-    let market_access_mode =
-        web_arg_string_any(value, &["marketAccessMode", "market_access_mode"])?;
-    let shared_with_emails =
-        web_optional_deserialize::<Vec<String>>(value, "sharedWithEmails")?.unwrap_or_default();
-    let access_by_app = web_optional_deserialize(value, "accessByApp")?.unwrap_or_default();
-    let app_settings = web_optional_deserialize(value, "appSettings")?.unwrap_or_default();
-    let for_sale_official_price_percent_by_app =
-        web_optional_deserialize(value, "forSaleOfficialPricePercentByApp")?.unwrap_or_default();
-    let official_price_percent = match value
-        .get("officialPricePercent")
-        .or_else(|| value.get("official_price_percent"))
-    {
-        Some(Value::Null) => Some(None),
-        Some(raw) => Some(Some(
-            raw.as_u64()
-                .and_then(|value| u16::try_from(value).ok())
-                .ok_or_else(|| {
-                    ApiError::bad_request(
-                        "officialPricePercent must be an integer between 1 and 100",
-                    )
-                })?,
-        )),
-        None => None,
-    };
+    let free_access = web_share_free_access(value)?.unwrap_or(false);
     let user_grants =
         web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
             .unwrap_or_default();
+    let user_usage_edits =
+        web_optional_deserialize::<BTreeMap<String, ShareUserUsageEdit>>(value, "userUsageEdits")?;
+    let share_usage_edit =
+        web_optional_deserialize::<ShareTotalUsageEdit>(value, "shareUsageEdit")?;
+    // Fail fast, before the remote subdomain claim below can produce an
+    // external side effect.  The authoritative write still happens inside the
+    // quota lock so a concurrent invocation cannot interleave with it.
+    if share_usage_edit.as_ref().is_some_and(|edit| {
+        edit.action == ShareUserUsageEditAction::Set && edit.tokens_used.is_none()
+    }) {
+        return Err(ApiError::bad_request(
+            "shareUsageEdit.tokensUsed is required for action set",
+        ));
+    }
     let token_limit = web_optional_i64(value, &["tokenLimit", "token_limit"])
         .ok_or_else(|| ApiError::bad_request("tokenLimit is required"))?;
     let parallel_limit = web_optional_i64(value, &["parallelLimit", "parallel_limit"])
@@ -1648,15 +1596,7 @@ pub(in crate::api) async fn web_save_provider_share(
             &share_id,
             ShareSettingsPatch {
                 description: Some(description),
-                for_sale: Some(for_sale),
-                market_access_mode: Some(market_access_mode),
-                shared_with_emails: Some(shared_with_emails),
-                access_by_app: Some(access_by_app),
-                app_settings: Some(app_settings),
-                for_sale_official_price_percent_by_app: Some(
-                    for_sale_official_price_percent_by_app,
-                ),
-                official_price_percent,
+                free_access: Some(free_access),
                 token_limit: Some(token_limit),
                 parallel_limit: Some(parallel_limit),
                 expires_at: Some(expires_at),
@@ -1667,9 +1607,29 @@ pub(in crate::api) async fn web_save_provider_share(
             crate::infra::time::now_ms() as i64,
         )
         .map_err(map_share_patch_error)?;
+    // Reject an impossible baseline before the remote subdomain claim below can
+    // produce an external side effect.  This pass is validation only: the
+    // authoritative rebase is written inside the quota lock, against the locked
+    // Usage snapshot and the commit timestamp, so a request that lands between
+    // this check and the commit still counts on top of the operator baseline
+    // and a window rollover cannot strand the rebase in a stale window.
+    if let Some(edits) = user_usage_edits.as_ref() {
+        staged
+            .clone()
+            .apply_user_usage_edits(
+                &share_id,
+                &current,
+                edits,
+                &usage_for_quota,
+                crate::infra::time::now_ms() as i64,
+                operator.as_deref(),
+            )
+            .map_err(map_share_patch_error)?;
+    }
     let candidate = staged
-        .canonicalize_primary_app_settings(&share_id)
-        .map_err(map_share_patch_error)?;
+        .get(&share_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))?;
     staged
         .replace_configured_share(candidate.clone())
         .map_err(map_share_patch_error)?;
@@ -1724,11 +1684,31 @@ pub(in crate::api) async fn web_save_provider_share(
                     ),
                 ));
             }
+            let original = current.clone();
             store
                 .replace_configured_share(candidate)
                 .map_err(map_share_patch_error)?;
+            if let Some(edits) = user_usage_edits.as_ref() {
+                store
+                    .apply_user_usage_edits(
+                        &share_id,
+                        &original,
+                        edits,
+                        usage,
+                        applied_at_ms,
+                        operator.as_deref(),
+                    )
+                    .map_err(map_share_patch_error)?;
+                log_share_usage_edits(&share_id, operator.as_deref(), edits);
+            }
+            if let Some(edit) = share_usage_edit.as_ref() {
+                store
+                    .apply_share_total_usage_edit(&share_id, edit, applied_at_ms)
+                    .map_err(map_share_patch_error)?;
+                log_share_total_usage_edit(&share_id, operator.as_deref(), edit);
+            }
             store
-                .rebuild_user_anchored_usage(&share_id, usage, applied_at_ms)
+                .rebuild_user_usage_from_history(&share_id, usage, applied_at_ms)
                 .map_err(map_share_patch_error)?;
             store
                 .get(&share_id)
@@ -2395,18 +2375,20 @@ where
         .map_err(ApiError::bad_request)
 }
 
-pub(in crate::api) fn web_share_for_sale_flags(args: &Value) -> (Option<bool>, Option<bool>) {
-    if let Some(value) = web_optional_string_any(args, &["forSale", "for_sale"]) {
-        return match value.trim().to_ascii_lowercase().as_str() {
-            "free" => (Some(false), Some(true)),
-            "yes" | "true" | "1" | "share" => (Some(true), Some(false)),
-            _ => (Some(false), Some(false)),
-        };
+pub(in crate::api) fn web_share_free_access(args: &Value) -> Result<Option<bool>, ApiError> {
+    Ok(web_optional_bool(args, &["freeAccess", "free_access"]))
+}
+
+fn reject_retired_share_input_fields(args: &Value) -> Result<(), ApiError> {
+    if !args.is_object() {
+        return Err(ApiError::bad_request("share input must be an object"));
     }
-    if let Some(value) = web_optional_bool(args, &["forSale", "for_sale"]) {
-        return (Some(value), Some(false));
+    if let Some(field) = find_retired_share_field(args) {
+        return Err(ApiError::bad_request(format!(
+            "retired Share field `{field}` is not accepted; use freeAccess/userGrants"
+        )));
     }
-    (None, None)
+    Ok(())
 }
 
 pub(in crate::api) fn web_optional_auth_provider_type(
@@ -2517,6 +2499,19 @@ pub(in crate::api) fn deepseek_account_json(
 #[cfg(test)]
 mod managed_auth_provider_label_tests {
     use super::*;
+
+    #[test]
+    fn canonical_free_access_is_read_directly() {
+        assert_eq!(
+            web_share_free_access(&json!({ "freeAccess": true })).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            web_share_free_access(&json!({ "freeAccess": false })).unwrap(),
+            Some(false)
+        );
+        assert_eq!(web_share_free_access(&json!({})).unwrap(), None);
+    }
 
     #[test]
     fn agy_and_antigravity_keep_distinct_auth_provider_labels() {

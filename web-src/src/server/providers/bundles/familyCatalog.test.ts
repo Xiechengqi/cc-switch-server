@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import { familyById, providerRegistry } from "@/server/providerRegistry";
 import {
   FAMILY_GROUP_ORDER,
+  SUBSCRIPTION_FAMILY_IDS,
   familyAuthKind,
+  familyCategoryId,
   familyGroupId,
   familyIsExperimental,
   familySearchText,
@@ -21,18 +23,51 @@ describe("familyCatalog", () => {
     expect(recommendedFamily().familyId).toBe("family.claude_oauth");
   });
 
-  it("places every visible Family into exactly one group", () => {
-    const grouped = new Set(
-      groupFamilies(providerRegistry.families).flatMap((group) =>
-        group.families.map((family) => family.familyId),
-      ),
+  it("places every visible Family into exactly one of the two categories", () => {
+    const groups = groupFamilies(providerRegistry.families);
+    const groupedIds = groups.flatMap((group) =>
+      group.families.map((family) => family.familyId),
     );
-    expect([...grouped].sort()).toEqual(
+    expect(FAMILY_GROUP_ORDER).toEqual(["subscription", "api_key"]);
+    expect(new Set(groupedIds).size).toBe(groupedIds.length);
+    expect([...groupedIds].sort()).toEqual(
       [...providerRegistry.families.map((family) => family.familyId)].sort(),
     );
-    expect(FAMILY_GROUP_ORDER).toContain(
-      familyGroupId("family.custom_http"),
-    );
+    expect(
+      groups
+        .find((group) => group.groupId === "subscription")
+        ?.families.map((family) => family.familyId),
+    ).toEqual([...SUBSCRIPTION_FAMILY_IDS]);
+    expect(
+      groups
+        .find((group) => group.groupId === "api_key")
+        ?.families.map((family) => family.familyId),
+    ).toEqual([
+      "family.anthropic_api_key",
+      "family.deepseek_account",
+      "family.aws_bedrock_aksk",
+      "family.aws_bedrock_api_key",
+      "family.openrouter",
+      "family.nvidia",
+      "family.deepseek_api",
+      "family.openai_api_key",
+      "family.gemini_api_key",
+      "family.custom_http",
+    ]);
+    expect(familyCategoryId("family.custom_http")).toBe("api_key");
+    expect(familyGroupId("family.custom_http")).toBe("api_key");
+    expect(familyCategoryId("family.future_provider")).toBe("api_key");
+    const futureFamily = {
+      ...providerRegistry.families[0]!,
+      familyId: "family.future_provider",
+    };
+    expect(
+      groupFamilies([...providerRegistry.families, futureFamily])
+        .find((group) => group.groupId === "api_key")
+        ?.families.some(
+          (family) => family.familyId === "family.future_provider",
+        ),
+    ).toBe(true);
   });
 
   it("classifies auth, experimental maturity, and supported Apps", () => {
@@ -40,6 +75,10 @@ describe("familyCatalog", () => {
     expect(familyAuthKind(familyById("family.openrouter")!)).toBe("api_key");
     expect(familyAuthKind(familyById("family.aws_bedrock_aksk")!)).toBe("aws");
     expect(familyAuthKind(familyById("family.custom_http")!)).toBe("custom");
+    expect(familyCategoryId("family.cursor_api_key")).toBe("subscription");
+    expect(familyCategoryId("family.ollama_cloud")).toBe("subscription");
+    expect(familyCategoryId("family.kimi_coding_api_key")).toBe("subscription");
+    expect(familyCategoryId("family.deepseek_account")).toBe("api_key");
     expect(familyIsExperimental(familyById("family.cursor_oauth")!)).toBe(true);
     expect(familySupportedApps(familyById("family.openai_oauth")!)).toEqual([
       "claude",
@@ -49,7 +88,9 @@ describe("familyCatalog", () => {
 
   it("filters Families by search text and App", () => {
     const grok = filterFamilies(providerRegistry.families, "grok");
-    expect(grok.map((family) => family.familyId)).toEqual(["family.grok_oauth"]);
+    expect(grok.map((family) => family.familyId)).toEqual([
+      "family.grok_oauth",
+    ]);
     const codexOnly = filterFamilies(providerRegistry.families, "", "codex");
     expect(
       codexOnly.every((family) =>

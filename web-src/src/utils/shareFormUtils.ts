@@ -1,14 +1,5 @@
-import type {
-  PublicTokenMarket,
-  ShareAccessByApp,
-  ShareAppSettingsByApp,
-  ShareBindings,
-} from "@/lib/api";
+import type { ShareBindings } from "@/lib/api";
 import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
-import {
-  UNLIMITED_PARALLEL_LIMIT,
-  UNLIMITED_TOKEN_LIMIT,
-} from "@/utils/shareUtils";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -28,7 +19,7 @@ export function normalizeShareEmails(emails: string[]): string[] {
   );
 }
 
-export function buildShareUserGrantsForAcl({
+export function buildShareUserGrants({
   source,
   ownerEmail,
   aclEmails,
@@ -74,73 +65,10 @@ export function buildShareUserGrantsForAcl({
   return next;
 }
 
-export function formatMarketSelectLabel(market: PublicTokenMarket): string {
-  return market.displayName.replace(/^https?:\/\//i, "");
-}
-
 export function shareAppDisplayLabel(app: keyof ShareBindings): string {
   if (app === "claude") return "Claude";
   if (app === "codex") return "Codex";
   return "Gemini";
-}
-
-export interface BuildShareAclPayloadInput {
-  app: keyof ShareBindings;
-  forSale: "Yes" | "No" | "Free";
-  marketAccessMode: "selected" | "all";
-  shareToEmails: string[];
-  selectedTokenMarketEmails: string[];
-  tokenLimit: number;
-  parallelLimit: number;
-  expiresAt: string;
-}
-
-export function buildShareAclPayload({
-  app,
-  forSale,
-  marketAccessMode,
-  shareToEmails,
-  selectedTokenMarketEmails,
-  tokenLimit,
-  parallelLimit,
-  expiresAt,
-}: BuildShareAclPayloadInput): {
-  sharedWithEmails: string[];
-  marketAccessMode: "selected" | "all";
-  accessByApp: ShareAccessByApp;
-  appSettings: ShareAppSettingsByApp;
-} {
-  const marketEmails =
-    forSale !== "Yes"
-      ? []
-      : marketAccessMode === "all"
-        ? []
-        : selectedTokenMarketEmails;
-  const emails = normalizeShareEmails([...shareToEmails, ...marketEmails]);
-
-  const accessByApp: ShareAccessByApp = {
-    [app]: {
-      sharedWithEmails: emails,
-      marketAccessMode,
-    },
-  };
-  const appSettings: ShareAppSettingsByApp = {
-    [app]: {
-      forSale,
-      marketAccessMode,
-      sharedWithEmails: emails,
-      tokenLimit: tokenLimit ?? UNLIMITED_TOKEN_LIMIT,
-      parallelLimit: parallelLimit ?? UNLIMITED_PARALLEL_LIMIT,
-      expiresAt,
-    },
-  };
-
-  return {
-    sharedWithEmails: emails,
-    marketAccessMode,
-    accessByApp,
-    appSettings,
-  };
 }
 
 export const SHARE_EXPIRY_PRESETS = [

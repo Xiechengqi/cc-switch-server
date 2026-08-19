@@ -169,6 +169,13 @@ pub(crate) async fn control_apply_share_settings(
                     "currentShare": current_share,
                 })));
             }
+            crate::domain::sharing::shares::SharePatchError::GrantRevisionConflict { .. }
+            | crate::domain::sharing::shares::SharePatchError::UsageTargetBelowObserved {
+                ..
+            }
+            | crate::domain::sharing::shares::SharePatchError::ManagedGrantReadOnly(_) => {
+                return Err(ApiError::conflict_code(error.code(), error.to_string()));
+            }
             crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
                 return Err(ApiError::bad_request(message));
             }

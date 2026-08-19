@@ -53,12 +53,11 @@ RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 
 `RUN_TESTS=0` 仅用于负向审计：脚本会记录 `local-contracts-unverified`，输出 `decision=blocked` 并以状态码 `1` 退出；不得将其作为本地合同或发布验收通过证据。
 
-真实 router/market/provider 输入齐备后：
+真实 Router/Gateway/provider 输入齐备后：
 
 ```bash
 STRICT=1 scripts/smoke/real-acceptance-env-check.sh
-RUN_PROBES=1 STREAM_PROBE=1 scripts/smoke/direct-market-diagnostics.sh
-scripts/smoke/router-market-smoke.sh
+RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/router-share-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 scripts/smoke/oauth-readiness-check.sh
 node scripts/smoke/grok-oauth-real.mjs
@@ -99,6 +98,38 @@ Record only format, counts, blocker codes, key source category, short reference
 fingerprint, and pass/fail state. Never record an envelope, root key, or plaintext
 credential.
 
+## Share 配额手工修正验收
+
+以下步骤覆盖「已消耗 Token」两层修正：per-user grant 配额与 Share 总量。二者是
+不同层级，验收时必须分别确认，不能用其中一个的结果推断另一个。
+
+1. per-user：在供应商远程分享的「用户限制」中给某用户选择「每 7 天」并把周期开始
+   时间填成过去的某个 UTC 时间点（不得晚于当前时间，精确到分钟）。保存后确认返回的
+   `usageQuota.windowStartsAtMs` / `windowEndsAtMs` 与该锚点一致，且 `effectiveTokensUsed`
+   由历史请求重建而不是清零。
+2. per-user：把「已消耗 Token」设为高于观测值的数字并保存，确认 `usageRebase.targetTokens`
+   等于该值、`usageRebase.appliedBy` 记录的是当前已验证管理员邮箱、`usageQuota.manualOffsetTokens`
+   等于 `effective - observed`。随后发起一次真实请求，确认新增量是**累加**在该基线上。
+3. per-user：把目标值填成低于观测历史的数字，必须被 `cc_switch_share_usage_target_below_observed`
+   拒绝；并发编辑同一 grant 必须出现 `cc_switch_share_user_grant_revision_conflict`；
+   Router Share Market 托管的 grant 必须返回 `cc_switch_share_market_grant_read_only`。
+4. per-user：等待或人为跨过一个固定周期边界后刷新，确认旧基线不再生效
+   （`usageQuota.rebaseApplies` 为 false 且 `manualOffsetTokens` 归零），配额不会被上个
+   周期的修正继续压制。
+5. Share 总量：在同一个已存在的 Share 上编辑「已消耗 Token」总量。它与 per-user 配额
+   相互独立——Share 总量是纯累加器，永远不从 Usage 历史重建，因此这里是**直接赋值**。
+   确认未触碰该字段的保存不会覆盖期间产生的真实消耗。
+6. Share 总量：把总量设到 Token 限额之上，确认 Share 变为 `exhausted` 且被禁用；再设回
+   限额之下，确认状态回到 `paused` 且**仍然是禁用**，必须由操作者显式恢复。
+7. 重置：对该 Share 执行 reset usage，确认每个 grant 的派生快照与操作者基线一并清除；
+   之后的请求或刷新都不得让旧基线复活。
+8. Provider 官方配额（Accounts/OAuth 上游订阅与限流状态）是**外部数据**，Server 无法
+   rebase，也不提供本地修改入口。验收只确认它可以从上游刷新并如实展示；任何"看起来
+   可以改"的入口都属于缺陷。
+
+以上每一步都需要真实 Router/Share/请求输入。缺少真实输入时只能记录本地验证结果，
+不得标记为真实通过。
+
 ## 必需变量
 
 ### server 基础
@@ -110,18 +141,15 @@ credential.
 | `CC_SWITCH_IMAGE_STORE_DIR` | 多副本共享的 durable capability 目录；必须支持跨进程锁与 atomic rename | 只记录挂载类别，不记录宿主机敏感路径 |
 | `CC_SWITCH_CODEX_IMAGES_SMOKE` | `1` 时显式允许付费的 4K Images/Responses 探针 | 可完整记录 |
 
-### router/market public probe
+### Router/Gateway public probe
 
 | 变量 | 用途 | 记录方式 |
 | --- | --- | --- |
 | `ROUTER_BASE_URL` | 真实 router base | 可完整记录 |
-| `ROUTER_API_TOKEN` | Router Share URL 和 market API URL 的调用 token | 只记录 prefix |
+| `ROUTER_API_TOKEN` | Router Share/Gateway API 的调用 token | 只记录 prefix |
 | `ROUTER_API_TOKEN_HEADER` | `Authorization`、`x-api-key` 或 `x-goog-api-key` | 可完整记录 |
 | `CC_SWITCH_SHARE_URL` | 同时承载 Claude/Codex/Gemini 协议的 Router Share URL，不带 API path | 可完整记录 |
 | `SHARE_ID` | server 本地 share id | 可完整记录 |
-| `MARKET_API_URL` | market API base，不带 `/v1/responses` | 可完整记录 |
-| `MARKET_API_TOKEN` | market 专用用户 API key，可选 | 不记录明文 |
-| `MARKET_API_TOKEN_HEADER` | market 专用 header，可选 | 可完整记录 |
 | `PROBE_MODEL` | 低成本 probe 模型，默认 `probe` | 可完整记录 |
 | `STREAM_PROBE` | `1` 时执行短 stream probe | 可完整记录 |
 | `REQUIRE_STREAM_USAGE` | `1` 时 stream 摘要必须看到 usage 字段才算通过 | 可完整记录 |
@@ -173,7 +201,7 @@ OAuth refresh fixture 的最小验收顺序：
 2. 执行账号手动 refresh，记录状态码、脱敏账号，并确认 token 轮换成功后 `lastRefreshError` 为空；profile/quota enrichment 通过独立 quota refresh 验收。
 3. 绑定 provider 到该账号，清空或过期 access token 后发起本地 share 短请求，确认 proxy 转发前自动 refresh。
 4. 再跑同一 provider 的 non-stream 和 stream 短请求，记录 requestId、status、actualModel、usage 摘要。
-5. Router Share/market 入口只记录 URL、状态码、requestId 和脱敏账号，不记录 provider raw response。
+5. Router Share/Gateway 入口只记录 URL、状态码、requestId 和脱敏账号，不记录 provider raw response。
 
 Codex OAuth 专项补充：
 
@@ -250,15 +278,14 @@ Claude OAuth 专项补充：
 26. 20x 已有本地 `default_claude_max_20x` fixture 证据，但仍需真实账号确认当前 Anthropic 响应。5x 当前只有同形 `..._5x` 解析规则，没有 checked-in 真实 fixture；在 5x 账号和脱敏响应证据齐备前，release evidence 必须写 `blocked-inputs` 或 `SKIP`，不得写 live passed。
 27. 真实专项账号缺少任一个时，脚本会为对应等级输出独立 `[SKIP]`；只运行本地 resolver/API/UI 测试并将该等级标为未验收。不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。Share、5x、20x 三个 gate 的 SKIP/FAIL/PASS 必须分别记录，不能用其中一个 PASS 覆盖其他 gate 的缺失输入。
 
-Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Market 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-market-acceptance.md)。
+Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-market-acceptance.md)。
 
 ## 脱敏 Evidence
 
 以下脚本支持 `EVIDENCE_FILE=/tmp/...json`，只写脱敏摘要：
 
 - `scripts/smoke/real-acceptance-env-check.sh`
-- `scripts/smoke/router-market-smoke.sh`
-- `scripts/smoke/direct-market-diagnostics.sh`
+- `scripts/smoke/router-share-smoke.sh`
 - `scripts/smoke/code-agent-regression.sh`
 - `scripts/smoke/oauth-readiness-check.sh`
 - `scripts/smoke/grok-oauth-real.mjs`

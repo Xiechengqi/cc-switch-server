@@ -21,13 +21,13 @@ import { toast } from "sonner";
 import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
-import { MarketSelectorField } from "@/components/providers/ProviderShareSection";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
 import { CodexReferralPanel } from "@/components/providers/forms/CodexReferralPanel";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Collapsible,
   CollapsibleContent,
@@ -44,7 +44,6 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { EmailTagsInput } from "@/components/ui/tags-input";
 import { Textarea } from "@/components/ui/textarea";
 import type {
   ProviderBundleView,
@@ -64,7 +63,6 @@ import {
   useClientTunnelQuery,
   useManagedAccountsQuery,
   useSharesQuery,
-  useTokenMarketsQuery,
 } from "@/lib/query";
 import {
   customPolicyForProfile,
@@ -88,10 +86,9 @@ import {
 import { SecretInput } from "@/server/ui/SecretInput";
 import { cn } from "@/lib/utils";
 import {
-  buildShareUserGrantsForAcl,
+  buildShareUserGrants,
   isValidShareEmail,
   SHARE_TOKEN_PRESETS,
-  uniqueSortedEmails,
 } from "@/utils/shareFormUtils";
 import { DEFAULT_PARALLEL_LIMIT } from "@/utils/shareUtils";
 import {
@@ -135,6 +132,14 @@ import {
 } from "./bundleValidation";
 import { preferredManagedAccount, recommendedFamily } from "./familyCatalog";
 import { FamilyPicker } from "./FamilyPicker";
+import {
+  canVisitCreateStep,
+  CREATE_STEPS,
+  nextCreateStep,
+  previousCreateStep,
+  unlockCreateStep,
+  type CreateStep,
+} from "./createStepNavigation";
 
 interface ProviderBundleEditorProps {
   bundle?: ProviderBundleView;
@@ -144,9 +149,6 @@ interface ProviderBundleEditorProps {
   onSaved: (bundle: ProviderBundleView) => void;
   onOpenShareSettings?: () => void;
 }
-
-type CreateStep = "family" | "supply" | "share";
-const CREATE_STEPS: CreateStep[] = ["family", "supply", "share"];
 
 function fieldErrorClass(invalid: boolean): string {
   return invalid ? "border-destructive focus-visible:ring-destructive" : "";
@@ -736,25 +738,19 @@ function BundleShareEditor({
   draft,
   onChange,
   ownerEmail,
+  shareExists,
   shareUrl,
   onOpenShareSettings,
 }: {
   draft: ProviderBundleShareDraft;
   onChange: (draft: ProviderBundleShareDraft) => void;
   ownerEmail: string;
+  /** The consumed-token correction only applies to an already created Share. */
+  shareExists: boolean;
   shareUrl?: string | null;
   onOpenShareSettings?: () => void;
 }) {
   const { t } = useTranslation();
-  const [marketSelectKey, setMarketSelectKey] = useState(0);
-  const marketsQuery = useTokenMarketsQuery(
-    draft.enabled && draft.forSale === "Yes",
-  );
-  const markets = marketsQuery.data ?? [];
-  const marketEmails = useMemo(
-    () => new Set(markets.map((market) => market.email.trim().toLowerCase())),
-    [markets],
-  );
   const routerManagedEmails = useMemo(
     () =>
       new Set(
@@ -767,34 +763,9 @@ function BundleShareEditor({
       ),
     [draft.userGrants],
   );
-  const selectedMarketEmails = useMemo(
-    () =>
-      draft.marketAccessMode === "selected"
-        ? draft.sharedWithEmails.filter(
-            (email) =>
-              marketEmails.has(email.toLowerCase()) &&
-              !routerManagedEmails.has(email.toLowerCase()),
-          )
-        : [],
-    [
-      draft.marketAccessMode,
-      draft.sharedWithEmails,
-      marketEmails,
-      routerManagedEmails,
-    ],
-  );
   const protectedGrantEmails = useMemo(
-    () => new Set([...selectedMarketEmails, ...routerManagedEmails]),
-    [routerManagedEmails, selectedMarketEmails],
-  );
-  const directEmails = useMemo(
-    () =>
-      draft.sharedWithEmails.filter(
-        (email) =>
-          !marketEmails.has(email.toLowerCase()) &&
-          !routerManagedEmails.has(email.toLowerCase()),
-      ),
-    [draft.sharedWithEmails, marketEmails, routerManagedEmails],
+    () => routerManagedEmails,
+    [routerManagedEmails],
   );
   const normalizedOwnerEmail = ownerEmail.trim().toLowerCase();
   const defaultUserPolicy = useMemo(
@@ -803,15 +774,16 @@ function BundleShareEditor({
   );
   const displayedUserGrants = useMemo(
     () =>
-      buildShareUserGrantsForAcl({
+      buildShareUserGrants({
         source: draft.userGrants,
         ownerEmail: normalizedOwnerEmail,
-        aclEmails: draft.sharedWithEmails,
+        aclEmails: Object.values(draft.userGrants)
+          .filter((grant) => grant.active !== false && grant.role === "shareto")
+          .map((grant) => grant.email),
         defaultPolicy: defaultUserPolicy,
       }),
     [
       defaultUserPolicy,
-      draft.sharedWithEmails,
       draft.userGrants,
       normalizedOwnerEmail,
     ],
@@ -819,60 +791,15 @@ function BundleShareEditor({
   const slugInvalid = Boolean(
     draft.subdomain.trim() && !isValidShareSlug(draft.subdomain),
   );
-  const directEmailInvalid = directEmails.some(
-    (email) => !isValidShareEmail(email),
-  );
-  const marketsError =
-    marketsQuery.error instanceof Error
-      ? marketsQuery.error.message
-      : marketsQuery.error
-        ? String(marketsQuery.error)
-        : undefined;
-
-  const updateAccessEmails = (
-    emails: string[],
-    patch: Partial<ProviderBundleShareDraft> = {},
-  ) => {
-    const normalizedEmails = uniqueSortedEmails(
-      emails.map((email) => email.trim().toLowerCase()).filter(Boolean),
-    );
-    const sourceGrants = patch.userGrants ?? draft.userGrants;
-    onChange({
-      ...draft,
-      ...patch,
-      sharedWithEmails: normalizedEmails,
-      userGrants: buildShareUserGrantsForAcl({
-        source: sourceGrants,
-        ownerEmail: normalizedOwnerEmail,
-        aclEmails: normalizedEmails,
-        defaultPolicy: defaultUserPolicy,
-      }),
-    });
-  };
-
-  const updateDirectEmails = (emails: string[]) =>
-    updateAccessEmails([...emails, ...selectedMarketEmails]);
-
-  const updateMarketEmails = (emails: string[]) =>
-    updateAccessEmails([...directEmails, ...emails], {
-      marketAccessMode: "selected",
-    });
-
   const updateUserGrants = (
     userGrants: ProviderBundleShareDraft["userGrants"],
   ) => {
-    const sharedWithEmails = uniqueSortedEmails(
-      Object.values(userGrants)
-        .filter(
-          (grant) =>
-            grant.active !== false &&
-            grant.role === "shareto" &&
-            grant.manager !== "routerShareMarket",
-        )
-        .map((grant) => grant.email.trim().toLowerCase())
-        .filter(Boolean),
-    );
-    onChange({ ...draft, sharedWithEmails, userGrants });
+    onChange({ ...draft, userGrants });
+  };
+  const updateUserUsageEdits = (
+    userUsageEdits: ProviderBundleShareDraft["userUsageEdits"],
+  ) => {
+    onChange({ ...draft, userUsageEdits });
   };
 
   return (
@@ -957,35 +884,29 @@ function BundleShareEditor({
             ) : null}
           </div>
           <div className="space-y-2">
-            <Label>
-              {t("provider.share.forSale", { defaultValue: "访问模式" })}
-            </Label>
-            <Select
-              value={draft.forSale}
-              onValueChange={(forSale) => {
-                const next = forSale as ProviderBundleShareDraft["forSale"];
-                if (next === "Yes") {
-                  onChange({ ...draft, forSale: next });
-                  return;
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="bundle-share-free-access"
+                checked={draft.freeAccess}
+                onCheckedChange={(checked) =>
+                  onChange({ ...draft, freeAccess: checked === true })
                 }
-                updateAccessEmails(directEmails, { forSale: next });
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="No">
-                  {t("provider.share.private", { defaultValue: "私有" })}
-                </SelectItem>
-                <SelectItem value="Free">
-                  {t("provider.share.free", { defaultValue: "免费" })}
-                </SelectItem>
-                <SelectItem value="Yes">
-                  {t("provider.share.market", { defaultValue: "市场" })}
-                </SelectItem>
-              </SelectContent>
-            </Select>
+              />
+              <Label
+                htmlFor="bundle-share-free-access"
+                className="cursor-pointer font-normal"
+              >
+                {t("share.freeAccess.label", {
+                  defaultValue: "公开免费使用",
+                })}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("share.freeAccess.hint", {
+                defaultValue:
+                  "默认私有。勾选后，任意已登录 Router 用户可免费调用；下方授权用户仍可设置个人配额。",
+              })}
+            </p>
           </div>
           <div className="space-y-2 md:col-span-2">
             <Label>
@@ -998,55 +919,13 @@ function BundleShareEditor({
               }
             />
           </div>
-          <div className="space-y-2 md:col-span-2">
-            <Label htmlFor="bundle-share-authorized-emails">
-              {t("provider.share.sharedWith", { defaultValue: "授权邮箱" })}
-            </Label>
-            <EmailTagsInput
-              inputId="bundle-share-authorized-emails"
-              value={directEmails}
-              invalid={directEmailInvalid}
-              placeholder={t("share.sharedWithEmails", {
-                defaultValue: "输入邮箱后按 Enter 添加",
-              })}
-              onChange={updateDirectEmails}
-            />
-            {directEmailInvalid ? (
-              <p className="text-xs text-destructive">
-                {t("share.validation.invalidEmail", {
-                  defaultValue: "邮箱格式无效",
-                })}
-              </p>
-            ) : null}
-          </div>
-          {draft.forSale === "Yes" ? (
-            <MarketSelectorField
-              markets={markets}
-              marketAccessMode={draft.marketAccessMode}
-              selectedMarketEmails={selectedMarketEmails}
-              marketSelectKey={marketSelectKey}
-              disabled={marketsQuery.isLoading || marketsQuery.isError}
-              marketsLoading={marketsQuery.isLoading}
-              marketsError={marketsError}
-              onRetryMarkets={() => void marketsQuery.refetch()}
-              onMarketAccessModeChange={(marketAccessMode) => {
-                if (marketAccessMode === "all") {
-                  updateAccessEmails(directEmails, { marketAccessMode });
-                  return;
-                }
-                updateAccessEmails([...directEmails, ...selectedMarketEmails], {
-                  marketAccessMode,
-                });
-              }}
-              onSelectedMarketEmailsChange={updateMarketEmails}
-              onMarketSelectKeyChange={setMarketSelectKey}
-            />
-          ) : null}
           <ShareUserGrantsEditor
             value={displayedUserGrants}
             ownerEmail={normalizedOwnerEmail}
             defaultPolicy={defaultUserPolicy}
             protectedEmails={protectedGrantEmails}
+            usageEdits={draft.userUsageEdits}
+            onUsageEditsChange={updateUserUsageEdits}
             onChange={updateUserGrants}
           />
           <div className="grid gap-4 md:col-span-2 md:grid-cols-3">
@@ -1092,10 +971,29 @@ function BundleShareEditor({
                   </Button>
                 ))}
               </div>
+              {shareExists ? (
+                <div className="space-y-1.5 pt-1">
+                  <Label>{t("share.totalUsageEdit.label")}</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={draft.tokensUsed}
+                    onChange={(event) =>
+                      onChange({ ...draft, tokensUsed: event.target.value })
+                    }
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t("share.totalUsageEdit.hint")}
+                  </p>
+                </div>
+              ) : null}
             </div>
             <div className="space-y-2">
               <Label>
-                {t("provider.share.parallelLimit", { defaultValue: "并发限额" })}
+                {t("provider.share.parallelLimit", {
+                  defaultValue: "并发限额",
+                })}
               </Label>
               <Input
                 type="number"
@@ -1202,6 +1100,9 @@ export function ProviderBundleEditor({
   );
   const [createStep, setCreateStep] = useState<CreateStep>(
     persisted ? "supply" : "family",
+  );
+  const [highestCreateStep, setHighestCreateStep] = useState<CreateStep>(
+    persisted ? "share" : "family",
   );
   const [validation, setValidation] = useState<BundleValidationIssue | null>(
     null,
@@ -1446,6 +1347,8 @@ export function ProviderBundleEditor({
     setActiveApp(nextDraft.surfaces[0]?.app ?? "claude");
     setShareDraft(createBundleShareDraft());
     setValidation(null);
+    setCreateStep("family");
+    setHighestCreateStep("family");
   };
 
   const changeFamily = (familyId: string) => {
@@ -1466,15 +1369,30 @@ export function ProviderBundleEditor({
   const focusIssue = (issue: BundleValidationIssue) => {
     if (issue.surface) setActiveApp(issue.surface);
     if (!persisted) {
-      setCreateStep(
-        issue.field === "family" ? "family" : "supply",
-      );
+      setCreateStep(issue.field === "family" ? "family" : "supply");
     }
     requestAnimationFrame(() => {
       document
         .getElementById(bundleValidationFieldId(issue))
         ?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
+  };
+
+  const selectCreateStep = (step: CreateStep) => {
+    if (!canVisitCreateStep(step, highestCreateStep)) return;
+    setCreateStep(step);
+  };
+
+  const advanceCreateStep = () => {
+    const next = nextCreateStep(createStep);
+    if (!next) return;
+    setHighestCreateStep((current) => unlockCreateStep(current, next));
+    setCreateStep(next);
+  };
+
+  const retreatCreateStep = () => {
+    const previous = previousCreateStep(createStep);
+    if (previous) setCreateStep(previous);
   };
 
   const retryCredentialReveal = async (slot: string) => {
@@ -1555,7 +1473,9 @@ export function ProviderBundleEditor({
       return;
     }
     if (
-      shareDraft.sharedWithEmails.some((email) => !isValidShareEmail(email))
+      Object.values(shareDraft.userGrants).some(
+        (grant) => !isValidShareEmail(grant.email),
+      )
     ) {
       if (!persisted) setCreateStep("share");
       toast.error(
@@ -1646,24 +1566,38 @@ export function ProviderBundleEditor({
       </div>
 
       {!persisted ? (
-        <div className="grid grid-cols-3 gap-2">
+        <div
+          role="tablist"
+          aria-label={t("providerBundle.stepNavigation", {
+            defaultValue: "Provider creation steps",
+          })}
+          className="grid grid-cols-3 gap-2"
+        >
           {CREATE_STEPS.map((step, index) => (
             <button
               key={step}
+              id={`bundle-tab-${step}`}
               type="button"
+              role="tab"
+              aria-selected={createStep === step}
+              aria-controls={`bundle-section-${step}`}
+              aria-disabled={!canVisitCreateStep(step, highestCreateStep)}
+              disabled={!canVisitCreateStep(step, highestCreateStep)}
               className={cn(
-                "rounded-md border px-3 py-2 text-left text-xs font-medium sm:text-sm",
+                "min-w-0 rounded-md border px-2 py-2 text-center text-xs font-medium sm:px-3 sm:text-sm",
                 createStep === step
                   ? "border-primary bg-primary/5 text-foreground"
                   : "border-border text-muted-foreground",
+                !canVisitCreateStep(step, highestCreateStep) &&
+                  "cursor-not-allowed opacity-50",
               )}
-              onClick={() => setCreateStep(step)}
+              onClick={() => selectCreateStep(step)}
             >
               {index + 1}.{" "}
               {step === "family"
                 ? t("providerBundle.stepFamily", { defaultValue: "选择类型" })
                 : step === "supply"
-                  ? t("providerBundle.stepSupply", { defaultValue: "完成供给" })
+                  ? t("providerBundle.stepSupply", { defaultValue: "配置" })
                   : t("providerBundle.stepShare", { defaultValue: "远程分享" })}
             </button>
           ))}
@@ -1672,8 +1606,14 @@ export function ProviderBundleEditor({
         <div className="flex flex-wrap gap-2 text-xs">
           {(
             [
-              ["supply", t("providerBundle.stepSupply", { defaultValue: "供给" })],
-              ["share", t("providerBundle.stepShare", { defaultValue: "远程分享" })],
+              [
+                "supply",
+                t("providerBundle.stepSupply", { defaultValue: "配置" }),
+              ],
+              [
+                "share",
+                t("providerBundle.stepShare", { defaultValue: "远程分享" }),
+              ],
             ] as const
           ).map(([section, label]) => (
             <Button
@@ -1695,751 +1635,800 @@ export function ProviderBundleEditor({
 
       <div className="space-y-6">
         {showFamilyStep ? (
-          <Section
-            title={t("providerBundle.family", { defaultValue: "供应商类型" })}
+          <div
+            id="bundle-section-family"
+            role="tabpanel"
+            aria-labelledby="bundle-tab-family"
           >
-            <FamilyPicker
-              selectedFamilyId={draft.familyId}
-              onSelect={changeFamily}
-              onAutoSelect={applyFamily}
-            />
-          </Section>
+            <Section
+              title={t("providerBundle.family", { defaultValue: "供应商类型" })}
+            >
+              <FamilyPicker
+                selectedFamilyId={draft.familyId}
+                onSelect={changeFamily}
+                onAutoSelect={applyFamily}
+              />
+            </Section>
+          </div>
         ) : null}
 
         {showSupplyStep ? (
-          <div id="bundle-section-supply" className="space-y-6">
-        <Section
-          title={t("providerBundle.basic", { defaultValue: "基本信息" })}
-        >
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2 md:col-span-2">
-              <div className="flex items-center justify-center">
-                <ProviderIconControl
-                  icon={draft.icon}
-                  iconColor={draft.iconColor}
-                  providerName={draft.name}
-                  onChange={(icon, iconColor) =>
-                    setDraft((current) => ({
-                      ...current,
-                      icon,
-                      iconColor,
-                    }))
-                  }
-                />
-              </div>
-              {persisted ? (
-                <p className="text-center text-sm text-muted-foreground">
-                  {family.label}
-                </p>
-              ) : null}
-              {duplicate ? (
-                <p className="text-center text-sm text-muted-foreground">
-                  {t("providerBundle.duplicateSecretsCleared", {
-                    defaultValue: "Credentials are not copied. Enter them again before saving.",
-                  })}
-                </p>
-              ) : null}
-            </div>
-            {customRecipes.length ? (
-              <div className="space-y-2 md:col-span-2">
-                <Label>{t("providerBundle.quickPreset")}</Label>
-                <Select
-                  value={activeCustomRecipe?.recipeId ?? ""}
-                  onValueChange={(recipeId) => {
-                    const recipe = customRecipes.find(
-                      (candidate) => candidate.recipeId === recipeId,
-                    );
-                    if (!recipe) return;
-                    setDraft((current) =>
-                      applyCustomRecipeToBundleDraft(current, recipe),
-                    );
-                    const recipeProfile = profileById(recipe.profileId);
-                    if (recipeProfile) setActiveApp(recipeProfile.app);
-                  }}
-                >
-                  <SelectTrigger>
-                    <SelectValue
-                      placeholder={t("providerBundle.manualConfiguration")}
-                    />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {customRecipes.map((recipe) => (
-                      <SelectItem key={recipe.recipeId} value={recipe.recipeId}>
-                        {t(recipe.labelKey, { defaultValue: recipe.label })}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : null}
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.basic.name")}</Label>
-              <Input
-                id={bundleValidationFieldId({
-                  code: "nameRequired",
-                  field: "name",
-                  message: "",
-                })}
-                value={draft.name}
-                className={cn(
-                  fieldErrorClass(
-                    matchesBundleValidationIssue(validation, "name"),
-                  ),
-                  !identityEditable &&
-                    "cursor-default bg-muted/40 text-muted-foreground",
-                )}
-                readOnly={!identityEditable}
-                onChange={(event) =>
-                  identityEditable &&
-                  setDraft({ ...draft, name: event.target.value })
-                }
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.basic.website")}</Label>
-              <Input
-                type="url"
-                value={draft.websiteUrl}
-                readOnly={!identityEditable}
-                className={cn(
-                  !identityEditable &&
-                    "cursor-default bg-muted/40 text-muted-foreground",
-                )}
-                onChange={(event) =>
-                  identityEditable &&
-                  setDraft({ ...draft, websiteUrl: event.target.value })
-                }
-              />
-            </div>
-            <div className="space-y-2 md:col-span-2">
-              <Label>{t("serverProviderForm.basic.notes")}</Label>
-              <Textarea
-                rows={2}
-                value={draft.notes}
-                onChange={(event) =>
-                  setDraft({ ...draft, notes: event.target.value })
-                }
-              />
-            </div>
-          </div>
-        </Section>
-
-        {credentialProfile?.credentialPolicy.mode === "managed_account" ? (
-          <Section
-            title={t("providerBundle.account", { defaultValue: "OAuth 账号" })}
-            icon={<KeyRound className="h-4 w-4" />}
+          <div
+            id="bundle-section-supply"
+            role="tabpanel"
+            aria-labelledby="bundle-tab-supply"
+            className="space-y-6"
           >
-            <div
-              id={bundleValidationFieldId({
-                code: "accountRequired",
-                field: "account",
-                message: "",
-              })}
-              className={cn(
-                matchesBundleValidationIssue(validation, "account") &&
-                  "rounded-md border border-destructive p-3",
-              )}
+            <Section
+              title={t("providerBundle.basic", { defaultValue: "基本信息" })}
             >
-            <ManagedAccountSection
-              providerType={
-                credentialProfile.credentialPolicy.accountProviderType
-              }
-              selectedAccountId={draft.accountId || null}
-              onAccountSelect={(accountId) => {
-                const account = accounts.find((item) => item.id === accountId);
-                setDraft((current) => ({
-                  ...current,
-                  accountId: accountId ?? "",
-                  accountGeneration: account?.authIdentityGeneration,
-                }));
-              }}
-            />
-            {matchesBundleValidationIssue(validation, "account") &&
-            validation ? (
-              <p className="mt-2 text-xs text-destructive">
-                {validationMessage(validation)}
-              </p>
-            ) : null}
-            </div>
-          </Section>
-        ) : null}
-
-        {familyCredentialSlots(family).length ? (
-          <Section
-            title={t("providerBundle.credential", { defaultValue: "共享凭据" })}
-            icon={<KeyRound className="h-4 w-4" />}
-          >
-            <div className="grid gap-4 md:grid-cols-2">
-              {familyCredentialSlots(family).map(({ logical, pointer }) => {
-                const actualPointer =
-                  Object.keys(draft.secrets).find(
-                    (slot) =>
-                      slot === pointer ||
-                      slot.endsWith(pointer.slice(pointer.lastIndexOf("/"))),
-                  ) ?? pointer;
-                const secret = draft.secrets[actualPointer] ?? {
-                  configured: false,
-                  value: "",
-                  clear: false,
-                };
-                const edit = credentialEditForBundleSecret(
-                  actualPointer,
-                  secret,
-                );
-                const revealedValue = revealedCredentialValues[actualPointer];
-                const revealStatus =
-                  credentialRevealStatuses[actualPointer] ?? "idle";
-                const value = credentialInputValue(edit, revealedValue);
-                const loadingCurrent =
-                  edit.configured &&
-                  edit.action === "keep" &&
-                  revealStatus === "loading";
-                const currentRevealFailed =
-                  edit.configured &&
-                  edit.action === "keep" &&
-                  revealStatus === "error";
-                return (
-                  <div key={logical} className="space-y-2">
-                    <div className="flex min-h-6 items-center justify-between gap-2">
-                      <Label>{fieldLabel(logical)}</Label>
-                      {loadingCurrent ? (
-                        <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
-                      ) : currentRevealFailed ? (
-                        <Button
-                          type="button"
-                          size="icon"
-                          variant="ghost"
-                          className="h-6 w-6"
-                          title={t("common.retry")}
-                          aria-label={t("common.retry")}
-                          onClick={() =>
-                            void retryCredentialReveal(actualPointer)
-                          }
-                        >
-                          <RefreshCw className="h-3.5 w-3.5" />
-                        </Button>
-                      ) : null}
-                    </div>
-                    <SecretInput
-                      id={bundleValidationFieldId({
-                        code: "credentialRequired",
-                        field: "credential",
-                        message: "",
-                      })}
-                      className={fieldErrorClass(
-                        matchesBundleValidationIssue(validation, "credential"),
-                      )}
-                      value={value}
-                      disabled={loadingCurrent || edit.action === "clear"}
-                      autoComplete="new-password"
-                      placeholder={
-                        loadingCurrent
-                          ? t("serverProviderForm.credentials.loading")
-                          : currentRevealFailed
-                            ? t(
-                                "serverProviderForm.credentials.loadFailedPlaceholder",
-                              )
-                            : t("serverProviderForm.credentials.placeholder")
-                      }
-                      onChange={(event) => {
-                        const next = updateCredentialInput(
-                          edit,
-                          event.target.value,
-                          {
-                            optional: logical === "session_token",
-                            revealedValue,
-                            revealStatus,
-                          },
-                        );
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2 md:col-span-2">
+                  <div className="flex items-center justify-center">
+                    <ProviderIconControl
+                      icon={draft.icon}
+                      iconColor={draft.iconColor}
+                      providerName={draft.name}
+                      onChange={(icon, iconColor) =>
                         setDraft((current) => ({
                           ...current,
-                          secrets: {
-                            ...current.secrets,
-                            [actualPointer]:
-                              bundleSecretFromCredentialEdit(next),
-                          },
-                        }));
-                      }}
-                    />
-                    {currentRevealFailed ? (
-                      <p className="text-xs text-destructive">
-                        {t("serverProviderForm.credentials.loadFailed")}
-                      </p>
-                    ) : null}
-                  </div>
-                );
-              })}
-              {credentialProfile?.formComposition === "aws" ? (
-                <div className="space-y-2">
-                  <Label>AWS Region</Label>
-                  <Input
-                    id={bundleValidationFieldId({
-                      code: "awsRegionRequired",
-                      field: "awsRegion",
-                      message: "",
-                    })}
-                    className={fieldErrorClass(
-                      matchesBundleValidationIssue(validation, "awsRegion"),
-                    )}
-                    value={draft.awsRegion}
-                    onChange={(event) =>
-                      setDraft({ ...draft, awsRegion: event.target.value })
-                    }
-                  />
-                </div>
-              ) : null}
-            </div>
-          </Section>
-        ) : null}
-
-        <Section title={t("serverProviderForm.model.title")}>
-          <div className="max-w-xl space-y-4">
-            <p className="text-sm text-muted-foreground">
-              {t("providerBundle.modelScopeHint", {
-                defaultValue:
-                  "Global uses one upstream model for every configurable App. Per App lets each Surface keep its own model.",
-              })}
-            </p>
-            <div className="space-y-2">
-              <Label>{t("providerBundle.modelScope")}</Label>
-              {perAppModelPolicyRequired ? (
-                <Badge variant="secondary">
-                  {t("providerBundle.modelScopePerApp")}
-                </Badge>
-              ) : perAppModelPolicySupported ? (
-                <Tabs
-                  value={draft.modelPolicyScope}
-                  onValueChange={(value) => {
-                    if (value !== "global" && value !== "per_app") return;
-                    if (
-                      value === "global" &&
-                      draft.modelPolicyScope === "per_app" &&
-                      perAppModelPoliciesDiffer(draft)
-                    ) {
-                      setModelScopeConfirmOpen(true);
-                      return;
-                    }
-                    setDraft((current) =>
-                      changeModelPolicyScope(current, value),
-                    );
-                  }}
-                >
-                  <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
-                    <TabsTrigger value="global" className="rounded-sm">
-                      {t("providerBundle.modelScopeGlobal")}
-                    </TabsTrigger>
-                    <TabsTrigger value="per_app" className="rounded-sm">
-                      {t("providerBundle.modelScopePerApp")}
-                    </TabsTrigger>
-                  </TabsList>
-                </Tabs>
-              ) : (
-                <Badge variant="secondary">
-                  {t("providerBundle.modelScopeGlobal")}
-                </Badge>
-              )}
-            </div>
-
-            {draft.modelPolicyScope === "global" ? (
-              <>
-                <div className="space-y-2">
-                  {allowedModelPolicies.length > 1 ? (
-                    <Tabs
-                      value={draft.modelPolicy}
-                      onValueChange={(value) => {
-                        if (value !== "single" && value !== "passthrough")
-                          return;
-                        if (!allowedModelPolicies.includes(value)) return;
-                        setDraft((current) =>
-                          updateBundleModel(
-                            current,
-                            value,
-                            value === "single" && !current.upstreamModel.trim()
-                              ? defaultSharedModel
-                              : current.upstreamModel,
-                          ),
-                        );
-                      }}
-                    >
-                      <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
-                        {allowedModelPolicies.map((policy) => (
-                          <TabsTrigger
-                            key={policy}
-                            value={policy}
-                            className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground"
-                          >
-                            {policy === "single" ? (
-                              <Target className="hidden h-4 w-4 shrink-0 sm:block" />
-                            ) : (
-                              <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
-                            )}
-                            {policy === "single"
-                              ? t("providerBundle.modelSingle")
-                              : t("providerBundle.modelPassthrough")}
-                          </TabsTrigger>
-                        ))}
-                      </TabsList>
-                    </Tabs>
-                  ) : (
-                    <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
-                      {draft.modelPolicy === "single" ? (
-                        <Target className="h-4 w-4" />
-                      ) : (
-                        <ArrowRightLeft className="h-4 w-4" />
-                      )}
-                      {draft.modelPolicy === "single"
-                        ? t("providerBundle.modelSingle")
-                        : t("providerBundle.modelPassthrough")}
-                    </div>
-                  )}
-                </div>
-                {draft.modelPolicy === "single" ? (
-                  <div className="space-y-2">
-                    <Label htmlFor="provider-bundle-model">
-                      {t("serverProviderForm.model.upstreamModel")}
-                    </Label>
-                    <Input
-                      id={bundleValidationFieldId({
-                        code: "upstreamModelRequired",
-                        field: "upstreamModel",
-                        message: "",
-                      })}
-                      className={fieldErrorClass(
-                        matchesBundleValidationIssue(
-                          validation,
-                          "upstreamModel",
-                        ),
-                      )}
-                      value={draft.upstreamModel}
-                      onChange={(event) =>
-                        setDraft((current) =>
-                          updateBundleModel(
-                            current,
-                            current.modelPolicy,
-                            event.target.value,
-                          ),
-                        )
-                      }
-                    />
-                  </div>
-                ) : null}
-                {fixedModelSurfaces.length ? (
-                  <div className="grid gap-2 border-t pt-3 text-sm">
-                    {fixedModelSurfaces.map((surface) => (
-                      <div
-                        key={surface.app}
-                        className="flex min-w-0 items-center gap-2"
-                      >
-                        <span className="shrink-0 font-medium">
-                          {APP_LABELS[surface.app]}
-                        </span>
-                        <Badge variant="secondary">
-                          {t("providerBundle.modelProfileFixed")}
-                        </Badge>
-                        <span
-                          className="min-w-0 truncate text-muted-foreground"
-                          title={
-                            surface.modelPolicy === "single"
-                              ? surface.upstreamModel
-                              : t("providerBundle.modelPassthrough")
-                          }
-                        >
-                          {surface.modelPolicy === "single"
-                            ? surface.upstreamModel
-                            : t("providerBundle.modelPassthrough")}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-              </>
-            ) : null}
-          </div>
-        </Section>
-
-        <Collapsible>
-          <CollapsibleTrigger asChild>
-            <Button type="button" variant="ghost" size="sm">
-              <ChevronDown className="mr-2 h-4 w-4" />
-              {t("providerBundle.advanced", { defaultValue: "高级设置" })}
-            </Button>
-          </CollapsibleTrigger>
-          <CollapsibleContent className="space-y-6 pt-4">
-        <Section
-          title={t("providerBundle.testModel", {
-            defaultValue: "测试模型",
-          })}
-        >
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <Label>{t("providerBundle.testApp")}</Label>
-              <Select
-                value={draft.testApp}
-                onValueChange={(value) =>
-                  setDraft((current) => ({
-                    ...current,
-                    testApp: value as CoreProviderApp,
-                  }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {enabledTestApps.map((app) => (
-                    <SelectItem key={app} value={app}>
-                      <span className="flex items-center gap-2">
-                        <AppLogo app={app} />
-                        {APP_LABELS[app]}
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="provider-bundle-test-model">
-                {t("providerBundle.providerTestModel", {
-                  defaultValue: "供应商默认测试模型",
-                })}
-              </Label>
-              <Input
-                id="provider-bundle-test-model"
-                value={draft.testModel}
-                placeholder={healthCheckConfig?.testModels[draft.testApp]}
-                className="focus:placeholder:text-transparent"
-                onChange={(event) =>
-                  setDraft((current) => ({
-                    ...current,
-                    testModel: event.target.value,
-                  }))
-                }
-              />
-            </div>
-            <div className="space-y-3 md:col-span-2">
-              <Label>
-                {t("providerBundle.surfaceTestModelOverrides", {
-                  defaultValue: "App 特例",
-                })}
-              </Label>
-              <div className="grid gap-4 md:grid-cols-3">
-                {enabledTestApps.map((app) => (
-                  <div key={app} className="space-y-2">
-                    <Label
-                      htmlFor={`provider-bundle-${app}-test-model`}
-                      className="flex items-center gap-2 text-xs text-muted-foreground"
-                    >
-                      <AppLogo app={app} />
-                      {APP_LABELS[app]}
-                    </Label>
-                    <Input
-                      id={`provider-bundle-${app}-test-model`}
-                      value={draft.surfaceTestModels[app]}
-                      placeholder={
-                        draft.testModel.trim() ||
-                        healthCheckConfig?.testModels[app]
-                      }
-                      className="focus:placeholder:text-transparent"
-                      onChange={(event) =>
-                        setDraft((current) => ({
-                          ...current,
-                          surfaceTestModels: {
-                            ...current.surfaceTestModels,
-                            [app]: event.target.value,
-                          },
+                          icon,
+                          iconColor,
                         }))
                       }
                     />
                   </div>
-                ))}
+                  {persisted ? (
+                    <p className="text-center text-sm text-muted-foreground">
+                      {family.label}
+                    </p>
+                  ) : null}
+                  {duplicate ? (
+                    <p className="text-center text-sm text-muted-foreground">
+                      {t("providerBundle.duplicateSecretsCleared", {
+                        defaultValue:
+                          "Credentials are not copied. Enter them again before saving.",
+                      })}
+                    </p>
+                  ) : null}
+                </div>
+                {customRecipes.length ? (
+                  <div className="space-y-2 md:col-span-2">
+                    <Label>{t("providerBundle.quickPreset")}</Label>
+                    <Select
+                      value={activeCustomRecipe?.recipeId ?? ""}
+                      onValueChange={(recipeId) => {
+                        const recipe = customRecipes.find(
+                          (candidate) => candidate.recipeId === recipeId,
+                        );
+                        if (!recipe) return;
+                        setDraft((current) =>
+                          applyCustomRecipeToBundleDraft(current, recipe),
+                        );
+                        const recipeProfile = profileById(recipe.profileId);
+                        if (recipeProfile) setActiveApp(recipeProfile.app);
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue
+                          placeholder={t("providerBundle.manualConfiguration")}
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {customRecipes.map((recipe) => (
+                          <SelectItem
+                            key={recipe.recipeId}
+                            value={recipe.recipeId}
+                          >
+                            {t(recipe.labelKey, { defaultValue: recipe.label })}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ) : null}
+                <div className="space-y-2">
+                  <Label>{t("serverProviderForm.basic.name")}</Label>
+                  <Input
+                    id={bundleValidationFieldId({
+                      code: "nameRequired",
+                      field: "name",
+                      message: "",
+                    })}
+                    value={draft.name}
+                    className={cn(
+                      fieldErrorClass(
+                        matchesBundleValidationIssue(validation, "name"),
+                      ),
+                      !identityEditable &&
+                        "cursor-default bg-muted/40 text-muted-foreground",
+                    )}
+                    readOnly={!identityEditable}
+                    onChange={(event) =>
+                      identityEditable &&
+                      setDraft({ ...draft, name: event.target.value })
+                    }
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>{t("serverProviderForm.basic.website")}</Label>
+                  <Input
+                    type="url"
+                    value={draft.websiteUrl}
+                    readOnly={!identityEditable}
+                    className={cn(
+                      !identityEditable &&
+                        "cursor-default bg-muted/40 text-muted-foreground",
+                    )}
+                    onChange={(event) =>
+                      identityEditable &&
+                      setDraft({ ...draft, websiteUrl: event.target.value })
+                    }
+                  />
+                </div>
+                <div className="space-y-2 md:col-span-2">
+                  <Label>{t("serverProviderForm.basic.notes")}</Label>
+                  <Textarea
+                    rows={2}
+                    value={draft.notes}
+                    onChange={(event) =>
+                      setDraft({ ...draft, notes: event.target.value })
+                    }
+                  />
+                </div>
               </div>
-            </div>
-          </div>
-        </Section>
+            </Section>
 
-        {commonEndpointEditable ? (
-          <Section title={t("serverProviderForm.endpoint.title")}>
-            <Input
-              id={bundleValidationFieldId({
-                code: "endpointInvalid",
-                field: "endpoint",
-                message: "",
-              })}
-              type="url"
-              className={fieldErrorClass(
-                matchesBundleValidationIssue(validation, "endpoint"),
-              )}
-              value={draft.endpoint}
-              onChange={(event) =>
-                setDraft({ ...draft, endpoint: event.target.value })
-              }
-            />
-          </Section>
-        ) : null}
-
-        <Section
-          title={t("providerBundle.connectionTimeouts", {
-            defaultValue: "连接与超时",
-          })}
-        >
-          <div className="grid gap-4 md:grid-cols-3">
-            {[
-              {
-                key: "timeoutSeconds" as const,
-                defaultKey: "requestTimeoutSeconds" as const,
-                label: t("providerBundle.requestTimeout", {
-                  defaultValue: "请求超时（秒）",
-                }),
-                max: 3_600,
-              },
-              {
-                key: "streamFirstByteTimeoutSeconds" as const,
-                defaultKey: "streamFirstByteTimeoutSeconds" as const,
-                label: t("providerBundle.firstByteTimeout", {
-                  defaultValue: "首字节超时（秒）",
-                }),
-                max: 600,
-              },
-              {
-                key: "streamIdleTimeoutSeconds" as const,
-                defaultKey: "streamIdleTimeoutSeconds" as const,
-                label: t("providerBundle.streamIdleTimeout", {
-                  defaultValue: "流空闲超时（秒）",
-                }),
-                max: 3_600,
-              },
-            ].map(({ key, defaultKey, label, max }) => (
-              <div key={key} className="space-y-2">
-                <Label>{label}</Label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={max}
-                  step={1}
-                  value={draft.transport[key]}
-                  placeholder={
-                    requestDefaults
-                      ? String(requestDefaults[defaultKey])
-                      : undefined
-                  }
-                  className="focus:placeholder:text-transparent"
-                  onChange={(event) =>
-                    setDraft((current) => ({
-                      ...current,
-                      transport: {
-                        ...current.transport,
-                        [key]: event.target.value,
-                      },
-                    }))
-                  }
-                />
-              </div>
-            ))}
-          </div>
-        </Section>
-
-        {codexDriverOptions ? (
-          <Section title={t("codexOauth.featureOptionsTitle")}>
-            <CodexFeatureOptions
-              values={{
-                codexFastMode: draft.surfaces.some(
-                  (surface) => surface.driverOptions.codexFastMode === true,
-                ),
-                codexImageGenerationEnabled: draft.surfaces.some(
-                  (surface) =>
-                    surface.driverOptions.codexImageGenerationEnabled === true,
-                ),
-                codexWebsocketEnabled: draft.surfaces.some(
-                  (surface) =>
-                    surface.driverOptions.codexWebsocketEnabled === true,
-                ),
-              }}
-              onChange={setDriverOption}
-            />
-          </Section>
-        ) : null}
-
-        {codexDriverOptions &&
-        persisted &&
-        draft.accountId &&
-        draft.expectedRevision != null ? (
-          <Section title={t("codexReferrals.sectionTitle")}>
-            <CodexReferralPanel
-              providerId={draft.id}
-              expectedRevision={draft.expectedRevision}
-            />
-          </Section>
-        ) : null}
-          </CollapsibleContent>
-        </Collapsible>
-
-        {showSurfaceTabs || family.endpointScope === "surface" ? (
-        <Section
-          title={t("providerBundle.surfaces", { defaultValue: "应用接口" })}
-        >
-          {showSurfaceTabs ? (
-          <Tabs
-            value={activeApp}
-            onValueChange={(value) => setActiveApp(value as CoreProviderApp)}
-          >
-            <TabsList
-              className="grid h-auto w-full"
-              style={{
-                gridTemplateColumns: `repeat(${draft.surfaces.length}, minmax(0, 1fr))`,
-              }}
-            >
-              {draft.surfaces.map((surface) => (
-                <TabsTrigger
-                  key={surface.app}
-                  value={surface.app}
-                  className="min-w-0 gap-2"
-                >
-                  <AppLogo app={surface.app} />
-                  <span className="truncate">{APP_LABELS[surface.app]}</span>
-                  {surface.enabled ? (
-                    <Check className="h-3.5 w-3.5" />
-                  ) : (
-                    <span className="text-[10px] text-muted-foreground">
-                      {t("providerBundle.surfaceOff", { defaultValue: "关" })}
-                    </span>
+            {credentialProfile?.credentialPolicy.mode === "managed_account" ? (
+              <Section
+                title={t("providerBundle.account", {
+                  defaultValue: "OAuth 账号",
+                })}
+                icon={<KeyRound className="h-4 w-4" />}
+              >
+                <div
+                  id={bundleValidationFieldId({
+                    code: "accountRequired",
+                    field: "account",
+                    message: "",
+                  })}
+                  className={cn(
+                    matchesBundleValidationIssue(validation, "account") &&
+                      "rounded-md border border-destructive p-3",
                   )}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-            {draft.surfaces.map((surface) => (
-              <TabsContent key={surface.app} value={surface.app}>
-                <SurfaceEditor
-                  surface={surface}
-                  modelPolicyScope={draft.modelPolicyScope}
-                  validation={validation}
-                  onChange={updateSurface}
-                />
-              </TabsContent>
-            ))}
-          </Tabs>
-          ) : activeSurface ? (
-            <SurfaceEditor
-              surface={activeSurface}
-              modelPolicyScope={draft.modelPolicyScope}
-              validation={validation}
-              onChange={updateSurface}
-            />
-          ) : null}
-        </Section>
-        ) : null}
+                >
+                  <ManagedAccountSection
+                    providerType={
+                      credentialProfile.credentialPolicy.accountProviderType
+                    }
+                    selectedAccountId={draft.accountId || null}
+                    onAccountSelect={(accountId) => {
+                      const account = accounts.find(
+                        (item) => item.id === accountId,
+                      );
+                      setDraft((current) => ({
+                        ...current,
+                        accountId: accountId ?? "",
+                        accountGeneration: account?.authIdentityGeneration,
+                      }));
+                    }}
+                  />
+                  {matchesBundleValidationIssue(validation, "account") &&
+                  validation ? (
+                    <p className="mt-2 text-xs text-destructive">
+                      {validationMessage(validation)}
+                    </p>
+                  ) : null}
+                </div>
+              </Section>
+            ) : null}
+
+            {familyCredentialSlots(family).length ? (
+              <Section
+                title={t("providerBundle.credential", {
+                  defaultValue: "共享凭据",
+                })}
+                icon={<KeyRound className="h-4 w-4" />}
+              >
+                <div className="grid gap-4 md:grid-cols-2">
+                  {familyCredentialSlots(family).map(({ logical, pointer }) => {
+                    const actualPointer =
+                      Object.keys(draft.secrets).find(
+                        (slot) =>
+                          slot === pointer ||
+                          slot.endsWith(
+                            pointer.slice(pointer.lastIndexOf("/")),
+                          ),
+                      ) ?? pointer;
+                    const secret = draft.secrets[actualPointer] ?? {
+                      configured: false,
+                      value: "",
+                      clear: false,
+                    };
+                    const edit = credentialEditForBundleSecret(
+                      actualPointer,
+                      secret,
+                    );
+                    const revealedValue =
+                      revealedCredentialValues[actualPointer];
+                    const revealStatus =
+                      credentialRevealStatuses[actualPointer] ?? "idle";
+                    const value = credentialInputValue(edit, revealedValue);
+                    const loadingCurrent =
+                      edit.configured &&
+                      edit.action === "keep" &&
+                      revealStatus === "loading";
+                    const currentRevealFailed =
+                      edit.configured &&
+                      edit.action === "keep" &&
+                      revealStatus === "error";
+                    return (
+                      <div key={logical} className="space-y-2">
+                        <div className="flex min-h-6 items-center justify-between gap-2">
+                          <Label>{fieldLabel(logical)}</Label>
+                          {loadingCurrent ? (
+                            <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
+                          ) : currentRevealFailed ? (
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="h-6 w-6"
+                              title={t("common.retry")}
+                              aria-label={t("common.retry")}
+                              onClick={() =>
+                                void retryCredentialReveal(actualPointer)
+                              }
+                            >
+                              <RefreshCw className="h-3.5 w-3.5" />
+                            </Button>
+                          ) : null}
+                        </div>
+                        <SecretInput
+                          id={bundleValidationFieldId({
+                            code: "credentialRequired",
+                            field: "credential",
+                            message: "",
+                          })}
+                          className={fieldErrorClass(
+                            matchesBundleValidationIssue(
+                              validation,
+                              "credential",
+                            ),
+                          )}
+                          value={value}
+                          disabled={loadingCurrent || edit.action === "clear"}
+                          autoComplete="new-password"
+                          placeholder={
+                            loadingCurrent
+                              ? t("serverProviderForm.credentials.loading")
+                              : currentRevealFailed
+                                ? t(
+                                    "serverProviderForm.credentials.loadFailedPlaceholder",
+                                  )
+                                : t(
+                                    "serverProviderForm.credentials.placeholder",
+                                  )
+                          }
+                          onChange={(event) => {
+                            const next = updateCredentialInput(
+                              edit,
+                              event.target.value,
+                              {
+                                optional: logical === "session_token",
+                                revealedValue,
+                                revealStatus,
+                              },
+                            );
+                            setDraft((current) => ({
+                              ...current,
+                              secrets: {
+                                ...current.secrets,
+                                [actualPointer]:
+                                  bundleSecretFromCredentialEdit(next),
+                              },
+                            }));
+                          }}
+                        />
+                        {currentRevealFailed ? (
+                          <p className="text-xs text-destructive">
+                            {t("serverProviderForm.credentials.loadFailed")}
+                          </p>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                  {credentialProfile?.formComposition === "aws" ? (
+                    <div className="space-y-2">
+                      <Label>AWS Region</Label>
+                      <Input
+                        id={bundleValidationFieldId({
+                          code: "awsRegionRequired",
+                          field: "awsRegion",
+                          message: "",
+                        })}
+                        className={fieldErrorClass(
+                          matchesBundleValidationIssue(validation, "awsRegion"),
+                        )}
+                        value={draft.awsRegion}
+                        onChange={(event) =>
+                          setDraft({ ...draft, awsRegion: event.target.value })
+                        }
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              </Section>
+            ) : null}
+
+            <Section title={t("serverProviderForm.model.title")}>
+              <div className="max-w-xl space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  {t("providerBundle.modelScopeHint", {
+                    defaultValue:
+                      "Global uses one upstream model for every configurable App. Per App lets each Surface keep its own model.",
+                  })}
+                </p>
+                <div className="space-y-2">
+                  <Label>{t("providerBundle.modelScope")}</Label>
+                  {perAppModelPolicyRequired ? (
+                    <Badge variant="secondary">
+                      {t("providerBundle.modelScopePerApp")}
+                    </Badge>
+                  ) : perAppModelPolicySupported ? (
+                    <Tabs
+                      value={draft.modelPolicyScope}
+                      onValueChange={(value) => {
+                        if (value !== "global" && value !== "per_app") return;
+                        if (
+                          value === "global" &&
+                          draft.modelPolicyScope === "per_app" &&
+                          perAppModelPoliciesDiffer(draft)
+                        ) {
+                          setModelScopeConfirmOpen(true);
+                          return;
+                        }
+                        setDraft((current) =>
+                          changeModelPolicyScope(current, value),
+                        );
+                      }}
+                    >
+                      <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
+                        <TabsTrigger value="global" className="rounded-sm">
+                          {t("providerBundle.modelScopeGlobal")}
+                        </TabsTrigger>
+                        <TabsTrigger value="per_app" className="rounded-sm">
+                          {t("providerBundle.modelScopePerApp")}
+                        </TabsTrigger>
+                      </TabsList>
+                    </Tabs>
+                  ) : (
+                    <Badge variant="secondary">
+                      {t("providerBundle.modelScopeGlobal")}
+                    </Badge>
+                  )}
+                </div>
+
+                {draft.modelPolicyScope === "global" ? (
+                  <>
+                    <div className="space-y-2">
+                      {allowedModelPolicies.length > 1 ? (
+                        <Tabs
+                          value={draft.modelPolicy}
+                          onValueChange={(value) => {
+                            if (value !== "single" && value !== "passthrough")
+                              return;
+                            if (!allowedModelPolicies.includes(value)) return;
+                            setDraft((current) =>
+                              updateBundleModel(
+                                current,
+                                value,
+                                value === "single" &&
+                                  !current.upstreamModel.trim()
+                                  ? defaultSharedModel
+                                  : current.upstreamModel,
+                              ),
+                            );
+                          }}
+                        >
+                          <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
+                            {allowedModelPolicies.map((policy) => (
+                              <TabsTrigger
+                                key={policy}
+                                value={policy}
+                                className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground"
+                              >
+                                {policy === "single" ? (
+                                  <Target className="hidden h-4 w-4 shrink-0 sm:block" />
+                                ) : (
+                                  <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
+                                )}
+                                {policy === "single"
+                                  ? t("providerBundle.modelSingle")
+                                  : t("providerBundle.modelPassthrough")}
+                              </TabsTrigger>
+                            ))}
+                          </TabsList>
+                        </Tabs>
+                      ) : (
+                        <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
+                          {draft.modelPolicy === "single" ? (
+                            <Target className="h-4 w-4" />
+                          ) : (
+                            <ArrowRightLeft className="h-4 w-4" />
+                          )}
+                          {draft.modelPolicy === "single"
+                            ? t("providerBundle.modelSingle")
+                            : t("providerBundle.modelPassthrough")}
+                        </div>
+                      )}
+                    </div>
+                    {draft.modelPolicy === "single" ? (
+                      <div className="space-y-2">
+                        <Label htmlFor="provider-bundle-model">
+                          {t("serverProviderForm.model.upstreamModel")}
+                        </Label>
+                        <Input
+                          id={bundleValidationFieldId({
+                            code: "upstreamModelRequired",
+                            field: "upstreamModel",
+                            message: "",
+                          })}
+                          className={fieldErrorClass(
+                            matchesBundleValidationIssue(
+                              validation,
+                              "upstreamModel",
+                            ),
+                          )}
+                          value={draft.upstreamModel}
+                          onChange={(event) =>
+                            setDraft((current) =>
+                              updateBundleModel(
+                                current,
+                                current.modelPolicy,
+                                event.target.value,
+                              ),
+                            )
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    {fixedModelSurfaces.length ? (
+                      <div className="grid gap-2 border-t pt-3 text-sm">
+                        {fixedModelSurfaces.map((surface) => (
+                          <div
+                            key={surface.app}
+                            className="flex min-w-0 items-center gap-2"
+                          >
+                            <span className="shrink-0 font-medium">
+                              {APP_LABELS[surface.app]}
+                            </span>
+                            <Badge variant="secondary">
+                              {t("providerBundle.modelProfileFixed")}
+                            </Badge>
+                            <span
+                              className="min-w-0 truncate text-muted-foreground"
+                              title={
+                                surface.modelPolicy === "single"
+                                  ? surface.upstreamModel
+                                  : t("providerBundle.modelPassthrough")
+                              }
+                            >
+                              {surface.modelPolicy === "single"
+                                ? surface.upstreamModel
+                                : t("providerBundle.modelPassthrough")}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
+              </div>
+            </Section>
+
+            <Collapsible>
+              <CollapsibleTrigger asChild>
+                <Button type="button" variant="ghost" size="sm">
+                  <ChevronDown className="mr-2 h-4 w-4" />
+                  {t("providerBundle.advanced", { defaultValue: "高级设置" })}
+                </Button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="space-y-6 pt-4">
+                <Section
+                  title={t("providerBundle.testModel", {
+                    defaultValue: "测试模型",
+                  })}
+                >
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label>{t("providerBundle.testApp")}</Label>
+                      <Select
+                        value={draft.testApp}
+                        onValueChange={(value) =>
+                          setDraft((current) => ({
+                            ...current,
+                            testApp: value as CoreProviderApp,
+                          }))
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {enabledTestApps.map((app) => (
+                            <SelectItem key={app} value={app}>
+                              <span className="flex items-center gap-2">
+                                <AppLogo app={app} />
+                                {APP_LABELS[app]}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="provider-bundle-test-model">
+                        {t("providerBundle.providerTestModel", {
+                          defaultValue: "供应商默认测试模型",
+                        })}
+                      </Label>
+                      <Input
+                        id="provider-bundle-test-model"
+                        value={draft.testModel}
+                        placeholder={
+                          healthCheckConfig?.testModels[draft.testApp]
+                        }
+                        className="focus:placeholder:text-transparent"
+                        onChange={(event) =>
+                          setDraft((current) => ({
+                            ...current,
+                            testModel: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="space-y-3 md:col-span-2">
+                      <Label>
+                        {t("providerBundle.surfaceTestModelOverrides", {
+                          defaultValue: "App 特例",
+                        })}
+                      </Label>
+                      <div className="grid gap-4 md:grid-cols-3">
+                        {enabledTestApps.map((app) => (
+                          <div key={app} className="space-y-2">
+                            <Label
+                              htmlFor={`provider-bundle-${app}-test-model`}
+                              className="flex items-center gap-2 text-xs text-muted-foreground"
+                            >
+                              <AppLogo app={app} />
+                              {APP_LABELS[app]}
+                            </Label>
+                            <Input
+                              id={`provider-bundle-${app}-test-model`}
+                              value={draft.surfaceTestModels[app]}
+                              placeholder={
+                                draft.testModel.trim() ||
+                                healthCheckConfig?.testModels[app]
+                              }
+                              className="focus:placeholder:text-transparent"
+                              onChange={(event) =>
+                                setDraft((current) => ({
+                                  ...current,
+                                  surfaceTestModels: {
+                                    ...current.surfaceTestModels,
+                                    [app]: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </Section>
+
+                {commonEndpointEditable ? (
+                  <Section title={t("serverProviderForm.endpoint.title")}>
+                    <Input
+                      id={bundleValidationFieldId({
+                        code: "endpointInvalid",
+                        field: "endpoint",
+                        message: "",
+                      })}
+                      type="url"
+                      className={fieldErrorClass(
+                        matchesBundleValidationIssue(validation, "endpoint"),
+                      )}
+                      value={draft.endpoint}
+                      onChange={(event) =>
+                        setDraft({ ...draft, endpoint: event.target.value })
+                      }
+                    />
+                  </Section>
+                ) : null}
+
+                <Section
+                  title={t("providerBundle.connectionTimeouts", {
+                    defaultValue: "连接与超时",
+                  })}
+                >
+                  <div className="grid gap-4 md:grid-cols-3">
+                    {[
+                      {
+                        key: "timeoutSeconds" as const,
+                        defaultKey: "requestTimeoutSeconds" as const,
+                        label: t("providerBundle.requestTimeout", {
+                          defaultValue: "请求超时（秒）",
+                        }),
+                        max: 3_600,
+                      },
+                      {
+                        key: "streamFirstByteTimeoutSeconds" as const,
+                        defaultKey: "streamFirstByteTimeoutSeconds" as const,
+                        label: t("providerBundle.firstByteTimeout", {
+                          defaultValue: "首字节超时（秒）",
+                        }),
+                        max: 600,
+                      },
+                      {
+                        key: "streamIdleTimeoutSeconds" as const,
+                        defaultKey: "streamIdleTimeoutSeconds" as const,
+                        label: t("providerBundle.streamIdleTimeout", {
+                          defaultValue: "流空闲超时（秒）",
+                        }),
+                        max: 3_600,
+                      },
+                    ].map(({ key, defaultKey, label, max }) => (
+                      <div key={key} className="space-y-2">
+                        <Label>{label}</Label>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={max}
+                          step={1}
+                          value={draft.transport[key]}
+                          placeholder={
+                            requestDefaults
+                              ? String(requestDefaults[defaultKey])
+                              : undefined
+                          }
+                          className="focus:placeholder:text-transparent"
+                          onChange={(event) =>
+                            setDraft((current) => ({
+                              ...current,
+                              transport: {
+                                ...current.transport,
+                                [key]: event.target.value,
+                              },
+                            }))
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </Section>
+
+                {codexDriverOptions ? (
+                  <Section title={t("codexOauth.featureOptionsTitle")}>
+                    <CodexFeatureOptions
+                      values={{
+                        codexFastMode: draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions.codexFastMode === true,
+                        ),
+                        codexImageGenerationEnabled: draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions
+                              .codexImageGenerationEnabled === true,
+                        ),
+                        codexWebsocketEnabled: draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions.codexWebsocketEnabled ===
+                            true,
+                        ),
+                      }}
+                      onChange={setDriverOption}
+                    />
+                  </Section>
+                ) : null}
+
+                {codexDriverOptions &&
+                persisted &&
+                draft.accountId &&
+                draft.expectedRevision != null ? (
+                  <Section title={t("codexReferrals.sectionTitle")}>
+                    <CodexReferralPanel
+                      providerId={draft.id}
+                      expectedRevision={draft.expectedRevision}
+                    />
+                  </Section>
+                ) : null}
+              </CollapsibleContent>
+            </Collapsible>
+
+            {showSurfaceTabs || family.endpointScope === "surface" ? (
+              <Section
+                title={t("providerBundle.surfaces", {
+                  defaultValue: "应用接口",
+                })}
+              >
+                {showSurfaceTabs ? (
+                  <Tabs
+                    value={activeApp}
+                    onValueChange={(value) =>
+                      setActiveApp(value as CoreProviderApp)
+                    }
+                  >
+                    <TabsList
+                      className="grid h-auto w-full"
+                      style={{
+                        gridTemplateColumns: `repeat(${draft.surfaces.length}, minmax(0, 1fr))`,
+                      }}
+                    >
+                      {draft.surfaces.map((surface) => (
+                        <TabsTrigger
+                          key={surface.app}
+                          value={surface.app}
+                          className="min-w-0 gap-2"
+                        >
+                          <AppLogo app={surface.app} />
+                          <span className="truncate">
+                            {APP_LABELS[surface.app]}
+                          </span>
+                          {surface.enabled ? (
+                            <Check className="h-3.5 w-3.5" />
+                          ) : (
+                            <span className="text-[10px] text-muted-foreground">
+                              {t("providerBundle.surfaceOff", {
+                                defaultValue: "关",
+                              })}
+                            </span>
+                          )}
+                        </TabsTrigger>
+                      ))}
+                    </TabsList>
+                    {draft.surfaces.map((surface) => (
+                      <TabsContent key={surface.app} value={surface.app}>
+                        <SurfaceEditor
+                          surface={surface}
+                          modelPolicyScope={draft.modelPolicyScope}
+                          validation={validation}
+                          onChange={updateSurface}
+                        />
+                      </TabsContent>
+                    ))}
+                  </Tabs>
+                ) : activeSurface ? (
+                  <SurfaceEditor
+                    surface={activeSurface}
+                    modelPolicyScope={draft.modelPolicyScope}
+                    validation={validation}
+                    onChange={updateSurface}
+                  />
+                ) : null}
+              </Section>
+            ) : null}
           </div>
         ) : null}
 
         {showShareStep ? (
-        <div id="bundle-section-share" ref={shareSectionRef}>
-          <BundleShareEditor
-            draft={shareDraft}
-            onChange={setShareDraft}
-            ownerEmail={ownerEmail}
-            shareUrl={shareUrl}
-            onOpenShareSettings={onOpenShareSettings}
-          />
-        </div>
+          <div
+            id="bundle-section-share"
+            role="tabpanel"
+            aria-labelledby="bundle-tab-share"
+            ref={shareSectionRef}
+          >
+            <BundleShareEditor
+              draft={shareDraft}
+              onChange={setShareDraft}
+              ownerEmail={ownerEmail}
+              shareExists={Boolean(existingShare)}
+              shareUrl={shareUrl}
+              onOpenShareSettings={onOpenShareSettings}
+            />
+          </div>
         ) : null}
       </div>
 
@@ -2456,22 +2445,14 @@ export function ProviderBundleEditor({
           <Button
             type="button"
             variant="outline"
-            onClick={() =>
-              setCreateStep(createStep === "share" ? "supply" : "family")
-            }
+            onClick={retreatCreateStep}
             disabled={saving}
           >
             {t("common.previous")}
           </Button>
         ) : null}
         {!persisted && createStep !== "share" ? (
-          <Button
-            type="button"
-            onClick={() =>
-              setCreateStep(createStep === "family" ? "supply" : "share")
-            }
-            disabled={saving}
-          >
+          <Button type="button" onClick={advanceCreateStep} disabled={saving}>
             {t("common.next")}
           </Button>
         ) : (
@@ -2495,7 +2476,7 @@ export function ProviderBundleEditor({
           defaultValue: "更换供应商类型？",
         })}
         message={t("providerBundle.changeFamilyMessage", {
-          defaultValue: "未保存的供给和分享设置将被新的类型默认值替换。",
+          defaultValue: "未保存的配置和分享设置将被新的类型默认值替换。",
         })}
         confirmText={t("providerBundle.changeFamilyConfirm", {
           defaultValue: "更换类型",

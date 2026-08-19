@@ -67,25 +67,10 @@ export function useToggleProviderShare(
     if (!shareable || !providerId) return;
     await createMutation.mutateAsync({
       bindings: { [appId]: providerId },
-      forSale: "Yes",
+      freeAccess: false,
       tokenLimit: UNLIMITED_TOKEN_LIMIT,
       parallelLimit: UNLIMITED_PARALLEL_LIMIT,
       expiresAt: Date.parse(PERMANENT_EXPIRES_AT),
-      sharedWithEmails: [],
-      marketAccessMode: "all",
-      accessByApp: {
-        [appId]: { sharedWithEmails: [], marketAccessMode: "all" },
-      },
-      appSettings: {
-        [appId]: {
-          forSale: "Yes",
-          marketAccessMode: "all",
-          sharedWithEmails: [],
-          tokenLimit: UNLIMITED_TOKEN_LIMIT,
-          parallelLimit: UNLIMITED_PARALLEL_LIMIT,
-          expiresAt: PERMANENT_EXPIRES_AT,
-        },
-      },
     });
   };
 

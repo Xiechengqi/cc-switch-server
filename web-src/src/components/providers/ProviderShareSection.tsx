@@ -8,10 +8,15 @@ import {
   Loader2,
   Save,
   Share2,
-  X,
 } from "lucide-react";
-import type { AppId, PublicTokenMarket, ShareReuseCandidate } from "@/lib/api";
-import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
+import type { AppId, ShareReuseCandidate } from "@/lib/api";
+import type {
+  ShareUserGrantMap,
+  ShareUserPolicy,
+  ShareUserUsageEditMap,
+  ShareTotalUsageEdit,
+  ShareRecord,
+} from "@/lib/api/share";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -19,14 +24,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { ProviderShareReuseDialog } from "@/components/providers/ProviderShareReuseDialog";
@@ -44,7 +41,6 @@ import {
   useRemoveShareBindingMutation,
   useSaveProviderShareMutation,
   useSettingsQuery,
-  useTokenMarketsQuery,
 } from "@/lib/query";
 import {
   getProviderShareState,
@@ -67,9 +63,7 @@ import {
 } from "@/utils/shareUtils";
 import { formatShareRouterDisplay } from "@/utils/shareRouter";
 import {
-  buildShareUserGrantsForAcl,
-  buildShareAclPayload,
-  formatMarketSelectLabel,
+  buildShareUserGrants,
   isValidShareEmail,
   normalizeShareEmails,
   SHARE_EXPIRY_PRESETS,
@@ -151,13 +145,6 @@ function shareStateVariant(
   return "outline";
 }
 
-function splitShareToEmails(
-  emails: string[],
-  marketEmailSet: Set<string>,
-): string[] {
-  return emails.filter((email) => !marketEmailSet.has(email.toLowerCase()));
-}
-
 export function ProviderShareSection({
   appId,
   providerId,
@@ -181,7 +168,6 @@ export function ProviderShareSection({
   const saveMutation = useSaveProviderShareMutation();
 
   const [isShareOpen, setIsShareOpen] = useState(false);
-  const [confirmFreeOpen, setConfirmFreeOpen] = useState(false);
   const [reuseCandidates, setReuseCandidates] = useState<
     ShareReuseCandidate[] | null
   >(null);
@@ -198,22 +184,13 @@ export function ProviderShareSection({
 
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
-  const [forSaleValue, setForSaleValue] = useState<"Yes" | "No" | "Free">(
-    "Yes",
-  );
-  const [marketAccessMode, setMarketAccessMode] = useState<"selected" | "all">(
-    "all",
-  );
-  const [selectedMarketEmails, setSelectedMarketEmails] = useState<string[]>(
-    [],
-  );
-  const [marketSelectKey, setMarketSelectKey] = useState(0);
-  const [shareToEmails, setShareToEmails] = useState<string[]>([]);
+  const [freeAccess, setFreeAccess] = useState(false);
   const [userGrants, setUserGrants] = useState<ShareUserGrantMap>({});
+  const [userUsageEdits, setUserUsageEdits] =
+    useState<ShareUserUsageEditMap>({});
   const [tokenLimitInput, setTokenLimitInput] = useState("");
+  const [tokensUsedInput, setTokensUsedInput] = useState("");
   const [parallelLimitInput, setParallelLimitInput] = useState("");
-  const [officialPricePercentInput, setOfficialPricePercentInput] =
-    useState("");
   const [expiresInSecsInput, setExpiresInSecsInput] = useState(
     String(permanentExpiresInSecs()),
   );
@@ -228,6 +205,7 @@ export function ProviderShareSection({
   const subdomainManualRef = useRef(false);
   const shareInitRef = useRef<string | null>(null);
   const tokenLimitTouchedRef = useRef(false);
+  const tokensUsedTouchedRef = useRef(false);
   const parallelLimitTouchedRef = useRef(false);
   const expiresTouchedRef = useRef(false);
 
@@ -240,20 +218,6 @@ export function ProviderShareSection({
       share.routerSyncedDescriptorGeneration !== share.descriptorGeneration ||
       share.routerSyncedDescriptorFingerprint !== share.descriptorFingerprint),
   );
-  const marketsQueryEnabled = shareExists && isShareOpen;
-  const {
-    data: markets = [],
-    isLoading: marketsLoading,
-    error: marketsError,
-    refetch: refetchMarkets,
-  } = useTokenMarketsQuery(marketsQueryEnabled);
-
-  const usageMarkets = markets;
-  const usageMarketEmailSet = useMemo(
-    () => new Set(usageMarkets.map((market) => market.email.toLowerCase())),
-    [usageMarkets],
-  );
-
   const ownerEmail = useMemo(
     () => resolveShareOwnerEmail(clientTunnel?.config?.ownerEmail),
     [clientTunnel?.config?.ownerEmail],
@@ -274,12 +238,12 @@ export function ProviderShareSection({
     if (shareInitRef.current === initKey) return;
     shareInitRef.current = initKey;
     tokenLimitTouchedRef.current = false;
+    tokensUsedTouchedRef.current = false;
     parallelLimitTouchedRef.current = false;
     expiresTouchedRef.current = false;
 
     setDescriptionInput(share?.description?.trim() ?? "");
-    setForSaleValue(share?.forSale ?? "Yes");
-    setMarketAccessMode(share?.marketAccessMode ?? "all");
+    setFreeAccess(share?.freeAccess ?? false);
     setSubdomainInput(share?.shareSlug?.trim() ?? "");
     setAllowPersonalCredits(share?.allowPersonalCredits ?? false);
     setAutoConsumeBankedReset(share?.autoConsumeBankedReset ?? false);
@@ -291,21 +255,7 @@ export function ProviderShareSection({
     );
     subdomainManualRef.current = Boolean(share?.shareSlug?.trim());
 
-    const appAccess = share?.accessByApp?.[shareableApp];
     const existingGrants = share?.userGrants ?? {};
-    const routerManagedEmails = new Set(
-      Object.values(existingGrants)
-        .filter((grant) => grant.manager === "routerShareMarket")
-        .map((grant) => grant.email.trim().toLowerCase()),
-    );
-    const allEmails = normalizeShareEmails(
-      appAccess?.sharedWithEmails ?? share?.sharedWithEmails ?? [],
-    );
-    const directEmails = splitShareToEmails(
-      allEmails,
-      usageMarketEmailSet,
-    ).filter((email) => !routerManagedEmails.has(email));
-    setShareToEmails(directEmails);
 
     const defaultPolicy: ShareUserPolicy = {
       parallelLimit:
@@ -332,34 +282,12 @@ export function ProviderShareSection({
         policy: { ...defaultPolicy },
       };
     }
-    for (const email of allEmails) {
-      if (!nextGrants[email]) {
-        nextGrants[email] = {
-          email,
-          role: "shareto",
-          active: true,
-          policy: { ...defaultPolicy },
-        };
-      }
-    }
     setUserGrants(nextGrants);
-
-    const tokenEmails = allEmails.filter((email) =>
-      usageMarketEmailSet.has(email),
-    );
-    setSelectedMarketEmails(tokenEmails);
+    setUserUsageEdits({});
 
     setTokenLimitInput(formatShareLimitInput(share?.tokenLimit));
+    setTokensUsedInput(String(Math.max(0, share?.tokensUsed ?? 0)));
     setParallelLimitInput(formatShareLimitInput(share?.parallelLimit));
-    const officialPricePercent =
-      share?.officialPricePercent ??
-      share?.forSaleOfficialPricePercentByApp?.[shareableApp];
-    setOfficialPricePercentInput(
-      Number.isInteger(officialPricePercent)
-        ? String(officialPricePercent)
-        : "",
-    );
-
     const permanent = share ? isPermanentExpiry(share.expiresAt) : true;
     setIsPermanent(permanent);
     if (share?.expiresAt && !permanent) {
@@ -371,7 +299,7 @@ export function ProviderShareSection({
     } else {
       setExpiresInSecsInput(String(permanentExpiresInSecs()));
     }
-  }, [share, shareableApp, ownerEmail, usageMarketEmailSet]);
+  }, [share, shareableApp, ownerEmail]);
 
   useEffect(() => {
     if (shareExists || subdomainManualRef.current || share) return;
@@ -401,29 +329,22 @@ export function ProviderShareSection({
   const shareDraftFingerprint = stableStringify({
     subdomain: subdomainInput.trim(),
     description: descriptionInput.trim(),
-    forSale: forSaleValue,
-    marketAccessMode,
-    selectedMarketEmails: uniqueSortedEmails(
-      selectedMarketEmails
-        .map((email) => email.trim().toLowerCase())
-        .filter(Boolean),
-    ),
-    shareToEmails: normalizeShareEmails(shareToEmails),
+    freeAccess,
     userGrants,
+    userUsageEdits,
     tokenLimit:
       !tokenLimitTouchedRef.current && share
         ? normalizeShareLimitValue(share.tokenLimit)
         : tokenLimitInput.trim()
           ? Number(tokenLimitInput)
           : UNLIMITED_TOKEN_LIMIT,
+    tokensUsed: tokensUsedTouchedRef.current ? tokensUsedInput.trim() : null,
     parallelLimit:
       !parallelLimitTouchedRef.current && share
         ? normalizeShareLimitValue(share.parallelLimit)
         : parallelLimitInput.trim()
           ? Number(parallelLimitInput)
           : UNLIMITED_PARALLEL_LIMIT,
-    officialPricePercent:
-      forSaleValue === "Yes" ? officialPricePercentInput.trim() : "",
     expiry:
       !expiresTouchedRef.current && share?.expiresAt
         ? isPermanentExpiry(share.expiresAt)
@@ -481,25 +402,6 @@ export function ProviderShareSection({
   const normalizedOwnerEmail = ownerEmail.trim().toLowerCase();
   const ownerEmailInvalid =
     !normalizedOwnerEmail || !isValidShareEmail(normalizedOwnerEmail);
-  const shareToInvalid = shareToEmails.some(
-    (email) => email && !isValidShareEmail(email),
-  );
-  const marketDisabled = forSaleValue !== "Yes";
-  const normalizedSelectedMarketEmails = uniqueSortedEmails(
-    selectedMarketEmails
-      .map((email) => email.trim().toLowerCase())
-      .filter((email) => usageMarketEmailSet.has(email)),
-  );
-  const salePricingEligible = forSaleValue === "Yes";
-  const salePricingVisible = shareRunning && salePricingEligible;
-  const salePricingInvalid =
-    officialPricePercentInput !== "" &&
-    !/^(?:[1-9]|[1-9][0-9]|100)$/.test(officialPricePercentInput);
-  const salePricingPayload =
-    salePricingEligible && officialPricePercentInput !== ""
-      ? { [shareableApp]: Number(officialPricePercentInput) }
-      : {};
-
   const resolveTokenLimit = () =>
     tokenLimitInput.trim() ? Number(tokenLimitInput) : UNLIMITED_TOKEN_LIMIT;
   const resolveParallelLimit = () =>
@@ -510,6 +412,31 @@ export function ProviderShareSection({
     Number(bankedResetExpiryLeadMinutes);
   const bankedResetLeadIsValid = (value: number) =>
     Number.isSafeInteger(value) && value >= 10 && value <= 10080;
+
+  /**
+   * The Share total counter is only ever sent when the operator actually
+   * edited it.  An untouched field must not resend the value the editor was
+   * opened with: requests that landed since then would be silently erased.
+   */
+  const resolveShareUsageEditForSave = (): ShareTotalUsageEdit | undefined => {
+    if (!tokensUsedTouchedRef.current) return undefined;
+    const raw = tokensUsedInput.trim();
+    if (!raw) return undefined;
+    const tokensUsed = Number(raw);
+    if (!Number.isSafeInteger(tokensUsed) || tokensUsed < 0) return undefined;
+    if (share && tokensUsed === share.tokensUsed) return undefined;
+    return tokensUsed === 0
+      ? { action: "clear" }
+      : { action: "set", tokensUsed };
+  };
+
+  const shareUsageEditIsInvalid = () => {
+    if (!tokensUsedTouchedRef.current) return false;
+    const raw = tokensUsedInput.trim();
+    if (!raw) return false;
+    const tokensUsed = Number(raw);
+    return !Number.isSafeInteger(tokensUsed) || tokensUsed < 0;
+  };
 
   const resolveTokenLimitForSave = () => {
     if (!tokenLimitTouchedRef.current && share) {
@@ -550,76 +477,60 @@ export function ProviderShareSection({
     expiresAt: isPermanent ? undefined : new Date(resolveExpiresAt()).getTime(),
   };
 
-  const effectiveMarketGrantEmails =
-    forSaleValue !== "Yes"
-      ? []
-      : marketAccessMode === "selected"
-        ? normalizedSelectedMarketEmails
-        : [];
-  const selectedMarketGrantEmails = new Set(effectiveMarketGrantEmails);
   const routerManagedGrantEmails = new Set(
     Object.values(userGrants)
       .filter((grant) => grant.manager === "routerShareMarket")
       .map((grant) => grant.email.trim().toLowerCase()),
   );
-  const protectedGrantEmails = new Set([
-    ...selectedMarketGrantEmails,
-    ...routerManagedGrantEmails,
-  ]);
+  const protectedGrantEmails = routerManagedGrantEmails;
 
-  const userGrantsForAcl = (aclEmails: string[]) =>
-    buildShareUserGrantsForAcl({
-      source: userGrants,
+  const activeShareToEmails = (grants: ShareUserGrantMap) =>
+    normalizeShareEmails(
+      Object.values(grants)
+        .filter((grant) => grant.active !== false && grant.role === "shareto")
+        .map((grant) => grant.email),
+    );
+
+  const canonicalUserGrants = (grants: ShareUserGrantMap) =>
+    buildShareUserGrants({
+      source: grants,
       ownerEmail: normalizedOwnerEmail,
-      aclEmails,
+      aclEmails: activeShareToEmails(grants),
       defaultPolicy: userGrantDefaultPolicy,
     });
 
-  const syncUserGrantsForMarketEmails = (marketEmails: string[]) => {
-    const aclEmails = normalizeShareEmails([...shareToEmails, ...marketEmails]);
-    setUserGrants((current) =>
-      buildShareUserGrantsForAcl({
-        source: current,
-        ownerEmail: normalizedOwnerEmail,
-        aclEmails,
-        defaultPolicy: userGrantDefaultPolicy,
-      }),
+  const canonicalUserUsageEdits = (grants: ShareUserGrantMap) => {
+    const allowed = new Set(
+      Object.values(grants)
+        .filter(
+          (grant) =>
+            grant.active !== false && grant.manager !== "routerShareMarket",
+        )
+        .map((grant) => grant.email.trim().toLowerCase()),
+    );
+    return Object.fromEntries(
+      Object.entries(userUsageEdits).filter(([email]) =>
+        allowed.has(email.trim().toLowerCase()),
+      ),
     );
   };
 
-  const displayedUserGrants = buildShareUserGrantsForAcl({
+  const displayedUserGrants = buildShareUserGrants({
     source: userGrants,
     ownerEmail: normalizedOwnerEmail,
-    aclEmails: [...shareToEmails, ...effectiveMarketGrantEmails],
+    aclEmails: activeShareToEmails(userGrants),
     defaultPolicy: userGrantDefaultPolicy,
   });
 
   const handleUserGrantsChange = (nextGrants: ShareUserGrantMap) => {
     setUserGrants(nextGrants);
-    setShareToEmails(
-      Object.values(nextGrants)
-        .filter((grant) => grant.active !== false && grant.role === "shareto")
-        .filter((grant) => !protectedGrantEmails.has(grant.email))
-        .map((grant) => grant.email),
-    );
     markShareDraftChanged();
   };
 
-  const buildAclPayload = (
-    tokenLimit: number,
-    parallelLimit: number,
-    expiresAt: string,
-  ) =>
-    buildShareAclPayload({
-      app: shareableApp,
-      forSale: forSaleValue,
-      marketAccessMode,
-      shareToEmails,
-      selectedTokenMarketEmails: normalizedSelectedMarketEmails,
-      tokenLimit,
-      parallelLimit,
-      expiresAt,
-    });
+  const handleUserUsageEditsChange = (nextEdits: ShareUserUsageEditMap) => {
+    setUserUsageEdits(nextEdits);
+    markShareDraftChanged();
+  };
 
   const createConfiguredShare = async () => {
     if (ownerEmailInvalid) {
@@ -628,8 +539,6 @@ export function ProviderShareSection({
       );
       return;
     }
-    if (shareToInvalid) return;
-
     const tokenLimit = resolveTokenLimitForSave();
     const parallelLimit = resolveParallelLimitForSave();
     const resetLeadMinutes = resolveBankedResetLeadMinutes();
@@ -655,25 +564,15 @@ export function ProviderShareSection({
       return;
     }
 
-    const aclPayload = buildAclPayload(tokenLimit, parallelLimit, expiresAt);
-    const payloadUserGrants = userGrantsForAcl(aclPayload.sharedWithEmails);
+    const payloadUserGrants = canonicalUserGrants(userGrants);
     const created = await createMutation.mutateAsync({
       bindings: { [shareableApp]: providerId },
-      forSale: forSaleValue,
+      freeAccess,
       tokenLimit,
       parallelLimit,
       expiresAt: expiresAtMs,
       subdomain: subdomainInput.trim() || undefined,
       description: descriptionInput.trim() || undefined,
-      sharedWithEmails: aclPayload.sharedWithEmails,
-      marketAccessMode: aclPayload.marketAccessMode,
-      accessByApp: aclPayload.accessByApp,
-      appSettings: aclPayload.appSettings,
-      forSaleOfficialPricePercentByApp: salePricingPayload,
-      officialPricePercent:
-        salePricingEligible && officialPricePercentInput !== ""
-          ? Number(officialPricePercentInput)
-          : null,
       allowPersonalCredits,
       autoConsumeBankedReset,
       bankedResetExpiryLeadMinutes: resetLeadMinutes,
@@ -733,19 +632,16 @@ export function ProviderShareSection({
       );
       return false;
     }
-    if (shareToInvalid || salePricingInvalid) {
-      toast.error(
-        t("provider.share.invalidConfiguration", {
-          defaultValue: "请修正远程分享配置后再保存",
-        }),
-      );
-      return false;
-    }
-
     const tokenLimit = resolveTokenLimitForSave();
     const parallelLimit = resolveParallelLimitForSave();
     const resetLeadMinutes = resolveBankedResetLeadMinutes();
     if (Number.isNaN(tokenLimit) || Number.isNaN(parallelLimit)) {
+      toast.error(
+        t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
+      );
+      return false;
+    }
+    if (shareUsageEditIsInvalid()) {
       toast.error(
         t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
       );
@@ -757,27 +653,14 @@ export function ProviderShareSection({
     }
 
     const nextExpiresAt = resolveExpiresAtForSave();
-    const aclPayload = buildAclPayload(
-      tokenLimit,
-      parallelLimit,
-      nextExpiresAt,
-    );
-    const payloadUserGrants = userGrantsForAcl(aclPayload.sharedWithEmails);
-    await saveMutation.mutateAsync({
+    const payloadUserGrants = canonicalUserGrants(userGrants);
+    const payloadUserUsageEdits = canonicalUserUsageEdits(payloadUserGrants);
+    const saved = (await saveMutation.mutateAsync({
       shareId: share.id,
       expectedConfigRevision: share.configRevision,
       subdomain: subdomainInput.trim(),
       description: descriptionInput.trim() || undefined,
-      forSale: forSaleValue,
-      sharedWithEmails: aclPayload.sharedWithEmails,
-      marketAccessMode: aclPayload.marketAccessMode,
-      accessByApp: aclPayload.accessByApp,
-      appSettings: aclPayload.appSettings,
-      forSaleOfficialPricePercentByApp: salePricingPayload,
-      officialPricePercent:
-        salePricingEligible && officialPricePercentInput !== ""
-          ? Number(officialPricePercentInput)
-          : null,
+      freeAccess,
       tokenLimit,
       parallelLimit,
       expiresAt: nextExpiresAt,
@@ -786,7 +669,13 @@ export function ProviderShareSection({
       bankedResetExpiryLeadMinutes: resetLeadMinutes,
       previousResponseCacheEnabled,
       userGrants: payloadUserGrants,
-    });
+      userUsageEdits: payloadUserUsageEdits,
+      shareUsageEdit: resolveShareUsageEditForSave(),
+    })) as ShareRecord;
+    if (saved?.userGrants) setUserGrants(saved.userGrants);
+    setUserUsageEdits({});
+    tokensUsedTouchedRef.current = false;
+    setTokensUsedInput(String(Math.max(0, saved?.tokensUsed ?? 0)));
     setShareDraftBaseline({
       key: shareDraftInitializationKey,
       fingerprint: shareDraftFingerprintRef.current,
@@ -807,11 +696,6 @@ export function ProviderShareSection({
       return;
     }
     if (share && isShareRunning(share)) {
-      const persistedPrice =
-        share.forSaleOfficialPricePercentByApp?.[shareableApp];
-      setOfficialPricePercentInput(
-        Number.isInteger(persistedPrice) ? String(persistedPrice) : "",
-      );
       await removeBindingMutation.mutateAsync({
         shareId: share.id,
         app: shareableApp,
@@ -833,9 +717,6 @@ export function ProviderShareSection({
     clientSubdomain && shareSlugPreview && routerHost
       ? `${shareSlugPreview}--${clientSubdomain}.${routerHost}`
       : null;
-
-  const marketsErrorMessage =
-    marketsError instanceof Error ? marketsError.message : undefined;
 
   return (
     <div className="rounded-lg border border-border/50 bg-muted/20">
@@ -1053,122 +934,41 @@ export function ProviderShareSection({
                   />
                 </div>
 
-                <div className="space-y-2">
-                  <Label htmlFor="provider-share-for-sale">
-                    {t("share.forSale", { defaultValue: "For Sale" })}
-                  </Label>
-                  <Select
-                    value={forSaleValue}
-                    disabled={busy}
-                    onValueChange={(value) => {
-                      const next = value as "Yes" | "No" | "Free";
-                      if (next === "Free") {
-                        setConfirmFreeOpen(true);
-                      } else {
-                        setForSaleValue(next);
-                        if (next !== "Yes") setOfficialPricePercentInput("");
-                        markShareDraftChanged();
-                      }
-                    }}
-                  >
-                    <SelectTrigger id="provider-share-for-sale">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="No">
-                        {t("share.forSaleOptions.no", { defaultValue: "否" })}
-                      </SelectItem>
-                      <SelectItem value="Yes">
-                        {t("share.forSaleOptions.yes", { defaultValue: "是" })}
-                      </SelectItem>
-                      <SelectItem value="Free">
-                        {t("share.forSaleOptions.free", {
-                          defaultValue: "免费",
-                        })}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                {salePricingVisible ? (
-                  <div className="space-y-2 md:col-span-2">
-                    <Label htmlFor="provider-share-official-price-percent">
-                      {t("provider.share.officialPricePercent", {
-                        defaultValue: "模型定价（官方价的百分比）",
-                      })}
-                    </Label>
-                    <Input
-                      id="provider-share-official-price-percent"
-                      type="text"
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      maxLength={3}
-                      value={officialPricePercentInput}
+                <div className="space-y-2 md:col-span-2">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="provider-share-free-access"
+                      checked={freeAccess}
                       disabled={busy}
-                      aria-invalid={salePricingInvalid}
-                      className={cn(salePricingInvalid && "border-destructive")}
-                      placeholder={t(
-                        "provider.share.officialPricePercentPlaceholder",
-                        {
-                          defaultValue: "留空则使用 Token Market 默认定价",
-                        },
-                      )}
-                      onChange={(event) => {
-                        setOfficialPricePercentInput(event.target.value);
+                      onCheckedChange={(checked) => {
+                        setFreeAccess(checked === true);
                         markShareDraftChanged();
                       }}
                     />
-                    <p
-                      className={cn(
-                        "text-xs",
-                        salePricingInvalid
-                          ? "text-destructive"
-                          : "text-muted-foreground",
-                      )}
+                    <Label
+                      htmlFor="provider-share-free-access"
+                      className="cursor-pointer font-normal"
                     >
-                      {salePricingInvalid
-                        ? t("provider.share.officialPricePercentInvalid", {
-                            defaultValue: "模型定价必须是 1-100 的整数。",
-                          })
-                        : t("provider.share.officialPricePercentHint", {
-                            defaultValue: "只允许 1-100 的整数。",
-                          })}
-                    </p>
+                      {t("share.freeAccess.label", {
+                        defaultValue: "公开免费使用",
+                      })}
+                    </Label>
                   </div>
-                ) : null}
-
-                <MarketSelectorField
-                  markets={usageMarkets}
-                  marketAccessMode={marketAccessMode}
-                  selectedMarketEmails={normalizedSelectedMarketEmails}
-                  marketSelectKey={marketSelectKey}
-                  disabled={marketDisabled || busy}
-                  marketsLoading={marketsLoading}
-                  marketsError={marketsErrorMessage}
-                  onRetryMarkets={() => void refetchMarkets()}
-                  onMarketAccessModeChange={(value) => {
-                    setMarketAccessMode(value);
-                    if (value === "all") setSelectedMarketEmails([]);
-                    syncUserGrantsForMarketEmails(
-                      value === "selected"
-                        ? normalizedSelectedMarketEmails
-                        : [],
-                    );
-                    markShareDraftChanged();
-                  }}
-                  onSelectedMarketEmailsChange={(emails) => {
-                    setSelectedMarketEmails(emails);
-                    syncUserGrantsForMarketEmails(emails);
-                    markShareDraftChanged();
-                  }}
-                  onMarketSelectKeyChange={setMarketSelectKey}
-                />
+                  <p className="text-xs text-muted-foreground">
+                    {t("share.freeAccess.hint", {
+                      defaultValue:
+                        "默认私有。勾选后，任意已登录 Router 用户可免费调用；下方授权用户仍可设置个人配额。",
+                    })}
+                  </p>
+                </div>
 
                 <ShareUserGrantsEditor
                   value={displayedUserGrants}
                   ownerEmail={normalizedOwnerEmail}
                   defaultPolicy={userGrantDefaultPolicy}
                   protectedEmails={protectedGrantEmails}
+                  usageEdits={userUsageEdits}
+                  onUsageEditsChange={handleUserUsageEditsChange}
                   disabled={busy}
                   onChange={handleUserGrantsChange}
                 />
@@ -1225,6 +1025,27 @@ export function ProviderShareSection({
                           {preset.toLocaleString()}
                         </Button>
                       ))}
+                    </div>
+                    <div className="space-y-1.5 pt-1">
+                      <Label htmlFor="provider-share-tokens-used">
+                        {t("share.totalUsageEdit.label")}
+                      </Label>
+                      <Input
+                        id="provider-share-tokens-used"
+                        type="number"
+                        min={0}
+                        step={1}
+                        disabled={busy || !shareExists}
+                        value={tokensUsedInput}
+                        onChange={(event) => {
+                          tokensUsedTouchedRef.current = true;
+                          setTokensUsedInput(event.target.value);
+                          markShareDraftChanged();
+                        }}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {t("share.totalUsageEdit.hint")}
+                      </p>
                     </div>
                   </div>
 
@@ -1398,23 +1219,6 @@ export function ProviderShareSection({
         </div>
       </div>
 
-      <ConfirmDialog
-        isOpen={confirmFreeOpen}
-        title={t("share.forSaleOptions.free", { defaultValue: "免费" })}
-        message={t("share.freeConfirm", {
-          defaultValue: "确认将 For Sale 设为 Free？",
-        })}
-        confirmText={t("common.confirm", { defaultValue: "确认" })}
-        cancelText={t("common.cancel", { defaultValue: "取消" })}
-        variant="info"
-        onConfirm={() => {
-          setForSaleValue("Free");
-          setOfficialPricePercentInput("");
-          markShareDraftChanged();
-          setConfirmFreeOpen(false);
-        }}
-        onCancel={() => setConfirmFreeOpen(false)}
-      />
       <ProviderShareReuseDialog
         candidates={reuseCandidates}
         onConfirm={(reuse, shareId) => {
@@ -1422,162 +1226,6 @@ export function ProviderShareSection({
         }}
         onCancel={() => setReuseCandidates(null)}
       />
-    </div>
-  );
-}
-
-export function MarketSelectorField({
-  markets,
-  marketAccessMode,
-  selectedMarketEmails,
-  marketSelectKey,
-  disabled,
-  marketsLoading,
-  marketsError,
-  onRetryMarkets,
-  onMarketAccessModeChange,
-  onSelectedMarketEmailsChange,
-  onMarketSelectKeyChange,
-}: {
-  markets: PublicTokenMarket[];
-  marketAccessMode: "selected" | "all";
-  selectedMarketEmails: string[];
-  marketSelectKey: number;
-  disabled: boolean;
-  marketsLoading: boolean;
-  marketsError?: string;
-  onRetryMarkets: () => void;
-  onMarketAccessModeChange: (mode: "selected" | "all") => void;
-  onSelectedMarketEmailsChange: (emails: string[]) => void;
-  onMarketSelectKeyChange: (updater: (current: number) => number) => void;
-}) {
-  const { t } = useTranslation();
-
-  return (
-    <div className="space-y-2 md:col-span-2">
-      <Label>{t("share.market.title", { defaultValue: "Token Market" })}</Label>
-      <div className="flex flex-wrap items-center gap-2">
-        <Select
-          key={marketSelectKey}
-          value={marketAccessMode === "all" ? "__all__" : "__selected_market__"}
-          disabled={disabled}
-          onValueChange={(value) => {
-            if (value === "__all__") {
-              onMarketAccessModeChange("all");
-              onMarketSelectKeyChange((current) => current + 1);
-              return;
-            }
-            if (value === "__selected_market__") {
-              onMarketAccessModeChange("selected");
-              return;
-            }
-            onMarketAccessModeChange("selected");
-            onSelectedMarketEmailsChange(
-              uniqueSortedEmails([
-                ...selectedMarketEmails,
-                value.toLowerCase(),
-              ]),
-            );
-            onMarketSelectKeyChange((current) => current + 1);
-          }}
-        >
-          <SelectTrigger className="w-56">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all__">
-              {t("share.market.all", { defaultValue: "全部" })}
-            </SelectItem>
-            <SelectItem value="__selected_market__" disabled>
-              {t("share.market.select", { defaultValue: "选择 Market" })}
-            </SelectItem>
-            {markets.map((market) => (
-              <SelectItem key={market.id} value={market.email}>
-                {formatMarketSelectLabel(market)}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        {marketsLoading ? (
-          <span className="text-xs text-muted-foreground">
-            {t("common.loading", { defaultValue: "加载中" })}
-          </span>
-        ) : null}
-        {marketsError ? (
-          <button
-            type="button"
-            className="text-xs text-destructive underline"
-            onClick={onRetryMarkets}
-          >
-            {marketsError}
-          </button>
-        ) : null}
-      </div>
-      {marketAccessMode === "all" ? (
-        <Badge variant="secondary" className="w-fit text-xs">
-          {t("share.market.allSelected", { defaultValue: "已选中所有 Market" })}
-        </Badge>
-      ) : (
-        <MarketTags
-          markets={markets}
-          selectedMarketEmails={selectedMarketEmails}
-          removable
-          disabled={disabled}
-          onRemove={(email) =>
-            onSelectedMarketEmailsChange(
-              selectedMarketEmails.filter((item) => item !== email),
-            )
-          }
-        />
-      )}
-    </div>
-  );
-}
-
-function MarketTags({
-  markets,
-  selectedMarketEmails,
-  removable = false,
-  disabled = false,
-  onRemove,
-}: {
-  markets: PublicTokenMarket[];
-  selectedMarketEmails: string[];
-  removable?: boolean;
-  disabled?: boolean;
-  onRemove?: (email: string) => void;
-}) {
-  const marketByEmail = new Map(
-    markets.map((market) => [market.email.toLowerCase(), market]),
-  );
-
-  if (selectedMarketEmails.length === 0) return null;
-
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {selectedMarketEmails.map((email) => {
-        const market = marketByEmail.get(email);
-        return (
-          <Badge
-            key={email}
-            variant="outline"
-            className="flex items-center gap-1 text-xs"
-          >
-            <span>{market?.displayName ?? email}</span>
-            {removable ? (
-              <button
-                type="button"
-                className="rounded-full text-muted-foreground hover:text-foreground disabled:opacity-50"
-                disabled={disabled}
-                aria-label={`Remove ${market?.displayName ?? email}`}
-                onClick={() => onRemove?.(email)}
-              >
-                <X className="h-3 w-3" />
-              </button>
-            ) : null}
-          </Badge>
-        );
-      })}
     </div>
   );
 }

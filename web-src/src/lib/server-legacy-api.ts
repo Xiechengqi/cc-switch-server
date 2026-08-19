@@ -494,12 +494,6 @@ export interface AccountDevicePollResponse {
   account?: AccountLoginAccountSummary | null;
 }
 
-export interface ShareAcl {
-  sharedWithEmails: string[];
-  publicMarketEmail?: string | null;
-  marketAccessMode?: string | null;
-}
-
 export interface ShareBinding {
   app: AppKind;
   providerId: string;
@@ -520,7 +514,6 @@ export interface ShareRecord {
   accountEmail?: string | null;
   quotaPercent?: number | null;
   tunnelSubdomain?: string | null;
-  acl?: ShareAcl | null;
   tokenLimit?: number | null;
   parallelLimit?: number | null;
   tokensUsed: number;
@@ -530,11 +523,7 @@ export interface ShareRecord {
   created_at_ms?: number | string | null;
   created_at?: number | string | null;
   expiresAt?: number | null;
-  forSale: boolean;
-  accessByApp?: Record<string, unknown>;
-  appSettings?: Record<string, unknown>;
-  forSaleOfficialPricePercentByApp?: Record<string, number>;
-  officialPricePercent?: number | null;
+  freeAccess?: boolean;
   allowPersonalCredits?: boolean;
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
@@ -565,15 +554,10 @@ export interface UpsertShareInput {
   accountEmail?: string | null;
   quotaPercent?: number | null;
   tunnelSubdomain?: string | null;
-  acl?: ShareAcl;
   tokenLimit?: number;
   parallelLimit?: number;
   expiresAt?: number;
-  forSale?: boolean;
-  accessByApp?: Record<string, unknown>;
-  appSettings?: Record<string, unknown>;
-  forSaleOfficialPricePercentByApp?: Record<string, number>;
-  officialPricePercent?: number;
+  freeAccess?: boolean;
   allowPersonalCredits?: boolean;
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;

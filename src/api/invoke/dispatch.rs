@@ -1,6 +1,5 @@
 use super::super::*;
-use std::collections::BTreeMap;
-
+use crate::domain::sharing::retired_fields::find_retired_share_field;
 use crate::domain::sharing::router_contract::ShareSettingsPatch;
 
 pub(in crate::api) async fn web_invoke_compat(
@@ -46,6 +45,20 @@ async fn web_invoke_requires_session(state: &ServerState, command: &str) -> bool
         | "login_with_api_token" => false,
         _ => true,
     }
+}
+
+/// Verified admin identity for operator-attributable Share mutations.
+///
+/// The session is already required before dispatch, so a missing principal
+/// here means the request arrived over a path that carries no identity; the
+/// mutation still proceeds, it is simply recorded as unattributed.
+async fn share_usage_operator(state: &ServerState, headers: &HeaderMap) -> Option<String> {
+    crate::api::session::resolve_web_admin_principal(state, headers)
+        .await
+        .ok()
+        .flatten()
+        .map(|principal| principal.user_email().trim().to_ascii_lowercase())
+        .filter(|email| !email.is_empty())
 }
 
 async fn web_invoke_dispatch(
@@ -697,10 +710,6 @@ async fn web_invoke_dispatch(
                 .ok_or_else(|| ApiError::not_found("share not found"))?;
             Ok(json!(connect_info_for_share(&config, &share)?))
         }
-        "list_token_markets" => {
-            let markets = fetch_public_token_markets_from_router(state).await?;
-            Ok(json!(markets))
-        }
         "create_share" => {
             let input = web_share_upsert_input(state, &args).await?;
             let value = web_payload(&args, &["params", "input", "share"]);
@@ -816,16 +825,14 @@ async fn web_invoke_dispatch(
             Ok(json!(response))
         }
         "email_auth_logout" => web_email_auth_logout(state).await,
-        "update_share_acl" => {
-            let share = web_update_share_acl(state, &args).await?;
-            Ok(json!(share))
-        }
         "save_provider_share" => {
-            let share = Box::pin(web_save_provider_share(state, &args)).await?;
+            let operator = share_usage_operator(state, headers).await;
+            let share = Box::pin(web_save_provider_share(state, &args, operator)).await?;
             Ok(json!(share))
         }
         "save_provider_bundle_share" => {
-            let share = Box::pin(web_save_provider_bundle_share(state, &args)).await?;
+            let operator = share_usage_operator(state, headers).await;
+            let share = Box::pin(web_save_provider_bundle_share(state, &args, operator)).await?;
             match share.as_ref() {
                 Some(share) => web_share_json(&state.config_snapshot().await, share),
                 None => Ok(Value::Null),
@@ -1696,19 +1703,6 @@ async fn web_invoke_dispatch(
             .await?;
             Ok(json!(share))
         }
-        "update_share_for_sale" => {
-            let payload = web_payload(&args, &["params", "input"]);
-            let share = web_patch_share_settings(
-                state,
-                payload,
-                ShareSettingsPatch {
-                    for_sale: web_optional_string_any(payload, &["forSale", "for_sale"]),
-                    ..ShareSettingsPatch::default()
-                },
-            )
-            .await?;
-            Ok(json!(share))
-        }
         "update_share_token_limit" => {
             let payload = web_payload(&args, &["params", "input"]);
             let token_limit = payload
@@ -1757,48 +1751,6 @@ async fn web_invoke_dispatch(
             .await?;
             Ok(json!(share))
         }
-        "update_share_for_sale_official_price_percent" => {
-            let payload = web_payload(&args, &["params", "input"]);
-            let official_price_percent = match payload
-                .get("officialPricePercent")
-                .or_else(|| payload.get("official_price_percent"))
-            {
-                Some(Value::Null) => Some(None),
-                Some(raw) => Some(Some(
-                    raw.as_u64()
-                        .and_then(|value| u16::try_from(value).ok())
-                        .ok_or_else(|| {
-                            ApiError::bad_request(
-                                "officialPricePercent must be an integer between 1 and 100",
-                            )
-                        })?,
-                )),
-                None => None,
-            };
-            let pricing = web_optional_deserialize::<BTreeMap<AppKind, u16>>(
-                payload,
-                "forSaleOfficialPricePercentByApp",
-            )?
-            .or_else(|| {
-                web_optional_deserialize::<BTreeMap<AppKind, u16>>(
-                    payload,
-                    "for_sale_official_price_percent_by_app",
-                )
-                .ok()
-                .flatten()
-            });
-            let share = web_patch_share_settings(
-                state,
-                payload,
-                ShareSettingsPatch {
-                    for_sale_official_price_percent_by_app: pricing,
-                    official_price_percent,
-                    ..ShareSettingsPatch::default()
-                },
-            )
-            .await?;
-            Ok(json!(share))
-        }
         "update_share_subdomain" => {
             let payload = web_payload(&args, &["params", "input"]);
             let share_id = web_arg_share_id(payload)?;
@@ -1841,6 +1793,14 @@ async fn web_invoke_dispatch(
             Ok(json!(response.share))
         }
         "import_shares" => {
+            if let Some(field) = find_retired_share_field(
+                args.get("shares")
+                    .ok_or_else(|| ApiError::bad_request("shares is required"))?,
+            ) {
+                return Err(ApiError::bad_request(format!(
+                    "retired Share field `{field}` is not accepted; use freeAccess/userGrants"
+                )));
+            }
             let shares: Vec<Share> = web_arg_value_any(&args, &["shares"])?;
             for share in &shares {
                 crate::domain::sharing::invariants::validate_share_import(share)

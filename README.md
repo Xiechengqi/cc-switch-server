@@ -25,7 +25,7 @@ browser / operator
 
 ```text
 Claude / Codex / Gemini client
-  -> Router Share URL or market API URL
+  -> Router Share URL / signed Gateway route
   -> cc-switch-router
   -> signed ingress over SSH reverse tunnel
   -> cc-switch-server Share binding
@@ -52,7 +52,7 @@ Claude / Codex / Gemini client
 - Router ingress 新鲜度采用非对称边界:最多接受 30 秒前签发、最多接受未来 5 秒签发的上下文,边界值有效。验签失败仍返回空正文 `401`,同时用 `x-cc-switch-internal-ingress-*` 向 Router 提供稳定原因码和时间诊断；这些内部响应头必须由 Router 剥离,不得传给公网调用方。普通业务 `401` 不附该诊断头。
 - 支持 Router 内建 Share Market entitlement add/revoke 通过 pending edit 幂等应用到 Server Share，并同步 per-app 授权展示状态。
 - Usage 记录完整 request lifecycle、Provider Bundle/Surface、Share/用户、实际上游模型、重试、延迟与 Token 观测状态，并通过 Server-native REST 提供聚合、筛选、明细和 cursor 分页。
-- usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值、Share Token 限额及 Token Market 售价仍按各自业务边界管理。
+- usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值和 Share Token 限额由 Server/Router 各自边界管理。Server 不保存外部 Token Market 用户、价格或账本。
 - JSON 写入使用 temp file fsync、atomic rename 和父目录 fsync；`/api/backup` 支持创建、列出、恢复主要 store，恢复前自动 pre-restore 快照。
 - `/web-api/events` 通过已认证 SSE 推送 Usage/Share/tunnel 事件，Web 当前页会刷新对应查询缓存。
 - `cc-switch-server version --json` 和 `/version` 会输出版本、commit id、commit message、build time、target、profile、rustc 和 dirty 状态。
@@ -205,14 +205,14 @@ RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 - `cc_switch_router_upgrade_task_reports_total{outcome="success|failure"}`：升级任务回执尝试次数。
 - `cc_switch_router_upgrade_task_report_last_success_timestamp_seconds`：最近一次成功回执的 Unix 时间戳；尚未成功回执前不会输出该时间序列。
 
-有真实 router、market、provider、OAuth 或 Router 内建 Share Market 端到端环境时，把变量写入私有 env 文件后运行：
+有真实 Router、Share grant、Client Market、provider 或 OAuth 端到端环境时，把变量写入私有 env 文件后运行：
 
 ```bash
 set -a
 source /tmp/cc-switch-server-real.env
 set +a
 STRICT=1 scripts/smoke/real-acceptance-env-check.sh
-RUN_PROBES=1 STREAM_PROBE=1 scripts/smoke/direct-market-diagnostics.sh
+RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/router-share-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 RUN_REAL=1 scripts/release-readiness.sh
 ```
@@ -258,13 +258,13 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 7. Router 内建 Share Market entitlement 会通过 pending share edit 下发；Server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
 8. router 可经 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime`、`/_share-router/model-health` 拉取 runtime。
 9. `/_ctl/apply_share_settings` 和 `/_ctl/refresh_share_usage` 使用 router `control_secret` HMAC、timestamp、nonce 防重放。
-10. Router Share URL 请求由已验签 ingress context 中的 Share 身份选择 binding。Router 将非 market 的 Share 流量标记为 `dataSource=direct`；对应 request log 由 server 同步到 router，market source 日志不由 server 回传，避免与 market 侧计费日志重复。
+10. Router Share URL 请求由已验签 ingress context 中的 Share 身份选择 binding。Server 只同步 Router Share/Gateway observation 所需的脱敏 request log；Router migration 21 已将可安全关联的旧 usage 最小化迁入 canonical Share log，并物理删除旧 Market 明细与 archive。
 
 联调验收重点：
 
 - router client 表中 0 share client 也应显示在线/健康。
 - router share 表能看到 server share 的 owner、subdomain、app runtime、provider 和 quota 展示字段。
-- market API URL 能调度 server share。
+- signed Gateway/Share route 能调度 server share（真实 Gateway 输入缺失时标记 blocked）。
 - Router Share URL 能经 Router 调用 server Share，request log 不重复且保留 country/IP/source。
 - Router 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 Server Share。
 
@@ -295,7 +295,7 @@ GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后
 | Codex Images | capability URL 固定使用 Router 签名 context 中的 Share host；短期图片默认保存到 `<config-dir>/image-capabilities`，仅多副本共享时用 `CC_SWITCH_IMAGE_STORE_DIR` 覆盖，底层文件系统必须支持跨进程锁和 atomic rename |
 | OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
 | Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
-| 真实验收 | `ROUTER_BASE_URL`、`MARKET_URL`、`MARKET_API_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`CC_SWITCH_SHARE_URL` 及各真实 Provider token |
+| 真实验收 | `ROUTER_BASE_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`CC_SWITCH_SHARE_URL` 及各真实 Provider token |
 | stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
 | release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
 
@@ -375,6 +375,10 @@ Router Share URL 下的反代入口：
 ## 文档
 
 - [外部 Provider 审计台账](UPSTREAM_IMPORT.md)
+- [历史三方系统审计（已废止）](docs/system-audit-and-normalization-plan.md)
+- [Client + Router：旧 Token Market 解耦与剔除实施计划](docs/token-market-decoupling-plan.md)
+- [Client + Router：旧 Token Market 解耦整体 Review](docs/token-market-decoupling-review.md)
+- [独立 Market 候选实现历史评估（非当前前置）](docs/market-replacement-sub2api-plan.md)
 - [UI 人工验收清单](docs/manual-ui-checklist.md)
 - [部署](docs/deployment.md)
 - [真实验收 runbook](docs/real-acceptance-runbook.md)

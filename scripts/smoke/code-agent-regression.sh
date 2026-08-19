@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The server's large protocol fixtures need a larger test-thread stack than
+# Rust's platform default.  Keep the override configurable while making this
+# gate agree with the documented full-test command.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"
+
 SERVER_URL="${SERVER_URL:-http://127.0.0.1:15721}"
 API_TOKEN="${CC_SWITCH_SERVER_TOKEN:-}"
 SHARE_URL="${CC_SWITCH_SHARE_URL:-}"
-MARKET_API_URL="${MARKET_API_URL:-}"
-MARKET_CLAUDE_API_URL="${MARKET_CLAUDE_API_URL:-}"
-MARKET_CODEX_API_URL="${MARKET_CODEX_API_URL:-${MARKET_API_URL}}"
-MARKET_GEMINI_API_URL="${MARKET_GEMINI_API_URL:-}"
 ROUTER_API_TOKEN="${ROUTER_API_TOKEN:-}"
 ROUTER_API_TOKEN_HEADER="${ROUTER_API_TOKEN_HEADER:-Authorization}"
-MARKET_API_TOKEN="${MARKET_API_TOKEN:-}"
-MARKET_API_TOKEN_HEADER="${MARKET_API_TOKEN_HEADER:-}"
 RUN_CONTRACT_TESTS="${RUN_CONTRACT_TESTS:-1}"
 RUN_REAL="${RUN_REAL:-0}"
 STREAM_PROBE="${STREAM_PROBE:-0}"
@@ -47,16 +46,6 @@ if [[ -n "$ROUTER_API_TOKEN" ]]; then
     Authorization|authorization) router_auth_header=(-H "Authorization: Bearer $ROUTER_API_TOKEN") ;;
     x-api-key|X-API-Key|x-goog-api-key|X-Goog-Api-Key) router_auth_header=(-H "$ROUTER_API_TOKEN_HEADER: $ROUTER_API_TOKEN") ;;
     *) echo "unsupported ROUTER_API_TOKEN_HEADER: $ROUTER_API_TOKEN_HEADER" >&2; exit 2 ;;
-  esac
-fi
-
-market_auth_header=("${router_auth_header[@]}")
-if [[ -n "$MARKET_API_TOKEN" ]]; then
-  market_header="${MARKET_API_TOKEN_HEADER:-Authorization}"
-  case "$market_header" in
-    Authorization|authorization) market_auth_header=(-H "Authorization: Bearer $MARKET_API_TOKEN") ;;
-    x-api-key|X-API-Key|x-goog-api-key|X-Goog-Api-Key) market_auth_header=(-H "$market_header: $MARKET_API_TOKEN") ;;
-    *) echo "unsupported MARKET_API_TOKEN_HEADER: $market_header" >&2; exit 2 ;;
   esac
 fi
 
@@ -270,48 +259,6 @@ if [[ -n "$SHARE_URL" && -n "$ROUTER_API_TOKEN" ]]; then
     fi
 else
   skip "CC_SWITCH_SHARE_URL or ROUTER_API_TOKEN missing; skipped Router Share probes"
-fi
-
-echo "== market source probes =="
-if [[ -n "$ROUTER_API_TOKEN" || -n "$MARKET_API_TOKEN" ]]; then
-  if [[ -n "$MARKET_CLAUDE_API_URL" ]]; then
-    probe "market claude messages non-stream" "$MARKET_CLAUDE_API_URL/v1/messages" \
-      '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":false}' \
-      "${market_auth_header[@]}"
-    if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "market claude messages stream" "$MARKET_CLAUDE_API_URL/v1/messages" \
-        '{"model":"probe","max_tokens":1,"messages":[{"role":"user","content":"stream ping"}],"stream":true}' \
-        "${market_auth_header[@]}"
-    fi
-  else
-    skip "MARKET_CLAUDE_API_URL missing; skipped market Claude probes"
-  fi
-  if [[ -n "$MARKET_CODEX_API_URL" ]]; then
-    probe "market codex responses non-stream" "$MARKET_CODEX_API_URL/v1/responses" \
-    '{"model":"probe","input":"ping","stream":false,"max_output_tokens":1}' \
-    "${market_auth_header[@]}"
-    if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "market codex responses stream" "$MARKET_CODEX_API_URL/v1/responses" \
-        '{"model":"probe","input":"stream ping","stream":true,"max_output_tokens":1}' \
-        "${market_auth_header[@]}"
-    fi
-  else
-    skip "MARKET_CODEX_API_URL/MARKET_API_URL missing; skipped market Codex probes"
-  fi
-  if [[ -n "$MARKET_GEMINI_API_URL" ]]; then
-    probe "market gemini generateContent non-stream" "$MARKET_GEMINI_API_URL/v1beta/models/probe:generateContent" \
-      '{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-      "${market_auth_header[@]}"
-    if [[ "$STREAM_PROBE" == "1" ]]; then
-      stream_probe "market gemini generateContent stream" "$MARKET_GEMINI_API_URL/v1beta/models/probe:streamGenerateContent" \
-        '{"contents":[{"role":"user","parts":[{"text":"stream ping"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-        "${market_auth_header[@]}"
-    fi
-  else
-    skip "MARKET_GEMINI_API_URL missing; skipped market Gemini probes"
-  fi
-else
-  skip "ROUTER_API_TOKEN/MARKET_API_TOKEN missing; skipped market source probes"
 fi
 
 if [[ "$RUN_REAL" != "1" ]]; then
