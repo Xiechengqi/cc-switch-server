@@ -86,7 +86,7 @@ pub(in crate::api) async fn setup_check_subdomain(
     let router_url =
         ServerConfig::preview_router_url(&input.router_url).map_err(ApiError::bad_request)?;
     let availability =
-        check_subdomain_for_router_outcome(&state, &router_url, &subdomain, None).await?;
+        check_subdomain_for_router_outcome(&state, &router_url, &subdomain, None, None).await?;
     Ok(Json(SetupSubdomainCheckResponse {
         ok: true,
         available: availability.available,

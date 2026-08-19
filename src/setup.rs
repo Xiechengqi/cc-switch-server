@@ -167,7 +167,15 @@ pub async fn complete_setup(
 
     if let Some(router_url) = config.router_api_base() {
         if let Some(subdomain) = config.client.tunnel_subdomain.clone() {
-            match check_subdomain_for_router(state, router_url, &subdomain, None).await {
+            match check_subdomain_for_router(
+                state,
+                router_url,
+                &subdomain,
+                None,
+                config.owner.email.as_deref(),
+            )
+            .await
+            {
                 Ok(availability) if !availability.available => {
                     return Err(subdomain_conflict_error(
                         &subdomain,

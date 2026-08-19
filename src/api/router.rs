@@ -147,11 +147,13 @@ pub(in crate::api) async fn web_client_tunnel_subdomain_check(
         .identity
         .as_ref()
         .map(|identity| identity.installation_id.as_str());
+    let owner_email = config.owner.email.as_deref();
     let availability = crate::client_tunnel_provision::check_subdomain_for_router_outcome(
         &state,
         router_url,
         &subdomain,
         installation_id,
+        owner_email,
     )
     .await?;
     Ok(Json(SetupSubdomainCheckResponse {

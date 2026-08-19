@@ -101,6 +101,7 @@ pub(crate) async fn check_subdomain_for_router(
     router_url: &str,
     subdomain: &str,
     installation_id: Option<&str>,
+    owner_email: Option<&str>,
 ) -> Result<SubdomainAvailability, ApiError> {
     let http_client = state.http_client().await;
     client::check_client_tunnel_subdomain_available(
@@ -108,6 +109,7 @@ pub(crate) async fn check_subdomain_for_router(
         router_url,
         subdomain,
         installation_id,
+        owner_email,
     )
     .await
     .map_err(|error| ApiError::bad_gateway(format!("router subdomain check failed: {error}")))
@@ -118,8 +120,11 @@ pub(crate) async fn check_subdomain_for_router_outcome(
     router_url: &str,
     subdomain: &str,
     installation_id: Option<&str>,
+    owner_email: Option<&str>,
 ) -> Result<SubdomainCheckOutcome, ApiError> {
-    match check_subdomain_for_router(state, router_url, subdomain, installation_id).await {
+    match check_subdomain_for_router(state, router_url, subdomain, installation_id, owner_email)
+        .await
+    {
         Ok(availability) => Ok(SubdomainCheckOutcome {
             available: availability.available,
             checked: true,
@@ -152,6 +157,7 @@ pub(crate) async fn check_router_reachable(
             &http_client,
             router_url,
             "zzzzprobe",
+            None,
             None,
         )
         .await
@@ -197,7 +203,9 @@ pub(crate) async fn suggest_client_tunnel_subdomain(
             });
         }
 
-        match check_subdomain_for_router(state, router_url, &candidate, installation_id).await {
+        match check_subdomain_for_router(state, router_url, &candidate, installation_id, None)
+            .await
+        {
             Ok(availability) if availability.available => {
                 return Ok(SuggestSubdomainOutcome {
                     subdomain: candidate,
@@ -270,8 +278,17 @@ pub(crate) async fn provision_client_tunnel(
     let installation_id = config
         .registered_router_identity()
         .map(|identity| identity.installation_id.as_str());
+    let owner_email = config.owner.email.as_deref();
     if let Some(subdomain) = config.client.tunnel_subdomain.clone() {
-        match check_subdomain_for_router(state, &api_base, &subdomain, installation_id).await {
+        match check_subdomain_for_router(
+            state,
+            &api_base,
+            &subdomain,
+            installation_id,
+            owner_email,
+        )
+        .await
+        {
             Ok(availability) if !availability.available => {
                 return Err(subdomain_conflict_error(
                     &subdomain,

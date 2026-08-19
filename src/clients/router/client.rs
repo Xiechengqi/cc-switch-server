@@ -1300,12 +1300,14 @@ pub async fn check_client_tunnel_subdomain_available(
     router_api_base: &str,
     subdomain: &str,
     installation_id: Option<&str>,
+    owner_email: Option<&str>,
 ) -> anyhow::Result<SubdomainAvailability> {
     check_client_tunnel_subdomain_available_with_timeout(
         http,
         router_api_base,
         subdomain,
         installation_id,
+        owner_email,
         ROUTER_CONTROL_PLANE_SYNC_TIMEOUT,
     )
     .await
@@ -1358,6 +1360,7 @@ async fn check_client_tunnel_subdomain_available_with_timeout(
     router_api_base: &str,
     subdomain: &str,
     installation_id: Option<&str>,
+    owner_email: Option<&str>,
     timeout: Duration,
 ) -> anyhow::Result<SubdomainAvailability> {
     tokio::time::timeout(
@@ -1367,6 +1370,7 @@ async fn check_client_tunnel_subdomain_available_with_timeout(
             router_api_base,
             subdomain,
             installation_id,
+            owner_email,
         ),
     )
     .await
@@ -1383,6 +1387,7 @@ async fn check_client_tunnel_subdomain_available_request(
     router_api_base: &str,
     subdomain: &str,
     installation_id: Option<&str>,
+    owner_email: Option<&str>,
 ) -> anyhow::Result<SubdomainAvailability> {
     let api_base = router_api_base.trim_end_matches('/');
     let mut url = reqwest::Url::parse(&format!(
@@ -1394,6 +1399,10 @@ async fn check_client_tunnel_subdomain_available_request(
     if let Some(installation_id) = installation_id.filter(|value| !value.trim().is_empty()) {
         url.query_pairs_mut()
             .append_pair("installationId", installation_id.trim());
+    }
+    if let Some(owner_email) = owner_email.filter(|value| !value.trim().is_empty()) {
+        url.query_pairs_mut()
+            .append_pair("ownerEmail", owner_email.trim());
     }
     let response = http
         .get(url)
@@ -4462,6 +4471,7 @@ mod tests {
             &reqwest::Client::new(),
             &format!("http://{addr}"),
             "availability-timeout",
+            None,
             None,
             Duration::from_millis(20),
         )

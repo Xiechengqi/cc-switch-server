@@ -891,11 +891,13 @@ async fn web_invoke_dispatch(
                 .identity
                 .as_ref()
                 .map(|identity| identity.installation_id.as_str());
+            let owner_email = config.owner.email.as_deref();
             let availability = crate::client_tunnel_provision::check_subdomain_for_router(
                 state,
                 router_url,
                 &subdomain,
                 installation_id,
+                owner_email,
             )
             .await?;
             Ok(json!({
