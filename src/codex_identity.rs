@@ -252,18 +252,36 @@ fn parse_stable_version_component(value: &str) -> Option<u64> {
 }
 
 pub(crate) fn default_user_agent() -> String {
+    canonical_auth_identity().1
+}
+
+pub(crate) fn canonical_auth_identity() -> (String, String) {
     let version = configured_version();
-    let fallback = default_user_agent_for_version(&version);
-    let Some(candidate) = env::var(CODEX_USER_AGENT_ENV)
+    let fallback_ua = default_user_agent_for_version(&version);
+    let candidate = env::var(CODEX_USER_AGENT_ENV)
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
-        return fallback;
-    };
-    pair_user_agent(&candidate)
-        .map(|(_, user_agent)| user_agent)
-        .unwrap_or(fallback)
+        .filter(|value| !value.is_empty());
+    let (originator, user_agent) = candidate
+        .as_deref()
+        .and_then(pair_user_agent)
+        .unwrap_or_else(|| (DEFAULT_CODEX_ORIGINATOR.to_string(), fallback_ua));
+    let user_agent = set_user_agent_version(&user_agent, &version).unwrap_or(user_agent);
+    (originator, user_agent)
+}
+
+fn set_user_agent_version(user_agent: &str, version: &str) -> Option<String> {
+    let slash = user_agent.find('/')?;
+    let rest = &user_agent[slash + 1..];
+    let version_end = rest
+        .find(|ch: char| ch.is_ascii_whitespace() || ch == '(')
+        .unwrap_or(rest.len());
+    Some(format!(
+        "{}{}{}",
+        &user_agent[..slash + 1],
+        version,
+        &rest[version_end..]
+    ))
 }
 
 pub(crate) fn finalize_headers(headers: &mut Vec<(&'static str, String)>) {
@@ -281,6 +299,7 @@ pub(crate) fn finalize_headers(headers: &mut Vec<(&'static str, String)>) {
         .filter(|value| version_at_least(value, DEFAULT_CODEX_VERSION))
         .map(str::to_string)
         .unwrap_or(configured_version);
+    let user_agent = set_user_agent_version(&user_agent, &version).unwrap_or(user_agent);
 
     replace_or_push(headers, "user-agent", user_agent);
     replace_or_push(headers, "originator", originator);
@@ -302,6 +321,7 @@ pub(crate) fn finalize_owned_headers(headers: &mut Vec<(String, String)>) {
         .filter(|value| version_at_least(value, DEFAULT_CODEX_VERSION))
         .map(str::to_string)
         .unwrap_or(configured_version);
+    let user_agent = set_user_agent_version(&user_agent, &version).unwrap_or(user_agent);
 
     replace_or_push_owned(headers, "user-agent", user_agent);
     replace_or_push_owned(headers, "originator", originator);
@@ -522,6 +542,14 @@ mod tests {
         assert!(pair_user_agent("codex_cli_rs_evil/1.0.0").is_none());
         assert!(pair_user_agent("Codex \u{1}evil/1.0.0").is_none());
         assert!(pair_user_agent("curl").is_none());
+    }
+
+    #[test]
+    fn canonical_auth_identity_pairs_originator_and_current_version_without_version_header() {
+        let (originator, user_agent) = canonical_auth_identity();
+        assert_eq!(originator, DEFAULT_CODEX_ORIGINATOR);
+        assert!(user_agent.starts_with(&format!("{DEFAULT_CODEX_ORIGINATOR}/")));
+        assert!(user_agent.contains(&configured_version()));
     }
 
     #[test]

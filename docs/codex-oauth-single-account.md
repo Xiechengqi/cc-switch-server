@@ -118,7 +118,11 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 - FAST 完全由 Provider 的 `codexFastMode` 控制：客户端的 `service_tier`/`serviceTier` 不能开启或关闭它。推理等级仍由客户端选择，OpenAI `reasoning.effort`/`reasoning_effort`、Claude `output_config.effort`/`thinking.effort` 和 Gemini `generationConfig.thinkingConfig.thinkingLevel` 的显式值均记录为 requested effort，转换后的最终出站值记录为 effective effort；`low`、`medium`、`high`、`xhigh`、`max` 保持不变，仅把非 wire 别名 `ultra` 规范为 `max`。
 - 首次 401 只允许对原账号强制 refresh 一次，再以同一 Provider、账号、workspace、session 和请求 body 重放。
 - 第二次 401、429、403、5xx、网络错误或流内错误都不能切换 Provider/账号。
-- 非流式 `response.failed` 和 SSE semantic failure 会保留 OpenAI 错误语义；已向下游提交业务输出后绝不透明重放完整生成。
+- `server_is_overloaded` / `slow_down` 是请求级容量降载，不是账号故障。HTTP SSE、下游非流聚合、Images 和 WS→HTTP fallback 在尚未向下游提交业务输出时，允许对同一 binding 做有界重试（最多再发两次，含短抖动，仍受总 retry 预算约束）。Share pin 禁止换号，但不禁止这条同账号重试。重试成功不得留下第一次失败的 Provider outcome；用尽后也不得因此写入账号 cooldown。
+- 已向下游提交业务输出后绝不透明重放完整生成。此时把 `server_is_overloaded` / `slow_down` 改写为客户端可退避的 `server_error`，保留原始 message；`rate_limit_exceeded` 与 `invalid_request` 不改码、不走容量重试。
+- `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 时没有生命周期缓冲，无法静默重试，只做已写出帧的错误码改写。
+- Token 换票 / refresh / Device 流使用与推理同源的官方 `originator` + User-Agent，凭据面不发 `version` 头。推理面继续配对 `originator` / User-Agent / `version`。关闭 Codex 版本同步并长期停在内置 `0.144.1` 会提高被上游优先降载的概率。
+- 非流式 `response.failed` 和 SSE semantic failure 会保留 OpenAI 错误语义；容量降载的改码是唯一例外。
 - Responses Lite、custom/freeform tool、`tool_search`、usage 四桶和空 `response.completed.output` 恢复使用同一执行身份。
 - Images generation/edit 使用固定 Codex bridge、身份头和 body 上限；401 重放后仍返回原始上游错误 body，不用另一个账号掩盖错误。
 - models manifest 与 alpha search 只访问固定 ChatGPT Codex endpoint，并采用同账号一次 401 refresh 边界。

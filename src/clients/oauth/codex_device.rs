@@ -22,7 +22,6 @@ const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEVICE_CODE_DEFAULT_EXPIRES_IN: u64 = 900;
 const POLLING_SAFETY_MARGIN_SECS: u64 = 3;
-const CODEX_USER_AGENT: &str = "cc-switch-server-codex-oauth";
 const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OAUTH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
@@ -208,6 +207,20 @@ impl fmt::Display for CodexDeviceError {
 
 impl std::error::Error for CodexDeviceError {}
 
+fn codex_auth_identity_headers() -> reqwest::header::HeaderMap {
+    let (originator, user_agent) = crate::codex_identity::canonical_auth_identity();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_str(&user_agent)
+            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("codex_cli_rs")),
+    );
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&originator) {
+        headers.insert("originator", value);
+    }
+    headers
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct DeviceCodeResponse {
     device_auth_id: String,
@@ -231,7 +244,7 @@ pub async fn start_device_flow(
     let mut response = http
         .post(DEVICE_AUTH_USERCODE_URL)
         .header("Content-Type", "application/json")
-        .header("User-Agent", CODEX_USER_AGENT)
+        .headers(codex_auth_identity_headers())
         .json(&json!({ "client_id": CODEX_CLIENT_ID }))
         .timeout(OAUTH_REQUEST_TIMEOUT)
         .send()
@@ -293,7 +306,7 @@ pub async fn poll_device_flow(
     let mut poll_response = http
         .post(DEVICE_AUTH_TOKEN_URL)
         .header("Content-Type", "application/json")
-        .header("User-Agent", CODEX_USER_AGENT)
+        .headers(codex_auth_identity_headers())
         .json(&json!({
             "device_auth_id": device_code,
             "user_code": flow.user_code,
@@ -383,7 +396,7 @@ async fn exchange_code_for_tokens(
     let mut response = http
         .post(OAUTH_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("User-Agent", CODEX_USER_AGENT)
+        .headers(codex_auth_identity_headers())
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -718,7 +731,7 @@ mod tests {
         let poll_response = http
             .post(poll_url)
             .header("Content-Type", "application/json")
-            .header("User-Agent", CODEX_USER_AGENT)
+            .headers(codex_auth_identity_headers())
             .json(&json!({
                 "device_auth_id": device_code,
                 "user_code": flow.user_code,
@@ -754,7 +767,7 @@ mod tests {
         let response = http
             .post(token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("User-Agent", CODEX_USER_AGENT)
+            .headers(codex_auth_identity_headers())
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("code", success.authorization_code.as_str()),

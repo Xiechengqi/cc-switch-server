@@ -68,6 +68,11 @@ use super::kimi_runtime::{
     KimiThinkingReplayStreamAccumulator, KimiThinkingReplayStreamOutcome,
 };
 use super::kiro;
+use super::openai_capacity_shed::{
+    capacity_shed_retry_source, is_openai_capacity_shed_failure,
+    openai_stream_bytes_start_client_output, sanitize_openai_capacity_shed_json_bytes,
+    sanitize_openai_capacity_shed_json_text, sanitize_openai_capacity_shed_sse_bytes,
+};
 use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
@@ -108,6 +113,9 @@ const CODEX_IMAGES_MAX_UPSTREAM_BYTES: usize = 72 * 1024 * 1024;
 const CODEX_IMAGES_MAX_PIXELS: u64 = 8_294_400;
 const MAX_FORWARD_RETRY_ATTEMPTS: u32 = 3;
 const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
+const MAX_CODEX_CAPACITY_RETRIES: u32 = 2;
+const CODEX_CAPACITY_RETRY_MIN_DELAY_MS: u64 = 200;
+const CODEX_CAPACITY_RETRY_MAX_DELAY_MS: u64 = 800;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_SHARE_MODEL_COOLDOWN_MS: i64 = 5 * 60_000;
 const DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
@@ -411,6 +419,8 @@ struct ForwardAttemptContext {
     grok_session_id: Option<String>,
     provider_binding_pinned: bool,
     retry_audit: Option<ForwardRetryAudit>,
+    codex_capacity_retry_attempted: u32,
+    pending_capacity_retry_delay: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +446,8 @@ impl Default for ForwardAttemptContext {
             grok_session_id: None,
             provider_binding_pinned: false,
             retry_audit: None,
+            codex_capacity_retry_attempted: 0,
+            pending_capacity_retry_delay: None,
         }
     }
 }
@@ -457,6 +469,7 @@ impl ForwardAttemptContext {
         next.attempt = next.attempt.saturating_add(1);
         next.body_retry_stage = body_retry_stage;
         next.execution = Some(execution.clone());
+        next.pending_capacity_retry_delay = None;
         next.retry_audit = Some(ForwardRetryAudit {
             stage,
             source,
@@ -503,6 +516,18 @@ impl ForwardAttemptContext {
         );
         next.codex_overflow_compact_attempted = true;
         next.codex_body_override = Some(body);
+        next
+    }
+
+    fn after_codex_capacity_retry(
+        &self,
+        execution: &ProviderExecution,
+        source: &'static str,
+        delay: Duration,
+    ) -> Self {
+        let mut next = self.next(execution, self.body_retry_stage, "capacity", source);
+        next.codex_capacity_retry_attempted = next.codex_capacity_retry_attempted.saturating_add(1);
+        next.pending_capacity_retry_delay = Some(delay);
         next
     }
 }
@@ -1259,6 +1284,9 @@ async fn forward_with_attempt(
     let raw_body_for_retry = body;
     let retry_gemini_path = gemini_path;
     'attempt: loop {
+        if let Some(delay) = attempt_context.pending_capacity_retry_delay.take() {
+            tokio::time::sleep(delay).await;
+        }
         let gemini_path = retry_gemini_path.clone();
         let body = decode_request_body_for_proxy_with_limit(
             &headers,
@@ -2242,6 +2270,21 @@ async fn forward_with_attempt(
                             continue 'attempt;
                         }
                     }
+                    if !failure.saw_business_output {
+                        if let Some(shed) = failure.semantic_failure.as_ref() {
+                            if let Some(next_attempt) = next_codex_capacity_retry_attempt(
+                                route,
+                                &attempt_context,
+                                &execution,
+                                shed,
+                            ) {
+                                attempt_context = next_attempt;
+                                drop(account_in_flight_guard);
+                                drop(share_invocation_guard);
+                                continue 'attempt;
+                            }
+                        }
+                    }
                     record_openai_responses_aggregation_failure(
                         &state,
                         &stored,
@@ -2734,6 +2777,22 @@ async fn forward_with_attempt(
                                 }
                             }
                             if failure.origin == FailureOrigin::Provider {
+                                if !pending_chunk_saw_business_output
+                                    && !openai_stream_bytes_start_client_output(&chunk)
+                                {
+                                    if let Some(next_attempt) = next_codex_capacity_retry_attempt(
+                                        route,
+                                        &attempt_context,
+                                        &execution,
+                                        failure,
+                                    ) {
+                                        attempt_context = next_attempt;
+                                        drop(inner);
+                                        drop(account_in_flight_guard);
+                                        drop(share_invocation_guard);
+                                        continue 'attempt;
+                                    }
+                                }
                                 record_provider_outcome(
                                     &state,
                                     &stored,
@@ -3156,6 +3215,8 @@ async fn forward_with_attempt(
                         let transformed = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
+                        let transformed =
+                            stream_state.sanitize_openai_capacity_shed_chunk(transformed);
                         stream_state.record_image_transport_emit(&transformed, false);
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(false).await;
@@ -3253,6 +3314,8 @@ async fn forward_with_attempt(
                             let transformed = stream_state
                                 .codex_custom_tool_stream_patcher
                                 .push(transformed);
+                            let transformed =
+                                stream_state.sanitize_openai_capacity_shed_chunk(transformed);
                             stream_state.record_image_transport_emit(&transformed, false);
                             stream_state.commit_kimi_thinking_replay_stream().await;
                             stream_state.finalize_terminal_usage(true).await;
@@ -3674,6 +3737,11 @@ async fn forward_with_attempt(
                     return Err(error);
                 }
             }
+        } else {
+            bytes
+        };
+        let bytes = if execution.driver_is("oauth.openai_codex") {
+            Bytes::from(sanitize_openai_capacity_shed_json_bytes(&bytes).0)
         } else {
             bytes
         };
@@ -9737,6 +9805,7 @@ async fn run_codex_websocket_http_fallback(
         turn.record_retry("transport", source);
     }
     crate::metrics::record_codex_websocket_fallback(source, "attempt");
+    let mut capacity_retry_attempted = 0_u32;
     let rate_limit_share_id = active_usage_turn
         .as_ref()
         .and_then(|turn| turn.request_context.share_id.clone());
@@ -10081,6 +10150,22 @@ async fn run_codex_websocket_http_fallback(
                 failure,
                 replay_payloads,
             }) => {
+                if is_openai_capacity_shed_failure(&failure)
+                    && execution.driver_is("oauth.openai_codex")
+                {
+                    if let Some(delay) =
+                        take_codex_http_fallback_capacity_retry(&mut capacity_retry_attempted)
+                    {
+                        let _ = replay_payloads;
+                        record_forward_retry(
+                            ProxyRoute::CodexResponses,
+                            "capacity",
+                            capacity_shed_retry_source(&failure),
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                }
                 record_provider_outcome(
                     state,
                     &stored,
@@ -10092,6 +10177,7 @@ async fn run_codex_websocket_http_fallback(
                     "forwarding Responses semantic failure after HTTP fallback failover exhausted"
                 );
                 for payload in replay_payloads {
+                    let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
                     relay_codex_http_fallback_event(downstream, output_patcher, payload).await?;
                 }
                 finish_active_websocket_terminal(
@@ -10804,10 +10890,12 @@ async fn relay_codex_http_fallback_semantic_event(
     }
 
     for pending in pending_lifecycle_payloads.drain(..) {
+        let pending = sanitize_openai_capacity_shed_json_text(&pending).0;
         relay_codex_http_fallback_event(downstream, output_patcher, pending)
             .await
             .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
     }
+    let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
     relay_codex_http_fallback_event(downstream, output_patcher, payload)
         .await
         .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
@@ -11070,12 +11158,28 @@ fn websocket_message_payload_len(message: &TungsteniteMessage) -> usize {
     }
 }
 
+fn sanitize_openai_capacity_shed_websocket_message(message: &mut TungsteniteMessage) {
+    match message {
+        TungsteniteMessage::Text(text) => {
+            *text = sanitize_openai_capacity_shed_json_text(text).0;
+        }
+        TungsteniteMessage::Binary(bytes) => {
+            let (rewritten, changed) = sanitize_openai_capacity_shed_json_bytes(bytes);
+            if changed {
+                *bytes = rewritten.into();
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn send_responses_websocket_message(
     downstream: &mut WebSocket,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     mode: ResponsesWebsocketMode,
     mut message: TungsteniteMessage,
 ) -> Result<bool, ProxyError> {
+    sanitize_openai_capacity_shed_websocket_message(&mut message);
     if matches!(mode, ResponsesWebsocketMode::Codex) {
         output_patcher.patch_message(&mut message);
     }
@@ -11621,6 +11725,56 @@ fn antigravity_limit_info(
     )
     .then(|| super::antigravity_retry::parse_google_rpc_retry(status.as_u16(), body))
     .flatten()
+}
+
+fn take_codex_http_fallback_capacity_retry(attempted: &mut u32) -> Option<Duration> {
+    if *attempted >= MAX_CODEX_CAPACITY_RETRIES {
+        return None;
+    }
+    *attempted = attempted.saturating_add(1);
+    Some(codex_capacity_retry_delay(MAX_FORWARD_RETRY_ELAPSED_MS))
+}
+
+fn codex_capacity_retry_delay(remaining_ms: u128) -> Duration {
+    if remaining_ms < CODEX_CAPACITY_RETRY_MIN_DELAY_MS as u128 {
+        return Duration::from_millis(remaining_ms as u64);
+    }
+    let max_delay = CODEX_CAPACITY_RETRY_MAX_DELAY_MS.min(remaining_ms as u64);
+    let delay_ms = if max_delay <= CODEX_CAPACITY_RETRY_MIN_DELAY_MS {
+        max_delay
+    } else {
+        let span = max_delay - CODEX_CAPACITY_RETRY_MIN_DELAY_MS;
+        CODEX_CAPACITY_RETRY_MIN_DELAY_MS + (rand::rngs::OsRng.next_u64() % (span + 1))
+    };
+    Duration::from_millis(delay_ms)
+}
+
+fn next_codex_capacity_retry_attempt(
+    route: ProxyRoute,
+    attempt_context: &ForwardAttemptContext,
+    execution: &ProviderExecution,
+    failure: &SemanticFailure,
+) -> Option<ForwardAttemptContext> {
+    if !execution.driver_is("oauth.openai_codex") || !is_openai_capacity_shed_failure(failure) {
+        return None;
+    }
+    if attempt_context.codex_capacity_retry_attempted >= MAX_CODEX_CAPACITY_RETRIES
+        || !attempt_context.retry_allowed()
+    {
+        return None;
+    }
+    let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS
+        .saturating_sub(current_time_ms().saturating_sub(attempt_context.started_at_ms));
+    if remaining_ms < CODEX_CAPACITY_RETRY_MIN_DELAY_MS as u128 {
+        return None;
+    }
+    let source = capacity_shed_retry_source(failure);
+    record_forward_retry(route, "capacity", source);
+    Some(attempt_context.after_codex_capacity_retry(
+        execution,
+        source,
+        codex_capacity_retry_delay(remaining_ms),
+    ))
 }
 
 fn next_antigravity_limit_attempt(
@@ -17242,6 +17396,15 @@ struct StreamForwardState {
     image_keepalive_interval: Duration,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
+}
+
+impl StreamForwardState {
+    fn sanitize_openai_capacity_shed_chunk(&self, chunk: Bytes) -> Bytes {
+        if self.stored.provider_type != ProviderType::CodexOAuth {
+            return chunk;
+        }
+        sanitize_openai_capacity_shed_sse_bytes(&chunk)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -29461,6 +29624,333 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         server_a.abort();
         server_b.abort();
         server_c.abort();
+    }
+
+    fn capacity_shed_sse(id: &str) -> String {
+        format!(
+            concat!(
+                "event: response.created\n",
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{id}\",\"status\":\"in_progress\"}}}}\n",
+                "\n",
+                "event: response.in_progress\n",
+                "data: {{\"type\":\"response.in_progress\",\"response\":{{\"id\":\"{id}\",\"status\":\"in_progress\"}}}}\n",
+                "\n",
+                "event: error\n",
+                "data: {{\"type\":\"error\",\"error\":{{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}}\n",
+                "\n"
+            ),
+            id = id
+        )
+    }
+
+    fn completed_sse(id: &str) -> String {
+        format!(
+            concat!(
+                "event: response.created\n",
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{id}\"}}}}\n",
+                "\n",
+                "event: response.output_text.delta\n",
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}}\n",
+                "\n",
+                "event: response.completed\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}\n",
+                "\n",
+                "data: [DONE]\n",
+                "\n"
+            ),
+            id = id
+        )
+    }
+
+    #[tokio::test]
+    async fn codex_sse_capacity_shed_retries_same_account_before_downstream_commit() {
+        let name = "codex-sse-capacity";
+        let upstream = spawn_test_overflow_upstream(vec![
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: capacity_shed_sse("resp-shed-1"),
+            },
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: completed_sse("resp-shed-2"),
+            },
+        ])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::from_millis(0)),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("resp-shed-2"), "{body}");
+        assert!(!body.contains("resp-shed-1"), "{body}");
+        assert!(!body.contains("server_is_overloaded"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 2);
+        let account = state
+            .find_account_by_id(&format!("{name}-account"))
+            .await
+            .unwrap();
+        assert!(account.rate_limited_until.is_none());
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_capacity_shed_retries_when_share_binding_is_pinned() {
+        let name = "codex-sse-capacity-share";
+        let upstream = spawn_test_overflow_upstream(vec![
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: capacity_shed_sse("resp-share-1"),
+            },
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: completed_sse("resp-share-2"),
+            },
+        ])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let provider_id = execution.stored.provider.id.clone();
+        let share_id = format!("{name}-share");
+        install_antigravity_test_share(
+            &state,
+            &share_id,
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            &provider_id,
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(&share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::from_millis(0)),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("resp-share-2"), "{body}");
+        assert!(!body.contains("server_is_overloaded"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 2);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_capacity_shed_after_output_rewrites_code_without_retry() {
+        let name = "codex-sse-capacity-after-output";
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-partial\"}}\n",
+                "\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+                "\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n",
+                "\n",
+                "event: response.failed\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-partial\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n",
+                "\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("partial"), "{body}");
+        assert!(body.contains(r#""code":"server_error""#), "{body}");
+        assert!(!body.contains("server_is_overloaded"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_capacity_shed_exhausted_retries_rewrite_without_account_cooldown() {
+        let name = "codex-sse-capacity-exhausted";
+        let upstream = spawn_test_overflow_upstream(vec![
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: capacity_shed_sse("resp-ex-1"),
+            },
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: capacity_shed_sse("resp-ex-2"),
+            },
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: capacity_shed_sse("resp-ex-3"),
+            },
+        ])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::from_millis(0)),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("resp-ex-3"), "{body}");
+        assert!(!body.contains("resp-ex-1"), "{body}");
+        assert!(body.contains(r#""code":"server_error""#), "{body}");
+        assert!(!body.contains("server_is_overloaded"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 3);
+        let account = state
+            .find_account_by_id(&format!("{name}-account"))
+            .await
+            .unwrap();
+        assert!(account.rate_limited_until.is_none());
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_rate_limit_does_not_use_capacity_retry_or_rewrite() {
+        let name = "codex-sse-rate-limit";
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-limit\"}}\n",
+                "\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 3s\"}}\n",
+                "\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("rate_limit_exceeded"), "{body}");
+        assert!(!body.contains("server_error"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_non_stream_capacity_shed_retries_same_account() {
+        let name = "codex-json-capacity";
+        let upstream = spawn_test_overflow_upstream(vec![
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: capacity_shed_sse("resp-json-1"),
+            },
+            TestOverflowReply {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: completed_sse("resp-json-2"),
+            },
+        ])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":false}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::from_millis(0)),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(&collect_response_body(response).await).unwrap();
+        assert_eq!(body["id"], "resp-json-2");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 2);
+        upstream.server.abort();
     }
 
     #[tokio::test]

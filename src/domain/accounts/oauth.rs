@@ -351,6 +351,10 @@ fn set_oauth_user_agent(
     token_url: &str,
     default_user_agent: Option<&str>,
 ) {
+    if provider_type == ProviderType::CodexOAuth {
+        apply_codex_auth_identity(headers);
+        return;
+    }
     let user_agent = if provider_type == ProviderType::ClaudeOAuth {
         claude_oauth_user_agent_for_token_url(token_url)
     } else {
@@ -365,6 +369,24 @@ fn set_oauth_user_agent(
         entry.1 = user_agent.clone();
     } else {
         headers.push(("User-Agent".to_string(), user_agent));
+    }
+}
+
+fn apply_codex_auth_identity(headers: &mut Vec<(String, String)>) {
+    let (originator, user_agent) = crate::codex_identity::canonical_auth_identity();
+    upsert_owned_header(headers, "User-Agent", user_agent);
+    upsert_owned_header(headers, "originator", originator);
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("version"));
+}
+
+fn upsert_owned_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
+    if let Some(entry) = headers
+        .iter_mut()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+    {
+        entry.1 = value;
+    } else {
+        headers.push((name.to_string(), value));
     }
 }
 
@@ -474,7 +496,7 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             client_secret: None,
             client_secret_env: None,
             refresh_scope: Some("openid profile email"),
-            user_agent: Some("cc-switch-server-codex-oauth"),
+            user_agent: None,
             profile_url: None,
             profile_strategy: OAuthProfileStrategy::JwtClaims,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
@@ -2892,6 +2914,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(conflict.contains("subject"));
+    }
+
+    #[test]
+    fn codex_token_and_refresh_requests_use_canonical_auth_identity_without_version() {
+        let (originator, user_agent) = crate::codex_identity::canonical_auth_identity();
+        let exchange = super::build_authorization_code_request(
+            ProviderType::CodexOAuth,
+            "code",
+            super::CODEX_CLI_REDIRECT_URI,
+            Some("verifier"),
+            "state",
+        )
+        .unwrap();
+        assert_eq!(
+            header(&exchange.headers, "user-agent"),
+            Some(user_agent.as_str())
+        );
+        assert_eq!(
+            header(&exchange.headers, "originator"),
+            Some(originator.as_str())
+        );
+        assert!(header(&exchange.headers, "version").is_none());
+
+        let refresh = super::build_refresh_request(
+            ProviderType::CodexOAuth,
+            &account(ProviderType::CodexOAuth),
+        )
+        .unwrap();
+        assert_eq!(
+            header(&refresh.headers, "user-agent"),
+            Some(user_agent.as_str())
+        );
+        assert_eq!(
+            header(&refresh.headers, "originator"),
+            Some(originator.as_str())
+        );
+        assert!(header(&refresh.headers, "version").is_none());
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 
     #[test]

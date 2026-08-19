@@ -17,6 +17,7 @@ mod grok;
 pub(crate) mod kimi;
 pub(crate) mod kimi_runtime;
 pub(crate) mod kiro;
+mod openai_capacity_shed;
 mod outbound_identity;
 pub(crate) mod outbound_request;
 mod overflow_compact;
