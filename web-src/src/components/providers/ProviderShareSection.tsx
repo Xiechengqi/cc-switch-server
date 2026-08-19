@@ -14,7 +14,6 @@ import type {
   ShareUserGrantMap,
   ShareUserPolicy,
   ShareUserUsageEditMap,
-  ShareTotalUsageEdit,
   ShareRecord,
 } from "@/lib/api/share";
 import { Button } from "@/components/ui/button";
@@ -189,7 +188,6 @@ export function ProviderShareSection({
   const [userUsageEdits, setUserUsageEdits] =
     useState<ShareUserUsageEditMap>({});
   const [tokenLimitInput, setTokenLimitInput] = useState("");
-  const [tokensUsedInput, setTokensUsedInput] = useState("");
   const [parallelLimitInput, setParallelLimitInput] = useState("");
   const [expiresInSecsInput, setExpiresInSecsInput] = useState(
     String(permanentExpiresInSecs()),
@@ -205,7 +203,6 @@ export function ProviderShareSection({
   const subdomainManualRef = useRef(false);
   const shareInitRef = useRef<string | null>(null);
   const tokenLimitTouchedRef = useRef(false);
-  const tokensUsedTouchedRef = useRef(false);
   const parallelLimitTouchedRef = useRef(false);
   const expiresTouchedRef = useRef(false);
 
@@ -238,7 +235,6 @@ export function ProviderShareSection({
     if (shareInitRef.current === initKey) return;
     shareInitRef.current = initKey;
     tokenLimitTouchedRef.current = false;
-    tokensUsedTouchedRef.current = false;
     parallelLimitTouchedRef.current = false;
     expiresTouchedRef.current = false;
 
@@ -286,7 +282,6 @@ export function ProviderShareSection({
     setUserUsageEdits({});
 
     setTokenLimitInput(formatShareLimitInput(share?.tokenLimit));
-    setTokensUsedInput(String(Math.max(0, share?.tokensUsed ?? 0)));
     setParallelLimitInput(formatShareLimitInput(share?.parallelLimit));
     const permanent = share ? isPermanentExpiry(share.expiresAt) : true;
     setIsPermanent(permanent);
@@ -338,7 +333,6 @@ export function ProviderShareSection({
         : tokenLimitInput.trim()
           ? Number(tokenLimitInput)
           : UNLIMITED_TOKEN_LIMIT,
-    tokensUsed: tokensUsedTouchedRef.current ? tokensUsedInput.trim() : null,
     parallelLimit:
       !parallelLimitTouchedRef.current && share
         ? normalizeShareLimitValue(share.parallelLimit)
@@ -412,31 +406,6 @@ export function ProviderShareSection({
     Number(bankedResetExpiryLeadMinutes);
   const bankedResetLeadIsValid = (value: number) =>
     Number.isSafeInteger(value) && value >= 10 && value <= 10080;
-
-  /**
-   * The Share total counter is only ever sent when the operator actually
-   * edited it.  An untouched field must not resend the value the editor was
-   * opened with: requests that landed since then would be silently erased.
-   */
-  const resolveShareUsageEditForSave = (): ShareTotalUsageEdit | undefined => {
-    if (!tokensUsedTouchedRef.current) return undefined;
-    const raw = tokensUsedInput.trim();
-    if (!raw) return undefined;
-    const tokensUsed = Number(raw);
-    if (!Number.isSafeInteger(tokensUsed) || tokensUsed < 0) return undefined;
-    if (share && tokensUsed === share.tokensUsed) return undefined;
-    return tokensUsed === 0
-      ? { action: "clear" }
-      : { action: "set", tokensUsed };
-  };
-
-  const shareUsageEditIsInvalid = () => {
-    if (!tokensUsedTouchedRef.current) return false;
-    const raw = tokensUsedInput.trim();
-    if (!raw) return false;
-    const tokensUsed = Number(raw);
-    return !Number.isSafeInteger(tokensUsed) || tokensUsed < 0;
-  };
 
   const resolveTokenLimitForSave = () => {
     if (!tokenLimitTouchedRef.current && share) {
@@ -641,12 +610,6 @@ export function ProviderShareSection({
       );
       return false;
     }
-    if (shareUsageEditIsInvalid()) {
-      toast.error(
-        t("provider.share.invalidNumber", { defaultValue: "请输入有效数字" }),
-      );
-      return false;
-    }
     if (!bankedResetLeadIsValid(resetLeadMinutes)) {
       toast.error(t("codexSharePolicy.resetLeadInvalid"));
       return false;
@@ -670,12 +633,9 @@ export function ProviderShareSection({
       previousResponseCacheEnabled,
       userGrants: payloadUserGrants,
       userUsageEdits: payloadUserUsageEdits,
-      shareUsageEdit: resolveShareUsageEditForSave(),
     })) as ShareRecord;
     if (saved?.userGrants) setUserGrants(saved.userGrants);
     setUserUsageEdits({});
-    tokensUsedTouchedRef.current = false;
-    setTokensUsedInput(String(Math.max(0, saved?.tokensUsed ?? 0)));
     setShareDraftBaseline({
       key: shareDraftInitializationKey,
       fingerprint: shareDraftFingerprintRef.current,
@@ -1025,27 +985,6 @@ export function ProviderShareSection({
                           {preset.toLocaleString()}
                         </Button>
                       ))}
-                    </div>
-                    <div className="space-y-1.5 pt-1">
-                      <Label htmlFor="provider-share-tokens-used">
-                        {t("share.totalUsageEdit.label")}
-                      </Label>
-                      <Input
-                        id="provider-share-tokens-used"
-                        type="number"
-                        min={0}
-                        step={1}
-                        disabled={busy || !shareExists}
-                        value={tokensUsedInput}
-                        onChange={(event) => {
-                          tokensUsedTouchedRef.current = true;
-                          setTokensUsedInput(event.target.value);
-                          markShareDraftChanged();
-                        }}
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        {t("share.totalUsageEdit.hint")}
-                      </p>
                     </div>
                   </div>
 

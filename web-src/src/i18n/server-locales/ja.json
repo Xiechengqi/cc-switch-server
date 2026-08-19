@@ -301,10 +301,6 @@
       "readOnly": "Share Market 管理（読み取り専用）",
       "period": "Token 期間"
     },
-    "totalUsageEdit": {
-      "label": "消費済みトークン（合計）",
-      "hint": "Share 合計カウンターの手動補正です。以降のリクエストはこの値に加算されます。0 を指定するとクリアされます。上限に達した Share は枯渇状態を解除しますが、一時停止のままなので手動で再開してください。"
-    },
     "boundProviderHint": "このアプリのリクエストはバインド済み Provider を常に使用し、フェイルオーバーには参加しません。",
     "manageInProviderHint": "共有設定を変更するには、バインド済み Provider の編集画面を開いてください。",
     "emptyReadOnlyHint": "Share は Provider 編集画面の「リモート共有」で作成、管理します。",

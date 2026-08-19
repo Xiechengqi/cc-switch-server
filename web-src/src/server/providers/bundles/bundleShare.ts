@@ -4,7 +4,6 @@ import {
   type ShareUserGrantMap,
   type ShareUserPolicy,
   type ShareUserUsageEditMap,
-  type ShareTotalUsageEdit,
 } from "@/lib/api/share";
 import {
   buildShareUserGrants,
@@ -23,8 +22,6 @@ export interface ProviderBundleShareDraft {
   description: string;
   freeAccess: boolean;
   tokenLimit: string;
-  /** Share-total consumed tokens; an operator correction, not a limit. */
-  tokensUsed: string;
   parallelLimit: string;
   expiry: ProviderBundleShareExpiry;
   userGrants: ShareUserGrantMap;
@@ -120,7 +117,6 @@ export function createBundleShareDraft(
     description: share?.description ?? "",
     freeAccess: share?.freeAccess ?? false,
     tokenLimit: share && share.tokenLimit >= 0 ? String(share.tokenLimit) : "",
-    tokensUsed: String(Math.max(0, share?.tokensUsed ?? 0)),
     parallelLimit:
       share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "",
     expiry,
@@ -141,6 +137,30 @@ export function createBundleShareDraft(
     previousResponseCacheEnabled: share
       ? Boolean(share.previousResponseCacheEnabled)
       : true,
+  };
+}
+
+/**
+ * ShareUserGrantsEditor reports the grant map and the usage-edit map through
+ * two callbacks in the same tick.  A consumer that keeps both halves in one
+ * draft object must fold each update functionally: spreading a single captured
+ * draft in both handlers makes the second call overwrite the first, silently
+ * dropping a newly added authorized user.
+ */
+export function bundleShareGrantHandlers(
+  update: (
+    apply: (current: ProviderBundleShareDraft) => ProviderBundleShareDraft,
+  ) => void,
+): {
+  onChange: (userGrants: ProviderBundleShareDraft["userGrants"]) => void;
+  onUsageEditsChange: (
+    userUsageEdits: ProviderBundleShareDraft["userUsageEdits"],
+  ) => void;
+} {
+  return {
+    onChange: (userGrants) => update((current) => ({ ...current, userGrants })),
+    onUsageEditsChange: (userUsageEdits) =>
+      update((current) => ({ ...current, userUsageEdits })),
   };
 }
 
@@ -193,20 +213,6 @@ export async function saveBundleShare(
       allowedUsageEmails.has(email.trim().toLowerCase()),
     ),
   );
-  // Only an actual edit is sent.  Resending the value the editor was opened
-  // with would silently erase requests that landed in the meantime.
-  let shareUsageEdit: ShareTotalUsageEdit | undefined;
-  const tokensUsedRaw = draft.tokensUsed.trim();
-  if (existing && tokensUsedRaw) {
-    const tokensUsed = Number(tokensUsedRaw);
-    if (!Number.isSafeInteger(tokensUsed) || tokensUsed < 0) {
-      throw new Error("Consumed tokens must be a non-negative integer");
-    }
-    if (tokensUsed !== existing.tokensUsed) {
-      shareUsageEdit =
-        tokensUsed === 0 ? { action: "clear" } : { action: "set", tokensUsed };
-    }
-  }
   const bankedResetExpiryLeadMinutes = limitValue(
     draft.bankedResetExpiryLeadMinutes,
     60,
@@ -236,7 +242,6 @@ export async function saveBundleShare(
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
     userGrants,
     userUsageEdits,
-    shareUsageEdit,
   });
 }
 

@@ -300,10 +300,6 @@
       "readOnly": "Managed by Share Market; read-only",
       "period": "Token period"
     },
-    "totalUsageEdit": {
-      "label": "Consumed tokens (total)",
-      "hint": "Operator correction for the Share total counter. Later requests accumulate on top of this value; 0 clears it. An exhausted Share leaves that state but stays paused until you resume it."
-    },
     "boundProviderHint": "Requests for this app always use the bound Provider and do not participate in failover.",
     "manageInProviderHint": "Open the bound Provider editor to change sharing settings.",
     "emptyReadOnlyHint": "Shares are created and managed in the Remote Share section of the Provider editor.",

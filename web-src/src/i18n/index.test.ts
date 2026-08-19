@@ -136,7 +136,7 @@ describe("i18n resources", () => {
     }
   });
 
-  it.each(["userLimit", "totalUsageEdit"])(
+  it.each(["userLimit"])(
     "provides Server Share %s copy in every supported language",
     (block) => {
       const keys = Object.keys(

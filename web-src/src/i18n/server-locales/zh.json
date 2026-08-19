@@ -300,10 +300,6 @@
       "readOnly": "Share Market 管理，只读",
       "period": "Token 周期"
     },
-    "totalUsageEdit": {
-      "label": "已消耗 Token（总额）",
-      "hint": "对 Share 总计数的人工校正。之后的请求将在此数值上累加；填 0 表示清零。已耗尽的 Share 会解除耗尽状态，但仍保持暂停，需要手动恢复。"
-    },
     "boundProviderHint": "此应用的请求固定使用绑定的 Provider，不参与故障转移。",
     "manageInProviderHint": "修改分享设置请打开绑定的 Provider 编辑页。",
     "emptyReadOnlyHint": "分享在 Provider 编辑页的“远程分享”区域创建与管理。",

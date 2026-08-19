@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
@@ -95,6 +102,7 @@ import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
   isValidShareSlug,
+  bundleShareGrantHandlers,
   saveBundleShare,
   shareForBundle,
   type ProviderBundleShareDraft,
@@ -738,15 +746,18 @@ function BundleShareEditor({
   draft,
   onChange,
   ownerEmail,
-  shareExists,
   shareUrl,
   onOpenShareSettings,
 }: {
   draft: ProviderBundleShareDraft;
-  onChange: (draft: ProviderBundleShareDraft) => void;
+  /**
+   * A state setter, not a plain callback: ShareUserGrantsEditor reports a
+   * grant change and its usage-edit change through two callbacks in the same
+   * tick, so both updates must be applied functionally or the second one
+   * overwrites the first from a stale draft.
+   */
+  onChange: Dispatch<SetStateAction<ProviderBundleShareDraft>>;
   ownerEmail: string;
-  /** The consumed-token correction only applies to an already created Share. */
-  shareExists: boolean;
   shareUrl?: string | null;
   onOpenShareSettings?: () => void;
 }) {
@@ -791,16 +802,10 @@ function BundleShareEditor({
   const slugInvalid = Boolean(
     draft.subdomain.trim() && !isValidShareSlug(draft.subdomain),
   );
-  const updateUserGrants = (
-    userGrants: ProviderBundleShareDraft["userGrants"],
-  ) => {
-    onChange({ ...draft, userGrants });
-  };
-  const updateUserUsageEdits = (
-    userUsageEdits: ProviderBundleShareDraft["userUsageEdits"],
-  ) => {
-    onChange({ ...draft, userUsageEdits });
-  };
+  const { onChange: updateUserGrants, onUsageEditsChange: updateUserUsageEdits } =
+    bundleShareGrantHandlers(onChange);
+  const updateDraft = (patch: Partial<ProviderBundleShareDraft>) =>
+    onChange((current) => ({ ...current, ...patch }));
 
   return (
     <Section
@@ -847,7 +852,7 @@ function BundleShareEditor({
           <Switch
             id="bundle-share-enabled"
             checked={draft.enabled}
-            onCheckedChange={(enabled) => onChange({ ...draft, enabled })}
+            onCheckedChange={(enabled) => updateDraft({ enabled })}
           />
         </div>
       </div>
@@ -864,12 +869,12 @@ function BundleShareEditor({
                 aria-invalid={slugInvalid}
                 className={cn(slugInvalid && "border-destructive")}
                 onChange={(event) =>
-                  onChange({ ...draft, subdomain: event.target.value })
+                  updateDraft({ subdomain: event.target.value })
                 }
               />
               <SubdomainGeneratorButton
                 embedded={false}
-                onGenerated={(subdomain) => onChange({ ...draft, subdomain })}
+                onGenerated={(subdomain) => updateDraft({ subdomain })}
                 onError={(message) => toast.error(message)}
                 suggest={() => shareApi.suggestShareSlug()}
               />
@@ -889,7 +894,7 @@ function BundleShareEditor({
                 id="bundle-share-free-access"
                 checked={draft.freeAccess}
                 onCheckedChange={(checked) =>
-                  onChange({ ...draft, freeAccess: checked === true })
+                  updateDraft({ freeAccess: checked === true })
                 }
               />
               <Label
@@ -915,7 +920,7 @@ function BundleShareEditor({
             <Input
               value={draft.description}
               onChange={(event) =>
-                onChange({ ...draft, description: event.target.value })
+                updateDraft({ description: event.target.value })
               }
             />
           </div>
@@ -939,7 +944,7 @@ function BundleShareEditor({
                 placeholder={t("share.unlimited", { defaultValue: "无上限" })}
                 value={draft.tokenLimit}
                 onChange={(event) =>
-                  onChange({ ...draft, tokenLimit: event.target.value })
+                  updateDraft({ tokenLimit: event.target.value })
                 }
               />
               <div className="flex flex-wrap gap-1.5">
@@ -948,7 +953,7 @@ function BundleShareEditor({
                   variant={draft.tokenLimit === "" ? "secondary" : "outline"}
                   size="sm"
                   className="h-7 px-2 text-xs"
-                  onClick={() => onChange({ ...draft, tokenLimit: "" })}
+                  onClick={() => updateDraft({ tokenLimit: "" })}
                 >
                   {t("share.unlimited", { defaultValue: "无上限" })}
                 </Button>
@@ -964,30 +969,13 @@ function BundleShareEditor({
                     size="sm"
                     className="h-7 px-2 text-xs"
                     onClick={() =>
-                      onChange({ ...draft, tokenLimit: String(preset) })
+                      updateDraft({ tokenLimit: String(preset) })
                     }
                   >
                     {preset.toLocaleString()}
                   </Button>
                 ))}
               </div>
-              {shareExists ? (
-                <div className="space-y-1.5 pt-1">
-                  <Label>{t("share.totalUsageEdit.label")}</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    step={1}
-                    value={draft.tokensUsed}
-                    onChange={(event) =>
-                      onChange({ ...draft, tokensUsed: event.target.value })
-                    }
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {t("share.totalUsageEdit.hint")}
-                  </p>
-                </div>
-              ) : null}
             </div>
             <div className="space-y-2">
               <Label>
@@ -1001,7 +989,7 @@ function BundleShareEditor({
                 placeholder={t("share.unlimited", { defaultValue: "无上限" })}
                 value={draft.parallelLimit}
                 onChange={(event) =>
-                  onChange({ ...draft, parallelLimit: event.target.value })
+                  updateDraft({ parallelLimit: event.target.value })
                 }
               />
               <div className="flex flex-wrap gap-1.5">
@@ -1010,7 +998,7 @@ function BundleShareEditor({
                   variant={draft.parallelLimit === "" ? "secondary" : "outline"}
                   size="sm"
                   className="h-7 px-2 text-xs"
-                  onClick={() => onChange({ ...draft, parallelLimit: "" })}
+                  onClick={() => updateDraft({ parallelLimit: "" })}
                 >
                   {t("share.unlimited", { defaultValue: "无上限" })}
                 </Button>
@@ -1024,8 +1012,7 @@ function BundleShareEditor({
                   size="sm"
                   className="h-7 px-2 text-xs"
                   onClick={() =>
-                    onChange({
-                      ...draft,
+                    updateDraft({
                       parallelLimit: String(DEFAULT_PARALLEL_LIMIT),
                     })
                   }
@@ -1041,8 +1028,7 @@ function BundleShareEditor({
               <Select
                 value={draft.expiry}
                 onValueChange={(expiry) =>
-                  onChange({
-                    ...draft,
+                  updateDraft({
                     expiry: expiry as ProviderBundleShareDraft["expiry"],
                   })
                 }
@@ -2424,7 +2410,6 @@ export function ProviderBundleEditor({
               draft={shareDraft}
               onChange={setShareDraft}
               ownerEmail={ownerEmail}
-              shareExists={Boolean(existingShare)}
               shareUrl={shareUrl}
               onOpenShareSettings={onOpenShareSettings}
             />

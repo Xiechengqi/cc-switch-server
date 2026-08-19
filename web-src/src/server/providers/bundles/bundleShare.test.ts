@@ -268,6 +268,21 @@ describe("Provider Bundle sharing", () => {
     expect(shareApiMock.delete).toHaveBeenCalledWith("share-1");
   });
 
+  it("does not send a Share-total usage correction from the provider share form", async () => {
+    const existing = share({ claude: "bundle-1" });
+    existing.tokensUsed = 1234;
+    shareApiMock.saveProviderBundleShare.mockResolvedValue(existing);
+
+    const draft = createBundleShareDraft(existing);
+    expect(draft).not.toHaveProperty("tokensUsed");
+
+    await saveBundleShare("bundle-1", draft, existing);
+
+    expect(
+      shareApiMock.saveProviderBundleShare.mock.calls[0]?.[0],
+    ).not.toHaveProperty("shareUsageEdit");
+  });
+
   it("persists per-email user limits through the Bundle command", async () => {
     shareApiMock.saveProviderBundleShare.mockResolvedValue(undefined);
     const draft = createBundleShareDraft();

@@ -69,6 +69,12 @@ function fixedPeriodDurationMs(period: ShareTokenPeriod): number | undefined {
   return undefined;
 }
 
+/**
+ * `onChange` and `onUsageEditsChange` fire together in one event handler, so a
+ * consumer that keeps both halves inside a single state object must apply each
+ * update functionally; spreading a captured draft in both handlers drops the
+ * grant change.
+ */
 type ShareUserGrantsEditorProps = {
   value: ShareUserGrantMap;
   ownerEmail: string;
