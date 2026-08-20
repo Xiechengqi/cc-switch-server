@@ -144,6 +144,7 @@ impl ProxyError {
     const KIRO_UPSTREAM_STREAM_ERROR_PREFIX: &'static str = "[KIRO_UPSTREAM_STREAM_ERROR] ";
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
+    const CAPACITY_SHED_PREFIX: &'static str = "[CC_UPSTREAM_CAPACITY_SHED] ";
     const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
     const USER_IDENTITY_REQUIRED_PREFIX: &'static str = "[CC_USER_IDENTITY_REQUIRED] ";
 
@@ -213,6 +214,17 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn upstream_capacity_shed(retry_after_seconds: u64) -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "{}{retry_after_seconds}]{}OpenAI Codex upstream is temporarily overloaded; retry shortly",
+                Self::RETRY_AFTER_PREFIX,
+                Self::CAPACITY_SHED_PREFIX,
+            ),
+        }
+    }
+
     pub(super) fn rate_limited(message: impl Into<String>, retry_after_seconds: u64) -> Self {
         Self {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -246,6 +258,7 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
+            .or_else(|| message.strip_prefix(Self::CAPACITY_SHED_PREFIX))
             .unwrap_or(message)
     }
 
@@ -301,6 +314,9 @@ impl ProxyError {
         }
         if message.starts_with(Self::USER_IDENTITY_REQUIRED_PREFIX) {
             return "cc_switch_user_identity_required";
+        }
+        if message.starts_with(Self::CAPACITY_SHED_PREFIX) {
+            return "cc_switch_upstream_capacity_shed";
         }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX) {
             return "TOOL_JSON_INVALID";

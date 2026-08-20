@@ -45,9 +45,13 @@
     {
       "name": "root_level_client_code",
       "input": {
-        "type": "error",
-        "code": "invalid_request_error",
-        "message": "invalid input"
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "invalid_request_error",
+            "message": "invalid input"
+          }
+        }
       },
       "expected": {
         "origin": "client",

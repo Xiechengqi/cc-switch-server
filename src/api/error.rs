@@ -604,6 +604,31 @@ mod retry_response_tests {
         assert_eq!(json["error"], "account is cooling down");
         assert_eq!(json["retryable"], true);
     }
+
+    #[tokio::test]
+    async fn capacity_shed_response_has_stable_code_and_short_retry_delay() {
+        let response = super::ApiError::proxy(crate::proxy::ProxyError::upstream_capacity_shed(1))
+            .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "cc_switch_upstream_capacity_shed");
+        assert_eq!(json["retryAfterSeconds"], 1);
+        assert_eq!(json["retryable"], true);
+        assert_eq!(
+            json["error"],
+            "OpenAI Codex upstream is temporarily overloaded; retry shortly"
+        );
+        assert!(!json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("CC_UPSTREAM_CAPACITY_SHED"));
+    }
 }
 
 pub(crate) fn map_codex_workspace_rebind_error(

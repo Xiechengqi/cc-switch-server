@@ -108,7 +108,7 @@ fn declared_event_terminal(format: UpstreamFormat, event: &str) -> Option<Upstre
         UpstreamFormat::OpenAiResponses => match event {
             "response.completed" => Some(UpstreamTerminal::Completed),
             "response.incomplete" => Some(UpstreamTerminal::Incomplete),
-            "response.failed" | "response.cancelled" | "response.canceled" | "error" => {
+            "response.failed" | "response.cancelled" | "response.canceled" => {
                 Some(UpstreamTerminal::Failed)
             }
             _ => None,
@@ -130,8 +130,9 @@ fn payload_terminal(format: UpstreamFormat, payload: &str) -> Option<UpstreamTer
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
         return None;
     };
-    if value.get("error").is_some_and(|error| !error.is_null())
-        || value.get("type").and_then(Value::as_str) == Some("error")
+    if format != UpstreamFormat::OpenAiResponses
+        && (value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("type").and_then(Value::as_str) == Some("error"))
     {
         return Some(UpstreamTerminal::Failed);
     }
@@ -263,6 +264,24 @@ mod tests {
             .push(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
             .unwrap();
         assert_eq!(detector.terminal(), Some(UpstreamTerminal::Completed));
+    }
+
+    #[test]
+    fn responses_error_frame_is_not_terminal() {
+        let mut detector = UpstreamTerminalDetector::new(UpstreamFormat::OpenAiResponses);
+        detector
+            .push(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(detector.terminal(), None);
+
+        detector
+            .push(
+                b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(detector.terminal(), Some(UpstreamTerminal::Failed));
     }
 
     #[test]

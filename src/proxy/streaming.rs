@@ -116,6 +116,7 @@ pub struct ResponsesSseAggregator {
     output_item_bytes: usize,
     next_output_index: u64,
     stream_status: Option<&'static str>,
+    last_error: Option<Value>,
     max_retained_bytes: usize,
 }
 
@@ -497,6 +498,7 @@ impl ResponsesSseAggregator {
             output_item_bytes: 0,
             next_output_index: 0,
             stream_status: None,
+            last_error: None,
             max_retained_bytes: max_retained_bytes.max(1),
         }
     }
@@ -514,6 +516,11 @@ impl ResponsesSseAggregator {
         if !self.is_terminal() {
             let events = self.decoder.finish().map_err(stream_aggregation_error)?;
             self.process_events(events)?;
+        }
+        if !self.is_terminal() {
+            if let Some(error) = self.last_error.take() {
+                return Err(stream_terminal_error(&error));
+            }
         }
         let stream_status = self.stream_status.ok_or_else(|| {
             ResponsesSseAggregationError::new(
@@ -564,9 +571,10 @@ impl ResponsesSseAggregator {
                 "response.incomplete" => {
                     self.retain_terminal_response(event.value, "incomplete")?
                 }
-                "response.failed" | "response.cancelled" | "response.canceled" | "error" => {
+                "response.failed" | "response.cancelled" | "response.canceled" => {
                     return Err(stream_terminal_error(&event.value));
                 }
+                "error" => self.last_error = Some(event.value),
                 _ => match event.value.get("status").and_then(Value::as_str) {
                     Some("completed") => self.retain_terminal_response(event.value, "completed")?,
                     Some("incomplete") => {
@@ -1164,6 +1172,40 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         );
         let error = oversized.push(event.as_bytes()).unwrap_err();
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn responses_aggregator_keeps_reading_after_error_frame() {
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator
+            .push(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n",
+            )
+            .unwrap();
+        assert!(!aggregator.is_terminal());
+        aggregator
+            .push(
+                b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"overloaded\"}}}\n\n",
+            )
+            .unwrap_err();
+    }
+
+    #[test]
+    fn responses_aggregator_promotes_error_frame_at_eof() {
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator
+            .push(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n",
+            )
+            .unwrap();
+        let error = aggregator.finish().unwrap_err();
+        assert_eq!(
+            error.kind,
+            ResponsesSseAggregationErrorKind::UpstreamFailure
+        );
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        let message = error.into_proxy_error().to_string();
+        assert!(message.contains("overloaded"), "{message}");
     }
 
     #[test]

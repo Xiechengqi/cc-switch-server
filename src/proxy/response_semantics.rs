@@ -29,12 +29,33 @@ impl SemanticFailure {
     pub(super) fn display_message(&self) -> String {
         format!("{}: {}", self.code, self.message)
     }
+
+    pub(super) fn retryable_error_frame(&self) -> bool {
+        if self.origin == FailureOrigin::Client {
+            return false;
+        }
+        let code = normalize_failure_token(&self.code);
+        matches!(
+            code.as_str(),
+            "server_is_overloaded"
+                | "slow_down"
+                | "server_error"
+                | "service_unavailable"
+                | "service_unavailable_error"
+                | "upstream_error"
+                | "authentication_error"
+                | "unauthorized"
+                | "invalid_api_key"
+        ) || code.contains("rate_limit")
+            || code.contains("usage_limit")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SemanticObservation {
     Lifecycle,
     Business,
+    ErrorFrame(SemanticFailure),
     SuccessTerminal,
     IncompleteTerminal,
     Failure(SemanticFailure),
@@ -45,6 +66,7 @@ impl SemanticObservation {
         match self {
             Self::Lifecycle => "lifecycle",
             Self::Business => "business",
+            Self::ErrorFrame(_) => "error_frame",
             Self::SuccessTerminal => "success_terminal",
             Self::IncompleteTerminal => "incomplete_terminal",
             Self::Failure(failure) => match failure.origin {
@@ -55,7 +77,11 @@ impl SemanticObservation {
     }
 
     pub(super) fn commits_downstream(&self) -> bool {
-        !matches!(self, Self::Lifecycle)
+        match self {
+            Self::Lifecycle => false,
+            Self::ErrorFrame(failure) => !failure.retryable_error_frame(),
+            _ => true,
+        }
     }
 
     pub(super) fn counts_as_business_output(&self) -> bool {
@@ -132,9 +158,12 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
         .unwrap_or(value);
     let status = response.get("status").and_then(Value::as_str);
 
+    if event_type == "error" {
+        return SemanticObservation::ErrorFrame(failure_from_value(value, response, status));
+    }
     if matches!(status, Some("failed" | "cancelled"))
-        || non_null_error(response).is_some()
-        || event_type == "error"
+        || nested_non_null_error(response).is_some()
+        || nested_non_null_error(value).is_some()
         || event_type == "response.failed"
         || matches!(event_type, "response.cancelled" | "response.canceled")
     {
@@ -158,8 +187,8 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
 }
 
 fn failure_from_value(value: &Value, response: &Value, status: Option<&str>) -> SemanticFailure {
-    let error = non_null_error(response)
-        .or_else(|| non_null_error(value))
+    let error = nested_non_null_error(response)
+        .or_else(|| nested_non_null_error(value))
         .unwrap_or(response);
     let code = error
         .get("code")
@@ -201,10 +230,20 @@ fn failure_from_value(value: &Value, response: &Value, status: Option<&str>) -> 
     }
 }
 
-fn non_null_error(value: &Value) -> Option<&Value> {
+fn nested_non_null_error(value: &Value) -> Option<&Value> {
     value
         .get("error")
         .filter(|error| error_value_is_substantive(error))
+        .or_else(|| {
+            value
+                .pointer("/status_details/error")
+                .filter(|error| error_value_is_substantive(error))
+        })
+        .or_else(|| {
+            value
+                .pointer("/body/error")
+                .filter(|error| error_value_is_substantive(error))
+        })
 }
 
 pub(super) fn error_value_is_substantive(error: &Value) -> bool {
@@ -219,7 +258,7 @@ pub(super) fn error_value_is_substantive(error: &Value) -> bool {
 }
 
 fn classify_failure_origin(code: &str) -> FailureOrigin {
-    let code = code.trim().to_ascii_lowercase().replace(['-', '.'], "_");
+    let code = normalize_failure_token(code);
     if matches!(
         code.as_str(),
         "bad_request"
@@ -257,6 +296,10 @@ fn classify_failure_origin(code: &str) -> FailureOrigin {
     }
 }
 
+fn normalize_failure_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', '.'], "_")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamEncoding {
     Unknown,
@@ -270,6 +313,8 @@ pub(super) struct ResponsesSseInspector {
     buffer: Vec<u8>,
     saw_business: bool,
     terminal: Option<SemanticTerminal>,
+    pending_error: Option<SemanticFailure>,
+    terminal_from_error_frame: bool,
     done_seen: bool,
 }
 
@@ -280,6 +325,8 @@ impl Default for ResponsesSseInspector {
             buffer: Vec::new(),
             saw_business: false,
             terminal: None,
+            pending_error: None,
+            terminal_from_error_frame: false,
             done_seen: false,
         }
     }
@@ -321,7 +368,7 @@ impl ResponsesSseInspector {
         max_event_bytes: usize,
     ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
         self.detect_encoding();
-        let observations = match self.encoding {
+        let mut observations = match self.encoding {
             StreamEncoding::Unknown if self.buffer.iter().all(u8::is_ascii_whitespace) => {
                 self.buffer.clear();
                 Vec::new()
@@ -336,11 +383,15 @@ impl ResponsesSseInspector {
             StreamEncoding::Sse => self.drain_sse(true, max_pending_bytes, max_event_bytes)?,
         };
         if self.terminal.is_none() {
-            return Err(SemanticProtocolError::new(if self.done_seen {
-                "Responses stream emitted [DONE] before a terminal response event"
+            if let Some(failure) = self.promote_pending_error() {
+                observations.push(SemanticObservation::Failure(failure));
             } else {
-                "Responses stream ended before a terminal response event"
-            }));
+                return Err(SemanticProtocolError::new(if self.done_seen {
+                    "Responses stream emitted [DONE] before a terminal response event"
+                } else {
+                    "Responses stream ended before a terminal response event"
+                }));
+            }
         }
         Ok(observations)
     }
@@ -351,6 +402,16 @@ impl ResponsesSseInspector {
 
     pub(super) fn terminal(&self) -> Option<&SemanticTerminal> {
         self.terminal.as_ref()
+    }
+
+    pub(super) fn synthesized_failure_from_error_frame(&self) -> Option<&SemanticFailure> {
+        match self.terminal.as_ref() {
+            Some(SemanticTerminal::Failure(failure)) if self.terminal_from_error_frame => {
+                Some(failure)
+            }
+            None => self.pending_error.as_ref(),
+            _ => None,
+        }
     }
 
     fn detect_encoding(&mut self) {
@@ -541,6 +602,9 @@ impl ResponsesSseInspector {
     fn observe_done(&mut self) -> Result<(), SemanticProtocolError> {
         self.done_seen = true;
         if self.terminal.is_none() {
+            if self.promote_pending_error().is_some() {
+                return Ok(());
+            }
             return Err(SemanticProtocolError::new(
                 "Responses stream emitted [DONE] before a terminal response event",
             ));
@@ -551,6 +615,9 @@ impl ResponsesSseInspector {
     fn record(&mut self, observation: &SemanticObservation) {
         match observation {
             SemanticObservation::Lifecycle => {}
+            SemanticObservation::ErrorFrame(failure) => {
+                self.pending_error = Some(failure.clone());
+            }
             SemanticObservation::Business => self.saw_business = true,
             SemanticObservation::SuccessTerminal => {
                 self.terminal.get_or_insert(SemanticTerminal::Success);
@@ -563,6 +630,15 @@ impl ResponsesSseInspector {
                     .get_or_insert_with(|| SemanticTerminal::Failure(failure.clone()));
             }
         }
+    }
+
+    fn promote_pending_error(&mut self) -> Option<SemanticFailure> {
+        let failure = self.pending_error.take()?;
+        if self.terminal.is_none() {
+            self.terminal = Some(SemanticTerminal::Failure(failure.clone()));
+            self.terminal_from_error_frame = true;
+        }
+        Some(failure)
     }
 
     fn ensure_bounded(&self, max_event_bytes: usize) -> Result<(), SemanticProtocolError> {
@@ -686,6 +762,54 @@ mod tests {
                 ..
             })
         ));
+        let error_frame = classify_value(&json!({
+            "type": "error",
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later."
+            }
+        }));
+        assert!(matches!(
+            error_frame,
+            SemanticObservation::ErrorFrame(SemanticFailure {
+                origin: FailureOrigin::Provider,
+                ref code,
+                ..
+            }) if code == "server_is_overloaded"
+        ));
+        assert!(!error_frame.commits_downstream());
+
+        let status_details = classify_value(&json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": null,
+                "status_details": {
+                    "error": {
+                        "code": "server_is_overloaded",
+                        "message": "Our servers are currently overloaded. Please try again later."
+                    }
+                }
+            }
+        }));
+        assert!(matches!(
+            status_details,
+            SemanticObservation::Failure(SemanticFailure {
+                origin: FailureOrigin::Provider,
+                ref code,
+                ..
+            }) if code == "server_is_overloaded"
+        ));
+
+        let non_retryable_error_frame = classify_value(&json!({
+            "type": "error",
+            "error": {
+                "code": "unexpected_protocol_failure",
+                "message": "cannot continue"
+            }
+        }));
+        assert!(non_retryable_error_frame.commits_downstream());
     }
 
     #[test]
@@ -726,6 +850,86 @@ mod tests {
             inspector.terminal(),
             Some(SemanticTerminal::Failure(_))
         ));
+        inspector.finish().unwrap();
+    }
+
+    #[test]
+    fn sse_inspector_does_not_treat_error_frame_as_terminal() {
+        let mut inspector = ResponsesSseInspector::default();
+        let observations = inspector
+            .push(
+                concat!(
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n",
+                    "\n",
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n",
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [
+                SemanticObservation::Lifecycle,
+                SemanticObservation::ErrorFrame(SemanticFailure {
+                    origin: FailureOrigin::Provider,
+                    code,
+                    ..
+                })
+            ] if code == "server_is_overloaded"
+        ));
+        assert!(inspector.terminal().is_none());
+        let finished = inspector.finish().unwrap();
+        assert!(matches!(
+            finished.as_slice(),
+            [SemanticObservation::Failure(SemanticFailure {
+                origin: FailureOrigin::Provider,
+                code,
+                ..
+            })] if code == "server_is_overloaded"
+        ));
+        assert!(matches!(
+            inspector.terminal(),
+            Some(SemanticTerminal::Failure(SemanticFailure {
+                code,
+                ..
+            })) if code == "server_is_overloaded"
+        ));
+    }
+
+    #[test]
+    fn sse_inspector_promotes_error_frame_when_done_arrives_first() {
+        let mut inspector = ResponsesSseInspector::default();
+        let observations = inspector
+            .push(
+                concat!(
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 3s\"}}\n",
+                    "\n",
+                    "data: [DONE]\n",
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [SemanticObservation::ErrorFrame(SemanticFailure {
+                origin: FailureOrigin::Provider,
+                code,
+                ..
+            })] if code == "rate_limit_exceeded"
+        ));
+        assert!(matches!(
+            inspector.terminal(),
+            Some(SemanticTerminal::Failure(SemanticFailure {
+                code,
+                ..
+            })) if code == "rate_limit_exceeded"
+        ));
+        assert!(inspector.synthesized_failure_from_error_frame().is_some());
         inspector.finish().unwrap();
     }
 

@@ -22,6 +22,7 @@ pub enum ProviderRequestOutcome {
     Success { status_code: u16 },
     Failure { status_code: u16 },
     RateLimited { status_code: u16 },
+    CapacityShed { status_code: u16 },
     NetworkFailure,
 }
 

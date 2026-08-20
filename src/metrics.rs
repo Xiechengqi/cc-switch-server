@@ -154,6 +154,7 @@ pub fn record_provider_outcome(app: &str, provider_type: &str, outcome: Provider
         ProviderRequestOutcome::Success { .. } => "success",
         ProviderRequestOutcome::Failure { .. } => "failure",
         ProviderRequestOutcome::RateLimited { .. } => "rate_limited",
+        ProviderRequestOutcome::CapacityShed { .. } => "capacity_shed",
         ProviderRequestOutcome::NetworkFailure => "network_failure",
     };
     metrics::counter!(

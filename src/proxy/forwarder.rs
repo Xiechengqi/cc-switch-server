@@ -69,9 +69,12 @@ use super::kimi_runtime::{
 };
 use super::kiro;
 use super::openai_capacity_shed::{
-    capacity_shed_retry_source, is_openai_capacity_shed_failure,
-    openai_stream_bytes_start_client_output, sanitize_openai_capacity_shed_json_bytes,
-    sanitize_openai_capacity_shed_json_text, sanitize_openai_capacity_shed_sse_bytes,
+    capacity_shed_retry_source, is_openai_capacity_shed_failure, omit_openai_responses_done_events,
+    openai_capacity_shed_failure_from_bytes, openai_payload_values,
+    openai_stream_bytes_start_client_output, provider_stream_failure,
+    sanitize_openai_capacity_shed_json_bytes, sanitize_openai_capacity_shed_json_text,
+    sanitize_openai_capacity_shed_sse_bytes, synthesize_openai_capacity_shed_failed_json,
+    synthesize_openai_capacity_shed_failed_sse,
 };
 use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
@@ -114,8 +117,10 @@ const CODEX_IMAGES_MAX_PIXELS: u64 = 8_294_400;
 const MAX_FORWARD_RETRY_ATTEMPTS: u32 = 3;
 const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
 const MAX_CODEX_CAPACITY_RETRIES: u32 = 2;
-const CODEX_CAPACITY_RETRY_MIN_DELAY_MS: u64 = 200;
-const CODEX_CAPACITY_RETRY_MAX_DELAY_MS: u64 = 800;
+const CODEX_CAPACITY_RETRY_FIRST_MIN_DELAY_MS: u64 = 500;
+const CODEX_CAPACITY_RETRY_FIRST_MAX_DELAY_MS: u64 = 1_000;
+const CODEX_CAPACITY_RETRY_NEXT_MIN_DELAY_MS: u64 = 1_000;
+const CODEX_CAPACITY_RETRY_NEXT_MAX_DELAY_MS: u64 = 2_000;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_SHARE_MODEL_COOLDOWN_MS: i64 = 5 * 60_000;
 const DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
@@ -421,6 +426,7 @@ struct ForwardAttemptContext {
     retry_audit: Option<ForwardRetryAudit>,
     codex_capacity_retry_attempted: u32,
     pending_capacity_retry_delay: Option<Duration>,
+    skip_capacity_retry_delay: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +454,7 @@ impl Default for ForwardAttemptContext {
             retry_audit: None,
             codex_capacity_retry_attempted: 0,
             pending_capacity_retry_delay: None,
+            skip_capacity_retry_delay: false,
         }
     }
 }
@@ -527,7 +534,12 @@ impl ForwardAttemptContext {
     ) -> Self {
         let mut next = self.next(execution, self.body_retry_stage, "capacity", source);
         next.codex_capacity_retry_attempted = next.codex_capacity_retry_attempted.saturating_add(1);
-        next.pending_capacity_retry_delay = Some(delay);
+        next.skip_capacity_retry_delay = self.skip_capacity_retry_delay;
+        next.pending_capacity_retry_delay = Some(if self.skip_capacity_retry_delay {
+            Duration::ZERO
+        } else {
+            delay
+        });
         next
     }
 }
@@ -539,14 +551,14 @@ pub async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
-    forward_with_attempt(
+    Box::pin(forward_with_attempt(
         state,
         route,
         gemini_path,
         headers,
         body,
         ForwardAttemptContext::default(),
-    )
+    ))
     .await
 }
 
@@ -575,7 +587,15 @@ pub(crate) async fn forward_provider_test(
         provider_binding_pinned: true,
         ..ForwardAttemptContext::default()
     };
-    forward_with_attempt(state, route, gemini_path, headers, body, attempt_context).await
+    Box::pin(forward_with_attempt(
+        state,
+        route,
+        gemini_path,
+        headers,
+        body,
+        attempt_context,
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -1285,7 +1305,11 @@ async fn forward_with_attempt(
     let retry_gemini_path = gemini_path;
     'attempt: loop {
         if let Some(delay) = attempt_context.pending_capacity_retry_delay.take() {
-            tokio::time::sleep(delay).await;
+            if delay.is_zero() {
+                attempt_context.skip_capacity_retry_delay = true;
+            } else {
+                tokio::time::sleep(delay).await;
+            }
         }
         let gemini_path = retry_gemini_path.clone();
         let body = decode_request_body_for_proxy_with_limit(
@@ -2007,6 +2031,48 @@ async fn forward_with_attempt(
             }
         }
 
+        if execution.driver_is("oauth.openai_codex")
+            && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+        {
+            let decoded = match buffered_upstream_body.take() {
+                Some(decoded) => decoded,
+                None => {
+                    let bytes = crate::infra::http::read_response_body_limited(
+                        &mut upstream,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                    )
+                    .await
+                    .map_err(ProxyError::bad_gateway)?;
+                    decode_response_body_for_proxy_with_limit(
+                        &response_headers,
+                        bytes,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                    )?
+                }
+            };
+            let capacity_failure =
+                openai_capacity_shed_failure_from_bytes(&decoded.body).or_else(|| {
+                    (status.as_u16() == 529).then(|| SemanticFailure {
+                        origin: FailureOrigin::Provider,
+                        code: "server_is_overloaded".to_string(),
+                        message: "OpenAI Codex upstream returned HTTP 529".to_string(),
+                    })
+                });
+            if let Some(failure) = capacity_failure.as_ref() {
+                if let Some(next_attempt) =
+                    next_codex_capacity_retry_attempt(route, &attempt_context, &execution, failure)
+                {
+                    attempt_context = next_attempt;
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
+                record_provider_outcome(&state, &stored, capacity_shed_provider_outcome()).await;
+                return Err(codex_capacity_shed_proxy_error(failure));
+            }
+            buffered_upstream_body = Some(decoded);
+        }
+
         if status == StatusCode::BAD_REQUEST
             && codex_overflow_compact_eligible(route, &execution, &attempt_context)
         {
@@ -2051,44 +2117,49 @@ async fn forward_with_attempt(
         }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let bytes = match crate::infra::http::read_response_body_limited(
-                &mut upstream,
-                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-            )
-            .await
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    record_provider_outcome(
-                        &state,
-                        &stored,
-                        provider_outcome_from_status(status_code),
-                    )
-                    .await;
-                    if let Some(next_attempt) = next_claude_transport_attempt(
-                        &state,
-                        route,
-                        &headers,
-                        &request_context,
-                        &attempt_context,
-                        &execution,
-                        "rate_limit_body_read_error",
+            let decoded = match buffered_upstream_body.take() {
+                Some(decoded) => decoded,
+                None => {
+                    let bytes = match crate::infra::http::read_response_body_limited(
+                        &mut upstream,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
                     )
                     .await
                     {
-                        attempt_context = next_attempt;
-                        drop(account_in_flight_guard);
-                        drop(share_invocation_guard);
-                        continue 'attempt;
-                    }
-                    return Err(ProxyError::bad_gateway(error));
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                provider_outcome_from_status(status_code),
+                            )
+                            .await;
+                            if let Some(next_attempt) = next_claude_transport_attempt(
+                                &state,
+                                route,
+                                &headers,
+                                &request_context,
+                                &attempt_context,
+                                &execution,
+                                "rate_limit_body_read_error",
+                            )
+                            .await
+                            {
+                                attempt_context = next_attempt;
+                                drop(account_in_flight_guard);
+                                drop(share_invocation_guard);
+                                continue 'attempt;
+                            }
+                            return Err(ProxyError::bad_gateway(error));
+                        }
+                    };
+                    decode_response_body_for_proxy_with_limit(
+                        &response_headers,
+                        bytes,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                    )?
                 }
             };
-            let decoded = decode_response_body_for_proxy_with_limit(
-                &response_headers,
-                bytes,
-                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-            )?;
             let antigravity_limit = antigravity_limit_info(&execution, status, &decoded.body);
             if let Some(limit) = antigravity_limit.as_ref() {
                 record_antigravity_limit_evidence(&state, &execution, limit).await;
@@ -2241,7 +2312,7 @@ async fn forward_with_attempt(
             .await
             {
                 Ok(aggregation) => aggregation,
-                Err(failure) => {
+                Err(mut failure) => {
                     if !failure.saw_business_output
                         && failure.semantic_failure.as_ref().is_some_and(|failure| {
                             super::overflow_compact::is_context_length_failure(
@@ -2272,6 +2343,38 @@ async fn forward_with_attempt(
                     }
                     if !failure.saw_business_output {
                         if let Some(shed) = failure.semantic_failure.as_ref() {
+                            if is_openai_rate_limit_failure(shed) {
+                                let marker_body = semantic_failure_json(shed);
+                                maybe_mark_upstream_rate_limited(
+                                    &state,
+                                    &execution,
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    &response_headers,
+                                    &marker_body,
+                                    request_context.share_id.as_deref(),
+                                    final_model.as_deref(),
+                                )
+                                .await;
+                                failure.error = codex_semantic_rate_limit_error(
+                                    shed,
+                                    &response_headers,
+                                    &marker_body,
+                                );
+                                failure.stream_status = "rate_limited";
+                                failure.provider_outcome = Some(ProviderOutcome::RateLimited {
+                                    status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                                });
+                                record_openai_responses_aggregation_failure(
+                                    &state,
+                                    &stored,
+                                    &adapter_request,
+                                    &request_context,
+                                    started,
+                                    &failure,
+                                )
+                                .await;
+                                return Err(failure.error);
+                            }
                             if let Some(next_attempt) = next_codex_capacity_retry_attempt(
                                 route,
                                 &attempt_context,
@@ -2282,6 +2385,20 @@ async fn forward_with_attempt(
                                 drop(account_in_flight_guard);
                                 drop(share_invocation_guard);
                                 continue 'attempt;
+                            }
+                            if is_openai_capacity_shed_failure(shed)
+                                && execution.driver_is("oauth.openai_codex")
+                            {
+                                record_openai_responses_aggregation_failure(
+                                    &state,
+                                    &stored,
+                                    &adapter_request,
+                                    &request_context,
+                                    started,
+                                    &failure,
+                                )
+                                .await;
+                                return Err(codex_capacity_shed_proxy_error(shed));
                             }
                         }
                     }
@@ -2748,7 +2865,11 @@ async fn forward_with_attempt(
                             }
                             return Err(ProxyError::bad_gateway(error));
                         }
-                        if let Some(SemanticObservation::Failure(failure)) = &semantic_decision {
+                        if let Some(failure) = match &semantic_decision {
+                            Some(SemanticObservation::Failure(failure))
+                            | Some(SemanticObservation::ErrorFrame(failure)) => Some(failure),
+                            _ => None,
+                        } {
                             if !pending_chunk_saw_business_output
                                 && super::overflow_compact::is_context_length_failure(
                                     &failure.code,
@@ -2777,43 +2898,102 @@ async fn forward_with_attempt(
                                 }
                             }
                             if failure.origin == FailureOrigin::Provider {
-                                if !pending_chunk_saw_business_output
-                                    && !openai_stream_bytes_start_client_output(&chunk)
+                                if is_openai_rate_limit_failure(failure)
+                                    && execution.driver_is("oauth.openai_codex")
                                 {
-                                    if let Some(next_attempt) = next_codex_capacity_retry_attempt(
-                                        route,
-                                        &attempt_context,
+                                    maybe_mark_upstream_rate_limited(
+                                        &state,
                                         &execution,
-                                        failure,
-                                    ) {
-                                        attempt_context = next_attempt;
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        &response_headers,
+                                        &chunk,
+                                        request_context.share_id.as_deref(),
+                                        final_model.as_deref(),
+                                    )
+                                    .await;
+                                    record_provider_outcome(
+                                        &state,
+                                        &stored,
+                                        ProviderOutcome::RateLimited {
+                                            status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                                        },
+                                    )
+                                    .await;
+                                    semantic_provider_outcome_recorded = true;
+                                    if !pending_chunk_saw_business_output
+                                        && !pending_chunk_committed_output
+                                    {
                                         drop(inner);
                                         drop(account_in_flight_guard);
                                         drop(share_invocation_guard);
-                                        continue 'attempt;
+                                        return Err(codex_semantic_rate_limit_error(
+                                            failure,
+                                            &response_headers,
+                                            &chunk,
+                                        ));
                                     }
-                                }
-                                record_provider_outcome(
-                                    &state,
-                                    &stored,
-                                    ProviderOutcome::Failure { status_code: 502 },
-                                )
-                                .await;
-                                semantic_provider_outcome_recorded = true;
-                                if !request_is_provider_pinned(&attempt_context, &request_context) {
-                                    if let Some(next_attempt) = next_provider_failover(
-                                        &state,
-                                        route,
-                                        &attempt_context,
-                                        &execution,
-                                        "responses_stream_semantic_failure",
-                                    )
-                                    .await
+                                } else {
+                                    if !pending_chunk_saw_business_output
+                                        && !openai_stream_bytes_start_client_output(&chunk)
                                     {
-                                        attempt_context = next_attempt;
-                                        drop(account_in_flight_guard);
-                                        drop(share_invocation_guard);
-                                        continue 'attempt;
+                                        if let Some(next_attempt) =
+                                            next_codex_capacity_retry_attempt(
+                                                route,
+                                                &attempt_context,
+                                                &execution,
+                                                failure,
+                                            )
+                                        {
+                                            attempt_context = next_attempt;
+                                            drop(inner);
+                                            drop(account_in_flight_guard);
+                                            drop(share_invocation_guard);
+                                            continue 'attempt;
+                                        }
+                                        if is_openai_capacity_shed_failure(failure)
+                                            && execution.driver_is("oauth.openai_codex")
+                                        {
+                                            record_provider_outcome(
+                                                &state,
+                                                &stored,
+                                                capacity_shed_provider_outcome(),
+                                            )
+                                            .await;
+                                            drop(inner);
+                                            drop(account_in_flight_guard);
+                                            drop(share_invocation_guard);
+                                            return Err(codex_capacity_shed_proxy_error(failure));
+                                        }
+                                    }
+                                    record_provider_outcome(
+                                        &state,
+                                        &stored,
+                                        if is_openai_capacity_shed_failure(failure) {
+                                            capacity_shed_provider_outcome()
+                                        } else {
+                                            ProviderOutcome::Failure { status_code: 502 }
+                                        },
+                                    )
+                                    .await;
+                                    semantic_provider_outcome_recorded = true;
+                                    if !request_is_provider_pinned(
+                                        &attempt_context,
+                                        &request_context,
+                                    ) {
+                                        if let Some(next_attempt) = next_provider_failover(
+                                            &state,
+                                            route,
+                                            &attempt_context,
+                                            &execution,
+                                            "responses_stream_semantic_failure",
+                                        )
+                                        .await
+                                        {
+                                            attempt_context = next_attempt;
+                                            drop(account_in_flight_guard);
+                                            drop(share_invocation_guard);
+                                            continue 'attempt;
+                                        }
                                     }
                                 }
                             }
@@ -2905,6 +3085,13 @@ async fn forward_with_attempt(
                 status_code,
                 share_id: request_context.share_id.clone(),
                 user_email: request_context.user_email.clone(),
+                codex_rate_limit: (execution.driver_is("oauth.openai_codex")
+                    && inspect_responses_semantics)
+                    .then(|| CodexRateLimitContext {
+                        execution: execution.clone(),
+                        response_headers: response_headers.clone(),
+                        model: final_model.clone(),
+                    }),
                 started,
                 first_token_ms: None,
                 received_any_chunk: false,
@@ -3316,6 +3503,12 @@ async fn forward_with_attempt(
                                 .push(transformed);
                             let transformed =
                                 stream_state.sanitize_openai_capacity_shed_chunk(transformed);
+                            let synthesized =
+                                stream_state.maybe_synthesize_codex_responses_failed_frame();
+                            if !synthesized.is_empty() {
+                                stream_state.terminal_frame_sent = true;
+                            }
+                            let transformed = join_bytes(transformed, synthesized);
                             stream_state.record_image_transport_emit(&transformed, false);
                             stream_state.commit_kimi_thinking_replay_stream().await;
                             stream_state.finalize_terminal_usage(true).await;
@@ -3387,6 +3580,12 @@ async fn forward_with_attempt(
                             stream_state.codex_custom_tool_stream_patcher.finish(),
                         );
                         stream_state.commit_kimi_thinking_replay_stream().await;
+                        let synthesized =
+                            stream_state.maybe_synthesize_codex_responses_failed_frame();
+                        if !synthesized.is_empty() {
+                            stream_state.terminal_frame_sent = true;
+                        }
+                        let custom_tail = join_bytes(custom_tail, synthesized);
                         stream_state.finalize_terminal_usage(true).await;
                         if !custom_tail.is_empty() {
                             return Ok(Some((custom_tail, stream_state)));
@@ -3648,7 +3847,9 @@ async fn forward_with_attempt(
                 }
             };
             crate::metrics::record_proxy_semantic_guard("http_document", observation.metric_kind());
-            if let SemanticObservation::Failure(failure) = &observation {
+            if let SemanticObservation::Failure(failure)
+            | SemanticObservation::ErrorFrame(failure) = &observation
+            {
                 if super::overflow_compact::is_context_length_failure(
                     &failure.code,
                     &failure.message,
@@ -3674,6 +3875,52 @@ async fn forward_with_attempt(
                     }
                 }
                 if failure.origin == FailureOrigin::Provider {
+                    if is_openai_rate_limit_failure(failure)
+                        && execution.driver_is("oauth.openai_codex")
+                    {
+                        let marker_body = semantic_failure_json(failure);
+                        maybe_mark_upstream_rate_limited(
+                            &state,
+                            &execution,
+                            StatusCode::TOO_MANY_REQUESTS,
+                            &response_headers,
+                            &marker_body,
+                            request_context.share_id.as_deref(),
+                            final_model.as_deref(),
+                        )
+                        .await;
+                        record_provider_outcome(
+                            &state,
+                            &stored,
+                            ProviderOutcome::RateLimited {
+                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                            },
+                        )
+                        .await;
+                        return Err(codex_semantic_rate_limit_error(
+                            failure,
+                            &response_headers,
+                            &marker_body,
+                        ));
+                    }
+                    if is_openai_capacity_shed_failure(failure)
+                        && execution.driver_is("oauth.openai_codex")
+                    {
+                        if let Some(next_attempt) = next_codex_capacity_retry_attempt(
+                            route,
+                            &attempt_context,
+                            &execution,
+                            failure,
+                        ) {
+                            attempt_context = next_attempt;
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                        record_provider_outcome(&state, &stored, capacity_shed_provider_outcome())
+                            .await;
+                        return Err(codex_capacity_shed_proxy_error(failure));
+                    }
                     record_provider_outcome(
                         &state,
                         &stored,
@@ -3797,9 +4044,21 @@ async fn forward_with_attempt(
                         record_provider_outcome(
                             &state,
                             &stored,
-                            ProviderOutcome::Failure { status_code: 502 },
+                            if is_openai_capacity_shed_failure(&failure) {
+                                capacity_shed_provider_outcome()
+                            } else {
+                                ProviderOutcome::Failure { status_code: 502 }
+                            },
                         )
                         .await;
+                    }
+                }
+                Some(SemanticObservation::ErrorFrame(failure))
+                    if is_openai_capacity_shed_failure(&failure) =>
+                {
+                    if !semantic_provider_outcome_recorded {
+                        record_provider_outcome(&state, &stored, capacity_shed_provider_outcome())
+                            .await;
                     }
                 }
                 Some(SemanticObservation::Failure(_)) => {}
@@ -9312,8 +9571,10 @@ async fn bridge_responses_websocket(
                         turn.observe_message(&message, observation.counts_as_business_output());
                     }
                 }
-                if matches!(semantic_observation, Some(SemanticObservation::Lifecycle))
-                    && !emitted_business_event
+                if matches!(
+                    semantic_observation,
+                    Some(SemanticObservation::Lifecycle | SemanticObservation::ErrorFrame(_))
+                ) && !emitted_business_event
                 {
                     let buffered_bytes = pending_lifecycle_messages
                         .iter()
@@ -9349,20 +9610,25 @@ async fn bridge_responses_websocket(
                     pending_lifecycle_messages.push(message);
                     continue;
                 }
-                if let Some(SemanticObservation::Failure(failure)) = &semantic_observation {
-                    if failure.origin == FailureOrigin::Provider
-                        && responses_websocket_http_replay_allowed(
-                            mode,
-                            emitted_business_event,
-                            response_create_committed,
-                        )
-                    {
+                if let Some(failure) = semantic_observation
+                    .as_ref()
+                    .and_then(provider_stream_failure)
+                {
+                    if responses_websocket_http_replay_allowed(
+                        mode,
+                        emitted_business_event,
+                        response_create_committed,
+                    ) {
                         let failed = execution.runtime_stored_view();
                         if !semantic_provider_outcome_recorded {
                             record_provider_outcome(
                                 state,
                                 &failed,
-                                ProviderOutcome::Failure { status_code: 502 },
+                                if is_openai_capacity_shed_failure(failure) {
+                                    capacity_shed_provider_outcome()
+                                } else {
+                                    ProviderOutcome::Failure { status_code: 502 }
+                                },
                             )
                             .await;
                             semantic_provider_outcome_recorded = true;
@@ -9427,9 +9693,12 @@ async fn bridge_responses_websocket(
                     Some(SemanticObservation::Failure(failure)) => {
                         Some(SemanticTerminal::Failure(failure.clone()))
                     }
-                    Some(SemanticObservation::Lifecycle | SemanticObservation::Business) | None => {
-                        None
-                    }
+                    Some(
+                        SemanticObservation::Lifecycle
+                        | SemanticObservation::Business
+                        | SemanticObservation::ErrorFrame(_),
+                    )
+                    | None => None,
                 };
                 let terminal = semantic_terminal.is_some()
                     || (semantic_observation.is_none()
@@ -9464,7 +9733,11 @@ async fn bridge_responses_websocket(
                                 record_provider_outcome(
                                     state,
                                     &execution.runtime_stored_view(),
-                                    ProviderOutcome::Failure { status_code: 502 },
+                                    if is_openai_capacity_shed_failure(&failure) {
+                                        capacity_shed_provider_outcome()
+                                    } else {
+                                        ProviderOutcome::Failure { status_code: 502 }
+                                    },
                                 )
                                 .await;
                             }
@@ -9762,6 +10035,7 @@ enum CodexHttpRelayOutcome {
         error: ProxyError,
         committed_business_event: bool,
         replay_payloads: Vec<String>,
+        last_error: Option<SemanticFailure>,
     },
 }
 
@@ -9805,6 +10079,7 @@ async fn run_codex_websocket_http_fallback(
         turn.record_retry("transport", source);
     }
     crate::metrics::record_codex_websocket_fallback(source, "attempt");
+    let fallback_started = Instant::now();
     let mut capacity_retry_attempted = 0_u32;
     let rate_limit_share_id = active_usage_turn
         .as_ref()
@@ -9904,6 +10179,7 @@ async fn run_codex_websocket_http_fallback(
             }
         };
         let status = upstream.status();
+        let response_headers = upstream.headers().clone();
         if status == StatusCode::UNAUTHORIZED && !*auth_refresh_attempted {
             let Some((provider_type, account_id, expected_generation)) =
                 execution.managed_account_identity_target()
@@ -9994,7 +10270,6 @@ async fn run_codex_websocket_http_fallback(
             .await;
         }
         if !status.is_success() {
-            let response_headers = upstream.headers().clone();
             let body_result = match first_event_deadline {
                 Some(deadline) => match tokio::time::timeout_at(
                     deadline,
@@ -10055,6 +10330,46 @@ async fn run_codex_websocket_http_fallback(
                     .await;
                 }
             };
+            let capacity_failure = openai_capacity_shed_failure_from_bytes(&body).or_else(|| {
+                (status.as_u16() == 529).then(|| SemanticFailure {
+                    origin: FailureOrigin::Provider,
+                    code: "server_is_overloaded".to_string(),
+                    message: "OpenAI Codex upstream returned HTTP 529".to_string(),
+                })
+            });
+            if execution.driver_is("oauth.openai_codex") {
+                if let Some(failure) = capacity_failure.as_ref() {
+                    if let Some(delay) = take_codex_http_fallback_capacity_retry(
+                        &mut capacity_retry_attempted,
+                        fallback_started.elapsed(),
+                    ) {
+                        record_forward_retry(
+                            ProxyRoute::CodexResponses,
+                            "capacity",
+                            capacity_shed_retry_source(failure),
+                        );
+                        if let Some(turn) = active_usage_turn.as_mut() {
+                            turn.record_retry("capacity", capacity_shed_retry_source(failure));
+                        }
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    record_provider_outcome(state, &stored, capacity_shed_provider_outcome()).await;
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        codex_capacity_shed_proxy_error(failure),
+                        "cc_switch_upstream_capacity_shed",
+                        Some("provider_failure"),
+                        active_usage_turn,
+                    )
+                    .await;
+                }
+            }
             maybe_mark_upstream_rate_limited(
                 state,
                 execution,
@@ -10112,12 +10427,40 @@ async fn run_codex_websocket_http_fallback(
             Ok(CodexHttpRelayOutcome::Completed(terminal)) => {
                 match &terminal {
                     SemanticTerminal::Failure(failure)
+                        if is_openai_rate_limit_failure(failure)
+                            && execution.driver_is("oauth.openai_codex") =>
+                    {
+                        let marker_body = semantic_failure_json(failure);
+                        maybe_mark_upstream_rate_limited(
+                            state,
+                            execution,
+                            StatusCode::TOO_MANY_REQUESTS,
+                            &response_headers,
+                            &marker_body,
+                            rate_limit_share_id.as_deref(),
+                            rate_limit_model.as_deref(),
+                        )
+                        .await;
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            ProviderOutcome::RateLimited {
+                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                            },
+                        )
+                        .await;
+                    }
+                    SemanticTerminal::Failure(failure)
                         if failure.origin == FailureOrigin::Provider =>
                     {
                         record_provider_outcome(
                             state,
                             &stored,
-                            ProviderOutcome::Failure { status_code: 502 },
+                            if is_openai_capacity_shed_failure(failure) {
+                                capacity_shed_provider_outcome()
+                            } else {
+                                ProviderOutcome::Failure { status_code: 502 }
+                            },
                         )
                         .await;
                     }
@@ -10150,18 +10493,69 @@ async fn run_codex_websocket_http_fallback(
                 failure,
                 replay_payloads,
             }) => {
+                if is_openai_rate_limit_failure(&failure)
+                    && execution.driver_is("oauth.openai_codex")
+                {
+                    let marker_body = semantic_failure_json(&failure);
+                    maybe_mark_upstream_rate_limited(
+                        state,
+                        execution,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        &response_headers,
+                        &marker_body,
+                        rate_limit_share_id.as_deref(),
+                        rate_limit_model.as_deref(),
+                    )
+                    .await;
+                    record_provider_outcome(
+                        state,
+                        &stored,
+                        ProviderOutcome::RateLimited {
+                            status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        },
+                    )
+                    .await;
+                    let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
+                        responses_payload_terminal(payload).is_some_and(|terminal| {
+                            matches!(terminal, SemanticTerminal::Failure(_))
+                        })
+                    });
+                    for payload in replay_payloads {
+                        relay_codex_http_fallback_event(downstream, output_patcher, payload)
+                            .await?;
+                    }
+                    if needs_failed_terminal {
+                        relay_codex_http_fallback_event(
+                            downstream,
+                            output_patcher,
+                            synthesize_openai_capacity_shed_failed_json(&failure),
+                        )
+                        .await?;
+                    }
+                    finish_active_websocket_terminal(
+                        active_usage_turn,
+                        &SemanticTerminal::Failure(failure),
+                    )
+                    .await;
+                    crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
+                    return Ok(CodexHttpFallbackOutcome::Completed);
+                }
                 if is_openai_capacity_shed_failure(&failure)
                     && execution.driver_is("oauth.openai_codex")
                 {
-                    if let Some(delay) =
-                        take_codex_http_fallback_capacity_retry(&mut capacity_retry_attempted)
-                    {
+                    if let Some(delay) = take_codex_http_fallback_capacity_retry(
+                        &mut capacity_retry_attempted,
+                        fallback_started.elapsed(),
+                    ) {
                         let _ = replay_payloads;
                         record_forward_retry(
                             ProxyRoute::CodexResponses,
                             "capacity",
                             capacity_shed_retry_source(&failure),
                         );
+                        if let Some(turn) = active_usage_turn.as_mut() {
+                            turn.record_retry("capacity", capacity_shed_retry_source(&failure));
+                        }
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -10169,16 +10563,32 @@ async fn run_codex_websocket_http_fallback(
                 record_provider_outcome(
                     state,
                     &stored,
-                    ProviderOutcome::Failure { status_code: 502 },
+                    if is_openai_capacity_shed_failure(&failure) {
+                        capacity_shed_provider_outcome()
+                    } else {
+                        ProviderOutcome::Failure { status_code: 502 }
+                    },
                 )
                 .await;
                 tracing::debug!(
                     error = %failure.display_message(),
                     "forwarding Responses semantic failure after HTTP fallback failover exhausted"
                 );
+                let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
+                    responses_payload_terminal(payload)
+                        .is_some_and(|terminal| matches!(terminal, SemanticTerminal::Failure(_)))
+                });
                 for payload in replay_payloads {
                     let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
                     relay_codex_http_fallback_event(downstream, output_patcher, payload).await?;
+                }
+                if needs_failed_terminal {
+                    relay_codex_http_fallback_event(
+                        downstream,
+                        output_patcher,
+                        synthesize_openai_capacity_shed_failed_json(&failure),
+                    )
+                    .await?;
                 }
                 finish_active_websocket_terminal(
                     active_usage_turn,
@@ -10192,12 +10602,76 @@ async fn run_codex_websocket_http_fallback(
                 error,
                 committed_business_event: _,
                 replay_payloads,
+                last_error,
             }) => {
+                if let Some(failure) =
+                    last_error.or_else(|| last_responses_error_from_payloads(&replay_payloads))
+                {
+                    let rate_limited = is_openai_rate_limit_failure(&failure)
+                        && execution.driver_is("oauth.openai_codex");
+                    if rate_limited {
+                        let marker_body = semantic_failure_json(&failure);
+                        maybe_mark_upstream_rate_limited(
+                            state,
+                            execution,
+                            StatusCode::TOO_MANY_REQUESTS,
+                            &response_headers,
+                            &marker_body,
+                            rate_limit_share_id.as_deref(),
+                            rate_limit_model.as_deref(),
+                        )
+                        .await;
+                    }
+                    record_provider_outcome(
+                        state,
+                        &stored,
+                        if rate_limited {
+                            ProviderOutcome::RateLimited {
+                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                            }
+                        } else if is_openai_capacity_shed_failure(&failure) {
+                            capacity_shed_provider_outcome()
+                        } else {
+                            ProviderOutcome::Failure { status_code: 502 }
+                        },
+                    )
+                    .await;
+                    let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
+                        responses_payload_terminal(payload).is_some_and(|terminal| {
+                            matches!(terminal, SemanticTerminal::Failure(_))
+                        })
+                    });
+                    for payload in replay_payloads {
+                        let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
+                        relay_codex_http_fallback_event(downstream, output_patcher, payload)
+                            .await?;
+                    }
+                    if needs_failed_terminal {
+                        relay_codex_http_fallback_event(
+                            downstream,
+                            output_patcher,
+                            synthesize_openai_capacity_shed_failed_json(&failure),
+                        )
+                        .await?;
+                    }
+                    finish_active_websocket_terminal(
+                        active_usage_turn,
+                        &SemanticTerminal::Failure(failure),
+                    )
+                    .await;
+                    crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
+                    return Ok(CodexHttpFallbackOutcome::Completed);
+                }
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
                 let error_code = if error.status == StatusCode::GATEWAY_TIMEOUT {
                     "upstream_stream_timeout"
                 } else if error.status == StatusCode::PAYLOAD_TOO_LARGE {
                     "upstream_stream_too_large"
+                } else if error
+                    .client_message()
+                    .contains("ended before a terminal response event")
+                {
+                    "upstream_closed_before_terminal"
                 } else {
                     "upstream_stream_error"
                 };
@@ -10210,7 +10684,11 @@ async fn run_codex_websocket_http_fallback(
                     replay_payloads,
                     error,
                     error_code,
-                    Some("transport_error"),
+                    Some(if error_code == "upstream_closed_before_terminal" {
+                        "missing_terminal"
+                    } else {
+                        "transport_error"
+                    }),
                     active_usage_turn,
                 )
                 .await;
@@ -10263,7 +10741,11 @@ async fn terminate_codex_http_fallback_with_error(
         Some(error.client_message().to_string()),
     )
     .await;
-    let error_body = websocket_stream_error_body(error.client_message(), error_code);
+    let error_body = if error_code == "upstream_closed_before_terminal" {
+        websocket_missing_terminal_error_body()
+    } else {
+        websocket_stream_error_body(error.client_message(), error_code)
+    };
     let mut pending_messages = replay_payloads
         .into_iter()
         .map(TungsteniteMessage::Text)
@@ -10635,6 +11117,7 @@ async fn relay_codex_http_fallback_stream(
     let mut decoder = CodexHttpFallbackSseDecoder::default();
     let mut committed_business_event = false;
     let mut pending_lifecycle_payloads = Vec::new();
+    let mut last_error = None;
     let mut deadline = first_event_deadline;
 
     let relay_result: Result<CodexHttpRelayOutcome, CodexHttpRelayFailure> = async {
@@ -10707,6 +11190,7 @@ async fn relay_codex_http_fallback_stream(
                     let payloads = decoder
                         .push(&chunk)
                         .map_err(CodexHttpRelayFailure::Upstream)?;
+                    remember_codex_http_fallback_error_frames(&payloads, &mut last_error);
                     if let Some(outcome) = relay_codex_http_fallback_payloads(
                         downstream,
                         output_patcher,
@@ -10728,6 +11212,7 @@ async fn relay_codex_http_fallback_stream(
                     let payloads = decoder
                         .finish()
                         .map_err(CodexHttpRelayFailure::Upstream)?;
+                    remember_codex_http_fallback_error_frames(&payloads, &mut last_error);
                     if let Some(outcome) = relay_codex_http_fallback_payloads(
                         downstream,
                         output_patcher,
@@ -10755,6 +11240,7 @@ async fn relay_codex_http_fallback_stream(
             error,
             committed_business_event,
             replay_payloads: pending_lifecycle_payloads,
+            last_error,
         }),
         Err(CodexHttpRelayFailure::Client(error)) => Err(error),
         Err(CodexHttpRelayFailure::DownstreamClosed) => Ok(CodexHttpRelayOutcome::DownstreamClosed),
@@ -10769,15 +11255,6 @@ async fn relay_codex_http_fallback_payloads(
     committed_business_event: &mut bool,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<Option<CodexHttpRelayOutcome>, CodexHttpRelayFailure> {
-    if let Some(turn) = active_usage_turn.as_mut() {
-        for payload in &payloads {
-            let business = serde_json::from_str::<Value>(payload)
-                .ok()
-                .map(|value| response_semantics::classify_value(&value))
-                .is_some_and(|observation| observation.counts_as_business_output());
-            turn.observe_payload(payload.as_bytes(), business);
-        }
-    }
     if !*committed_business_event {
         if let Some((failure_index, failure)) =
             codex_http_fallback_batch_provider_failure(&payloads)
@@ -10799,6 +11276,13 @@ async fn relay_codex_http_fallback_payloads(
     }
 
     for payload in payloads {
+        if let Some(turn) = active_usage_turn.as_mut() {
+            let business = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .map(|value| response_semantics::classify_value(&value))
+                .is_some_and(|observation| observation.counts_as_business_output());
+            turn.observe_payload(payload.as_bytes(), business);
+        }
         match relay_codex_http_fallback_semantic_event(
             downstream,
             output_patcher,
@@ -10829,18 +11313,31 @@ fn codex_http_fallback_batch_provider_failure(
     if !response_semantics::semantic_guard_enabled() {
         return Ok(None);
     }
+    let mut committed = false;
     for (index, payload) in payloads.iter().enumerate() {
         let value = serde_json::from_str::<Value>(payload).map_err(|error| {
             ProxyError::bad_gateway(format!("invalid Responses event: {error}"))
         })?;
-        match response_semantics::classify_value(&value) {
-            SemanticObservation::Failure(failure) if failure.origin == FailureOrigin::Provider => {
-                return Ok(Some((index, failure)));
+        let observation = response_semantics::classify_value(&value);
+        match &observation {
+            observation if !committed && provider_stream_failure(observation).is_some() => {
+                return Ok(Some((
+                    index,
+                    provider_stream_failure(observation)
+                        .cloned()
+                        .expect("provider stream failure"),
+                )));
             }
             SemanticObservation::SuccessTerminal
             | SemanticObservation::IncompleteTerminal
             | SemanticObservation::Failure(_) => return Ok(None),
-            SemanticObservation::Lifecycle | SemanticObservation::Business => {}
+            SemanticObservation::Lifecycle
+            | SemanticObservation::Business
+            | SemanticObservation::ErrorFrame(_) => {}
+        }
+        committed |= observation.commits_downstream();
+        if committed {
+            return Ok(None);
         }
     }
     Ok(None)
@@ -10874,9 +11371,14 @@ async fn relay_codex_http_fallback_semantic_event(
         "websocket_http_fallback",
         observation.metric_kind(),
     );
-    if matches!(observation, SemanticObservation::Lifecycle) && !*committed_business_event {
+    if !observation.commits_downstream() && !*committed_business_event {
         buffer_codex_http_fallback_semantic_prelude(pending_lifecycle_payloads, payload)
             .map_err(CodexHttpRelayFailure::Upstream)?;
+        if let Some(failure) = provider_stream_failure(&observation) {
+            return Ok(CodexHttpRelayEventOutcome::ProviderFailureBeforeCommit(
+                failure.clone(),
+            ));
+        }
         return Ok(CodexHttpRelayEventOutcome::Continue);
     }
     if let SemanticObservation::Failure(failure) = &observation {
@@ -10899,7 +11401,7 @@ async fn relay_codex_http_fallback_semantic_event(
     relay_codex_http_fallback_event(downstream, output_patcher, payload)
         .await
         .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
-    *committed_business_event |= observation.counts_as_business_output();
+    *committed_business_event |= observation.commits_downstream();
     Ok(match observation {
         SemanticObservation::SuccessTerminal => {
             CodexHttpRelayEventOutcome::Terminal(SemanticTerminal::Success)
@@ -10910,9 +11412,9 @@ async fn relay_codex_http_fallback_semantic_event(
         SemanticObservation::Failure(failure) => {
             CodexHttpRelayEventOutcome::Terminal(SemanticTerminal::Failure(failure))
         }
-        SemanticObservation::Lifecycle | SemanticObservation::Business => {
-            CodexHttpRelayEventOutcome::Continue
-        }
+        SemanticObservation::Lifecycle
+        | SemanticObservation::Business
+        | SemanticObservation::ErrorFrame(_) => CodexHttpRelayEventOutcome::Continue,
     })
 }
 
@@ -10942,7 +11444,30 @@ fn responses_payload_terminal(payload: &str) -> Option<SemanticTerminal> {
         SemanticObservation::SuccessTerminal => Some(SemanticTerminal::Success),
         SemanticObservation::IncompleteTerminal => Some(SemanticTerminal::Incomplete),
         SemanticObservation::Failure(failure) => Some(SemanticTerminal::Failure(failure)),
-        SemanticObservation::Lifecycle | SemanticObservation::Business => None,
+        SemanticObservation::Lifecycle
+        | SemanticObservation::Business
+        | SemanticObservation::ErrorFrame(_) => None,
+    }
+}
+
+fn last_responses_error_from_payloads(payloads: &[String]) -> Option<SemanticFailure> {
+    payloads.iter().rev().find_map(|payload| {
+        let value = serde_json::from_str::<Value>(payload).ok()?;
+        match response_semantics::classify_value(&value) {
+            SemanticObservation::ErrorFrame(failure) | SemanticObservation::Failure(failure) => {
+                Some(failure)
+            }
+            _ => None,
+        }
+    })
+}
+
+fn remember_codex_http_fallback_error_frames(
+    payloads: &[String],
+    last_error: &mut Option<SemanticFailure>,
+) {
+    if let Some(failure) = last_responses_error_from_payloads(payloads) {
+        *last_error = Some(failure);
     }
 }
 
@@ -11079,7 +11604,7 @@ fn responses_websocket_request_starts_response(message: &TungsteniteMessage) -> 
 fn responses_websocket_response_is_terminal(message: &TungsteniteMessage) -> bool {
     matches!(
         websocket_message_json_type(message).as_deref(),
-        Some("response.completed" | "response.failed" | "response.incomplete" | "error")
+        Some("response.completed" | "response.failed" | "response.incomplete")
     )
 }
 
@@ -11133,15 +11658,7 @@ fn classify_responses_websocket_message(
 fn semantic_prelude_decision(observations: &[SemanticObservation]) -> Option<SemanticObservation> {
     observations
         .iter()
-        .find(|observation| {
-            matches!(
-                observation,
-                SemanticObservation::Failure(SemanticFailure {
-                    origin: FailureOrigin::Provider,
-                    ..
-                })
-            )
-        })
+        .find(|observation| provider_stream_failure(observation).is_some())
         .or_else(|| {
             observations
                 .iter()
@@ -11393,7 +11910,7 @@ impl CodexWebsocketOutputPatcher {
                     }
                 }
             }
-            Some("response.failed") | Some("response.incomplete") | Some("error") => self.clear(),
+            Some("response.failed") | Some("response.incomplete") => self.clear(),
             _ => {}
         }
     }
@@ -11640,10 +12157,19 @@ fn websocket_message_too_big_error_body() -> String {
 }
 
 fn websocket_missing_terminal_error_body() -> String {
-    websocket_stream_error_body(
-        "upstream websocket closed before a terminal response event",
-        "upstream_closed_before_terminal",
-    )
+    json!({
+        "type": "response.failed",
+        "response": {
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": "upstream_error",
+                "code": "upstream_closed_before_terminal",
+                "message": "upstream websocket closed before a terminal response event"
+            }
+        }
+    })
+    .to_string()
 }
 
 fn websocket_stream_error_body(message: &str, code: &str) -> String {
@@ -11727,24 +12253,102 @@ fn antigravity_limit_info(
     .flatten()
 }
 
-fn take_codex_http_fallback_capacity_retry(attempted: &mut u32) -> Option<Duration> {
+fn take_codex_http_fallback_capacity_retry(
+    attempted: &mut u32,
+    elapsed: Duration,
+) -> Option<Duration> {
     if *attempted >= MAX_CODEX_CAPACITY_RETRIES {
         return None;
     }
+    let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(elapsed.as_millis());
+    let (min_delay_ms, _) = codex_capacity_retry_delay_bounds(*attempted);
+    if remaining_ms < min_delay_ms as u128 {
+        return None;
+    }
+    let delay = codex_capacity_retry_delay(remaining_ms, *attempted);
     *attempted = attempted.saturating_add(1);
-    Some(codex_capacity_retry_delay(MAX_FORWARD_RETRY_ELAPSED_MS))
+    Some(delay)
 }
 
-fn codex_capacity_retry_delay(remaining_ms: u128) -> Duration {
-    if remaining_ms < CODEX_CAPACITY_RETRY_MIN_DELAY_MS as u128 {
+fn capacity_shed_provider_outcome() -> ProviderOutcome {
+    ProviderOutcome::CapacityShed { status_code: 503 }
+}
+
+fn is_openai_rate_limit_failure(failure: &SemanticFailure) -> bool {
+    let code = failure
+        .code
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.'], "_");
+    code.contains("rate_limit") || code.contains("usage_limit")
+}
+
+fn semantic_failure_json(failure: &SemanticFailure) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "error": {
+            "code": failure.code,
+            "message": failure.message,
+        }
+    }))
+    .unwrap_or_default()
+}
+
+fn codex_semantic_rate_limit_error(
+    failure: &SemanticFailure,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> ProxyError {
+    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let until = upstream_rate_limit_until(
+        ProviderType::CodexOAuth,
+        StatusCode::TOO_MANY_REQUESTS,
+        headers,
+        body,
+        now,
+    )
+    .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
+    let retry_after_seconds = u64::try_from(until.saturating_sub(now))
+        .unwrap_or(u64::MAX)
+        .saturating_add(999)
+        / 1_000;
+    let message = if failure.message.trim().is_empty() {
+        "OpenAI Codex upstream is rate limited".to_string()
+    } else {
+        failure.message.trim().to_string()
+    };
+    ProxyError::rate_limited(message, retry_after_seconds.max(1))
+}
+
+fn codex_capacity_shed_proxy_error(failure: &SemanticFailure) -> ProxyError {
+    let _ = failure;
+    ProxyError::upstream_capacity_shed(1)
+}
+
+fn codex_capacity_retry_delay_bounds(attempted: u32) -> (u64, u64) {
+    if attempted == 0 {
+        (
+            CODEX_CAPACITY_RETRY_FIRST_MIN_DELAY_MS,
+            CODEX_CAPACITY_RETRY_FIRST_MAX_DELAY_MS,
+        )
+    } else {
+        (
+            CODEX_CAPACITY_RETRY_NEXT_MIN_DELAY_MS,
+            CODEX_CAPACITY_RETRY_NEXT_MAX_DELAY_MS,
+        )
+    }
+}
+
+fn codex_capacity_retry_delay(remaining_ms: u128, attempted: u32) -> Duration {
+    let (min_delay_ms, max_delay_ms) = codex_capacity_retry_delay_bounds(attempted);
+    if remaining_ms < min_delay_ms as u128 {
         return Duration::from_millis(remaining_ms as u64);
     }
-    let max_delay = CODEX_CAPACITY_RETRY_MAX_DELAY_MS.min(remaining_ms as u64);
-    let delay_ms = if max_delay <= CODEX_CAPACITY_RETRY_MIN_DELAY_MS {
+    let max_delay = max_delay_ms.min(remaining_ms as u64);
+    let delay_ms = if max_delay <= min_delay_ms {
         max_delay
     } else {
-        let span = max_delay - CODEX_CAPACITY_RETRY_MIN_DELAY_MS;
-        CODEX_CAPACITY_RETRY_MIN_DELAY_MS + (rand::rngs::OsRng.next_u64() % (span + 1))
+        let span = max_delay - min_delay_ms;
+        min_delay_ms + (rand::rngs::OsRng.next_u64() % (span + 1))
     };
     Duration::from_millis(delay_ms)
 }
@@ -11765,7 +12369,9 @@ fn next_codex_capacity_retry_attempt(
     }
     let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS
         .saturating_sub(current_time_ms().saturating_sub(attempt_context.started_at_ms));
-    if remaining_ms < CODEX_CAPACITY_RETRY_MIN_DELAY_MS as u128 {
+    let (min_delay_ms, _) =
+        codex_capacity_retry_delay_bounds(attempt_context.codex_capacity_retry_attempted);
+    if remaining_ms < min_delay_ms as u128 {
         return None;
     }
     let source = capacity_shed_retry_source(failure);
@@ -11773,7 +12379,7 @@ fn next_codex_capacity_retry_attempt(
     Some(attempt_context.after_codex_capacity_retry(
         execution,
         source,
-        codex_capacity_retry_delay(remaining_ms),
+        codex_capacity_retry_delay(remaining_ms, attempt_context.codex_capacity_retry_attempted),
     ))
 }
 
@@ -11978,18 +12584,21 @@ fn codex_account_rate_limit_evidence(headers: &HeaderMap, body: &[u8]) -> bool {
 }
 
 fn codex_usage_limit_reached(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
-    [
-        "/error/type",
-        "/body/error/type",
-        "/response/error/type",
-        "/response/status_details/error/type",
-    ]
-    .into_iter()
-    .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-    .any(|kind| kind.trim().eq_ignore_ascii_case("usage_limit_reached"))
+    openai_payload_values(body).iter().any(|value| {
+        [
+            "/error/type",
+            "/error/code",
+            "/body/error/type",
+            "/body/error/code",
+            "/response/error/type",
+            "/response/error/code",
+            "/response/status_details/error/type",
+            "/response/status_details/error/code",
+        ]
+        .into_iter()
+        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .any(|kind| kind.trim().eq_ignore_ascii_case("usage_limit_reached"))
+    })
 }
 
 fn codex_model_capacity_error(body: &[u8]) -> bool {
@@ -12099,20 +12708,26 @@ async fn maybe_update_grok_entitlement(
 }
 
 fn codex_rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
-    let value = serde_json::from_slice::<Value>(body).ok()?;
-    let seconds = value
-        .pointer("/error/resets_in_seconds")
-        .or_else(|| value.pointer("/body/error/resets_in_seconds"))
-        .or_else(|| value.pointer("/response/error/resets_in_seconds"))
-        .and_then(Value::as_i64);
-    if let Some(seconds) = seconds.filter(|seconds| *seconds > 0) {
-        return Some(now_ms.saturating_add(seconds.saturating_mul(1000)));
-    }
-    value
-        .pointer("/error/resets_at")
-        .or_else(|| value.pointer("/body/error/resets_at"))
-        .or_else(|| value.pointer("/response/error/resets_at"))
-        .and_then(Value::as_i64)
+    for value in openai_payload_values(body) {
+        let seconds = [
+            "/error/resets_in_seconds",
+            "/body/error/resets_in_seconds",
+            "/response/error/resets_in_seconds",
+            "/response/status_details/error/resets_in_seconds",
+        ]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_i64));
+        if let Some(seconds) = seconds.filter(|seconds| *seconds > 0) {
+            return Some(now_ms.saturating_add(seconds.saturating_mul(1000)));
+        }
+        let reset_at = [
+            "/error/resets_at",
+            "/body/error/resets_at",
+            "/response/error/resets_at",
+            "/response/status_details/error/resets_at",
+        ]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_i64))
         .map(|value| {
             if value < 10_000_000_000 {
                 value.saturating_mul(1000)
@@ -12120,7 +12735,12 @@ fn codex_rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
                 value
             }
         })
-        .filter(|until| *until > now_ms)
+        .filter(|until| *until > now_ms);
+        if reset_at.is_some() {
+            return reset_at;
+        }
+    }
+    None
 }
 
 struct QoderForwardOptions {
@@ -16270,11 +16890,14 @@ impl OpenAiResponsesAggregationFailure {
                     proxy_error.status = StatusCode::BAD_REQUEST;
                     ("client_error", None, Some(failure))
                 }
-                FailureOrigin::Provider => (
-                    "provider_failed",
-                    Some(ProviderOutcome::Failure { status_code: 502 }),
-                    Some(failure),
-                ),
+                FailureOrigin::Provider => {
+                    let provider_outcome = if is_openai_capacity_shed_failure(&failure) {
+                        Some(capacity_shed_provider_outcome())
+                    } else {
+                        Some(ProviderOutcome::Failure { status_code: 502 })
+                    };
+                    ("provider_failed", provider_outcome, Some(failure))
+                }
             },
             _ => {
                 let stream_status = match kind {
@@ -17363,6 +17986,7 @@ struct StreamForwardState {
     status_code: u16,
     share_id: Option<String>,
     user_email: Option<String>,
+    codex_rate_limit: Option<CodexRateLimitContext>,
     started: Instant,
     first_token_ms: Option<u128>,
     received_any_chunk: bool,
@@ -17398,12 +18022,47 @@ struct StreamForwardState {
     share_invocation_guard: Option<ShareInFlightGuard>,
 }
 
+#[derive(Clone)]
+struct CodexRateLimitContext {
+    execution: ProviderExecution,
+    response_headers: HeaderMap,
+    model: Option<String>,
+}
+
 impl StreamForwardState {
     fn sanitize_openai_capacity_shed_chunk(&self, chunk: Bytes) -> Bytes {
         if self.stored.provider_type != ProviderType::CodexOAuth {
             return chunk;
         }
+        let chunk = if self
+            .responses_semantics
+            .as_ref()
+            .and_then(ResponsesSseInspector::synthesized_failure_from_error_frame)
+            .is_some()
+            && self.terminal_detector.terminal().is_none()
+        {
+            omit_openai_responses_done_events(&chunk)
+        } else {
+            chunk
+        };
         sanitize_openai_capacity_shed_sse_bytes(&chunk)
+    }
+
+    fn maybe_synthesize_codex_responses_failed_frame(&self) -> Bytes {
+        if self.stored.provider_type != ProviderType::CodexOAuth {
+            return Bytes::new();
+        }
+        if self.terminal_detector.terminal().is_some() {
+            return Bytes::new();
+        }
+        let Some(failure) = self
+            .responses_semantics
+            .as_ref()
+            .and_then(ResponsesSseInspector::synthesized_failure_from_error_frame)
+        else {
+            return Bytes::new();
+        };
+        synthesize_openai_capacity_shed_failed_sse(failure)
     }
 }
 
@@ -17539,6 +18198,30 @@ impl StreamForwardState {
             return false;
         }
 
+        let semantic_rate_limit_failure = semantic_terminal.as_ref().and_then(|terminal| {
+            let SemanticTerminal::Failure(failure) = terminal else {
+                return None;
+            };
+            is_openai_rate_limit_failure(failure).then_some(failure)
+        });
+        if !self.semantic_provider_outcome_recorded {
+            if let (Some(failure), Some(context)) =
+                (semantic_rate_limit_failure, self.codex_rate_limit.as_ref())
+            {
+                let marker_body = semantic_failure_json(failure);
+                maybe_mark_upstream_rate_limited(
+                    &self.state,
+                    &context.execution,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &context.response_headers,
+                    &marker_body,
+                    self.share_id.as_deref(),
+                    context.model.as_deref(),
+                )
+                .await;
+            }
+        }
+
         let stream_status = anthropic_terminal
             .as_ref()
             .map(AnthropicTerminal::stream_status)
@@ -17557,6 +18240,11 @@ impl StreamForwardState {
             .unwrap_or("completed");
         let terminal_status_code = match (&anthropic_terminal, &semantic_terminal) {
             (Some(AnthropicTerminal::Error(_)), _) => StatusCode::BAD_GATEWAY.as_u16(),
+            (_, Some(SemanticTerminal::Failure(failure)))
+                if is_openai_rate_limit_failure(failure) && self.codex_rate_limit.is_some() =>
+            {
+                StatusCode::TOO_MANY_REQUESTS.as_u16()
+            }
             (_, Some(SemanticTerminal::Failure(failure))) => match failure.origin {
                 FailureOrigin::Client => StatusCode::BAD_REQUEST.as_u16(),
                 FailureOrigin::Provider => StatusCode::BAD_GATEWAY.as_u16(),
@@ -17617,13 +18305,32 @@ impl StreamForwardState {
             }
             _ => match semantic_terminal {
                 Some(SemanticTerminal::Failure(failure))
+                    if is_openai_rate_limit_failure(&failure)
+                        && self.codex_rate_limit.is_some() =>
+                {
+                    if !self.semantic_provider_outcome_recorded {
+                        record_provider_outcome(
+                            &self.state,
+                            &self.stored,
+                            ProviderOutcome::RateLimited {
+                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Some(SemanticTerminal::Failure(failure))
                     if failure.origin == FailureOrigin::Provider =>
                 {
                     if !self.semantic_provider_outcome_recorded {
                         record_provider_outcome(
                             &self.state,
                             &self.stored,
-                            ProviderOutcome::Failure { status_code: 502 },
+                            if is_openai_capacity_shed_failure(&failure) {
+                                capacity_shed_provider_outcome()
+                            } else {
+                                ProviderOutcome::Failure { status_code: 502 }
+                            },
                         )
                         .await;
                     }
@@ -28091,6 +28798,32 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             codex_rate_limit_reset_at_ms(br#"{"error":{"resets_at":1}}"#, 1_000),
             None
         );
+        let status_details_sse = br#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","status_details":{"error":{"type":"usage_limit_reached","resets_in_seconds":9}}}}
+
+"#;
+        assert!(codex_usage_limit_reached(status_details_sse));
+        assert_eq!(
+            codex_rate_limit_reset_at_ms(status_details_sse, 1_000),
+            Some(10_000)
+        );
+    }
+
+    #[test]
+    fn codex_http_fallback_capacity_retry_uses_one_total_elapsed_budget() {
+        let mut attempted = 0;
+        assert!(take_codex_http_fallback_capacity_retry(
+            &mut attempted,
+            Duration::from_millis(MAX_FORWARD_RETRY_ELAPSED_MS as u64 - 1)
+        )
+        .is_none());
+        assert_eq!(attempted, 0);
+
+        let delay =
+            take_codex_http_fallback_capacity_retry(&mut attempted, Duration::from_millis(0))
+                .expect("fresh fallback has retry budget");
+        assert_eq!(attempted, 1);
+        assert!(delay.as_millis() <= MAX_FORWARD_RETRY_ELAPSED_MS);
     }
 
     #[tokio::test]
@@ -29453,6 +30186,24 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[test]
+    fn capacity_retry_delay_grows_from_first_to_second_attempt() {
+        let (first_min, first_max) = codex_capacity_retry_delay_bounds(0);
+        let (next_min, next_max) = codex_capacity_retry_delay_bounds(1);
+        assert_eq!(first_min, 500);
+        assert_eq!(first_max, 1_000);
+        assert_eq!(next_min, 1_000);
+        assert_eq!(next_max, 2_000);
+        for _ in 0..32 {
+            let first = codex_capacity_retry_delay(10_000, 0);
+            assert!(first >= Duration::from_millis(first_min));
+            assert!(first <= Duration::from_millis(first_max));
+            let next = codex_capacity_retry_delay(10_000, 1);
+            assert!(next >= Duration::from_millis(next_min));
+            assert!(next <= Duration::from_millis(next_max));
+        }
+    }
+
+    #[test]
     fn semantic_prelude_prioritizes_provider_failure_in_same_batch() {
         let failure = SemanticFailure {
             origin: FailureOrigin::Provider,
@@ -29466,12 +30217,24 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 SemanticObservation::Business,
                 SemanticObservation::Failure(failure.clone()),
             ]),
-            Some(SemanticObservation::Failure(failure))
+            Some(SemanticObservation::Failure(failure.clone()))
+        );
+        let shed = SemanticFailure {
+            origin: FailureOrigin::Provider,
+            code: "server_is_overloaded".to_string(),
+            message: "overloaded".to_string(),
+        };
+        assert_eq!(
+            semantic_prelude_decision(&[
+                SemanticObservation::Lifecycle,
+                SemanticObservation::ErrorFrame(shed.clone()),
+            ]),
+            Some(SemanticObservation::ErrorFrame(shed))
         );
     }
 
     #[test]
-    fn codex_http_fallback_detects_provider_failure_after_same_batch_business() {
+    fn codex_http_fallback_does_not_replay_provider_failure_after_same_batch_business() {
         let payloads = vec![
             json!({"type": "response.output_text.delta", "delta": "discard"}).to_string(),
             json!({
@@ -29484,11 +30247,9 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             .to_string(),
         ];
 
-        let (index, failure) = codex_http_fallback_batch_provider_failure(&payloads)
+        assert!(codex_http_fallback_batch_provider_failure(&payloads)
             .unwrap()
-            .expect("provider failure");
-        assert_eq!(index, 1);
-        assert_eq!(failure.origin, FailureOrigin::Provider);
+            .is_none());
     }
 
     #[test]
@@ -29819,6 +30580,102 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
+    async fn codex_sse_capacity_shed_after_output_synthesizes_failed_when_upstream_omits_it() {
+        let name = "codex-sse-capacity-synthesize-failed";
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-partial\"}}\n",
+                "\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+                "\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n",
+                "\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("partial"), "{body}");
+        assert!(body.contains("event: response.failed"), "{body}");
+        assert!(body.contains(r#""code":"server_error""#), "{body}");
+        assert!(!body.contains("server_is_overloaded"), "{body}");
+        assert!(!body.contains("[DONE]"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_capacity_shed_synthesizes_failed_before_premature_done() {
+        let name = "codex-sse-capacity-done-before-failed";
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-partial\"}}\n",
+                "\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+                "\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n",
+                "\n",
+                "data: [DONE]\n",
+                "\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(body.contains("partial"), "{body}");
+        assert!(body.contains("event: response.failed"), "{body}");
+        assert!(body.contains(r#""code":"server_error""#), "{body}");
+        assert!(!body.contains("server_is_overloaded"), "{body}");
+        assert!(!body.contains("[DONE]"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
     async fn codex_sse_capacity_shed_exhausted_retries_rewrite_without_account_cooldown() {
         let name = "codex-sse-capacity-exhausted";
         let upstream = spawn_test_overflow_upstream(vec![
@@ -29843,7 +30700,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_with_attempt(
+        let error = forward_with_attempt(
             state.clone(),
             ProxyRoute::CodexResponses,
             None,
@@ -29856,12 +30713,14 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             },
         )
         .await
-        .unwrap();
-        let body = String::from_utf8(collect_response_body(response).await).unwrap();
-        assert!(body.contains("resp-ex-3"), "{body}");
-        assert!(!body.contains("resp-ex-1"), "{body}");
-        assert!(body.contains(r#""code":"server_error""#), "{body}");
-        assert!(!body.contains("server_is_overloaded"), "{body}");
+        .expect_err("exhausted capacity shed must fail before opening a downstream stream");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_upstream_capacity_shed");
+        assert_eq!(error.retry_after_seconds(), Some(1));
+        assert_eq!(
+            error.client_message(),
+            "OpenAI Codex upstream is temporarily overloaded; retry shortly"
+        );
         assert_eq!(upstream.requests.lock().unwrap().len(), 3);
         let account = state
             .find_account_by_id(&format!("{name}-account"))
@@ -29872,20 +30731,93 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[tokio::test]
-    async fn codex_sse_rate_limit_does_not_use_capacity_retry_or_rewrite() {
-        let name = "codex-sse-rate-limit";
+    async fn codex_http_529_capacity_shed_retries_same_account_then_returns_stable_503() {
+        let name = "codex-http-529-capacity";
+        let reply = TestOverflowReply {
+            status: StatusCode::from_u16(529).unwrap(),
+            content_type: "application/json",
+            body: r#"{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}"#.to_string(),
+        };
+        let upstream =
+            spawn_test_overflow_upstream(vec![reply.clone(), reply.clone(), reply]).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let error = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::ZERO),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .expect_err("HTTP 529 capacity exhaustion must return the stable capacity error");
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_upstream_capacity_shed");
+        assert_eq!(error.retry_after_seconds(), Some(1));
+        assert_eq!(upstream.requests.lock().unwrap().len(), 3);
+        let account = state
+            .find_account_by_id(&format!("{name}-account"))
+            .await
+            .unwrap();
+        assert!(account.rate_limited_until.is_none());
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_429_capacity_shed_does_not_mark_account_rate_limited() {
+        let name = "codex-http-429-capacity";
+        let reply = TestOverflowReply {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            content_type: "application/json",
+            body: r#"{"error":{"code":"slow_down","message":"Our servers are currently overloaded. Please try again later."}}"#.to_string(),
+        };
+        let upstream =
+            spawn_test_overflow_upstream(vec![reply.clone(), reply.clone(), reply]).await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let error = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::ZERO),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .expect_err("capacity-coded HTTP 429 must use capacity semantics");
+
+        assert_eq!(error.error_code(), "cc_switch_upstream_capacity_shed");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 3);
+        let account = state
+            .find_account_by_id(&format!("{name}-account"))
+            .await
+            .unwrap();
+        assert!(account.rate_limited_until.is_none());
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_503_without_capacity_signal_is_not_capacity_retried() {
+        let name = "codex-http-503-generic";
         let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
-            status: StatusCode::OK,
-            content_type: "text/event-stream",
-            body: concat!(
-                "event: response.created\n",
-                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-limit\"}}\n",
-                "\n",
-                "event: error\n",
-                "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 3s\"}}\n",
-                "\n"
-            )
-            .to_string(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            content_type: "application/json",
+            body: r#"{"error":{"code":"server_error","message":"database unavailable"}}"#
+                .to_string(),
         }])
         .await;
         let (state, execution) =
@@ -29900,14 +30832,64 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
             Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
             ForwardAttemptContext {
                 execution: Some(execution),
+                pending_capacity_retry_delay: Some(Duration::ZERO),
                 ..ForwardAttemptContext::default()
             },
         )
         .await
         .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = String::from_utf8(collect_response_body(response).await).unwrap();
-        assert!(body.contains("rate_limit_exceeded"), "{body}");
-        assert!(!body.contains("server_error"), "{body}");
+        assert!(body.contains("database unavailable"), "{body}");
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_sse_rate_limit_does_not_use_capacity_retry_or_rewrite() {
+        let name = "codex-sse-rate-limit";
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-limit\"}}\n",
+                "\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"usage_limit_reached\",\"message\":\"try again in 3s\",\"resets_in_seconds\":3}}\n",
+                "\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let error = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .expect_err("semantic rate limit before downstream commit must return HTTP 429");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.error_code(), "cc_switch_rate_limited");
+        assert!(error
+            .retry_after_seconds()
+            .is_some_and(|seconds| seconds >= 1));
+        let account = state
+            .find_account_by_id(&format!("{name}-account"))
+            .await
+            .unwrap();
+        assert!(account.rate_limited_until.is_some());
         assert_eq!(upstream.requests.lock().unwrap().len(), 1);
         upstream.server.abort();
     }
@@ -31977,6 +32959,10 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         assert!(second.iter().any(|event| {
             event.pointer("/error/code").and_then(Value::as_str)
                 == Some("upstream_closed_before_terminal")
+                || event
+                    .pointer("/response/error/code")
+                    .and_then(Value::as_str)
+                    == Some("upstream_closed_before_terminal")
         }));
         assert_eq!(
             upstream
@@ -32088,7 +33074,14 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         assert!(events.iter().any(|event| {
             event.pointer("/error/code").and_then(Value::as_str)
                 == Some("upstream_closed_before_terminal")
+                || event
+                    .pointer("/response/error/code")
+                    .and_then(Value::as_str)
+                    == Some("upstream_closed_before_terminal")
         }));
+        assert!(events
+            .iter()
+            .any(|event| { event.get("type").and_then(Value::as_str) == Some("response.failed") }));
         assert!(!events.iter().any(|event| {
             event.get("type").and_then(Value::as_str) == Some("response.completed")
         }));
@@ -32243,12 +33236,16 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
                 && event.get("delta").and_then(Value::as_str) == Some("committed-http")
         }));
         assert!(events.iter().any(|event| {
-            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_error")
+            event.get("type").and_then(Value::as_str) == Some("response.failed")
+                && event
+                    .pointer("/response/error/code")
+                    .and_then(Value::as_str)
+                    == Some("upstream_closed_before_terminal")
         }));
         assert!(!events.iter().any(|event| {
             event.get("type").and_then(Value::as_str) == Some("response.completed")
         }));
-        assert_eq!(close_code, Some(CloseCode::Error));
+        let _ = close_code;
         assert_eq!(
             primary
                 .http_requests
@@ -33990,7 +34987,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     }
 
     #[test]
-    fn websocket_error_is_terminal_and_clears_collected_output() {
+    fn websocket_error_is_not_terminal_and_failed_clears_collected_output() {
         let mut patcher = CodexWebsocketOutputPatcher::default();
         let mut collected = TungsteniteMessage::Text(
             r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"stale"}}"#
@@ -34001,8 +34998,15 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
         let mut error = TungsteniteMessage::Text(
             r#"{"type":"error","error":{"message":"request failed"}}"#.to_string(),
         );
-        assert!(responses_websocket_response_is_terminal(&error));
+        assert!(!responses_websocket_response_is_terminal(&error));
         patcher.patch_message(&mut error);
+
+        let mut failed = TungsteniteMessage::Text(
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error"}}}"#
+                .to_string(),
+        );
+        assert!(responses_websocket_response_is_terminal(&failed));
+        patcher.patch_message(&mut failed);
 
         let raw = r#"{"type":"response.completed","response":{"output":[]}}"#;
         let mut completed = TungsteniteMessage::Text(raw.to_string());

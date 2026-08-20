@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
 
-use super::response_semantics::SemanticFailure;
+use super::response_semantics::{SemanticFailure, SemanticObservation};
 
 pub(super) const OPENAI_CAPACITY_SHED_RETRYABLE_CLIENT_CODE: &str = "server_error";
 const CAPACITY_SHED_CODES: &[&str] = &["server_is_overloaded", "slow_down"];
@@ -10,9 +10,53 @@ pub(super) fn is_openai_capacity_shed_failure(failure: &SemanticFailure) -> bool
     is_openai_capacity_shed_code_or_message(&failure.code, &failure.message)
 }
 
+pub(super) fn provider_stream_failure(
+    observation: &SemanticObservation,
+) -> Option<&SemanticFailure> {
+    match observation {
+        SemanticObservation::Failure(failure)
+            if failure.origin == super::response_semantics::FailureOrigin::Provider =>
+        {
+            Some(failure)
+        }
+        SemanticObservation::ErrorFrame(failure)
+            if failure.origin == super::response_semantics::FailureOrigin::Provider
+                && is_openai_capacity_shed_failure(failure) =>
+        {
+            Some(failure)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn is_openai_capacity_shed_value(value: &Value) -> bool {
     let (code, message) = capacity_shed_code_and_message(value);
     is_openai_capacity_shed_code_or_message(&code, &message)
+}
+
+pub(super) fn openai_payload_values(bytes: &[u8]) -> Vec<Value> {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return vec![value];
+    }
+    iter_stream_payloads(bytes)
+        .into_iter()
+        .filter(|payload| payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+        .collect()
+}
+
+pub(super) fn openai_capacity_shed_failure_from_bytes(bytes: &[u8]) -> Option<SemanticFailure> {
+    openai_payload_values(bytes).into_iter().find_map(|value| {
+        if !is_openai_capacity_shed_value(&value) {
+            return None;
+        }
+        match super::response_semantics::classify_value(&value) {
+            SemanticObservation::Failure(failure) | SemanticObservation::ErrorFrame(failure) => {
+                Some(failure)
+            }
+            _ => None,
+        }
+    })
 }
 
 pub(super) fn capacity_shed_retry_source(failure: &SemanticFailure) -> &'static str {
@@ -33,7 +77,12 @@ fn is_openai_capacity_shed_code_or_message(code: &str, message: &str) -> bool {
     if CAPACITY_SHED_CODES.contains(&code.as_str()) {
         return true;
     }
-    is_openai_capacity_shed_message(message)
+    (code.is_empty()
+        || matches!(
+            code.as_str(),
+            "server_error" | "service_unavailable" | "service_unavailable_error" | "upstream_error"
+        ))
+        && is_openai_capacity_shed_message(message)
 }
 
 fn is_openai_capacity_shed_message(message: &str) -> bool {
@@ -65,8 +114,33 @@ fn capacity_shed_code_and_message(value: &Value) -> (String, String) {
 fn nested_error(value: &Value) -> Option<&Value> {
     value
         .pointer("/response/error")
-        .or_else(|| value.get("error"))
-        .filter(|error| !error.is_null())
+        .filter(|error| substantive_error_value(error))
+        .or_else(|| {
+            value
+                .pointer("/response/status_details/error")
+                .filter(|error| substantive_error_value(error))
+        })
+        .or_else(|| {
+            value
+                .get("error")
+                .filter(|error| substantive_error_value(error))
+        })
+        .or_else(|| {
+            value
+                .pointer("/body/error")
+                .filter(|error| substantive_error_value(error))
+        })
+}
+
+fn substantive_error_value(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Number(_) => true,
+    }
 }
 
 fn string_field(value: Option<&Value>, field: &str) -> Option<String> {
@@ -255,6 +329,79 @@ pub(super) fn sanitize_openai_capacity_shed_json_text(payload: &str) -> (String,
     )
 }
 
+pub(super) fn synthesize_openai_capacity_shed_failed_sse(failure: &SemanticFailure) -> Bytes {
+    let code = if is_openai_capacity_shed_failure(failure) {
+        OPENAI_CAPACITY_SHED_RETRYABLE_CLIENT_CODE
+    } else if failure.code.trim().is_empty() {
+        "server_error"
+    } else {
+        failure.code.trim()
+    };
+    let message = if failure.message.trim().is_empty() {
+        "Upstream response failed"
+    } else {
+        failure.message.trim()
+    };
+    Bytes::from(format!(
+        "event: response.failed\ndata: {}\n\n",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "object": "response",
+                "status": "failed",
+                "error": {
+                    "type": "upstream_error",
+                    "code": code,
+                    "message": message,
+                }
+            }
+        })
+    ))
+}
+
+pub(super) fn synthesize_openai_capacity_shed_failed_json(failure: &SemanticFailure) -> String {
+    let code = if is_openai_capacity_shed_failure(failure) {
+        OPENAI_CAPACITY_SHED_RETRYABLE_CLIENT_CODE
+    } else if failure.code.trim().is_empty() {
+        "server_error"
+    } else {
+        failure.code.trim()
+    };
+    let message = if failure.message.trim().is_empty() {
+        "Upstream response failed"
+    } else {
+        failure.message.trim()
+    };
+    json!({
+        "type": "response.failed",
+        "response": {
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "type": "upstream_error",
+                "code": code,
+                "message": message,
+            }
+        }
+    })
+    .to_string()
+}
+
+pub(super) fn omit_openai_responses_done_events(input: &[u8]) -> Bytes {
+    let mut output = Vec::with_capacity(input.len());
+    let mut rest = input;
+    while let Some((end, delim)) = next_event_boundary(rest) {
+        if sse_event_payload(&rest[..end]).as_deref() != Some("[DONE]") {
+            output.extend_from_slice(&rest[..end + delim]);
+        }
+        rest = &rest[end + delim..];
+    }
+    if !rest.is_empty() && sse_event_payload(rest).as_deref() != Some("[DONE]") {
+        output.extend_from_slice(rest);
+    }
+    Bytes::from(output)
+}
+
 pub(super) fn sanitize_openai_capacity_shed_sse_bytes(input: &[u8]) -> Bytes {
     let mut output = Vec::with_capacity(input.len());
     let mut rest = input;
@@ -272,7 +419,12 @@ fn sanitize_openai_capacity_shed_value(value: &mut Value) -> bool {
         return false;
     }
     let mut changed = false;
-    for pointer in ["/response/error", "/error"] {
+    for pointer in [
+        "/response/error",
+        "/response/status_details/error",
+        "/error",
+        "/body/error",
+    ] {
         let Some(error) = value.pointer_mut(pointer) else {
             continue;
         };
@@ -488,6 +640,16 @@ data: {"type":"error","error":{"code":"server_is_overloaded","message":"overload
         );
         assert!(!changed);
         assert!(out.contains("rate_limit_exceeded"));
+
+        let (out, changed) = sanitize_openai_capacity_shed_json_text(
+            r#"{"type":"response.failed","response":{"status":"failed","error":null,"status_details":{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}}"#,
+        );
+        assert!(changed);
+        assert!(out.contains(r#""code":"server_error""#));
+        assert!(!out.contains("server_is_overloaded"));
+        let failure = openai_capacity_shed_failure_from_bytes(out.as_bytes())
+            .expect("sanitized generic server_error message remains recognizable as capacity");
+        assert!(is_openai_capacity_shed_failure(&failure));
     }
 
     #[test]
@@ -502,6 +664,51 @@ data: {"type":"error","error":{"code":"server_is_overloaded","message":"overload
         assert!(text.contains(r#""code":"server_error""#));
         assert!(!text.contains("server_is_overloaded"));
         assert!(text.contains("Our servers are currently overloaded"));
+    }
+
+    #[test]
+    fn synthesizes_response_failed_with_retryable_code() {
+        let failure = SemanticFailure {
+            origin: crate::proxy::response_semantics::FailureOrigin::Provider,
+            code: "server_is_overloaded".to_string(),
+            message: "Our servers are currently overloaded. Please try again later.".to_string(),
+        };
+        let sse = String::from_utf8(synthesize_openai_capacity_shed_failed_sse(&failure).to_vec())
+            .unwrap();
+        assert!(sse.contains("event: response.failed"));
+        assert!(sse.contains(r#""code":"server_error""#));
+        assert!(!sse.contains("server_is_overloaded"));
+        assert!(sse.contains("Our servers are currently overloaded"));
+        assert!(!sse.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn omits_done_events_until_a_terminal_can_be_synthesized() {
+        let input = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n",
+            "\n",
+            "data: [DONE]\n",
+            "\n"
+        );
+        let output = omit_openai_responses_done_events(input.as_bytes());
+        let text = String::from_utf8(output.to_vec()).unwrap();
+        assert!(text.contains("event: error"));
+        assert!(!text.contains("[DONE]"));
+    }
+
+    #[test]
+    fn synthesizes_response_failed_without_rewriting_rate_limit() {
+        let failure = SemanticFailure {
+            origin: crate::proxy::response_semantics::FailureOrigin::Provider,
+            code: "rate_limit_exceeded".to_string(),
+            message: "try again in 3s".to_string(),
+        };
+        let sse = String::from_utf8(synthesize_openai_capacity_shed_failed_sse(&failure).to_vec())
+            .unwrap();
+        assert!(sse.contains("event: response.failed"));
+        assert!(sse.contains(r#""code":"rate_limit_exceeded""#));
+        assert!(!sse.contains(r#""code":"server_error""#));
     }
 
     #[test]
