@@ -2505,7 +2505,6 @@ export function ServerProviderForm({
           appId={appId}
           providerId={providerId}
           providerName={state.draft.name}
-          onOpenShareSettings={onOpenShareSettings}
           onDirtyChange={setShareDirty}
         />
       ) : (

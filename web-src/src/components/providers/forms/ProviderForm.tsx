@@ -3694,7 +3694,6 @@ function ProviderFormFull({
               appId={appId}
               providerId={providerId}
               providerName={form.watch("name") || providerId}
-              onOpenShareSettings={onOpenShareSettings}
               onDirtyChange={handleProviderShareDirtyChange}
             />
           ) : isShareableApp(appId) ? (

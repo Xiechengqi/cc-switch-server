@@ -294,6 +294,7 @@ export function ShareUserGrantsEditor({
   };
 
   const openEdit = (grant: ShareUserGrant) => {
+    if (grant.role === "owner") return;
     setEditingEmail(grant.email);
     setDraftError("");
     setDraft({
@@ -655,7 +656,7 @@ export function ShareUserGrantsEditor({
                 <TableCell className="px-3 py-2">{displayExpiry(grant.policy.expiresAt, permanent)}</TableCell>
                 <TableCell className="px-3 py-2">
                   <div className="flex justify-end gap-1">
-                    {!protectedEmails?.has(grant.email) ? (
+                    {grant.role !== "owner" && !protectedEmails?.has(grant.email) ? (
                       <Button
                         type="button"
                         variant="ghost"

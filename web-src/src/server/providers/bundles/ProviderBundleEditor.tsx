@@ -177,17 +177,22 @@ function AppLogo({ app, size = 16 }: { app: CoreProviderApp; size?: number }) {
 function Section({
   title,
   icon,
+  action,
   children,
 }: {
   title: string;
   icon?: React.ReactNode;
+  action?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
     <section className="space-y-4 pb-6">
-      <h2 className="flex items-center gap-2 text-sm font-semibold">
-        {icon}
-        {title}
+      <h2 className="flex items-center justify-between gap-3 text-sm font-semibold">
+        <span className="flex min-w-0 items-center gap-2">
+          {icon}
+          {title}
+        </span>
+        {action}
       </h2>
       {children}
     </section>
@@ -747,7 +752,6 @@ function BundleShareEditor({
   onChange,
   ownerEmail,
   shareUrl,
-  onOpenShareSettings,
 }: {
   draft: ProviderBundleShareDraft;
   /**
@@ -759,7 +763,6 @@ function BundleShareEditor({
   onChange: Dispatch<SetStateAction<ProviderBundleShareDraft>>;
   ownerEmail: string;
   shareUrl?: string | null;
-  onOpenShareSettings?: () => void;
 }) {
   const { t } = useTranslation();
   const routerManagedEmails = useMemo(
@@ -811,56 +814,47 @@ function BundleShareEditor({
     <Section
       title={t("provider.share.sectionTitle", { defaultValue: "远程分享" })}
       icon={<Share2 className="h-4 w-4" />}
+      action={
+        <Switch
+          id="bundle-share-enabled"
+          checked={draft.enabled}
+          aria-label={t("provider.share.enableShare", {
+            defaultValue: "启用远程分享",
+          })}
+          onCheckedChange={(enabled) => updateDraft({ enabled })}
+        />
+      }
     >
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          {shareUrl ? (
-            <>
-              <code className="max-w-full truncate rounded bg-muted px-2 py-1 text-xs">
-                {shareUrl}
-              </code>
-              <Button
-                type="button"
-                size="icon"
-                variant="outline"
-                title={t("common.copy")}
-                onClick={() => void copyText(shareUrl)}
-              >
-                <Copy className="h-4 w-4" />
-              </Button>
-            </>
-          ) : (
-            <Badge variant="outline">
-              {t("provider.share.stateNone", { defaultValue: "未启用分享" })}
-            </Badge>
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          {onOpenShareSettings ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={onOpenShareSettings}
-            >
-              {t("common.settings")}
-            </Button>
-          ) : null}
-          <Label htmlFor="bundle-share-enabled">
-            {t("provider.share.enableShare", { defaultValue: "启用远程分享" })}
-          </Label>
-          <Switch
-            id="bundle-share-enabled"
-            checked={draft.enabled}
-            onCheckedChange={(enabled) => updateDraft({ enabled })}
-          />
-        </div>
-      </div>
       {draft.enabled ? (
         <div className="grid gap-4 md:grid-cols-2">
+          {shareUrl ? (
+            <div className="space-y-2 md:col-span-2">
+              <Label htmlFor="bundle-share-host">
+                {t("share.subdomain", { defaultValue: "Share 完整域名" })}
+              </Label>
+              <div
+                id="bundle-share-host"
+                className="flex min-h-10 items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2"
+              >
+                <p className="min-w-0 flex-1 truncate font-mono text-sm">
+                  {shareUrl}
+                </p>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0"
+                  title={t("common.copy")}
+                  onClick={() => void copyText(shareUrl)}
+                >
+                  <Copy className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <div className="space-y-2">
             <Label htmlFor="bundle-share-subdomain">
-              {t("provider.share.subdomain", { defaultValue: "分享子域名" })}
+              {t("share.shareSlug", { defaultValue: "Share slug" })}
             </Label>
             <div className="flex items-center gap-2">
               <Input
@@ -889,7 +883,12 @@ function BundleShareEditor({
             ) : null}
           </div>
           <div className="space-y-2">
-            <div className="flex items-center gap-2">
+            <Label htmlFor="bundle-share-free-access">
+              {t("share.freeAccess.label", {
+                defaultValue: "公开免费使用",
+              })}
+            </Label>
+            <div className="flex min-h-10 items-center gap-2 rounded-lg border border-border/60 px-3">
               <Checkbox
                 id="bundle-share-free-access"
                 checked={draft.freeAccess}
@@ -897,21 +896,12 @@ function BundleShareEditor({
                   updateDraft({ freeAccess: checked === true })
                 }
               />
-              <Label
-                htmlFor="bundle-share-free-access"
-                className="cursor-pointer font-normal"
-              >
-                {t("share.freeAccess.label", {
-                  defaultValue: "公开免费使用",
+              <span className="text-sm">
+                {t("share.freeAccess.short", {
+                  defaultValue: "任意已登录 Router 用户可免费调用",
                 })}
-              </Label>
+              </span>
             </div>
-            <p className="text-xs text-muted-foreground">
-              {t("share.freeAccess.hint", {
-                defaultValue:
-                  "默认私有。勾选后，任意已登录 Router 用户可免费调用；下方授权用户仍可设置个人配额。",
-              })}
-            </p>
           </div>
           <div className="space-y-2 md:col-span-2">
             <Label>
@@ -2416,7 +2406,6 @@ export function ProviderBundleEditor({
               onChange={setShareDraft}
               ownerEmail={ownerEmail}
               shareUrl={shareUrl}
-              onOpenShareSettings={onOpenShareSettings}
             />
           </div>
         ) : null}

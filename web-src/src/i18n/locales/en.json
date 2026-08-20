@@ -3083,6 +3083,7 @@
     "freeAccess": {
       "label": "Public free access",
       "hint": "Private by default. When enabled, any signed-in Router user may invoke this Share for free; authorized users below can still have individual quota overrides.",
+      "short": "Any signed-in Router user can invoke for free",
       "public": "Public free",
       "private": "Private"
     },

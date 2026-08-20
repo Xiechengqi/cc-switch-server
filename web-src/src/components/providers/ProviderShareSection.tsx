@@ -89,15 +89,14 @@ export function ProviderSharePlaceholder() {
             </Badge>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2 opacity-50">
-          <Label
-            htmlFor="provider-share-placeholder"
-            className="text-sm text-muted-foreground"
-          >
-            {t("provider.share.enableShare", { defaultValue: "启用远程分享" })}
-          </Label>
-          <Switch id="provider-share-placeholder" checked={false} disabled />
-        </div>
+        <Switch
+          id="provider-share-placeholder"
+          checked={false}
+          disabled
+          aria-label={t("provider.share.enableShare", {
+            defaultValue: "启用远程分享",
+          })}
+        />
       </div>
       <div className="border-t border-border/40 px-4 pb-4 pt-3">
         <p className="text-sm text-muted-foreground">
@@ -115,7 +114,6 @@ interface ProviderShareSectionProps {
   appId: AppId;
   providerId: string;
   providerName: string;
-  onOpenShareSettings?: () => void;
   onDirtyChange?: (dirty: boolean) => void;
 }
 
@@ -148,7 +146,6 @@ export function ProviderShareSection({
   appId,
   providerId,
   providerName,
-  onOpenShareSettings,
   onDirtyChange,
 }: ProviderShareSectionProps) {
   const { t } = useTranslation();
@@ -706,22 +703,14 @@ export function ProviderShareSection({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <div
-            className="flex items-center gap-2"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <Label
-              htmlFor="provider-share-enabled"
-              className="text-sm text-muted-foreground"
-            >
-              {t("provider.share.enableShare", {
-                defaultValue: "启用远程分享",
-              })}
-            </Label>
+          <div onClick={(event) => event.stopPropagation()}>
             <Switch
               id="provider-share-enabled"
               checked={shareRunning}
               disabled={busy}
+              aria-label={t("provider.share.enableShare", {
+                defaultValue: "启用远程分享",
+              })}
               onCheckedChange={(checked) => void handleShareToggle(checked)}
             />
           </div>
@@ -775,40 +764,30 @@ export function ProviderShareSection({
             <>
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2 md:col-span-2">
-                  <Label htmlFor="provider-share-router">
-                    {t("share.tunnel.region", { defaultValue: "路由节点" })}
+                  <Label htmlFor="provider-share-host">
+                    {t("share.subdomain", { defaultValue: "Share 完整域名" })}
                   </Label>
-                  <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
-                    <p
-                      id="provider-share-router"
-                      className="text-sm font-medium"
-                    >
-                      {formatShareRouterDisplay(tunnelConfig.domain)}
+                  <div
+                    id="provider-share-host"
+                    className="flex min-h-10 items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2"
+                  >
+                    <p className="min-w-0 flex-1 truncate font-mono text-sm">
+                      {tunnelLabel || shareHostPreview || "—"}
                     </p>
-                    {onOpenShareSettings ? (
+                    {tunnelLabel || shareHostPreview ? (
                       <Button
                         type="button"
-                        variant="link"
-                        size="sm"
-                        className="h-auto shrink-0 px-0"
-                        onClick={onOpenShareSettings}
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8 shrink-0"
+                        onClick={() =>
+                          void copyText(tunnelLabel || shareHostPreview || "")
+                        }
                       >
-                        {t("provider.share.openShareSettings", {
-                          defaultValue: "前往设置修改",
-                        })}
+                        <Copy className="h-3.5 w-3.5" />
                       </Button>
                     ) : null}
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    {shareExists
-                      ? t("share.routerLockedAfterCreate", {
-                          defaultValue: "路由节点已绑定。",
-                        })
-                      : t("provider.share.routerFromSettingsHint", {
-                          defaultValue:
-                            "使用设置 → 分享中的默认 Router 节点创建 share。",
-                        })}
-                  </p>
                 </div>
 
                 <div className="space-y-2">
@@ -867,22 +846,9 @@ export function ProviderShareSection({
                       suggest={() => shareApi.suggestShareSlug()}
                     />
                   </div>
-                  <div className="space-y-1">
-                    <p className="text-xs text-muted-foreground">
-                      {t("share.subdomainHint")}
-                    </p>
-                    {shareHostPreview ? (
-                      <p className="text-xs font-mono text-muted-foreground">
-                        {t("share.shareHostPreview", {
-                          defaultValue: "Public host: {{host}}",
-                          host: shareHostPreview,
-                        })}
-                      </p>
-                    ) : null}
-                    <p className="text-xs text-muted-foreground">
-                      {t("share.subdomainEditHint")}
-                    </p>
-                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {t("share.subdomainHint")}
+                  </p>
                 </div>
 
                 <div className="space-y-2 md:col-span-2">
@@ -903,8 +869,13 @@ export function ProviderShareSection({
                   />
                 </div>
 
-                <div className="space-y-2 md:col-span-2">
-                  <div className="flex items-center gap-2">
+                <div className="space-y-2">
+                  <Label htmlFor="provider-share-free-access">
+                    {t("share.freeAccess.label", {
+                      defaultValue: "公开免费使用",
+                    })}
+                  </Label>
+                  <div className="flex min-h-10 items-center gap-2 rounded-lg border border-border/60 px-3">
                     <Checkbox
                       id="provider-share-free-access"
                       checked={freeAccess}
@@ -914,21 +885,12 @@ export function ProviderShareSection({
                         markShareDraftChanged();
                       }}
                     />
-                    <Label
-                      htmlFor="provider-share-free-access"
-                      className="cursor-pointer font-normal"
-                    >
-                      {t("share.freeAccess.label", {
-                        defaultValue: "公开免费使用",
+                    <span className="text-sm">
+                      {t("share.freeAccess.short", {
+                        defaultValue: "任意已登录 Router 用户可免费调用",
                       })}
-                    </Label>
+                    </span>
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    {t("share.freeAccess.hint", {
-                      defaultValue:
-                        "默认私有。勾选后，任意已登录 Router 用户可免费调用；下方授权用户仍可设置个人配额。",
-                    })}
-                  </p>
                 </div>
 
                 <ShareUserGrantsEditor
@@ -1113,20 +1075,6 @@ export function ProviderShareSection({
                   </div>
                 </div>
               </div>
-
-              {tunnelLabel ? (
-                <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-background px-3 py-2 text-sm">
-                  <span className="font-mono text-xs">{tunnelLabel}</span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => void copyText(tunnelLabel)}
-                  >
-                    <Copy className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              ) : null}
 
               {share && (share.routerLastSyncError || routerSyncPending) ? (
                 <p
