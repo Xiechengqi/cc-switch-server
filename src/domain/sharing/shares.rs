@@ -2269,8 +2269,13 @@ impl ShareStore {
             .cloned()
             .ok_or(SharePatchError::NotFound)?;
         let mut candidate = self.clone();
+        let merged_usage_edits = match (usage_edits, patch.user_usage_edits.as_ref()) {
+            (Some(explicit), _) => Some(explicit.clone()),
+            (None, Some(from_patch)) => Some(from_patch.clone()),
+            (None, None) => None,
+        };
         candidate.apply_settings_patch(share_id, patch)?;
-        if let Some(edits) = usage_edits {
+        if let Some(edits) = merged_usage_edits.as_ref() {
             candidate.apply_user_usage_edits(
                 share_id,
                 &original,
@@ -2845,7 +2850,14 @@ impl ShareStore {
     ) -> Option<(u64, String)> {
         let share = self.shares.iter_mut().find(|item| item.id == share_id)?;
         let changed = share.descriptor_fingerprint.as_deref() != Some(fingerprint.as_str());
-        if changed || share.descriptor_generation == 0 {
+        // Grant/quota edits bump config_revision even when the static
+        // fingerprint is unchanged (`usageQuota` is stripped).  If this
+        // generation was already ACKed, mint a new one so Router's upsert
+        // actually writes the payload.  Failed or in-flight pushes already
+        // sit ahead of the ACK and must retry the same generation.
+        let revision_pending = share.router_synced_revision < share.config_revision
+            && share.descriptor_generation == share.router_synced_descriptor_generation;
+        if changed || share.descriptor_generation == 0 || revision_pending {
             share.descriptor_generation = share
                 .descriptor_generation
                 .max(share.router_synced_descriptor_generation)
@@ -2898,6 +2910,11 @@ impl ShareStore {
             || share.descriptor_fingerprint.is_none()
             || share.router_synced_descriptor_generation != share.descriptor_generation
             || share.router_synced_descriptor_fingerprint != share.descriptor_fingerprint
+            // Grant/quota edits always bump config_revision.  Some of those
+            // fields are stripped from the static fingerprint (usageQuota) or
+            // can otherwise leave the fingerprint unchanged, so revision
+            // lag must still force a Router upsert.
+            || share.router_synced_revision < share.config_revision
     }
 
     pub fn record_router_descriptor_sync_mode(
@@ -6124,6 +6141,22 @@ mod tests {
             Ok(300),
         ));
         assert!(!store.descriptor_projection_pending(store.get("projection-order").unwrap()));
+
+        store
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "projection-order")
+            .expect("projection share")
+            .config_revision = 2;
+        assert!(
+            store.descriptor_projection_pending(store.get("projection-order").unwrap()),
+            "a later config revision must still push to Router even when the static fingerprint is unchanged"
+        );
+        let (third_generation, third_fingerprint) = store
+            .prepare_descriptor_projection("projection-order", second_fingerprint.clone())
+            .unwrap();
+        assert_eq!(third_generation, 3);
+        assert_eq!(third_fingerprint, second_fingerprint);
     }
 
     #[test]

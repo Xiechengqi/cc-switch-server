@@ -136,10 +136,24 @@ function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
   };
 }
 
-function currentGrantTokens(grant: ShareUserGrant): number {
+function currentGrantTokens(
+  grant: ShareUserGrant,
+  usageEdits: ShareUserUsageEditMap = {},
+): number {
+  const edit = usageEdits[grant.email.trim().toLowerCase()];
+  if (edit?.action === "set" && edit.targetTokens != null) {
+    return edit.targetTokens;
+  }
+  if (edit?.action === "clear") {
+    return grant.usageQuota?.observedTokensUsed ?? grantTokensFromUsage(grant);
+  }
   // The Server-derived view is authoritative when present.  The bucket read
   // below only covers grants persisted before the view existed.
   if (grant.usageQuota) return grant.usageQuota.effectiveTokensUsed;
+  return grantTokensFromUsage(grant);
+}
+
+function grantTokensFromUsage(grant: ShareUserGrant): number {
   const usage = grant.usage;
   if (!usage) return 0;
   switch (grant.policy.tokenPeriod) {
@@ -168,7 +182,7 @@ function currentGrantTokens(grant: ShareUserGrant): number {
  * save.
  */
 function observedGrantTokens(grant: ShareUserGrant): number {
-  return grant.usageQuota?.observedTokensUsed ?? currentGrantTokens(grant);
+  return grant.usageQuota?.observedTokensUsed ?? grantTokensFromUsage(grant);
 }
 
 function usageEditForGrant(
@@ -390,6 +404,34 @@ export function ShareUserGrantsEditor({
         expiresAt,
       },
     };
+    if (draft.usageAction === "set" && consumedTokens != null) {
+      const previousQuota = previous?.usageQuota;
+      const observed = previous ? observedGrantTokens(previous) : 0;
+      next.usageQuota = {
+        period: draft.tokenPeriod,
+        anchorAtMs: tokenPeriodAnchorAtMs,
+        windowStartsAtMs: previousQuota?.windowStartsAtMs,
+        windowEndsAtMs: previousQuota?.windowEndsAtMs,
+        effectiveTokensUsed: consumedTokens,
+        observedTokensUsed: observed,
+        manualOffsetTokens: consumedTokens - observed,
+        observedRequestsCount: previousQuota?.observedRequestsCount ?? 0,
+        rebaseApplies: true,
+      };
+    } else if (draft.usageAction === "clear") {
+      const previousQuota = previous?.usageQuota;
+      const observed = previous ? observedGrantTokens(previous) : 0;
+      next.usageRebase = undefined;
+      next.usageQuota = previousQuota
+        ? {
+            ...previousQuota,
+            effectiveTokensUsed: observed,
+            observedTokensUsed: observed,
+            manualOffsetTokens: 0,
+            rebaseApplies: false,
+          }
+        : undefined;
+    }
     const updated = { ...value };
     if (editingEmail && editingEmail !== email) delete updated[editingEmail];
     updated[email] = next;
@@ -635,7 +677,7 @@ export function ShareUserGrantsEditor({
                 </TableCell>
                 <TableCell className="px-3 py-2">
                   <div className="font-mono text-xs">
-                    {currentGrantTokens(grant).toLocaleString()}
+                    {currentGrantTokens(grant, usageEdits).toLocaleString()}
                   </div>
                   {grant.usageRebase ? (
                     <div className="text-[11px] text-muted-foreground">

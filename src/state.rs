@@ -17997,6 +17997,7 @@ async fn build_router_share_upsert_ops_with_policy(
             .is_some_and(|share| {
                 share.descriptor_generation == 0
                     || share.descriptor_fingerprint.as_deref() != Some(fingerprint.as_str())
+                    || share.router_synced_revision < share.config_revision
             })
     });
     if needs_prepare {

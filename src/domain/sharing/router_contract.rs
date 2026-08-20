@@ -75,6 +75,8 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
 }
 
