@@ -180,6 +180,7 @@ export function ProviderShareSection({
     key: string;
     fingerprint: string;
   } | null>(null);
+  const [shareHydrateNonce, setShareHydrateNonce] = useState(0);
 
   const [subdomainInput, setSubdomainInput] = useState("");
   const [descriptionInput, setDescriptionInput] = useState("");
@@ -202,9 +203,11 @@ export function ProviderShareSection({
 
   const subdomainManualRef = useRef(false);
   const shareInitRef = useRef<string | null>(null);
+  const appliedShareRevisionRef = useRef<number | null>(null);
   const tokenLimitTouchedRef = useRef(false);
   const parallelLimitTouchedRef = useRef(false);
   const expiresTouchedRef = useRef(false);
+  const shareDraftDirtyRef = useRef(false);
 
   const shareableApp = isShareableApp(appId) ? appId : null;
   const shareExists = Boolean(share);
@@ -232,8 +235,12 @@ export function ProviderShareSection({
   useEffect(() => {
     if (!shareableApp) return;
     const initKey = share?.id ?? "new";
-    if (shareInitRef.current === initKey) return;
+    const revision = share?.configRevision ?? null;
+    const sameShare = shareInitRef.current === initKey;
+    if (sameShare && appliedShareRevisionRef.current === revision) return;
+    if (sameShare && shareDraftDirtyRef.current) return;
     shareInitRef.current = initKey;
+    appliedShareRevisionRef.current = revision;
     tokenLimitTouchedRef.current = false;
     parallelLimitTouchedRef.current = false;
     expiresTouchedRef.current = false;
@@ -280,6 +287,7 @@ export function ProviderShareSection({
     }
     setUserGrants(nextGrants);
     setUserUsageEdits({});
+    setShareHydrateNonce((current) => current + 1);
 
     setTokenLimitInput(formatShareLimitInput(share?.tokenLimit));
     setParallelLimitInput(formatShareLimitInput(share?.parallelLimit));
@@ -370,13 +378,14 @@ export function ProviderShareSection({
       cancelAnimationFrame(firstFrame);
       if (secondFrame !== null) cancelAnimationFrame(secondFrame);
     };
-  }, [shareDraftInitializationKey]);
+  }, [shareDraftInitializationKey, shareHydrateNonce]);
 
   const shareDraftDirty = Boolean(
     share &&
     shareDraftBaseline?.key === shareDraftInitializationKey &&
     shareDraftBaseline.fingerprint !== shareDraftFingerprint,
   );
+  shareDraftDirtyRef.current = shareDraftDirty;
 
   useEffect(() => {
     onDirtyChange?.(shareDraftDirty);

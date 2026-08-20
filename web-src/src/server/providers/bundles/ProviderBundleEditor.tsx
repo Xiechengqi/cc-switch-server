@@ -1116,9 +1116,11 @@ export function ProviderBundleEditor({
   );
   const draftBaselineRef = useRef(stableStringify(draft));
   const shareBaselineRef = useRef(stableStringify(shareDraft));
+  const shareDirtyRef = useRef(false);
+  const shareDirty = stableStringify(shareDraft) !== shareBaselineRef.current;
+  shareDirtyRef.current = shareDirty;
   const dirty =
-    stableStringify(draft) !== draftBaselineRef.current ||
-    stableStringify(shareDraft) !== shareBaselineRef.current;
+    stableStringify(draft) !== draftBaselineRef.current || shareDirty;
   const closeGuard = useUnsavedChangesGuard({
     active: true,
     dirty: dirty && !saving,
@@ -1286,7 +1288,10 @@ export function ProviderBundleEditor({
 
   useEffect(() => {
     const nextShareDraft = createBundleShareDraft(existingShare);
-    shareBaselineRef.current = stableStringify(nextShareDraft);
+    if (shareDirtyRef.current) return;
+    const nextFingerprint = stableStringify(nextShareDraft);
+    if (nextFingerprint === shareBaselineRef.current) return;
+    shareBaselineRef.current = nextFingerprint;
     setShareDraft(nextShareDraft);
   }, [existingShare?.id, existingShare?.configRevision]);
 
