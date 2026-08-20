@@ -344,6 +344,28 @@ fn effective_user_tokens(grant: &ShareUserGrant, snapshot: &ShareUserQuotaSnapsh
     )
 }
 
+fn effective_grant_tokens_for_policy(grant: &ShareUserGrant, now_ms: i64) -> u64 {
+    let bucket = grant.usage.tokens_for_policy(&grant.policy, now_ms);
+    if let Some(rebase) = grant.usage_rebase.as_ref() {
+        if rebase.period == grant.policy.token_period
+            && rebase.anchor_at_ms == grant.policy.token_period_anchor_at_ms
+        {
+            return rebase.target_tokens.max(bucket).max(
+                grant
+                    .usage_quota
+                    .map(|quota| quota.effective_tokens_used)
+                    .unwrap_or(0),
+            );
+        }
+    }
+    if let Some(quota) = grant.usage_quota {
+        if quota.rebase_applies {
+            return quota.effective_tokens_used.max(bucket);
+        }
+    }
+    bucket
+}
+
 /// Builds the derived quota view a client can render without re-deriving the
 /// rebase arithmetic itself.
 fn quota_view(
@@ -1501,10 +1523,9 @@ impl ShareStore {
                     concurrency: None,
                 });
             }
-            if grant
-                .policy
-                .token_limit
-                .is_some_and(|limit| grant.usage.tokens_for_policy(&grant.policy, now_ms) >= limit)
+            if grant.policy.token_limit.is_some_and(|limit| {
+                effective_grant_tokens_for_policy(grant, now_ms) >= limit
+            })
             {
                 return Err(ShareInvocationRejection {
                     reason: ShareRejectReason::UserExhausted,
@@ -1578,6 +1599,19 @@ impl ShareStore {
         {
             if let Some(grant) = share.user_grants.get_mut(&email) {
                 let policy = grant.policy.clone();
+                let baseline = effective_grant_tokens_for_policy(grant, recorded_at_ms);
+                let current = grant.usage.tokens_for_policy(&policy, recorded_at_ms);
+                if baseline > current {
+                    let _ = grant.usage.rebuild_current_policy_bucket(
+                        &policy,
+                        recorded_at_ms,
+                        baseline,
+                        grant
+                            .usage_quota
+                            .map(|quota| quota.observed_requests_count)
+                            .unwrap_or(0),
+                    );
+                }
                 if count_request {
                     grant
                         .usage
@@ -1586,6 +1620,15 @@ impl ShareStore {
                     grant
                         .usage
                         .record_supplemental_for_policy(&policy, tokens, recorded_at_ms);
+                }
+                let used = grant.usage.tokens_for_policy(&policy, recorded_at_ms);
+                if let Some(quota) = grant.usage_quota.as_mut() {
+                    quota.effective_tokens_used = used;
+                    quota.observed_tokens_used = quota.observed_tokens_used.saturating_add(tokens);
+                    if count_request {
+                        quota.observed_requests_count =
+                            quota.observed_requests_count.saturating_add(1);
+                    }
                 }
                 grant.updated_at_ms = now_ms();
             }
@@ -4778,6 +4821,18 @@ mod tests {
         assert_eq!(quota.observed_requests_count, 2);
         assert!(quota.rebase_applies);
 
+        store
+            .record_user_invocation_result("usage-rebase", Some("user@example.com"), 500, now)
+            .unwrap();
+        assert_eq!(
+            store.get("usage-rebase").unwrap().user_grants["user@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            670,
+            "a later request must accumulate on the saved consumed-token baseline"
+        );
+
         let clear = BTreeMap::from([(
             "user@example.com".to_string(),
             ShareUserUsageEdit {
@@ -4821,6 +4876,52 @@ mod tests {
             !cleared_quota.rebase_applies,
             "no baseline is standing once it is cleared"
         );
+    }
+
+    #[test]
+    fn saved_consumed_tokens_become_the_baseline_for_the_next_request() {
+        let now = test_timestamp_ms(2026, 7, 28, 12, 0);
+        let mut input = codex_share_input("usage-baseline");
+        add_manual_shareto(&mut input, "user@example.com");
+        let mut store = ShareStore::default();
+        let created = store.upsert(input).unwrap();
+        let revision = created.user_grants["user@example.com"].revision;
+        let usage = UsageStore::default();
+        let edit = BTreeMap::from([(
+            "user@example.com".to_string(),
+            ShareUserUsageEdit {
+                action: ShareUserUsageEditAction::Set,
+                target_tokens: Some(10_000),
+                expected_grant_revision: Some(revision),
+                period: Some(ShareTokenPeriod::Lifetime),
+                anchor_at_ms: None,
+                source: crate::domain::sharing::router_contract::ShareUsageRebaseSource::Manual,
+            },
+        )]);
+        let rebased = store
+            .apply_settings_patch_with_usage_edits(
+                "usage-baseline",
+                ShareSettingsPatch::default(),
+                Some(&edit),
+                &usage,
+                now,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            rebased.user_grants["user@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            10_000
+        );
+
+        store
+            .record_user_invocation_result("usage-baseline", Some("user@example.com"), 500, now)
+            .unwrap();
+        let grant = &store.get("usage-baseline").unwrap().user_grants["user@example.com"];
+        assert_eq!(grant.usage.lifetime.tokens_used, 10_500);
+        assert_eq!(grant.usage_quota.unwrap().effective_tokens_used, 10_500);
     }
 
     #[test]

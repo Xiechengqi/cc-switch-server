@@ -51,12 +51,10 @@ type PolicyDraft = {
   usageAction: "unchanged" | "set" | "clear";
 };
 
-type BatchPolicyDraft = Omit<
-  PolicyDraft,
-  "email" | "consumedTokens" | "usageAction"
-> & {
+type BatchPolicyDraft = Omit<PolicyDraft, "email"> & {
   applyParallelLimit: boolean;
   applyTokenLimit: boolean;
+  applyConsumedTokens: boolean;
   applyExpiresAt: boolean;
 };
 
@@ -206,17 +204,21 @@ function usageEditForGrant(
   };
 }
 
-function batchPolicyDraft(policy: ShareUserPolicy): BatchPolicyDraft {
-  const draft = policyDraft("", policy);
+function batchPolicyDraft(grant: ShareUserGrant, usageEdits: ShareUserUsageEditMap): BatchPolicyDraft {
+  const draft = policyDraft(grant.email, grant.policy);
+  const usage = usageEditForGrant(grant, usageEdits);
   return {
     parallelLimit: draft.parallelLimit,
     tokenLimit: draft.tokenLimit,
     tokenPeriod: draft.tokenPeriod,
     tokenPeriodAnchor: draft.tokenPeriodAnchor,
     expiresAt: draft.expiresAt,
-    applyParallelLimit: false,
-    applyTokenLimit: false,
-    applyExpiresAt: false,
+    consumedTokens: usage.consumedTokens,
+    usageAction: usage.usageAction === "clear" ? "clear" : "set",
+    applyParallelLimit: true,
+    applyTokenLimit: true,
+    applyConsumedTokens: true,
+    applyExpiresAt: true,
   };
 }
 
@@ -308,7 +310,7 @@ export function ShareUserGrantsEditor({
   };
 
   const openEdit = (grant: ShareUserGrant) => {
-    if (grant.role === "owner") return;
+    if (protectedEmails?.has(grant.email)) return;
     setEditingEmail(grant.email);
     setDraftError("");
     setDraft({
@@ -330,7 +332,7 @@ export function ShareUserGrantsEditor({
     const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
     if (!firstSelected) return;
     setBatchError("");
-    setBatchDraft(batchPolicyDraft(firstSelected.policy));
+    setBatchDraft(batchPolicyDraft(firstSelected, usageEdits));
   };
 
   const saveDraft = () => {
@@ -476,34 +478,61 @@ export function ShareUserGrantsEditor({
       : undefined;
     const anchored = ANCHORED_PERIODS.has(batchDraft.tokenPeriod);
     const tokenPeriodAnchorAtMs = anchored
-      ? parseUtcDateTime(batchDraft.tokenPeriodAnchor)
+      ? parseUtcDateTime(batchDraft.tokenPeriodAnchor) : undefined;
+    const consumedTokens = batchDraft.consumedTokens.trim()
+      ? Number(batchDraft.consumedTokens)
       : undefined;
     if (
       !batchDraft.applyParallelLimit &&
       !batchDraft.applyTokenLimit &&
+      !batchDraft.applyConsumedTokens &&
       !batchDraft.applyExpiresAt
     ) {
       return;
     }
+    const selectedGrants = grants.filter((grant) => selectedEditableEmails.has(grant.email));
+    const usageFloor = selectedGrants.reduce(
+      (highest, grant) => Math.max(highest, observedGrantTokens(grant)),
+      0,
+    );
+    const usageInvalid =
+      batchDraft.applyConsumedTokens &&
+      batchDraft.usageAction === "set" &&
+      consumedTokens != null &&
+      (!Number.isSafeInteger(consumedTokens) ||
+        consumedTokens < 0 ||
+        consumedTokens < usageFloor);
     if (
       (batchDraft.applyParallelLimit && parallelLimit != null &&
         (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
       (batchDraft.applyTokenLimit && tokenLimit != null &&
         (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
-      (batchDraft.applyExpiresAt && expiresAt != null && !Number.isFinite(expiresAt)) ||
-      (batchDraft.applyTokenLimit && anchored && (
+      (batchDraft.applyExpiresAt && expiresAt != null && !Number.isFinite(expiresAt)) || (batchDraft.applyTokenLimit && anchored && (
         tokenPeriodAnchorAtMs == null ||
         !Number.isFinite(tokenPeriodAnchorAtMs) ||
         tokenPeriodAnchorAtMs > Math.floor(Date.now() / 60_000) * 60_000
-      ))
+      )) ||
+      usageInvalid
     ) {
-      setBatchError(t("share.userLimit.invalidPolicy", {
-        defaultValue: "限制必须为正整数，且时间必须有效。",
-      }));
+      setBatchError(
+        usageInvalid
+          ? consumedTokens != null && consumedTokens < usageFloor
+            ? t("share.userLimit.consumedBelowObserved", {
+                defaultValue:
+                  "已消耗 Token 不能低于当前观测值（{{observed}}）。",
+                observed: usageFloor.toLocaleString(),
+              })
+            : t("share.userLimit.invalidUsage", {
+                defaultValue: "已消耗 Token 必须是大于等于 0 的整数。",
+              })
+          : t("share.userLimit.invalidPolicy", {
+              defaultValue: "限制必须为正整数，且时间必须有效。",
+            }),
+      );
       return;
     }
 
-    onChange(applyShareUserPolicyBatch(value, selectedEditableEmails, {
+    const nextGrants = applyShareUserPolicyBatch(value, selectedEditableEmails, {
       ...(batchDraft.applyParallelLimit
         ? { parallelLimit: { value: parallelLimit } }
         : {}),
@@ -519,10 +548,79 @@ export function ShareUserGrantsEditor({
       ...(batchDraft.applyExpiresAt
         ? { expiresAt: { value: expiresAt } }
         : {}),
-    }));
-    if (onUsageEditsChange && batchDraft.applyTokenLimit) {
-      const nextEdits = { ...usageEdits };
-      for (const email of selectedEditableEmails) delete nextEdits[email];
+    });
+    if (batchDraft.applyConsumedTokens) {
+      for (const grant of selectedGrants) {
+        const current = nextGrants[grant.email] ?? grant;
+        const observed = observedGrantTokens(grant);
+        const period = batchDraft.applyTokenLimit
+          ? batchDraft.tokenPeriod
+          : current.policy.tokenPeriod;
+        const anchorAtMs = batchDraft.applyTokenLimit
+          ? tokenPeriodAnchorAtMs : current.policy.tokenPeriodAnchorAtMs;
+        if (batchDraft.usageAction === "set" && consumedTokens != null) {
+          const previousQuota = current.usageQuota;
+          nextGrants[grant.email] = {
+            ...current,
+            usageQuota: {
+              period,
+              anchorAtMs,
+              windowStartsAtMs: previousQuota?.windowStartsAtMs,
+              windowEndsAtMs: previousQuota?.windowEndsAtMs,
+              effectiveTokensUsed: consumedTokens,
+              observedTokensUsed: observed,
+              manualOffsetTokens: consumedTokens - observed,
+              observedRequestsCount: previousQuota?.observedRequestsCount ?? 0,
+              rebaseApplies: true,
+            },
+          };
+        } else if (batchDraft.usageAction === "clear") {
+          const previousQuota = current.usageQuota;
+          nextGrants[grant.email] = {
+            ...current,
+            usageRebase: undefined,
+            usageQuota: previousQuota
+              ? {
+                  ...previousQuota,
+                  effectiveTokensUsed: observed,
+                  observedTokensUsed: observed,
+                  manualOffsetTokens: 0,
+                  rebaseApplies: false,
+                }
+              : undefined,
+          };
+        }
+      }
+    }
+    onChange(nextGrants);
+    if (onUsageEditsChange && (batchDraft.applyTokenLimit || batchDraft.applyConsumedTokens)) {
+      const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
+      for (const grant of selectedGrants) {
+        const email = grant.email.trim().toLowerCase();
+        if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "set" && consumedTokens != null) {
+          nextEdits[email] = {
+            action: "set",
+            targetTokens: consumedTokens,
+            expectedGrantRevision: grant.revision,
+            period: batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod,
+            anchorAtMs: batchDraft.applyTokenLimit
+              ? tokenPeriodAnchorAtMs
+              : grant.policy.tokenPeriodAnchorAtMs,
+            source: usageEdits[email]?.source ?? "manual",
+          };
+        } else if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "clear" && grant.usageRebase) {
+          nextEdits[email] = {
+            action: "clear",
+            expectedGrantRevision: grant.revision,
+            period: batchDraft.applyTokenLimit ? batchDraft.tokenPeriod : grant.policy.tokenPeriod,
+            anchorAtMs: batchDraft.applyTokenLimit
+              ? tokenPeriodAnchorAtMs
+              : grant.policy.tokenPeriodAnchorAtMs,
+          };
+        } else {
+          delete nextEdits[email];
+        }
+      }
       onUsageEditsChange(nextEdits);
     }
     setSelectedEmails(new Set());
@@ -609,8 +707,8 @@ export function ShareUserGrantsEditor({
         </div>
       </div>
 
-      <div className="overflow-x-auto rounded-md border border-border-default">
-        <Table className={selecting ? "min-w-[900px]" : "min-w-[840px]"}>
+      <div className="w-full overflow-hidden rounded-md border border-border-default [&_.relative.w-full.overflow-auto]:overflow-hidden">
+        <Table className="w-full table-fixed">
           <TableHeader>
             <TableRow>
               {selecting ? (
@@ -627,15 +725,15 @@ export function ShareUserGrantsEditor({
                   />
                 </TableHead>
               ) : null}
-              <TableHead className="h-9 px-3">Email</TableHead>
-              <TableHead className="h-9 px-3">{t("share.parallelLimit", { defaultValue: "并发" })}</TableHead>
-              <TableHead className="h-9 px-3">Token</TableHead>
-              <TableHead className="h-9 px-3">
+              <TableHead className="h-9 w-[28%] px-3">Email</TableHead>
+              <TableHead className="h-9 w-[12%] px-3">{t("share.parallelLimit", { defaultValue: "并发" })}</TableHead>
+              <TableHead className="h-9 w-[18%] px-3">Token</TableHead>
+              <TableHead className="h-9 w-[22%] px-3">
                 {t("share.userLimit.consumedTokens", {
                   defaultValue: "已消耗 Token（当前周期）",
                 })}
               </TableHead>
-              <TableHead className="h-9 px-3">{t("share.expiration", { defaultValue: "到期" })}</TableHead>
+              <TableHead className="h-9 w-[12%] px-3">{t("share.expiration", { defaultValue: "到期" })}</TableHead>
               <TableHead className="h-9 w-20 px-3" />
             </TableRow>
           </TableHeader>
@@ -662,9 +760,9 @@ export function ShareUserGrantsEditor({
                     />
                   </TableCell>
                 ) : null}
-                <TableCell className="px-3 py-2">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="truncate">{grant.email}</span>
+                <TableCell className="px-3 py-2 align-top">
+                  <div className="flex min-w-0 flex-wrap items-start gap-2">
+                    <span className="min-w-0 whitespace-normal break-all">{grant.email}</span>
                     {grant.role === "owner" ? <Badge variant="secondary">Owner</Badge> : null}
                     {grant.manager === "routerShareMarket" ? (
                       <Badge variant="secondary">Share Market</Badge>
@@ -675,8 +773,8 @@ export function ShareUserGrantsEditor({
                 <TableCell className="px-3 py-2">
                   {displayLimit(grant.policy.tokenLimit, unlimited)} · {periodLabels[grant.policy.tokenPeriod]}
                 </TableCell>
-                <TableCell className="px-3 py-2">
-                  <div className="font-mono text-xs">
+                <TableCell className="px-3 py-2 align-top">
+                  <div className="whitespace-normal break-all font-mono text-xs">
                     {currentGrantTokens(grant, usageEdits).toLocaleString()}
                   </div>
                   {grant.usageRebase ? (
@@ -698,7 +796,7 @@ export function ShareUserGrantsEditor({
                 <TableCell className="px-3 py-2">{displayExpiry(grant.policy.expiresAt, permanent)}</TableCell>
                 <TableCell className="px-3 py-2">
                   <div className="flex justify-end gap-1">
-                    {grant.role !== "owner" && !protectedEmails?.has(grant.email) ? (
+                    {!protectedEmails?.has(grant.email) ? (
                       <Button
                         type="button"
                         variant="ghost"
@@ -858,7 +956,7 @@ export function ShareUserGrantsEditor({
                     : "",
                 })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent className="z-[120]">
+                  <SelectContent className="z-[130]">
                     {(Object.keys(periodLabels) as ShareTokenPeriod[]).map((period) => <SelectItem key={period} value={period}>{periodLabels[period]}</SelectItem>)}
                   </SelectContent>
                 </Select>
@@ -982,10 +1080,10 @@ export function ShareUserGrantsEditor({
               <div className="space-y-2">
                 <Label>{t("share.userLimit.period", { defaultValue: "Token 周期" })}</Label>
                 <Select
-                  disabled={!batchDraft.applyTokenLimit}
                   value={batchDraft.tokenPeriod}
                   onValueChange={(tokenPeriod: ShareTokenPeriod) => setBatchDraft({
                     ...batchDraft,
+                    applyTokenLimit: true,
                     tokenPeriod,
                     tokenPeriodAnchor: ANCHORED_PERIODS.has(tokenPeriod)
                       ? (batchDraft.tokenPeriodAnchor || toUtcDateTime())
@@ -993,12 +1091,64 @@ export function ShareUserGrantsEditor({
                   })}
                 >
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent className="z-[120]">
+                  <SelectContent className="z-[130]">
                     {(Object.keys(periodLabels) as ShareTokenPeriod[]).map((period) => (
                       <SelectItem key={period} value={period}>{periodLabels[period]}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="share-user-batch-consumed-enabled"
+                    checked={batchDraft.applyConsumedTokens}
+                    onCheckedChange={(checked) => setBatchDraft({
+                      ...batchDraft,
+                      applyConsumedTokens: checked === true,
+                    })}
+                  />
+                  <Label htmlFor="share-user-batch-consumed-enabled">
+                    {t("share.userLimit.consumedTokens", {
+                      defaultValue: "已消耗 Token（当前周期）",
+                    })}
+                  </Label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    disabled={!batchDraft.applyConsumedTokens}
+                    placeholder="0"
+                    value={batchDraft.consumedTokens}
+                    onChange={(event) => setBatchDraft({
+                      ...batchDraft,
+                      consumedTokens: event.target.value,
+                      usageAction: "set",
+                    })}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={!batchDraft.applyConsumedTokens}
+                    onClick={() => setBatchDraft({
+                      ...batchDraft,
+                      consumedTokens: "",
+                      usageAction: "clear",
+                    })}
+                  >
+                    {t("share.userLimit.clearRebase", {
+                      defaultValue: "清除重基线",
+                    })}
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t("share.userLimit.batchConsumedHint", {
+                    defaultValue: "勾选后会把该值应用到所有已选用户。留空并保存表示不创建手工重基线。",
+                  })}
+                </p>
               </div>
               {batchDraft.applyTokenLimit && ANCHORED_PERIODS.has(batchDraft.tokenPeriod) ? (
                 <div className="space-y-2 sm:col-span-2">
@@ -1077,6 +1227,7 @@ export function ShareUserGrantsEditor({
               disabled={batchDraft != null &&
                 !batchDraft.applyParallelLimit &&
                 !batchDraft.applyTokenLimit &&
+                !batchDraft.applyConsumedTokens &&
                 !batchDraft.applyExpiresAt}
               onClick={saveBatchDraft}
             >
