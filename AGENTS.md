@@ -32,7 +32,7 @@
 外部仓库改动只作为 Provider 类型和协议行为证据，不作为实现同步源。根据证据调整 Server 前，必须更新或核对：
 
 - `UPSTREAM_IMPORT.md`
-- `docs/provider-coverage.md`
+- `docs/provider/coverage.md`
 
 ## 状态写入
 
@@ -46,11 +46,22 @@ shares 写路径已收敛到 `mutate_shares_immediate` / `try_mutate_shares_imme
 
 ## UI 独立性
 
-Server Web UI 以本仓库的产品需求、Server API 和 `assets/contract/web-runtime-contract.json` 为唯一实现依据，人工验收见 `docs/manual-ui-checklist.md`。
+Server Web UI 以本仓库的产品需求、Server API 和 `assets/contract/web-runtime-contract.json` 为唯一实现依据，人工验收见 `docs/acceptance/manual-ui-checklist.md`。
 
 禁止从 cc-switch 或其他外部项目批量复制、同步或覆盖 React 组件、样式、locale、运行时命令和页面结构。外部项目只能作为 Provider 类型、协议行为或缺陷修复的审计证据；吸收时必须按 Server 边界重新设计、逐项实现并独立 review。
 
 本地-only 工作索引（已 gitignore，不提交）：`docs/remaining-work-index.md`。
+
+## 文档
+
+`docs/README.md` 是全部文档的唯一索引。新增或移动 `docs/` 下的文档时必须同步：
+
+- 在 `docs/README.md` 中登记，并标注状态（权威 / 生成 / 历史 / 数据）。
+- 归档件放进 `docs/history/`，开头必须带只读横幅（`归档文档 · 只读 · 不代表当前实现`）。
+- 生成类文档不得手工编辑，改动源在生成脚本或 `assets/contract/`。
+- 移动文件后更新引用它的脚本、`.env.example` 和其他文档；`node scripts/audit/audit-docs-index.mjs`（已并入 `scripts/static-checks.sh`）会校验链接可解析、索引完整和归档横幅存在。
+
+架构叙述的真值来源是 `docs/architecture/overview.md`；协议线格式以 `cc-switch-router/PROTOCOL.md` 为准；系统级文档站在 `tokenswitch-docsify`。
 
 ## 管理员密码修改
 

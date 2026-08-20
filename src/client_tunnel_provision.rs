@@ -203,8 +203,7 @@ pub(crate) async fn suggest_client_tunnel_subdomain(
             });
         }
 
-        match check_subdomain_for_router(state, router_url, &candidate, installation_id, None)
-            .await
+        match check_subdomain_for_router(state, router_url, &candidate, installation_id, None).await
         {
             Ok(availability) if availability.available => {
                 return Ok(SuggestSubdomainOutcome {
@@ -280,14 +279,8 @@ pub(crate) async fn provision_client_tunnel(
         .map(|identity| identity.installation_id.as_str());
     let owner_email = config.owner.email.as_deref();
     if let Some(subdomain) = config.client.tunnel_subdomain.clone() {
-        match check_subdomain_for_router(
-            state,
-            &api_base,
-            &subdomain,
-            installation_id,
-            owner_email,
-        )
-        .await
+        match check_subdomain_for_router(state, &api_base, &subdomain, installation_id, owner_email)
+            .await
         {
             Ok(availability) if !availability.available => {
                 return Err(subdomain_conflict_error(

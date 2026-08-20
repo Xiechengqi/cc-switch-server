@@ -11166,7 +11166,7 @@ fn sanitize_openai_capacity_shed_websocket_message(message: &mut TungsteniteMess
         TungsteniteMessage::Binary(bytes) => {
             let (rewritten, changed) = sanitize_openai_capacity_shed_json_bytes(bytes);
             if changed {
-                *bytes = rewritten.into();
+                *bytes = rewritten;
             }
         }
         _ => {}

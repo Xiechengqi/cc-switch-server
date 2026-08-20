@@ -1,6 +1,17 @@
 # cc-switch-server 审查报告（修复前）
 
-> **历史快照 / 已废止**：本文记录 2026-08-06 修复前状态，其中关于 Router Token Market、按 app 售价和旧 Share sale contract 的判断已经失效。当前产品边界以 [`docs/token-market-decoupling-plan.md`](docs/token-market-decoupling-plan.md) 和根目录 `AGENTS.md` 为准；不得按本文恢复旧 Token Market 代码或协议。
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `server-pre-fix.md（仓库根目录）` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、[`docs/share/access-policy.md`](../share/access-policy.md) |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+
+> **历史快照 / 已废止**：本文记录 2026-08-06 修复前状态，其中关于 Router Token Market、按 app 售价和旧 Share sale contract 的判断已经失效。当前产品边界以 [`docs/history/token-market-decoupling-plan.md`](token-market-decoupling-plan.md) 和根目录 `AGENTS.md` 为准；不得按本文恢复旧 Token Market 代码或协议。
 
 - **仓库**：`/data/projects/cc-switch-server`
 - **分支**：`main`，HEAD `bb004b0 refactor(server): consolidate runtime files under config directory`

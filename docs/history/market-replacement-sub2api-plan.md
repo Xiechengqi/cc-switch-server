@@ -1,5 +1,16 @@
 # 基于 sub2api 的 Share Market 替换评估与实施规划
 
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/market-replacement-sub2api-plan.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、[`docs/share/access-policy.md`](../share/access-policy.md) |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+
 > **历史/探索性文档（非当前权威计划）**：当前产品方向已调整为先从 `cc-switch-server` 与 `cc-switch-router` 完整剔除旧 Token Market，只保留 Client + Router、Router Share Market 与 Client Market。当前权威计划见 [`token-market-decoupling-plan.md`](token-market-decoupling-plan.md)。本文仅保留此前对 sub2api 及独立 Market 形态的可行性研究；不应据此开始 fork、迁移或替换实施。
 >
 > 状态：**历史评估，未实施（已被当前解耦计划取代）**

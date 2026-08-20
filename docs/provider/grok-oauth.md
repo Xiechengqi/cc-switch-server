@@ -182,7 +182,7 @@ node scripts/smoke/grok-oauth-real.mjs
 
 脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON 和 Responses SSE，并对两个 Responses 请求携带固定 session id 与合法 `x-grok-turn-idx`。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
 
-401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/real-acceptance-runbook.md` 单独留证。
+401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/acceptance/real-acceptance-runbook.md` 单独留证。
 
 ## 非目标与剩余风险
 

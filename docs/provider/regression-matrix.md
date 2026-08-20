@@ -2,7 +2,7 @@
 
 本矩阵对应 Z3/Z8。真实 provider/token 不存在时，只能执行本地 contract 和 mock 回归；真实账号回归不得伪标完成。
 
-AD3 已将本页矩阵固化为 `docs/code-agent-regression-matrix.json`。`scripts/smoke/code-agent-regression.sh` 会先运行 `scripts/smoke/code-agent-matrix-summary.mjs`，输出：
+AD3 已将本页矩阵固化为 `docs/provider/regression-matrix.json`。`scripts/smoke/code-agent-regression.sh` 会先运行 `scripts/smoke/code-agent-matrix-summary.mjs`，输出：
 
 - `matrixTotal`：矩阵组合总数。
 - `matrixRunnable`：当前环境变量齐备、可运行的组合数。

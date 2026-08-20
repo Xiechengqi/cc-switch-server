@@ -166,7 +166,7 @@ scripts/smoke/router-share-smoke.sh
 
 建议外层使用 Caddy/Nginx/Cloudflare Tunnel 终止 TLS，再反代到 `127.0.0.1:15721` 或内网地址。`router` tunnel 暴露的 public URL 与本机管理入口可以并存，但生产管理入口必须使用强密码和最小暴露面。
 
-Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body，不能在 Worker 中调用 `.text()`、`.json()` 或 `.arrayBuffer()`。Capability URL 的 host 固定来自 Router 签名 Share context，不从源站 Host 或 forwarded header 推导。Capability 文件默认持久化到 `<config-dir>/image-capabilities`；多副本应把 `CC_SWITCH_IMAGE_STORE_DIR` 指向同一个支持跨进程文件锁、atomic rename 和目录同步的挂载目录，让 `/v1/images/files/<token>` 的 Router 鉴权 GET/HEAD 可落到任一副本。不能共享该目录时才配置生成与下载的粘性回源。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`codex-oauth-single-account.md`](codex-oauth-single-account.md#cloudflare-proxy)。
+Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body，不能在 Worker 中调用 `.text()`、`.json()` 或 `.arrayBuffer()`。Capability URL 的 host 固定来自 Router 签名 Share context，不从源站 Host 或 forwarded header 推导。Capability 文件默认持久化到 `<config-dir>/image-capabilities`；多副本应把 `CC_SWITCH_IMAGE_STORE_DIR` 指向同一个支持跨进程文件锁、atomic rename 和目录同步的挂载目录，让 `/v1/images/files/<token>` 的 Router 鉴权 GET/HEAD 可落到任一副本。不能共享该目录时才配置生成与下载的粘性回源。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`../provider/codex-oauth.md`](../provider/codex-oauth.md#cloudflare-proxy)。
 
 ## OAuth/代理桥接运维
 
@@ -181,7 +181,7 @@ Responses JSON、SSE、WebSocket 和 WS→HTTP fallback 共享下游提交边界
 - `cc_switch_proxy_semantic_guard_total{surface,observation}`：`lifecycle`、`business`、`success_terminal`、`incomplete_terminal`、`client_failure`、`provider_failure`、`protocol_error`。
 - `cc_switch_reasoning_bridge_total{direction,outcome}`：reasoning envelope encode/decode 成功、过大、MAC 或 envelope 校验失败。
 
-真实 Claude/OpenAI OAuth、ChatGPT upstream、Router callback、Market 和 Share grant 仍按 `docs/real-acceptance-runbook.md` 提供输入后执行；离线 fixture、mock 和 readiness 不能标记这些项目真实通过。
+真实 Claude/OpenAI OAuth、ChatGPT upstream、Router callback、Market 和 Share grant 仍按 `docs/acceptance/real-acceptance-runbook.md` 提供输入后执行；离线 fixture、mock 和 readiness 不能标记这些项目真实通过。
 
 ## 数据目录
 

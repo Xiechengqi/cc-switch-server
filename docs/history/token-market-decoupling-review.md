@@ -1,5 +1,16 @@
 # Client + Router 旧 Token Market 解耦整体 Review
 
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/token-market-decoupling-review.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、[`docs/share/access-policy.md`](../share/access-policy.md) |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+
 > Review 日期：2026-08-18
 >
 > 范围：`cc-switch-server`（Client）与同级 `cc-switch-router`（Router）。

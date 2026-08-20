@@ -13,6 +13,10 @@
 
 当前仓库只维护 server 运行路径：HTTP API、静态 Web UI、本地 JSON store、反代转发、router/share tunnel 和真实验收脚本。不迁移 Tauri window/tray/updater/deeplink、Claude Desktop profile 写入、MCP、skills、session manager 和桌面安装资产。
 
+## 在系统中的位置
+
+Token 路由交易系统有三个角色、两个运行时组件：**Client**（本仓库 `cc-switch-server`）、**Router** 与 **Client / Share Market**（后两者同为 `cc-switch-router` 进程）。
+
 管理面链路：
 
 ```text
@@ -33,37 +37,22 @@ Claude / Codex / Gemini client
   -> upstream provider or OAuth backend
 ```
 
+`:15721` **不对外提供推理 API**。完整架构见 [`docs/architecture/overview.md`](docs/architecture/overview.md)。
+
 ## 特性
 
-- 提供 setup、password/API token 登录和 router 邮箱验证码登录；Web UI 覆盖 provider、account、share、usage、router、backup 和 diagnostics 常用操作。
-- 在 Router Share URL 下支持 Claude、Codex、Gemini 三类入口：`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、Gemini `/v1beta/*` 和 OpenAI-compatible `/v1/models`/`/models`；这些路径不是 `15721` 的客户端直连 API。
-- 通过显式 legacy reader 保留旧 cc-switch Provider metadata、AuthBinding 和未知扩展字段；Universal 派生项只作为迁移输入，不再是 Server runtime 真值。
-- Provider API 导出仅返回脱敏视图；受控导入按 server 当前分类和凭据补丁契约执行，不提供跨 store 的通用配置导入导出。
-- 已实现 Codex Chat Completions 与 Responses 的直接互转，保留 max/reasoning/response_format/tool/usage 等 Codex bridge 关键字段。
-- 已接入 Claude/Codex/Gemini/OpenAI-compatible/Gemini-native/Anthropic-native 之间的主要跨协议 adapter contract，并把 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset 纳入 coverage。
-- Cursor 已按 OAuth CLI / API Key SDK 双 rail 接入 Claude/Codex/Gemini，覆盖协议、请求、事件、tool、h2、session、identity 和 image；生产 endpoint 只从 runtime secrets 读取，Provider maturity 保持 Experimental，直到两条 rail 的真实验收矩阵分别通过。
-- GitHub Copilot 已提供 device flow 静态导入路径，真实 token/live models/stream 回归完成前保持 fallback。Kiro 已有 server-native refresh、模型发现和 Claude/Codex 非流/流式桥，本地协议合同为 Native/fixture-verified；真实账号的模型、usage、401 rollover、tool/image 与限流验收仍为 live pending。
-- Codex 同时支持 Device OAuth 与官方 CLI PKCE OAuth；远程 HTTPS Client URL 可在浏览器 localhost 回调失败后，将完整 callback URL 提交回 Server 完成认证。浏览器和 device flow 的 start/poll/cancel 都绑定发起登录的管理员主体及短期有效期。Codex、Claude、Gemini、Antigravity/Agy 等受管账号可执行 server-native refresh/profile/quota；Ollama API Key 仍是 Provider-owned 凭据，保存后直接读取官方 `/api/me` 与 `/api/usage` 并在 Provider 卡片显示账号、计划和用量，不创建 Account 行。
-- Managed OAuth Provider Bundle 必须显式绑定账号。Codex OAuth 的 active account 仅是账号中心独立操作的目标，不重绑 Provider 或 Share，也不参与数据面路由。所有外部推理请求只能通过 Router 暴露的同一个 Share URL 进入；Server 校验 Router ingress 签名和 Share 身份后，由 Share binding 精确选择 Claude/Codex/Gemini Surface 及其绑定账号。请求不会按占用、quota、cooldown、concurrency 或错误切换账号。Claude/Codex 的首个 401 都只在原账号强刷并重放一次，不做跨 Provider 或跨账号故障转移。
-- Provider Bundle 的模型策略默认由全局控制，可切换为按 App 独立控制；只有至少两个 App Surface 支持可配置策略时才允许独立模式。Profile 固定策略不接受覆盖，Server Web、Share descriptor 与 Router 均显式展示其为固定例外。
-- Codex Responses WebSocket 使用按 Provider/runtime/session/workspace/凭据隔离的有界连接缓存；连接、握手或发送 `response.create` 前的传输失败/超时可回退到同账号 HTTP/SSE，`response.create` 一旦成功发送便不再透明重放，后续流只受首业务事件和空闲超时约束。
-- Codex context overflow 自动压缩可通过 `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 显式启用；它只在业务输出提交前使用同一账号做一次有界摘要和重试，默认关闭且摘要 usage 独立记录。
-- 支持 router installation register、client tunnel、share tunnel、share batch sync、Router Share request log sync、pending share edit pull/ack/event 监听。
-- Router ingress 新鲜度采用非对称边界:最多接受 30 秒前签发、最多接受未来 5 秒签发的上下文,边界值有效。验签失败仍返回空正文 `401`,同时用 `x-cc-switch-internal-ingress-*` 向 Router 提供稳定原因码和时间诊断；这些内部响应头必须由 Router 剥离,不得传给公网调用方。普通业务 `401` 不附该诊断头。
-- 支持 Router 内建 Share Market entitlement add/revoke 通过 pending edit 幂等应用到 Server Share，并同步 per-app 授权展示状态。
-- Usage 记录完整 request lifecycle、Provider Bundle/Surface、Share/用户、实际上游模型、重试、延迟与 Token 观测状态，并通过 Server-native REST 提供聚合、筛选、明细和 cursor 分页。
-- usage 仅统计 Token、请求状态和延迟，不计算模型成本或 USD 金额；账号 quota 调度阈值和 Share Token 限额由 Server/Router 各自边界管理。Server 不保存外部 Token Market 用户、价格或账本。
-- JSON 写入使用 temp file fsync、atomic rename 和父目录 fsync；`/api/backup` 支持创建、列出、恢复主要 store，恢复前自动 pre-restore 快照。
-- `/web-api/events` 通过已认证 SSE 推送 Usage/Share/tunnel 事件，Web 当前页会刷新对应查询缓存。
-- `cc-switch-server version --json` 和 `/version` 会输出版本、commit id、commit message、build time、target、profile、rustc 和 dirty 状态。
+- **管理面**：setup、password / API token 登录和 router 邮箱验证码登录；Web UI 覆盖 provider、account、share、usage、router、backup、diagnostics。
+- **多协议反代**：Claude Messages、Codex Chat Completions / Responses（双向互转）、Gemini `/v1beta/*`、OpenAI-compatible `/v1/models`；已接入 OpenRouter、Ollama、Nvidia、DeepSeek、SubRouter、OpenCode Go 等 preset。
+- **Server-native OAuth**：Claude / Codex（Device + CLI PKCE）/ Gemini / Antigravity / Cursor / Copilot / Kiro / Grok / Kimi / Qoder 的登录、刷新、profile 与 quota，全部在 Server 侧完成，无桌面依赖。
+- **显式绑定，不做故障转移**：Managed OAuth Provider Bundle 必须显式绑定账号；请求不按占用、quota、cooldown、并发或错误切换账号，首个 401 只在原账号强刷并重放一次。
+- **Router 集成**：installation register、client tunnel、share tunnel、share batch sync、Router Share request log sync、pending share edit pull/ack/事件监听；ingress 新鲜度采用非对称窗口（≤30s 前签发、≤5s 未来）。
+- **用量计量**：记录完整 request lifecycle、Provider Bundle/Surface、Share/用户、实际上游模型、重试、延迟与 Token 观测状态，通过 Server-native REST 提供聚合、筛选、明细和 cursor 分页。**只统计 Token / 状态 / 延迟，不计算成本或 USD 金额**，也不保存外部 Token Market 用户、价格或账本。
+- **持久化安全**：JSON 写入使用 temp file fsync + atomic rename + 父目录 fsync；凭据以 XChaCha20-Poly1305 加密；`/api/backup` 支持创建、列出、恢复，恢复前自动 pre-restore 快照。
+- **可观测**：`/web-api/events` 认证 SSE 推送 Usage/Share/tunnel 事件；`/metrics` 暴露 Prometheus 指标；`version --json` 与 `/version` 输出版本、commit、build time、target、profile、rustc 和 dirty 状态。
 
 ## Code Agent 反代支持
 
-`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。Provider 桥接能力按 Server 自身的协议契约实现，能力分级以静态 adapter contract 覆盖度与真实验收结果为准。
-
-### 支持的客户端入口
-
-下表路径全部相对于同一个 Router Share URL。`15721` 只承载管理 UI、控制面、健康检查和 Router 签名后的内部 ingress。
+`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。下表路径全部相对于同一个 Router Share URL。
 
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
@@ -78,9 +67,9 @@ Claude / Codex / Gemini client
 | **DeepSeek Account** | 作为 Claude 上游桥 | ⚠️ Planned | 账密协议桥与 PoW 已接线；Codex/Gemini 路径仍为 skeleton |
 | **Cline / OpenCode / Qoder / Trae / Windsurf / Zed** | — | ❌ 不支持 | server 产品边界不覆盖这些 IDE 专属 MITM 或插件生态 |
 
-能力分级：`✅ Native` = 静态 adapter contract 已覆盖且属主线验收对象；`⚠️ Planned` = 转发/签名已接线但缺真实 non-stream/stream 验收；`⚠️ Fallback` = skeleton 或 manual import 路径；`❌` = 未实现。详见 [`docs/code-agent-regression-matrix.md`](docs/code-agent-regression-matrix.md)。
+能力分级：`✅ Native` = 静态 adapter contract 已覆盖且属主线验收对象；`⚠️ Planned` = 转发/签名已接线但缺真实 non-stream/stream 验收；`⚠️ Fallback` = skeleton 或 manual import 路径；`❌` = 未实现。详见 [`docs/provider/regression-matrix.md`](docs/provider/regression-matrix.md)。
 
-> **cc-switch-server 的产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；提供 Server-native OAuth、share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。Cursor/Kiro/Copilot/DeepSeek 等跨厂商后端桥由本仓库独立维护，capability 升级以 Server 契约和真实验收为 gate。
+> **产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；提供 Server-native OAuth、share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。
 
 ### 供应商 × App 能力矩阵（摘要）
 
@@ -97,88 +86,18 @@ Claude / Codex / Gemini client
 | Kiro OAuth | ⚠️ | — | — | Planned（仅 Claude） |
 | DeepSeek Account | ⚠️ | — | — | Planned（仅 Claude） |
 
-完整 provider 类型与 preset 覆盖见 [`docs/provider-coverage.md`](docs/provider-coverage.md)；运行时矩阵可通过 `GET /api/provider-matrix` 获取。
+完整 provider 类型与 preset 覆盖见 [`docs/provider/coverage.md`](docs/provider/coverage.md)；运行时矩阵可通过 `GET /api/provider-matrix` 获取。
 
 ## 快速开始
 
-开发启动：
-
 ```bash
 cargo run -- --host 0.0.0.0 --port 15721
+# 打开 http://127.0.0.1:15721 完成 setup
 ```
 
-显式 `serve` 子命令与无子命令启动兼容：
+完整初始化方式（Web / API / CLI）、远程 OpenAI CLI OAuth、常用命令与本地验证步骤见 [`docs/guide/getting-started.md`](docs/guide/getting-started.md)。
 
-```bash
-cargo run -- serve --host 0.0.0.0 --port 15721
-```
-
-首次启动后打开：
-
-```text
-http://127.0.0.1:15721
-```
-
-或直接调用 setup API（无需鉴权）：
-
-```bash
-curl -fsS -X POST http://127.0.0.1:15721/api/setup/bootstrap \
-  -H 'content-type: application/json' \
-  -d '{"password":"password123","ownerEmail":"owner@example.com","routerUrl":"https://sgptokenswitch.cc","clientTunnelSubdomain":""}'
-```
-
-`clientTunnelSubdomain` 留空时，server 会生成可读的随机单词子域名并尽量在 Router 上验证可用性。响应中的 `sessionToken` 可直接作为 Bearer token 使用。
-
-### 远程 OpenAI CLI OAuth
-
-通过非本机 Client URL 管理 Server 时，OpenAI 仍只接受官方 `http://localhost:1455/auth/callback`，Server 不替换或伪造 redirect URI。Web 管理面在 HTTPS 下提供安全的手工回传流程：
-
-1. 在 Codex OAuth 账号区选择 CLI OAuth 并打开授权链接。
-2. 浏览器授权后会跳转到本机 `localhost:1455`；页面不可达是远程部署下的预期现象。
-3. 从地址栏提交完整的 `http://localhost:1455/auth/callback?code=...&state=...` URL，Server 校验固定 scheme/host/port/path、state、当前管理员主体和会话期限后交换 token。
-
-只有 Server 实际绑定 loopback 地址、请求未经过 forwarded host 且 `Host` 也是 loopback 时才允许本机例外；监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，伪造 loopback `Host` 不会降级安全要求。非 loopback Client URL 必须是 Server 配置中的 HTTPS Client URL，并由同源 Web 页面发起；只接受完整 callback URL，不接受裸 code。Device OAuth 保持可用。存在一条 Codex 凭据时该账号自动成为账号中心操作目标；存在多条凭据时可在 Web 管理面显式选择，`needs_selection` 只阻断依赖该偏好的账号中心操作，不影响已明确绑定账号的 Share 数据面。`GET /api/accounts` 等控制面响应只返回凭据存在性和运行状态，不返回或导出 access/refresh/id token、API key、extra headers、profile 或 raw 上游载荷。
-
-或使用 CLI 在启动 HTTP 前写本地配置：
-
-```bash
-cc-switch-server init \
-  --owner-email owner@example.com \
-  --router-url https://sgptokenswitch.cc \
-  --password password123
-```
-
-官方脚本：
-
-```bash
-scripts/bootstrap/server-init-http.sh
-scripts/bootstrap/server-init-local.sh
-```
-
-查看 binary 构建信息：
-
-```bash
-cargo run -- version
-cargo run -- version --json
-```
-
-## 常用命令
-
-配置和诊断命令只读取本地配置与 JSON store，不启动 HTTP、router 注册、tunnel 或后台监听器：
-
-```bash
-cargo run -- config path
-cargo run -- config print
-cargo run -- config validate
-cargo run -- doctor
-cargo run -- doctor --check-port
-```
-
-`config print` 输出脱敏 JSON 摘要，不打印 password/API token hash、router private key/control secret 或 provider/account token。
-
-## 本地验证
-
-提交前建议执行：
+提交前的最小验证：
 
 ```bash
 cargo fmt -- --check
@@ -188,203 +107,52 @@ cargo test
 scripts/static-checks.sh
 ```
 
-允许编译和启动本地 server 时执行完整本地验收：
-
-```bash
-node scripts/audit/audit-provider-coverage.mjs --check
-node scripts/audit/audit-ui-provider-matrix.mjs --check
-scripts/audit/validate-local.sh
-scripts/smoke/smoke-local.sh
-RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
-```
-
-`RUN_TESTS=0` 仅用于负向审计：脚本会记录 `local-contracts-unverified`，输出 `decision=blocked` 并以状态码 `1` 退出；不得将其作为本地合同或发布验收通过证据。
-
-升级任务向 Router 回报状态时，`/metrics` 暴露以下低基数指标，用于发现 Client 已完成升级但 Router 状态未收敛的问题：
-
-- `cc_switch_router_upgrade_task_reports_total{outcome="success|failure"}`：升级任务回执尝试次数。
-- `cc_switch_router_upgrade_task_report_last_success_timestamp_seconds`：最近一次成功回执的 Unix 时间戳；尚未成功回执前不会输出该时间序列。
-
-有真实 Router、Share grant、Client Market、provider 或 OAuth 端到端环境时，把变量写入私有 env 文件后运行：
-
-```bash
-set -a
-source /tmp/cc-switch-server-real.env
-set +a
-STRICT=1 scripts/smoke/real-acceptance-env-check.sh
-RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/router-share-smoke.sh
-RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
-RUN_REAL=1 scripts/release-readiness.sh
-```
-
-真实验收脚本只输出脱敏摘要；缺真实输入、skeleton 未退场或部署未测时不会标记为通过。
-
 ## 部署
-
-构建并安装 binary：
 
 ```bash
 cargo build --release
 sudo install -m 0755 target/release/cc-switch-server /usr/local/bin/cc-switch-server
 ```
 
-systemd unit 位于 `deploy/cc-switch-server.service`：
+systemd unit 位于 `deploy/cc-switch-server.service`，默认使用 `/var/lib/cc-switch-server` 作为配置目录。Docker、GitHub Actions 发布流程与生产注意事项见 [`docs/guide/deployment.md`](docs/guide/deployment.md)。
 
-```bash
-sudo install -m 0644 deploy/cc-switch-server.service /etc/systemd/system/cc-switch-server.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now cc-switch-server
-```
+## 配置
 
-默认 unit 使用 `/var/lib/cc-switch-server` 作为配置目录。生产环境应固定该目录并做备份，里面包含 provider、account token、share、tunnel、usage 和 router identity JSON。
-
-Docker：
-
-```bash
-docker build -t cc-switch-server .
-docker run --rm -p 15721:15721 -v cc-switch-server-data:/data/cc-switch-server cc-switch-server
-```
-
-GitHub Actions 中的 `Build and Release` workflow 会在 `main` 分支 push 后构建 Linux AMD64/ARM64 binary，并覆盖发布 `latest` release。
-
-## Router / Market 联调
-
-1. 启动 server，打开 `http://server-host:15721` 完成 setup。
-2. Router URL 填 router API base，例如 `https://router.example.com`。
-3. setup 会同步执行 `register -> owner bind -> client tunnel claim`；子域名冲突会在初始化阶段直接报错。Router 不可达时允许完成本地 setup，但健康状态会提示隧道未注册。子域名留空时 server 会自动生成唯一名称。
-4. 添加 provider 或 account 后创建 share；未填写 share subdomain 时，server 会自动生成。
-5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
-6. share descriptor 会在创建、修改、删除时自动同步，并在 client 启动或重新注册 router 后自动校准，无需人工全量同步。
-7. Router 内建 Share Market entitlement 会通过 pending share edit 下发；Server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
-8. router 可经 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime`、`/_share-router/model-health` 拉取 runtime。
-9. `/_ctl/apply_share_settings` 和 `/_ctl/refresh_share_usage` 使用 router `control_secret` HMAC、timestamp、nonce 防重放。
-10. Router Share URL 请求由已验签 ingress context 中的 Share 身份选择 binding。Server 只同步 Router Share/Gateway observation 所需的脱敏 request log；Router migration 21 已将可安全关联的旧 usage 最小化迁入 canonical Share log，并物理删除旧 Market 明细与 archive。
-
-联调验收重点：
-
-- router client 表中 0 share client 也应显示在线/健康。
-- router share 表能看到 server share 的 owner、subdomain、app runtime、provider 和 quota 展示字段。
-- signed Gateway/Share route 能调度 server share（真实 Gateway 输入缺失时标记 blocked）。
-- Router Share URL 能经 Router 调用 server Share，request log 不重复且保留 country/IP/source。
-- Router 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 Server Share。
-
-## 关键配置
-
-默认配置目录为 `~/.cc-switch-server`。常用参数和环境变量：
+默认配置目录为 `~/.cc-switch-server`，可用 `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR` 覆盖。常用参数：
 
 | 领域 | 配置 |
 | --- | --- |
 | 监听地址 | `--host` / `CC_SWITCH_SERVER_HOST`，默认 `127.0.0.1` |
 | 监听端口 | `--port` / `CC_SWITCH_SERVER_PORT`，默认 `15721` |
-| 配置目录 | `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR`，默认 `~/.cc-switch-server` |
-| 静态 Web | 默认使用构建时内嵌到 binary 的 Web UI；`--web-dist-dir` / `CC_SWITCH_SERVER_WEB_DIST_DIR` 仅用于开发或调试时覆盖静态目录 |
+| 配置目录 | `--config-dir` / `CC_SWITCH_SERVER_CONFIG_DIR` |
 | 日志级别 | `--log-level` / `CC_SWITCH_SERVER_LOG`，默认 `info` |
-| 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时记录请求生命周期、Provider 选择、重试/切换和终态等脱敏结构化 INFO 审计事件，并通过 installation 身份签名批量上传到当前 Router；不上传请求/响应正文、凭据、邮箱或任意 tracing 文本 |
-| 持久日志 | `<config-dir>/log/cc-switch-server.log` 跨进程保留供本机诊断；单文件达到 8 MiB 后轮转，并在同目录保留最近 2 个备份，不按日志时间清理 |
-| 审计日志缓冲 | `<config-dir>/log/audit-events.jsonl` 是 Router 上传前的本地 spool；单文件达到 16 MiB 后轮转并保留最近 7 个备份，上传端按 cursor 增量读取且 batch 不跨 boot stream，cursor 通过私有临时文件写入、`fsync`、原子替换和父目录同步持久化；Router 不可用时按上限留存并指数退避重试；spool writer 遇到临时文件错误会保留待写事件并自动退避恢复，队列或 writer 不可用时新的推理请求保持 fail-closed，已接纳请求的 terminal 事件即使采集开关随后关闭或 writer 暂时降级仍会排队等待恢复，恢复后补记脱敏状态事件；规范化 Router API 地址或 installation 任一变化，以及 cursor 缺失或损坏时，都会先隔离既有 backlog，避免日志跨 Client 或跨 Router 泄露 |
-| Router 心跳 | `CC_SWITCH_SERVER_ROUTER_HEARTBEAT_INTERVAL_SECS`，默认 `60` 秒，实际发送间隔带 ±10% jitter（允许范围 `15`-`60` 秒） |
-| OAuth client | Gemini 浏览器登录需要 `CC_SWITCH_SERVER_GEMINI_CLIENT_ID` / `CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET`；Antigravity/Agy 浏览器登录需要 `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID` / `CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET` |
-| Managed OAuth 并发 | 每账号默认最多 8 个 in-flight 请求；provider 可设置 `ACCOUNT_MAX_CONCURRENT` / `MAX_CONCURRENT_REQUESTS`，全局可用 `CC_SWITCH_ACCOUNT_MAX_CONCURRENT` 覆盖，设为 `0` 关闭 |
-| Streaming 超时 | Provider 默认首业务事件超时 120 秒、后续事件空闲超时 300 秒；`STREAM_FIRST_BYTE_TIMEOUT_MS` / `UPSTREAM_STREAM_FIRST_BYTE_TIMEOUT_MS` 和 `STREAM_IDLE_TIMEOUT_MS` / `UPSTREAM_STREAM_IDLE_TIMEOUT_MS` 可覆盖，设为 `0` 关闭对应超时 |
-| 请求体上限 | Router ingress 请求的生效上限是 `min(本地上限, Router 声明上限)`；Router 通过不参与签名的 `x-cc-switch-ingress-body-limit`（十进制字节）声明本次档位，伪造只能压低不能抬高。本地三档由 `server.json` 的 `requestBodyLimits.{defaultMb,mediaMb,imageMb}` 或 `CC_SWITCH_REQUEST_BODY_LIMIT_MB` / `CC_SWITCH_MEDIA_REQUEST_BODY_LIMIT_MB` / `CC_SWITCH_IMAGE_REQUEST_BODY_LIMIT_MB` 配置（普通档 1-64 MB，视频/图片档 1-256 MB 且不低于普通档），默认取上限 64/256/256 MB，即默认由 Router settings 决定实际天花板；改动需重启进程。旧版 Router 不发送该头时回退到历史值（普通 2 MiB / 视频 32 MiB / 图片 48 MiB）。请求体整体驻留内存，收紧本地上限即可为本机内存兜底 |
-| 图片内容层上限 | 请求体档位之外，图片内容另有独立的语义上限，且**返回 400 而非 413**：multipart `/v1/images/edits` 每张 20 MiB、合计 32 MiB、最多 16 张（`src/proxy/remote_image.rs`）。因此 multipart 图片编辑的实际天花板恒为 32 MiB，把 Router / 本地图片档调到 32 MiB 以上不会放宽它。JSON / data-URL 形式的 `/v1/images/edits` 只校验 16 张上限。Claude / Cursor 通道内联远程图片 URL 时单张上限 1 MiB |
-| 媒体响应上限 | 响应侧上限独立于请求体档位且不可配：Grok 媒体响应 64 MiB（超限 502）、Codex Images 输出 48 MiB / 上游 72 MiB / 8294400 像素。视频结果偏大时先撞的是这一条，不是请求体上限 |
-| Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
-| Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
-| Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
-| Codex Images | capability URL 固定使用 Router 签名 context 中的 Share host；短期图片默认保存到 `<config-dir>/image-capabilities`，仅多副本共享时用 `CC_SWITCH_IMAGE_STORE_DIR` 覆盖，底层文件系统必须支持跨进程锁和 atomic rename |
-| OAuth 重登隔离 | 连续 20 次 `invalid_grant` 后账号自动标记为需重登并退出其固定 Provider 内的账号调度；`CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 可调整阈值 |
-| Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
-| 真实验收 | `ROUTER_BASE_URL`、`ROUTER_API_TOKEN`、`SHARE_ID`、`CC_SWITCH_SHARE_URL` 及各真实 Provider token |
-| stream 验收 | `STREAM_PROBE`、`REQUIRE_STREAM_USAGE` |
-| release readiness | `RUN_REAL`、`RUN_DEPLOYMENT_TESTS` |
 
-主要本地 store：
+**全部**配置项、环境变量和 Provider 存储格式迁移见 [`docs/guide/configuration.md`](docs/guide/configuration.md)；数据文件布局与加密方式见 [`docs/architecture/storage.md`](docs/architecture/storage.md)。
 
-- `server.json`：owner、password hash、router、client tunnel subdomain、installation identity 和 `requestBodyLimits` 本地请求体上限。
-- `providers.json`：Provider Bundle 及其 Claude / Codex / Gemini Surface 配置。
-- `accounts.json`：账号 token、profile、quota、raw snapshot；token 字段用 `accounts.key` 或 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY` 做 XChaCha20Poly1305 加密。
-- `accounts.key`：本机生成的根密钥；同时派生 Account token 与 S2 Provider credential 的独立密钥。备份/迁移时必须和 `accounts.json`、`providers.json` 一起保留。
-- `shares.json` / `tunnels.json`：Share、binding、ACL、Router 管理的 Share Market entitlement 和 tunnel runtime。
-- `usage/`：`manifest.json` 描述 schema 1 存储合同，`requests.json` 保留最近 32 天请求明细，`events/YYYY-MM-DD.jsonl` 是待压缩 journal，`rollups.json` 保留 Share 用户配额所需的长期聚合。Server 不读取或迁移旧版根目录 Usage 文件。
-- `image-capabilities/`：默认的短期图片 capability payload/metadata；URL 默认跨重启有效 1 小时，内容仍属于敏感生成结果。
-- `email-auth.json` 及运行时生成的日志/备份目录。
+数据目录中的文件可能包含 token、secret 或账号信息，**不能提交到 git**。
 
-这些文件可能包含 token、secret 或账号信息，不能提交到 git。
+## Router 联调
 
-跨环境迁移必须先停止旧、新实例，再完整复制实际配置目录；不能只复制部分 JSON。具体步骤和 OAuth 加密密钥要求见 [Server Data Directory Migration](docs/server-data-migration.md)。
-
-### Provider 存储格式
-
-全新数据目录在首次保存 Provider 时写入带格式 guard 的 S2 `providers.json`，静态 API Key、Bearer、AWS secret 和受控自定义 header 值以 XChaCha20-Poly1305 credential slot 保存。已有 S1 安装会继续读取 S1，普通启动不会改写文件；管理员必须停服后显式切换：
-
-```bash
-# 可在服务运行时只读预检
-cc-switch-server config migrate-provider-store
-
-# 以下写操作必须先停止 cc-switch-server
-cc-switch-server config migrate-provider-store --apply
-cc-switch-server config migrate-provider-store --rollback
-cc-switch-server config migrate-provider-store --cleanup-snapshot
-```
-
-`--apply` 只有在身份/凭据分类及 S1/S2 RuntimePlan parity 全部通过时才会创建 S1 快照并切换；`--rollback` 恢复该快照；快照只通过显式 `--cleanup-snapshot` 删除。服务持有数据目录锁时，三个写操作均会失败。
-
-如果配置了 `CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY`，恢复和迁移时必须提供完全相同的 32 字节 base64 根密钥；否则必须保留匹配的 `accounts.key`。S2 能防止单独泄露 `providers.json` 或不含密钥的 Provider 快照，但完整数据目录、环境根密钥或 Server OS 用户权限一并泄露时仍可解密，不能把它视为硬件密钥边界。
+setup 时填入 Router API base 即可完成 `register → owner bind → client tunnel claim`。完整联调步骤、验收重点、相关 API 与排障见 [`docs/guide/router-integration.md`](docs/guide/router-integration.md)。
 
 ## API 入口
 
-常用健康和管理入口：
-
-- `GET /health`
-- `GET /metrics`
-- `GET /version`
-- `GET /api/setup/status`
-- `POST /api/setup/validate`
-- `POST /api/setup/bootstrap`
-- `POST /api/setup`
-- `POST /api/auth/login`
-- `GET /api/provider-coverage`
-- `GET /api/provider-matrix`
-- `GET /web-api/events`
-- `GET /api/backup`
-- `GET /api/providers`
-- `GET /api/accounts`
-- `GET /api/shares`
-- `GET /api/router/tunnels`
-- `GET /web-api/usage/overview`
-- `GET /web-api/usage/trends`
-- `GET /web-api/usage/facets`
-- `GET /web-api/usage/provider-bundles`
-- `GET /web-api/usage/models`
-- `GET /web-api/usage/shares`
-- `GET /web-api/usage/requests`
-- `GET /web-api/usage/requests/:id`
+常用健康与管理入口：`GET /health`、`GET /ready`、`GET /metrics`、`GET /version`、`GET /api/setup/status`、`POST /api/setup/bootstrap`、`POST /api/auth/login`、`GET /api/providers`、`GET /api/accounts`、`GET /api/shares`、`GET /api/router/tunnels`、`GET /api/backup`、`GET /web-api/events`、`GET /web-api/usage/*`。
 
 Usage 查询使用 `[fromMs, toMs)`，明细范围最多 32 天；趋势接口单次最多返回 2,000 个时间桶。
 
-Router Share URL 下的反代入口：
+Router Share URL 下的反代入口：`POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1beta/*`。
 
-- `POST /v1/messages`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1beta/*`
-
-完整接口以 `src/api/mod.rs` 的 router 定义为准。
+完整接口以 `src/api/mod.rs` 的 `app_router()` 定义为准。
 
 ## 文档
 
-- [外部 Provider 审计台账](UPSTREAM_IMPORT.md)
-- [历史三方系统审计（已废止）](docs/system-audit-and-normalization-plan.md)
-- [Client + Router：旧 Token Market 解耦与剔除实施计划](docs/token-market-decoupling-plan.md)
-- [Client + Router：旧 Token Market 解耦整体 Review](docs/token-market-decoupling-review.md)
-- [独立 Market 候选实现历史评估（非当前前置）](docs/market-replacement-sub2api-plan.md)
-- [UI 人工验收清单](docs/manual-ui-checklist.md)
-- [部署](docs/deployment.md)
-- [真实验收 runbook](docs/real-acceptance-runbook.md)
-- [Kimi Code 单账号反代](docs/kimi-code-single-account.md)
-- [Grok OAuth 单账号反代](docs/grok-oauth-single-account.md)
-- [Cursor AgentService 验收](docs/cursor-agentservice-acceptance.md)
-- [Codex OAuth 单账号反代](docs/codex-oauth-single-account.md)
-- [provider 覆盖](docs/provider-coverage.md)
-- [usage token accounting](docs/usage-token-accounting.md)
+全部文档的索引、权威性标记与状态见 **[`docs/README.md`](docs/README.md)**。
+
+常用入口：
+
+- [架构总览](docs/architecture/overview.md) · [Router 契约](docs/architecture/router-contract.md) · [存储](docs/architecture/storage.md)
+- [快速开始](docs/guide/getting-started.md) · [配置参考](docs/guide/configuration.md) · [部署](docs/guide/deployment.md)
+- [Provider 覆盖](docs/provider/coverage.md) · [回归矩阵](docs/provider/regression-matrix.md)
+- [Share 访问策略](docs/share/access-policy.md)
+- [外部 Provider 审计台账](UPSTREAM_IMPORT.md) · [开发约定](AGENTS.md)

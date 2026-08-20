@@ -224,7 +224,7 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 - 自动 Reset 的同一候选在并发请求、进程重启锁竞争和 401 重试下只使用同一幂等 ID，其他账号上游请求数为零。
 - SSE/WS 续传只保留 tool call/call output，failed/incomplete 不写入，缺签名 principal 时始终 cache miss。
 
-真实 OAuth、订阅权限、图片能力和长连接生产可用性仍需要按 [`real-acceptance-runbook.md`](real-acceptance-runbook.md) 使用专用测试账号取证；离线测试不能替代真实上游验收。
+真实 OAuth、订阅权限、图片能力和长连接生产可用性仍需要按 [`real-acceptance-runbook.md`](../acceptance/real-acceptance-runbook.md) 使用专用测试账号取证；离线测试不能替代真实上游验收。
 
 ## 非目标
 

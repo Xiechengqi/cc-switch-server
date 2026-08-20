@@ -102,7 +102,7 @@ fi
 
 echo "== secret audit =="
 secret_audit_files=(
-  docs/code-agent-regression-matrix.json
+  docs/provider/regression-matrix.json
   assets/contract/provider-fixtures/structures.json
 )
 while IFS= read -r file; do

@@ -1,6 +1,17 @@
 # 代码审计缺口修复计划（Phase X）
 
-> **Historical notice**：本文记录早期 Phase X 审计与实施状态，不能作为当前目录结构、行号、测试数量或完成状态的权威依据。当前三方现状、风险优先级和后续路线图见 [`docs/system-audit-and-normalization-plan.md`](system-audit-and-normalization-plan.md)。
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/code-audit-gap-plan.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、根目录 `AGENTS.md` |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+
+> **Historical notice**：本文记录早期 Phase X 审计与实施状态，不能作为当前目录结构、行号、测试数量或完成状态的权威依据。当前三方现状、风险优先级和后续路线图见 [`docs/history/system-audit-and-normalization-plan.md`](system-audit-and-normalization-plan.md)。
 
 > **来源**：2026-07-06 对外部 Provider/协议证据、Server（本仓库 @ `6fce8e4`）和 Router（`cc-switch-router`）的交叉审计。审计**不采信任何既有规划文档的状态标记**，全部结论来自协议证据与实测（`cargo test` 595 passed / typecheck / Router 契约逐条核对）。
 > **定位约束**：Server 是独立 token 反代服务端；客户端专属功能（Skill/MCP/OpenClaw/Hermes/OMO/prompts/sessions/deeplink 等）维持排除，本计划不涉及。
@@ -25,7 +36,7 @@
 | 任务 | 状态 | 依据 |
 | --- | --- | --- |
 | X1 typecheck 修复 | **已完成** | 提交 `18cbca5`；typecheck exit 0 复核通过 |
-| Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/architecture-refactor-plan.md` 第七节 |
+| Phase R 结构重构 | **已完成并关闭** | R1–R7 全部实施，提交 `65721b8`；关闭登记见 `docs/history/architecture-refactor-plan.md` 第七节 |
 | X2 Ollama clamp 协议修复 | **已完成** | `src/proxy/adapters.rs` 针对 Ollama 目标传入 `ReasoningEffortMode::Ollama`；fixture 覆盖 `xhigh→max`、显式关闭→`none`、非 Ollama 透传；`UPSTREAM_IMPORT.md` 已登记 `d7d33e51` |
 | X4–X11 | **本地可实施项已完成** | X4/X5/X6/X7/X9/X10/X11 静态实现与 R4 写路径收敛均已落地；X8 第二批 CSS 过渡层削减（5817→1917 行，门禁 2000 行 + 35 个零引用 class 上限）；`api/types.rs` 按域拆分为 `api/types/{common,auth,backup,settings,providers,accounts,usage,shares,router,models}.rs`；capability native 升级、真实发信/OAuth/router 验收仍按外部环境 gate |
 
@@ -244,4 +255,4 @@ node scripts/audit/audit-server-product-boundary.mjs
 
 1. DeepSeek / Kiro / Copilot / Bedrock 真实账号 non-stream + stream + usage 验收
 2. Codex banked reset invite/consume live API
-3. Providers 页人工 UI 截图回归（见 `docs/manual-ui-checklist.md`）
+3. Providers 页人工 UI 截图回归（见 `docs/acceptance/manual-ui-checklist.md`）

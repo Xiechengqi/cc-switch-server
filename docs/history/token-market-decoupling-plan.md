@@ -1,5 +1,16 @@
 # Client + Router：旧 Token Market 解耦/剔除计划与实施记录
 
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/token-market-decoupling-plan.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、[`docs/share/access-policy.md`](../share/access-policy.md) |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+
 > 状态：**仓库内实施完成，生产部署与真实 E2E 待独立环境输入**。
 >
 > 版本：2026-08-18 / v2.1（含 Gateway inventory 隐私收口）。
@@ -94,7 +105,7 @@ accessByApp / access_by_app
 appSettings / app_settings
 ```
 
-Server REST/import/invoke 对 camelCase 与 snake_case 退休字段都 fail-closed。Router active model 不包含这些字段，未知字段不会被静默丢弃。完整访问规则见 [share-access-policy.md](share-access-policy.md)。
+Server REST/import/invoke 对 camelCase 与 snake_case 退休字段都 fail-closed。Router active model 不包含这些字段，未知字段不会被静默丢弃。完整访问规则见 [share-access-policy.md](../share/access-policy.md)。
 
 ### 3.3 Server 持久化退休
 

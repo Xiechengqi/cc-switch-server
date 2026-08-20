@@ -1,5 +1,16 @@
 # 历史：三方 Token 路由交易系统现状审计与系统规整计划
 
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/system-audit-and-normalization-plan.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、[`docs/share/access-policy.md`](../share/access-policy.md) |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+
 > **状态：已废止（historical / superseded），不得作为当前架构、实施计划或发布依据。**
 >
 > 审计日期：2026-08-18
@@ -8,7 +19,7 @@
 >
 > 本文仅保留旧三方架构审计的历史证据。文中关于独立 `cc-switch-market`、三方运行拓扑、Market 资金风险和对应路线图的“当前”表述均已失效，不得据此恢复旧 Token Market。
 >
-> 当前产品边界和实施记录以 [`docs/token-market-decoupling-plan.md`](token-market-decoupling-plan.md) 为准；Server 的现行开发约束以仓库根目录 `AGENTS.md` 为准。
+> 当前产品边界和实施记录以 [`docs/history/token-market-decoupling-plan.md`](token-market-decoupling-plan.md) 为准；Server 的现行开发约束以仓库根目录 `AGENTS.md` 为准。
 
 ## 1. 文档定位与阅读规则
 
@@ -246,7 +257,7 @@ Market 的关键资金状态是 `user_reserved → user_cash/provider payable/co
 | S-06 Web terminal 是主机级权限 | 高影响信任边界 /事实高 | `enable_web_terminal` 默认可开；`require_web_admin_session` 接受 Router delegated owner/admin；`CC_SWITCH_TERMINAL_PERMIT_WRITE` 默认 true | Router owner/admin 经 Client Web tunnel 可执行 Server 主机 shell，默认可写；Router 被接管等同 Server 运维面被接管 | 必须明确“Router admin 是否等同 Server admin”；决定 local-owner-only、生产默认关闭/只读、独立高权限角色和审计。未经决定不直接禁用或扩权 |
 | S-07 client subdomain adoption 跨文件非原子 | P2 /高 | `state.rs::commit_client_subdomain_adoption` 先写 `shares.json`、再写 `server.json`、最后更新内存 | 第二次写失败或进程崩溃会让 Share 子域名和 Server tunnel 配置分叉 | transaction marker + 启动恢复/对账；加故障注入测试 |
 | S-08 God Object/超大热路径 | P2 /高 | `state.rs`、`forwarder.rs`、`transforms.rs`、`adapters.rs` 行数和职责集中 | 任意小功能触碰全局状态/stream 语义；锁、测试和 review 半径过大；机械搬文件会放大回归 | 先冻结 contract/invariant，再按 capability、stream lifecycle、usage contract 拆分；保留 state façade 和既有依赖方向 |
-| S-09 文档与脚本漂移 | P1（发布流程）/高 | `docs/architecture-refactor-plan.md`、`docs/code-audit-gap-plan.md` 仍大量引用不存在的 `src/http.rs`、`src/core/*`；OAuth smoke 使用旧 test filter | 新贡献者会按旧路径改错代码；CI 可能在 0 tests 时假通过 | 本文作为 current roadmap；旧文档标记 historical；脚本对过滤器命中数为 0 直接失败，并增加 docs path/protocol drift audit |
+| S-09 文档与脚本漂移 | P1（发布流程）/高 | `docs/history/architecture-refactor-plan.md`、`docs/history/code-audit-gap-plan.md` 仍大量引用不存在的 `src/http.rs`、`src/core/*`；OAuth smoke 使用旧 test filter | 新贡献者会按旧路径改错代码；CI 可能在 0 tests 时假通过 | 本文作为 current roadmap；旧文档标记 historical；脚本对过滤器命中数为 0 直接失败，并增加 docs path/protocol drift audit |
 
 ### 6.2 Router–Server 协议问题
 
@@ -290,8 +301,8 @@ Market 的关键资金状态是 `user_reserved → user_cash/provider payable/co
 ### D0：历史提案（已由 Client + Router 路线取代）
 
 - 本文不再作为当前入口；仅保留旧三方审计证据。
-- 旧 Token Market 解耦专项以 `docs/token-market-decoupling-plan.md` 为当前权威执行计划；它覆盖旧 Market 的删除/保留/泛化矩阵、跨 Router Gateway 预留和 client+router-only 验收门禁。
-- `docs/architecture-refactor-plan.md`、`docs/code-audit-gap-plan.md` 保留历史证据，但在完成复核前不得把其中的“已完成”、旧行号和旧路径当作现状；后续应在文件顶部加 `historical` 标识和指向本文的链接。
+- 旧 Token Market 解耦专项以 `docs/history/token-market-decoupling-plan.md` 为当前权威执行计划；它覆盖旧 Market 的删除/保留/泛化矩阵、跨 Router Gateway 预留和 client+router-only 验收门禁。
+- `docs/history/architecture-refactor-plan.md`、`docs/history/code-audit-gap-plan.md` 保留历史证据，但在完成复核前不得把其中的“已完成”、旧行号和旧路径当作现状；后续应在文件顶部加 `historical` 标识和指向本文的链接。
 
 ### D1：先写契约，再动代码
 
@@ -302,11 +313,11 @@ Market 的关键资金状态是 `user_reserved → user_cash/provider payable/co
 3. Router `PROTOCOL.md` 与 Server 对应章节：以 v2 fixture 生成 ingress 字段、签名域、时间窗口、replay、header stripping、cutoff 和升级顺序。
 4. `docs/market-settlement-contract.md`：reserve/streaming/needs_review/settled/failed_released 状态机、usage state、ledger event、幂等键、risk_loss 和 webhook。
 5. `docs/storage-backup-recovery.md`：每个 store/object 的 owner、敏感级别、原子性、备份覆盖、恢复顺序、RPO/RTO。
-6. `docs/provider-coverage.md` 与 `UPSTREAM_IMPORT.md`：只记录五个权威 upstream 来源的 Provider 类型证据；外部仓库改动不作为同步实现源。
+6. `docs/provider/coverage.md` 与 `UPSTREAM_IMPORT.md`：只记录五个权威 upstream 来源的 Provider 类型证据；外部仓库改动不作为同步实现源。
 
 ### D2：清理漂移与生成式门禁
 
-- 重新核对 `README.md`、`docs/deployment.md`、`docs/real-acceptance-runbook.md` 的监听地址、配置目录、backup 边界和默认值。
+- 重新核对 `README.md`、`docs/guide/deployment.md`、`docs/acceptance/real-acceptance-runbook.md` 的监听地址、配置目录、backup 边界和默认值。
 - 给历史计划中的旧路径加 `historical/current` 标签；删除或改写会误导实施者的旧行号、旧测试数量和旧模块名。
 - 修复 `scripts/smoke/oauth-readiness-check.sh` 的测试过滤器；对 `cargo test` 过滤器命中 0 项直接失败。
 - 增加 docs drift audit：检查 `src/http.rs`、`src/core/` 等不存在路径，检查 Router 协议常量和文档签名域，检查配置代码/向导/`.env.example` 默认值一致性。

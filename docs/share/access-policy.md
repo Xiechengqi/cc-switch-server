@@ -96,7 +96,7 @@ Share Market 自身的免费/付费 listing、seat、subscription、grant/revoke
 - 人工 ShareTo 只通过“添加授权用户”创建，并在同一处配置个人配额；
 - Share 卡片显示“私有 / 公开免费”，授权摘要只从活动 `userGrants` 派生；
 - Router Share Market grant 显示来源标记且只读。
-- 用户周期用量的官方额度重置场景、`userUsageEdits` 保存协议和重基线公式见 [`share-user-usage-rebase.md`](share-user-usage-rebase.md)。
+- 用户周期用量的官方额度重置场景、`userUsageEdits` 保存协议和重基线公式见 [`share-user-usage-rebase.md`](user-usage-rebase.md)。
 
 ## 7. 回滚与验收
 

@@ -1,15 +1,21 @@
 # Transform/Streaming Coverage Tracker
 
-Date: 2026-07-19
-
-This tracker follows Phase X / X7. It records the Server-owned transform and streaming regression surface.
+> Status: **authoritative**. Last verified: 2026-08-20.
+>
+> This tracker records the Server-owned transform and streaming regression surface. The numbers below
+> are a *floor*, not a snapshot — run the audit for live counts.
 
 ## Current Gate
 
 | Item | Value |
 | --- | --- |
-| Server minimum | 216 tests across the owned transform, streaming, adapter, and stream-transform modules |
+| Server minimum | 216 tests across the owned transform, streaming, adapter, and stream-transform modules (override with `CC_SWITCH_TRANSFORM_MIN_TESTS`) |
 | Gate | `node scripts/audit/audit-transform-coverage.mjs --check` from `scripts/static-checks.sh` |
+| Counted modules | `src/proxy/transforms.rs`, `src/proxy/streaming.rs`, `src/proxy/adapters.rs`, `src/proxy/stream_transforms.rs` |
+
+Observed on 2026-08-20 (`node scripts/audit/audit-transform-coverage.mjs`): 394 tests total —
+transforms 97, streaming 128, adapters 104, stream_transforms 65. Re-run the audit rather than
+trusting this line; it is a dated observation, not a contract.
 
 ## First Batch Covered
 

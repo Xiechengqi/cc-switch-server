@@ -1,5 +1,19 @@
 # Code Plan Enhancement Plan
 
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/code-plan-enhancement-plan.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、根目录 `AGENTS.md` |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
+>
+> **外部输入说明**：本文引用的 `/data/projects/proxy/proxy.md`、`proxy.html` 是**仓库外**的一次性评分输入，
+> 不随本仓库版本化，也不保证仍然存在或内容未变。缺失该文件不影响本归档件的历史价值，也不构成待办。
+
 This plan covers every `cc-switch-server` Code Plan score below 9 in
 `/data/projects/proxy/proxy.md`. External repositories are protocol evidence,
 not synchronization sources. Every implementation keeps one explicit Account
@@ -19,7 +33,7 @@ scope.
 - Treat checked-in fixtures and local tests as protocol evidence. Keep live
   acceptance pending until a real credential exercises the documented route.
 - Record every adopted external behavior in `UPSTREAM_IMPORT.md` and keep
-  `docs/provider-coverage.md` aligned with the runtime contract.
+  `docs/provider/coverage.md` aligned with the runtime contract.
 
 ## Scoring Queue and References
 
@@ -803,7 +817,7 @@ After all nine phases:
    shadow accounts, and cross-account failover in all new code.
 3. Run the full Rust and Web test suites, provider/UI audits, local smoke suite,
    offline release readiness, and every new fixture contract.
-4. Reconcile implementation evidence with `docs/provider-coverage.md`,
+4. Reconcile implementation evidence with `docs/provider/coverage.md`,
    `UPSTREAM_IMPORT.md`, and `/data/projects/proxy/proxy.md`/`proxy.html`.
 5. Change a score only where checked-in implementation and tests justify it;
    local fixtures never count as live acceptance.

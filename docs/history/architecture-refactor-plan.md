@@ -1,9 +1,20 @@
 # 架构优化重构计划（Phase R）
 
-> **Historical notice**：本文记录早期 Phase R 的实施过程和历史路径，不能作为当前目录结构、行号、测试数量或完成状态的权威依据。当前三方现状、风险优先级和后续路线图见 [`docs/system-audit-and-normalization-plan.md`](system-audit-and-normalization-plan.md)。
+> **归档文档 · 只读 · 不代表当前实现**
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 状态 | 历史记录（archived），仅作过程与决策证据保留 |
+> | 归档日期 | 2026-08-20 |
+> | 原路径 | `docs/architecture-refactor-plan.md` |
+> | 当前权威 | [`docs/architecture/overview.md`](../architecture/overview.md)、根目录 `AGENTS.md` |
+>
+> 不得据此判断当前目录结构、行号、测试数量、能力状态或产品边界。文档索引见 [`docs/README.md`](../README.md)。
 
-> **来源**：2026-07-06 技术架构评审（基于同日三方代码交叉审计，见 `docs/code-audit-gap-plan.md` 摘要表；本文档所有行数/引用数均为当日 HEAD `6fce8e4` 实测值）。
-> **性质**：纯结构重构——**不改变任何运行时行为、不新增功能、不修 bug**。任何与功能相关的改动一律走 `docs/code-audit-gap-plan.md`（Phase X）。
+> **Historical notice**：本文记录早期 Phase R 的实施过程和历史路径，不能作为当前目录结构、行号、测试数量或完成状态的权威依据。当前三方现状、风险优先级和后续路线图见 [`docs/history/system-audit-and-normalization-plan.md`](system-audit-and-normalization-plan.md)。
+
+> **来源**：2026-07-06 技术架构评审（基于同日三方代码交叉审计，见 `docs/history/code-audit-gap-plan.md` 摘要表；本文档所有行数/引用数均为当日 HEAD `6fce8e4` 实测值）。
+> **性质**：纯结构重构——**不改变任何运行时行为、不新增功能、不修 bug**。任何与功能相关的改动一律走 `docs/history/code-audit-gap-plan.md`（Phase X）。
 > **执行者提示**：本文档面向可以直接开工的实施者（人或 code agent）。每个任务给出前置条件、精确操作、验收命令与提交规范；`cargo check` 的编译错误是重构过程中的**导航工具**而非事故，按提示逐个修复即可。
 > **后记（2026-07-22）**：Server 已删除模型成本计算、pricing store 和 provider 成本配置。下文相关名称仅记录 2026-07-06 的历史结构与迁移过程，不代表当前能力。
 
@@ -116,7 +127,7 @@ tests/                     # R3 后可选：HTTP 契约级集成测试
 > 1. 每个 R 任务独立成组提交，**禁止与任何功能改动混在同一提交**；提交信息格式 `refactor(structure): R<n> <内容>`。
 > 2. 每步完成必须通过第六节验证基线**全部命令**后才允许开始下一步。
 > 3. 移动文件用 `git mv` 保持历史。
-> 4. 除本文档明确列出的重命名/移动外，**不修改任何函数体逻辑**；发现 bug 记录到 `docs/code-audit-gap-plan.md`，不顺手修。
+> 4. 除本文档明确列出的重命名/移动外，**不修改任何函数体逻辑**；发现 bug 记录到 `docs/history/code-audit-gap-plan.md`，不顺手修。
 > 5. `cargo check --all-targets` 直接取退出码，禁止管道吞码（`cargo check | tail` 会掩盖非零退出）。
 
 ### R1 lib/bin 拆分 + 依赖方向门禁
@@ -376,7 +387,7 @@ fi
 
 ---
 
-## 四、与 Phase X（`docs/code-audit-gap-plan.md`）的时序咬合
+## 四、与 Phase X（`docs/history/code-audit-gap-plan.md`）的时序咬合
 
 ```
 X1 → X3 → X2（P0 门禁修复，先行）
@@ -425,7 +436,7 @@ node scripts/audit/audit-server-product-boundary.mjs
 | R6 workspace 化 | 挂起，三个触发条件（增量编译变慢 / 第二交付物 / 多人并行）均未满足；R2/R3 目录边界即未来 crate 边界 |
 | R8 proxy 体积拆分 | 挂起，见 R8 节；X6/Y 增长期继续往 `adapters.rs`/`transforms.rs`/`kiro.rs` 写入，触发前不拆 |
 
-后续工作回到功能主线 `docs/code-audit-gap-plan.md`：P0 已清零；X4/X5/X6 第一/二/三批/X7/X8 第一批/X9/X10/X11 已静态落地，R4 存储写路径收敛已完成。剩余本地可实施项以 X8 后续 CSS 收口和 `api/types.rs` DTO 就近化为主，真实发信/OAuth/router/market 验收仍按外部环境 gate 推进。
+后续工作回到功能主线 `docs/history/code-audit-gap-plan.md`：P0 已清零；X4/X5/X6 第一/二/三批/X7/X8 第一批/X9/X10/X11 已静态落地，R4 存储写路径收敛已完成。剩余本地可实施项以 X8 后续 CSS 收口和 `api/types.rs` DTO 就近化为主，真实发信/OAuth/router/market 验收仍按外部环境 gate 推进。
 
 ## 八、变更记录
 

@@ -23,7 +23,7 @@ for (const file of [
   'assets/contract/server-provider-legacy-inventory.json',
   'assets/contract/upstream-provider-source-baseline.json',
   'assets/contract/web-runtime-contract.json',
-  'docs/code-agent-regression-matrix.json',
+  'docs/provider/regression-matrix.json',
 ]) {
   JSON.parse(fs.readFileSync(file, 'utf8'));
 }
@@ -51,6 +51,9 @@ node scripts/audit/audit-ui-provider-matrix.mjs --check
 node scripts/audit/audit-server-product-boundary.mjs
 node scripts/audit/audit-web-i18n-literals.mjs
 node scripts/audit/audit-web-runtime-contract.mjs
+
+echo "== docs index =="
+node scripts/audit/audit-docs-index.mjs
 
 echo "== web dist size =="
 node scripts/audit/audit-web-dist-size.mjs

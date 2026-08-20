@@ -179,6 +179,10 @@ function toMarkdown(coverage) {
   const lines = [];
   lines.push("# Provider Coverage");
   lines.push("");
+  lines.push(
+    "> **自动生成文件 · 请勿手工编辑。** 由 `scripts/audit/audit-provider-coverage.mjs` 从 `assets/contract/provider-coverage.json` 生成；手工改动会被 `--check` 判为不同步。",
+  );
+  lines.push("");
   lines.push(`Generated from: \`${coverage.generatedFrom.baseline}\``);
   lines.push(
     `Server migration inventory: \`${coverage.generatedFrom.serverLegacyInventory}\``,
@@ -402,7 +406,7 @@ function serverEvidenceNotes() {
     "- Claude Kimi uses native `/coding/v1/messages?beta=true` and `/coding/v1/messages/count_tokens?beta=true`; Codex and Gemini bridge to `/coding/v1/chat/completions`; authoritative discovery uses `/coding/v1/models`. Every surface binds one explicit `kimi_code` Account and applies final Bearer plus `KimiCLI/1.37.0` and account-scoped `X-Msh-*` identity headers. Extra headers cannot override auth/device identity, and the first 401 may refresh and replay only that Account once.",
     "- Model discovery is single-flight and scoped by App, Provider revision/runtime, exact Account, auth identity generation, and token refresh generation. A successful empty catalog is authoritative; only reviewed wire models become aliases, while unknown/unreviewed models fail closed. Retryable failure can use bounded stale data only in the identical scope.",
     "- K3 effort normalizes to `low`/`high`/`max` with default `max`; thinking keeps all signed blocks. Replay is bounded and scoped by App, Provider revision/runtime, Account generation, Share, hashed signed user, session, and model family. CAS writes/deletes revalidate binding and generation; 400/422 deletes only an applied replay, and streaming commits at `message_stop` rather than waiting for EOF.",
-    "- Thirty offline Kimi contract tests pass across three App surfaces, discovery, reasoning/replay, same-account 401, and generation drift. Real device login, refresh, catalog, stream/tools/images, quota, error recovery, and entitlement acceptance remain external gates. See `docs/kimi-code-single-account.md`.",
+    "- Thirty offline Kimi contract tests pass across three App surfaces, discovery, reasoning/replay, same-account 401, and generation drift. Real device login, refresh, catalog, stream/tools/images, quota, error recovery, and entitlement acceptance remain external gates. See `docs/provider/kimi-code.md`.",
     "",
     "### `qoder_cosy` (Qoder COSY)",
     "",
@@ -498,7 +502,7 @@ coverage.fixtures = {
 };
 
 const jsonPath = path.join(repoRoot, "assets/contract/provider-coverage.json");
-const mdPath = path.join(repoRoot, "docs/provider-coverage.md");
+const mdPath = path.join(repoRoot, "docs/provider/coverage.md");
 const json = `${JSON.stringify(coverage, null, 2)}\n`;
 const markdown = toMarkdown(coverage);
 

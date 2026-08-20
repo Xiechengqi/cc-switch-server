@@ -279,7 +279,7 @@ Claude OAuth 专项补充：
 26. 20x 已有本地 `default_claude_max_20x` fixture 证据，但仍需真实账号确认当前 Anthropic 响应。5x 当前只有同形 `..._5x` 解析规则，没有 checked-in 真实 fixture；在 5x 账号和脱敏响应证据齐备前，release evidence 必须写 `blocked-inputs` 或 `SKIP`，不得写 live passed。
 27. 真实专项账号缺少任一个时，脚本会为对应等级输出独立 `[SKIP]`；只运行本地 resolver/API/UI 测试并将该等级标为未验收。不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。Share、5x、20x 三个 gate 的 SKIP/FAIL/PASS 必须分别记录，不能用其中一个 PASS 覆盖其他 gate 的缺失输入。
 
-Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-market-acceptance.md)。
+Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
 
 ## 脱敏 Evidence
 

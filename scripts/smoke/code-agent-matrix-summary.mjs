@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 
-const matrixPath = process.argv[2] || "docs/code-agent-regression-matrix.json";
+const matrixPath = process.argv[2] || "docs/provider/regression-matrix.json";
 const matrix = JSON.parse(fs.readFileSync(matrixPath, "utf8"));
 const fixtureEvidencePath =
   process.env.MATRIX_LIVE_EVIDENCE_FILE || process.argv[3] || "";
