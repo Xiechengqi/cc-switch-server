@@ -9,6 +9,12 @@
   <img alt="Storage" src="https://img.shields.io/badge/storage-JSON-0f766e?style=flat-square">
 </p>
 
+<p align="center">
+  官网 <a href="https://tokenswitch.org"><strong>tokenswitch.org</strong></a> ·
+  系统文档 <a href="https://docs.tokenswitch.org"><strong>docs.tokenswitch.org</strong></a> ·
+  Router <a href="https://github.com/Xiechengqi/cc-switch-router"><strong>cc-switch-router</strong></a>
+</p>
+
 `cc-switch-server` 是独立 server 产品，不是 `cc-switch` 的派生 UI 或整仓 fork。Server 的产品需求、API、运行时契约和 Web UI 均在本仓库独立设计与维护；外部项目只用于审计 Claude、Codex、Gemini Provider 类型和协议行为，不作为代码或界面同步源。
 
 当前仓库只维护 server 运行路径：HTTP API、静态 Web UI、本地 JSON store、反代转发、router/share tunnel 和真实验收脚本。不迁移 Tauri window/tray/updater/deeplink、Claude Desktop profile 写入、MCP、skills、session manager 和桌面安装资产。
