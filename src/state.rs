@@ -17225,8 +17225,10 @@ async fn apply_and_ack_share_edit(
         ack_retryable,
         current_config_revision,
         current_share,
+        applied_at_ms,
+        effective_policy,
     ) = match apply_result {
-        Ok(()) => {
+        Ok((applied_at_ms, effective_policy)) => {
             summary.applied += 1;
             let sync_result = sync_one_share_to_router(state, &edit.share_id).await;
             match sync_result {
@@ -17241,7 +17243,16 @@ async fn apply_and_ack_share_edit(
                     );
                 }
             }
-            ("applied".to_string(), None, None, None, None, None)
+            (
+                "applied".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                applied_at_ms,
+                effective_policy,
+            )
         }
         Err(error) => {
             summary.rejected += 1;
@@ -17290,6 +17301,8 @@ async fn apply_and_ack_share_edit(
                 retryable,
                 current_config_revision,
                 current_share,
+                None,
+                None,
             )
         }
     };
@@ -17302,10 +17315,33 @@ async fn apply_and_ack_share_edit(
         retryable: ack_retryable,
         current_config_revision,
         current_share,
+        applied_at_ms,
+        effective_policy,
     };
     let http_client = state.http_client().await;
     match client::ack_share_edit(&http_client, config, ack).await {
-        Ok(()) => summary.acked += 1,
+        Ok(()) => {
+            summary.acked += 1;
+            if let Some(operation_id) = edit
+                .patch
+                .managed_grant
+                .as_ref()
+                .map(|operation| operation.operation_id.clone())
+            {
+                if let Err(error) = state
+                    .mutate_shares_immediate(move |shares| {
+                        shares.forget_router_control_operation(&operation_id)
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        edit_id = %edit.id,
+                        error = %error,
+                        "persisting managed Share operation ACK cleanup failed"
+                    );
+                }
+            }
+        }
         Err(error) => {
             summary.ack_failed += 1;
             tracing::warn!(
@@ -17318,23 +17354,56 @@ async fn apply_and_ack_share_edit(
     }
 }
 
-async fn apply_share_edit_locally(state: &ServerState, edit: &ShareEditView) -> anyhow::Result<()> {
-    if edit.patch.managed_grant.is_some() {
+async fn apply_share_edit_locally(
+    state: &ServerState,
+    edit: &ShareEditView,
+) -> anyhow::Result<(
+    Option<i64>,
+    Option<crate::domain::sharing::router_contract::ShareUserPolicy>,
+)> {
+    let managed_grant = edit.patch.managed_grant.clone();
+    let share = if managed_grant.is_some() {
         state
             .apply_router_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())
-            .await??;
+            .await??
     } else {
         state
             .apply_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())
-            .await??;
-    }
+            .await??
+    };
     state
         .mutate_shares_immediate(|shares| {
             shares.router_registered = true;
             shares.last_router_error = None;
         })
         .await?;
-    Ok(())
+    let Some(operation) = managed_grant else {
+        return Ok((None, None));
+    };
+    if operation.action != crate::domain::sharing::router_contract::ShareManagedGrantAction::Upsert
+    {
+        return Ok((None, None));
+    }
+    if let Some((applied_at_ms, effective_policy)) = state
+        .shares
+        .read()
+        .await
+        .router_control_upsert_result(&operation.operation_id)
+    {
+        return Ok((Some(applied_at_ms), Some(effective_policy)));
+    }
+    let grant = share
+        .user_grants
+        .values()
+        .find(|grant| {
+            grant.active
+                && grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("applied managed grant is missing from the Share"))?;
+    let applied_at_ms = i64::try_from(grant.updated_at_ms).map_err(|_| {
+        anyhow::anyhow!("managed grant applied time is outside the supported range")
+    })?;
+    Ok((Some(applied_at_ms), Some(grant.policy.clone())))
 }
 
 async fn record_share_edit_sync_error(state: &ServerState, message: String) {

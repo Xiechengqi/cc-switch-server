@@ -27,6 +27,7 @@ const SHARES_FILE_NAME: &str = "shares.json";
 pub const DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 60;
 pub const MIN_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 10;
 pub const MAX_BANKED_RESET_EXPIRY_LEAD_MINUTES: u32 = 7 * 24 * 60;
+const MAX_MANAGED_GRANT_DURATION_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 fn default_banked_reset_expiry_lead_minutes() -> u32 {
     DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES
@@ -463,6 +464,14 @@ pub struct ShareStore {
 pub struct AppliedRouterControlOperation {
     applied_at_ms: u128,
     fingerprint: String,
+    #[serde(default)]
+    share_id: String,
+    #[serde(default)]
+    share_sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_applied_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_effective_policy: Option<ShareUserPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1523,9 +1532,10 @@ impl ShareStore {
                     concurrency: None,
                 });
             }
-            if grant.policy.token_limit.is_some_and(|limit| {
-                effective_grant_tokens_for_policy(grant, now_ms) >= limit
-            })
+            if grant
+                .policy
+                .token_limit
+                .is_some_and(|limit| effective_grant_tokens_for_policy(grant, now_ms) >= limit)
             {
                 return Err(ShareInvocationRejection {
                     reason: ShareRejectReason::UserExhausted,
@@ -2253,32 +2263,75 @@ impl ShareStore {
         if let Some(operation) = managed_grant.as_ref() {
             apply_managed_grant_operation(&mut share, operation)?;
         }
+        let managed_grant_result = managed_grant
+            .as_ref()
+            .and_then(|operation| {
+                (operation.action == ShareManagedGrantAction::Upsert).then(|| {
+                    share
+                        .user_grants
+                        .values()
+                        .find(|grant| {
+                            grant.active
+                                && grant.entitlement_id.as_deref()
+                                    == Some(operation.entitlement_id.as_str())
+                        })
+                        .map(|grant| {
+                            (
+                                i64::try_from(grant.updated_at_ms).unwrap_or(i64::MAX),
+                                grant.policy.clone(),
+                            )
+                        })
+                })
+            })
+            .flatten();
         crate::domain::sharing::invariants::validate_share_import(&share)?;
         mark_share_config_pending(&mut share);
         self.shares[index] = share.clone();
         if let Some(operation) = managed_grant {
+            // Router serializes managed operations per Share. Seeing a newer
+            // shareSequence proves every older operation for this Share was
+            // resolved, so retain only the replay window that can still be
+            // requested. Legacy records without share metadata stay intact.
+            self.applied_router_control_operations.retain(|_, applied| {
+                applied.share_id.is_empty()
+                    || applied.share_id != share_id
+                    || applied.share_sequence >= operation.share_sequence
+            });
             self.applied_router_control_operations.insert(
                 operation.operation_id,
                 AppliedRouterControlOperation {
                     applied_at_ms: now_ms(),
                     fingerprint: managed_grant_fingerprint
                         .expect("managed operation fingerprint is populated after validation"),
+                    share_id: share_id.to_string(),
+                    share_sequence: operation.share_sequence,
+                    result_applied_at_ms: managed_grant_result
+                        .as_ref()
+                        .map(|(applied_at_ms, _)| *applied_at_ms),
+                    result_effective_policy: managed_grant_result
+                        .map(|(_, effective_policy)| effective_policy),
                 },
             );
-            while self.applied_router_control_operations.len() > 2_048 {
-                let Some(oldest) = self
-                    .applied_router_control_operations
-                    .iter()
-                    .min_by_key(|(_, operation)| operation.applied_at_ms)
-                    .map(|(operation_id, _)| operation_id.clone())
-                else {
-                    break;
-                };
-                self.applied_router_control_operations.remove(&oldest);
-            }
         }
 
         Ok(share)
+    }
+
+    pub(crate) fn router_control_upsert_result(
+        &self,
+        operation_id: &str,
+    ) -> Option<(i64, ShareUserPolicy)> {
+        let operation = self.applied_router_control_operations.get(operation_id)?;
+        Some((
+            operation.result_applied_at_ms?,
+            operation.result_effective_policy.clone()?,
+        ))
+    }
+
+    pub(crate) fn forget_router_control_operation(&mut self, operation_id: &str) -> bool {
+        self.applied_router_control_operations
+            .remove(operation_id)
+            .is_some()
     }
 
     pub fn apply_settings_patch_with_usage(
@@ -3540,13 +3593,33 @@ fn validate_managed_grant_operation(
         ));
     }
     match operation.action {
-        ShareManagedGrantAction::Upsert if operation.policy.is_none() => Err(
-            SharePatchError::Invalid("managed grant upsert requires policy".to_string()),
-        ),
-        ShareManagedGrantAction::Revoke if operation.policy.is_some() => Err(
-            SharePatchError::Invalid("managed grant revoke must not include policy".to_string()),
-        ),
-        _ => Ok(()),
+        ShareManagedGrantAction::Upsert => {
+            let policy = operation.policy.as_ref().ok_or_else(|| {
+                SharePatchError::Invalid("managed grant upsert requires policy".to_string())
+            })?;
+            if let Some(duration_seconds) = operation.duration_seconds {
+                if !(1..=MAX_MANAGED_GRANT_DURATION_SECONDS).contains(&duration_seconds) {
+                    return Err(SharePatchError::Invalid(format!(
+                        "managed grant durationSeconds must be between 1 and {MAX_MANAGED_GRANT_DURATION_SECONDS}"
+                    )));
+                }
+                if policy.expires_at.is_some() || policy.token_period_anchor_at_ms.is_some() {
+                    return Err(SharePatchError::Invalid(
+                        "relative managed grants must not provide an absolute expiry or token-period anchor"
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        ShareManagedGrantAction::Revoke => {
+            if operation.policy.is_some() || operation.duration_seconds.is_some() {
+                return Err(SharePatchError::Invalid(
+                    "managed grant revoke must not include policy or durationSeconds".to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3567,7 +3640,7 @@ fn apply_managed_grant_operation(
 
     match operation.action {
         ShareManagedGrantAction::Upsert => {
-            let policy = operation.policy.clone().ok_or_else(|| {
+            let mut policy = operation.policy.clone().ok_or_else(|| {
                 SharePatchError::Invalid("managed grant upsert requires policy".to_string())
             })?;
             if policy.parallel_limit == Some(0) || policy.token_limit == Some(0) {
@@ -3575,7 +3648,31 @@ fn apply_managed_grant_operation(
                     "user limits must be positive or unlimited".to_string(),
                 ));
             }
-            validate_user_policy(&policy, now_ms() as i64).map_err(SharePatchError::Invalid)?;
+            let applied_at_ms = now_ms();
+            let now = i64::try_from(applied_at_ms).unwrap_or(i64::MAX);
+            if let Some(duration_seconds) = operation.duration_seconds {
+                let duration_ms = i64::try_from(duration_seconds)
+                    .ok()
+                    .and_then(|seconds| seconds.checked_mul(1_000))
+                    .ok_or_else(|| {
+                        SharePatchError::Invalid(
+                            "managed grant durationSeconds is too large".to_string(),
+                        )
+                    })?;
+                policy.expires_at = now
+                    .checked_add(duration_ms)
+                    .ok_or_else(|| {
+                        SharePatchError::Invalid(
+                            "managed grant absolute expiry is outside the supported range"
+                                .to_string(),
+                        )
+                    })?
+                    .into();
+            }
+            if policy.token_period.requires_anchor() && policy.token_period_anchor_at_ms.is_none() {
+                policy.token_period_anchor_at_ms = Some(now.div_euclid(60_000) * 60_000);
+            }
+            validate_user_policy(&policy, now).map_err(SharePatchError::Invalid)?;
             if share.user_grants.values().any(|grant| {
                 grant.active
                     && grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
@@ -3596,7 +3693,6 @@ fn apply_managed_grant_operation(
                 }
             }
 
-            let now = now_ms();
             let previous = share.user_grants.get(&email).cloned();
             share.user_grants.insert(
                 email.clone(),
@@ -3617,8 +3713,8 @@ fn apply_managed_grant_operation(
                         .as_ref()
                         .map(|grant| grant.created_at_ms)
                         .filter(|created_at| *created_at > 0)
-                        .unwrap_or(now),
-                    updated_at_ms: now,
+                        .unwrap_or(applied_at_ms),
+                    updated_at_ms: applied_at_ms,
                     revoked_at_ms: None,
                     revision: previous
                         .as_ref()
@@ -3835,6 +3931,7 @@ mod tests {
                 token_period_anchor_at_ms: None,
                 expires_at: None,
             }),
+            duration_seconds: None,
         }
     }
 
@@ -3933,6 +4030,177 @@ mod tests {
                 .policy
                 .token_limit,
             Some(10_000)
+        );
+    }
+
+    #[test]
+    fn managed_relative_term_starts_when_applied_and_replay_keeps_effective_policy() {
+        let mut store = ShareStore::default();
+        let original = store
+            .upsert(codex_share_input("managed-relative-term"))
+            .unwrap();
+        let mut operation = managed_operation(
+            "operation-relative-term",
+            "entitlement-relative-term",
+            original.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        let policy = operation.policy.as_mut().unwrap();
+        policy.token_period = ShareTokenPeriod::SevenDays;
+        operation.duration_seconds = Some(86_400);
+
+        let updated = store
+            .apply_settings_patch(
+                "managed-relative-term",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation.clone()),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        let applied = updated.user_grants.get("renter@example.com").unwrap();
+        let applied_at_ms = i64::try_from(applied.updated_at_ms).unwrap();
+        assert_eq!(applied.policy.expires_at, Some(applied_at_ms + 86_400_000));
+        assert_eq!(
+            applied.policy.token_period_anchor_at_ms,
+            Some(applied_at_ms.div_euclid(60_000) * 60_000)
+        );
+        let effective_policy = applied.policy.clone();
+        assert_eq!(
+            store.router_control_upsert_result("operation-relative-term"),
+            Some((applied_at_ms, effective_policy.clone()))
+        );
+
+        let persisted = serde_json::to_string(&store).unwrap();
+        let mut store: ShareStore = serde_json::from_str(&persisted).unwrap();
+        let replayed = store
+            .apply_settings_patch(
+                "managed-relative-term",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        let replayed = replayed.user_grants.get("renter@example.com").unwrap();
+        assert_eq!(
+            replayed.updated_at_ms,
+            u128::try_from(applied_at_ms).unwrap()
+        );
+        assert_eq!(replayed.policy, effective_policy);
+        assert_eq!(
+            store.router_control_upsert_result("operation-relative-term"),
+            Some((applied_at_ms, effective_policy))
+        );
+        assert!(store.forget_router_control_operation("operation-relative-term"));
+        assert!(store
+            .router_control_upsert_result("operation-relative-term")
+            .is_none());
+    }
+
+    #[test]
+    fn newer_share_sequence_retires_only_that_shares_replay_record() {
+        let mut store = ShareStore::default();
+        let first = store
+            .upsert(codex_share_input("managed-sequence-a"))
+            .unwrap();
+        let mut second_input = codex_share_input("managed-sequence-b");
+        second_input.provider_id = "managed-sequence-b-provider".to_string();
+        let second = store.upsert(second_input).unwrap();
+        let first_operation = managed_operation(
+            "operation-sequence-a-1",
+            "entitlement-sequence-a",
+            first.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter-a@example.com",
+        );
+        let second_operation = managed_operation(
+            "operation-sequence-b-1",
+            "entitlement-sequence-b",
+            second.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter-b@example.com",
+        );
+        let first = store
+            .apply_settings_patch(
+                "managed-sequence-a",
+                ShareSettingsPatch {
+                    managed_grant: Some(first_operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        store
+            .apply_settings_patch(
+                "managed-sequence-b",
+                ShareSettingsPatch {
+                    managed_grant: Some(second_operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        let mut next_operation = managed_operation(
+            "operation-sequence-a-2",
+            "entitlement-sequence-a",
+            first.config_revision,
+            ShareManagedGrantAction::Revoke,
+            "renter-a@example.com",
+        );
+        next_operation.share_sequence = 2;
+        store
+            .apply_settings_patch(
+                "managed-sequence-a",
+                ShareSettingsPatch {
+                    managed_grant: Some(next_operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!store
+            .applied_router_control_operations
+            .contains_key("operation-sequence-a-1"));
+        assert!(store
+            .applied_router_control_operations
+            .contains_key("operation-sequence-a-2"));
+        assert!(store
+            .applied_router_control_operations
+            .contains_key("operation-sequence-b-1"));
+        assert_eq!(store.applied_router_control_operations.len(), 2);
+    }
+
+    #[test]
+    fn managed_permanent_grant_materializes_rolling_token_period_anchor() {
+        let mut store = ShareStore::default();
+        let original = store
+            .upsert(codex_share_input("managed-permanent-term"))
+            .unwrap();
+        let mut operation = managed_operation(
+            "operation-permanent-term",
+            "entitlement-permanent-term",
+            original.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        operation.policy.as_mut().unwrap().token_period = ShareTokenPeriod::ThirtyDays;
+
+        let updated = store
+            .apply_settings_patch(
+                "managed-permanent-term",
+                ShareSettingsPatch {
+                    managed_grant: Some(operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        let grant = updated.user_grants.get("renter@example.com").unwrap();
+        let applied_at_ms = i64::try_from(grant.updated_at_ms).unwrap();
+        assert_eq!(grant.policy.expires_at, None);
+        assert_eq!(
+            grant.policy.token_period_anchor_at_ms,
+            Some(applied_at_ms.div_euclid(60_000) * 60_000)
         );
     }
 

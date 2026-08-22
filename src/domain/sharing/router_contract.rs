@@ -98,6 +98,10 @@ pub struct ShareManagedGrantOperation {
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ShareUserPolicy>,
+    /// Relative service term. The Server turns this into an absolute expiry
+    /// when it actually applies the grant, so queueing time is never consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -608,6 +608,10 @@ pub struct ShareEditAckPayload {
     pub current_config_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_share: Option<ShareDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_policy: Option<crate::domain::sharing::router_contract::ShareUserPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3184,6 +3188,8 @@ mod tests {
                 retryable: None,
                 current_config_revision: None,
                 current_share: None,
+                applied_at_ms: None,
+                effective_policy: None,
             },
         };
         assert_eq!(
@@ -3221,6 +3227,8 @@ mod tests {
                     config_revision: 4,
                     ..ShareDescriptor::default()
                 }),
+                applied_at_ms: None,
+                effective_policy: None,
             },
         };
         let value = serde_json::to_value(payload).expect("serialize revision-conflict ACK");

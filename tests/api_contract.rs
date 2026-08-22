@@ -1158,6 +1158,7 @@ async fn ordinary_share_settings_entrypoint_rejects_managed_grants() {
                     action: ShareManagedGrantAction::Revoke,
                     email: "renter@example.com".to_string(),
                     policy: None,
+                    duration_seconds: None,
                 }),
                 ..ShareSettingsPatch::default()
             },
