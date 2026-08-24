@@ -141,7 +141,8 @@ pub struct ShareUserPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     /// Empty keeps legacy/manual ShareTo behavior. Router-managed market
-    /// grants always carry exactly the App purchased by the renter.
+    /// grants carry an explicit App set and may include core Apps that are not
+    /// bound yet, so enabling them later does not require replacing the grant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_apps: Vec<AppKind>,
 }
@@ -1748,9 +1749,9 @@ mod tests {
     }
 
     #[test]
-    fn v3_app_scope_matches_router_wire_format_and_keeps_legacy_omission() {
+    fn v3_all_app_scope_matches_router_wire_format_and_keeps_legacy_omission() {
         let policy = ShareUserPolicy {
-            allowed_apps: vec![AppKind::Codex],
+            allowed_apps: vec![AppKind::Claude, AppKind::Codex, AppKind::Gemini],
             ..ShareUserPolicy::default()
         };
         let wire = serde_json::to_value(&policy).expect("serialize App-scoped policy");
@@ -1759,14 +1760,14 @@ mod tests {
             wire,
             json!({
                 "tokenPeriod": "lifetime",
-                "allowedApps": ["codex"]
+                "allowedApps": ["claude", "codex", "gemini"]
             })
         );
         assert_eq!(
             serde_json::from_value::<ShareUserPolicy>(wire)
                 .expect("deserialize Router App scope")
                 .allowed_apps,
-            [AppKind::Codex]
+            [AppKind::Claude, AppKind::Codex, AppKind::Gemini]
         );
         assert!(serde_json::from_value::<ShareUserPolicy>(json!({}))
             .expect("deserialize legacy policy")

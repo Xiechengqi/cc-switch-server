@@ -1072,7 +1072,8 @@ async fn control_apply_share_settings_accepts_router_share_market_managed_grant(
                 "policy": {
                     "parallelLimit": 2,
                     "tokenLimit": 1000,
-                    "tokenPeriod": "day"
+                    "tokenPeriod": "day",
+                    "allowedApps": ["claude", "codex", "gemini"]
                 }
             }
         }
@@ -1127,6 +1128,10 @@ async fn control_apply_share_settings_accepts_router_share_market_managed_grant(
     assert_eq!(
         grant.entitlement_id.as_deref(),
         Some("router-share-market-entitlement-1")
+    );
+    assert_eq!(
+        grant.policy.allowed_apps,
+        [AppKind::Claude, AppKind::Codex, AppKind::Gemini]
     );
 }
 
