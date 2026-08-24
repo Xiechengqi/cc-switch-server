@@ -84,8 +84,8 @@ describe("familyCatalog", () => {
     expect(familyCategoryId("family.deepseek_account")).toBe("api_key");
     expect(familyIsExperimental(familyById("family.cursor_oauth")!)).toBe(true);
     expect(familySupportedApps(familyById("family.openai_oauth")!)).toEqual([
-      "claude",
       "codex",
+      "claude",
     ]);
   });
 

@@ -32,7 +32,8 @@ pub(crate) use control::{
     control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
     control_refresh_share_usage, share_router_health, share_router_model_health,
-    share_router_request_logs, share_router_runtime,
+    share_router_model_health_batch, share_router_model_health_batch_v2, share_router_request_logs,
+    share_router_runtime,
 };
 pub use control::{
     control_signature, control_signature_for_method, refresh_share_usage_items,
@@ -253,6 +254,14 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/_share-router/model-health",
             post(share_router_model_health),
+        )
+        .route(
+            "/_share-router/model-health/batch",
+            post(share_router_model_health_batch),
+        )
+        .route(
+            "/_share-router/model-health/batch-v2",
+            post(share_router_model_health_batch_v2),
         )
         .route(
             APPLY_SHARE_SETTINGS_PATH,

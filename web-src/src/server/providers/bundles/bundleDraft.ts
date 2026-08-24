@@ -150,8 +150,8 @@ function clone<T>(value: T): T {
 }
 
 export const BUNDLE_TEST_APP_ORDER: CoreProviderApp[] = [
-  "claude",
   "codex",
+  "claude",
   "gemini",
 ];
 

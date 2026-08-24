@@ -737,6 +737,7 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
             let calls = upstream_calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(75)).await;
                 (
                     StatusCode::OK,
                     "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
@@ -816,6 +817,7 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
     assert!(log.is_streaming);
     assert_eq!(log.provider_id, "provider-health-probe");
     assert_eq!(log.data_source.as_deref(), Some("cc-switch-router-probe"));
+    assert!(log.provider_health_fingerprint.is_some());
     assert_eq!(log.stream_status.as_deref(), Some("completed"));
     assert_eq!(log.status_code, 200);
     assert!(log.error_message.is_none());
@@ -838,6 +840,169 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
         "provider-health-probe"
     );
     assert_eq!(response["modelHealth"]["codex"][0]["status"], "success");
+
+    upsert_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "provider-health-probe-2".to_string(),
+            name: "Health Probe Provider 2".to_string(),
+            settings_config: json!({
+                "env": {
+                    "OPENAI_BASE_URL": format!("http://{upstream_addr}"),
+                    "OPENAI_API_KEY": "sk-local-secret"
+                },
+                "models": ["gpt-5.5"],
+                "testModel": "gpt-5.5"
+            }),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        },
+    )
+    .await;
+    state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(test_share_input(
+                    "share-health-probe-2",
+                    "provider-health-probe-2",
+                    ProviderType::Codex,
+                ))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    let batch_body = serde_json::to_vec(&json!({
+        "cycleId": "utc-1787529600",
+        "targets": [
+            {"shareId": "share-health-probe", "appType": "openai"},
+            {"shareId": "share-health-probe-2", "appType": "codex"},
+            {"shareId": "share-health-probe-stale", "appType": "openai"},
+            {"shareId": "share-health-probe", "appType": "openai"}
+        ]
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::POST,
+            "/_share-router/model-health/batch",
+            &["share-health-probe"],
+            "nonce-model-health-batch",
+            batch_body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert_eq!(response["cycleId"], "utc-1787529600");
+    assert_eq!(response["results"].as_array().map(Vec::len), Some(2));
+    assert!(response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["appType"] == "openai" && result["status"] == "success"));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let response = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::POST,
+            "/_share-router/model-health/batch",
+            &["share-health-probe"],
+            "nonce-model-health-batch-retry",
+            batch_body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let v2_body = serde_json::to_vec(&json!({
+        "contractVersion": 2,
+        "cycleId": "utc-1787531400",
+        "targets": [
+            {"shareId": "share-health-probe", "appType": "openai"}
+        ]
+    }))
+    .unwrap();
+    let first = app.clone().oneshot(share_router_request(
+        Method::POST,
+        "/_share-router/model-health/batch-v2",
+        &["share-health-probe"],
+        "nonce-model-health-batch-v2",
+        v2_body.clone(),
+    ));
+    let second = app.clone().oneshot(share_router_request(
+        Method::POST,
+        "/_share-router/model-health/batch-v2",
+        &["share-health-probe"],
+        "nonce-model-health-batch-v2-concurrent-retry",
+        v2_body,
+    ));
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let response = json_body(first).await;
+    let retried = json_body(second).await;
+    let expected_v2_results = response["results"].clone();
+    assert_eq!(retried["results"], expected_v2_results);
+    let v2_results = expected_v2_results.as_array().unwrap();
+    assert_eq!(v2_results.len(), 1);
+    assert!(v2_results.iter().all(|result| {
+        result["outcome"] == "success"
+            && result["failureDomain"].is_null()
+            && result["reasonCode"] == "probe_succeeded"
+            && result["evidenceScope"] == "provider_runtime"
+            && result["evidenceVersion"] == 2
+            && result["observationId"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64)
+    }));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "concurrent retries of one Router cycle must share one Provider probe"
+    );
+
+    state
+        .mutate_providers_immediate(|providers| {
+            let provider = providers
+                .providers
+                .iter_mut()
+                .find(|provider| {
+                    provider.app == AppKind::Codex
+                        && provider.provider.id == "provider-health-probe"
+                })
+                .unwrap();
+            provider.provider.settings_config["testModel"] = json!("gpt-5.6");
+        })
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(share_router_request(
+            Method::POST,
+            "/_share-router/model-health/batch",
+            &["share-health-probe"],
+            "nonce-model-health-batch-runtime-change",
+            batch_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = json_body(response).await;
+    assert!(response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|result| {
+            result["shareId"] == "share-health-probe" && result["requestedModel"] == "gpt-5.6"
+        }));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
 
     state
         .mutate_providers_immediate(|providers| {
@@ -864,6 +1029,7 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
         .unwrap();
     let body = serde_json::to_vec(&json!({"appType": "codex"})).unwrap();
     let response = app
+        .clone()
         .oneshot(share_router_request(
             Method::POST,
             "/_share-router/model-health",
@@ -873,8 +1039,33 @@ async fn share_router_model_health_stream_probe_persists_bound_provider_result()
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+
+    state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .shares
+                .iter_mut()
+                .find(|share| share.id == "share-health-probe")
+                .unwrap()
+                .enabled_apps = Some(Default::default());
+        })
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&json!({"appType": "codex"})).unwrap();
+    let response = app
+        .oneshot(share_router_request(
+            Method::POST,
+            "/_share-router/model-health",
+            &["share-health-probe"],
+            "nonce-model-health-disabled-app",
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
 }
 
 #[tokio::test]

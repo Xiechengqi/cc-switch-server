@@ -275,8 +275,8 @@ if (requireDirectory(serverRoot, "Server audit root")) {
   requireText(
     serverRoot,
     "src/domain/sharing/router_contract.rs",
-    /pub const SHARE_CONTRACT_VERSION: u16 = 3;/,
-    "Share Contract v3 constant",
+    /pub const SHARE_CONTRACT_VERSION: u16 = 4;/,
+    "Share Contract v4 constant",
   );
   requireBlock(
     serverRoot,
@@ -411,8 +411,8 @@ if (requireDirectory(routerRoot, "Router audit root")) {
   requireText(
     routerRoot,
     "src/models.rs",
-    /pub const SHARE_CONTRACT_VERSION: u16 = 3;/,
-    "Share Contract v3 constant",
+    /pub const SHARE_CONTRACT_VERSION: u16 = 4;/,
+    "Share Contract v4 constant",
   );
   requireBlock(
     routerRoot,

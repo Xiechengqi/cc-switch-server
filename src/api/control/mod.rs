@@ -43,5 +43,6 @@ pub use ctl::{
     ControlRefreshShareUsageItem,
 };
 pub(crate) use share_router::{
-    share_router_health, share_router_model_health, share_router_request_logs, share_router_runtime,
+    share_router_health, share_router_model_health, share_router_model_health_batch,
+    share_router_model_health_batch_v2, share_router_request_logs, share_router_runtime,
 };

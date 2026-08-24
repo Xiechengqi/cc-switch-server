@@ -1,6 +1,6 @@
 # Router 联调
 
-> 状态：**权威文档**。最后核对：2026-08-20。
+> 状态：**权威文档**。最后核对：2026-08-24。
 >
 > 协议与契约细节见 [`../architecture/router-contract.md`](../architecture/router-contract.md)；验收剧本见 [`../acceptance/router-share-acceptance.md`](../acceptance/router-share-acceptance.md)。
 >
@@ -15,7 +15,7 @@
 5. 点击 share tunnel start 后，server 会 claim share subdomain、申请 `http` lease 并建立 SSH reverse tunnel。
 6. share descriptor 会在创建、修改、删除时自动同步，并在 client 启动或重新注册 router 后自动校准，无需人工全量同步。
 7. Router 内建 Share Market entitlement 会通过 pending share edit 下发；Server 后台监听 edit event，也可手动调用 `POST /api/router/share-edits/pull` 拉取并回写 ack。
-8. router 可经 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime`、`/_share-router/model-health` 拉取 runtime。
+8. router 优先经 client tunnel、再经在线 share tunnel 调 `/_share-router/health`、`/_share-router/request-logs`、`/_share-router/share-runtime` 和 `/_share-router/model-health/batch-v2`；`batch`/单目标 `model-health` 仅保留兼容用途。
 9. `/_ctl/apply_share_settings` 和 `/_ctl/refresh_share_usage` 使用 router `control_secret` HMAC、timestamp、nonce 防重放。
 10. Router Share URL 请求由已验签 ingress context 中的 Share 身份选择 binding。Server 只同步 Router Share/Gateway observation 所需的脱敏 request log；Router migration 21 已将可安全关联的旧 usage 最小化迁入 canonical Share log，并物理删除旧 Market 明细与 archive。
 
@@ -26,6 +26,8 @@
 - signed Gateway/Share route 能调度 server share（真实 Gateway 输入缺失时标记 blocked）。
 - Router Share URL 能经 Router 调用 server Share，request log 不重复且保留 country/IP/source。
 - Router 内建 Share Market entitlement add/revoke 能通过 pending share edit 幂等应用到 Server Share。
+- Router 每个 UTC 半小时只为 Share 选择一个带可执行 `modelProbe` 的已启用 App（Codex → Claude → Gemini；不可测试项顺延），Server 按 Provider runtime 去重探测；v2 重试返回相同 `observationId` 和稳定结果，不重复消耗模型请求。
+- Client 与 Share Market 侧边栏热力图只使用半小时 Provider 模型探针，不混入每 30 秒一次的 tunnel 连通性结果。
 
 ## 3. 相关 API
 

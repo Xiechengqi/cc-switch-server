@@ -178,6 +178,14 @@ impl Default for UsageStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageProviderHealthResult {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageLog {
     pub request_id: String,
     pub record_kind: UsageRecordKind,
@@ -267,6 +275,10 @@ pub struct UsageLog {
     pub user_email: Option<String>,
     #[serde(default)]
     pub data_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_health_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_health_result: Option<UsageProviderHealthResult>,
     #[serde(default)]
     pub is_health_check: bool,
     #[serde(default)]
@@ -846,6 +858,8 @@ impl UsageLog {
             share_slug: None,
             user_email: None,
             data_source: None,
+            provider_health_fingerprint: None,
+            provider_health_result: None,
             is_health_check: false,
             is_streaming: false,
             stream_status: None,

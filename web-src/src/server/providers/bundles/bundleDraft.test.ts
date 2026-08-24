@@ -138,7 +138,7 @@ describe("Provider Bundle drafts", () => {
             (surface) => surface.app === "codex" && surface.enabled,
           )
           ? "codex"
-          : (["claude", "codex", "gemini"] as const).find((app) =>
+          : (["codex", "claude", "gemini"] as const).find((app) =>
               draft.surfaces.some(
                 (surface) => surface.app === app && surface.enabled,
               ),
@@ -162,10 +162,10 @@ describe("Provider Bundle drafts", () => {
 
   it("selects one enabled test App and normalizes it after Surface changes", () => {
     const grok = createProviderBundleDraft(familyById("family.grok_oauth")!);
-    expect(grok.testApp).toBe("claude");
+    expect(grok.testApp).toBe("codex");
 
-    grok.surfaces[0]!.enabled = false;
-    expect(normalizeBundleTestApp(grok).testApp).toBe("codex");
+    grok.surfaces.find((surface) => surface.app === "codex")!.enabled = false;
+    expect(normalizeBundleTestApp(grok).testApp).toBe("claude");
 
     const openai = createProviderBundleDraft(
       familyById("family.openai_oauth")!,

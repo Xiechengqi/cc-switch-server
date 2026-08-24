@@ -768,6 +768,7 @@ pub struct ServerStateInner {
     share_edit_sync: AsyncMutex<()>,
     pub(crate) provider_health_cycle: AsyncMutex<()>,
     pub(crate) provider_health_cycle_pending: std::sync::atomic::AtomicBool,
+    provider_health_probe_locks: Mutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
     router_share_runtime_refreshes: Mutex<BTreeSet<String>>,
     router_request_log_sync_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
@@ -5776,6 +5777,7 @@ impl ServerStateInner {
             share_edit_sync: AsyncMutex::new(()),
             provider_health_cycle: AsyncMutex::new(()),
             provider_health_cycle_pending: std::sync::atomic::AtomicBool::new(false),
+            provider_health_probe_locks: Mutex::new(BTreeMap::new()),
             router_share_runtime_refreshes: Mutex::new(BTreeSet::new()),
             router_request_log_sync_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
@@ -6982,6 +6984,29 @@ impl ServerStateInner {
         provider_id: &str,
     ) -> Option<Arc<crate::domain::providers::runtime::ProviderRuntimePlan>> {
         self.providers.read().await.runtime_plan(app, provider_id)
+    }
+
+    pub(crate) async fn lock_provider_health_probe(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = format!("{}:{provider_id}", app.as_str());
+        let lock = {
+            let mut active = self
+                .provider_health_probe_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = active.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                active.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     pub async fn coding_plan_quota_snapshot(
@@ -10916,6 +10941,7 @@ impl ServerStateInner {
                         && existing.app == log.app
                         && existing.provider_id == log.provider_id
                         && existing.data_source == log.data_source
+                        && existing.provider_health_fingerprint == log.provider_health_fingerprint
                         && existing.requested_model == log.requested_model
                 })
                 .max_by_key(|existing| existing.created_at_ms)

@@ -1,6 +1,6 @@
 use super::*;
 use crate::domain::providers::registry::ProviderKey;
-use crate::domain::providers::runtime::PROVIDER_MODEL_PROBE_PROMPT;
+use crate::domain::providers::runtime::{build_provider_model_probe, PROVIDER_MODEL_PROBE_PROMPT};
 
 const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -3035,17 +3035,6 @@ fn normalize_codex_oauth_test_model(model: &str) -> String {
     format!("{trimmed}@low")
 }
 
-fn parse_model_with_effort(model: &str) -> (String, Option<String>) {
-    if let Some(pos) = model.find('@').or_else(|| model.find('#')) {
-        let actual_model = model[..pos].trim().to_string();
-        let effort = model[pos + 1..].trim().to_string();
-        if !actual_model.is_empty() && !effort.is_empty() {
-            return (actual_model, Some(effort));
-        }
-    }
-    (model.trim().to_string(), None)
-}
-
 pub(in crate::api) fn provider_test_body(
     app: AppKind,
     stored: &StoredProvider,
@@ -3054,45 +3043,8 @@ pub(in crate::api) fn provider_test_body(
     stream: bool,
 ) -> String {
     let model = provider_test_model(app, stored, override_model, None);
-    let value = match app {
-        AppKind::Claude => serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": test_prompt}],
-            "stream": stream
-        }),
-        AppKind::Codex => {
-            let (actual_model, effort) = parse_model_with_effort(&model);
-            let mut body = serde_json::json!({
-                "model": actual_model,
-                "input": [{
-                    "role": "user",
-                    "content": test_prompt
-                }],
-                "stream": stream
-            });
-            if let Some(effort) = effort {
-                body["reasoning"] = serde_json::json!({ "effort": effort });
-            } else if stored.provider_type == ProviderType::CodexOAuth {
-                body["reasoning"] = serde_json::json!({ "effort": "low" });
-            } else {
-                body["max_output_tokens"] = serde_json::json!(1);
-            }
-            if stored.provider_type == ProviderType::CodexOAuth {
-                body["store"] = serde_json::json!(false);
-                body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
-                body["instructions"] = serde_json::json!("");
-                body["tools"] = serde_json::json!([]);
-                body["parallel_tool_calls"] = serde_json::json!(false);
-            }
-            body
-        }
-        AppKind::Gemini => serde_json::json!({
-            "contents": [{"role": "user", "parts": [{"text": test_prompt}]}],
-            "generationConfig": {"maxOutputTokens": 1}
-        }),
-    };
-    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    build_provider_model_probe(app, stored.provider_type, &model, test_prompt, stream, "")
+        .body_json()
 }
 
 pub(in crate::api) fn provider_test_stream_completed(app: AppKind, body: &str) -> bool {

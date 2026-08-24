@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
@@ -12,14 +12,19 @@ use crate::domain::providers::bundle::{
     bundle_test_app, is_explicit_bundle_surface, surface_enabled,
 };
 use crate::domain::providers::model::AppKind;
-use crate::domain::providers::runtime::{ProviderHealthCheckConfig, PROVIDER_MODEL_PROBE_PROMPT};
+use crate::domain::providers::runtime::{
+    build_provider_model_probe, ProviderHealthCheckConfig, ProviderModelProbe, RuntimeModelPolicy,
+    PROVIDER_MODEL_PROBE_PROMPT,
+};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::{
     quota_block_for_provider, quota_block_message, share_bindings,
 };
-use crate::domain::sharing::shares::Share;
+use crate::domain::sharing::shares::{share_app_api_enabled, Share};
 use crate::domain::stream_check::{HealthStatus, StreamCheckResult};
-use crate::domain::usage::store::{UsageLog, UsageLogContext, UsageModelMetadata};
+use crate::domain::usage::store::{
+    UsageLog, UsageLogContext, UsageModelMetadata, UsageProviderHealthResult, UsageStore,
+};
 use crate::infra::time::now_ms;
 use crate::state::ServerState;
 
@@ -34,6 +39,7 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const TRANSIENT_CONFIRMATION_DELAY: Duration =
     Duration::from_millis(PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS as u64);
 const QUOTA_BLOCK_REPEAT_INTERVAL_MS: u128 = 6 * 60 * 60 * 1000;
+const ROUTER_PROBE_FALLBACK_AFTER_MS: u128 = 45 * 60 * 1000;
 const PROBE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_PROBES: usize = 3;
 const SCHEDULED_SOURCE: &str = "cc-switch-scheduled";
@@ -46,6 +52,21 @@ pub(crate) struct ShareBindingHealthCheck {
     pub(crate) provider_id: String,
     pub(crate) provider_name: String,
     pub(crate) quota_blocked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BatchShareBindingTarget {
+    pub(crate) share: Share,
+    pub(crate) provider: StoredProvider,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BatchShareBindingHealthCheck {
+    pub(crate) share_id: String,
+    pub(crate) app: AppKind,
+    pub(crate) check: ShareBindingHealthCheck,
+    pub(crate) model_probe: ProviderModelProbe,
+    pub(crate) model_policy: RuntimeModelPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +108,6 @@ pub(crate) async fn run_share_model_health_cycle(state: &ServerState) {
 async fn run_share_model_health_cycle_once(state: &ServerState) {
     let shares = state.shares.read().await.shares.clone();
     let providers = state.providers_snapshot().await;
-    let accounts = state.accounts_snapshot().await;
     let config = web_provider_health_check_config(state).await;
 
     if let Err(error) = state.prune_provider_health_snapshots().await {
@@ -102,9 +122,8 @@ async fn run_share_model_health_cycle_once(state: &ServerState) {
     let target_count = targets.len();
     let results = stream::iter(targets.into_values().map(|target| {
         let state = state.clone();
-        let accounts = accounts.clone();
         let config = config.clone();
-        async move { process_initial_health_target(&state, target, &accounts, &config).await }
+        async move { process_initial_health_target(&state, target, &config).await }
     }))
     .buffer_unordered(MAX_CONCURRENT_PROBES)
     .collect::<Vec<_>>()
@@ -170,6 +189,9 @@ fn health_targets(
         .filter(|share| share.enabled && share.status == "active")
     {
         for (app, provider_id) in share_bindings(share) {
+            if !share_app_api_enabled(share, app) {
+                continue;
+            }
             let provider_exists = providers
                 .providers
                 .iter()
@@ -218,20 +240,64 @@ fn is_health_target_surface(provider: &StoredProvider) -> bool {
 async fn process_initial_health_target(
     state: &ServerState,
     target: HealthTarget,
-    accounts: &AccountStore,
     config: &ProviderHealthCheckConfig,
 ) -> anyhow::Result<Option<HealthTarget>> {
-    if let Some(block) = quota_block_for_provider(&target.provider, Some(accounts)) {
+    if recent_router_cycle_covers_provider(state, &target.provider).await {
+        tracing::debug!(
+            app = target.provider.app.as_str(),
+            provider_id = %target.provider.provider.id,
+            "skipped local Provider health probe because a recent Router cycle is authoritative"
+        );
+        return Ok(None);
+    }
+    let probe_guard = state
+        .lock_provider_health_probe(target.provider.app, &target.provider.provider.id)
+        .await;
+    if recent_router_cycle_covers_provider(state, &target.provider).await {
+        tracing::debug!(
+            app = target.provider.app.as_str(),
+            provider_id = %target.provider.provider.id,
+            "skipped queued local Provider health probe because a Router cycle became authoritative"
+        );
+        return Ok(None);
+    }
+    let Some(plan) = state
+        .provider_runtime_plan(target.provider.app, &target.provider.provider.id)
+        .await
+        .filter(|plan| plan.provider_revision == target.provider.resource.revision)
+    else {
+        return Ok(None);
+    };
+    let accounts = state.accounts_snapshot().await;
+    if let Some(block) = quota_block_for_provider(&target.provider, Some(&accounts)) {
         let active_shares = current_active_shares_for_provider(state, &target.provider).await;
+        let model = plan.test_model.clone().unwrap_or_else(|| {
+            provider_test_model(target.provider.app, &target.provider, None, Some(config))
+        });
+        let health_fingerprint = plan.health_fingerprint();
+        let mut refreshes = Vec::with_capacity(active_shares.len());
         for share in &active_shares {
-            record_quota_block(state, share, &target.provider, config, &block).await?;
-            notify_runtime_refresh(state, share).await;
+            record_quota_block_with_identity(
+                state,
+                share,
+                &target.provider,
+                model.clone(),
+                Some(&health_fingerprint),
+                &block,
+                QUOTA_SOURCE,
+                QUOTA_BLOCK_REPEAT_INTERVAL_MS,
+            )
+            .await?;
+            refreshes.push(share.clone());
         }
+        drop(probe_guard);
+        notify_runtime_refreshes(state, refreshes).await;
         return Ok(None);
     }
 
     let probe =
-        probe_provider_and_record(state, &target.provider, config, SCHEDULED_SOURCE).await?;
+        probe_provider_and_record_locked(state, &target.provider, config, SCHEDULED_SOURCE).await?;
+    drop(probe_guard);
     if probe.probe_support == ProviderProbeSupport::Unsupported {
         tracing::debug!(
             app = target.provider.app.as_str(),
@@ -255,6 +321,7 @@ async fn process_initial_health_target(
         &target.provider,
         &probe.result,
         SCHEDULED_SOURCE,
+        &snapshot.runtime_fingerprint,
     )
     .await?;
 
@@ -267,11 +334,31 @@ async fn process_initial_health_target(
     Ok(Some(target))
 }
 
+async fn recent_router_cycle_covers_provider(
+    state: &ServerState,
+    provider: &StoredProvider,
+) -> bool {
+    let providers = state.providers_snapshot().await;
+    let plan = providers.runtime_plan(provider.app, &provider.provider.id);
+    let usage = state.usage.read().await;
+    let health = crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref());
+    health
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("cc-switch-router-cycle:"))
+        && health.checked_at_ms.is_some_and(|checked_at| {
+            now_ms().saturating_sub(checked_at) < ROUTER_PROBE_FALLBACK_AFTER_MS
+        })
+}
+
 async fn confirm_health_target(
     state: &ServerState,
     target: HealthTarget,
     config: &ProviderHealthCheckConfig,
 ) -> anyhow::Result<()> {
+    let probe_guard = state
+        .lock_provider_health_probe(target.provider.app, &target.provider.provider.id)
+        .await;
     let providers = state.providers_snapshot().await;
     let Some(current) = providers
         .providers
@@ -285,6 +372,14 @@ async fn confirm_health_target(
     else {
         return Ok(());
     };
+    if recent_router_cycle_covers_provider(state, &current).await {
+        tracing::debug!(
+            app = current.app.as_str(),
+            provider_id = %current.provider.id,
+            "skipped queued Provider health confirmation because a Router cycle became authoritative"
+        );
+        return Ok(());
+    }
     let runtime_plan = providers.runtime_plan(current.app, &current.provider.id);
     let still_pending = {
         let usage = state.usage.read().await;
@@ -299,9 +394,12 @@ async fn confirm_health_target(
         return Ok(());
     }
     let confirmation =
-        probe_provider_and_record(state, &current, config, CONFIRMATION_SOURCE).await?;
-    if confirmation.probe_support == ProviderProbeSupport::Supported
-        && confirmation.snapshot.is_some()
+        probe_provider_and_record_locked(state, &current, config, CONFIRMATION_SOURCE).await?;
+    drop(probe_guard);
+    if let Some(snapshot) = confirmation
+        .snapshot
+        .as_ref()
+        .filter(|_| confirmation.probe_support == ProviderProbeSupport::Supported)
     {
         let active_shares = current_active_shares_for_provider(state, &current).await;
         project_probe_to_shares(
@@ -310,6 +408,7 @@ async fn confirm_health_target(
             &current,
             &confirmation.result,
             CONFIRMATION_SOURCE,
+            &snapshot.runtime_fingerprint,
         )
         .await?;
     }
@@ -317,6 +416,18 @@ async fn confirm_health_target(
 }
 
 pub(crate) async fn probe_provider_and_record(
+    state: &ServerState,
+    provider: &StoredProvider,
+    config: &ProviderHealthCheckConfig,
+    source: &str,
+) -> anyhow::Result<RecordedProviderProbe> {
+    let _probe = state
+        .lock_provider_health_probe(provider.app, &provider.provider.id)
+        .await;
+    probe_provider_and_record_locked(state, provider, config, source).await
+}
+
+async fn probe_provider_and_record_locked(
     state: &ServerState,
     provider: &StoredProvider,
     config: &ProviderHealthCheckConfig,
@@ -414,7 +525,9 @@ pub(crate) async fn record_probe_observation(
                 .unwrap_or(provider.resource.revision),
             runtime_fingerprint: runtime_fingerprint.to_string(),
             status,
-            checked_at_ms: now_ms(),
+            checked_at_ms: u128::try_from(result.tested_at)
+                .unwrap_or_default()
+                .saturating_mul(1_000),
             source: source.to_string(),
             status_code: result.http_status,
             latency_ms: result.response_time_ms,
@@ -463,8 +576,15 @@ pub(crate) async fn record_provider_test_response(
         source,
     )
     .await?;
-    if snapshot.is_some() {
-        project_accepted_probe_to_active_shares(state, provider, &result, source).await?;
+    if let Some(snapshot) = snapshot.as_ref() {
+        project_accepted_probe_to_active_shares(
+            state,
+            provider,
+            &result,
+            source,
+            &snapshot.runtime_fingerprint,
+        )
+        .await?;
     }
     Ok(snapshot)
 }
@@ -478,7 +598,18 @@ pub(crate) async fn project_recorded_probe_to_active_shares(
     if probe.probe_support == ProviderProbeSupport::Unsupported || probe.snapshot.is_none() {
         return Ok(0);
     }
-    project_accepted_probe_to_active_shares(state, provider, &probe.result, source).await
+    project_accepted_probe_to_active_shares(
+        state,
+        provider,
+        &probe.result,
+        source,
+        &probe
+            .snapshot
+            .as_ref()
+            .expect("snapshot checked above")
+            .runtime_fingerprint,
+    )
+    .await
 }
 
 pub(crate) async fn check_share_binding(
@@ -490,11 +621,24 @@ pub(crate) async fn check_share_binding(
     source: &str,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
     if let Some(block) = quota_block_for_provider(provider, Some(accounts)) {
-        return record_quota_block(state, share, provider, config, &block).await;
+        return record_quota_block(
+            state,
+            share,
+            provider,
+            config,
+            &block,
+            QUOTA_SOURCE,
+            QUOTA_BLOCK_REPEAT_INTERVAL_MS,
+        )
+        .await;
     }
 
     let probe = probe_provider_and_record(state, provider, config, source).await?;
-    if probe.probe_support == ProviderProbeSupport::Supported && probe.snapshot.is_some() {
+    if let Some(snapshot) = probe
+        .snapshot
+        .as_ref()
+        .filter(|_| probe.probe_support == ProviderProbeSupport::Supported)
+    {
         state
             .push_usage_log(health_usage_log(
                 share,
@@ -502,6 +646,7 @@ pub(crate) async fn check_share_binding(
                 &probe.result,
                 source,
                 true,
+                Some(&snapshot.runtime_fingerprint),
             ))
             .await?;
     }
@@ -513,16 +658,468 @@ pub(crate) async fn check_share_binding(
     })
 }
 
+/// Executes at most one network probe for each Provider runtime and projects
+/// the accepted result to every requested Share. `source` is a deterministic
+/// Router cycle identifier, so an HTTP retry reuses an already persisted
+/// result instead of consuming another model request.
+pub(crate) async fn check_share_bindings_batch(
+    state: &ServerState,
+    targets: Vec<BatchShareBindingTarget>,
+    config: &ProviderHealthCheckConfig,
+    source: &str,
+) -> anyhow::Result<Vec<BatchShareBindingHealthCheck>> {
+    let mut grouped = BTreeMap::<(AppKind, String), Vec<BatchShareBindingTarget>>::new();
+    for target in targets {
+        grouped
+            .entry((target.provider.app, target.provider.provider.id.clone()))
+            .or_default()
+            .push(target);
+    }
+
+    let mut checked_groups = stream::iter(grouped.into_iter().map(|(key, group)| async move {
+        (
+            key,
+            check_share_binding_group(state, group, config, source).await,
+        )
+    }))
+    .buffer_unordered(MAX_CONCURRENT_PROBES)
+    .collect::<Vec<_>>()
+    .await;
+    checked_groups.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut output = Vec::new();
+    for ((app, provider_id), result) in checked_groups {
+        match result {
+            Ok(results) => output.extend(results),
+            Err(error) => {
+                tracing::warn!(
+                    app = app.as_str(),
+                    provider_id,
+                    %error,
+                    "omitted failed Provider group from Router model health batch"
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
+async fn check_share_binding_group(
+    state: &ServerState,
+    group: Vec<BatchShareBindingTarget>,
+    config: &ProviderHealthCheckConfig,
+    source: &str,
+) -> anyhow::Result<Vec<BatchShareBindingHealthCheck>> {
+    let Some(first) = group.first() else {
+        return Ok(Vec::new());
+    };
+    let provider = first.provider.clone();
+    let probe_guard = state
+        .lock_provider_health_probe(provider.app, &provider.provider.id)
+        .await;
+    let current_shares = state.shares.read().await.shares.clone();
+    let group = group
+        .into_iter()
+        .filter_map(|target| {
+            current_shares
+                .iter()
+                .find(|share| {
+                    share.id == target.share.id
+                        && share.enabled
+                        && share.status == "active"
+                        && share_app_api_enabled(share, provider.app)
+                        && share_bindings(share).iter().any(|(app, provider_id)| {
+                            *app == provider.app && provider_id == &provider.provider.id
+                        })
+                })
+                .cloned()
+                .map(|share| BatchShareBindingTarget {
+                    share,
+                    provider: target.provider,
+                })
+        })
+        .collect::<Vec<_>>();
+    if group.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plan = state
+        .provider_runtime_plan(provider.app, &provider.provider.id)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!("Provider runtime plan is unavailable for Router model health batch")
+        })?;
+    anyhow::ensure!(
+        plan.provider_revision == provider.resource.revision,
+        "Provider runtime changed before Router model health batch"
+    );
+    anyhow::ensure!(
+        provider_probe_support(&plan) == ProviderProbeSupport::Supported,
+        "Provider runtime no longer supports model testing"
+    );
+    let requested_model = plan
+        .test_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Provider test model is unavailable for Router batch"))?;
+    let expected_health_fingerprint = plan.health_fingerprint();
+    let model_probe = build_provider_model_probe(
+        provider.app,
+        provider.provider_type,
+        requested_model,
+        PROVIDER_MODEL_PROBE_PROMPT,
+        true,
+        expected_health_fingerprint.clone(),
+    );
+    let model_policy = plan.model_policy.clone();
+    let mut output = Vec::with_capacity(group.len());
+    let mut refreshes = Vec::new();
+    if let Some(result) =
+        existing_cycle_result(state, &provider, source, &expected_health_fingerprint).await
+    {
+        let quota_blocked = recovered_cycle_result_is_quota_blocked(&result);
+        let mut already_projected =
+            existing_cycle_share_ids(state, &provider, source, &expected_health_fingerprint).await;
+        for target in group {
+            if !already_projected.contains(&target.share.id) {
+                state
+                    .push_usage_log(health_usage_log(
+                        &target.share,
+                        &provider,
+                        &result,
+                        source,
+                        !quota_blocked,
+                        Some(&expected_health_fingerprint),
+                    ))
+                    .await?;
+                refreshes.push(target.share.clone());
+                already_projected.insert(target.share.id.clone());
+            }
+            output.push(BatchShareBindingHealthCheck {
+                share_id: target.share.id,
+                app: provider.app,
+                check: ShareBindingHealthCheck {
+                    result: result.clone(),
+                    provider_id: provider.provider.id.clone(),
+                    provider_name: provider.provider.name.clone(),
+                    quota_blocked,
+                },
+                model_probe: model_probe.clone(),
+                model_policy: model_policy.clone(),
+            });
+        }
+        drop(probe_guard);
+        notify_runtime_refreshes(state, refreshes).await;
+        return Ok(output);
+    }
+    let accounts = state.accounts_snapshot().await;
+    if let Some(block) = quota_block_for_provider(&provider, Some(&accounts)) {
+        let (first, remaining) = group
+            .split_first()
+            .expect("non-empty Provider group was checked above");
+        let check = record_quota_block_with_identity(
+            state,
+            &first.share,
+            &provider,
+            requested_model.to_string(),
+            Some(&expected_health_fingerprint),
+            &block,
+            source,
+            0,
+        )
+        .await?;
+        let current_fingerprint = state
+            .provider_runtime_plan(provider.app, &provider.provider.id)
+            .await
+            .filter(|current| current.provider_revision == provider.resource.revision)
+            .map(|current| current.health_fingerprint());
+        anyhow::ensure!(
+            current_fingerprint.as_deref() == Some(expected_health_fingerprint.as_str()),
+            "Provider runtime changed during Router quota observation"
+        );
+        refreshes.push(first.share.clone());
+        output.push(BatchShareBindingHealthCheck {
+            share_id: first.share.id.clone(),
+            app: provider.app,
+            check: check.clone(),
+            model_probe: model_probe.clone(),
+            model_policy: model_policy.clone(),
+        });
+        for target in remaining {
+            state
+                .push_usage_log(health_usage_log(
+                    &target.share,
+                    &provider,
+                    &check.result,
+                    source,
+                    false,
+                    Some(&expected_health_fingerprint),
+                ))
+                .await?;
+            refreshes.push(target.share.clone());
+            output.push(BatchShareBindingHealthCheck {
+                share_id: target.share.id.clone(),
+                app: provider.app,
+                check: check.clone(),
+                model_probe: model_probe.clone(),
+                model_policy: model_policy.clone(),
+            });
+        }
+        drop(probe_guard);
+        notify_runtime_refreshes(state, refreshes).await;
+        return Ok(output);
+    }
+
+    let probe = probe_provider_and_record_locked(state, &provider, config, source).await?;
+    let Some(snapshot) = probe
+        .snapshot
+        .as_ref()
+        .filter(|_| probe.probe_support == ProviderProbeSupport::Supported)
+    else {
+        anyhow::bail!(
+            "Provider runtime changed or became unsupported during Router model health batch"
+        );
+    };
+    anyhow::ensure!(
+        snapshot.runtime_fingerprint == expected_health_fingerprint,
+        "Provider runtime changed during Router model health batch"
+    );
+    let result = probe.result;
+
+    let already_projected =
+        existing_cycle_share_ids(state, &provider, source, &expected_health_fingerprint).await;
+    for target in group {
+        if !already_projected.contains(&target.share.id) {
+            state
+                .push_usage_log(health_usage_log(
+                    &target.share,
+                    &provider,
+                    &result,
+                    source,
+                    true,
+                    Some(&expected_health_fingerprint),
+                ))
+                .await?;
+            refreshes.push(target.share.clone());
+        }
+        output.push(BatchShareBindingHealthCheck {
+            share_id: target.share.id,
+            app: provider.app,
+            check: ShareBindingHealthCheck {
+                result: result.clone(),
+                provider_id: provider.provider.id.clone(),
+                provider_name: provider.provider.name.clone(),
+                quota_blocked: false,
+            },
+            model_probe: model_probe.clone(),
+            model_policy: model_policy.clone(),
+        });
+    }
+    drop(probe_guard);
+    notify_runtime_refreshes(state, refreshes).await;
+    Ok(output)
+}
+
+async fn existing_cycle_result(
+    state: &ServerState,
+    provider: &StoredProvider,
+    source: &str,
+    expected_health_fingerprint: &str,
+) -> Option<StreamCheckResult> {
+    let usage = state.usage.read().await;
+    existing_cycle_result_from_usage(&usage, provider, source, expected_health_fingerprint)
+}
+
+fn existing_cycle_result_from_usage(
+    usage: &UsageStore,
+    provider: &StoredProvider,
+    source: &str,
+    expected_health_fingerprint: &str,
+) -> Option<StreamCheckResult> {
+    let log = usage
+        .logs
+        .iter()
+        .filter(|log| {
+            log.is_health_check
+                && log.app == provider.app
+                && log.provider_id == provider.provider.id
+                && log.data_source.as_deref() == Some(source)
+                && log.provider_health_fingerprint.as_deref() == Some(expected_health_fingerprint)
+        })
+        .max_by_key(|log| log.created_at_ms);
+    if let Some(result) = log.and_then(|log| exact_cycle_result_from_log(log, provider)) {
+        return Some(result);
+    }
+    if let Some(snapshot) = usage
+        .provider_health
+        .get(provider.app, &provider.provider.id)
+        .filter(|snapshot| {
+            snapshot.source == source && snapshot.runtime_fingerprint == expected_health_fingerprint
+        })
+    {
+        let success = snapshot.status.is_success();
+        return Some(StreamCheckResult {
+            status: match snapshot.status {
+                ProviderHealthStatus::Healthy => HealthStatus::Operational,
+                ProviderHealthStatus::Degraded => HealthStatus::Degraded,
+                ProviderHealthStatus::Unknown | ProviderHealthStatus::Unhealthy => {
+                    HealthStatus::Failed
+                }
+            },
+            success,
+            provider_revision: Some(snapshot.provider_revision),
+            message: if success {
+                "Check succeeded".to_string()
+            } else {
+                snapshot
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Check failed".to_string())
+            },
+            response_time_ms: snapshot.latency_ms,
+            http_status: snapshot.status_code,
+            model_used: snapshot
+                .model
+                .clone()
+                .unwrap_or_else(|| provider.app.as_str().to_string()),
+            tested_at: seconds_from_ms(snapshot.checked_at_ms),
+            retry_count: log
+                .map(|log| log.attempt_count.saturating_sub(1))
+                .unwrap_or_default(),
+            error_category: snapshot.error_category.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        });
+    }
+    let log = log?;
+    let success = (200..400).contains(&log.status_code)
+        && (!log.is_streaming || log.stream_status.as_deref() == Some("completed"));
+    Some(StreamCheckResult {
+        status: if success {
+            HealthStatus::Operational
+        } else {
+            HealthStatus::Failed
+        },
+        success,
+        provider_revision: Some(provider.resource.revision),
+        message: if success {
+            "Check succeeded".to_string()
+        } else {
+            log.error_message
+                .clone()
+                .unwrap_or_else(|| "Check failed".to_string())
+        },
+        response_time_ms: Some(log.duration_ms.min(u128::from(u64::MAX)) as u64),
+        http_status: Some(log.status_code),
+        model_used: log
+            .requested_model
+            .clone()
+            .or_else(|| log.model.clone())
+            .unwrap_or_else(|| provider.app.as_str().to_string()),
+        tested_at: seconds_from_ms(log.created_at_ms),
+        retry_count: log.attempt_count.saturating_sub(1),
+        error_category: log.failure_kind.clone(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+    })
+}
+
+fn exact_cycle_result_from_log(
+    log: &UsageLog,
+    provider: &StoredProvider,
+) -> Option<StreamCheckResult> {
+    let evidence = log.provider_health_result.as_ref()?;
+    let status = match evidence.status.as_str() {
+        "operational" => HealthStatus::Operational,
+        "degraded" => HealthStatus::Degraded,
+        "failed" => HealthStatus::Failed,
+        _ => return None,
+    };
+    let success = matches!(status, HealthStatus::Operational | HealthStatus::Degraded);
+    Some(StreamCheckResult {
+        status,
+        success,
+        provider_revision: Some(provider.resource.revision),
+        message: if success {
+            "Check succeeded".to_string()
+        } else {
+            log.error_message
+                .clone()
+                .unwrap_or_else(|| "Check failed".to_string())
+        },
+        response_time_ms: Some(log.duration_ms.min(u128::from(u64::MAX)) as u64),
+        http_status: evidence.http_status,
+        model_used: log
+            .requested_model
+            .clone()
+            .or_else(|| log.model.clone())
+            .unwrap_or_else(|| provider.app.as_str().to_string()),
+        tested_at: seconds_from_ms(log.created_at_ms),
+        retry_count: log.attempt_count.saturating_sub(1),
+        error_category: log.failure_kind.clone(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+    })
+}
+
+fn recovered_cycle_result_is_quota_blocked(result: &StreamCheckResult) -> bool {
+    result.error_category.as_deref() == Some("quotaBlocked")
+}
+
+async fn existing_cycle_share_ids(
+    state: &ServerState,
+    provider: &StoredProvider,
+    source: &str,
+    expected_health_fingerprint: &str,
+) -> HashSet<String> {
+    let usage = state.usage.read().await;
+    existing_cycle_share_ids_from_usage(&usage, provider, source, expected_health_fingerprint)
+}
+
+fn existing_cycle_share_ids_from_usage(
+    usage: &UsageStore,
+    provider: &StoredProvider,
+    source: &str,
+    expected_health_fingerprint: &str,
+) -> HashSet<String> {
+    usage
+        .logs
+        .iter()
+        .filter(|log| {
+            log.is_health_check
+                && log.app == provider.app
+                && log.provider_id == provider.provider.id
+                && log.data_source.as_deref() == Some(source)
+                && log.provider_health_fingerprint.as_deref() == Some(expected_health_fingerprint)
+        })
+        .filter_map(|log| log.share_id.clone())
+        .collect()
+}
+
 async fn project_probe_to_shares(
     state: &ServerState,
     shares: &[Share],
     provider: &StoredProvider,
     result: &StreamCheckResult,
     source: &str,
+    health_fingerprint: &str,
 ) -> anyhow::Result<()> {
     for share in shares {
         state
-            .push_usage_log(health_usage_log(share, provider, result, source, true))
+            .push_usage_log(health_usage_log(
+                share,
+                provider,
+                result,
+                source,
+                true,
+                Some(health_fingerprint),
+            ))
             .await?;
         notify_runtime_refresh(state, share).await;
     }
@@ -534,10 +1131,11 @@ async fn project_accepted_probe_to_active_shares(
     provider: &StoredProvider,
     result: &StreamCheckResult,
     source: &str,
+    health_fingerprint: &str,
 ) -> anyhow::Result<usize> {
     let shares = current_active_shares_for_provider(state, provider).await;
     let projected = shares.len();
-    project_probe_to_shares(state, &shares, provider, result, source).await?;
+    project_probe_to_shares(state, &shares, provider, result, source, health_fingerprint).await?;
     Ok(projected)
 }
 
@@ -553,6 +1151,7 @@ fn active_shares_for_provider(shares: &[Share], app: AppKind, provider_id: &str)
     shares
         .iter()
         .filter(|share| share.enabled && share.status == "active")
+        .filter(|share| share_app_api_enabled(share, app))
         .filter(|share| {
             share_bindings(share)
                 .iter()
@@ -679,12 +1278,41 @@ async fn record_quota_block(
     provider: &StoredProvider,
     config: &ProviderHealthCheckConfig,
     block: &AccountUsageBlock,
+    source: &str,
+    repeat_interval_ms: u128,
 ) -> anyhow::Result<ShareBindingHealthCheck> {
-    let model = state
+    let runtime_plan = state
         .provider_runtime_plan(provider.app, &provider.provider.id)
-        .await
+        .await;
+    let model = runtime_plan
+        .as_ref()
         .and_then(|plan| plan.test_model.clone())
         .unwrap_or_else(|| provider_test_model(provider.app, provider, None, Some(config)));
+    let health_fingerprint = runtime_plan.map(|plan| plan.health_fingerprint());
+    record_quota_block_with_identity(
+        state,
+        share,
+        provider,
+        model,
+        health_fingerprint.as_deref(),
+        block,
+        source,
+        repeat_interval_ms,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_quota_block_with_identity(
+    state: &ServerState,
+    share: &Share,
+    provider: &StoredProvider,
+    model: String,
+    health_fingerprint: Option<&str>,
+    block: &AccountUsageBlock,
+    source: &str,
+    repeat_interval_ms: u128,
+) -> anyhow::Result<ShareBindingHealthCheck> {
     let result = StreamCheckResult {
         status: HealthStatus::Failed,
         success: false,
@@ -701,9 +1329,9 @@ async fn record_quota_block(
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
     };
-    let log = health_usage_log(share, provider, &result, QUOTA_SOURCE, false);
+    let log = health_usage_log(share, provider, &result, source, false, health_fingerprint);
     let persisted = state
-        .push_health_usage_log_if_due(log, QUOTA_BLOCK_REPEAT_INTERVAL_MS)
+        .push_health_usage_log_if_due(log, repeat_interval_ms)
         .await?;
     let mut result = result;
     result.tested_at = seconds_from_ms(persisted.created_at_ms);
@@ -726,6 +1354,7 @@ fn health_usage_log(
     result: &StreamCheckResult,
     source: &str,
     streaming: bool,
+    health_fingerprint: Option<&str>,
 ) -> UsageLog {
     let mut log = UsageLog::new(
         provider.app,
@@ -741,13 +1370,32 @@ fn health_usage_log(
         },
         Default::default(),
     );
-    log.error_message = (!result.success).then(|| redact_provider_test_error(&result.message));
+    log.provider_health_fingerprint = health_fingerprint.map(str::to_string);
+    log.provider_health_result = Some(UsageProviderHealthResult {
+        status: match result.status {
+            HealthStatus::Operational => "operational",
+            HealthStatus::Degraded => "degraded",
+            HealthStatus::Failed => "failed",
+        }
+        .to_string(),
+        http_status: result.http_status,
+    });
+    let checked_at_ms = u128::try_from(result.tested_at)
+        .unwrap_or_default()
+        .saturating_mul(1_000);
+    log.created_at_ms = checked_at_ms;
+    log.completed_at_ms = checked_at_ms;
+    log.started_at_ms =
+        checked_at_ms.saturating_sub(u128::from(result.response_time_ms.unwrap_or(0)));
     log.apply_context(UsageLogContext {
         share_id: Some(share.id.clone()),
         share_name: share.display_name.clone(),
         data_source: Some(source.to_string()),
         is_health_check: true,
         is_streaming: streaming,
+        error_message: (!result.success).then(|| redact_provider_test_error(&result.message)),
+        failure_kind: result.error_category.clone(),
+        attempt_count: Some(result.retry_count.saturating_add(1)),
         stream_status: streaming.then(|| {
             if result.success {
                 "completed".to_string()
@@ -841,6 +1489,12 @@ async fn notify_runtime_refresh(state: &ServerState, share: &Share) {
             error = %error,
             "notify Router model health refresh failed"
         );
+    }
+}
+
+async fn notify_runtime_refreshes(state: &ServerState, shares: Vec<Share>) {
+    for share in shares {
+        notify_runtime_refresh(state, &share).await;
     }
 }
 
@@ -982,6 +1636,90 @@ mod tests {
             &result,
             "runtime-2",
         ));
+    }
+
+    #[test]
+    fn router_cycle_recovery_rejects_a_previous_runtime_fingerprint() {
+        let provider = provider();
+        let share = share("share-1", "p1", true, "active");
+        let source = "cc-switch-router-cycle:utc-1800";
+        let mut result = failed_probe_result(
+            &provider,
+            "gpt-test".to_string(),
+            "unused".to_string(),
+            "network",
+            Some(200),
+            1,
+        );
+        result.status = HealthStatus::Degraded;
+        result.success = true;
+        result.message = "Check succeeded".to_string();
+        result.response_time_ms = Some(25);
+        result.http_status = None;
+        result.error_category = None;
+
+        let mut usage = UsageStore::default();
+        usage.logs.push(health_usage_log(
+            &share,
+            &provider,
+            &result,
+            source,
+            true,
+            Some("health-fingerprint-old"),
+        ));
+        usage.provider_health.record(ProviderHealthObservation {
+            app: provider.app,
+            provider_id: provider.provider.id.clone(),
+            provider_revision: provider.resource.revision,
+            runtime_fingerprint: "health-fingerprint-old".to_string(),
+            status: ProviderHealthStatus::Healthy,
+            checked_at_ms: u128::try_from(result.tested_at)
+                .unwrap_or_default()
+                .saturating_mul(1_000),
+            source: source.to_string(),
+            status_code: result.http_status,
+            latency_ms: result.response_time_ms,
+            model: Some(result.model_used.clone()),
+            error_category: None,
+            error_message: None,
+            transient_failure: false,
+        });
+
+        let recovered =
+            existing_cycle_result_from_usage(&usage, &provider, source, "health-fingerprint-old")
+                .expect("matching runtime should recover the persisted cycle result");
+        assert!(recovered.success);
+        assert_eq!(recovered.status, HealthStatus::Degraded);
+        assert_eq!(recovered.http_status, None);
+        assert_eq!(recovered.retry_count, 1);
+        assert!(!recovered_cycle_result_is_quota_blocked(&recovered));
+        let mut quota_blocked = recovered.clone();
+        quota_blocked.success = false;
+        quota_blocked.error_category = Some("quotaBlocked".to_string());
+        assert!(recovered_cycle_result_is_quota_blocked(&quota_blocked));
+        assert!(existing_cycle_result_from_usage(
+            &usage,
+            &provider,
+            source,
+            "health-fingerprint-new",
+        )
+        .is_none());
+        assert_eq!(
+            existing_cycle_share_ids_from_usage(
+                &usage,
+                &provider,
+                source,
+                "health-fingerprint-old",
+            ),
+            HashSet::from([share.id.clone()])
+        );
+        assert!(existing_cycle_share_ids_from_usage(
+            &usage,
+            &provider,
+            source,
+            "health-fingerprint-new",
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1170,5 +1908,13 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "active");
+    }
+
+    #[test]
+    fn projection_excludes_a_bound_but_disabled_share_app() {
+        let mut disabled = share("disabled-app", "p1", true, "active");
+        disabled.enabled_apps = Some(Default::default());
+
+        assert!(active_shares_for_provider(&[disabled], AppKind::Codex, "p1").is_empty());
     }
 }

@@ -1,8 +1,8 @@
 # Router 契约（Server 侧视角）
 
-> 状态：**权威文档（Server 侧）**。线格式、字段定义与 Router 内部行为以 `cc-switch-router/PROTOCOL.md` 为准（11 节）；本文只描述 Server 实现了什么、在哪里实现、以及 Server 侧的判定规则。
+> 状态：**权威文档（Server 侧）**。线格式、字段定义与 Router 内部行为以 `cc-switch-router/PROTOCOL.md` 为准；本文只描述 Server 实现了什么、在哪里实现、以及 Server 侧的判定规则。
 >
-> 最后核对：2026-08-20。
+> 最后核对：2026-08-24。
 
 ## 1. 实现位置
 
@@ -46,9 +46,13 @@ Router 主动调用 Server 的 `/_ctl/*` 端点：
 | `/_share-router/health` | GET | 健康探测 |
 | `/_share-router/request-logs` | GET | 请求日志查询 |
 | `/_share-router/share-runtime` | GET | Share 运行时快照 |
-| `/_share-router/model-health` | POST | 模型健康上报 |
+| `/_share-router/model-health` | POST | 兼容的单 Share 模型探针 |
+| `/_share-router/model-health/batch` | POST | 模型健康批协议 v1（滚动回退） |
+| `/_share-router/model-health/batch-v2` | POST | 当前模型健康批协议 v2 |
 
-Share 定位头：`x-cc-switch-share-id`（`src/api/control/share_router.rs`）。
+单目标请求使用 `x-cc-switch-share-id` 定位 Share；batch 从 HMAC 签名 body 的 `targets[]` 定位，不依赖单 Share 头。v2 要求 `contractVersion=2`，按 Provider runtime 去重执行并返回稳定的 SHA-256 `observationId`、outcome、failure domain、reason 和 evidence version。失效 Share 目标或单个 Provider 组异常只省略对应结果，不中断其他组。
+
+Router 半小时探针与“连接”弹窗共用 Share Contract v4 的 `modelProbe` 测试模型和 Provider 策略，但执行范围不同：前者是 Server 内部 Provider 测试，后者经公开 Share URL 做端到端连接测试。Server 本地半小时 scheduler 在 45 分钟内已有 Router cycle 时跳过相同 Provider。
 
 ## 5. IngressContext
 
@@ -68,14 +72,16 @@ Server 侧校验（`src/clients/router/ingress.rs`）：
 
 Router 通过**未签名**头 `x-cc-switch-ingress-body-limit` 声明其上限；Server 的生效值为 `min(本地 requestBodyLimits, Router 声明)`。本地值存于 `server.json` 的 `requestBodyLimits`。
 
-## 7. Share 契约 v2
+## 7. Share 契约 v4
 
-当前生效字段只有：
+v4 延续 v2 的统一 Share 访问边界：
 
 - `freeAccess`（默认 `false`，即私有）
 - `userGrants`
 - `tokenLimit`
 - `parallelLimit`
+
+并新增不含凭据的 Provider 运行时探针描述 `appRuntimes.*.modelProbe` / `appProviders.*.modelProbe`。它包含 Server 权威测试模型、wire model、结构化请求、响应完成模式、payload revision 和 health fingerprint。Router 的 Curl、端到端测试、半小时定时探针不得另行维护硬编码模型或请求模板。
 
 以下 v1 字段**已退役，且对 camelCase 与 snake_case 两种写法都 fail-closed**（`src/domain/sharing/retired_fields.rs`）：
 `acl`、`forSale`/`for_sale`、`officialPricePercent`、`forSaleOfficialPricePercentByApp`、`sharedWithEmails`、`marketAccessMode`、`accessByApp`、`appSettings`。

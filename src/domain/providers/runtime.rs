@@ -27,7 +27,149 @@ pub const MAX_PROVIDER_REQUEST_TIMEOUT_SECONDS: u64 = 3_600;
 pub const MAX_PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS: u64 = 600;
 pub const MAX_PROVIDER_IDLE_TIMEOUT_SECONDS: u64 = 3_600;
 pub const PROVIDER_MODEL_PROBE_PROMPT: &str = "ping";
-const PROVIDER_MODEL_PROBE_PAYLOAD_REVISION: u32 = 1;
+pub const PROVIDER_MODEL_PROBE_PAYLOAD_REVISION: u32 = 2;
+
+/// Public, credential-free description of the exact model request used to
+/// probe a Provider runtime.  The Router renders connection examples from this
+/// value and asks the Server to execute the same probe; neither consumer needs
+/// to infer Provider-specific model or payload rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderModelProbe {
+    /// Public API vocabulary.  This deliberately differs from the internal
+    /// product names (`codex` / `claude`) used by AppKind.
+    pub api_type: String,
+    /// Authoritative Server test model, including optional modifiers such as
+    /// Codex `@low`.
+    pub requested_model: String,
+    /// Model value placed on the public API wire.  For example
+    /// `gpt-5.6-luna@low` becomes `gpt-5.6-luna` plus a reasoning field.
+    pub wire_model: String,
+    pub method: String,
+    pub path: String,
+    pub body: Value,
+    pub stream: bool,
+    pub response_mode: String,
+    pub payload_revision: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health_fingerprint: String,
+}
+
+impl ProviderModelProbe {
+    pub fn body_json(&self) -> String {
+        serde_json::to_string(&self.body).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+pub fn build_provider_model_probe(
+    app: AppKind,
+    provider_type: ProviderType,
+    requested_model: &str,
+    prompt: &str,
+    stream: bool,
+    health_fingerprint: impl Into<String>,
+) -> ProviderModelProbe {
+    let requested_model = requested_model.trim().to_string();
+    let (wire_model, reasoning_effort) = if app == AppKind::Codex {
+        split_probe_model_modifier(&requested_model)
+    } else {
+        (requested_model.clone(), None)
+    };
+    let (api_type, path, body, response_mode) = match app {
+        AppKind::Claude => (
+            "anthropic",
+            "/v1/messages".to_string(),
+            json!({
+                "model": wire_model.clone(),
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": stream,
+            }),
+            if stream { "anthropic_sse" } else { "json" },
+        ),
+        AppKind::Codex => {
+            let mut body = json!({
+                "model": wire_model.clone(),
+                "input": [{"role": "user", "content": prompt}],
+                "stream": stream,
+            });
+            if let Some(effort) = reasoning_effort {
+                body["reasoning"] = json!({ "effort": effort });
+            } else if provider_type == ProviderType::CodexOAuth {
+                body["reasoning"] = json!({ "effort": "low" });
+            } else {
+                body["max_output_tokens"] = json!(1);
+            }
+            if provider_type == ProviderType::CodexOAuth {
+                body["store"] = json!(false);
+                body["include"] = json!(["reasoning.encrypted_content"]);
+                body["instructions"] = json!("");
+                body["tools"] = json!([]);
+                body["parallel_tool_calls"] = json!(false);
+            }
+            (
+                "openai",
+                "/v1/responses".to_string(),
+                body,
+                if stream { "responses_sse" } else { "json" },
+            )
+        }
+        AppKind::Gemini => {
+            let operation = if stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            (
+                "gemini",
+                format!(
+                    "/v1beta/models/{}:{operation}",
+                    encode_probe_path_segment(&wire_model)
+                ),
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 1},
+                }),
+                if stream { "gemini_sse" } else { "json" },
+            )
+        }
+    };
+    ProviderModelProbe {
+        api_type: api_type.to_string(),
+        requested_model,
+        wire_model,
+        method: "POST".to_string(),
+        path,
+        body,
+        stream,
+        response_mode: response_mode.to_string(),
+        payload_revision: PROVIDER_MODEL_PROBE_PAYLOAD_REVISION,
+        health_fingerprint: health_fingerprint.into(),
+    }
+}
+
+fn split_probe_model_modifier(model: &str) -> (String, Option<String>) {
+    if let Some(position) = model.find('@').or_else(|| model.find('#')) {
+        let wire_model = model[..position].trim();
+        let modifier = model[position + 1..].trim();
+        if !wire_model.is_empty() && !modifier.is_empty() {
+            return (wire_model.to_string(), Some(modifier.to_string()));
+        }
+    }
+    (model.trim().to_string(), None)
+}
+
+fn encode_probe_path_segment(value: &str) -> String {
+    let mut url =
+        url::Url::parse("https://probe.invalid/v1beta/models").expect("static probe URL is valid");
+    url.path_segments_mut()
+        .expect("static probe URL can accept path segments")
+        .push(value);
+    url.path()
+        .strip_prefix("/v1beta/models/")
+        .unwrap_or(value)
+        .to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1495,6 +1637,89 @@ mod tests {
         assert_eq!(runtime.transport.timeout_ms, 300_000);
         assert_eq!(runtime.transport.stream_first_byte_timeout_ms, 120_000);
         assert_eq!(runtime.transport.stream_idle_timeout_ms, 300_000);
+    }
+
+    #[test]
+    fn public_model_probes_match_each_app_wire_contract() {
+        let claude = build_provider_model_probe(
+            AppKind::Claude,
+            ProviderType::Claude,
+            "claude-sonnet-test",
+            "ping",
+            true,
+            "claude-fingerprint",
+        );
+        assert_eq!(claude.api_type, "anthropic");
+        assert_eq!(claude.path, "/v1/messages");
+        assert_eq!(claude.body["model"], "claude-sonnet-test");
+        assert_eq!(claude.body["stream"], true);
+        assert_eq!(claude.response_mode, "anthropic_sse");
+
+        let codex = build_provider_model_probe(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            "gpt-5.6-luna@low",
+            "ping",
+            true,
+            "codex-fingerprint",
+        );
+        assert_eq!(codex.api_type, "openai");
+        assert_eq!(codex.path, "/v1/responses");
+        assert_eq!(codex.requested_model, "gpt-5.6-luna@low");
+        assert_eq!(codex.wire_model, "gpt-5.6-luna");
+        assert_eq!(codex.body["model"], "gpt-5.6-luna");
+        assert_eq!(codex.body["reasoning"]["effort"], "low");
+        assert_eq!(codex.body["store"], false);
+        assert_eq!(codex.response_mode, "responses_sse");
+
+        let gemini = build_provider_model_probe(
+            AppKind::Gemini,
+            ProviderType::Gemini,
+            "publishers/google/models/gemini-test",
+            "ping",
+            false,
+            "gemini-fingerprint",
+        );
+        assert_eq!(gemini.api_type, "gemini");
+        assert_eq!(
+            gemini.path,
+            "/v1beta/models/publishers%2Fgoogle%2Fmodels%2Fgemini-test:generateContent"
+        );
+        assert_eq!(gemini.body["contents"][0]["parts"][0]["text"], "ping");
+        assert_eq!(gemini.response_mode, "json");
+        assert_eq!(
+            gemini.payload_revision,
+            PROVIDER_MODEL_PROBE_PAYLOAD_REVISION
+        );
+    }
+
+    #[test]
+    fn non_codex_probe_model_modifiers_remain_literal_model_names() {
+        let claude = build_provider_model_probe(
+            AppKind::Claude,
+            ProviderType::Claude,
+            "claude-sonnet@2026-08-24",
+            "ping",
+            true,
+            "claude-fingerprint",
+        );
+        assert_eq!(claude.wire_model, "claude-sonnet@2026-08-24");
+        assert_eq!(claude.body["model"], "claude-sonnet@2026-08-24");
+        assert!(claude.body.get("reasoning").is_none());
+
+        let gemini = build_provider_model_probe(
+            AppKind::Gemini,
+            ProviderType::Gemini,
+            "gemini-preview#2026-08-24",
+            "ping",
+            false,
+            "gemini-fingerprint",
+        );
+        assert_eq!(gemini.wire_model, "gemini-preview#2026-08-24");
+        assert_eq!(
+            gemini.path,
+            "/v1beta/models/gemini-preview%232026-08-24:generateContent"
+        );
     }
 
     fn provider(profile_id: &str, provider_type: ProviderType) -> StoredProvider {

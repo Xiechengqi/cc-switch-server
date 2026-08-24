@@ -1089,7 +1089,7 @@ pub fn default_enabled_test_app(family_id: &str, enabled: &[AppKind]) -> Option<
     if family_id == "family.openai_oauth" && enabled.contains(&AppKind::Codex) {
         return Some(AppKind::Codex);
     }
-    [AppKind::Claude, AppKind::Codex, AppKind::Gemini]
+    [AppKind::Codex, AppKind::Claude, AppKind::Gemini]
         .into_iter()
         .find(|app| enabled.contains(app))
 }

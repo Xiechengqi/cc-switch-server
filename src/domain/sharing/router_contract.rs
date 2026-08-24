@@ -20,13 +20,14 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::registry::profile_by_id;
 use crate::domain::providers::runtime::{
-    authoritative_managed_account, ProviderRuntimePlan, RuntimeModelPolicy,
+    authoritative_managed_account, build_provider_model_probe, ProviderModelProbe,
+    ProviderRuntimePlan, RuntimeModelPolicy, PROVIDER_MODEL_PROBE_PROMPT,
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::Share;
 
-pub const SHARE_CONTRACT_VERSION: u16 = 3;
+pub const SHARE_CONTRACT_VERSION: u16 = 4;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -524,6 +525,8 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_policy: Option<RuntimeModelPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_probe: Option<ProviderModelProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
@@ -580,6 +583,8 @@ pub struct ShareAppProvider {
     pub model_policy_source: Option<ModelPolicySource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_policy: Option<RuntimeModelPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_probe: Option<ProviderModelProbe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ShareProviderHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1110,6 +1115,7 @@ fn upstream_provider(
     let provider_type_id = resolved_provider_type.as_str().to_string();
     let (model_policy_scope, model_policy_source, model_policy) =
         provider_model_policy_metadata(provider, runtime_plan);
+    let model_probe = provider_model_probe(provider, runtime_plan);
     ShareUpstreamProvider {
         kind: provider_type_id.clone(),
         app: app.to_string(),
@@ -1127,6 +1133,7 @@ fn upstream_provider(
         model_policy_scope,
         model_policy_source,
         model_policy,
+        model_probe,
         health,
         available,
     }
@@ -1170,6 +1177,7 @@ fn app_provider(input: AppProviderInput<'_>) -> ShareAppProvider {
     let provider_type_id = resolved_provider_type.as_str().to_string();
     let (model_policy_scope, model_policy_source, model_policy) =
         provider_model_policy_metadata(provider, runtime_plan);
+    let model_probe = provider_model_probe(provider, runtime_plan);
     ShareAppProvider {
         id: provider.provider.id.clone(),
         name: provider.provider.name.clone(),
@@ -1203,6 +1211,7 @@ fn app_provider(input: AppProviderInput<'_>) -> ShareAppProvider {
         model_policy_scope,
         model_policy_source,
         model_policy,
+        model_probe,
         health,
         available,
     }
@@ -1229,6 +1238,28 @@ fn provider_model_policy_metadata(
     let model_policy_source = bundle_model_policy_source(&provider.provider, profile).ok();
     let model_policy = runtime_plan.map(|plan| plan.model_policy.clone());
     (model_policy_scope, model_policy_source, model_policy)
+}
+
+fn provider_model_probe(
+    provider: &StoredProvider,
+    runtime_plan: Option<&ProviderRuntimePlan>,
+) -> Option<ProviderModelProbe> {
+    let plan = runtime_plan?;
+    if health::provider_probe_support(plan) != health::ProviderProbeSupport::Supported {
+        return None;
+    }
+    let test_model = plan.test_model.as_deref()?.trim();
+    if test_model.is_empty() {
+        return None;
+    }
+    Some(build_provider_model_probe(
+        provider.app,
+        provider.provider_type,
+        test_model,
+        PROVIDER_MODEL_PROBE_PROMPT,
+        true,
+        plan.health_fingerprint(),
+    ))
 }
 
 fn provider_availability(
@@ -1801,15 +1832,19 @@ mod tests {
             .insert("testApp".to_string(), json!("codex"));
         provider.resource.profile_id =
             Some(crate::domain::providers::registry::ProfileId::parse("codex.grok_oauth").unwrap());
-        let providers = ProviderStore {
+        let mut providers = ProviderStore {
             providers: vec![provider],
             ..ProviderStore::default()
         };
+        providers
+            .rebuild_runtime_index(&AccountStore::default())
+            .expect("compile Provider runtime fixture");
         let share = test_share(provider_type, None);
 
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         let provider = descriptor.app_providers.codex.first().unwrap();
 
+        assert_eq!(descriptor.contract_version, 4);
         assert_eq!(provider.bundle_id.as_deref(), Some("p1"));
         assert_eq!(provider.supported_apps, ["claude", "codex", "gemini"]);
         assert_eq!(provider.model_policy_scope, Some(ModelPolicyScope::Global));
@@ -1820,7 +1855,49 @@ mod tests {
         let serialized = serde_json::to_value(provider).unwrap();
         assert_eq!(serialized["modelPolicyScope"], json!("global"));
         assert_eq!(serialized["modelPolicySource"], json!("bundle_global"));
+        let probe = provider.model_probe.as_ref().expect("v4 model probe");
+        assert_eq!(probe.api_type, "openai");
+        assert_eq!(probe.method, "POST");
+        assert_eq!(probe.path, "/v1/responses");
+        assert_eq!(probe.body["model"], probe.wire_model);
+        assert_eq!(
+            descriptor
+                .app_runtimes
+                .codex
+                .as_ref()
+                .and_then(|runtime| runtime.model_probe.as_ref()),
+            Some(probe)
+        );
         assert!(provider.enabled);
+    }
+
+    #[test]
+    fn descriptor_omits_model_probe_when_the_runtime_driver_cannot_test() {
+        let provider_type = ProviderType::GrokOAuth;
+        let mut provider = test_provider(provider_type);
+        provider.resource.profile_id =
+            Some(crate::domain::providers::registry::ProfileId::parse("codex.grok_oauth").unwrap());
+        let mut providers = ProviderStore {
+            providers: vec![provider],
+            ..ProviderStore::default()
+        };
+        providers
+            .rebuild_runtime_index(&AccountStore::default())
+            .expect("compile Provider runtime fixture");
+        let stored = providers.providers.first().unwrap();
+        let mut plan = providers
+            .runtime_plan(stored.app, &stored.provider.id)
+            .unwrap()
+            .as_ref()
+            .clone();
+        plan.driver_id =
+            crate::domain::providers::registry::DriverId::parse("special.antigravity").unwrap();
+
+        assert_eq!(
+            health::provider_probe_support(&plan),
+            health::ProviderProbeSupport::Unsupported
+        );
+        assert!(provider_model_probe(stored, Some(&plan)).is_none());
     }
 
     #[test]
@@ -2584,7 +2661,8 @@ mod tests {
                         "upstreamModel": "glm-5.2",
                         "gpt-5.5": "glm-5.2"
                     },
-                    "models": ["glm-5.2"]
+                    "models": ["glm-5.2"],
+                    "testModel": "glm-5.2"
                 }),
                 category: None,
                 meta: Some(ProviderMeta {
