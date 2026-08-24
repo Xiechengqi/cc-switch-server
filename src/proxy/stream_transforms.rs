@@ -5218,6 +5218,12 @@ mod tests {
                 ProxyRoute::Gemini,
                 "to_gemini",
             ),
+            (
+                AppKind::Gemini,
+                ProviderType::GitHubCopilot,
+                ProxyRoute::Gemini,
+                "to_gemini",
+            ),
         ];
         for (app, provider_type, route, expected) in cases {
             let stored = gemini_v1internal_stored_provider(app, provider_type);
@@ -5427,6 +5433,53 @@ mod tests {
                 output_tokens: 5,
             },
         );
+    }
+
+    #[test]
+    fn copilot_chat_stream_to_gemini_preserves_tool_usage_and_single_terminal() {
+        use crate::domain::providers::model::{AppKind, ProviderType};
+
+        let stored =
+            gemini_v1internal_stored_provider(AppKind::Gemini, ProviderType::GitHubCopilot);
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::Gemini,
+            transforms::ResponsesToolContext::default(),
+        );
+        let chunks = [
+            Bytes::from_static(b"data: {\"id\":\"chat-copilot\",\"model\":\"gemini-3.5-flash\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_lookup\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]},\"finish_reason\":null}]}\n\n"),
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}]},\"finish_reason\":null}]}\n\n"),
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+            Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":5,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n"),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+        let mut output = Vec::new();
+        for chunk in chunks {
+            output.extend_from_slice(&transformer.push(chunk).unwrap());
+        }
+        output.extend_from_slice(&transformer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+        let payloads = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
+            .collect::<Vec<_>>();
+        let tool = payloads
+            .iter()
+            .find_map(|payload| payload.pointer("/candidates/0/content/parts/0/functionCall"))
+            .unwrap();
+        assert_eq!(tool["id"], "call_lookup");
+        assert_eq!(tool["name"], "lookup");
+        assert_eq!(tool["args"]["q"], "rust");
+        let terminals = payloads
+            .iter()
+            .filter(|payload| payload.pointer("/candidates/0/finishReason") == Some(&json!("STOP")))
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["usageMetadata"]["promptTokenCount"], 7);
+        assert_eq!(terminals[0]["usageMetadata"]["cachedContentTokenCount"], 2);
+        assert_eq!(terminals[0]["usageMetadata"]["candidatesTokenCount"], 5);
     }
 
     #[test]

@@ -740,6 +740,14 @@ fn assert_generation_observation(observation: &QoderRequestObservation) {
             .map(String::as_str),
         Some(MODEL_SOURCE)
     );
+    assert_eq!(
+        observation.headers.get("user-agent").map(String::as_str),
+        Some(crate::domain::qoder::QODER_COSY_USER_AGENT)
+    );
+    assert_eq!(
+        observation.headers.get("cosy-version").map(String::as_str),
+        Some("1.24.2")
+    );
     let body = observation.decoded_body.as_ref().unwrap();
     assert_eq!(body["model_config"], model_config());
     assert_eq!(

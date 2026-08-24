@@ -116,6 +116,22 @@ describe("Server Provider profile drafts", () => {
     expect(profileAllowsEndpointEditing(profile!)).toBe(false);
   });
 
+  it("materializes the Server-native Gemini GitHub Copilot surface", () => {
+    const profile = providerRegistry.profiles.find(
+      (item) => item.profileId === "gemini.github_copilot",
+    );
+    expect(profile).toBeDefined();
+
+    const draft = createDraftForProfile(profile!);
+    expect(draft.name).toBe("GitHub Copilot");
+    expect(readUpstreamModel(draft.settingsConfig)).toBe("gemini-3.5-flash");
+    expect(draft.meta).toMatchObject({
+      providerType: "github_copilot",
+    });
+    expect(serializedSecrets(draft.settingsConfig)).toEqual([]);
+    expect(profileAllowsEndpointEditing(profile!)).toBe(false);
+  });
+
   it("materializes the Server-native Codex Kiro surface", () => {
     const profile = providerRegistry.profiles.find(
       (item) => item.profileId === "codex.kiro_oauth",

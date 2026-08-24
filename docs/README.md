@@ -2,7 +2,7 @@
 
 > 本文件是 cc-switch-server 全部文档的**唯一索引**。新增文档必须在此登记并标注状态，否则 `scripts/static-checks.sh` 的文档检查会失败。
 >
-> 最后核对：2026-08-20。
+> 最后核对：2026-08-24。
 
 ## 状态标记
 
@@ -46,6 +46,8 @@
 | [grok-oauth.md](provider/grok-oauth.md) | 权威 | Grok OAuth 单账号反代 |
 | [kimi-code.md](provider/kimi-code.md) | 权威 | Kimi Code 单账号反代 |
 | [cursor.md](provider/cursor.md) | 权威 | Cursor AgentService 验收 |
+| [code-plan-delta-2026-08-23.md](provider/code-plan-delta-2026-08-23.md) | 权威 | 2026-08-23 Code Plan 协议增量、证据边界与 live 缺口 |
+| [code-plan-enhancement-2026-08-24.md](provider/code-plan-enhancement-2026-08-24.md) | 权威 | 七类低于 9 分 Code Plan 的参考、实施、拒绝项、不变量证明与 live gates |
 
 ## Share `docs/share/`
 

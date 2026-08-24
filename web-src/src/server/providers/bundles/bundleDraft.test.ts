@@ -173,7 +173,7 @@ describe("Provider Bundle drafts", () => {
     expect(openai.testApp).toBe("codex");
   });
 
-  it("creates both Copilot surfaces with one managed-account binding", () => {
+  it("creates all Copilot surfaces with one managed-account binding", () => {
     const family = familyById("family.github_copilot")!;
     const draft = createProviderBundleDraft(family);
     expect(
@@ -193,6 +193,11 @@ describe("Provider Bundle drafts", () => {
         profileId: "codex.github_copilot",
         enabled: true,
       },
+      {
+        app: "gemini",
+        profileId: "gemini.github_copilot",
+        enabled: true,
+      },
     ]);
     expect(supportsPerAppModelPolicy(family)).toBe(true);
     expect(requiresPerAppModelPolicy(family)).toBe(false);
@@ -202,6 +207,7 @@ describe("Provider Bundle drafts", () => {
     ).toEqual([
       { app: "claude", upstreamModel: "claude-sonnet-5" },
       { app: "codex", upstreamModel: "gpt-5.5" },
+      { app: "gemini", upstreamModel: "gemini-3.5-flash" },
     ]);
 
     draft.accountId = "copilot-account";
@@ -213,7 +219,7 @@ describe("Provider Bundle drafts", () => {
     });
     expect(write.modelPolicyScope).toBe("per_app");
     expect(write.modelPolicy).toBeUndefined();
-    expect(write.surfaces).toHaveLength(2);
+    expect(write.surfaces).toHaveLength(3);
     expect(write.surfaces.every((surface) => surface.enabled)).toBe(true);
 
     const global = changeModelPolicyScope(draft, "global");

@@ -723,7 +723,7 @@ async fn fetch_signed_quota_usage(
     }
     let mut response = request
         .header(ACCEPT, "application/json")
-        .header(USER_AGENT, "Go-http-client/2.0")
+        .header(USER_AGENT, crate::domain::qoder::QODER_COSY_USER_AGENT)
         .header("date", http_date)
         .header("signature", center_signature)
         .header("appcode", QODER_APP_CODE)
@@ -962,7 +962,7 @@ async fn refresh_global_token(
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .header(ACCEPT_ENCODING, "identity")
-        .header(USER_AGENT, "Go-http-client/2.0")
+        .header(USER_AGENT, crate::domain::qoder::QODER_COSY_USER_AGENT)
         .header("date", date)
         .header("signature", signature)
         .header("appcode", QODER_APP_CODE)
@@ -1269,7 +1269,7 @@ async fn complete_cn_auth_status(
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .header(ACCEPT_ENCODING, "identity")
-        .header(USER_AGENT, "Go-http-client/2.0")
+        .header(USER_AGENT, crate::domain::qoder::QODER_COSY_USER_AGENT)
         .header("date", date)
         .header("signature", signature)
         .header("appcode", QODER_APP_CODE)

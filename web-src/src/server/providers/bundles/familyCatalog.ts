@@ -43,6 +43,8 @@ export const SUBSCRIPTION_FAMILY_IDS = [
   "family.kimi_coding_api_key",
   "family.zhipu_glm_cn",
   "family.zhipu_glm_global",
+  "family.bailian_coding_plan_cn",
+  "family.bailian_coding_plan_global",
   "family.minimax_cn",
   "family.minimax_global",
   "family.volcengine_coding_plan",

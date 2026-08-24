@@ -108,10 +108,7 @@ pub fn cursor_agentservice_headers(
         ),
         (
             "x-cursor-client-version".to_string(),
-            match rail {
-                CursorProtocolRail::OAuthCli => account.resolved_client_version(),
-                CursorProtocolRail::ApiKeySdk => cursor_sdk_client_version(),
-            },
+            cursor_client_version_for_rail(rail, account),
         ),
         ("x-ghost-mode".to_string(), "true".to_string()),
         ("x-request-id".to_string(), request_id.clone()),
@@ -206,6 +203,16 @@ fn default_cursor_cli_versions_dir(home: &std::path::Path) -> std::path::PathBuf
             .join("cursor-agent/versions")
     } else {
         home.join(".local/share/cursor-agent/versions")
+    }
+}
+
+pub(crate) fn cursor_client_version_for_rail(
+    rail: CursorProtocolRail,
+    account: &CursorAccountData,
+) -> String {
+    match rail {
+        CursorProtocolRail::OAuthCli => account.resolved_client_version(),
+        CursorProtocolRail::ApiKeySdk => cursor_sdk_client_version(),
     }
 }
 

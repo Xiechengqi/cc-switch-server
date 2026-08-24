@@ -78,6 +78,9 @@ describe("familyCatalog", () => {
     expect(familyCategoryId("family.cursor_api_key")).toBe("subscription");
     expect(familyCategoryId("family.ollama_cloud")).toBe("subscription");
     expect(familyCategoryId("family.kimi_coding_api_key")).toBe("subscription");
+    expect(familyCategoryId("family.bailian_coding_plan_cn")).toBe(
+      "subscription",
+    );
     expect(familyCategoryId("family.deepseek_account")).toBe("api_key");
     expect(familyIsExperimental(familyById("family.cursor_oauth")!)).toBe(true);
     expect(familySupportedApps(familyById("family.openai_oauth")!)).toEqual([

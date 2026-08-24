@@ -510,6 +510,10 @@ pub fn valid_replay_content(content: &[u8]) -> bool {
                 .get("signature")
                 .and_then(Value::as_str)
                 .is_some_and(|signature| !signature.trim().is_empty())
+            && block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .is_none_or(|thinking| !super::kimi::is_kimi_reasoning_unavailable(thinking))
     });
     let tool_use = blocks.iter().any(|block| {
         block.get("type").and_then(Value::as_str) == Some("tool_use")
@@ -543,7 +547,7 @@ pub fn restore_kimi_thinking_replay_content(body: &[u8], cached_content: &[u8]) 
         let Some(content) = message.get("content") else {
             continue;
         };
-        if content == &cached || content_has_thinking(content) {
+        if content == &cached || content_has_usable_thinking(content) {
             continue;
         }
         let Some(current_parts) = non_thinking_content_parts(content) else {
@@ -558,14 +562,25 @@ pub fn restore_kimi_thinking_replay_content(body: &[u8], cached_content: &[u8]) 
     None
 }
 
-fn content_has_thinking(content: &Value) -> bool {
+fn content_has_usable_thinking(content: &Value) -> bool {
     content.as_array().is_some_and(|parts| {
-        parts.iter().any(|part| {
-            matches!(
-                part.get("type").and_then(Value::as_str),
-                Some("thinking" | "redacted_thinking")
-            )
-        })
+        parts
+            .iter()
+            .any(|part| match part.get("type").and_then(Value::as_str) {
+                Some("redacted_thinking") => true,
+                Some("thinking") => {
+                    part.get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|signature| !signature.trim().is_empty())
+                        && part
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .is_none_or(|thinking| {
+                                !super::kimi::is_kimi_reasoning_unavailable(thinking)
+                            })
+                }
+                _ => false,
+            })
     })
 }
 
@@ -1009,6 +1024,34 @@ mod tests {
             {"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"README.md"}}
         ]}]}"#;
         assert!(restore_kimi_thinking_replay_content(already_signed, cached).is_none());
+
+        let signature_only = br#"{"messages":[{"role":"assistant","content":[
+            {"type":"thinking","signature":"caller-sig"},
+            {"type":"text","text":"inspect"},
+            {"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"README.md"}}
+        ]}]}"#;
+        assert!(restore_kimi_thinking_replay_content(signature_only, cached).is_none());
+
+        for placeholder in [
+            "",
+            crate::proxy::kimi::KIMI_REASONING_UNAVAILABLE,
+            "unsigned caller reasoning",
+        ] {
+            let body = serde_json::to_vec(
+                &serde_json::json!({"messages":[{"role":"assistant","content":[
+                    {"type":"thinking","thinking":placeholder},
+                    {"type":"text","text":"inspect"},
+                    {"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"README.md"}}
+                ]}]}),
+            )
+            .unwrap();
+            let restored = restore_kimi_thinking_replay_content(&body, cached).unwrap();
+            let restored = serde_json::from_slice::<Value>(&restored).unwrap();
+            assert_eq!(
+                restored.pointer("/messages/0/content").unwrap(),
+                &serde_json::from_slice::<Value>(cached).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1116,6 +1159,9 @@ mod tests {
         assert!(!valid_replay_content(br#"[{"type":"text","text":"x"}]"#));
         assert!(valid_replay_content(
             br#"[{"type":"thinking","signature":"sig"},{"type":"tool_use","id":"tool"}]"#
+        ));
+        assert!(!valid_replay_content(
+            br#"[{"type":"thinking","thinking":"[reasoning unavailable]","signature":"sig"},{"type":"tool_use","id":"tool"}]"#
         ));
     }
 

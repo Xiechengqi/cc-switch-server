@@ -38,6 +38,10 @@ use super::super::retry_policy::{AuthRecoveryDecision, AuthRecoveryState};
 use super::super::router::ProxyRoute;
 use super::super::usage::{log_usage, update_stream_usage};
 use super::super::{setting, ProxyError};
+use super::agent_endpoint::{
+    default_cursor_server_config_url, resolve_cursor_agent_endpoint, CursorAgentEndpointRequest,
+    CursorAgentEndpointScope,
+};
 use super::agent_proto::{
     decode_agent_server_message, decode_exec_server_event, decode_kv_server_event,
     encode_agent_run_request, encode_exec_background_shell_rejected, encode_exec_delete_rejected,
@@ -93,10 +97,12 @@ enum CursorCredential {
     OAuthCli {
         account: CursorAccountData,
         access_token: String,
+        endpoint_principal: String,
     },
     ApiKeySdk {
         account: CursorAccountData,
         access_token: String,
+        endpoint_principal: String,
     },
 }
 
@@ -119,6 +125,17 @@ impl CursorCredential {
             Self::OAuthCli { access_token, .. } | Self::ApiKeySdk { access_token, .. } => {
                 access_token
             }
+        }
+    }
+
+    fn endpoint_principal(&self) -> &str {
+        match self {
+            Self::OAuthCli {
+                endpoint_principal, ..
+            }
+            | Self::ApiKeySdk {
+                endpoint_principal, ..
+            } => endpoint_principal,
         }
     }
 }
@@ -233,17 +250,25 @@ pub async fn forward_agentservice(
     let mut session_key = resolved_session.key.clone();
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_input_tokens(&plan.user_text);
-    let (mut session_entry, mut session_access_token) = acquire_or_open_session(
-        &state,
-        &stored,
-        &runtime_fingerprint,
-        &plan,
+    let mut auth_recovery = AuthRecoveryState::default();
+    let session_open_context = CursorSessionOpenContext {
+        state: &state,
+        stored: &stored,
+        runtime_fingerprint: &runtime_fingerprint,
+        plan: &plan,
+        request_context: &request_context,
+        timeouts,
+    };
+    let opened = acquire_or_open_session(
+        &session_open_context,
         &session_key,
         resolved_session.parked.as_ref(),
-        timeouts,
+        &mut auth_recovery,
     )
     .await?;
-    let mut auth_recovery = AuthRecoveryState::default();
+    let mut session_entry = opened.entry;
+    let mut session_access_token = opened.access_token;
+    session_key = opened.key;
     let status = loop {
         let status = session_status(&session_entry).await?;
         match cursor_agentservice_auth_action(
@@ -277,17 +302,16 @@ pub async fn forward_agentservice(
                     refreshed_scope,
                     session_key.conversation_id().to_string(),
                 );
-                (session_entry, session_access_token) = acquire_or_open_session(
-                    &state,
-                    &stored,
-                    &runtime_fingerprint,
-                    &plan,
+                let opened = acquire_or_open_session(
+                    &session_open_context,
                     &refreshed_key,
                     None,
-                    timeouts,
+                    &mut auth_recovery,
                 )
                 .await?;
-                session_key = refreshed_key;
+                session_entry = opened.entry;
+                session_access_token = opened.access_token;
+                session_key = opened.key;
             }
         }
     };
@@ -1370,23 +1394,36 @@ async fn declared_tool_names(
     session.declared_tool_names.clone()
 }
 
+struct CursorSessionOpenContext<'a> {
+    state: &'a ServerState,
+    stored: &'a StoredProvider,
+    runtime_fingerprint: &'a str,
+    plan: &'a AgentRunPlan,
+    request_context: &'a UsageLogContext,
+    timeouts: CursorH2Timeouts,
+}
+
+struct OpenedCursorSession {
+    entry: Arc<tokio::sync::Mutex<CursorSession>>,
+    access_token: Option<String>,
+    key: CursorSessionKey,
+}
+
 async fn acquire_or_open_session(
-    state: &ServerState,
-    stored: &StoredProvider,
-    runtime_fingerprint: &str,
-    plan: &AgentRunPlan,
+    context: &CursorSessionOpenContext<'_>,
     session_key: &CursorSessionKey,
     parked: Option<&CursorSessionReference>,
-    timeouts: CursorH2Timeouts,
-) -> Result<(Arc<tokio::sync::Mutex<CursorSession>>, Option<String>), ProxyError> {
-    if !plan.tool_results.is_empty() {
+    auth_recovery: &mut AuthRecoveryState,
+) -> Result<OpenedCursorSession, ProxyError> {
+    if !context.plan.tool_results.is_empty() {
         let parked = parked.ok_or_else(|| {
             ProxyError::cursor_session_lost(format!(
                 "Cursor session `{}` no longer matches its indexed tool context",
                 session_key.conversation_id()
             ))
         })?;
-        let entry = state
+        let entry = context
+            .state
             .cursor_sessions
             .acquire_resolved(parked)
             .await
@@ -1396,21 +1433,91 @@ async fn acquire_or_open_session(
                     session_key.conversation_id()
                 ))
             })?;
-        if let Err(error) = resume_tool_results(&entry, &plan.tool_results).await {
-            state
+        if let Err(error) = resume_tool_results(&entry, &context.plan.tool_results).await {
+            context
+                .state
                 .cursor_sessions
                 .release(entry.clone(), SessionState::Closed)
                 .await;
             return Err(error);
         }
-        return Ok((entry, None));
+        return Ok(OpenedCursorSession {
+            entry,
+            access_token: None,
+            key: session_key.clone(),
+        });
     }
 
-    let credential =
-        resolve_cursor_credential(state, stored, runtime_fingerprint, timeouts.request).await?;
-    let access_token = credential.access_token().to_string();
-    let entry = open_agent_stream(state, &credential, stored, plan, session_key, timeouts).await?;
-    Ok((entry, Some(access_token)))
+    let mut active_session_key = session_key.clone();
+    loop {
+        let credential = resolve_cursor_credential(
+            context.state,
+            context.stored,
+            context.runtime_fingerprint,
+            context.timeouts.request,
+        )
+        .await?;
+        let access_token = credential.access_token().to_string();
+        match open_agent_stream(
+            context.state,
+            &credential,
+            context.stored,
+            context.runtime_fingerprint,
+            context.plan,
+            &active_session_key,
+            context.timeouts,
+        )
+        .await
+        {
+            Ok(entry) => {
+                return Ok(OpenedCursorSession {
+                    entry,
+                    access_token: Some(access_token),
+                    key: active_session_key,
+                })
+            }
+            Err(error) => {
+                let action = cursor_agentservice_auth_action(
+                    context.state,
+                    context.stored,
+                    context.runtime_fingerprint,
+                    Some(&access_token),
+                    auth_recovery,
+                    error.status,
+                    true,
+                )
+                .await;
+                match action {
+                    CursorAgentServiceAuthAction::UseResponse => return Err(error),
+                    CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
+                        recover_cursor_unauthorized(
+                            context.state,
+                            context.stored,
+                            context.runtime_fingerprint,
+                            Some(&access_token),
+                        )
+                        .await?;
+                        let refreshed_scope = cursor_session_scope(
+                            context.state,
+                            context.stored,
+                            context.runtime_fingerprint,
+                            context.request_context,
+                        )
+                        .await?;
+                        active_session_key =
+                            rekey_cursor_session(&active_session_key, refreshed_scope);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rekey_cursor_session(
+    current: &CursorSessionKey,
+    refreshed_scope: CursorSessionScope,
+) -> CursorSessionKey {
+    CursorSessionKey::new(refreshed_scope, current.conversation_id().to_string())
 }
 
 async fn resume_tool_results(
@@ -1823,6 +1930,7 @@ async fn open_agent_stream(
     state: &ServerState,
     credential: &CursorCredential,
     stored: &StoredProvider,
+    runtime_fingerprint: &str,
     plan: &super::request_builder::AgentRunPlan,
     session_key: &CursorSessionKey,
     timeouts: CursorH2Timeouts,
@@ -1843,8 +1951,16 @@ async fn open_agent_stream(
     let body = encode_agent_run_request(&mut input).map_err(|message| {
         ProxyError::bad_request(format!("invalid Cursor AgentService model: {message}"))
     })?;
+    let endpoint = cursor_agentservice_url(
+        state,
+        stored,
+        runtime_fingerprint,
+        credential,
+        timeouts.request,
+    )
+    .await?;
     let stream = CursorH2Stream::open(
-        &cursor_agentservice_url(stored, credential.rail())?,
+        &endpoint,
         cursor_agentservice_headers(
             credential.rail(),
             credential.account(),
@@ -2227,6 +2343,19 @@ mod tests {
             }),
         );
         assert!(validate_cursor_runtime_configuration(&invalid_exchange).is_err());
+    }
+
+    #[test]
+    fn cursor_preopen_auth_recovery_rekeys_the_session_without_changing_conversation() {
+        let original_scope = CursorSessionScope::fixture("pre-refresh-generation");
+        let refreshed_scope = CursorSessionScope::fixture("post-refresh-generation");
+        let original = CursorSessionKey::new(original_scope, "conversation-stays-stable");
+
+        let refreshed = rekey_cursor_session(&original, refreshed_scope.clone());
+
+        assert_eq!(refreshed.conversation_id(), "conversation-stays-stable");
+        assert_eq!(refreshed.scope(), &refreshed_scope);
+        assert_ne!(refreshed.scope(), original.scope());
     }
 
     #[tokio::test]
@@ -2844,9 +2973,14 @@ async fn resolve_cursor_credential(
                     ProxyError::bad_request("Cursor OAuth managed account access token is required")
                 })?;
             let access_token = normalize_cursor_access_token(stored_access_token).to_string();
+            let endpoint_principal = format!(
+                "{}:{}:{}",
+                account.id, account.auth_identity_generation, account.token_refresh_generation
+            );
             Ok(CursorCredential::OAuthCli {
                 account: cursor_account_from_managed_account(account),
                 access_token,
+                endpoint_principal,
             })
         }
         ProviderType::CursorApiKey => {
@@ -2859,9 +2993,15 @@ async fn resolve_cursor_credential(
                 request_timeout,
             )
             .await?;
+            let account = cursor_account_for_api_key(&api_key);
+            let endpoint_principal = format!(
+                "{}:{}",
+                account.account_id, stored.resource.credential_generation
+            );
             Ok(CursorCredential::ApiKeySdk {
-                account: cursor_account_for_api_key(&api_key),
+                account,
                 access_token,
+                endpoint_principal,
             })
         }
         _ => Err(ProxyError::bad_request(
@@ -3175,11 +3315,12 @@ fn jwt_expiry_ms(token: &str) -> Option<i64> {
 }
 
 fn cursor_api_key_exchange_url(stored: &StoredProvider) -> Result<String, ProxyError> {
-    configured_cursor_endpoint(
+    configured_cursor_endpoint_with_default(
         stored,
         &["CURSOR_APIKEY_EXCHANGE_ENDPOINT"],
         &["CC_SWITCH_CURSOR_APIKEY_EXCHANGE_ENDPOINT"],
         "Cursor API key exchange endpoint",
+        "https://api2.cursor.sh/auth/exchange_user_api_key",
     )
 }
 
@@ -3189,25 +3330,62 @@ pub(super) fn validate_cursor_runtime_configuration(
     let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
         cursor_configuration_error("Cursor AgentService driver requires a Cursor provider")
     })?;
-    cursor_agentservice_url(stored, rail)?;
+    cursor_agentservice_override(stored, rail)?;
+    cursor_server_config_url(stored)?;
     if rail == CursorProtocolRail::ApiKeySdk {
         cursor_api_key_exchange_url(stored)?;
     }
     Ok(())
 }
 
-fn cursor_agentservice_url(
+async fn cursor_agentservice_url(
+    state: &ServerState,
+    stored: &StoredProvider,
+    runtime_fingerprint: &str,
+    credential: &CursorCredential,
+    request_timeout: std::time::Duration,
+) -> Result<String, ProxyError> {
+    let rail = credential.rail();
+    if let Some(endpoint) = cursor_agentservice_override(stored, rail)? {
+        return Ok(endpoint);
+    }
+    let scope = CursorAgentEndpointScope::derive(
+        stored.app.as_str(),
+        &stored.provider.id,
+        stored.resource.revision,
+        stored.resource.credential_generation,
+        runtime_fingerprint,
+        rail,
+        credential.endpoint_principal(),
+        credential.access_token(),
+    );
+    resolve_cursor_agent_endpoint(
+        &state.http_client().await,
+        &state.cursor_agent_endpoints,
+        CursorAgentEndpointRequest {
+            scope,
+            access_token: credential.access_token(),
+            rail,
+            account: credential.account(),
+            discovery_url: &cursor_server_config_url(stored)?,
+            request_timeout,
+        },
+    )
+    .await
+}
+
+fn cursor_agentservice_override(
     stored: &StoredProvider,
     rail: CursorProtocolRail,
-) -> Result<String, ProxyError> {
+) -> Result<Option<String>, ProxyError> {
     match rail {
-        CursorProtocolRail::OAuthCli => configured_cursor_endpoint(
+        CursorProtocolRail::OAuthCli => configured_cursor_endpoint_override(
             stored,
             &["CURSOR_OAUTH_AGENT_ENDPOINT"],
             &["CC_SWITCH_CURSOR_OAUTH_AGENT_ENDPOINT"],
             "Cursor OAuth CLI AgentService endpoint",
         ),
-        CursorProtocolRail::ApiKeySdk => configured_cursor_endpoint(
+        CursorProtocolRail::ApiKeySdk => configured_cursor_endpoint_override(
             stored,
             &["CURSOR_APIKEY_AGENT_ENDPOINT"],
             &["CC_SWITCH_CURSOR_APIKEY_AGENT_ENDPOINT"],
@@ -3216,12 +3394,35 @@ fn cursor_agentservice_url(
     }
 }
 
-fn configured_cursor_endpoint(
+fn cursor_server_config_url(stored: &StoredProvider) -> Result<String, ProxyError> {
+    configured_cursor_endpoint_with_default(
+        stored,
+        &["CURSOR_SERVER_CONFIG_ENDPOINT"],
+        &["CC_SWITCH_CURSOR_SERVER_CONFIG_ENDPOINT"],
+        "Cursor ServerConfig discovery endpoint",
+        default_cursor_server_config_url(),
+    )
+}
+
+fn configured_cursor_endpoint_with_default(
     stored: &StoredProvider,
     setting_names: &[&str],
     env_names: &[&str],
     label: &str,
+    default: &str,
 ) -> Result<String, ProxyError> {
+    Ok(
+        configured_cursor_endpoint_override(stored, setting_names, env_names, label)?
+            .unwrap_or_else(|| default.to_string()),
+    )
+}
+
+fn configured_cursor_endpoint_override(
+    stored: &StoredProvider,
+    setting_names: &[&str],
+    env_names: &[&str],
+    label: &str,
+) -> Result<Option<String>, ProxyError> {
     #[cfg(test)]
     let provider_override = setting(&stored.provider, setting_names);
     #[cfg(not(test))]
@@ -3229,22 +3430,17 @@ fn configured_cursor_endpoint(
         let _ = (stored, setting_names);
         None
     };
-    let value = provider_override
-        .or_else(|| {
-            env_names.iter().find_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
+    let value = provider_override.or_else(|| {
+        env_names.iter().find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
         })
-        .ok_or_else(|| {
-            cursor_configuration_error(format!(
-                "{label} is not configured; set {} as a runtime secret",
-                env_names.join(" or ")
-            ))
-        })?;
-    validate_cursor_endpoint(&value, label)
+    });
+    value
+        .map(|value| validate_cursor_endpoint(&value, label))
+        .transpose()
 }
 
 fn validate_cursor_endpoint(value: &str, label: &str) -> Result<String, ProxyError> {

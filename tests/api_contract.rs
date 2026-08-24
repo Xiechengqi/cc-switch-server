@@ -7384,7 +7384,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        65
+        70
     );
     assert!(registry["registry"]["families"]
         .as_array()
@@ -7445,7 +7445,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert_eq!(presets.status(), StatusCode::OK);
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
-    assert_eq!(presets.len(), 22);
+    assert_eq!(presets.len(), 24);
     assert!(presets
         .iter()
         .all(|preset| preset["profileId"].as_str().is_some()));

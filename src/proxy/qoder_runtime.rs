@@ -346,6 +346,7 @@ pub fn resolve_qoder_model_key(site: QoderSite, requested: &str) -> Result<Strin
         ("qwen3.7-plus", "qmodel"),
         ("kimi-k3", "kmodel_latest"),
         ("kimi-k2.7-code", "kmodel"),
+        ("glm-5.3", "gmodel"),
         ("glm-5.2", "gm51model"),
         ("deepseek-v4-pro", "dmodel"),
         ("deepseek-v4-flash", "dfmodel"),
@@ -359,6 +360,7 @@ pub fn resolve_qoder_model_key(site: QoderSite, requested: &str) -> Result<Strin
         ("qwen3.6-flash", "q36fmodel"),
         ("deepseek-v4-pro", "dmodel"),
         ("deepseek-v4-flash", "dfmodel"),
+        ("glm-5.3", "gmodel"),
         ("glm-5.2", "gm51model"),
         ("kimi-k2.7-code", "kmodel"),
         ("minimax-m2.7", "mmodel"),
@@ -821,10 +823,10 @@ fn qoder_reasoning_directive(request: &Map<String, Value>) -> ReasoningDirective
     match raw.as_deref() {
         None | Some("") => ReasoningDirective::Unspecified,
         Some("none" | "disabled" | "off") => ReasoningDirective::Disabled,
-        Some("minimal" | "low" | "medium") => ReasoningDirective::Enabled("high"),
-        Some("high" | "xhigh" | "very_high" | "very-high" | "max") => {
-            ReasoningDirective::Enabled("max")
-        }
+        Some("minimal" | "low") => ReasoningDirective::Enabled("low"),
+        Some("medium") => ReasoningDirective::Enabled("medium"),
+        Some("high") => ReasoningDirective::Enabled("high"),
+        Some("xhigh" | "very_high" | "very-high" | "max") => ReasoningDirective::Enabled("max"),
         Some(_) => ReasoningDirective::Unspecified,
     }
 }
@@ -834,12 +836,14 @@ enum ThinkingCapability {
     Unsupported,
     ToggleOnly,
     HighMax,
+    LowHighMax,
 }
 
 fn thinking_capability(site: QoderSite, model_key: &str) -> ThinkingCapability {
     match model_key {
         "qmodel_38max" | "qmodel_latest" | "qmodel" => ThinkingCapability::ToggleOnly,
         "dmodel" | "dfmodel" | "gm51model" => ThinkingCapability::HighMax,
+        "gmodel" => ThinkingCapability::LowHighMax,
         "q36fmodel" if site == QoderSite::Cn => ThinkingCapability::Unsupported,
         _ => ThinkingCapability::Unsupported,
     }
@@ -858,9 +862,24 @@ fn apply_reasoning_directive(
     }
     let enabled = !matches!(directive, ReasoningDirective::Disabled);
     model_config.insert("is_reasoning".to_string(), Value::Bool(enabled));
-    if capability == ThinkingCapability::HighMax || !enabled {
+    if matches!(
+        capability,
+        ThinkingCapability::HighMax | ThinkingCapability::LowHighMax
+    ) || !enabled
+    {
         let effort = match directive {
-            ReasoningDirective::Enabled(effort) => effort,
+            ReasoningDirective::Enabled(effort) => match capability {
+                ThinkingCapability::HighMax => match effort {
+                    "low" | "medium" => "high",
+                    _ => "max",
+                },
+                ThinkingCapability::LowHighMax => match effort {
+                    "low" => "low",
+                    "medium" | "high" => "high",
+                    _ => "max",
+                },
+                ThinkingCapability::Unsupported | ThinkingCapability::ToggleOnly => effort,
+            },
             ReasoningDirective::Disabled => "none",
             ReasoningDirective::Unspecified => return,
         };
@@ -1035,6 +1054,14 @@ mod tests {
             "q36fmodel"
         );
         assert_eq!(
+            resolve_qoder_model_key(QoderSite::Global, "glm-5.3").unwrap(),
+            "gmodel"
+        );
+        assert_eq!(
+            resolve_qoder_model_key(QoderSite::Cn, "qoder/GLM-5.3").unwrap(),
+            "gmodel"
+        );
+        assert_eq!(
             resolve_qoder_model_key(QoderSite::Global, "future-route").unwrap(),
             "future-route"
         );
@@ -1086,6 +1113,47 @@ mod tests {
         assert_eq!(prepared.body["model_config"]["is_reasoning"], true);
         assert_eq!(prepared.body["model_config"]["reasoning_effort"], "max");
         assert_eq!(prepared.body["stream"], true);
+    }
+
+    #[test]
+    fn glm_5_3_projects_client_effort_to_low_high_max() {
+        for (requested, expected) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+        ] {
+            let prepared = build_qoder_payload(
+                &json!({
+                    "model": "glm-5.3",
+                    "messages": [{"role": "user", "content": "run"}],
+                    "reasoning_effort": requested
+                }),
+                &json!({
+                    "key": "gmodel",
+                    "display_name": "GLM-5.3",
+                    "enable": true,
+                    "is_reasoning": false,
+                    "max_output_tokens": 131072
+                }),
+                QoderSite::Global,
+                "gmodel",
+                "session-a",
+                "personal_standard",
+                1_700_000_000_000,
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.body["model_config"]["reasoning_effort"], expected,
+                "requested={requested}"
+            );
+            assert_eq!(
+                prepared.body["model_config"]["is_reasoning"], true,
+                "requested={requested}"
+            );
+        }
     }
 
     #[test]

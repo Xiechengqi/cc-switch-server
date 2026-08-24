@@ -61,6 +61,7 @@ test("first-class Server Profiles are committed additions, not candidates", () =
     "codex.qoder_cosy",
     "codex.openai_api_key",
     "gemini.google_api_key",
+    "gemini.github_copilot",
     "gemini.kimi_code",
     "gemini.qoder_cosy",
     "gemini.cursor_api_key",
@@ -71,6 +72,10 @@ test("first-class Server Profiles are committed additions, not candidates", () =
     "codex.zhipu_glm_cn",
     "claude.zhipu_glm_global",
     "codex.zhipu_glm_global",
+    "claude.bailian_coding_plan_cn",
+    "codex.bailian_coding_plan_cn",
+    "claude.bailian_coding_plan_global",
+    "codex.bailian_coding_plan_global",
     "claude.minimax_cn",
     "codex.minimax_cn",
     "claude.minimax_global",
@@ -134,7 +139,7 @@ test("inventory validation rejects altered Custom HTTP recipe additions", () => 
 
 test("every required Provider type/app pair has a creatable Profile or recipe", () => {
   const registry = contract("provider-registry.json");
-  assert.equal(requiredProviderProfilePairs().length, 43);
+  assert.equal(requiredProviderProfilePairs().length, 44);
   assert.doesNotThrow(() => assertRequiredProviderCoverage(registry));
 
   const missing = structuredClone(registry);

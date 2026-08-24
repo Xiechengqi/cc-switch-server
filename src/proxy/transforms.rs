@@ -13,7 +13,7 @@ use super::tool_media::{
     extract_tool_media, flush_chat_media, queue_chat_media, sanitized_tool_text, ToolMediaPart,
     ToolMediaScope,
 };
-use super::tool_schema::normalize_function_parameters;
+use super::tool_schema::{normalize_function_parameters, normalize_gemini_function_parameters};
 
 const DEFAULT_OPENAI_TO_ANTHROPIC_MAX_TOKENS: u64 = 8192;
 const DEFAULT_UPSTREAM_REFUSAL_MESSAGE: &str = "The upstream model refused to provide a response.";
@@ -5445,7 +5445,7 @@ fn anthropic_tools_to_gemini(tools: Option<&Value>) -> Option<Value> {
             json!({
                 "name": tool.get("name").and_then(Value::as_str).unwrap_or("tool"),
                 "description": tool.get("description").cloned().unwrap_or(Value::String(String::new())),
-                "parameters": normalize_function_parameters(tool.get("input_schema"))
+                "parameters": normalize_gemini_function_parameters(tool.get("input_schema"))
             })
         })
         .collect::<Vec<_>>();

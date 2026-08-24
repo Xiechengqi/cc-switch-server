@@ -179,6 +179,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::Gemini,
             ProviderType::GeminiCli,
             ProviderType::OpenRouter,
+            ProviderType::GitHubCopilot,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,
             ProviderType::AntigravityOAuth,
@@ -600,7 +601,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
             "SigV4 converse request generation is wired; real AWS Bedrock forwarding remains unvalidated"
         }
         (_, ProviderType::GitHubCopilot) => {
-            "Claude and Codex forwarding plus model discovery are fixture-verified with one managed account; real github.com and GHES acceptance remains external"
+            "Claude, Codex, and Gemini forwarding plus model discovery are fixture-verified with one managed account; real github.com and GHES acceptance remains external"
         }
         (AppKind::Claude | AppKind::Codex, ProviderType::KiroOAuth) => {
             "single-account CodeWhisperer forwarder supports Anthropic Messages, OpenAI Chat, and OpenAI Responses; real Kiro account validation remains external"
@@ -609,7 +610,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
             "Claude forwarder protocol bridge is wired; real upstream validation remains pending"
         }
         (_, ProviderType::KimiCode) => {
-            "Kimi Code device OAuth, same-account refresh, official CLI identity, and OpenAI Chat protocol bridging are server-native; real-account acceptance remains external"
+            "Kimi Code device OAuth, same-account refresh, official CLI identity, native Claude Messages/count_tokens, and Codex/Gemini Chat bridging are server-native; real-account acceptance remains external"
         }
         (_, ProviderType::QoderCosy) => {
             "Qoder COSY uses one explicitly bound managed account and a site-frozen signed driver; real-account acceptance remains external"

@@ -13180,7 +13180,7 @@ async fn send_qoder_generation(
         ),
         (
             "user-agent".to_string(),
-            format!("QoderCLI/{}", runtime.session.session.client_version),
+            crate::domain::qoder::QODER_COSY_USER_AGENT.to_string(),
         ),
     ]);
     let mut headers = HeaderMap::new();
@@ -15286,6 +15286,7 @@ fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyE
             StatusCode::CONFLICT
         }
         ShareRejectReason::Unauthorized
+        | ShareRejectReason::AppNotAllowed
         | ShareRejectReason::Inactive
         | ShareRejectReason::Expired
         | ShareRejectReason::Exhausted
@@ -27251,6 +27252,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             status_changed: false,
             concurrency: None,
         });
+        let app_not_allowed = share_rejection_to_proxy_error(ShareInvocationRejection {
+            reason: ShareRejectReason::AppNotAllowed,
+            message: "This market entitlement does not include the claude API.".to_string(),
+            status_changed: false,
+            concurrency: None,
+        });
         let identity_required = share_rejection_to_proxy_error(ShareInvocationRejection {
             reason: ShareRejectReason::UserIdentityRequired,
             message: "An authenticated user identity is required.".to_string(),
@@ -27265,6 +27272,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             unauthorized.message,
             "This user is not authorized to invoke the Share. [Unauthorized]"
         );
+        assert_eq!(app_not_allowed.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            app_not_allowed.message,
+            "This market entitlement does not include the claude API. [AppNotAllowed]"
+        );
+        assert_eq!(app_not_allowed.error_code(), "cc_switch_forbidden");
         assert_eq!(identity_required.status, StatusCode::UNAUTHORIZED);
         assert_eq!(
             identity_required.client_message(),

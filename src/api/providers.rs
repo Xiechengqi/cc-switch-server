@@ -2684,7 +2684,9 @@ fn s1_provider_for_profile(
                 "env": {"ANTHROPIC_BASE_URL": "https://cloudcode-pa.googleapis.com"}
             }),
         ),
-        "codex.github_copilot" => ("GitHub Copilot", json!({})),
+        "claude.github_copilot" | "codex.github_copilot" | "gemini.github_copilot" => {
+            ("GitHub Copilot", json!({}))
+        }
         "codex.kiro_oauth" => ("Kiro OAuth", json!({})),
         "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi Code", json!({})),
         "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => ("Qoder COSY", json!({})),

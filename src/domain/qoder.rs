@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub const QODER_COSY_USER_AGENT: &str = "Go-http-client/2.0";
+
 const STANDARD_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const CUSTOM_ALPHABET: &[u8; 64] =
@@ -351,7 +353,7 @@ impl QoderSite {
                 center_base_url: Some("https://center.qoder.sh"),
                 gateway_base_url: "https://api1.qoder.sh",
                 job_gateway_base_url: "https://api2.qoder.sh",
-                client_version: "1.21.2",
+                client_version: "1.24.2",
                 oauth_client_id: "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
                 client_type: "5",
                 data_policy: "disagree",
@@ -363,7 +365,7 @@ impl QoderSite {
                 center_base_url: None,
                 gateway_base_url: "https://gateway.qoder.com.cn",
                 job_gateway_base_url: "https://gateway.qoder.com.cn",
-                client_version: "1.10.0",
+                client_version: "1.24.2",
                 oauth_client_id: "f5a7f67c-11a8-491e-8b8e-a07f2d0df4b7",
                 client_type: "0",
                 data_policy: "DISAGREE",
@@ -694,6 +696,8 @@ mod tests {
         assert_ne!(global.oauth_client_id, cn.oauth_client_id);
         assert_eq!(global.client_type, "5");
         assert_eq!(cn.client_type, "0");
+        assert_eq!(global.client_version, "1.24.2");
+        assert_eq!(cn.client_version, "1.24.2");
     }
 
     #[test]

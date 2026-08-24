@@ -1,4 +1,6 @@
-use serde_json::{json, Value};
+use std::collections::BTreeSet;
+
+use serde_json::{json, Map, Value};
 
 pub(crate) fn normalize_function_parameters(parameters: Option<&Value>) -> Value {
     let mut parameters = match parameters {
@@ -11,6 +13,200 @@ pub(crate) fn normalize_function_parameters(parameters: Option<&Value>) -> Value
         }
     }
     parameters
+}
+
+/// Normalizes the subset of JSON Schema accepted by Gemini/Code Assist tools.
+///
+/// Keep this separate from `normalize_function_parameters`: other upstreams
+/// accept a wider schema dialect and should not lose constraints just because
+/// Gemini rejects them.
+pub(crate) fn normalize_gemini_function_parameters(parameters: Option<&Value>) -> Value {
+    let mut parameters = normalize_function_parameters(parameters);
+    normalize_gemini_schema_node(&mut parameters);
+    parameters
+}
+
+pub(crate) fn normalize_gemini_tool_schemas(request: &mut Value) {
+    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let Some(tool) = tool.as_object_mut() else {
+            continue;
+        };
+        let declarations = if tool.contains_key("functionDeclarations") {
+            tool.get_mut("functionDeclarations")
+        } else {
+            tool.get_mut("function_declarations")
+        };
+        let Some(declarations) = declarations.and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for declaration in declarations {
+            let Some(declaration) = declaration.as_object_mut() else {
+                continue;
+            };
+            for key in [
+                "parameters",
+                "parametersJsonSchema",
+                "parameters_json_schema",
+            ] {
+                if let Some(parameters) = declaration.get_mut(key) {
+                    *parameters = normalize_gemini_function_parameters(Some(parameters));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn normalize_gemini_schema_node(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    promote_boolean_required_properties(object);
+
+    if schema_type_is(object, "integer") {
+        normalize_integral_exclusive_bound(object, "exclusiveMinimum", "minimum", 1);
+        normalize_integral_exclusive_bound(object, "exclusiveMaximum", "maximum", -1);
+    } else {
+        object.remove("exclusiveMinimum");
+        object.remove("exclusiveMaximum");
+    }
+
+    // Code Assist currently rejects this keyword even though it is valid JSON
+    // Schema. Dropping it weakens validation but keeps the tool callable.
+    object.remove("uniqueItems");
+
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_gemini_schema_node(child);
+            }
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "if",
+        "then",
+        "else",
+        "not",
+        "propertyNames",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            normalize_gemini_schema_node(child);
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for child in children {
+                normalize_gemini_schema_node(child);
+            }
+        }
+    }
+}
+
+fn promote_boolean_required_properties(object: &mut Map<String, Value>) {
+    let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let mut promoted = Vec::new();
+    for (name, schema) in properties.iter_mut() {
+        let Some(schema) = schema.as_object_mut() else {
+            continue;
+        };
+        if let Some(required) = schema.get("required").and_then(Value::as_bool) {
+            if required {
+                promoted.push(name.clone());
+            }
+            schema.remove("required");
+        }
+    }
+    if promoted.is_empty() {
+        return;
+    }
+
+    let mut required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    required.extend(promoted);
+    object.insert(
+        "required".to_string(),
+        Value::Array(required.into_iter().map(Value::String).collect()),
+    );
+}
+
+fn schema_type_is(object: &Map<String, Value>, expected: &str) -> bool {
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn normalize_integral_exclusive_bound(
+    object: &mut Map<String, Value>,
+    exclusive_key: &str,
+    inclusive_key: &str,
+    delta: i8,
+) {
+    let Some(exclusive) = object.remove(exclusive_key) else {
+        return;
+    };
+    let candidate = match exclusive {
+        Value::Bool(false) => return,
+        Value::Bool(true) => object
+            .get(inclusive_key)
+            .and_then(|value| increment_integral_bound(value, delta)),
+        value => increment_integral_bound(&value, delta),
+    };
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let replace = object
+        .get(inclusive_key)
+        .and_then(json_number_as_f64)
+        .zip(json_number_as_f64(&candidate))
+        .map(|(existing, candidate)| {
+            if delta > 0 {
+                existing < candidate
+            } else {
+                existing > candidate
+            }
+        })
+        .unwrap_or(true);
+    if replace {
+        object.insert(inclusive_key.to_string(), candidate);
+    }
+}
+
+fn increment_integral_bound(value: &Value, delta: i8) -> Option<Value> {
+    if let Some(value) = value.as_i64() {
+        return value
+            .checked_add(i64::from(delta))
+            .map(|value| Value::Number(value.into()));
+    }
+    let value = value.as_u64()?;
+    if delta > 0 {
+        value
+            .checked_add(delta as u64)
+            .map(|value| Value::Number(value.into()))
+    } else {
+        value
+            .checked_sub(delta.unsigned_abs() as u64)
+            .map(|value| Value::Number(value.into()))
+    }
+}
+
+fn json_number_as_f64(value: &Value) -> Option<f64> {
+    value.as_f64().filter(|value| value.is_finite())
 }
 
 #[cfg(test)]
@@ -69,5 +265,89 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    #[test]
+    fn gemini_normalizes_nested_exclusive_bounds_and_unique_items() {
+        let normalized = normalize_gemini_function_parameters(Some(&json!({
+            "type": "object",
+            "properties": {
+                "counts": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {"type": "integer", "exclusiveMinimum": 0}
+                },
+                "strict": {"type": "integer", "exclusiveMinimum": 0, "minimum": 5},
+                "weak": {"type": "integer", "exclusiveMinimum": 2, "minimum": 1},
+                "upper": {"type": "integer", "exclusiveMaximum": 10}
+            }
+        })));
+
+        assert_eq!(
+            normalized.pointer("/properties/counts/items/minimum"),
+            Some(&json!(1))
+        );
+        assert!(normalized
+            .pointer("/properties/counts/uniqueItems")
+            .is_none());
+        assert_eq!(
+            normalized.pointer("/properties/strict/minimum"),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            normalized.pointer("/properties/weak/minimum"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            normalized.pointer("/properties/upper/maximum"),
+            Some(&json!(9))
+        );
+    }
+
+    #[test]
+    fn gemini_drops_ambiguous_exclusive_bounds_and_promotes_required_flags() {
+        let normalized = normalize_gemini_function_parameters(Some(&json!({
+            "type": "object",
+            "properties": {
+                "ratio": {"type": "number", "exclusiveMinimum": 0.5},
+                "query": {"type": "string", "required": true},
+                "optional": {"type": "string", "required": false}
+            },
+            "required": ["existing"]
+        })));
+
+        assert!(normalized
+            .pointer("/properties/ratio/exclusiveMinimum")
+            .is_none());
+        assert!(normalized.pointer("/properties/query/required").is_none());
+        assert!(normalized
+            .pointer("/properties/optional/required")
+            .is_none());
+        assert_eq!(normalized["required"], json!(["existing", "query"]));
+    }
+
+    #[test]
+    fn gemini_native_request_normalizes_each_function_declaration() {
+        let mut request = json!({
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "exclusiveMinimum": 0}
+                        }
+                    }
+                }]
+            }]
+        });
+        normalize_gemini_tool_schemas(&mut request);
+        assert_eq!(
+            request.pointer("/tools/0/functionDeclarations/0/parameters/properties/limit/minimum"),
+            Some(&json!(1))
+        );
+        assert!(request
+            .pointer("/tools/0/functionDeclarations/0/parameters/properties/limit/exclusiveMinimum")
+            .is_none());
     }
 }

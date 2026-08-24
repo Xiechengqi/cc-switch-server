@@ -1489,6 +1489,7 @@ struct SseBuilder {
     tool_indices: HashMap<String, i32>,
     tool_names: HashMap<String, String>,
     tool_json: ToolJsonAccumulator,
+    tool_errors: Vec<KiroToolJsonError>,
     seen_tool_signatures: HashSet<String>,
     tool_leak_filter: ToolLeakFilter,
     inline_thinking: bool,
@@ -1648,10 +1649,18 @@ impl SseBuilder {
         input: &str,
         stop: bool,
     ) -> Result<Vec<Bytes>, KiroToolJsonError> {
-        let Some((id, kiro_name, name, parsed_input)) =
-            self.tool_json
-                .push(id, name, input, stop, &self.tool_name_map)?
-        else {
+        let completed = match self
+            .tool_json
+            .push(id, name, input, stop, &self.tool_name_map)
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                self.tool_json.reject(&error);
+                self.tool_errors.push(error);
+                return Ok(Vec::new());
+            }
+        };
+        let Some((id, kiro_name, name, parsed_input)) = completed else {
             return Ok(Vec::new());
         };
         let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
@@ -1691,6 +1700,7 @@ impl SseBuilder {
                 json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}),
             ));
         }
+        self.output_tokens += estimate_tokens(&name) + estimate_tokens(&input);
         self.seen_tool_signatures
             .insert(tool_signature(&name, &parsed_input));
         out.push(sse(
@@ -1701,8 +1711,15 @@ impl SseBuilder {
     }
 
     fn finish_events(&mut self) -> Result<Vec<Bytes>, KiroToolJsonError> {
-        self.tool_json.finish()?;
-        Ok(self.final_events())
+        if let Err(error) = self.tool_json.finish() {
+            self.tool_json.reject(&error);
+            self.tool_errors.push(error);
+        }
+        let events = self.final_events();
+        if self.next_index == 0 && !self.tool_errors.is_empty() {
+            return Err(self.tool_errors.remove(0));
+        }
+        Ok(events)
     }
 
     fn final_events(&mut self) -> Vec<Bytes> {
@@ -1904,6 +1921,7 @@ impl From<wire::WireError> for KiroToolJsonError {
 
 struct ToolJsonAccumulator {
     pending: HashMap<String, (String, String)>,
+    rejected: HashSet<String>,
     buffered_bytes: usize,
     max_buffered_bytes: usize,
 }
@@ -1912,6 +1930,7 @@ impl Default for ToolJsonAccumulator {
     fn default() -> Self {
         Self {
             pending: HashMap::new(),
+            rejected: HashSet::new(),
             buffered_bytes: 0,
             max_buffered_bytes: MAX_TOOL_JSON_BYTES,
         }
@@ -1935,6 +1954,9 @@ impl ToolJsonAccumulator {
         stop: bool,
         tool_name_map: &HashMap<String, String>,
     ) -> Result<Option<(String, String, String, Value)>, KiroToolJsonError> {
+        if self.rejected.contains(tool_use_id) {
+            return Ok(None);
+        }
         let buffered_bytes = self.buffered_bytes.saturating_add(input.len());
         if buffered_bytes > self.max_buffered_bytes {
             return Err(KiroToolJsonError::Limit {
@@ -1979,6 +2001,19 @@ impl ToolJsonAccumulator {
         )))
     }
 
+    fn reject(&mut self, error: &KiroToolJsonError) {
+        let tool_use_id = match error {
+            KiroToolJsonError::Invalid { tool_use_id, .. }
+            | KiroToolJsonError::Incomplete { tool_use_id, .. }
+            | KiroToolJsonError::Limit { tool_use_id, .. } => tool_use_id,
+            KiroToolJsonError::Wire { .. } => return,
+        };
+        if let Some((_, input)) = self.pending.remove(tool_use_id) {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(input.len());
+        }
+        self.rejected.insert(tool_use_id.clone());
+    }
+
     fn finish(&mut self) -> Result<(), KiroToolJsonError> {
         let pending = self
             .pending
@@ -1988,8 +2023,8 @@ impl ToolJsonAccumulator {
         let Some((tool_use_id, name, bytes)) = pending else {
             return Ok(());
         };
-        self.pending.remove(&tool_use_id);
-        self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes);
+        self.pending.clear();
+        self.buffered_bytes = 0;
         Err(KiroToolJsonError::Incomplete {
             tool_use_id,
             name,
@@ -2276,6 +2311,7 @@ fn kiro_event_bytes_to_anthropic_json(
     let mut redacted_thinking = Vec::new();
     let mut tools = Vec::new();
     let mut tool_accumulator = ToolJsonAccumulator::default();
+    let mut tool_errors = Vec::new();
     let mut seen_tool_signatures = HashSet::new();
     let mut tool_leak_filter = ToolLeakFilter::default();
     let mut usage = KiroUsageAccumulator::default();
@@ -2316,15 +2352,18 @@ fn kiro_event_bytes_to_anthropic_json(
                 name,
                 input,
                 stop,
-            } => {
-                if let Some((id, kiro_name, name, parsed_input)) =
-                    tool_accumulator.push(&id, &name, &input, stop, tool_name_map)?
-                {
+            } => match tool_accumulator.push(&id, &name, &input, stop, tool_name_map) {
+                Ok(Some((id, kiro_name, name, parsed_input))) => {
                     let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
                     seen_tool_signatures.insert(tool_signature(&name, &parsed_input));
                     tools.push((id, name, parsed_input));
                 }
-            }
+                Ok(None) => {}
+                Err(error) => {
+                    tool_accumulator.reject(&error);
+                    tool_errors.push(error);
+                }
+            },
             wire::Event::Usage {
                 event_type,
                 payload,
@@ -2340,7 +2379,10 @@ fn kiro_event_bytes_to_anthropic_json(
             "Kiro EventStream ended before endEvent",
         ));
     }
-    tool_accumulator.finish()?;
+    if let Err(error) = tool_accumulator.finish() {
+        tool_accumulator.reject(&error);
+        tool_errors.push(error);
+    }
     for visible in tool_leak_filter.push_text("", true) {
         text.push_str(&visible);
     }
@@ -2359,16 +2401,24 @@ fn kiro_event_bytes_to_anthropic_json(
     if !text.is_empty() {
         content.push(json!({"type":"text","text":text}));
     }
+    let mut fallback_output_tokens = estimate_tokens(&format!("{thinking}{text}"));
     for (id, name, input) in tools {
+        fallback_output_tokens += estimate_tokens(&name)
+            + estimate_tokens(&serde_json::to_string(&input).unwrap_or_default());
         content.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
     }
     for leaked in tool_leak_filter.take_deduped(&mut seen_tool_signatures) {
+        fallback_output_tokens += estimate_tokens(&leaked.name)
+            + estimate_tokens(&serde_json::to_string(&leaked.input).unwrap_or_default());
         content.push(json!({
             "type":"tool_use",
             "id": format!("toolleakfix_{}_{}", unix_timestamp_secs(), content.len() + 1),
             "name": leaked.name,
             "input": leaked.input
         }));
+    }
+    if content.is_empty() && !tool_errors.is_empty() {
+        return Err(tool_errors.remove(0));
     }
     let stop_reason = if content
         .iter()
@@ -2378,7 +2428,6 @@ fn kiro_event_bytes_to_anthropic_json(
     } else {
         "end_turn"
     };
-    let fallback_output_tokens = estimate_tokens(&format!("{thinking}{text}"));
     let usage = usage.final_usage(fallback_output_tokens);
     Ok(json!({
         "id": next_message_id(),
@@ -4299,6 +4348,113 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "TOOL_JSON_INCOMPLETE");
         assert!(!error.to_string().contains("file_path"));
+    }
+
+    #[test]
+    fn non_streaming_drops_only_the_invalid_tool_and_keeps_valid_output() {
+        let mixed_tools = event_stream_bytes(vec![
+            (
+                "toolUseEvent",
+                json!({
+                    "toolUseId": "toolu_good",
+                    "name": "Read",
+                    "input": "{\"file_path\":\"Cargo.toml\"}",
+                    "stop": true
+                }),
+            ),
+            (
+                "toolUseEvent",
+                json!({
+                    "toolUseId": "toolu_bad",
+                    "name": "Write",
+                    "input": "{\"file_path\":",
+                    "stop": true
+                }),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &mixed_tools,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+
+        assert_eq!(message.pointer("/content/0/id"), Some(&json!("toolu_good")));
+        assert_eq!(
+            message.pointer("/content/0/input/file_path"),
+            Some(&json!("Cargo.toml"))
+        );
+        assert_eq!(message.pointer("/content/1"), None);
+        assert_eq!(message.get("stop_reason"), Some(&json!("tool_use")));
+        assert!(
+            message
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_i64)
+                .unwrap()
+                > 0
+        );
+
+        let text_and_bad_tool = event_stream_bytes(vec![
+            (
+                "assistantResponseEvent",
+                json!({"content": "Partial but usable answer."}),
+            ),
+            (
+                "toolUseEvent",
+                json!({
+                    "toolUseId": "toolu_bad",
+                    "name": "Write",
+                    "input": "{\"file_path\":",
+                    "stop": true
+                }),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &text_and_bad_tool,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            message.pointer("/content/0/text"),
+            Some(&json!("Partial but usable answer."))
+        );
+        assert_eq!(message.pointer("/content/1"), None);
+        assert_eq!(message.get("stop_reason"), Some(&json!("end_turn")));
+    }
+
+    #[test]
+    fn streaming_drops_only_the_invalid_tool_and_counts_valid_tool_tokens() {
+        let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+        let mut output = builder
+            .tool_delta("toolu_good", "Read", "{\"file_path\":\"Cargo.toml\"}", true)
+            .unwrap();
+        assert!(builder
+            .tool_delta("toolu_bad", "Write", "{\"file_path\":", true)
+            .unwrap()
+            .is_empty());
+        output.extend(builder.finish_events().unwrap());
+        let output = output
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(output.contains("toolu_good"), "{output}");
+        assert!(!output.contains("toolu_bad"), "{output}");
+        assert!(output.contains("\"stop_reason\":\"tool_use\""), "{output}");
+        assert!(!output.contains("\"output_tokens\":0"), "{output}");
+
+        let mut invalid_only = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+        assert!(invalid_only
+            .tool_delta("toolu_bad", "Write", "{\"file_path\":", true)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            invalid_only.finish_events().unwrap_err().code(),
+            "TOOL_JSON_INVALID"
+        );
     }
 
     #[test]

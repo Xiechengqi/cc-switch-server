@@ -742,6 +742,7 @@ pub struct ServerStateInner {
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
+    pub cursor_agent_endpoints: crate::proxy::cursor::agent_endpoint::CursorAgentEndpointCache,
     pub cursor_api_key_tokens: crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache,
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
     pub(crate) kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache,
@@ -5744,6 +5745,8 @@ impl ServerStateInner {
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
+            cursor_agent_endpoints:
+                crate::proxy::cursor::agent_endpoint::CursorAgentEndpointCache::default(),
             cursor_api_key_tokens:
                 crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache::default(),
             cursor_model_catalogs:

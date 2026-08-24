@@ -107,7 +107,8 @@
       "label": "GitHub Copilot",
       "apps": [
         "claude",
-        "codex"
+        "codex",
+        "gemini"
       ],
       "required": true,
       "presentInSource": true,

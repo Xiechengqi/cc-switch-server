@@ -5,6 +5,7 @@
 //! forwarder.
 
 pub mod agent_driver;
+pub mod agent_endpoint;
 pub mod agent_proto;
 pub mod credential_cache;
 pub mod event_emitter;

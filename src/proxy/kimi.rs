@@ -32,6 +32,17 @@ pub const KIMI_MODEL_ALIASES: &[&str] = &[
     "k3",
 ];
 
+pub(super) const KIMI_REASONING_UNAVAILABLE: &str = "[reasoning unavailable]";
+
+pub(super) fn is_kimi_reasoning_unavailable(value: &str) -> bool {
+    value.trim() == KIMI_REASONING_UNAVAILABLE
+}
+
+fn usable_kimi_reasoning(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && !is_kimi_reasoning_unavailable(value)).then(|| value.to_string())
+}
+
 pub(super) fn finalize_request(
     plan: &ProviderRuntimePlan,
     request: &mut AdapterRequest,
@@ -399,10 +410,9 @@ fn backfill_chat_reasoning(body: &mut Map<String, Value>) {
         if let Some(reasoning) = message
             .get("reasoning_content")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .and_then(usable_kimi_reasoning)
         {
-            latest_reasoning = Some(reasoning.to_string());
+            latest_reasoning = Some(reasoning);
         }
         let has_tool_calls = message
             .get("tool_calls")
@@ -411,14 +421,15 @@ fn backfill_chat_reasoning(body: &mut Map<String, Value>) {
         let missing_reasoning = message
             .get("reasoning_content")
             .and_then(Value::as_str)
-            .is_none_or(|value| value.trim().is_empty());
+            .and_then(usable_kimi_reasoning)
+            .is_none();
         if !has_tool_calls || !missing_reasoning {
             continue;
         }
         let fallback = latest_reasoning
             .clone()
             .or_else(|| visible_message_text(message))
-            .unwrap_or_else(|| "[reasoning unavailable]".to_string());
+            .unwrap_or_else(|| KIMI_REASONING_UNAVAILABLE.to_string());
         message.insert("reasoning_content".to_string(), Value::String(fallback));
     }
 }
@@ -575,6 +586,40 @@ mod tests {
         assert_eq!(
             body["messages"][1]["reasoning_content"],
             json!("signed prior")
+        );
+    }
+
+    #[test]
+    fn k3_chat_never_reuses_unavailable_reasoning_as_authentic_history() {
+        let mut body = json!({
+            "messages": [
+                {"role":"assistant","reasoning_content":"authentic prior"},
+                {"role":"assistant","reasoning_content":" [reasoning unavailable] "},
+                {"role":"assistant","reasoning_content":"[reasoning unavailable]","tool_calls":[{"id":"one"}]},
+                {"role":"assistant","content":"visible fallback","reasoning_content":"[reasoning unavailable]","tool_calls":[{"id":"two"}]}
+            ]
+        });
+        backfill_chat_reasoning(body.as_object_mut().unwrap());
+
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            " [reasoning unavailable] "
+        );
+        assert_eq!(body["messages"][2]["reasoning_content"], "authentic prior");
+        assert_eq!(body["messages"][3]["reasoning_content"], "authentic prior");
+
+        let mut no_prior = json!({
+            "messages": [{
+                "role":"assistant",
+                "content":"visible fallback",
+                "reasoning_content":"[reasoning unavailable]",
+                "tool_calls":[{"id":"three"}]
+            }]
+        });
+        backfill_chat_reasoning(no_prior.as_object_mut().unwrap());
+        assert_eq!(
+            no_prior["messages"][0]["reasoning_content"],
+            "visible fallback"
         );
     }
 

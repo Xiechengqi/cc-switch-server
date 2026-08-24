@@ -69,7 +69,7 @@ Kimi refresh 使用固定 token endpoint、client ID、Kimi CLI User-Agent 和�
 
 ## 验收边界
 
-30 项离线 Kimi 测试覆盖 device poll 串行化、slow-down、稳定设备身份、JWT principal、账号 Profile round-trip、header 最终覆盖、三个 App 的精确 endpoint、权威模型目录、模型 allowlist、K3 effort、thinking replay、同账号 401 和代际漂移。真实 Kimi Code 账号仍需分别验证：
+32 项离线 Kimi 测试覆盖 device poll 串行化、slow-down、稳定设备身份、JWT principal、账号 Profile round-trip、header 最终覆盖、三个 App 的精确 endpoint、权威模型目录、模型 allowlist、K3 effort、thinking replay、同账号 401 和代际漂移。真实 Kimi Code 账号仍需分别验证：
 
 - device 登录与 refresh-token 轮换；
 - Claude/Codex/Gemini 三个 Surface 的非流和流式文本；

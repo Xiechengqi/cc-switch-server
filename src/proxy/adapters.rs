@@ -11,6 +11,7 @@ use super::copilot_optimizer::{
 };
 use super::request_governance::{govern_request_body, RequestGovernanceConfig};
 use super::thinking::{apply_thinking_pipeline, ThinkingPipelineConfig};
+use super::tool_schema::normalize_gemini_tool_schemas;
 use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
 use crate::domain::accounts::store::{Account, AccountStore};
@@ -696,7 +697,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
             ("claude_to_grok_responses", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::KimiCode) => {
-            ("claude_to_kimi_chat", AdapterSupport::Native)
+            ("claude_kimi_messages", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::QoderCosy) => {
             ("claude_to_qoder_cosy", AdapterSupport::Native)
@@ -766,7 +767,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Gemini, ProviderType::Codex | ProviderType::CodexOAuth) => {
             ("gemini_to_codex_responses", AdapterSupport::Native)
         }
-        (AppKind::Gemini, ProviderType::GitHubCopilot) => fallback("gemini_copilot_skeleton"),
+        (AppKind::Gemini, ProviderType::GitHubCopilot) => {
+            ("gemini_to_copilot_chat", AdapterSupport::Native)
+        }
         (AppKind::Gemini, ProviderType::DeepSeekAccount) => fallback("gemini_deepseek_skeleton"),
         (AppKind::Gemini, ProviderType::KiroOAuth) => fallback("gemini_kiro_skeleton"),
         (AppKind::Gemini, ProviderType::CursorOAuth | ProviderType::CursorApiKey) => {
@@ -830,7 +833,6 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::GrokOAuth
-                | ProviderType::KimiCode
         ),
         AppKind::Codex => matches!(
             provider_type,
@@ -929,6 +931,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::GitHubCopilot
                 | ProviderType::KimiCode
         )
     )
@@ -965,6 +968,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
+                | ProviderType::GitHubCopilot
         )
     )
 }
@@ -1454,7 +1458,8 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::OllamaCloud => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Nvidia => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
-            ProviderType::KimiCode | ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
+            ProviderType::KimiCode => Some(UpstreamFormat::AnthropicMessages),
+            ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Gemini | ProviderType::GeminiCli => Some(UpstreamFormat::GeminiNative),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -2251,10 +2256,15 @@ fn apply_gemini_v1internal_contract(
         })?;
     request.upstream_stream_requested = true;
     *endpoint = gemini_v1internal_endpoint(&plan.endpoint);
+    if antigravity_identity {
+        select_antigravity_inference_endpoint(endpoint, account);
+    }
     Ok(())
 }
 
 const GEMINI_AI_STUDIO_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+const ANTIGRAVITY_PRODUCTION_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_DAILY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL: &str = "gemini-2.5-flash";
 const ANTIGRAVITY_IDENTITY_PATCH: &str = "<identity>\nYou are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nYou are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\nThe USER will send you requests, which you must always prioritize addressing. Along with each USER request, we will attach additional metadata about their current state, such as what files they have open and where their cursor is.\nThis information may or may not be relevant to the coding task, it is up for you to decide.\n</identity>\n<communication_style>\n- **Proactiveness**. As an agent, you are allowed to be proactive, but only in the course of completing the user's task. For example, if the user asks you to add a new component, you can edit the code, verify build and test statuses, and take any other obvious follow-up actions, such as performing additional research. However, avoid surprising the user. For example, if the user asks HOW to approach something, you should answer their question and instead of jumping into editing a file.</communication_style>";
 
@@ -2311,6 +2321,12 @@ fn sanitize_gemini_v1internal_request(
     value: &mut Value,
     inject_antigravity_identity: bool,
 ) -> Result<(), ProxyError> {
+    if !value.is_object() {
+        return Err(ProxyError::bad_request(
+            "Gemini v1internal request must be a JSON object",
+        ));
+    }
+    normalize_gemini_tool_schemas(value);
     let object = value.as_object_mut().ok_or_else(|| {
         ProxyError::bad_request("Gemini v1internal request must be a JSON object")
     })?;
@@ -2321,6 +2337,7 @@ fn sanitize_gemini_v1internal_request(
         return Ok(());
     }
     object.remove("safetySettings");
+    enable_antigravity_mixed_tool_invocations(object);
     let identity_present = object
         .get("systemInstruction")
         .and_then(|value| value.get("parts"))
@@ -2355,6 +2372,92 @@ fn sanitize_gemini_v1internal_request(
         .expect("systemInstruction.parts was normalized to an array")
         .insert(0, json!({"text": ANTIGRAVITY_IDENTITY_PATCH}));
     Ok(())
+}
+
+fn enable_antigravity_mixed_tool_invocations(request: &mut serde_json::Map<String, Value>) {
+    let mut has_google_search = false;
+    let mut has_function_declarations = false;
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            has_google_search |= tool
+                .get("googleSearch")
+                .or_else(|| tool.get("google_search"))
+                .is_some_and(Value::is_object);
+            has_function_declarations |= tool
+                .get("functionDeclarations")
+                .or_else(|| tool.get("function_declarations"))
+                .and_then(Value::as_array)
+                .is_some_and(|declarations| !declarations.is_empty());
+        }
+    }
+    if !has_google_search || !has_function_declarations {
+        return;
+    }
+
+    let tool_config = request
+        .entry("toolConfig".to_string())
+        .or_insert_with(|| json!({}));
+    if !tool_config.is_object() {
+        *tool_config = json!({});
+    }
+    let tool_config = tool_config
+        .as_object_mut()
+        .expect("toolConfig was normalized to an object");
+    tool_config.remove("include_server_side_tool_invocations");
+    tool_config.insert(
+        "includeServerSideToolInvocations".to_string(),
+        Value::Bool(true),
+    );
+}
+
+fn select_antigravity_inference_endpoint(endpoint: &mut String, account: &Account) {
+    let Ok(parsed) = url::Url::parse(endpoint) else {
+        return;
+    };
+    if !matches!(
+        parsed.host_str(),
+        Some("cloudcode-pa.googleapis.com" | "daily-cloudcode-pa.googleapis.com")
+    ) {
+        return;
+    }
+    let base_url = if antigravity_account_has_paid_tier(account) {
+        ANTIGRAVITY_DAILY_BASE_URL
+    } else {
+        ANTIGRAVITY_PRODUCTION_BASE_URL
+    };
+    *endpoint = gemini_v1internal_endpoint(base_url);
+}
+
+fn antigravity_account_has_paid_tier(account: &Account) -> bool {
+    if account
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.get("selectedTierSource"))
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.eq_ignore_ascii_case("paidTier"))
+    {
+        return true;
+    }
+
+    std::iter::once(account.subscription_level.as_deref())
+        .chain(account.profile.as_ref().into_iter().map(|profile| {
+            ["/tier", "/subscriptionTier", "/selectedTier", "/planType"]
+                .into_iter()
+                .find_map(|pointer| profile.pointer(pointer).and_then(Value::as_str))
+        }))
+        .flatten()
+        .any(antigravity_tier_is_paid)
+}
+
+fn antigravity_tier_is_paid(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ")
+            .as_str(),
+        "pro" | "ultra" | "google ai pro" | "google ai ultra"
+    )
 }
 
 fn gemini_v1internal_endpoint(base_url: &str) -> String {
@@ -4104,7 +4207,6 @@ mod tests {
         ] {
             assert!(!looks_like_error_response(&value), "value={value}");
         }
-
         for value in [
             json!({"error": {"message": "failed"}}),
             json!({"errors": ["failed"]}),
@@ -4425,6 +4527,7 @@ mod tests {
         for (app, adapter) in [
             (AppKind::Claude, "claude_to_copilot_chat"),
             (AppKind::Codex, "codex_to_copilot_chat"),
+            (AppKind::Gemini, "gemini_to_copilot_chat"),
         ] {
             let capability = capability_for(app, ProviderType::GitHubCopilot);
             assert_eq!(capability.adapter, adapter);
@@ -4433,12 +4536,6 @@ mod tests {
             assert!(capability.supports_stream_usage);
             assert!(capability.supports_model_list);
         }
-
-        let gemini = capability_for(AppKind::Gemini, ProviderType::GitHubCopilot);
-        assert_eq!(gemini.adapter, "gemini_copilot_skeleton");
-        assert_eq!(gemini.support, AdapterSupport::GenericFallback);
-        assert!(!gemini.supports_stream_usage);
-        assert!(!gemini.supports_model_list);
     }
 
     #[test]
@@ -4594,11 +4691,6 @@ mod tests {
                 AppKind::Codex,
                 ProviderType::DeepSeekAccount,
                 "codex_deepseek_skeleton",
-            ),
-            (
-                AppKind::Gemini,
-                ProviderType::GitHubCopilot,
-                "gemini_copilot_skeleton",
             ),
             (
                 AppKind::Gemini,
@@ -4974,10 +5066,12 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(
-                endpoint,
-                format!("{}/v1internal:streamGenerateContent?alt=sse", plan.endpoint)
-            );
+            let expected_base = if antigravity_identity {
+                ANTIGRAVITY_PRODUCTION_BASE_URL
+            } else {
+                plan.endpoint.as_str()
+            };
+            assert_eq!(endpoint, gemini_v1internal_endpoint(expected_base));
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(body["project"], expected_project);
             assert_eq!(body["model"], "gemini-3.5-flash-medium");
@@ -5194,6 +5288,94 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn antigravity_mixed_tools_enable_server_side_invocations_without_losing_config() {
+        let mut request = json!({
+            "contents": [],
+            "tools": [
+                {"functionDeclarations": [{"name": "lookup", "parameters": {"type": "object"}}]},
+                {"googleSearch": {}}
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {"mode": "AUTO"},
+                "include_server_side_tool_invocations": false
+            }
+        });
+        sanitize_gemini_v1internal_request(&mut request, true).unwrap();
+
+        assert_eq!(
+            request.pointer("/toolConfig/includeServerSideToolInvocations"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            request.pointer("/toolConfig/functionCallingConfig/mode"),
+            Some(&json!("AUTO"))
+        );
+        assert!(request
+            .pointer("/toolConfig/include_server_side_tool_invocations")
+            .is_none());
+    }
+
+    #[test]
+    fn antigravity_single_tool_kind_does_not_invent_mixed_tool_config() {
+        for tools in [
+            json!([{"functionDeclarations": [{"name": "lookup"}]}]),
+            json!([{"googleSearch": {}}]),
+        ] {
+            let mut request = json!({"contents": [], "tools": tools});
+            sanitize_gemini_v1internal_request(&mut request, true).unwrap();
+            assert!(request.get("toolConfig").is_none());
+        }
+    }
+
+    #[test]
+    fn antigravity_endpoint_uses_paid_tier_authority_and_preserves_test_origins() {
+        let account = |profile: Value, subscription_level: Option<&str>| Account {
+            id: "antigravity-endpoint-account".to_string(),
+            provider_type: ProviderType::AntigravityOAuth,
+            profile: Some(profile),
+            subscription_level: subscription_level.map(str::to_string),
+            ..serde_json::from_value(json!({
+                "id": "antigravity-endpoint-account",
+                "providerType": "antigravity_oauth"
+            }))
+            .unwrap()
+        };
+
+        let mut unknown = gemini_v1internal_endpoint(ANTIGRAVITY_DAILY_BASE_URL);
+        select_antigravity_inference_endpoint(&mut unknown, &account(json!({}), None));
+        assert_eq!(
+            unknown,
+            gemini_v1internal_endpoint(ANTIGRAVITY_PRODUCTION_BASE_URL)
+        );
+
+        for paid in [
+            account(json!({}), Some("Pro")),
+            account(
+                json!({"selectedTier": {"name": "custom-paid"}, "selectedTierSource": "paidTier"}),
+                None,
+            ),
+        ] {
+            let mut endpoint = gemini_v1internal_endpoint(ANTIGRAVITY_PRODUCTION_BASE_URL);
+            select_antigravity_inference_endpoint(&mut endpoint, &paid);
+            assert_eq!(
+                endpoint,
+                gemini_v1internal_endpoint(ANTIGRAVITY_DAILY_BASE_URL)
+            );
+        }
+
+        let mut test_endpoint =
+            "http://127.0.0.1:43210/v1internal:streamGenerateContent?alt=sse".to_string();
+        select_antigravity_inference_endpoint(
+            &mut test_endpoint,
+            &account(json!({}), Some("Ultra")),
+        );
+        assert_eq!(
+            test_endpoint,
+            "http://127.0.0.1:43210/v1internal:streamGenerateContent?alt=sse"
         );
     }
 
@@ -5571,6 +5753,45 @@ mod tests {
                 .and_then(Value::as_str),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn kimi_selects_native_messages_only_for_the_claude_source_surface() {
+        let claude = stored_provider(
+            AppKind::Claude,
+            ProviderType::KimiCode,
+            json!({"modelMapping":{"mode":"single","upstreamModel":"kimi-for-coding"}}),
+        );
+        let request = adapter_for(AppKind::Claude, ProviderType::KimiCode)
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"claude-sonnet-5","max_tokens":128,"messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+                ),
+                &claude,
+                ProxyRoute::ClaudeMessages,
+                None,
+            )
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let capability = capability_for(AppKind::Claude, ProviderType::KimiCode);
+
+        assert_eq!(capability.adapter, "claude_kimi_messages");
+        assert!(!capability.requires_transform);
+        assert_eq!(body["messages"][0]["content"], "ping");
+        assert!(body.get("input").is_none());
+        assert_eq!(
+            upstream_format_for_route(&claude, Some(ProxyRoute::ClaudeMessages), &request.body),
+            Some(UpstreamFormat::AnthropicMessages)
+        );
+
+        for app in [AppKind::Codex, AppKind::Gemini] {
+            let stored = stored_provider(app, ProviderType::KimiCode, json!({}));
+            assert_eq!(
+                upstream_format_for_route(&stored, None, &[]),
+                Some(UpstreamFormat::OpenAiChat),
+                "app={app:?}"
+            );
+        }
     }
 
     #[test]
@@ -7428,6 +7649,73 @@ mod tests {
             expected_model: Some("google/gemini-3.5-flash"),
             expected_stream: false,
         });
+    }
+
+    #[test]
+    fn gemini_copilot_bridge_preserves_tools_usage_and_terminal_response() {
+        let mut stored = stored_provider(
+            AppKind::Gemini,
+            ProviderType::GitHubCopilot,
+            json!({
+                "modelMapping": {"mode": "single", "upstreamModel": "gemini-3.5-flash"}
+            }),
+        );
+        bind_managed_test_provider(&mut stored, "copilot-gemini-account");
+        let adapter = adapter_for(AppKind::Gemini, ProviderType::GitHubCopilot);
+
+        let request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"contents":[{"role":"user","parts":[{"text":"look it up"}]}],"tools":[{"functionDeclarations":[{"name":"lookup","description":"Look up a value","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]}]}"#,
+                ),
+                &stored,
+                ProxyRoute::Gemini,
+                Some("models/gemini-3.5-flash:streamGenerateContent"),
+            )
+            .unwrap();
+        let endpoint = adapter
+            .resolve_endpoint_for_request(
+                ProxyRoute::Gemini,
+                Some("models/gemini-3.5-flash:streamGenerateContent".to_string()),
+                &stored,
+                &request,
+            )
+            .unwrap();
+        let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(endpoint, "https://api.githubcopilot.com/chat/completions");
+        assert_eq!(request_body["model"], "gemini-3.5-flash");
+        assert_eq!(request_body["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(
+            request_body["tools"][0]["function"]["parameters"]["required"],
+            json!(["q"])
+        );
+        assert_eq!(request_body["stream"], true);
+        assert_eq!(request_body["stream_options"]["include_usage"], true);
+
+        let response = adapter
+            .transform_response(
+                Bytes::from_static(
+                    br#"{"id":"chatcmpl-copilot","model":"gemini-3.5-flash","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"rust\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":2}}}"#,
+                ),
+                &stored,
+                ProxyRoute::Gemini,
+            )
+            .unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+
+        assert_eq!(
+            response.pointer("/candidates/0/content/parts/0/functionCall/id"),
+            Some(&json!("call_lookup"))
+        );
+        assert_eq!(
+            response.pointer("/candidates/0/content/parts/0/functionCall/args/q"),
+            Some(&json!("rust"))
+        );
+        assert_eq!(response["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(response["usageMetadata"]["promptTokenCount"], 7);
+        assert_eq!(response["usageMetadata"]["cachedContentTokenCount"], 2);
+        assert_eq!(response["usageMetadata"]["candidatesTokenCount"], 5);
     }
 
     #[test]

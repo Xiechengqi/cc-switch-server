@@ -7,7 +7,7 @@ export const requiredProviderTypes = Object.freeze([
   ["gemini", "Google Gemini API key", ["gemini"]],
   ["gemini_cli", "Google Gemini OAuth / CLI", ["gemini", "claude"]],
   ["openrouter", "OpenRouter", ["claude", "codex", "gemini"]],
-  ["github_copilot", "GitHub Copilot", ["claude", "codex"]],
+  ["github_copilot", "GitHub Copilot", ["claude", "codex", "gemini"]],
   ["deepseek_account", "DeepSeek account", ["claude"]],
   ["kiro_oauth", "Kiro OAuth", ["claude", "codex"]],
   ["cursor_oauth", "Cursor OAuth", ["claude", "codex", "gemini"]],

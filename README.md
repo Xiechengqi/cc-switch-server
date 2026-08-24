@@ -66,14 +66,15 @@ Claude / Codex / Gemini client
 | **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；Images/Responses Cloudflare 心跳与持久化 capability URL；有界 WS cache 与提交前 HTTP/SSE fallback |
 | **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
-| **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | ⚠️ Partial | OAuth/模型列表已接入；无独立 `/antigravity/v1*` 路由组 |
-| **Cursor** | 作为 Claude/Codex 上游桥（非 IDE MITM） | 🧪 Experimental | OAuth CLI / API Key SDK 双 rail；固定单凭据与 runtime-secret endpoint，待分轨真实验收 |
-| **GitHub Copilot** | 作为 Claude 上游桥 | ⚠️ Fallback | 静态 preflight 与 model map 已接入；token 交换与 live 回归待验收 |
-| **Kiro** | 作为 Claude 上游桥 | ⚠️ Planned | CodeWhisperer 协议桥已静态接线；仅 Claude app，待真实验收 |
+| **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | 🧪 Experimental | OAuth、模型、tier/search contract 已接入；无独立 `/antigravity/v1*` 路由组，待真实验收 |
+| **Cursor** | 作为 Claude/Codex/Gemini 上游桥（非 IDE MITM） | 🧪 Experimental | OAuth CLI / API Key SDK 双 rail；固定单凭据、官方 endpoint discovery，待分轨真实验收 |
+| **GitHub Copilot** | 作为 Claude/Codex/Gemini 上游桥 | 🧪 Experimental | token exchange、model/quota 与三 Surface bridge 已 fixture-verified，github.com/GHES 待真实验收 |
+| **Kiro** | 作为 Claude/Codex 上游桥 | 🧪 Experimental | CodeWhisperer、profile/region、model/quota、EventStream 已 fixture-verified，待真实验收 |
 | **DeepSeek Account** | 作为 Claude 上游桥 | ⚠️ Planned | 账密协议桥与 PoW 已接线；Codex/Gemini 路径仍为 skeleton |
-| **Cline / OpenCode / Qoder / Trae / Windsurf / Zed** | — | ❌ 不支持 | server 产品边界不覆盖这些 IDE 专属 MITM 或插件生态 |
+| **Qoder / COSY** | 作为 Claude/Codex/Gemini 上游桥（非 IDE MITM） | 🧪 Experimental | Global/CN、Device/PAT、COSY 签名与三协议 bridge 已 fixture-verified，真实验收待完成 |
+| **Cline / OpenCode / Trae / Windsurf / Zed** | — | ❌ 不支持 | server 产品边界不覆盖这些 IDE 专属 MITM 或插件生态 |
 
-能力分级：`✅ Native` = 静态 adapter contract 已覆盖且属主线验收对象；`⚠️ Planned` = 转发/签名已接线但缺真实 non-stream/stream 验收；`⚠️ Fallback` = skeleton 或 manual import 路径；`❌` = 未实现。详见 [`docs/provider/regression-matrix.md`](docs/provider/regression-matrix.md)。
+能力分级：`✅ Native` = 静态 adapter contract 已覆盖且属主线验收对象；`🧪 Experimental` = 完整合同已接线但仍缺对应真实账号/区域验收；`⚠️ Planned` = 转发/签名仅部分接线；`⚠️ Fallback` = skeleton 或 manual import 路径；`❌` = 未实现。详见 [`docs/provider/regression-matrix.md`](docs/provider/regression-matrix.md)。
 
 > **产品边界**：不依赖 Tauri 桌面运行时，**不提供 Claude Code 热切换**（需重启 CLI 使 provider 变更生效）；提供 Server-native OAuth、share/router 隧道、Web 管理面、remote usage 同步与多租户 share binding。
 
@@ -85,12 +86,14 @@ Claude / Codex / Gemini client
 | Codex / OpenAI OAuth | ✅ | ✅ | — | Native |
 | Gemini / Gemini CLI OAuth | ✅ | ✅ | ✅ | Native |
 | OpenRouter / Ollama / Nvidia / DeepSeek API | ✅ | ✅ | ✅ | Native |
-| Antigravity / Agy OAuth | ✅ | — | ✅ | Native（经预设映射） |
-| Cursor OAuth / API Key | 🧪 | 🧪 | 🧪 | Experimental（CLI/SDK 分轨接线，runtime endpoint 必配，live-unverified） |
+| Antigravity / Agy OAuth | 🧪 | — | 🧪 | Experimental（经预设映射，live-unverified） |
+| Cursor OAuth / API Key | 🧪 | 🧪 | 🧪 | Experimental（CLI/SDK 分轨、官方 endpoint discovery，live-unverified） |
 | AWS Bedrock | ⚠️ | ⚠️ | ⚠️ | Planned（SigV4 合同已生成） |
-| GitHub Copilot | ⚠️ | ⚠️ | ⚠️ | Fallback |
-| Kiro OAuth | ⚠️ | — | — | Planned（仅 Claude） |
+| GitHub Copilot | 🧪 | 🧪 | 🧪 | Experimental（三 Surface fixture-verified，live-unverified） |
+| Kiro OAuth | 🧪 | 🧪 | — | Experimental（Claude/Codex fixture-verified，live-unverified） |
 | DeepSeek Account | ⚠️ | — | — | Planned（仅 Claude） |
+| Kimi Code | ✅ | ✅ | ✅ | Native contract（固定账号，live-unverified） |
+| Qoder COSY | 🧪 | 🧪 | 🧪 | Experimental（固定账号与三 Surface contract，live-unverified） |
 
 完整 provider 类型与 preset 覆盖见 [`docs/provider/coverage.md`](docs/provider/coverage.md)；运行时矩阵可通过 `GET /api/provider-matrix` 获取。
 

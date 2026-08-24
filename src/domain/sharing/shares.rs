@@ -1520,6 +1520,17 @@ impl ShareStore {
             });
         }
         if let Some(grant) = user_grant {
+            if !grant.policy.allowed_apps.is_empty() && !grant.policy.allowed_apps.contains(&app) {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::AppNotAllowed,
+                    message: format!(
+                        "This market entitlement does not include the {} API.",
+                        app.as_str()
+                    ),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
             if grant
                 .policy
                 .expires_at
@@ -3226,6 +3237,7 @@ pub enum ShareRejectReason {
     UnsupportedApp,
     UserIdentityRequired,
     Unauthorized,
+    AppNotAllowed,
     Inactive,
     Expired,
     Exhausted,
@@ -3242,6 +3254,7 @@ impl ShareRejectReason {
             Self::UnsupportedApp => "UnsupportedApp",
             Self::UserIdentityRequired => "UserIdentityRequired",
             Self::Unauthorized => "Unauthorized",
+            Self::AppNotAllowed => "AppNotAllowed",
             Self::Inactive => "Inactive",
             Self::Expired => "Expired",
             Self::Exhausted => "Exhausted",
@@ -3548,6 +3561,7 @@ fn default_user_policy(share: &Share) -> ShareUserPolicy {
         token_period: ShareTokenPeriod::Lifetime,
         token_period_anchor_at_ms: None,
         expires_at: share.expires_at,
+        allowed_apps: Vec::new(),
     }
 }
 
@@ -3930,6 +3944,7 @@ mod tests {
                 token_period: ShareTokenPeriod::Day,
                 token_period_anchor_at_ms: None,
                 expires_at: None,
+                allowed_apps: Vec::new(),
             }),
             duration_seconds: None,
         }
@@ -4031,6 +4046,82 @@ mod tests {
                 .token_limit,
             Some(10_000)
         );
+    }
+
+    #[test]
+    fn managed_grant_allowed_apps_is_enforced_without_breaking_legacy_empty_scope() {
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("app-scoped-grant")).unwrap();
+        let shared = store
+            .add_binding(
+                "app-scoped-grant",
+                ShareBinding {
+                    app: AppKind::Claude,
+                    provider_id: "claude-provider".into(),
+                    provider_type: ProviderType::Claude,
+                },
+            )
+            .unwrap();
+        let mut operation = managed_operation(
+            "operation-app-scope",
+            "entitlement-app-scope",
+            shared.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        operation
+            .policy
+            .as_mut()
+            .expect("upsert policy")
+            .allowed_apps = vec![AppKind::Codex];
+        store
+            .apply_settings_patch(
+                &original.id,
+                ShareSettingsPatch {
+                    managed_grant: Some(operation),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .expect("apply App-scoped managed grant");
+        let invocation_now = i64::try_from(now_ms()).expect("current timestamp fits i64");
+
+        assert!(store
+            .validate_for_invocation(
+                "app-scoped-grant",
+                AppKind::Codex,
+                Some("renter@example.com"),
+                invocation_now,
+            )
+            .is_ok());
+        let rejection = store
+            .validate_for_invocation(
+                "app-scoped-grant",
+                AppKind::Claude,
+                Some("renter@example.com"),
+                invocation_now,
+            )
+            .expect_err("Codex rental must not authorize Claude");
+        assert_eq!(rejection.reason, ShareRejectReason::AppNotAllowed);
+
+        store
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "app-scoped-grant")
+            .expect("App-scoped Share")
+            .user_grants
+            .get_mut("renter@example.com")
+            .expect("managed renter grant")
+            .policy
+            .allowed_apps
+            .clear();
+        assert!(store
+            .validate_for_invocation(
+                "app-scoped-grant",
+                AppKind::Claude,
+                Some("renter@example.com"),
+                invocation_now,
+            )
+            .is_ok());
     }
 
     #[test]
@@ -4626,6 +4717,7 @@ mod tests {
                     token_period: ShareTokenPeriod::Lifetime,
                     token_period_anchor_at_ms: None,
                     expires_at: input.expires_at,
+                    allowed_apps: Vec::new(),
                 },
                 ..ShareUserGrant::default()
             },
@@ -4750,6 +4842,7 @@ mod tests {
             token_period: ShareTokenPeriod::Lifetime,
             token_period_anchor_at_ms: None,
             expires_at: Some(expires_at),
+            allowed_apps: Vec::new(),
         };
         input.user_grants.insert(
             "User@Example.com".to_string(),

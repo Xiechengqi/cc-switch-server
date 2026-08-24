@@ -26,7 +26,7 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::Share;
 
-pub const SHARE_CONTRACT_VERSION: u16 = 2;
+pub const SHARE_CONTRACT_VERSION: u16 = 3;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -140,6 +140,10 @@ pub struct ShareUserPolicy {
     pub token_period_anchor_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// Empty keeps legacy/manual ShareTo behavior. Router-managed market
+    /// grants always carry exactly the App purchased by the renter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_apps: Vec<AppKind>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1741,6 +1745,33 @@ mod tests {
         let omitted: ShareSettingsPatch =
             serde_json::from_str(r#"{}"#).expect("parse omitted description");
         assert_eq!(omitted.description, None);
+    }
+
+    #[test]
+    fn v3_app_scope_matches_router_wire_format_and_keeps_legacy_omission() {
+        let policy = ShareUserPolicy {
+            allowed_apps: vec![AppKind::Codex],
+            ..ShareUserPolicy::default()
+        };
+        let wire = serde_json::to_value(&policy).expect("serialize App-scoped policy");
+
+        assert_eq!(
+            wire,
+            json!({
+                "tokenPeriod": "lifetime",
+                "allowedApps": ["codex"]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ShareUserPolicy>(wire)
+                .expect("deserialize Router App scope")
+                .allowed_apps,
+            [AppKind::Codex]
+        );
+        assert!(serde_json::from_value::<ShareUserPolicy>(json!({}))
+            .expect("deserialize legacy policy")
+            .allowed_apps
+            .is_empty());
     }
 
     #[test]

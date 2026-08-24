@@ -198,8 +198,8 @@ pub const CLAUDE_API_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token
 pub const CLAUDE_PLATFORM_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 static GEMINI_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-static CURSOR_TOKEN_URLS: &[&str] = &["https://api2.cursor.sh/oauth/token"];
-static CURSOR_AUTHORIZE_URL: &str = "https://www.cursor.com/loginDeepControl";
+static CURSOR_TOKEN_URLS: &[&str] = &["https://api2.cursor.sh/auth/exchange_user_api_key"];
+static CURSOR_AUTHORIZE_URL: &str = "https://cursor.com/loginDeepControl";
 static CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
 static CURSOR_USER_AGENT: &str = "Cursor/1.1.6 (cc-switch browser login)";
 static ANTIGRAVITY_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
@@ -1011,6 +1011,23 @@ pub fn build_refresh_request_for_token_url(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| missing_credential("refresh token is required"))?;
+    if provider_type == ProviderType::CursorOAuth {
+        let mut headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            (
+                "Authorization".to_string(),
+                format!("Bearer {refresh_token}"),
+            ),
+        ];
+        set_oauth_user_agent(&mut headers, provider_type, token_url, spec.user_agent);
+        return Ok(OAuthHttpRequest {
+            method: "POST",
+            url: token_url.to_string(),
+            headers,
+            body: json!({}),
+            body_format: OAuthRequestBodyFormat::Json,
+        });
+    }
     let client_id = resolve_client_id(&spec, account)?;
     let client_secret = resolve_client_secret(&spec, account)?;
 
@@ -1181,7 +1198,12 @@ pub fn refresh_update_from_token_response(
             .map(|_| now_ms.saturating_add(quota_refresh_interval_ms)),
         expires_at: response
             .expires_in
-            .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000))),
+            .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)))
+            .or_else(|| {
+                (provider_type == ProviderType::CursorOAuth)
+                    .then(|| cursor_token_expiry_ms(&response.access_token))
+                    .flatten()
+            }),
         ..Default::default()
     }
 }
@@ -2053,6 +2075,13 @@ fn decode_jwt_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&decoded).ok()
+}
+
+fn cursor_token_expiry_ms(token: &str) -> Option<i64> {
+    decode_jwt_claims(normalize_cursor_access_token(token))?
+        .get("exp")?
+        .as_i64()
+        .map(|seconds| seconds.saturating_mul(1000))
 }
 
 fn profile_value(
@@ -3500,10 +3529,17 @@ mod tests {
             ),
         )
         .expect("cursor request");
-        assert_eq!(cursor.url, "https://api2.cursor.sh/oauth/token");
+        assert_eq!(
+            cursor.url,
+            "https://api2.cursor.sh/auth/exchange_user_api_key"
+        );
         assert_eq!(cursor.body_format, OAuthRequestBodyFormat::Json);
-        assert_eq!(cursor.body["client_id"], "cursor-client-fixture");
+        assert_eq!(cursor.body, json!({}));
         assert!(cursor.body.get("client_secret").is_none());
+        assert!(cursor
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Authorization" && value == "Bearer refresh-token" }));
         assert!(cursor.headers.iter().any(|(name, value)| {
             name == "User-Agent" && value == "Cursor/1.1.6 (cc-switch browser login)"
         }));

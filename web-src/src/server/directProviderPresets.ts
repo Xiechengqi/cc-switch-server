@@ -221,6 +221,12 @@ export const qoderGeminiPreset: GeminiProviderPreset = {
 };
 
 const directProfileVisuals: Record<string, DirectProfileVisual> = {
+  "gemini.github_copilot": {
+    name: "GitHub Copilot",
+    websiteUrl: "https://github.com/features/copilot",
+    icon: "github",
+    iconColor: "#000000",
+  },
   "gemini.cursor_api_key": {
     name: "Cursor API Key",
     websiteUrl: "https://cursor.com",
@@ -248,6 +254,18 @@ const directProfileVisuals: Record<string, DirectProfileVisual> = {
     websiteUrl: "https://z.ai",
     icon: "zhipu",
     iconColor: "#0F62FE",
+  },
+  bailian_coding_plan_cn: {
+    name: "Alibaba Coding Plan (China)",
+    websiteUrl: "https://bailian.console.aliyun.com",
+    icon: "bailian",
+    iconColor: "#FF6A00",
+  },
+  bailian_coding_plan_global: {
+    name: "Alibaba Coding Plan (Global/Singapore)",
+    websiteUrl: "https://www.alibabacloud.com/product/coding",
+    icon: "bailian",
+    iconColor: "#FF6A00",
   },
   minimax_cn: {
     name: "MiniMax Coding Plan (China)",

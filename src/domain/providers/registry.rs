@@ -964,9 +964,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     }
 
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 28usize),
-        (AppKind::Codex, 21usize),
-        (AppKind::Gemini, 10usize),
+        (AppKind::Claude, 30usize),
+        (AppKind::Codex, 23usize),
+        (AppKind::Gemini, 11usize),
     ]);
     for (app, expected) in expected_counts {
         let actual = registry
@@ -987,9 +987,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 65 {
+    if registry.profiles.len() != 70 {
         bail!(
-            "Provider registry contains {} profiles, expected 65",
+            "Provider registry contains {} profiles, expected 70",
             registry.profiles.len()
         );
     }
@@ -1392,7 +1392,7 @@ fn validate_operation_contract(driver: &DriverSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 30] = [
+const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 35] = [
     "claude.anthropic_api_key",
     "claude.google_oauth",
     "claude.kimi_code",
@@ -1403,6 +1403,7 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 30] = [
     "codex.qoder_cosy",
     "codex.openai_api_key",
     "gemini.google_api_key",
+    "gemini.github_copilot",
     "gemini.kimi_code",
     "gemini.qoder_cosy",
     "gemini.cursor_api_key",
@@ -1413,6 +1414,10 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 30] = [
     "codex.zhipu_glm_cn",
     "claude.zhipu_glm_global",
     "codex.zhipu_glm_global",
+    "claude.bailian_coding_plan_cn",
+    "codex.bailian_coding_plan_cn",
+    "claude.bailian_coding_plan_global",
+    "codex.bailian_coding_plan_global",
     "claude.minimax_cn",
     "codex.minimax_cn",
     "claude.minimax_global",
@@ -1434,8 +1439,8 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.families.len(), 31);
-        assert_eq!(registry.profiles.len(), 65);
+        assert_eq!(registry.families.len(), 33);
+        assert_eq!(registry.profiles.len(), 70);
         assert_eq!(registry.legacy_preset_mappings.len(), 29);
         assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(
@@ -1454,6 +1459,86 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn bailian_coding_plan_profiles_pin_region_protocol_catalog_and_quota() {
+        use crate::domain::providers::coding_plan::{CodingPlanQuotaAdapter, CodingPlanRoute};
+
+        let cases = [
+            (
+                "claude.bailian_coding_plan_cn",
+                "https://coding.dashscope.aliyuncs.com",
+                UpstreamProtocol::AnthropicMessages,
+                AuthScheme::ApiKey,
+                CodingPlanRoute::ClaudeMessages,
+                "/apps/anthropic/v1/messages",
+                "qwen3-coder-plus",
+            ),
+            (
+                "codex.bailian_coding_plan_cn",
+                "https://coding.dashscope.aliyuncs.com",
+                UpstreamProtocol::OpenAiChat,
+                AuthScheme::Bearer,
+                CodingPlanRoute::CodexResponses,
+                "/v1/chat/completions",
+                "qwen3-max-2026-01-23",
+            ),
+            (
+                "claude.bailian_coding_plan_global",
+                "https://coding-intl.dashscope.aliyuncs.com",
+                UpstreamProtocol::AnthropicMessages,
+                AuthScheme::ApiKey,
+                CodingPlanRoute::ClaudeMessages,
+                "/apps/anthropic/v1/messages",
+                "qwen3.8-max-preview",
+            ),
+            (
+                "codex.bailian_coding_plan_global",
+                "https://coding-intl.dashscope.aliyuncs.com",
+                UpstreamProtocol::OpenAiChat,
+                AuthScheme::Bearer,
+                CodingPlanRoute::CodexResponses,
+                "/v1/chat/completions",
+                "qwen3.5-plus",
+            ),
+        ];
+
+        for (profile_id, origin, protocol, auth, route, path, model) in cases {
+            let profile = profile_by_id(profile_id).unwrap();
+            let contract = profile.coding_plan.as_ref().unwrap();
+            assert_eq!(contract.inference.fixed_origin, origin, "{profile_id}");
+            assert_eq!(contract.inference.protocol, protocol, "{profile_id}");
+            assert_eq!(contract.inference.auth_scheme, auth, "{profile_id}");
+            assert!(contract
+                .routes
+                .iter()
+                .any(|item| item.route == route && item.path == path));
+            assert!(contract.models.iter().any(|item| item.id == model));
+            assert_eq!(contract.quota.adapter, CodingPlanQuotaAdapter::Unavailable);
+            assert!(contract.quota.endpoint.is_none());
+            assert!(contract.quota.credential_slots.is_empty());
+            assert!(!contract.error.retry_same_credential_once_on_401);
+            assert!(!contract.error.retry_after_commit);
+        }
+    }
+
+    #[test]
+    fn glm_5_3_is_published_only_on_live_evidenced_openai_coding_rails() {
+        for (profile_id, expected) in [
+            ("claude.zhipu_glm_cn", false),
+            ("codex.zhipu_glm_cn", true),
+            ("claude.zhipu_glm_global", false),
+            ("codex.zhipu_glm_global", true),
+        ] {
+            let profile = profile_by_id(profile_id).unwrap();
+            let contract = profile.coding_plan.as_ref().unwrap();
+            assert_eq!(
+                contract.models.iter().any(|model| model.id == "glm-5.3"),
+                expected,
+                "{profile_id}"
+            );
+        }
     }
 
     #[test]
@@ -1482,6 +1567,7 @@ mod tests {
             (ProviderType::OpenRouter, AppKind::Gemini),
             (ProviderType::GitHubCopilot, AppKind::Claude),
             (ProviderType::GitHubCopilot, AppKind::Codex),
+            (ProviderType::GitHubCopilot, AppKind::Gemini),
             (ProviderType::DeepSeekAccount, AppKind::Claude),
             (ProviderType::KiroOAuth, AppKind::Claude),
             (ProviderType::KiroOAuth, AppKind::Codex),
@@ -1513,7 +1599,7 @@ mod tests {
             (ProviderType::QoderCosy, AppKind::Gemini),
         ];
 
-        assert_eq!(required.len(), 43);
+        assert_eq!(required.len(), 44);
 
         for (provider_type, app) in required {
             let profiles = provider_registry()

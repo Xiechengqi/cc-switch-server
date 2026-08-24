@@ -108,7 +108,10 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
             );
         }
         ManagedIdentityFamily::Qoder => {
-            set_user_agent(headers, "QoderCLI/1.21.2".to_string());
+            set_user_agent(
+                headers,
+                crate::domain::qoder::QODER_COSY_USER_AGENT.to_string(),
+            );
         }
         ManagedIdentityFamily::Kiro => {
             set_user_agent(headers, "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string())
@@ -252,6 +255,10 @@ mod tests {
             (
                 ManagedIdentityFamily::KimiCli,
                 crate::domain::kimi_cli::KIMI_USER_AGENT.to_string(),
+            ),
+            (
+                ManagedIdentityFamily::Qoder,
+                crate::domain::qoder::QODER_COSY_USER_AGENT.to_string(),
             ),
             (
                 ManagedIdentityFamily::Kiro,

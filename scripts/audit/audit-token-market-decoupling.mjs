@@ -275,8 +275,8 @@ if (requireDirectory(serverRoot, "Server audit root")) {
   requireText(
     serverRoot,
     "src/domain/sharing/router_contract.rs",
-    /pub const SHARE_CONTRACT_VERSION: u16 = 2;/,
-    "Share Contract v2 constant",
+    /pub const SHARE_CONTRACT_VERSION: u16 = 3;/,
+    "Share Contract v3 constant",
   );
   requireBlock(
     serverRoot,
@@ -284,7 +284,7 @@ if (requireDirectory(serverRoot, "Server audit root")) {
     "pub struct ShareDescriptor {",
     "\n}",
     {
-      label: "Server ShareDescriptor v2",
+      label: "Server ShareDescriptor v3",
       required: [
         [/contract_version/, "contract version"],
         [/free_access/, "canonical free access"],
@@ -302,7 +302,7 @@ if (requireDirectory(serverRoot, "Server audit root")) {
     "pub struct ShareSettingsPatch {",
     "\n}",
     {
-      label: "Server ShareSettingsPatch v2",
+      label: "Server ShareSettingsPatch v3",
       required: [
         [/free_access/, "canonical free access"],
         [/user_grants/, "canonical user grants"],
@@ -311,6 +311,16 @@ if (requireDirectory(serverRoot, "Server audit root")) {
         [retiredShareFieldPattern, "legacy Share sale/ACL fields"],
         [retiredShareKeyPattern, "legacy Share key literals"],
       ],
+    },
+  );
+  requireBlock(
+    serverRoot,
+    "src/domain/sharing/router_contract.rs",
+    "pub struct ShareUserPolicy {",
+    "\n}",
+    {
+      label: "Server ShareUserPolicy v3",
+      required: [[/allowed_apps/, "market App scope"]],
     },
   );
   requireBlock(
@@ -401,8 +411,8 @@ if (requireDirectory(routerRoot, "Router audit root")) {
   requireText(
     routerRoot,
     "src/models.rs",
-    /pub const SHARE_CONTRACT_VERSION: u16 = 2;/,
-    "Share Contract v2 constant",
+    /pub const SHARE_CONTRACT_VERSION: u16 = 3;/,
+    "Share Contract v3 constant",
   );
   requireBlock(
     routerRoot,
@@ -444,7 +454,7 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     "pub struct ShareDescriptor {",
     "\n}",
     {
-      label: "Router ShareDescriptor v2",
+      label: "Router ShareDescriptor v3",
       required: [
         [/contract_version/, "contract version"],
         [/free_access/, "canonical free access"],
@@ -462,7 +472,7 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     "pub struct ShareSettingsPatch {",
     "\n}",
     {
-      label: "Router ShareSettingsPatch v2",
+      label: "Router ShareSettingsPatch v3",
       required: [
         [/free_access/, "canonical free access"],
         [/user_grants/, "canonical user grants"],
@@ -471,6 +481,16 @@ if (requireDirectory(routerRoot, "Router audit root")) {
         [retiredShareFieldPattern, "legacy Share sale/ACL fields"],
         [retiredShareKeyPattern, "legacy Share key literals"],
       ],
+    },
+  );
+  requireBlock(
+    routerRoot,
+    "src/models.rs",
+    "pub struct ShareUserPolicy {",
+    "\n}",
+    {
+      label: "Router ShareUserPolicy v3",
+      required: [[/allowed_apps/, "market App scope"]],
     },
   );
   requireAllText(routerRoot, "src/store.rs", [
