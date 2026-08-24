@@ -14,7 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { codexBankedResetApi, subscriptionApi } from "@/lib/api";
-import type { CodexBankedResetCredit } from "@/lib/api";
+import type { CodexBankedResetCredit, CodexBankedResetStatus } from "@/lib/api";
 
 interface CodexBankedResetPanelProps {
   accountId?: string | null;
@@ -88,12 +88,10 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
     },
   });
 
-  const availableCredits = React.useMemo(() => {
-    return (statusQuery.data?.credits ?? []).filter((credit) => {
-      const status = credit.status?.toLowerCase();
-      return status === "available";
-    });
-  }, [statusQuery.data?.credits]);
+  const availableCredits = React.useMemo(
+    () => selectableBankedResetCredits(statusQuery.data),
+    [statusQuery.data],
+  );
 
   React.useEffect(() => {
     if (availableCredits.length === 0) {
@@ -127,20 +125,6 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
     },
   });
 
-  const handleConsume = () => {
-    if (!selectedCreditId) return;
-    setConsumeConfirmOpen(true);
-  };
-
-  const handleConsumeConfirm = () => {
-    if (!selectedCreditId) {
-      setConsumeConfirmOpen(false);
-      return;
-    }
-    consumeMutation.mutate(selectedCreditId);
-    setConsumeConfirmOpen(false);
-  };
-
   const selectedCredit = availableCredits.find(
     (credit) => credit.id === selectedCreditId,
   );
@@ -152,6 +136,26 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
     : null;
   const availableCount =
     statusQuery.data?.availableCount ?? availableCredits.length;
+  const consumeCreditId = resolveBankedResetConsumeCreditId(
+    availableCount,
+    selectedCreditId,
+    availableCredits,
+  );
+  const usesAutomaticSelection = consumeCreditId === "";
+
+  const handleConsume = () => {
+    if (consumeCreditId === null) return;
+    setConsumeConfirmOpen(true);
+  };
+
+  const handleConsumeConfirm = () => {
+    if (consumeCreditId === null) {
+      setConsumeConfirmOpen(false);
+      return;
+    }
+    consumeMutation.mutate(consumeCreditId);
+    setConsumeConfirmOpen(false);
+  };
 
   const consumeMessage = (code?: string | null) => {
     if (code === "nothing_to_reset")
@@ -252,11 +256,7 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
                   className="w-[22rem] max-w-[calc(100vw-2rem)]"
                 >
                   {availableCredits.map((credit, index) => {
-                    const summary = creditTimeSummary(
-                      credit,
-                      t,
-                      i18n.language,
-                    );
+                    const summary = creditTimeSummary(credit, t, i18n.language);
                     return (
                       <SelectItem
                         key={credit.id}
@@ -294,7 +294,11 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
             </div>
           ) : (
             <p className="rounded-md border border-dashed border-border-default px-3 py-4 text-sm text-muted-foreground">
-              {t("codexBankedReset.noCredits")}
+              {availableCount > 0
+                ? t("codexBankedReset.detailsUnavailable", {
+                    count: availableCount,
+                  })
+                : t("codexBankedReset.noCredits")}
             </p>
           )}
 
@@ -302,7 +306,7 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
             type="button"
             className="w-full"
             onClick={handleConsume}
-            disabled={!selectedCreditId || consumeMutation.isPending}
+            disabled={consumeCreditId === null || consumeMutation.isPending}
           >
             {consumeMutation.isPending ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -316,7 +320,11 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
       <ConfirmDialog
         isOpen={consumeConfirmOpen}
         title={t("codexBankedReset.useReset")}
-        message={t("codexBankedReset.consumeConfirm")}
+        message={t(
+          usesAutomaticSelection
+            ? "codexBankedReset.consumeConfirmAutomatic"
+            : "codexBankedReset.consumeConfirm",
+        )}
         confirmText={t("codexBankedReset.useReset")}
         cancelText={t("common.cancel")}
         variant="destructive"
@@ -326,6 +334,35 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
     </section>
   );
 };
+
+export function selectableBankedResetCredits(
+  status?: CodexBankedResetStatus,
+): CodexBankedResetCredit[] {
+  if (status?.detailsAvailable === false || status?.detailsStale === true) {
+    return [];
+  }
+  return (status?.credits ?? []).filter(
+    (credit) =>
+      credit.status?.trim().toLowerCase() === "available" &&
+      credit.idAvailable !== false &&
+      Boolean(credit.id?.trim()),
+  );
+}
+
+export function resolveBankedResetConsumeCreditId(
+  availableCount: number,
+  selectedCreditId: string,
+  availableCredits: CodexBankedResetCredit[],
+): string | null {
+  const selected = selectedCreditId.trim();
+  if (
+    selected &&
+    availableCredits.some((credit) => credit.id.trim() === selected)
+  ) {
+    return selected;
+  }
+  return availableCount > 0 && availableCredits.length === 0 ? "" : null;
+}
 
 function creditLabel(
   credit: CodexBankedResetCredit,

@@ -72,6 +72,18 @@ Content-Type: application/json
 
 Referral 不读取账号中心 active account，不遍历账号，也不会创建 Share 或改变 Share binding。
 
+## Banked Reset Provider 控制面
+
+Banked Reset 与 Referral 是两套独立的 ChatGPT 能力。历史提交 `ed8d123` 删除的是旧 `/referrals/invite/eligibility`、`/wham/referrals/eligibility_rules`、`/wham/referrals/invite` 邀请流程；reset-credit 的查询与消费后来已经恢复，邀请能力则由上一节的 Provider-scoped consumer Referral 控制面替代。不得恢复旧 `codex_banked_reset_invite` 命令。
+
+- quota refresh 并发查询 `/wham/usage?supports_rewardless_invites=true` 和 `/wham/rate-limit-reset-credits`，按 workspace 合并次数、明细、来源、fresh/stale 状态和最早到期时间。
+- ChatGPT 后台查询/消费使用固定生产 origin、Bearer、`ChatGPT-Account-Id`、官方 Codex identity 配对，以及 `codex-1` beta、attach、fetch 和 priority 请求头。外部项目的 Desktop UA/TLS 模拟不进入 Server。
+- Provider 卡片只从已缓存 quota 显示可用次数和最多三个到期倒计时，不发起额外查询，也不提供消费按钮。
+- 手动消费只位于 Provider 编辑控制面并要求确认。fresh 完整明细存在时提交所选真实 `credit_id`；usage 报告 `availableCount > 0` 但明细不可用、stale 或缺真实 id 时省略 `credit_id`，由 OpenAI 选择可用 credit。
+- 手动消费固定 Provider revision、账号、identity generation 和 verified workspace；进程锁、跨进程文件锁、同账号一次 401 refresh、原 redeem request id 复用和成功后的同账号强制 quota refresh 均保持不变。
+
+Grok OAuth 没有对应的 Banked Reset credit 协议。TokenRouter 也明确标记 xAI 未开放 reset-credit 接口；Grok 的“重置”只表示 weekly/monthly billing period 及请求限流的 `resetsAt` 倒计时。Server 已将 weekly、monthly、credits、on-demand、prepaid 和 spending-limit quota 投影到通用 Provider footer，因此不能为 Grok 复用 OpenAI 的 `/rate-limit-reset-credits/consume`、按钮或 Share 自动消费策略。
+
 ## Provider 与账号固定
 
 一次 Share 请求按以下顺序解析执行身份：

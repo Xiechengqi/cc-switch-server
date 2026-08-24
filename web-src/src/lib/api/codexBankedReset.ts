@@ -2,6 +2,7 @@ import { invokeCommand } from "@/lib/runtime";
 
 export interface CodexBankedResetCredit {
   id: string;
+  idAvailable?: boolean;
   status?: string | null;
   grantedAt?: string | number | null;
   expiresAt?: string | number | null;
@@ -50,13 +51,13 @@ export async function getCodexBankedResetStatus(
 
 export async function consumeCodexBankedReset(
   accountId: string | null | undefined,
-  creditId: string,
+  creditId?: string | null,
 ): Promise<CodexBankedResetConsumeResult> {
   return invokeCommand<CodexBankedResetConsumeResult>(
     "codex_banked_reset_consume",
     {
       accountId: accountId || null,
-      creditId,
+      creditId: creditId?.trim() || null,
     },
   );
 }

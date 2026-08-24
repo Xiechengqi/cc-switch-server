@@ -10,6 +10,7 @@ import {
   useSubscriptionQuota,
 } from "@/lib/query/subscription";
 import type {
+  CodexBankedResetQuotaSummary,
   QuotaTier,
   SubscriptionInfo,
   SubscriptionQuota,
@@ -171,6 +172,70 @@ function formatSubscriptionExpirySummary(
   }
 }
 
+export function formatBankedResetSummary(
+  summary: CodexBankedResetQuotaSummary | null | undefined,
+  t?: (key: string, options?: Record<string, unknown>) => string,
+  nowMs = Date.now(),
+): string | null {
+  if (!summary) return null;
+  const availableCredits = (summary.credits ?? []).filter(
+    (credit) => credit.status?.trim().toLowerCase() === "available",
+  );
+  const availableCount =
+    typeof summary.availableCount === "number" &&
+    Number.isFinite(summary.availableCount) &&
+    summary.availableCount >= 0
+      ? Math.floor(summary.availableCount)
+      : availableCredits.length;
+  if (availableCount <= 0) return null;
+
+  const countText = t
+    ? t("codexBankedReset.compactAvailable", { count: availableCount })
+    : `Banked Reset ${availableCount}`;
+  if (summary.detailsAvailable === false || summary.detailsStale === true) {
+    const detailText = t
+      ? t("codexBankedReset.compactDetailsUnavailable")
+      : "details unavailable";
+    return `${countText} · ${detailText}`;
+  }
+
+  const expiries = [
+    summary.nextExpiresAt,
+    ...availableCredits.map((credit) => credit.expiresAt),
+  ]
+    .map(normalizeBankedResetExpiry)
+    .filter((value): value is { timestamp: number; text: string } =>
+      Boolean(value),
+    )
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .filter(
+      (value, index, values) =>
+        index === 0 || value.timestamp !== values[index - 1].timestamp,
+    )
+    .map((value) => countdownStr(value.text, nowMs))
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 3);
+  if (expiries.length === 0) return countText;
+  const expiryText = t
+    ? t("codexBankedReset.compactExpiries", { times: expiries.join(" / ") })
+    : `expires ${expiries.join(" / ")}`;
+  return `${countText} · ${expiryText}`;
+}
+
+function normalizeBankedResetExpiry(
+  value: string | number | null | undefined,
+): { timestamp: number; text: string } | null {
+  if (value == null) return null;
+  const numeric = typeof value === "number" ? value : Number(value);
+  const timestamp = Number.isFinite(numeric)
+    ? numeric < 10_000_000_000
+      ? numeric * 1000
+      : numeric
+    : new Date(String(value)).getTime();
+  if (!Number.isFinite(timestamp)) return null;
+  return { timestamp, text: new Date(timestamp).toISOString() };
+}
+
 /** 格式化重置时间为倒计时文本（带 i18n 模板） */
 function formatResetTime(
   resetsAt: string | null,
@@ -284,6 +349,7 @@ export function formatQuotaSummary(
       ? formatSubscriptionExpirySummary(quota.subscription, t, nowMs)
       : null,
     ...tiers.map((tier) => formatCompactTier(tier, t, nowMs)),
+    formatBankedResetSummary(quota.bankedReset, t, nowMs),
     quota.quotaStatus === "valid_non_numeric"
       ? t
         ? t("subscription.numericQuotaNotExposed")

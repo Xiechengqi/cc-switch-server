@@ -106,6 +106,7 @@ pub(in crate::api) fn subscription_quota_not_found(tool: &str) -> Value {
         "staleTierNames": [],
         "tiers": [],
         "extraUsage": Value::Null,
+        "bankedReset": Value::Null,
         "error": Value::Null,
         "queriedAt": Value::Null,
     })
@@ -178,6 +179,7 @@ fn subscription_quota_from_parts(
             .map(subscription_tier_from_account_tier)
             .collect::<Vec<_>>(),
         "extraUsage": extra_usage_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
+        "bankedReset": banked_reset_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
         "error": error,
         "queriedAt": queried_at,
     })
@@ -281,6 +283,17 @@ fn extra_usage_for_ui(extra_usage: Option<&Value>) -> Value {
         return extra.clone();
     }
     Value::Null
+}
+
+fn banked_reset_for_ui(extra_usage: Option<&Value>) -> Value {
+    extra_usage
+        .and_then(|extra| {
+            extra
+                .get("bankedReset")
+                .or_else(|| extra.get("codexBankedReset"))
+        })
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn account_credential_status(account: &Account) -> &'static str {
@@ -430,6 +443,18 @@ mod tests {
                     "planType": "plus",
                     "planLabel": "ChatGPT Plus",
                     "expiresAt": "2026-08-01T00:00:00Z"
+                },
+                "bankedReset": {
+                    "availableCount": 2,
+                    "detailsAvailable": true,
+                    "detailsStale": false,
+                    "nextExpiresAt": "2026-07-10T00:00:00.000Z",
+                    "credits": [{
+                        "id": "credit-a",
+                        "idAvailable": true,
+                        "status": "available",
+                        "expiresAt": "2026-07-10T00:00:00.000Z"
+                    }]
                 }
             })),
         });
@@ -444,6 +469,41 @@ mod tests {
             quota["subscription"]["planLabel"],
             Value::String("ChatGPT Plus".to_string())
         );
+        assert_eq!(quota["bankedReset"]["availableCount"], 2);
+        assert_eq!(quota["bankedReset"]["detailsAvailable"], true);
+        assert_eq!(quota["bankedReset"]["credits"][0]["id"], "credit-a");
+    }
+
+    #[test]
+    fn subscription_quota_maps_grok_billing_resets_for_provider_cards() {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("SuperGrok".to_string()),
+            tiers: vec![
+                AccountQuotaTier {
+                    name: "grok_weekly".to_string(),
+                    utilization: Some(0.25),
+                    resets_at: Some(1_786_924_800_000),
+                    ..Default::default()
+                },
+                AccountQuotaTier {
+                    name: "grok_monthly".to_string(),
+                    utilization: Some(0.5),
+                    resets_at: Some(1_789_603_200_000),
+                    ..Default::default()
+                },
+            ],
+            extra_usage: None,
+        });
+        account.provider_type = ProviderType::GrokOAuth;
+
+        let quota = subscription_quota_from_account(&account, "grok_oauth");
+
+        assert_eq!(quota["tiers"][0]["name"], "grok_weekly");
+        assert_eq!(quota["tiers"][0]["resetsAt"], "2026-08-17T00:00:00+00:00");
+        assert_eq!(quota["tiers"][1]["name"], "grok_monthly");
+        assert_eq!(quota["tiers"][1]["resetsAt"], "2026-09-17T00:00:00+00:00");
+        assert!(quota["bankedReset"].is_null());
     }
 
     #[test]

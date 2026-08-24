@@ -14,6 +14,8 @@ const DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESET_CREDIT_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESET_CREDIT_ERROR_MESSAGE_CHARS: usize = 512;
+const CODEX_BACKGROUND_BETA: &str = "codex-1";
+const CODEX_BACKGROUND_LANGUAGE: &str = "zh-CN";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResetCreditDetailsError {
@@ -123,11 +125,12 @@ pub(crate) fn codex_authenticated_get(
 ) -> reqwest::RequestBuilder {
     let mut identity_headers = vec![("user-agent", crate::codex_identity::default_user_agent())];
     crate::codex_identity::finalize_headers(&mut identity_headers);
-    let mut request = http
-        .get(url)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(ACCEPT, "application/json")
-        .timeout(request_timeout);
+    let mut request = codex_background_headers(
+        http.get(url)
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(ACCEPT, "application/json"),
+    )
+    .timeout(request_timeout);
     for (name, value) in identity_headers {
         request = request.header(name, value);
     }
@@ -147,13 +150,14 @@ pub(crate) fn codex_authenticated_post(
 ) -> reqwest::RequestBuilder {
     let mut identity_headers = vec![("user-agent", crate::codex_identity::default_user_agent())];
     crate::codex_identity::finalize_headers(&mut identity_headers);
-    let mut request = http
-        .post(url)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(ACCEPT, "application/json")
-        .header("content-type", "application/json")
-        .json(&body)
-        .timeout(request_timeout);
+    let mut request = codex_background_headers(
+        http.post(url)
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(ACCEPT, "application/json")
+            .header("content-type", "application/json"),
+    )
+    .json(&body)
+    .timeout(request_timeout);
     for (name, value) in identity_headers {
         request = request.header(name, value);
     }
@@ -161,6 +165,18 @@ pub(crate) fn codex_authenticated_post(
         request = request.header("ChatGPT-Account-Id", workspace_id);
     }
     request
+}
+
+fn codex_background_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
+        .header("OpenAI-Beta", CODEX_BACKGROUND_BETA)
+        .header("OAI-Language", CODEX_BACKGROUND_LANGUAGE)
+        .header("X-OpenAI-Attach-Auth", "1")
+        .header("X-OpenAI-Attach-Integrity-State", "1")
+        .header("sec-fetch-site", "none")
+        .header("sec-fetch-mode", "no-cors")
+        .header("sec-fetch-dest", "empty")
+        .header("priority", "u=4, i")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1023,6 +1039,29 @@ mod tests {
         assert_eq!(user_agent.split('/').next(), Some(originator));
         assert!(request.headers().contains_key("version"));
         assert_eq!(request.headers()["chatgpt-account-id"], "workspace-a");
+        assert_eq!(request.headers()["openai-beta"], CODEX_BACKGROUND_BETA);
+        assert_eq!(request.headers()["oai-language"], CODEX_BACKGROUND_LANGUAGE);
+        assert_eq!(request.headers()["x-openai-attach-auth"], "1");
+        assert_eq!(request.headers()["x-openai-attach-integrity-state"], "1");
+        assert_eq!(request.headers()["sec-fetch-site"], "none");
+        assert_eq!(request.headers()["sec-fetch-mode"], "no-cors");
+        assert_eq!(request.headers()["sec-fetch-dest"], "empty");
+        assert_eq!(request.headers()["priority"], "u=4, i");
+
+        let post = codex_authenticated_post(
+            &reqwest::Client::new(),
+            "https://example.test/wham/rate-limit-reset-credits/consume",
+            "secret-token",
+            Some("workspace-a"),
+            json!({"redeem_request_id": "request-a"}),
+            Duration::from_secs(10),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(post.headers()["openai-beta"], CODEX_BACKGROUND_BETA);
+        assert_eq!(post.headers()["x-openai-attach-auth"], "1");
+        assert_eq!(post.headers()["x-openai-attach-integrity-state"], "1");
+        assert_eq!(post.headers()["chatgpt-account-id"], "workspace-a");
     }
 
     #[test]
@@ -1122,6 +1161,32 @@ mod tests {
         );
         assert!(request.contains("12345678-1234-8123-8123-123456789abc"));
         assert!(request.contains("credit-a"));
+    }
+
+    #[tokio::test]
+    async fn consume_without_credit_id_lets_upstream_select() {
+        let (url, request) = serve_one_http_response(
+            "200 OK",
+            r#"{"code":"reset","windows_reset":1,"available_count":0}"#,
+        )
+        .await;
+        let result = consume_reset_credit_from_url(
+            &reqwest::Client::new(),
+            &url,
+            "secret-token",
+            Some("workspace-a"),
+            "  ",
+            "12345678-1234-8123-8123-123456789abc",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let request = request.await.unwrap();
+
+        assert!(result.credit_id.is_empty());
+        assert_eq!(result.code.as_deref(), Some("reset"));
+        assert!(request.contains("12345678-1234-8123-8123-123456789abc"));
+        assert!(!request.contains("credit_id"));
     }
 
     #[tokio::test]

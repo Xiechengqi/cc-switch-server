@@ -22,6 +22,21 @@ export interface ExtraUsage {
   currency: string | null;
 }
 
+export interface CodexBankedResetQuotaCredit {
+  id?: string | null;
+  idAvailable?: boolean | null;
+  status?: string | null;
+  expiresAt?: string | number | null;
+}
+
+export interface CodexBankedResetQuotaSummary {
+  availableCount?: number | null;
+  detailsAvailable?: boolean | null;
+  detailsStale?: boolean | null;
+  nextExpiresAt?: string | number | null;
+  credits?: CodexBankedResetQuotaCredit[];
+}
+
 export type SubscriptionExpiresKind =
   "subscription" | "billing_period" | "quota_period" | "unknown";
 
@@ -69,6 +84,7 @@ export interface SubscriptionQuota {
   staleTierNames?: string[];
   tiers: QuotaTier[];
   extraUsage: ExtraUsage | null;
+  bankedReset?: CodexBankedResetQuotaSummary | null;
   error: string | null;
   queriedAt: number | null;
 }
