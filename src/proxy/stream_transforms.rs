@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use serde_json::{json, Value};
 
-use crate::domain::providers::store::StoredProvider;
+use crate::domain::providers::{model::ProviderType, store::StoredProvider};
 
 use super::adapters::{
     downstream_format_for_route, encode_stream_frames, transform_stream_value,
@@ -46,6 +46,14 @@ impl StreamEventTransformer {
             super::adapters::is_gemini_v1internal_provider_type(stored.provider_type);
         let gemini_terminal = unwrap_v1internal.then(GeminiStreamTerminalState::default);
         let bridge = match (upstream, downstream) {
+            (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::OpenAiResponses)
+                if stored.provider_type == ProviderType::GrokOAuth
+                    && responses_tool_context.requires_grok_emulation() =>
+            {
+                Some(StreamBridgeState::GrokResponsesTools(
+                    GrokResponsesToolsState::new(responses_tool_context.clone()),
+                ))
+            }
             (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::AnthropicMessages) => Some(
                 StreamBridgeState::ResponsesAnthropic(ResponsesAnthropicState::default()),
             ),
@@ -109,7 +117,7 @@ impl StreamEventTransformer {
         let Some(upstream) = self.upstream else {
             return Ok(chunk);
         };
-        if upstream == self.downstream && !self.unwrap_v1internal {
+        if upstream == self.downstream && !self.unwrap_v1internal && self.bridge.is_none() {
             return Ok(chunk);
         }
         self.buffer.extend_from_slice(&chunk);
@@ -120,7 +128,7 @@ impl StreamEventTransformer {
         let Some(upstream) = self.upstream else {
             return Ok(Bytes::new());
         };
-        if upstream == self.downstream && !self.unwrap_v1internal {
+        if upstream == self.downstream && !self.unwrap_v1internal && self.bridge.is_none() {
             return Ok(Bytes::new());
         }
         let mut output = self.drain_complete_events(true)?.to_vec();
@@ -356,6 +364,7 @@ fn standalone_line_is_ready(line: &[u8]) -> bool {
 
 #[derive(Debug)]
 enum StreamBridgeState {
+    GrokResponsesTools(GrokResponsesToolsState),
     ResponsesAnthropic(ResponsesAnthropicState),
     ChatAnthropic(ChatAnthropicState),
     GeminiAnthropic(GeminiAnthropicState),
@@ -370,6 +379,7 @@ enum StreamBridgeState {
 impl StreamBridgeState {
     fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
         Ok(match self {
+            Self::GrokResponsesTools(state) => state.transform(input),
             Self::ResponsesAnthropic(state) => state.transform(input),
             Self::ChatAnthropic(state) => state.transform(input),
             Self::GeminiAnthropic(state) => state.transform(input),
@@ -384,6 +394,7 @@ impl StreamBridgeState {
 
     fn upstream_done(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
         match self {
+            Self::GrokResponsesTools(state) if state.completed => Ok(state.finish_stream()),
             Self::ChatResponses(state) => Ok(state.finish_stream()),
             Self::GeminiAnthropic(state) => state.finish_stream(),
             Self::GeminiOpenAi(state) => state.finish_stream(),
@@ -403,6 +414,12 @@ impl StreamBridgeState {
     }
 
     fn finish_eof(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if let Self::GrokResponsesTools(state) = self {
+            let frames = state.finish_stream();
+            if state.completed {
+                return Ok(frames);
+            }
+        }
         if let Self::ChatResponses(state) = self {
             let frames = state.finish_stream();
             if state.completed {
@@ -426,6 +443,7 @@ impl StreamBridgeState {
 
     fn completed(&self) -> bool {
         match self {
+            Self::GrokResponsesTools(state) => state.completed,
             Self::ResponsesAnthropic(state) => state.completed,
             Self::ChatAnthropic(state) => state.completed,
             Self::GeminiAnthropic(state) => state.completed,
@@ -437,6 +455,222 @@ impl StreamBridgeState {
             Self::ToGemini(state) => state.completed(),
         }
     }
+}
+
+#[derive(Debug)]
+pub(super) struct GrokResponsesToolsState {
+    context: transforms::ResponsesToolContext,
+    calls: BTreeMap<i64, GrokEmulatedToolCall>,
+    completed: bool,
+}
+
+#[derive(Debug)]
+struct GrokEmulatedToolCall {
+    kind: transforms::ResponsesToolKind,
+    name: String,
+    item_id: String,
+    call_id: String,
+    arguments: String,
+    added_event: Value,
+}
+
+impl GrokResponsesToolsState {
+    pub(super) fn new(context: transforms::ResponsesToolContext) -> Self {
+        Self {
+            context,
+            calls: BTreeMap::new(),
+            completed: false,
+        }
+    }
+
+    pub(super) fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
+        if self.completed {
+            return Vec::new();
+        }
+        match input.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added") => self.output_item_added(input),
+            Some("response.function_call_arguments.delta") => self.arguments_delta(input),
+            Some("response.function_call_arguments.done") => self.arguments_done(input),
+            Some("response.output_item.done") => self.output_item_done(input),
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
+                let mut restored = input.clone();
+                transforms::restore_grok_responses_tool_items(&mut restored, &self.context);
+                self.calls.clear();
+                self.completed = true;
+                vec![StreamFrame::json(restored)]
+            }
+            _ => vec![StreamFrame::json(input.clone())],
+        }
+    }
+
+    fn output_item_added(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let Some(item) = input.get("item") else {
+            return vec![StreamFrame::json(input.clone())];
+        };
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return vec![StreamFrame::json(input.clone())];
+        }
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let Some(kind) = self.context.tool_kind(name) else {
+            return vec![StreamFrame::json(input.clone())];
+        };
+        if kind == transforms::ResponsesToolKind::Function {
+            return vec![StreamFrame::json(input.clone())];
+        }
+        let index = input
+            .get("output_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("call_tool")
+            .to_string();
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("fc_tool")
+            .to_string();
+        self.calls.insert(
+            index,
+            GrokEmulatedToolCall {
+                kind,
+                name: name.to_string(),
+                item_id: item_id.clone(),
+                call_id: call_id.clone(),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                added_event: input.clone(),
+            },
+        );
+        if matches!(
+            kind,
+            transforms::ResponsesToolKind::ApplyPatch | transforms::ResponsesToolKind::LocalShell
+        ) {
+            return Vec::new();
+        }
+        let mut output = input.clone();
+        output["item"] = self
+            .context
+            .response_item(&item_id, "in_progress", &call_id, name, "");
+        vec![StreamFrame::json(output)]
+    }
+
+    fn arguments_delta(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let index = input
+            .get("output_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let Some(call) = self.calls.get_mut(&index) else {
+            return vec![StreamFrame::json(input.clone())];
+        };
+        if let Some(delta) = input.get("delta").and_then(Value::as_str) {
+            call.arguments.push_str(delta);
+        }
+        if call.kind == transforms::ResponsesToolKind::Namespace {
+            vec![StreamFrame::json(input.clone())]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn arguments_done(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let index = input
+            .get("output_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let Some(call) = self.calls.get_mut(&index) else {
+            return vec![StreamFrame::json(input.clone())];
+        };
+        if let Some(arguments) = input.get("arguments").and_then(Value::as_str) {
+            call.arguments = arguments.to_string();
+        }
+        if call.kind == transforms::ResponsesToolKind::Namespace {
+            return vec![StreamFrame::json(input.clone())];
+        }
+        if call.kind != transforms::ResponsesToolKind::Custom {
+            return Vec::new();
+        }
+        let custom_input = custom_tool_input_from_function_arguments(&call.arguments);
+        let mut frames = Vec::new();
+        if !custom_input.is_empty() {
+            frames.push(StreamFrame::json(json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": call.item_id,
+                "output_index": index,
+                "delta": custom_input
+            })));
+        }
+        frames.push(StreamFrame::json(json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": call.item_id,
+            "output_index": index,
+            "input": custom_input
+        })));
+        frames
+    }
+
+    fn output_item_done(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let index = input
+            .get("output_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let Some(call) = self.calls.remove(&index) else {
+            return vec![StreamFrame::json(input.clone())];
+        };
+        let arguments = input
+            .pointer("/item/arguments")
+            .and_then(Value::as_str)
+            .filter(|arguments| !arguments.is_empty())
+            .unwrap_or(&call.arguments)
+            .to_string();
+        let mut frames = Vec::new();
+        if matches!(
+            call.kind,
+            transforms::ResponsesToolKind::ApplyPatch | transforms::ResponsesToolKind::LocalShell
+        ) {
+            let mut added = call.added_event;
+            added["item"] = self.context.response_item(
+                &call.item_id,
+                "in_progress",
+                &call.call_id,
+                &call.name,
+                &arguments,
+            );
+            frames.push(StreamFrame::json(added));
+        }
+        let mut output = input.clone();
+        output["item"] = self.context.response_item(
+            &call.item_id,
+            "completed",
+            &call.call_id,
+            &call.name,
+            &arguments,
+        );
+        frames.push(StreamFrame::json(output));
+        frames
+    }
+
+    fn finish_stream(&mut self) -> Vec<StreamFrame> {
+        self.calls.clear();
+        Vec::new()
+    }
+}
+
+fn custom_tool_input_from_function_arguments(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| arguments.to_string())
 }
 
 #[derive(Debug, Default)]
@@ -6064,6 +6298,125 @@ mod tests {
         );
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].payload_json()["type"], "content_block_stop");
+    }
+
+    #[test]
+    fn grok_function_stream_is_restored_to_codex_custom_tool_events() {
+        let context = transforms::responses_tool_context(&json!({
+            "tools": [{"type": "custom", "name": "exec"}],
+            "input": "run pwd"
+        }));
+        let mut state = GrokResponsesToolsState::new(context);
+
+        let added = state.transform(&json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_exec", "type": "function_call", "status": "in_progress",
+                "call_id": "call_exec", "name": "exec", "arguments": ""
+            }
+        }));
+        assert_eq!(added[0].payload_json()["item"]["type"], "custom_tool_call");
+
+        assert!(state
+            .transform(&json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "item_id": "fc_exec",
+                "delta": "{\"input\":\"pwd\"}"
+            }))
+            .is_empty());
+        let arguments_done = state.transform(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 1,
+            "item_id": "fc_exec",
+            "arguments": "{\"input\":\"pwd\"}"
+        }));
+        assert_eq!(arguments_done.len(), 2);
+        assert_eq!(
+            arguments_done[0].payload_json()["type"],
+            "response.custom_tool_call_input.delta"
+        );
+        assert_eq!(arguments_done[0].payload_json()["delta"], "pwd");
+        assert_eq!(
+            arguments_done[1].payload_json()["type"],
+            "response.custom_tool_call_input.done"
+        );
+
+        let item_done = state.transform(&json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_exec", "type": "function_call", "status": "completed",
+                "call_id": "call_exec", "name": "exec", "arguments": "{\"input\":\"pwd\"}"
+            }
+        }));
+        assert_eq!(
+            item_done[0].payload_json()["item"]["type"],
+            "custom_tool_call"
+        );
+        assert_eq!(item_done[0].payload_json()["item"]["input"], "pwd");
+
+        let completed = state.transform(&json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [{
+                "id": "fc_exec", "type": "function_call", "status": "completed",
+                "call_id": "call_exec", "name": "exec", "arguments": "{\"input\":\"pwd\"}"
+            }]}
+        }));
+        assert_eq!(
+            completed[0].payload_json()["response"]["output"][0]["type"],
+            "custom_tool_call"
+        );
+        assert!(state.completed);
+    }
+
+    #[test]
+    fn grok_apply_patch_stream_waits_for_complete_operation_before_added_event() {
+        let context = transforms::responses_tool_context(&json!({
+            "tools": [{"type": "apply_patch"}],
+            "input": "update the readme"
+        }));
+        let mut state = GrokResponsesToolsState::new(context);
+
+        assert!(state
+            .transform(&json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "sequence_number": 7,
+                "item": {"id": "fc_patch", "type": "function_call", "status": "in_progress", "call_id": "call_patch", "name": "cc_switch_apply_patch"}
+            }))
+            .is_empty());
+        assert!(state
+            .transform(&json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"operation\":{\"type\":\"delete_file\",\"path\":\"old.txt\"}}"
+            }))
+            .is_empty());
+        let frames = state.transform(&json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "sequence_number": 9,
+            "item": {"id": "fc_patch", "type": "function_call", "status": "completed", "call_id": "call_patch", "name": "cc_switch_apply_patch", "arguments": "{\"operation\":{\"type\":\"delete_file\",\"path\":\"old.txt\"}}"}
+        }));
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0].payload_json()["type"],
+            "response.output_item.added"
+        );
+        assert_eq!(frames[0].payload_json()["sequence_number"], 7);
+        assert_eq!(frames[0].payload_json()["item"]["type"], "apply_patch_call");
+        assert_eq!(
+            frames[0].payload_json()["item"]["operation"]["path"],
+            "old.txt"
+        );
+        assert_eq!(
+            frames[1].payload_json()["type"],
+            "response.output_item.done"
+        );
+        assert_eq!(frames[1].payload_json()["sequence_number"], 9);
     }
 
     #[test]

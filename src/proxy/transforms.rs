@@ -19,14 +19,18 @@ const DEFAULT_OPENAI_TO_ANTHROPIC_MAX_TOKENS: u64 = 8192;
 const DEFAULT_UPSTREAM_REFUSAL_MESSAGE: &str = "The upstream model refused to provide a response.";
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
+const APPLY_PATCH_PROXY_NAME: &str = "cc_switch_apply_patch";
+const LOCAL_SHELL_PROXY_NAME: &str = "cc_switch_local_shell";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponsesToolKind {
+pub(super) enum ResponsesToolKind {
     Function,
     Namespace,
     Custom,
     ToolSearch,
+    ApplyPatch,
+    LocalShell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +76,29 @@ impl ResponsesToolContext {
             .is_some_and(|spec| spec.kind == ResponsesToolKind::Custom)
     }
 
+    pub(super) fn tool_kind(&self, name: &str) -> Option<ResponsesToolKind> {
+        self.chat_name_to_spec.get(name).map(|spec| spec.kind)
+    }
+
+    pub(super) fn requires_grok_emulation(&self) -> bool {
+        self.chat_name_to_spec.values().any(|spec| {
+            matches!(
+                spec.kind,
+                ResponsesToolKind::Namespace
+                    | ResponsesToolKind::Custom
+                    | ResponsesToolKind::ToolSearch
+                    | ResponsesToolKind::ApplyPatch
+                    | ResponsesToolKind::LocalShell
+            )
+        })
+    }
+
+    fn has_tool_kind(&self, kind: ResponsesToolKind) -> bool {
+        self.chat_name_to_spec
+            .values()
+            .any(|spec| spec.kind == kind)
+    }
+
     fn chat_name_for_response_function(&self, name: &str, namespace: Option<&str>) -> String {
         let Some(namespace) = namespace.filter(|value| !value.is_empty()) else {
             return name.to_string();
@@ -114,6 +141,20 @@ impl ResponsesToolContext {
                 "call_id": call_id,
                 "name": spec.name,
                 "input": unwrap_custom_tool_input(arguments)
+            }),
+            Some(spec) if spec.kind == ResponsesToolKind::ApplyPatch => json!({
+                "id": item_id,
+                "type": "apply_patch_call",
+                "status": status,
+                "call_id": call_id,
+                "operation": parse_emulated_object_argument(arguments, "operation")
+            }),
+            Some(spec) if spec.kind == ResponsesToolKind::LocalShell => json!({
+                "id": item_id,
+                "type": "local_shell_call",
+                "status": status,
+                "call_id": call_id,
+                "action": parse_local_shell_action(arguments)
             }),
             Some(spec) => {
                 let mut item = json!({
@@ -188,6 +229,22 @@ impl ResponsesToolContext {
                     namespace: None,
                 },
             ),
+            "apply_patch" => self.add_spec(
+                APPLY_PATCH_PROXY_NAME.to_string(),
+                ResponsesToolSpec {
+                    kind: ResponsesToolKind::ApplyPatch,
+                    name: "apply_patch".to_string(),
+                    namespace: None,
+                },
+            ),
+            "local_shell" => self.add_spec(
+                LOCAL_SHELL_PROXY_NAME.to_string(),
+                ResponsesToolSpec {
+                    kind: ResponsesToolKind::LocalShell,
+                    name: "local_shell".to_string(),
+                    namespace: None,
+                },
+            ),
             "namespace" => {
                 let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
                 for child in tool
@@ -250,6 +307,442 @@ pub(crate) fn responses_tool_context_from_bytes(input: &[u8]) -> ResponsesToolCo
         .ok()
         .map(|value| responses_tool_context(&value))
         .unwrap_or_default()
+}
+
+pub(crate) fn normalize_grok_responses_tool_compatibility(
+    input: &mut Value,
+) -> Result<bool, TransformError> {
+    let context = responses_tool_context(input);
+    let Some(object) = input.as_object_mut() else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    let mut loaded_tools = Vec::new();
+
+    if let Some(tools) = object.get_mut("tools") {
+        let source = tools
+            .as_array()
+            .ok_or_else(|| TransformError::new("Grok Responses tools must be an array"))?
+            .clone();
+        let normalized = normalize_grok_response_tool_list(&source, &context, false)?;
+        changed |= normalized != source;
+        *tools = Value::Array(normalized);
+    }
+
+    if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            let Some(item_object) = item.as_object_mut() else {
+                continue;
+            };
+            match item_object.get("type").and_then(Value::as_str) {
+                Some("additional_tools") => {
+                    let source = item_object
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            TransformError::new(
+                                "Grok Responses additional_tools.tools must be an array",
+                            )
+                        })?
+                        .clone();
+                    let normalized = normalize_grok_response_tool_list(&source, &context, true)?;
+                    changed |= normalized != source;
+                    item_object.insert("tools".to_string(), Value::Array(normalized));
+                }
+                Some("tool_search_output") => {
+                    if let Some(tools) = item_object.get("tools").and_then(Value::as_array) {
+                        loaded_tools
+                            .extend(normalize_grok_response_tool_list(tools, &context, true)?);
+                    }
+                    *item = normalize_grok_tool_history_item(item_object, &context)?;
+                    changed = true;
+                }
+                Some(
+                    "custom_tool_call"
+                    | "custom_tool_call_output"
+                    | "tool_search_call"
+                    | "apply_patch_call"
+                    | "apply_patch_call_output"
+                    | "local_shell_call"
+                    | "local_shell_call_output",
+                ) => {
+                    *item = normalize_grok_tool_history_item(item_object, &context)?;
+                    changed = true;
+                }
+                Some("function_call") => {
+                    let Some(namespace) = item_object
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|namespace| !namespace.is_empty())
+                    else {
+                        continue;
+                    };
+                    let name = item_object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let alias = context.chat_name_for_response_function(name, Some(namespace));
+                    item_object.insert("name".to_string(), Value::String(alias));
+                    item_object.remove("namespace");
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !loaded_tools.is_empty() {
+        let target = object
+            .entry("tools")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| TransformError::new("Grok Responses tools must be an array"))?;
+        for tool in loaded_tools {
+            if !target.contains(&tool) {
+                target.push(tool);
+            }
+        }
+        changed = true;
+    }
+
+    if let Some(tool_choice) = object.get_mut("tool_choice") {
+        changed |= normalize_grok_tool_choice(tool_choice, &context)?;
+    }
+    if context.has_tool_kind(ResponsesToolKind::ToolSearch)
+        && object.get("parallel_tool_calls").and_then(Value::as_bool) != Some(false)
+    {
+        object.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn normalize_grok_response_tool_list(
+    tools: &[Value],
+    context: &ResponsesToolContext,
+    force_deferred: bool,
+) -> Result<Vec<Value>, TransformError> {
+    let mut output = Vec::new();
+    for tool in tools {
+        output.extend(normalize_grok_response_tool(tool, context, force_deferred)?);
+    }
+    Ok(output)
+}
+
+fn normalize_grok_response_tool(
+    tool: &Value,
+    context: &ResponsesToolContext,
+    force_deferred: bool,
+) -> Result<Vec<Value>, TransformError> {
+    let object = tool
+        .as_object()
+        .ok_or_else(|| TransformError::new("Grok Responses tool declaration must be an object"))?;
+    let tool_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| TransformError::new("Grok Responses tool type is required"))?;
+    match tool_type {
+        "function" => {
+            let name = response_tool_name(tool)
+                .ok_or_else(|| TransformError::new("Grok Responses function name is required"))?;
+            if object.get("defer_loading").and_then(Value::as_bool) == Some(true) && !force_deferred
+            {
+                return Ok(Vec::new());
+            }
+            let mut normalized = object.clone();
+            normalized.insert("name".to_string(), Value::String(name));
+            normalized.remove("defer_loading");
+            Ok(vec![Value::Object(normalized)])
+        }
+        "namespace" => {
+            let namespace = object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| TransformError::new("Grok Responses namespace name is required"))?;
+            let children = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    TransformError::new("Grok Responses namespace tools must be an array")
+                })?;
+            let mut output = Vec::new();
+            for child in children {
+                if child.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err(TransformError::new(
+                        "Grok Responses namespace may contain only function tools",
+                    ));
+                }
+                if child.get("defer_loading").and_then(Value::as_bool) == Some(true)
+                    && !force_deferred
+                {
+                    continue;
+                }
+                let name = response_tool_name(child).ok_or_else(|| {
+                    TransformError::new("Grok Responses namespace function name is required")
+                })?;
+                let alias = context.chat_name_for_response_function(&name, Some(namespace));
+                let mut normalized = child.as_object().cloned().unwrap_or_default();
+                normalized.insert("name".to_string(), Value::String(alias));
+                normalized.remove("defer_loading");
+                output.push(Value::Object(normalized));
+            }
+            Ok(output)
+        }
+        "custom" => {
+            let name = response_tool_name(tool).ok_or_else(|| {
+                TransformError::new("Grok Responses custom tool name is required")
+            })?;
+            let mut description = object
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !description.is_empty() {
+                description.push('\n');
+            }
+            description.push_str("Provide the custom tool input in the input string field.");
+            Ok(vec![json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                    "required": ["input"],
+                    "additionalProperties": false
+                }
+            })])
+        }
+        "tool_search" => Ok(vec![json!({
+            "type": "function",
+            "name": TOOL_SEARCH_PROXY_NAME,
+            "description": object.get("description").cloned().unwrap_or_else(|| json!("Search and load Codex tools or connectors for the current task.")),
+            "parameters": object.get("parameters").cloned().unwrap_or_else(|| json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query"]
+            }))
+        })]),
+        "apply_patch" => Ok(vec![json!({
+            "type": "function",
+            "name": APPLY_PATCH_PROXY_NAME,
+            "description": "Create, update, or delete one file using a structured V4A patch operation. create_file and update_file require path and diff; delete_file requires path.",
+            "parameters": {
+                "type": "object",
+                "properties": {"operation": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["create_file", "update_file", "delete_file"]},
+                        "path": {"type": "string", "minLength": 1},
+                        "diff": {"type": "string"}
+                    },
+                    "required": ["type", "path"],
+                    "additionalProperties": false
+                }},
+                "required": ["operation"],
+                "additionalProperties": false
+            },
+            "strict": true
+        })]),
+        "local_shell" => Ok(vec![json!({
+            "type": "function",
+            "name": LOCAL_SHELL_PROXY_NAME,
+            "description": "Execute one local shell action and return its output.",
+            "parameters": {
+                "type": "object",
+                "properties": {"action": {"type": "object"}},
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })]),
+        "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26" => {
+            Ok(vec![json!({"type": "web_search"})])
+        }
+        _ => Ok(vec![tool.clone()]),
+    }
+}
+
+fn normalize_grok_tool_history_item(
+    item: &Map<String, Value>,
+    context: &ResponsesToolContext,
+) -> Result<Value, TransformError> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let call_id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match item_type {
+        "custom_tool_call" => {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let namespace = item.get("namespace").and_then(Value::as_str);
+            let name = context.chat_name_for_response_function(name, namespace);
+            let input = item.get("input").and_then(Value::as_str).ok_or_else(|| {
+                TransformError::new("Grok Responses custom_tool_call.input must be a string")
+            })?;
+            Ok(json!({
+                "type": "function_call", "call_id": call_id, "name": name,
+                "arguments": json!({"input": input}).to_string()
+            }))
+        }
+        "tool_search_call" => Ok(json!({
+            "type": "function_call", "call_id": call_id, "name": TOOL_SEARCH_PROXY_NAME,
+            "arguments": response_history_arguments(item.get("arguments").or_else(|| item.get("query")))
+        })),
+        "apply_patch_call" => Ok(json!({
+            "type": "function_call", "call_id": call_id, "name": APPLY_PATCH_PROXY_NAME,
+            "arguments": json!({"operation": item.get("operation").cloned().unwrap_or(Value::Null)}).to_string()
+        })),
+        "local_shell_call" => Ok(json!({
+            "type": "function_call", "call_id": call_id, "name": LOCAL_SHELL_PROXY_NAME,
+            "arguments": json!({"action": item.get("action").cloned().unwrap_or(Value::Null)}).to_string()
+        })),
+        "custom_tool_call_output" | "apply_patch_call_output" | "local_shell_call_output" => {
+            let output = if item_type == "apply_patch_call_output" {
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                let detail = response_tool_output_text(item.get("output"));
+                if detail.is_empty() {
+                    format!("Apply patch status: {status}")
+                } else {
+                    format!("Apply patch status: {status}\n{detail}")
+                }
+            } else {
+                response_tool_output_text(item.get("output"))
+            };
+            Ok(json!({
+                "type": "function_call_output", "call_id": call_id,
+                "output": output
+            }))
+        }
+        "tool_search_output" => Ok(json!({
+            "type": "function_call_output", "call_id": call_id,
+            "output": json!({"tools": item.get("tools").cloned().unwrap_or_else(|| json!([]))}).to_string()
+        })),
+        _ => Ok(Value::Object(item.clone())),
+    }
+}
+
+fn response_history_arguments(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "{}".to_string(),
+    }
+}
+
+fn normalize_grok_tool_choice(
+    choice: &mut Value,
+    context: &ResponsesToolContext,
+) -> Result<bool, TransformError> {
+    let Some(object) = choice.as_object_mut() else {
+        return Ok(false);
+    };
+    let choice_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (name, namespace) = match choice_type {
+        "function" | "custom" => (
+            object
+                .get("name")
+                .or_else(|| object.get("function").and_then(|value| value.get("name")))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            object
+                .get("namespace")
+                .or_else(|| {
+                    object
+                        .get("function")
+                        .and_then(|value| value.get("namespace"))
+                })
+                .and_then(Value::as_str),
+        ),
+        "tool_search" => (TOOL_SEARCH_PROXY_NAME, None),
+        "apply_patch" => (APPLY_PATCH_PROXY_NAME, None),
+        "local_shell" => (LOCAL_SHELL_PROXY_NAME, None),
+        _ => return Ok(false),
+    };
+    if name.is_empty() {
+        return Err(TransformError::new(
+            "Grok Responses tool_choice name is required",
+        ));
+    }
+    let name = context.chat_name_for_response_function(name, namespace);
+    *choice = json!({"type": "function", "name": name});
+    Ok(true)
+}
+
+pub(crate) fn restore_grok_responses_tool_items(value: &mut Value, context: &ResponsesToolContext) {
+    restore_grok_responses_tool_items_inner(value, context);
+}
+
+fn restore_grok_responses_tool_items_inner(value: &mut Value, context: &ResponsesToolContext) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                restore_grok_responses_tool_items_inner(item, context);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("function_call") {
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if context
+                    .tool_kind(name)
+                    .is_some_and(|kind| kind != ResponsesToolKind::Function)
+                {
+                    let item_id = object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("fc_tool");
+                    let call_id = object
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("call_tool");
+                    let status = object
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    let arguments = object
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    *value = context.response_item(item_id, status, call_id, name, arguments);
+                    return;
+                }
+            }
+            for child in object.values_mut() {
+                restore_grok_responses_tool_items_inner(child, context);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_emulated_object_argument(arguments: &str, key: &str) -> Value {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| value.get(key).cloned().or(Some(value)))
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+fn parse_local_shell_action(arguments: &str) -> Value {
+    let action = parse_emulated_object_argument(arguments, "action");
+    if !action.as_object().is_some_and(Map::is_empty) {
+        return action;
+    }
+    json!({"type": "exec", "command": arguments})
 }
 
 fn collect_tool_search_output_tools(value: &Value, context: &mut ResponsesToolContext) {
@@ -9400,6 +9893,56 @@ mod tests {
             responses_custom_tool_names(&input),
             BTreeSet::from(["exec".to_string()])
         );
+    }
+
+    #[test]
+    fn grok_extended_tool_history_and_response_round_trip() {
+        let mut request = json!({
+            "model": "gpt-5.6-sol",
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "apply_patch"},
+                {"type": "local_shell"}
+            ],
+            "input": [
+                {"type": "custom_tool_call", "call_id": "call_exec", "name": "exec", "input": "pwd"},
+                {"type": "custom_tool_call_output", "call_id": "call_exec", "output": "/tmp"},
+                {"type": "apply_patch_call", "call_id": "call_patch", "operation": {
+                    "type": "update_file", "path": "README.md", "diff": "@@"
+                }},
+                {"type": "apply_patch_call_output", "call_id": "call_patch", "status": "completed", "output": "Done"},
+                {"type": "local_shell_call", "call_id": "call_shell", "action": {
+                    "type": "exec", "command": ["git", "status"]
+                }},
+                {"type": "local_shell_call_output", "call_id": "call_shell", "output": "clean"}
+            ]
+        });
+        let context = responses_tool_context(&request);
+
+        assert!(normalize_grok_responses_tool_compatibility(&mut request).unwrap());
+        assert_eq!(request["input"][0]["type"], "function_call");
+        assert_eq!(request["input"][0]["name"], "exec");
+        assert_eq!(request["input"][1]["type"], "function_call_output");
+        assert_eq!(request["input"][2]["name"], APPLY_PATCH_PROXY_NAME);
+        assert_eq!(request["input"][4]["name"], LOCAL_SHELL_PROXY_NAME);
+
+        let mut response = json!({
+            "id": "resp_1",
+            "output": [
+                {"id": "fc_exec", "type": "function_call", "status": "completed", "call_id": "call_exec_2", "name": "exec", "arguments": "{\"input\":\"ls\"}"},
+                {"id": "fc_patch", "type": "function_call", "status": "completed", "call_id": "call_patch_2", "name": APPLY_PATCH_PROXY_NAME, "arguments": "{\"operation\":{\"type\":\"delete_file\",\"path\":\"old.txt\"}}"},
+                {"id": "fc_shell", "type": "function_call", "status": "completed", "call_id": "call_shell_2", "name": LOCAL_SHELL_PROXY_NAME, "arguments": "{\"action\":{\"type\":\"exec\",\"command\":\"pwd\"}}"}
+            ]
+        });
+
+        restore_grok_responses_tool_items(&mut response, &context);
+
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(response["output"][0]["input"], "ls");
+        assert_eq!(response["output"][1]["type"], "apply_patch_call");
+        assert_eq!(response["output"][1]["operation"]["path"], "old.txt");
+        assert_eq!(response["output"][2]["type"], "local_shell_call");
+        assert_eq!(response["output"][2]["action"]["command"], "pwd");
     }
 
     #[test]

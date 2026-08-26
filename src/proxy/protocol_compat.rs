@@ -190,7 +190,7 @@ impl ProtocolCompatibilityError {
                 self.input_index
             ),
             (ProtocolIncompatibilityReason::InvalidAdditionalToolsItem, _) => format!(
-                "Grok Responses input[{}] additional_tools must contain a tools array and may include only role=developer",
+                "Grok Responses input[{}] additional_tools must contain a tools array and an optional developer or user role",
                 self.input_index
             ),
             (ProtocolIncompatibilityReason::InvalidAdditionalTool, Some(tool_index)) => format!(
@@ -291,7 +291,7 @@ pub(crate) fn normalize_grok_responses_request(
             || object.get("role").is_some_and(|role| {
                 role.as_str()
                     .map(str::trim)
-                    .is_none_or(|role| role != "developer")
+                    .is_none_or(|role| !matches!(role, "developer" | "user"))
             })
         {
             return Err(ProtocolCompatibilityError::new(
@@ -310,6 +310,9 @@ pub(crate) fn normalize_grok_responses_request(
                     None,
                 )
             })?;
+        if object.get("role").and_then(Value::as_str).map(str::trim) == Some("user") {
+            plan.fidelity = TransformFidelity::DeclaredLossy;
+        }
         if merged_tools.is_none() {
             merged_tools = Some(match input.get("tools") {
                 None => Vec::new(),
@@ -499,11 +502,11 @@ mod tests {
     }
 
     #[test]
-    fn custom_and_malformed_additional_tools_are_rejected() {
+    fn unsupported_and_malformed_additional_tools_are_rejected() {
         for (input, reason) in [
             (
                 json!({"input": [{"type": "additional_tools", "tools": [
-                    {"type": "custom", "name": "exec"}
+                    {"type": "future_tool", "name": "exec"}
                 ]}]}),
                 ProtocolIncompatibilityReason::UnsupportedAdditionalTool,
             ),
@@ -522,10 +525,6 @@ mod tests {
                 ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
             ),
             (
-                json!({"input": [{"type": "additional_tools", "role": "user", "tools": []}]}),
-                ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
-            ),
-            (
                 json!({"input": [{"type": "additional_tools", "role": 1, "tools": []}]}),
                 ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
             ),
@@ -535,6 +534,12 @@ mod tests {
                 reason
             );
         }
+
+        let (_, plan) = normalize_grok_responses_request(&json!({
+            "input": [{"type": "additional_tools", "role": "user", "tools": []}]
+        }))
+        .unwrap();
+        assert_eq!(plan.fidelity, TransformFidelity::DeclaredLossy);
     }
 
     #[test]

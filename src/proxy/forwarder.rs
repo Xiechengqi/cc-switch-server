@@ -101,6 +101,7 @@ use super::streaming::{
     StreamUsageAccumulator,
 };
 use super::terminal_detector::{UpstreamTerminal, UpstreamTerminalDetector};
+use super::transforms::{self, StreamPayload};
 use super::usage::{
     log_usage, update_image_stream_usage, update_stream_usage, update_stream_usage_result,
     update_websocket_stream_usage,
@@ -9289,6 +9290,9 @@ async fn bridge_responses_websocket(
                 };
                 if starts_response {
                     let effective_response_body = responses_websocket_http_body(&message)?;
+                    let requested_response_body = original_response_body
+                        .as_ref()
+                        .unwrap_or(&effective_response_body);
                     if matches!(mode, ResponsesWebsocketMode::Codex) {
                         if let Some(model) = codex_model_from_value(&effective_response_body) {
                             codex_session_model = Some(model);
@@ -9300,22 +9304,25 @@ async fn bridge_responses_websocket(
                             codex_session_model.as_deref(),
                         )?;
                     }
-                    output_patcher.begin_response(previous_response_cache_scope.map(|scope| {
-                        PreviousResponseCacheWriteContext::from_body(
-                            state,
-                            scope,
-                            &effective_response_body,
-                        )
-                    }));
+                    let grok_tool_context = matches!(mode, ResponsesWebsocketMode::Grok)
+                        .then(|| transforms::responses_tool_context(requested_response_body))
+                        .filter(transforms::ResponsesToolContext::requires_grok_emulation);
+                    output_patcher.begin_response(
+                        previous_response_cache_scope.map(|scope| {
+                            PreviousResponseCacheWriteContext::from_body(
+                                state,
+                                scope,
+                                &effective_response_body,
+                            )
+                        }),
+                        grok_tool_context,
+                    );
                     active_response_body = Some(effective_response_body.clone());
                     active_response_intent = Some(intent.clone());
                     let mut turn_context = request_context.clone();
                     if let Some(metadata) = policy_metadata {
                         apply_codex_policy_metadata(&mut turn_context, metadata);
                     }
-                    let requested_response_body = original_response_body
-                        .as_ref()
-                        .unwrap_or(&effective_response_body);
                     active_usage_turn = Some(
                         ResponsesWebsocketUsageTurn::start(
                             state,
@@ -11937,17 +11944,18 @@ async fn relay_codex_http_fallback_event(
     output_patcher: &mut CodexWebsocketOutputPatcher,
     payload: String,
 ) -> Result<bool, ProxyError> {
-    let mut message = TungsteniteMessage::Text(payload);
+    let message = TungsteniteMessage::Text(payload);
     let terminal = responses_websocket_response_is_terminal(&message)
         || websocket_message_json_type(&message).as_deref() == Some("error");
-    output_patcher.patch_message(&mut message);
-    let Some(message) = tungstenite_message_to_axum_ws(message) else {
-        return Ok(terminal);
-    };
-    downstream
-        .send(message)
-        .await
-        .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    for message in output_patcher.patch_messages(message) {
+        let Some(message) = tungstenite_message_to_axum_ws(message) else {
+            continue;
+        };
+        downstream
+            .send(message)
+            .await
+            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    }
     Ok(terminal)
 }
 
@@ -12165,17 +12173,25 @@ async fn send_responses_websocket_message(
     mut message: TungsteniteMessage,
 ) -> Result<bool, ProxyError> {
     sanitize_openai_capacity_shed_websocket_message(&mut message);
-    if matches!(mode, ResponsesWebsocketMode::Codex) {
-        output_patcher.patch_message(&mut message);
-    }
-    let Some(message) = tungstenite_message_to_axum_ws(message) else {
-        return Ok(false);
+    let messages = if matches!(
+        mode,
+        ResponsesWebsocketMode::Codex | ResponsesWebsocketMode::Grok
+    ) {
+        output_patcher.patch_messages(message)
+    } else {
+        vec![message]
     };
-    let closes = matches!(message, AxumWsMessage::Close(_));
-    downstream
-        .send(message)
-        .await
-        .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    let mut closes = false;
+    for message in messages {
+        let Some(message) = tungstenite_message_to_axum_ws(message) else {
+            continue;
+        };
+        closes |= matches!(message, AxumWsMessage::Close(_));
+        downstream
+            .send(message)
+            .await
+            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+    }
     Ok(closes)
 }
 
@@ -12344,12 +12360,54 @@ struct CodexWebsocketOutputPatcher {
     output_items_by_index: BTreeMap<i64, Value>,
     output_items_fallback: Vec<Value>,
     cache_write: Option<PreviousResponseCacheWriteContext>,
+    grok_tools: Option<super::stream_transforms::GrokResponsesToolsState>,
 }
 
 impl CodexWebsocketOutputPatcher {
-    fn begin_response(&mut self, cache_write: Option<PreviousResponseCacheWriteContext>) {
+    fn begin_response(
+        &mut self,
+        cache_write: Option<PreviousResponseCacheWriteContext>,
+        grok_tool_context: Option<transforms::ResponsesToolContext>,
+    ) {
         self.clear_output_items();
         self.cache_write = cache_write;
+        self.grok_tools =
+            grok_tool_context.map(super::stream_transforms::GrokResponsesToolsState::new);
+    }
+
+    fn patch_messages(&mut self, message: TungsteniteMessage) -> Vec<TungsteniteMessage> {
+        let binary = matches!(message, TungsteniteMessage::Binary(_));
+        let text = match &message {
+            TungsteniteMessage::Text(text) => Some(text.as_str()),
+            TungsteniteMessage::Binary(bytes) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        };
+        let Some(value) = text.and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+            return vec![message];
+        };
+        let Some(state) = self.grok_tools.as_mut() else {
+            let mut message = message;
+            self.patch_message(&mut message);
+            return vec![message];
+        };
+        state
+            .transform(&value)
+            .into_iter()
+            .filter_map(|frame| match frame.payload {
+                StreamPayload::Json(value) => serde_json::to_string(&value).ok().map(|text| {
+                    if binary {
+                        TungsteniteMessage::Binary(text.into_bytes())
+                    } else {
+                        TungsteniteMessage::Text(text)
+                    }
+                }),
+                StreamPayload::Done => None,
+            })
+            .map(|mut message| {
+                self.patch_message(&mut message);
+                message
+            })
+            .collect()
     }
 
     fn patch_message(&mut self, message: &mut TungsteniteMessage) {
@@ -12439,6 +12497,7 @@ impl CodexWebsocketOutputPatcher {
     fn clear(&mut self) {
         self.clear_output_items();
         self.cache_write = None;
+        self.grok_tools = None;
     }
 }
 
@@ -35411,7 +35470,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             None,
             headers,
             Bytes::from_static(
-                br#"{"model":"grok-4.6","stream":true,"input":[{"type":"additional_tools","tools":[{"type":"custom","name":"private-tool","description":"private-description"}]}]}"#,
+                br#"{"model":"grok-4.6","stream":true,"input":[{"type":"additional_tools","tools":[{"type":"future_tool","name":"private-tool","description":"private-description"}]}]}"#,
             ),
         )
         .await
@@ -35443,6 +35502,89 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .as_deref()
             .unwrap_or_default()
             .contains("private-description"));
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_http_emulates_codex_custom_tool_end_to_end() {
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let observed_body = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_body_for_route = std::sync::Arc::clone(&observed_body);
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |body: Bytes| {
+                let observed_body = std::sync::Arc::clone(&observed_body_for_route);
+                async move {
+                    *observed_body.lock().unwrap() = serde_json::from_slice::<Value>(&body).ok();
+                    axum::Json(json!({
+                        "id": "resp_tool",
+                        "status": "completed",
+                        "output": [{
+                            "id": "fc_exec",
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": "call_exec",
+                            "name": "exec",
+                            "arguments": "{\"input\":\"pwd\"}"
+                        }]
+                    }))
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-custom-tool-emulation");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-custom-tool-emulation",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-custom-tool-access",
+            None,
+            &[],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"gpt-5.6-sol","stream":false,"input":[{"type":"additional_tools","role":"user","tools":[{"type":"custom","name":"exec","description":"Run shell input"}]},{"role":"user","content":"run pwd"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["input"], "pwd");
+
+        let observed = observed_body.lock().unwrap().clone().unwrap();
+        assert!(observed["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "additional_tools"));
+        assert_eq!(observed["tools"][0]["type"], "function");
+        assert_eq!(observed["tools"][0]["name"], "exec");
+        assert_eq!(
+            observed.pointer("/tools/0/parameters/properties/input/type"),
+            Some(&json!("string"))
+        );
         upstream_server.abort();
     }
 
@@ -36762,17 +36904,20 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let state = forwarder_test_state("previous-response-websocket-write");
         let scope = previous_response_test_scope();
         let mut patcher = CodexWebsocketOutputPatcher::default();
-        patcher.begin_response(Some(PreviousResponseCacheWriteContext::from_body(
-            &state,
-            scope.clone(),
-            &json!({
-                "input": [{
-                    "type": "function_call_output",
-                    "call_id": "call-old",
-                    "output": "done"
-                }]
-            }),
-        )));
+        patcher.begin_response(
+            Some(PreviousResponseCacheWriteContext::from_body(
+                &state,
+                scope.clone(),
+                &json!({
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": "call-old",
+                        "output": "done"
+                    }]
+                }),
+            )),
+            None,
+        );
         let mut collected = TungsteniteMessage::Text(
             json!({
                 "type": "response.output_item.done",
@@ -36805,11 +36950,14 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(cached[1]["call_id"], json!("call-new"));
         assert_eq!(cached[1].get("id"), None);
 
-        patcher.begin_response(Some(PreviousResponseCacheWriteContext::from_body(
-            &state,
-            scope.clone(),
-            &json!({"input": []}),
-        )));
+        patcher.begin_response(
+            Some(PreviousResponseCacheWriteContext::from_body(
+                &state,
+                scope.clone(),
+                &json!({"input": []}),
+            )),
+            None,
+        );
         let mut failed = TungsteniteMessage::Text(
             json!({"type": "response.failed", "response": {"status": "failed"}}).to_string(),
         );
@@ -36872,6 +37020,62 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(
             next,
             r#"{"type":"response.completed","response":{"output":[]}}"#
+        );
+    }
+
+    #[test]
+    fn grok_websocket_output_restores_codex_custom_tool_events() {
+        let context = transforms::responses_tool_context(&json!({
+            "tools": [{"type": "custom", "name": "exec"}],
+            "input": "run pwd"
+        }));
+        let mut patcher = CodexWebsocketOutputPatcher::default();
+        patcher.begin_response(None, Some(context));
+
+        let added = patcher.patch_messages(TungsteniteMessage::Text(
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "fc_exec", "type": "function_call", "status": "in_progress", "call_id": "call_exec", "name": "exec"}
+            })
+            .to_string(),
+        ));
+        assert_eq!(
+            websocket_message_json_type(&added[0]).as_deref(),
+            Some("response.output_item.added")
+        );
+        let TungsteniteMessage::Text(added_text) = &added[0] else {
+            panic!("expected text frame");
+        };
+        let added_value: Value = serde_json::from_str(added_text).unwrap();
+        assert_eq!(added_value["item"]["type"], "custom_tool_call");
+
+        assert!(patcher
+            .patch_messages(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "delta": "{\"input\":\"pwd\"}"
+                })
+                .to_string(),
+            ))
+            .is_empty());
+        let done = patcher.patch_messages(TungsteniteMessage::Text(
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{\"input\":\"pwd\"}"
+            })
+            .to_string(),
+        ));
+        assert_eq!(done.len(), 2);
+        assert_eq!(
+            websocket_message_json_type(&done[0]).as_deref(),
+            Some("response.custom_tool_call_input.delta")
+        );
+        assert_eq!(
+            websocket_message_json_type(&done[1]).as_deref(),
+            Some("response.custom_tool_call_input.done")
         );
     }
 

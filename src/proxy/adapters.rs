@@ -1151,7 +1151,11 @@ fn transform_response_for_downstream(
     let downstream_format = downstream_format_for_route(route);
     let unwrap_v1internal = is_gemini_v1internal_provider_type(stored.provider_type);
     let cross_protocol = upstream_format != downstream_format;
-    if upstream_format == downstream_format && !unwrap_v1internal {
+    let restore_grok_tools = stored.provider_type == ProviderType::GrokOAuth
+        && upstream_format == UpstreamFormat::OpenAiResponses
+        && downstream_format == UpstreamFormat::OpenAiResponses
+        && responses_tool_context.requires_grok_emulation();
+    if upstream_format == downstream_format && !unwrap_v1internal && !restore_grok_tools {
         return Ok(body);
     }
     let mut input = match serde_json::from_slice::<Value>(&body) {
@@ -1187,6 +1191,16 @@ fn transform_response_for_downstream(
         return Ok(fallback_body);
     }
     if upstream_format == downstream_format {
+        if restore_grok_tools {
+            transforms::restore_grok_responses_tool_items(&mut input, responses_tool_context);
+            return serde_json::to_vec(&input)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    ProxyError::bad_gateway(format!(
+                        "restore Grok Responses tool items failed: {error}"
+                    ))
+                });
+        }
         return Ok(fallback_body);
     }
 
@@ -7191,6 +7205,38 @@ mod tests {
         assert_eq!(value.pointer("/tools/0/type"), Some(&json!("function")));
         assert_eq!(value.pointer("/tools/0/name"), Some(&json!("lookup")));
         assert!(value.pointer("/tools/0/function").is_none());
+    }
+
+    #[test]
+    fn grok_oauth_restores_emulated_custom_tool_in_non_stream_response() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::GrokOAuth, json!({"env": {}}));
+        let adapter = adapter_for(AppKind::Codex, ProviderType::GrokOAuth);
+        let request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"user","tools":[{"type":"custom","name":"exec"}]},{"role":"user","content":"run pwd"}]}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexResponses,
+                None,
+            )
+            .unwrap();
+        assert!(request.responses_tool_context.requires_grok_emulation());
+
+        let response = adapter
+            .transform_response_for_request(
+                Bytes::from_static(
+                    br#"{"id":"resp_1","status":"completed","output":[{"id":"fc_exec","type":"function_call","status":"completed","call_id":"call_exec","name":"exec","arguments":"{\"input\":\"pwd\"}"}]}"#,
+                ),
+                &stored,
+                ProxyRoute::CodexResponses,
+                &request,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&response).unwrap();
+
+        assert_eq!(value["output"][0]["type"], "custom_tool_call");
+        assert_eq!(value["output"][0]["input"], "pwd");
     }
 
     #[test]

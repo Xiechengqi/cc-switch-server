@@ -719,9 +719,14 @@ fn patch_grok_request_value(
     value: &mut Value,
     _route: ProxyRoute,
 ) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
-    let (normalized, protocol_transform) =
+    let tool_compatibility = super::transforms::normalize_grok_responses_tool_compatibility(value)
+        .map_err(|error| ProxyError::protocol_incompatible(error.to_string()))?;
+    let (normalized, mut protocol_transform) =
         super::protocol_compat::normalize_grok_responses_request(value)
             .map_err(|error| ProxyError::protocol_incompatible(error.client_message()))?;
+    if tool_compatibility {
+        protocol_transform.fidelity = super::protocol_compat::TransformFidelity::DeclaredLossy;
+    }
     *value = normalized;
     let model = {
         let Some(object) = value.as_object_mut() else {
@@ -741,6 +746,7 @@ fn patch_grok_request_value(
     if let Some(object) = value.as_object_mut() {
         object.remove("stream_options");
         object.remove("background");
+        object.remove("metadata");
         remove_keys(
             object,
             &[
@@ -1811,11 +1817,74 @@ mod tests {
     }
 
     #[test]
+    fn codex_extended_tools_are_emulated_before_additional_tools_merge() {
+        let mut body = json_body(json!({
+            "model": "gpt-5.6-sol",
+            "parallel_tool_calls": true,
+            "input": [
+                {"type": "additional_tools", "role": "user", "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run a command"},
+                    {"type": "namespace", "name": "mcp_files", "tools": [{
+                        "type": "function", "name": "read", "parameters": {"type": "object"}
+                    }]},
+                    {"type": "tool_search", "execution": "client"},
+                    {"type": "apply_patch"},
+                    {"type": "local_shell"}
+                ]},
+                {"type": "message", "role": "user", "content": "inspect the project"}
+            ]
+        }));
+
+        let plan = patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+        let tools = value["tools"].as_array().unwrap();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            plan.fidelity,
+            super::super::protocol_compat::TransformFidelity::DeclaredLossy
+        );
+        assert_eq!(tools.len(), 5);
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "cc_switch_apply_patch",
+                "cc_switch_local_shell",
+                "exec",
+                "mcp_files__read",
+                "tool_search",
+            ])
+        );
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
+        assert_eq!(value["parallel_tool_calls"], false);
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["type"], "message");
+    }
+
+    #[test]
+    fn grok_request_drops_claude_metadata_at_the_provider_boundary() {
+        let mut body = json_body(json!({
+            "model": "grok-4.6",
+            "metadata": {"user_id": "claude-code-session", "future": true},
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }));
+
+        patch_grok_request_body(&mut body, ProxyRoute::ClaudeMessages).unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+
+        assert!(value.get("metadata").is_none());
+        assert_eq!(value["input"][0]["content"], "hello");
+    }
+
+    #[test]
     fn incompatible_responses_items_return_stable_local_error_without_request_data() {
         let original = json_body(json!({
             "model": "grok-4.6",
             "input": [{"type": "additional_tools", "tools": [
-                {"type": "custom", "name": "secret-tool-name", "description": "secret-description"}
+                {"type": "future_tool", "name": "secret-tool-name", "description": "secret-description"}
             ]}]
         }));
         let mut body = original.clone();
@@ -1870,7 +1939,7 @@ mod tests {
                 "stream": true,
                 "stream_options": {"include_usage": true},
                 "background": true,
-                "tools": [{"type": "unsupported"}, {"type": "function"}]
+                "tools": [{"type": "unsupported"}, {"type": "function", "name": "lookup"}]
             }),
             Some("session-1"),
         )
@@ -1968,7 +2037,7 @@ mod tests {
                 "response": {
                     "model": "grok-4.6",
                     "input": [{"type": "additional_tools", "tools": [
-                        {"type": "custom", "name": "private-custom-tool"}
+                        {"type": "future_tool", "name": "private-custom-tool"}
                     ]}]
                 }
             }),
