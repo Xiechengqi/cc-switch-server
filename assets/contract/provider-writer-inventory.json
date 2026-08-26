@@ -9,11 +9,11 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "3980f48c532530c6cd35dc5444e8165ca0c951d5bfec74bde4806b19df5a6fd0"
+      "sha256": "6db7f2e32adae8f25d0866abd5ca08a3291dd560510dbcfefc046d884dab5a3a"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "06965665d5c21e0fbe8ac760b39495c03ed17523d0c02aeef4eabfeaf0ea39f5"
+      "sha256": "80cbc8e3611f236253db6a846c2327407b9075ab3fd1666263068040eba502f7"
     },
     {
       "path": "src/api/types/providers.rs",
@@ -33,11 +33,11 @@
     },
     {
       "path": "src/domain/providers/store.rs",
-      "sha256": "c344a9a6269b32f7da39a487eca5ce4d372b1507b9f8242547d83cb909478184"
+      "sha256": "2655259c514fcf3769959ea0d314db0d7bfee8f4c5e9ae3926c74b9e38f941b4"
     },
     {
       "path": "src/domain/providers/store_v2.rs",
-      "sha256": "d5c6e1f311b8e3d54e59e1504535829d76a0af5f2e74f60c47516a1c6a8737f1"
+      "sha256": "d7d2470b32043548da558220ba80c3e02b3834337099cf97a6fd14e8dea6e579"
     },
     {
       "path": "src/infra/backup.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "e9c400a1949404c93ea802802df2fcf2a8f17a1a459b8f958f81490e1ad01296"
+      "sha256": "4cf9b4d833678684ab98647b5a7c94e05c21edaa482be121b61bf50c6b079924"
     }
   ],
   "entries": [

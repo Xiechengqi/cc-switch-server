@@ -4,7 +4,7 @@
   "note": "This freezes the legacy Web preset inventory. Phase 2 replaces it with the Rust ProfileSpec registry.",
   "providerTypeSource": {
     "path": "src/domain/providers/model.rs",
-    "sha256": "43dcb55985927aa8cf05a55ce07d6fbd6b2e2e067394ccab5f7ddddfe71e430d"
+    "sha256": "53e71e1512cc59c02fd9319166006d0fdbad98c6f492e25089d9ecdc6cf580c4"
   },
   "providerTypes": [
     {
@@ -100,17 +100,17 @@
     {
       "app": "claude",
       "path": "web-src/src/config/claudeProviderPresets.ts",
-      "sha256": "bb43c3a613f0f1dde1fda1f521625de56dddc071fb3f6a9c95d53f5c2b060c1e"
+      "sha256": "8df07d9644b8153c5688240cf08e55211faf63a28239206efff763e645e529f1"
     },
     {
       "app": "codex",
       "path": "web-src/src/config/codexProviderPresets.ts",
-      "sha256": "18549032793a8173eb944f850456237a26653d315e324952904e65296c30c851"
+      "sha256": "bfd57d666e6e0883ac0608095ec8e8fe4ea4323c44ae8ad30138796375b2fb32"
     },
     {
       "app": "gemini",
       "path": "web-src/src/config/geminiProviderPresets.ts",
-      "sha256": "a21c19807b2be3c48d0c4cb7c778027d56233e91e05e3395f973e6edc5671c02"
+      "sha256": "a838f9d5f547db6776440312fc3b76d403924b97810d02e088fb07f6ecd1bdfc"
     }
   ],
   "presets": {
@@ -194,7 +194,7 @@
         "requiresOAuth": true,
         "websiteUrl": "https://x.ai",
         "baseUrl": "https://api.x.ai/v1",
-        "defaultModel": "grok-4.5",
+        "defaultModel": "grok-4.6",
         "declaredPointers": [
           "/apiFormat",
           "/category",
@@ -311,7 +311,7 @@
         "requiresOAuth": true,
         "websiteUrl": "https://cursor.com",
         "baseUrl": "https://api2.cursor.sh",
-        "defaultModel": "composer-2.5",
+        "defaultModel": "default",
         "declaredPointers": [
           "/category",
           "/icon",
@@ -351,7 +351,7 @@
         "requiresOAuth": false,
         "websiteUrl": "https://cursor.com/dashboard/cloud-agents",
         "baseUrl": "https://api.cursor.com",
-        "defaultModel": "composer-2.5",
+        "defaultModel": "default",
         "declaredPointers": [
           "/apiKeyUrl",
           "/category",
@@ -762,7 +762,7 @@
         "requiresOAuth": true,
         "websiteUrl": "https://x.ai",
         "baseUrl": "https://api.x.ai/v1",
-        "defaultModel": "grok-4.5",
+        "defaultModel": "grok-4.6",
         "declaredPointers": [
           "/auth",
           "/category",
@@ -779,6 +779,7 @@
           "/modelCatalog/1",
           "/modelCatalog/2",
           "/modelCatalog/3",
+          "/modelCatalog/4",
           "/modelMapping",
           "/modelMapping/mode",
           "/modelMapping/upstreamModel",
@@ -1255,7 +1256,7 @@
         "requiresOAuth": true,
         "websiteUrl": "https://x.ai",
         "baseUrl": "https://api.x.ai/v1",
-        "defaultModel": "grok-4.5",
+        "defaultModel": "grok-4.6",
         "declaredPointers": [
           "/baseURL",
           "/category",

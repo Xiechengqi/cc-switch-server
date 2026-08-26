@@ -1701,6 +1701,25 @@ mod tests {
     }
 
     #[test]
+    fn cursor_profiles_default_to_the_agentservice_default_selector() {
+        for profile_id in [
+            "claude.cursor_oauth",
+            "claude.cursor_api_key",
+            "codex.cursor_oauth",
+            "codex.cursor_api_key",
+            "gemini.cursor_oauth",
+            "gemini.cursor_api_key",
+        ] {
+            assert_eq!(
+                profile_by_id(profile_id)
+                    .and_then(|profile| profile.default_upstream_model.as_deref()),
+                Some("default"),
+                "{profile_id}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_key_requires_an_explicit_app_and_trimmed_id() {
         assert_eq!(
             ProviderKey::new(AppKind::Claude, "same-id").unwrap().app,

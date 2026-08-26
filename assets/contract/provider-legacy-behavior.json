@@ -181,7 +181,7 @@
       },
       "model": {
         "requested": "downstream request model",
-        "actual": "grok-4.5",
+        "actual": "grok-4.6",
         "strategy": "single"
       },
       "capabilities": {
@@ -353,7 +353,7 @@
       },
       "model": {
         "requested": "downstream request model",
-        "actual": "composer-2.5",
+        "actual": "default",
         "strategy": "single"
       },
       "capabilities": {
@@ -413,7 +413,7 @@
       },
       "model": {
         "requested": "downstream request model",
-        "actual": "composer-2.5",
+        "actual": "default",
         "strategy": "single"
       },
       "capabilities": {
@@ -986,7 +986,7 @@
       },
       "model": {
         "requested": "downstream request model",
-        "actual": "grok-4.5",
+        "actual": "grok-4.6",
         "strategy": "single"
       },
       "capabilities": {
@@ -1518,7 +1518,7 @@
       },
       "model": {
         "requested": "downstream request model",
-        "actual": "grok-4.5",
+        "actual": "grok-4.6",
         "strategy": "single"
       },
       "capabilities": {

@@ -1060,7 +1060,7 @@ mod tests {
         assert_eq!(loaded.providers[0].provider_type, ProviderType::GrokOAuth);
         assert_eq!(
             loaded.providers[0].provider.settings_config["modelMapping"],
-            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+            json!({"mode": "single", "upstreamModel": "grok-4.6"})
         );
 
         assert_eq!(fs::read(providers_path(&config_dir)).unwrap(), before);

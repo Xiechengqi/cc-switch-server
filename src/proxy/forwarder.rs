@@ -26212,7 +26212,7 @@ mod tests {
                                 mode: ResponsesWebsocketMode::Grok,
                                 grok_session_id: Some(session_id),
                                 grok_turn_index: turn_index,
-                                single_upstream_model: Some("grok-4.5".to_string()),
+                                single_upstream_model: Some("grok-4.6".to_string()),
                                 request_context: UsageLogContext::default(),
                                 state: &state,
                                 execution,

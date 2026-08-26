@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const shareUrl = (process.env.CC_SWITCH_SHARE_URL || "").trim().replace(/\/+$/, "");
 const routerToken = (process.env.ROUTER_API_TOKEN || "").trim();
 const routerTokenHeader = (process.env.ROUTER_API_TOKEN_HEADER || "Authorization").trim();
-const model = (process.env.CC_SWITCH_GROK_MODEL || "grok-4.5").trim();
+const model = (process.env.CC_SWITCH_GROK_MODEL || "grok-4.6").trim();
 const mediaSmoke = (process.env.CC_SWITCH_GROK_MEDIA_SMOKE || "0").trim() === "1";
 const evidenceFile = (process.env.EVIDENCE_FILE || "").trim();
 const configuredTimeoutMs = Number(process.env.CC_SWITCH_REAL_TIMEOUT_MS || 120_000);

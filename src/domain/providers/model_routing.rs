@@ -4,7 +4,7 @@ use thiserror::Error;
 use super::model::{classify_provider, AppKind, Provider, ProviderType};
 use super::registry::{FormComposition, ModelPolicyKind, ProfileSpec};
 
-pub const DEFAULT_GROK_MODEL: &str = "grok-4.5";
+pub const DEFAULT_GROK_MODEL: &str = "grok-4.6";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelRoutingMode {
@@ -558,7 +558,7 @@ mod tests {
 
         assert_eq!(
             provider.settings_config["modelMapping"],
-            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+            json!({"mode": "single", "upstreamModel": "grok-4.6"})
         );
     }
 
@@ -639,7 +639,7 @@ mod tests {
 
         assert_eq!(
             provider.settings_config["modelMapping"],
-            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+            json!({"mode": "single", "upstreamModel": "grok-4.6"})
         );
     }
 

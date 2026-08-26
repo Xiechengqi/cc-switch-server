@@ -886,9 +886,9 @@ fn stream_terminal_error(value: &Value) -> ResponsesSseAggregationError {
 }
 
 fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
-    let next_has_input = next.input_tokens.is_some()
-        || next.cache_read_tokens.is_some()
-        || next.cache_creation_tokens.is_some();
+    let next_has_raw_input = next.raw_input_tokens.is_some();
+    let next_has_input = next.input_tokens.is_some();
+    let next_has_cache = next.cache_read_tokens.is_some() || next.cache_creation_tokens.is_some();
     let next_has_output = next.output_tokens.is_some();
     if next.raw_input_tokens.is_some() {
         target.raw_input_tokens = next.raw_input_tokens;
@@ -905,13 +905,24 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
     if next.cache_creation_tokens.is_some() {
         target.cache_creation_tokens = next.cache_creation_tokens;
     }
+    if !next_has_raw_input && next_has_cache {
+        if let Some(raw_input_tokens) = target.raw_input_tokens {
+            target.input_tokens = Some(
+                raw_input_tokens
+                    .saturating_sub(target.cache_read_tokens.unwrap_or(0))
+                    .saturating_sub(target.cache_creation_tokens.unwrap_or(0)),
+            );
+        }
+    }
     if next.total_tokens.is_some()
-        && (next_has_input || !next_has_output || target.total_tokens.is_none())
+        && (next_has_raw_input || next_has_output || target.total_tokens.is_none())
     {
         target.total_tokens = next.total_tokens;
     }
     if next_has_output
+        && !next_has_raw_input
         && !next_has_input
+        && !next_has_cache
         && (target.input_tokens.is_some() || target.output_tokens.is_some())
     {
         target.total_tokens = Some(
@@ -1066,6 +1077,31 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(6));
         assert_eq!(usage.cache_read_tokens, Some(9));
+    }
+
+    #[test]
+    fn merges_responses_usage_split_across_lifecycle_events() {
+        let mut parser = StreamUsageAccumulator::new(InputTokenSemantics::Inclusive);
+        parser.push(
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":130,\"output_tokens\":30,\"total_tokens\":160}}}\n\n",
+                "event: response.in_progress\n",
+                "data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":10}}}}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            )
+            .as_bytes(),
+        );
+        let result = parser.finish_with_status();
+
+        assert!(!result.parse_error);
+        assert_eq!(result.usage.raw_input_tokens, Some(130));
+        assert_eq!(result.usage.input_tokens, Some(40));
+        assert_eq!(result.usage.output_tokens, Some(30));
+        assert_eq!(result.usage.cache_read_tokens, Some(80));
+        assert_eq!(result.usage.cache_creation_tokens, Some(10));
+        assert_eq!(result.usage.total_tokens, Some(160));
     }
 
     #[test]

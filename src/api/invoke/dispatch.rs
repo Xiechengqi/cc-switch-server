@@ -2446,6 +2446,7 @@ fn codex_control_target(
 
 fn grok_oauth_default_models() -> Vec<Value> {
     [
+        ("grok-4.6", "Grok 4.6"),
         ("grok-4.5", "Grok 4.5"),
         ("grok-4.3", "Grok 4.3"),
         ("grok-build-0.1", "Grok Build 0.1"),

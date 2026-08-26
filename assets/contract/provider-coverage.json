@@ -4,7 +4,7 @@
     "serverLegacyInventory": "assets/contract/server-provider-legacy-inventory.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "43dcb55985927aa8cf05a55ce07d6fbd6b2e2e067394ccab5f7ddddfe71e430d"
+      "sha256": "53e71e1512cc59c02fd9319166006d0fdbad98c6f492e25089d9ecdc6cf580c4"
     },
     "upstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },
@@ -1328,7 +1328,7 @@
         "providerType": "grok_oauth",
         "apiFormat": "openai_responses",
         "baseUrl": "https://api.x.ai/v1",
-        "defaultModel": "grok-4.5",
+        "defaultModel": "grok-4.6",
         "sourceIndex": 2
       },
       {
@@ -1352,7 +1352,7 @@
         "providerType": "cursor_oauth",
         "apiFormat": null,
         "baseUrl": "https://api2.cursor.sh",
-        "defaultModel": "composer-2.5",
+        "defaultModel": "default",
         "sourceIndex": 5
       },
       {
@@ -1360,7 +1360,7 @@
         "providerType": "cursor_apikey",
         "apiFormat": null,
         "baseUrl": "https://api.cursor.com",
-        "defaultModel": "composer-2.5",
+        "defaultModel": "default",
         "sourceIndex": 6
       },
       {
@@ -1450,7 +1450,7 @@
         "providerType": "grok_oauth",
         "apiFormat": null,
         "baseUrl": "https://api.x.ai/v1",
-        "defaultModel": "grok-4.5",
+        "defaultModel": "grok-4.6",
         "sourceIndex": 1
       },
       {
@@ -1532,7 +1532,7 @@
         "providerType": "grok_oauth",
         "apiFormat": null,
         "baseUrl": "https://api.x.ai/v1",
-        "defaultModel": "grok-4.5",
+        "defaultModel": "grok-4.6",
         "sourceIndex": 3
       },
       {

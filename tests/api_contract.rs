@@ -316,9 +316,9 @@ fn grok_provider_bundle_draft(bundle_id: &str, account_id: &str, client_request_
         "websiteUrl": "https://x.ai",
         "icon": "grok",
         "modelPolicy": "single",
-        "upstreamModel": "grok-4.5",
+        "upstreamModel": "grok-4.6",
         "testApp": "claude",
-        "testModel": "grok-4.5",
+        "testModel": "grok-4.6",
         "managedAccount": {
             "accountId": account_id,
             "authIdentityGeneration": 1
@@ -8036,7 +8036,7 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
     );
     assert_eq!(created["enabledApps"], created["supportedApps"]);
     assert_eq!(created["testApp"], "claude");
-    assert_eq!(created["testModel"], "grok-4.5");
+    assert_eq!(created["testModel"], "grok-4.6");
     assert_eq!(created["credentialConfigured"], true);
     assert_eq!(
         created["surfaces"].as_object().map(|value| value.len()),
@@ -8052,11 +8052,11 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
             .is_none());
         assert_eq!(
             created["surfaces"][provider_app]["runtime"]["modelPolicy"],
-            json!({"mode": "single", "upstreamModel": "grok-4.5"})
+            json!({"mode": "single", "upstreamModel": "grok-4.6"})
         );
         assert_eq!(
             created["surfaces"][provider_app]["runtime"]["testModel"],
-            "grok-4.5"
+            "grok-4.6"
         );
         assert!(
             !serde_json::to_string(&created["surfaces"][provider_app]["runtime"])

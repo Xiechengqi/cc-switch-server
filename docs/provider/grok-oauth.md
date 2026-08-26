@@ -50,7 +50,7 @@ Provider 不存在、绑定缺失、账号不可用、并发饱和或处于 cool
 HTTP 和 SSE 共用同一份 Grok request contract：
 
 - OpenAI Chat Completions 先无损规范化为 Responses，请求上游固定使用 Grok CLI `/v1/responses`；非流式和 SSE 再恢复为 Chat contract。Grok 数据面不再向上游发送 `/v1/chat/completions`。
-- Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.5`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
+- Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.6`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
 - 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。
 - 账号 `extraHeaders` 不能覆盖 Authorization、CLI identity、conversation/cache identity、turn、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。
 - Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。Codex Responses Lite 的 `additional_tools` 接受可选的规范 `role=developer`，随后把工具提升到 xAI 顶层 tools；完全相同的声明会去重，同名不同定义、其他 role、未知字段或无法无损映射的工具仍在本地 `422` fail closed。
@@ -123,7 +123,7 @@ Share URL 下的 `GET /v1/models` 使用该 Share 的 Codex Surface 绑定账号
 - 缓存按账号隔离，默认 TTL 为 300 秒，可通过 `CC_SWITCH_GROK_MODELS_TTL_SECONDS` 在 1 秒到 24 小时范围内调整。
 - 支持 ETag/304；成功目录记录抓取时间。
 - 上游失败且有缓存时返回 last-known-good，并标记 `stale=true`。
-- 没有可用缓存时返回静态 `grok-4.5` fallback。
+- 没有可用缓存时返回静态 `grok-4.6` fallback。
 - 上游目录响应体上限为 1 MiB，超限按上游失败处理。
 - entry 支持纯字符串以及 `id`、`model`、`modelId`、`name`、`_meta.model`、`_meta.modelId`，按该优先级选取标识；`hidden=true` 或 `_meta.hidden=true` 不对外发布。
 - 顶层元数据 `source`、`stale`、`fetchedAtMs` 用于区分 upstream、fresh cache、304、last-known-good 和 static fallback。
@@ -181,7 +181,7 @@ node scripts/smoke/grok-oauth-real.mjs
 
 可选变量：
 
-- `CC_SWITCH_GROK_MODEL`：覆盖默认 `grok-4.5`。
+- `CC_SWITCH_GROK_MODEL`：覆盖默认 `grok-4.6`。
 - `CC_SWITCH_GROK_MEDIA_SMOKE=1`：额外执行一次短图片生成；运行前必须已显式 bootstrap 或持久化 `image_generation` evidence。
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `EVIDENCE_FILE=/tmp/...json`：写入脱敏结果摘要。

@@ -1254,7 +1254,8 @@ fn request_model(body: &[u8]) -> Option<String> {
 fn normalize_grok_model(model: &str) -> String {
     match model.trim() {
         "" | "grok" | "grok-latest" => DEFAULT_GROK_MODEL.to_string(),
-        "grok-build-latest" | "grok-4.5-latest" => DEFAULT_GROK_MODEL.to_string(),
+        "grok-build-latest" | "grok-4.6-latest" => DEFAULT_GROK_MODEL.to_string(),
+        "grok-4.5-latest" => "grok-4.5".to_string(),
         "grok-build" => "grok-build-0.1".to_string(),
         "grok-composer" => "grok-composer-2.5-fast".to_string(),
         "grok-4.20-reasoning" => "grok-4.20-0309-reasoning".to_string(),
@@ -1319,6 +1320,7 @@ fn grok_model_supports_reasoning_effort(model: &str) -> bool {
         || model.starts_with("grok-4.20-multi-agent")
         || model.starts_with("grok-4.3")
         || model.starts_with("grok-4.5")
+        || model.starts_with("grok-4.6")
 }
 
 fn strip_server_item_ids(value: &mut Value) {
@@ -1517,8 +1519,10 @@ mod tests {
 
     #[test]
     fn normalizes_grok_model_aliases() {
-        assert_eq!(normalize_grok_model("grok"), "grok-4.5");
-        assert_eq!(normalize_grok_model("grok-build-latest"), "grok-4.5");
+        assert_eq!(normalize_grok_model("grok"), "grok-4.6");
+        assert_eq!(normalize_grok_model("grok-build-latest"), "grok-4.6");
+        assert_eq!(normalize_grok_model("grok-4.6-latest"), "grok-4.6");
+        assert_eq!(normalize_grok_model("grok-4.5-latest"), "grok-4.5");
         assert_eq!(normalize_grok_model("grok-build"), "grok-build-0.1");
         assert_eq!(
             normalize_grok_model("grok-composer"),

@@ -417,14 +417,14 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
         ProviderType::CursorOAuth => ProviderDefaults {
             base_url: "https://api2.cursor.sh",
             api_format: "openai_chat",
-            model: "composer-2.5",
+            model: "default",
             key: "ANTHROPIC_AUTH_TOKEN",
             aws_region: None,
         },
         ProviderType::CursorApiKey => ProviderDefaults {
             base_url: "https://api.cursor.com",
             api_format: "openai_chat",
-            model: "composer-2.5",
+            model: "default",
             key: "ANTHROPIC_AUTH_TOKEN",
             aws_region: None,
         },
@@ -466,7 +466,7 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
         ProviderType::GrokOAuth => ProviderDefaults {
             base_url: "https://api.x.ai/v1",
             api_format: "openai_responses",
-            model: "grok-4.5",
+            model: "grok-4.6",
             key: "XAI_API_KEY",
             aws_region: None,
         },
@@ -633,5 +633,22 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
             "static adapter contract is available; import refresh credentials to enable native refresh/profile; browser login remains disabled"
         }
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_provider_defaults_use_the_agentservice_default_selector() {
+        assert_eq!(
+            provider_defaults(ProviderType::CursorOAuth).model,
+            "default"
+        );
+        assert_eq!(
+            provider_defaults(ProviderType::CursorApiKey).model,
+            "default"
+        );
     }
 }

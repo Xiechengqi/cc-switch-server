@@ -106,7 +106,7 @@ function modelCatalog(
   );
 }
 
-const CURSOR_CODEX_UPSTREAM_MODEL = "composer-2.5";
+const CURSOR_CODEX_UPSTREAM_MODEL = "default";
 const cursorCodexModelCatalog = modelCatalog([
   {
     model: "gpt-5.5",
@@ -194,10 +194,11 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     isOfficial: true,
     category: "official",
     auth: {},
-    config: generateThirdPartyConfig("Grok", "https://api.x.ai/v1", "grok-4.5"),
+    config: generateThirdPartyConfig("Grok", "https://api.x.ai/v1", "grok-4.6"),
     providerType: "grok_oauth",
     requiresOAuth: true,
     modelCatalog: modelCatalog([
+      "grok-4.6",
       "grok-4.5",
       "grok-4.3",
       "grok-4.20-multi-agent",
@@ -205,11 +206,11 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     ]),
     testConfig: {
       enabled: true,
-      testModel: "grok-4.5",
+      testModel: "grok-4.6",
     },
     modelMapping: {
       mode: "single",
-      upstreamModel: "grok-4.5",
+      upstreamModel: "grok-4.6",
     },
     theme: {
       icon: "codex",
@@ -233,7 +234,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     ),
     modelMapping: {
       mode: "single",
-      upstreamModel: "composer-2.5",
+      upstreamModel: CURSOR_CODEX_UPSTREAM_MODEL,
     },
     providerType: "cursor_apikey",
     apiFormat: "openai_chat",
@@ -258,7 +259,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     ),
     modelMapping: {
       mode: "single",
-      upstreamModel: "composer-2.5",
+      upstreamModel: CURSOR_CODEX_UPSTREAM_MODEL,
     },
     providerType: "cursor_oauth",
     requiresOAuth: true,

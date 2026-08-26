@@ -1927,6 +1927,26 @@
       "retirePhase": "phase-10"
     },
     {
+      "locator": "legacyPreset.codex/modelCatalog/4",
+      "sourceFormat": "json_pointer",
+      "classification": "observation",
+      "secret": false,
+      "presets": [
+        "Cursor API Key",
+        "Cursor OAuth",
+        "Grok OAuth"
+      ],
+      "reader": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "writer": [
+        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
+      ],
+      "targetOwner": "registry_or_observation",
+      "migration": "profile_specific_s1_extractor",
+      "retirePhase": "phase-10"
+    },
+    {
       "locator": "legacyPreset.codex/modelMapping/upstreamModel",
       "sourceFormat": "json_pointer",
       "classification": "runtime",
@@ -2334,25 +2354,6 @@
     },
     {
       "locator": "legacyPreset.codex/modelCatalog/3/upstreamModel",
-      "sourceFormat": "json_pointer",
-      "classification": "observation",
-      "secret": false,
-      "presets": [
-        "Cursor API Key",
-        "Cursor OAuth"
-      ],
-      "reader": [
-        "web-src/src/components/providers/forms/ProviderForm.tsx"
-      ],
-      "writer": [
-        "web-src/src/components/providers/forms/ProviderForm.tsx::performSubmit"
-      ],
-      "targetOwner": "registry_or_observation",
-      "migration": "profile_specific_s1_extractor",
-      "retirePhase": "phase-10"
-    },
-    {
-      "locator": "legacyPreset.codex/modelCatalog/4",
       "sourceFormat": "json_pointer",
       "classification": "observation",
       "secret": false,

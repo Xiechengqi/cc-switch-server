@@ -165,7 +165,7 @@ const isOpenAIOAuthProviderType = (providerType?: string | null) =>
 const isGrokOauthProviderType = (providerType?: string | null) =>
   providerType === PROVIDER_TYPES.GROK_OAUTH || providerType === "grok_oauth";
 
-const CURSOR_DEFAULT_UPSTREAM_MODEL = "composer-2.5";
+const CURSOR_DEFAULT_UPSTREAM_MODEL = "default";
 
 const endpointUsesHost = (endpoint: string, host: string): boolean => {
   try {
@@ -1042,7 +1042,7 @@ function ProviderFormFull({
       const trimmedSingleUpstreamModel =
         codexSingleUpstreamModel.trim() ||
         (isGrokOauthProvider
-          ? "grok-4.5"
+          ? "grok-4.6"
           : isCursorOauthProviderForConfig || isCursorApiKeyPreset
             ? CURSOR_DEFAULT_UPSTREAM_MODEL
             : isOllamaCloudProviderForConfig
@@ -2023,7 +2023,7 @@ function ProviderFormFull({
     const codexActualModel =
       codexSingleUpstreamModel.trim() ||
       (isGrokOauthProvider
-        ? "grok-4.5"
+        ? "grok-4.6"
         : isCursorOauthProvider || isCursorApiKeyPreset
           ? CURSOR_DEFAULT_UPSTREAM_MODEL
           : isOllamaCloudProvider

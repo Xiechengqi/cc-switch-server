@@ -1223,7 +1223,7 @@ mod tests {
             icon_color: None,
             model_policy_scope: ModelPolicyScope::Global,
             model_policy: Some(ModelPolicyKind::Single),
-            upstream_model: Some("grok-4.5".to_string()),
+            upstream_model: Some("grok-4.6".to_string()),
             test_app: AppKind::Claude,
             test_model: None,
             surface_test_models: BTreeMap::new(),
@@ -1282,7 +1282,7 @@ mod tests {
         for surface in &draft.surfaces {
             assert_eq!(
                 draft.provider_for_surface(surface).unwrap().settings_config["modelMapping"],
-                json!({"mode": "single", "upstreamModel": "grok-4.5"})
+                json!({"mode": "single", "upstreamModel": "grok-4.6"})
             );
         }
     }

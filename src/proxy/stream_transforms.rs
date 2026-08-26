@@ -227,18 +227,15 @@ impl StreamEventTransformer {
         if let Some(terminal) = self.gemini_terminal.as_mut() {
             terminal.observe(&value)?;
         }
-        let frames = if self.upstream == Some(self.downstream) {
-            vec![StreamFrame::json(value)]
-        } else {
-            match self.bridge.as_mut() {
-                Some(bridge) => bridge.transform(&value)?,
-                None => transform_stream_value(
-                    self.upstream.expect("upstream format is present"),
-                    self.downstream,
-                    &value,
-                    &self.responses_tool_context,
-                ),
-            }
+        let frames = match self.bridge.as_mut() {
+            Some(bridge) => bridge.transform(&value)?,
+            None if self.upstream == Some(self.downstream) => vec![StreamFrame::json(value)],
+            None => transform_stream_value(
+                self.upstream.expect("upstream format is present"),
+                self.downstream,
+                &value,
+                &self.responses_tool_context,
+            ),
         };
         Ok(encode_stream_frames(&frames))
     }
@@ -492,8 +489,13 @@ impl GrokResponsesToolsState {
             Some("response.function_call_arguments.delta") => self.arguments_delta(input),
             Some("response.function_call_arguments.done") => self.arguments_done(input),
             Some("response.output_item.done") => self.output_item_done(input),
-            Some("response.completed" | "response.incomplete" | "response.failed") => {
+            Some(
+                "response.completed" | "response.done" | "response.incomplete" | "response.failed",
+            ) => {
                 let mut restored = input.clone();
+                if restored.get("type").and_then(Value::as_str) == Some("response.done") {
+                    restored["type"] = Value::String("response.completed".to_string());
+                }
                 transforms::restore_grok_responses_tool_items(&mut restored, &self.context);
                 self.calls.clear();
                 self.completed = true;
@@ -692,6 +694,7 @@ struct ResponsesAnthropicState {
     saw_reasoning: bool,
     web_search_requests: u64,
     x_search_requests: u64,
+    response_usage: Option<Value>,
     completed: bool,
 }
 
@@ -727,8 +730,10 @@ impl ResponsesAnthropicState {
         if self.completed {
             return Vec::new();
         }
+        self.observe_response_usage(input);
         match input.get("type").and_then(Value::as_str) {
             Some("response.created") => self.ensure_message_start(input),
+            Some("response.in_progress" | "response.queued") => self.ensure_message_start(input),
             Some("response.output_text.delta") => self.text_delta(input),
             Some("response.output_text.annotation.added") => self.annotation_added(input),
             Some(
@@ -742,11 +747,22 @@ impl ResponsesAnthropicState {
             Some("response.custom_tool_call_input.delta") => self.custom_input_delta(input),
             Some("response.custom_tool_call_input.done") => self.custom_input_done(input),
             Some("response.output_item.done") => self.output_item_done(input),
-            Some("response.completed") => self.complete(input),
+            Some("response.completed" | "response.done") => self.complete(input),
             Some("response.incomplete") => self.complete(input),
             Some("response.failed") | Some("error") => self.fail(input),
             _ => Vec::new(),
         }
+    }
+
+    fn observe_response_usage(&mut self, input: &Value) {
+        let Some(usage) = input
+            .pointer("/response/usage")
+            .or_else(|| input.get("usage"))
+        else {
+            return;
+        };
+        let target = self.response_usage.get_or_insert_with(|| json!({}));
+        merge_json_value(target, usage);
     }
 
     fn ensure_message_start(&mut self, input: &Value) -> Vec<StreamFrame> {
@@ -1217,7 +1233,11 @@ impl ResponsesAnthropicState {
         frames.extend(self.close_open_blocks());
         let stop_reason =
             transforms::openai_response_to_anthropic_stop_with_tools(response, self.saw_tool);
-        let mut usage = transforms::anthropic_usage_from_openai_usage(response.get("usage"));
+        let mut usage = transforms::anthropic_usage_from_openai_usage(
+            self.response_usage
+                .as_ref()
+                .or_else(|| response.get("usage")),
+        );
         let hosted_search_requests = self
             .web_search_requests
             .saturating_add(self.x_search_requests);
@@ -2700,6 +2720,25 @@ fn merge_bridge_item(target: &mut Value, incoming: &Value) {
         if !value.is_null() {
             target.insert(key.clone(), value.clone());
         }
+    }
+}
+
+fn merge_json_value(target: &mut Value, incoming: &Value) {
+    match (target.as_object_mut(), incoming.as_object()) {
+        (Some(target), Some(incoming)) => {
+            for (key, value) in incoming {
+                if value.is_null() {
+                    continue;
+                }
+                if let Some(existing) = target.get_mut(key) {
+                    merge_json_value(existing, value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        _ if !incoming.is_null() => *target = incoming.clone(),
+        _ => {}
     }
 }
 
@@ -6368,6 +6407,109 @@ mod tests {
             completed[0].payload_json()["response"]["output"][0]["type"],
             "custom_tool_call"
         );
+        assert!(state.completed);
+    }
+
+    #[test]
+    fn grok_response_done_is_normalized_to_codex_terminal_event() {
+        let context = transforms::responses_tool_context(&json!({
+            "tools": [{"type": "custom", "name": "exec"}],
+            "input": "run pwd"
+        }));
+        let mut state = GrokResponsesToolsState::new(context);
+
+        let terminal = state.transform(&json!({
+            "type": "response.done",
+            "response": {
+                "id": "resp_done",
+                "status": "completed",
+                "usage": {"input_tokens": 12, "output_tokens": 3}
+            }
+        }));
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload_json()["type"], "response.completed");
+        assert!(state.completed);
+        assert!(state.finish_stream().is_empty());
+    }
+
+    #[test]
+    fn grok_response_done_followed_by_done_finishes_without_protocol_error() {
+        let context = transforms::responses_tool_context(&json!({
+            "tools": [{"type": "custom", "name": "exec"}],
+            "input": "run pwd"
+        }));
+        let mut transformer = StreamEventTransformer {
+            upstream: Some(UpstreamFormat::OpenAiResponses),
+            downstream: UpstreamFormat::OpenAiResponses,
+            buffer: Vec::new(),
+            responses_tool_context: context.clone(),
+            bridge: Some(StreamBridgeState::GrokResponsesTools(
+                GrokResponsesToolsState::new(context),
+            )),
+            unwrap_v1internal: false,
+            gemini_terminal: None,
+        };
+        let output = transformer
+            .push(Bytes::from_static(
+                concat!(
+                    "event: response.done\n",
+                    "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            ))
+            .expect("response.done is a valid Grok terminal event");
+
+        let output = String::from_utf8(output.to_vec()).unwrap();
+        assert!(output.contains("\"type\":\"response.completed\""));
+        assert!(!output.contains("\"type\":\"response.done\""));
+        assert!(transformer.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn responses_to_anthropic_merges_partial_lifecycle_usage() {
+        let mut state = ResponsesAnthropicState::default();
+        let mut frames = state.transform(&json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_usage",
+                "model": "grok-4.6",
+                "status": "in_progress",
+                "usage": {
+                    "input_tokens": 130,
+                    "output_tokens": 30,
+                    "total_tokens": 160
+                }
+            }
+        }));
+        frames.extend(state.transform(&json!({
+            "type": "response.in_progress",
+            "response": {
+                "usage": {
+                    "input_tokens_details": {
+                        "cached_tokens": 80,
+                        "cache_write_tokens": 10
+                    }
+                }
+            }
+        })));
+        frames.extend(state.transform(&json!({
+            "type": "response.completed",
+            "response": {"id": "resp_usage", "status": "completed"}
+        })));
+
+        let usage = frames
+            .iter()
+            .find_map(|frame| {
+                let payload = frame.payload_json();
+                (payload["type"] == "message_delta").then(|| payload["usage"].clone())
+            })
+            .expect("terminal Anthropic usage");
+        assert_eq!(usage["input_tokens"], 40);
+        assert_eq!(usage["output_tokens"], 30);
+        assert_eq!(usage["cache_read_input_tokens"], 80);
+        assert_eq!(usage["cache_creation_input_tokens"], 10);
         assert!(state.completed);
     }
 
