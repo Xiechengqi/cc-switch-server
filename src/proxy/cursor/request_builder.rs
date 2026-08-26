@@ -31,7 +31,7 @@ pub enum InboundProtocol {
     GeminiNative,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultBlock {
     /// Client-facing tool call id — what cc-switch emitted in the previous
     /// turn. Used to look up the pending exec_id in the session.
@@ -41,13 +41,39 @@ pub struct ToolResultBlock {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletedToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolContinuationKind {
+    #[default]
+    None,
+    PureToolResults,
+    MixedToolResults,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentRunPlan {
     pub system_prompt: Option<String>,
     pub user_text: String,
     pub tools: Vec<McpToolDef>,
     pub images: Vec<ImageRef>,
+    /// Tool results from completed earlier turns. They are retained in the
+    /// flattened transcript for cold resume, but must never by themselves
+    /// trigger a parked-session lookup.
+    pub historical_tool_results: Vec<ToolResultBlock>,
+    /// Results submitted by the current request delta. Only these may resume
+    /// a live AgentService stream.
     pub tool_results: Vec<ToolResultBlock>,
+    pub continuation_kind: ToolContinuationKind,
+    /// The flattened request contains the assistant-side call metadata for
+    /// every active result, so a fresh AgentService run can continue without
+    /// asking the client to execute the same tool again.
+    pub cold_resume_ready: bool,
+    pub completed_tool_calls: Vec<CompletedToolCall>,
     /// Cursor's `RequestedModel.model_id` — the value passed to
     /// Cursor's model resolver. Comes from the upstream-mapped body.
     pub model_id: String,
@@ -60,6 +86,9 @@ pub struct AgentRunPlan {
     /// Credential-free Responses items retained across a parked tool turn and
     /// copied into completed-response state after the final terminal.
     pub response_input_items: Vec<Value>,
+    /// A conservative semantic signal used to reject a promise-only response
+    /// when the latest request plainly requires local project inspection.
+    pub local_tool_required_by_intent: bool,
 }
 
 /// Validate tool-result context for AgentService routing. Returns an error
@@ -68,14 +97,432 @@ pub struct AgentRunPlan {
 /// pending exec_id and the turn would silently fail. Mirrors sub2api's
 /// `validateFunctionCallOutputRequest` guard.
 pub fn validate_tool_result_context(plan: &AgentRunPlan) -> Result<(), String> {
+    let mut seen = std::collections::HashMap::<&str, (&str, bool)>::new();
     for tr in &plan.tool_results {
-        if tr.tool_call_id.trim().is_empty() {
+        let call_id = tr.tool_call_id.trim();
+        if call_id.is_empty() {
             return Err("function_call_output requires a non-empty call_id; \
                  continuation via previous_response_id without call_id is not supported"
                 .to_string());
         }
+        if let Some((content, is_error)) = seen.insert(call_id, (&tr.content, tr.is_error)) {
+            if content != tr.content || is_error != tr.is_error {
+                return Err(format!(
+                    "conflicting tool results for call_id `{call_id}` are not supported"
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+fn active_tool_results(
+    protocol: InboundProtocol,
+    body: &Value,
+) -> (Vec<ToolResultBlock>, ToolContinuationKind) {
+    match protocol {
+        InboundProtocol::AnthropicMessages => active_anthropic_tool_results(body),
+        InboundProtocol::OpenAiChat => active_openai_chat_tool_results(body),
+        InboundProtocol::OpenAiResponses => active_openai_response_tool_results(body),
+        InboundProtocol::GeminiNative => active_gemini_tool_results(body),
+    }
+}
+
+fn active_anthropic_tool_results(body: &Value) -> (Vec<ToolResultBlock>, ToolContinuationKind) {
+    let Some(message) = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return (Vec::new(), ToolContinuationKind::None);
+    };
+    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+        return (Vec::new(), ToolContinuationKind::None);
+    };
+    let mut results = Vec::new();
+    let mut mixed = false;
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str).unwrap_or("") {
+            "tool_result" => {
+                let content = stringify_anthropic_text_or_blocks(
+                    block.get("content").unwrap_or(&Value::Null),
+                )
+                .unwrap_or_default();
+                results.push(ToolResultBlock {
+                    tool_call_id: block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    content,
+                    is_error: block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+            "text" => {
+                mixed |= block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty());
+            }
+            _ => mixed = true,
+        }
+    }
+    continuation_kind(results, mixed)
+}
+
+fn active_openai_chat_tool_results(body: &Value) -> (Vec<ToolResultBlock>, ToolContinuationKind) {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return (Vec::new(), ToolContinuationKind::None);
+    };
+    let mut results = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .map(|message| ToolResultBlock {
+            tool_call_id: message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            content: message
+                .get("content")
+                .and_then(openai_content_text)
+                .unwrap_or_default(),
+            is_error: false,
+        })
+        .collect::<Vec<_>>();
+    results.reverse();
+    continuation_kind(results, false)
+}
+
+fn active_openai_response_tool_results(
+    body: &Value,
+) -> (Vec<ToolResultBlock>, ToolContinuationKind) {
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return (Vec::new(), ToolContinuationKind::None);
+    };
+    let mut results = items
+        .iter()
+        .rev()
+        .take_while(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .map(|item| ToolResultBlock {
+            tool_call_id: item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            content: item
+                .get("output")
+                .map(stringify_json_text)
+                .unwrap_or_default(),
+            is_error: false,
+        })
+        .collect::<Vec<_>>();
+    results.reverse();
+    continuation_kind(results, false)
+}
+
+fn active_gemini_tool_results(body: &Value) -> (Vec<ToolResultBlock>, ToolContinuationKind) {
+    let Some(content) = body
+        .get("contents")
+        .and_then(Value::as_array)
+        .and_then(|contents| contents.last())
+        .filter(|content| {
+            content
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                == "user"
+        })
+    else {
+        return (Vec::new(), ToolContinuationKind::None);
+    };
+    let parts = content.get("parts").unwrap_or(&Value::Null);
+    let results = gemini_function_responses(parts)
+        .into_iter()
+        .map(|response| {
+            let name = response
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("gemini_function_response");
+            ToolResultBlock {
+                tool_call_id: response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or(name)
+                    .to_string(),
+                content: response
+                    .get("response")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "{}".to_string()),
+                is_error: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let part_iter = match parts {
+        Value::Array(items) => items.iter().collect::<Vec<_>>(),
+        Value::Object(_) => vec![parts],
+        _ => Vec::new(),
+    };
+    let mixed = part_iter.iter().any(|part| {
+        part.get("functionResponse").is_none()
+            && part.get("function_response").is_none()
+            && part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_none_or(|text| !text.trim().is_empty())
+    });
+    continuation_kind(results, mixed)
+}
+
+fn continuation_kind(
+    results: Vec<ToolResultBlock>,
+    mixed: bool,
+) -> (Vec<ToolResultBlock>, ToolContinuationKind) {
+    let kind = if results.is_empty() {
+        ToolContinuationKind::None
+    } else if mixed {
+        ToolContinuationKind::MixedToolResults
+    } else {
+        ToolContinuationKind::PureToolResults
+    };
+    (results, kind)
+}
+
+fn stringify_json_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn tool_call_context_complete(
+    protocol: InboundProtocol,
+    body: &Value,
+    active_results: &[ToolResultBlock],
+) -> bool {
+    if active_results.is_empty() {
+        return false;
+    }
+    let mut call_ids = std::collections::HashSet::<String>::new();
+    match protocol {
+        InboundProtocol::AnthropicMessages => {
+            for message in body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            {
+                for block in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        call_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        InboundProtocol::OpenAiChat => {
+            for message in body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            {
+                for call in message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        call_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        InboundProtocol::OpenAiResponses => {
+            for item in body
+                .get("input")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            {
+                if let Some(id) = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    call_ids.insert(id.to_string());
+                }
+            }
+        }
+        InboundProtocol::GeminiNative => {
+            for content in body
+                .get("contents")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|content| {
+                    matches!(
+                        content.get("role").and_then(Value::as_str),
+                        Some("model" | "assistant")
+                    )
+                })
+            {
+                for call in gemini_function_calls(content.get("parts").unwrap_or(&Value::Null)) {
+                    if let Some(id) = call
+                        .get("id")
+                        .or_else(|| call.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        call_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    active_results
+        .iter()
+        .all(|result| call_ids.contains(result.tool_call_id.trim()))
+}
+
+fn completed_tool_calls(
+    protocol: InboundProtocol,
+    body: &Value,
+    active_results: &[ToolResultBlock],
+) -> Vec<CompletedToolCall> {
+    let active = active_results
+        .iter()
+        .map(|result| result.tool_call_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if active.is_empty() {
+        return Vec::new();
+    }
+    let mut calls = Vec::new();
+    match protocol {
+        InboundProtocol::AnthropicMessages => {
+            for block in body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+                .filter_map(|message| message.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            {
+                let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                if active.contains(id) {
+                    calls.push(CompletedToolCall {
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                    });
+                }
+            }
+        }
+        InboundProtocol::OpenAiChat => {
+            for call in body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+                .flatten()
+            {
+                let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                if active.contains(id) {
+                    let function = call.get("function").unwrap_or(&Value::Null);
+                    calls.push(CompletedToolCall {
+                        name: function
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|arguments| serde_json::from_str(arguments).ok())
+                            .unwrap_or_else(|| json!({})),
+                    });
+                }
+            }
+        }
+        InboundProtocol::OpenAiResponses => {
+            for call in body
+                .get("input")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            {
+                let id = call
+                    .get("call_id")
+                    .or_else(|| call.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if active.contains(id) {
+                    calls.push(CompletedToolCall {
+                        name: call
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: call
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|arguments| serde_json::from_str(arguments).ok())
+                            .unwrap_or_else(|| json!({})),
+                    });
+                }
+            }
+        }
+        InboundProtocol::GeminiNative => {
+            for call in body
+                .get("contents")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|content| {
+                    gemini_function_calls(content.get("parts").unwrap_or(&Value::Null))
+                })
+            {
+                let id = call
+                    .get("id")
+                    .or_else(|| call.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if active.contains(id) {
+                    calls.push(CompletedToolCall {
+                        name: call
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: call.get("args").cloned().unwrap_or_else(|| json!({})),
+                    });
+                }
+            }
+        }
+    }
+    calls
 }
 
 pub fn validate_tool_choice_contract(plan: &AgentRunPlan) -> Result<(), String> {
@@ -127,7 +574,7 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let (system_prompt, user_text, images, tool_results) = match protocol {
+    let (system_prompt, user_text, images, all_tool_results) = match protocol {
         InboundProtocol::AnthropicMessages => decompose_anthropic(body),
         InboundProtocol::OpenAiChat => decompose_openai_chat(body),
         InboundProtocol::OpenAiResponses => decompose_openai_responses(body),
@@ -150,6 +597,13 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         tools.clear();
     }
     let working_directory = extract_working_directory(body);
+    let (tool_results, continuation_kind) = active_tool_results(protocol, body);
+    let historical_count = all_tool_results.len().saturating_sub(tool_results.len());
+    let historical_tool_results = all_tool_results[..historical_count].to_vec();
+    let local_tool_required_by_intent =
+        request_requires_local_tool(protocol, body, &tools, &tool_results);
+    let cold_resume_ready = tool_call_context_complete(protocol, body, &tool_results);
+    let completed_tool_calls = completed_tool_calls(protocol, body, &tool_results);
     // OmniRoute found that Cursor's AgentService does not reliably honor
     // system prompts delivered via the KV blob channel. Prepend system
     // content into the UserMessage text as a pragmatic workaround. The
@@ -163,15 +617,24 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
     } else {
         user_text.clone()
     };
-    let user_text =
+    let mut user_text =
         enhance_agent_user_text(&user_text_with_system, &tool_choice, &tools, body, protocol);
+    if !tool_results.is_empty() && cold_resume_ready {
+        user_text.push_str(
+            "\n\nTOOL CONTINUATION SAFETY:\nThe tool results in this request have already been executed by the client. Continue from those results. Do not repeat an identical tool call or repeat its side effects.",
+        );
+    }
 
     AgentRunPlan {
         system_prompt,
         user_text,
         tools,
         images,
+        historical_tool_results,
         tool_results,
+        continuation_kind,
+        cold_resume_ready,
+        completed_tool_calls,
         model_id,
         previous_response_id,
         working_directory,
@@ -181,7 +644,16 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         } else {
             Vec::new()
         },
+        local_tool_required_by_intent,
     }
+}
+
+/// Preserve the continuation classification from the original inbound delta
+/// after Responses `previous_response_id` state has been prepended. Cached
+/// historical function outputs are context, not a new tool continuation.
+pub fn preserve_current_continuation(plan: &mut AgentRunPlan, original: &AgentRunPlan) {
+    plan.tool_results = original.tool_results.clone();
+    plan.continuation_kind = original.continuation_kind;
 }
 
 pub fn estimate_responses_input_tokens(body: &Value) -> u32 {
@@ -1330,6 +1802,141 @@ pub fn enhance_agent_user_text(
     }
 }
 
+fn request_requires_local_tool(
+    protocol: InboundProtocol,
+    body: &Value,
+    tools: &[McpToolDef],
+    active_results: &[ToolResultBlock],
+) -> bool {
+    if tools.is_empty() || !active_results.is_empty() {
+        return false;
+    }
+    let user_turns = current_user_turns(protocol, body);
+    let Some(mut latest) = user_turns.last().map(String::as_str) else {
+        return false;
+    };
+    let normalized = latest.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "continue" | "continue." | "继续" | "继续。"
+    ) {
+        if let Some(previous) = user_turns.iter().rev().nth(1) {
+            latest = previous;
+        }
+    }
+    local_project_intent(latest)
+}
+
+fn current_user_turns(protocol: InboundProtocol, body: &Value) -> Vec<String> {
+    match protocol {
+        InboundProtocol::AnthropicMessages => body
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|message| {
+                stringify_anthropic_text_or_blocks(message.get("content").unwrap_or(&Value::Null))
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect(),
+        InboundProtocol::OpenAiChat => body
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|message| message.get("content").and_then(openai_content_text))
+            .filter(|text| !text.trim().is_empty())
+            .collect(),
+        InboundProtocol::OpenAiResponses => match body.get("input") {
+            Some(Value::String(text)) if !text.trim().is_empty() => vec![text.clone()],
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|kind| kind == "message")
+                        && item.get("role").and_then(Value::as_str).unwrap_or("user") == "user"
+                })
+                .filter_map(|item| {
+                    let (text, _) =
+                        openai_responses_content_parts(item.get("content").unwrap_or(&Value::Null));
+                    (!text.trim().is_empty()).then_some(text)
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        InboundProtocol::GeminiNative => body
+            .get("contents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|content| {
+                content
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    == "user"
+            })
+            .filter_map(|content| {
+                let (text, _) =
+                    gemini_parts_text_images(content.get("parts").unwrap_or(&Value::Null));
+                (!text.trim().is_empty()).then_some(text)
+            })
+            .collect(),
+    }
+}
+
+fn local_project_intent(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let local_signal = [
+        "current project",
+        "current directory",
+        "this project",
+        "repository",
+        "repo",
+        "codebase",
+        "recent commit",
+        "git history",
+        "当前项目",
+        "当前目录",
+        "这个项目",
+        "本项目",
+        "仓库",
+        "代码库",
+        "项目结构",
+        "最近提交",
+        "提交记录",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
+    let action_signal = [
+        "inspect",
+        "analyze",
+        "analyse",
+        "review",
+        "read",
+        "summarize",
+        "explain",
+        "implement",
+        "modify",
+        "test",
+        "查看",
+        "读取",
+        "分析",
+        "解读",
+        "审查",
+        "总结",
+        "实现",
+        "修改",
+        "测试",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal));
+    local_signal && action_signal
+}
+
 pub fn extract_working_directory(body: &Value) -> String {
     body.get("metadata")
         .and_then(|m| m.get("working_directory"))
@@ -1462,6 +2069,47 @@ mod tests {
         assert_eq!(plan.tool_results.len(), 1);
         assert_eq!(plan.tool_results[0].tool_call_id, "tc_1");
         assert_eq!(plan.tool_results[0].content, "sunny");
+        assert_eq!(
+            plan.continuation_kind,
+            ToolContinuationKind::PureToolResults
+        );
+        assert!(plan.cold_resume_ready);
+    }
+
+    #[test]
+    fn anthropic_historical_tool_result_is_not_an_active_continuation() {
+        let body = json!({
+            "model": "default",
+            "messages": [
+                {"role":"assistant","content":[{"type":"tool_use","id":"old","name":"read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"done"}]},
+                {"role":"assistant","content":"finished"},
+                {"role":"user","content":"继续"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::AnthropicMessages, &body);
+        assert!(plan.tool_results.is_empty());
+        assert_eq!(plan.historical_tool_results.len(), 1);
+        assert_eq!(plan.continuation_kind, ToolContinuationKind::None);
+    }
+
+    #[test]
+    fn anthropic_mixed_tool_result_requires_cold_resume() {
+        let body = json!({
+            "messages": [
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call-1","content":"ok"},
+                    {"type":"text","text":"also summarize it"}
+                ]}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::AnthropicMessages, &body);
+        assert_eq!(
+            plan.continuation_kind,
+            ToolContinuationKind::MixedToolResults
+        );
+        assert!(plan.cold_resume_ready);
     }
 
     #[test]
@@ -1521,6 +2169,113 @@ mod tests {
     }
 
     #[test]
+    fn responses_historical_function_output_before_new_user_is_not_active() {
+        let body = json!({
+            "input": [
+                {"type":"function_call","name":"read","call_id":"old","arguments":"{}"},
+                {"type":"function_call_output","call_id":"old","output":"done"},
+                {"type":"message","role":"assistant","content":"finished"},
+                {"type":"message","role":"user","content":"continue"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert!(plan.tool_results.is_empty());
+        assert_eq!(plan.historical_tool_results.len(), 1);
+    }
+
+    #[test]
+    fn responses_prepended_cache_cannot_turn_history_into_current_continuation() {
+        let original_body = json!({
+            "previous_response_id":"resp_previous",
+            "input": []
+        });
+        let original = build_plan(InboundProtocol::OpenAiResponses, &original_body);
+        let expanded_body = json!({
+            "input":[{"type":"function_call_output","call_id":"old","output":"done"}]
+        });
+        let mut expanded = build_plan(InboundProtocol::OpenAiResponses, &expanded_body);
+        assert_eq!(expanded.tool_results.len(), 1);
+        preserve_current_continuation(&mut expanded, &original);
+        assert!(expanded.tool_results.is_empty());
+        assert_eq!(expanded.continuation_kind, ToolContinuationKind::None);
+    }
+
+    #[test]
+    fn responses_prepended_cache_allows_continue_to_inherit_local_intent() {
+        let original_body = json!({
+            "previous_response_id":"resp_previous",
+            "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+            "input":[{"type":"message","role":"user","content":"continue"}]
+        });
+        let original = build_plan(InboundProtocol::OpenAiResponses, &original_body);
+        assert!(!original.local_tool_required_by_intent);
+        let expanded_body = json!({
+            "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+            "input":[
+                {"type":"message","role":"user","content":"Summarize recent commits"},
+                {"type":"message","role":"assistant","content":"I will inspect them."},
+                {"type":"message","role":"user","content":"continue"}
+            ]
+        });
+        let mut expanded = build_plan(InboundProtocol::OpenAiResponses, &expanded_body);
+        preserve_current_continuation(&mut expanded, &original);
+        assert!(expanded.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn chat_trailing_tool_messages_form_the_current_continuation() {
+        let body = json!({
+            "messages": [
+                {"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]},
+                {"role":"tool","tool_call_id":"call-1","content":"contents"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiChat, &body);
+        assert_eq!(plan.tool_results.len(), 1);
+        assert!(plan.cold_resume_ready);
+        assert_eq!(plan.completed_tool_calls[0].name, "read");
+    }
+
+    #[test]
+    fn chat_only_uses_trailing_tool_message_suffix() {
+        let body = json!({
+            "messages": [
+                {"role":"assistant","tool_calls":[{"id":"old","type":"function","function":{"name":"read","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"old","content":"done"},
+                {"role":"assistant","content":"finished"},
+                {"role":"user","content":"continue"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiChat, &body);
+        assert!(plan.tool_results.is_empty());
+        assert_eq!(plan.historical_tool_results.len(), 1);
+    }
+
+    #[test]
+    fn local_project_request_requires_a_tool_even_with_auto_choice() {
+        let body = json!({
+            "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+            "input":[{"type":"message","role":"user","content":"深入解读当前项目"}]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn claude_continue_inherits_the_previous_local_project_intent() {
+        let body = json!({
+            "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"深入解读当前项目"},
+                {"role":"assistant","content":"我先查看结构。"},
+                {"role":"user","content":"继续"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::AnthropicMessages, &body);
+        assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
     fn openai_responses_previous_response_id_extracted() {
         let body = json!({
             "model": "gpt-5",
@@ -1553,6 +2308,18 @@ mod tests {
         });
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
         assert!(validate_tool_result_context(&plan).is_ok());
+    }
+
+    #[test]
+    fn validate_tool_result_context_rejects_conflicting_duplicate_call_id() {
+        let body = json!({
+            "input": [
+                {"type":"function_call_output","call_id":"fc_1","output":"first"},
+                {"type":"function_call_output","call_id":"fc_1","output":"different"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert!(validate_tool_result_context(&plan).is_err());
     }
 
     #[test]

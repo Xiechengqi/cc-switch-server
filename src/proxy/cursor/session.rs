@@ -182,6 +182,11 @@ pub struct CursorSession {
     pub working_directory: String,
     /// Map: client-facing tool call id → cursor exec metadata.
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
+    /// Exact tool calls whose results were supplied to a cold-resumed run.
+    /// Re-emitting one would ask the client to repeat an already completed
+    /// operation, so the driver rejects it before client commit.
+    pub cold_resume_completed_calls: Vec<(String, serde_json::Value)>,
+    pub cold_resume_replay_rejections: usize,
     /// Request-scoped KV blob store (system blob, future attachments).
     pub blob_store: HashMap<String, Bytes>,
     pub state: SessionState,
@@ -291,6 +296,17 @@ impl CursorSessionManager {
         Some(reference.entry.clone())
     }
 
+    /// Acquire and close an exact parked entry. A concurrently reacquired
+    /// Running session is never interrupted, and a stale reference cannot
+    /// affect a same-key replacement.
+    pub async fn close_parked_resolved(&self, reference: &CursorSessionReference) -> bool {
+        let Some(entry) = self.acquire_resolved(reference).await else {
+            return false;
+        };
+        self.release(entry, SessionState::Closed).await;
+        true
+    }
+
     /// Reserve this conversation before any AgentService request is sent.
     ///
     /// A live entry is never replaced. Reserving before the outbound open also
@@ -316,6 +332,8 @@ impl CursorSessionManager {
             semantic_items,
             working_directory,
             pending_tool_calls: HashMap::new(),
+            cold_resume_completed_calls: Vec::new(),
+            cold_resume_replay_rejections: 0,
             blob_store,
             state: SessionState::Running,
             last_activity: Instant::now(),
@@ -629,6 +647,8 @@ mod tests {
             semantic_items: Vec::new(),
             working_directory: String::new(),
             pending_tool_calls: HashMap::new(),
+            cold_resume_completed_calls: Vec::new(),
+            cold_resume_replay_rejections: 0,
             blob_store: HashMap::new(),
             state,
             last_activity: Instant::now(),
@@ -755,6 +775,77 @@ mod tests {
             .await
             .is_none());
         assert!(mgr.resolve_tool_call_id(&scope_b, "call-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn close_parked_resolved_cannot_remove_a_same_key_replacement() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("share-a");
+        let key = session_key(&scope);
+        let stale = session_entry(key.clone(), SessionState::AwaitingToolResult);
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert(key.clone(), stale.clone());
+        mgr.bind_tool_call_id(&key, &stale, "call-stale").await;
+        let reference = mgr
+            .resolve_tool_call_id(&scope, "call-stale")
+            .await
+            .unwrap();
+
+        let replacement = session_entry(key.clone(), SessionState::AwaitingToolResult);
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert(key.clone(), replacement.clone());
+        assert!(!mgr.close_parked_resolved(&reference).await);
+
+        assert!(mgr.has(&key).await);
+        assert_eq!(
+            replacement.lock().await.state,
+            SessionState::AwaitingToolResult
+        );
+        assert_eq!(stale.lock().await.state, SessionState::AwaitingToolResult);
+    }
+
+    #[tokio::test]
+    async fn close_parked_resolved_never_interrupts_a_running_owner() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("share-a");
+        let key = session_key(&scope);
+        let entry = session_entry(key.clone(), SessionState::AwaitingToolResult);
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert(key.clone(), entry.clone());
+        mgr.bind_tool_call_id(&key, &entry, "call-1").await;
+        let reference = mgr.resolve_tool_call_id(&scope, "call-1").await.unwrap();
+        assert!(mgr.acquire_resolved(&reference).await.is_some());
+        assert!(!mgr.close_parked_resolved(&reference).await);
+        assert_eq!(entry.lock().await.state, SessionState::Running);
+        assert!(mgr.has(&key).await);
+    }
+
+    #[tokio::test]
+    async fn close_parked_resolved_owns_and_removes_the_exact_entry() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("share-a");
+        let key = session_key(&scope);
+        let entry = session_entry(key.clone(), SessionState::AwaitingToolResult);
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert(key.clone(), entry.clone());
+        mgr.bind_tool_call_id(&key, &entry, "call-1").await;
+        let reference = mgr.resolve_tool_call_id(&scope, "call-1").await.unwrap();
+        assert!(mgr.close_parked_resolved(&reference).await);
+        assert!(!mgr.has(&key).await);
+        assert_eq!(entry.lock().await.state, SessionState::Closed);
+        assert!(mgr.resolve_tool_call_id(&scope, "call-1").await.is_none());
     }
 
     #[tokio::test]
