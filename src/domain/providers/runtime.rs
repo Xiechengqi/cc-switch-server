@@ -1153,6 +1153,15 @@ fn runtime_driver_options(
             "codexWebsocketEnabled",
             meta.codex_websocket_enabled.map(|value| json!(value)),
         ),
+        (
+            "codexResponsesKeepaliveIntervalMs",
+            meta.codex_responses_keepalive_interval_ms
+                .map(|value| json!(value)),
+        ),
+        (
+            "codexRoutingHintEnabled",
+            meta.codex_routing_hint_enabled.map(|value| json!(value)),
+        ),
     ] {
         if let Some(value) = value {
             options.insert(name.to_string(), value);
@@ -2571,6 +2580,30 @@ mod tests {
                 .get("customUserAgent")
                 .and_then(Value::as_str),
             Some("custom-agent/2")
+        );
+    }
+
+    #[test]
+    fn codex_runtime_compiles_keepalive_and_routing_options_from_provider_meta() {
+        let accounts = AccountStore::default();
+        let mut stored = provider("codex.openai_oauth", ProviderType::CodexOAuth);
+        let meta = stored.provider.meta.as_mut().unwrap();
+        meta.codex_responses_keepalive_interval_ms = Some(22_000);
+        meta.codex_routing_hint_enabled = Some(false);
+
+        let plan = compile_runtime_plan(&stored, &accounts).unwrap();
+
+        assert_eq!(
+            plan.driver_options
+                .get("codexResponsesKeepaliveIntervalMs")
+                .and_then(Value::as_u64),
+            Some(22_000)
+        );
+        assert_eq!(
+            plan.driver_options
+                .get("codexRoutingHintEnabled")
+                .and_then(Value::as_bool),
+            Some(false)
         );
     }
 

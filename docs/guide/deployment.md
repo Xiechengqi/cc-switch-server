@@ -166,7 +166,9 @@ scripts/smoke/router-share-smoke.sh
 
 建议外层使用 Caddy/Nginx/Cloudflare Tunnel 终止 TLS，再反代到 `127.0.0.1:15721` 或内网地址。`router` tunnel 暴露的 public URL 与本机管理入口可以并存，但生产管理入口必须使用强密码和最小暴露面。
 
-Codex OAuth Images 穿过 Cloudflare 时，反代必须流式透传源站 Body，不能在 Worker 中调用 `.text()`、`.json()` 或 `.arrayBuffer()`。Capability URL 的 host 固定来自 Router 签名 Share context，不从源站 Host 或 forwarded header 推导。Capability 文件默认持久化到 `<config-dir>/image-capabilities`；多副本应把 `CC_SWITCH_IMAGE_STORE_DIR` 指向同一个支持跨进程文件锁、atomic rename 和目录同步的挂载目录，让 `/v1/images/files/<token>` 的 Router 鉴权 GET/HEAD 可落到任一副本。不能共享该目录时才配置生成与下载的粘性回源。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`../provider/codex-oauth.md`](../provider/codex-oauth.md#cloudflare-proxy)。
+Codex OAuth 的普通 Responses SSE 和 Images 穿过 Nginx/Cloudflare 时，反代必须流式透传源站 Body并关闭响应缓冲。Nginx 至少应对这些路径设置 `proxy_buffering off`、`proxy_cache off`，并让 `proxy_read_timeout` 高于 Server 的上游 idle timeout；不要依赖把超时设得很短来发现断流。Cloudflare Worker 不能调用 `.text()`、`.json()` 或 `.arrayBuffer()`，必须直接返回上游 `ReadableStream`，并确认约 15 秒一次的 SSE comment/JSON 空白能立即 flush。普通文本 keepalive 只在首个业务或终态事件已提交后启动，不会掩盖首包前真实错误，也不会延长 Server 对上游的 first-event/idle deadline；`X-Accel-Buffering: no` 不应被中间层覆盖。
+
+Capability URL 的 host 固定来自 Router 签名 Share context，不从源站 Host 或 forwarded header 推导。Capability 文件默认持久化到 `<config-dir>/image-capabilities`；多副本应把 `CC_SWITCH_IMAGE_STORE_DIR` 指向同一个支持跨进程文件锁、atomic rename 和目录同步的挂载目录，让 `/v1/images/files/<token>` 的 Router 鉴权 GET/HEAD 可落到任一副本。不能共享该目录时才配置生成与下载的粘性回源。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`../provider/codex-oauth.md`](../provider/codex-oauth.md#cloudflare-proxy)。
 
 ## OAuth/代理桥接运维
 

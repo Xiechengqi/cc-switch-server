@@ -319,6 +319,7 @@ pub(super) struct GrokForwardContract {
     pub session_id: Option<String>,
     pub headers: Vec<(&'static str, String)>,
     pub actual_model: String,
+    pub protocol_transform: super::protocol_compat::TransformPlan,
 }
 
 pub(super) fn set_forward_contract_turn_index(
@@ -378,7 +379,8 @@ pub(super) fn apply_forward_contract(
     tenant_scope: Option<&str>,
     cli_profile: bool,
 ) -> Result<GrokForwardContract, ProxyError> {
-    patch_grok_request_body(body, route)?;
+    let protocol_transform = patch_grok_request_body(body, route)?;
+    record_protocol_transform(&protocol_transform, "http");
     let model = request_model(body).unwrap_or_else(|| DEFAULT_GROK_MODEL.to_string());
     let session_id = grok_session_id(
         downstream_headers,
@@ -436,6 +438,7 @@ pub(super) fn apply_forward_contract(
         session_id,
         headers,
         actual_model: model,
+        protocol_transform,
     })
 }
 
@@ -498,15 +501,15 @@ fn valid_video_request_id(request_id: &str) -> bool {
 pub(super) fn patch_grok_request_body(
     body: &mut Bytes,
     route: ProxyRoute,
-) -> Result<(), ProxyError> {
+) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
     let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
         ProxyError::bad_request(format!("Grok request body must be valid JSON: {error}"))
     })?;
-    patch_grok_request_value(&mut value, route);
+    let protocol_transform = patch_grok_request_value(&mut value, route)?;
     *body = serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError::bad_request(format!("Grok request encode failed: {error}")))?;
-    Ok(())
+    Ok(protocol_transform)
 }
 
 pub(super) fn inject_prompt_cache_key(
@@ -541,10 +544,21 @@ fn remove_prompt_cache_key(body: &mut Bytes) -> Result<(), ProxyError> {
     Ok(())
 }
 
-fn patch_grok_request_value(value: &mut Value, route: ProxyRoute) {
+fn patch_grok_request_value(
+    value: &mut Value,
+    route: ProxyRoute,
+) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
+    let protocol_transform = if route == ProxyRoute::CodexChatCompletions {
+        super::protocol_compat::TransformPlan::unchanged()
+    } else {
+        let (normalized, plan) = super::protocol_compat::normalize_grok_responses_request(value)
+            .map_err(|error| ProxyError::protocol_incompatible(error.client_message()))?;
+        *value = normalized;
+        plan
+    };
     let model = {
         let Some(object) = value.as_object_mut() else {
-            return;
+            return Ok(protocol_transform);
         };
         let model = normalize_grok_model(
             object
@@ -582,6 +596,27 @@ fn patch_grok_request_value(value: &mut Value, route: ProxyRoute) {
         }
     }
     strip_invalid_encrypted_content(value);
+    Ok(protocol_transform)
+}
+
+fn record_protocol_transform(
+    plan: &super::protocol_compat::TransformPlan,
+    transport: &'static str,
+) {
+    if plan.actions.is_empty() {
+        return;
+    }
+    tracing::info!(
+        provider_protocol = plan.provider_protocol,
+        endpoint = plan.endpoint,
+        transport,
+        fidelity = ?plan.fidelity,
+        preserved_input_items = plan.preserved_input_items,
+        mapped_input_items = plan.mapped_input_items(),
+        merged_tools = plan.merged_tools(),
+        deduplicated_tools = plan.deduplicated_tools(),
+        "applied Grok Responses protocol compatibility plan"
+    );
 }
 
 fn maybe_apply_free_cache(
@@ -604,6 +639,9 @@ fn maybe_apply_free_cache(
     let Some(object) = value.as_object_mut() else {
         return Ok(None);
     };
+    if request_has_client_tool_contract(object) {
+        return Ok(None);
+    }
     object.insert(
         "tools".to_string(),
         json!([
@@ -616,6 +654,14 @@ fn maybe_apply_free_cache(
         .map(Bytes::from)
         .map_err(|error| ProxyError::bad_request(format!("Grok request encode failed: {error}")))?;
     Ok(Some(identity))
+}
+
+fn request_has_client_tool_contract(object: &Map<String, Value>) -> bool {
+    object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || object.get("tool_choice").is_some()
 }
 
 fn grok_free_cache_enabled() -> bool {
@@ -879,8 +925,12 @@ pub(super) fn video_task_id_from_response(body: &[u8]) -> Option<String> {
     .map(str::to_string)
 }
 
-fn normalize_ws_response_body(value: &mut Value, session_id: Option<&str>) {
-    patch_grok_request_value(value, ProxyRoute::CodexResponses);
+fn normalize_ws_response_body(
+    value: &mut Value,
+    session_id: Option<&str>,
+) -> Result<(), ProxyError> {
+    let protocol_transform = patch_grok_request_value(value, ProxyRoute::CodexResponses)?;
+    record_protocol_transform(&protocol_transform, "websocket");
     if let Some(session_id) = session_id {
         if let Some(object) = value.as_object_mut() {
             object.insert(
@@ -898,17 +948,24 @@ fn normalize_ws_response_body(value: &mut Value, session_id: Option<&str>) {
             object.remove("instructions");
         }
     }
+    Ok(())
 }
 
-pub(super) fn ws_request_body(mut value: Value, session_id: Option<&str>) -> Value {
-    normalize_ws_response_body(&mut value, session_id);
-    json!({
+pub(super) fn ws_request_body(
+    mut value: Value,
+    session_id: Option<&str>,
+) -> Result<Value, ProxyError> {
+    normalize_ws_response_body(&mut value, session_id)?;
+    Ok(json!({
         "type": "response.create",
         "response": value,
-    })
+    }))
 }
 
-pub(super) fn ws_message_body(mut value: Value, session_id: Option<&str>) -> Value {
+pub(super) fn ws_message_body(
+    mut value: Value,
+    session_id: Option<&str>,
+) -> Result<Value, ProxyError> {
     if value.get("type").is_none() {
         return ws_request_body(value, session_id);
     }
@@ -918,18 +975,18 @@ pub(super) fn ws_message_body(mut value: Value, session_id: Option<&str>) -> Val
         .is_some_and(|event_type| event_type == "response.create")
     {
         if let Some(response) = value.get_mut("response") {
-            normalize_ws_response_body(response, session_id);
+            normalize_ws_response_body(response, session_id)?;
         } else if let Some(event_type) = value
             .as_object_mut()
             .and_then(|object| object.remove("type"))
         {
-            normalize_ws_response_body(&mut value, session_id);
+            normalize_ws_response_body(&mut value, session_id)?;
             if let Some(object) = value.as_object_mut() {
                 object.insert("type".to_string(), event_type);
             }
         }
     }
-    value
+    Ok(value)
 }
 
 pub(super) fn new_session_id() -> String {
@@ -1485,6 +1542,88 @@ mod tests {
     }
 
     #[test]
+    fn responses_additional_tools_are_promoted_before_grok_sanitization() {
+        let mut body = json_body(json!({
+            "model": "grok-4.6",
+            "futureTopLevelField": {"preserve": true},
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+            "input": [
+                {"type": "additional_tools", "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                    {"type": "function", "name": "write", "parameters": {"type": "object"}}
+                ]},
+                {"type": "message", "role": "user", "content": "hello", "futureItemField": true}
+            ]
+        }));
+
+        let plan = patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+
+        assert_eq!(plan.mapped_input_items(), 1);
+        assert_eq!(plan.merged_tools(), 1);
+        assert_eq!(plan.deduplicated_tools(), 1);
+        assert_eq!(value["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(value["tools"][1]["name"], "write");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["futureItemField"], true);
+        assert_eq!(value["futureTopLevelField"], json!({"preserve": true}));
+    }
+
+    #[test]
+    fn incompatible_responses_items_return_stable_local_error_without_request_data() {
+        let original = json_body(json!({
+            "model": "grok-4.6",
+            "input": [{"type": "additional_tools", "tools": [
+                {"type": "custom", "name": "secret-tool-name", "description": "secret-description"}
+            ]}]
+        }));
+        let mut body = original.clone();
+
+        let error = patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap_err();
+
+        assert_eq!(body, original);
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.error_code(), "cc_switch_protocol_incompatible");
+        assert_eq!(error.error_type(), "invalid_request_error");
+        assert!(!error.retryable());
+        assert!(!error.client_message().contains("secret-tool-name"));
+        assert!(!error.client_message().contains("secret-description"));
+        assert!(!error.client_message().contains("CC_PROTOCOL_INCOMPATIBLE"));
+    }
+
+    #[test]
+    fn chat_route_does_not_apply_responses_input_item_validation() {
+        let mut body = json_body(json!({
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "input": [{"type": "future_chat_metadata"}]
+        }));
+
+        let plan = patch_grok_request_body(&mut body, ProxyRoute::CodexChatCompletions).unwrap();
+
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["input"][0]["type"],
+            "future_chat_metadata"
+        );
+    }
+
+    #[test]
+    fn free_cache_never_overwrites_a_client_tool_contract() {
+        assert!(request_has_client_tool_contract(
+            json!({"tools": [{"type": "function", "name": "lookup"}]})
+                .as_object()
+                .unwrap()
+        ));
+        assert!(request_has_client_tool_contract(
+            json!({"tool_choice": "none"}).as_object().unwrap()
+        ));
+        assert!(!request_has_client_tool_contract(
+            json!({"tools": []}).as_object().unwrap()
+        ));
+    }
+
+    #[test]
     fn ws_request_body_reuses_grok_body_patch() {
         let value = ws_request_body(
             json!({
@@ -1496,7 +1635,8 @@ mod tests {
                 "tools": [{"type": "unsupported"}, {"type": "function"}]
             }),
             Some("session-1"),
-        );
+        )
+        .unwrap();
         let response = &value["response"];
         assert_eq!(response["model"], "grok-build-0.1");
         assert!(response.get("stream_options").is_none());
@@ -1527,7 +1667,8 @@ mod tests {
                 }
             }),
             Some("session-1"),
-        );
+        )
+        .unwrap();
         let response = &value["response"];
         assert_eq!(response["model"], "grok-composer-2.5-fast");
         assert!(response.get("external_web_access").is_none());
@@ -1553,7 +1694,8 @@ mod tests {
                 "instructions": "duplicate continuation instructions"
             }),
             Some("session-flat"),
-        );
+        )
+        .unwrap();
 
         assert_eq!(value["type"], "response.create");
         assert_eq!(value["model"], "grok-build-0.1");
@@ -1562,6 +1704,42 @@ mod tests {
         assert!(value.get("instructions").is_none());
         assert_eq!(value["store"], true);
         assert_eq!(value["prompt_cache_key"], "session-flat");
+    }
+
+    #[test]
+    fn websocket_uses_the_same_additional_tools_compatibility_rule() {
+        let value = ws_message_body(
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "grok-4.6",
+                    "input": [{"type": "additional_tools", "tools": [
+                        {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+                    ]}]
+                }
+            }),
+            Some("session-compatible"),
+        )
+        .unwrap();
+        assert_eq!(value["response"]["tools"][0]["name"], "lookup");
+        assert!(value["response"]["input"].as_array().unwrap().is_empty());
+
+        let error = ws_message_body(
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "grok-4.6",
+                    "input": [{"type": "additional_tools", "tools": [
+                        {"type": "custom", "name": "private-custom-tool"}
+                    ]}]
+                }
+            }),
+            Some("session-incompatible"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.error_code(), "cc_switch_protocol_incompatible");
+        assert!(!error.client_message().contains("private-custom-tool"));
     }
 
     #[test]

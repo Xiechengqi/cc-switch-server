@@ -8,6 +8,8 @@ const CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_MAX_ENTRIES: usize = 2_000;
 const CACHE_MAX_ITEMS_PER_ENTRY: usize = 200;
 const CACHE_MAX_RESPONSE_ID_LEN: usize = 512;
+const TOMBSTONE_TTL_MS: i64 = 2 * 60 * 1_000;
+const TOMBSTONE_MAX_ENTRIES: usize = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PreviousResponseCacheScope {
@@ -31,11 +33,55 @@ struct PreviousResponseCacheEntry {
     access_sequence: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousResponseUnavailableReason {
+    Expired,
+    CountEvicted,
+    ByteEvicted,
+    EntryTooLarge,
+    TooManyItems,
+}
+
+#[derive(Debug, Clone)]
+struct PreviousResponseTombstone {
+    reason: PreviousResponseUnavailableReason,
+    expires_at_ms: i64,
+    access_sequence: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviousResponseCacheStats {
+    pub current_entries: usize,
+    pub current_bytes: usize,
+    pub current_tombstones: usize,
+    pub high_water_entries: usize,
+    pub high_water_bytes: usize,
+    pub max_observed_entry_bytes: usize,
+    pub max_observed_entry_items: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub expired: u64,
+    pub count_evictions: u64,
+    pub byte_evictions: u64,
+    pub oversize_entry_rejections: u64,
+    pub too_many_items_rejections: u64,
+    pub invalid_response_id_rejections: u64,
+    pub required_context_unavailable: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviousResponseCacheLookup {
+    pub items: Option<Vec<Value>>,
+    pub unavailable_reason: Option<PreviousResponseUnavailableReason>,
+}
+
 #[derive(Debug, Default)]
 pub struct PreviousResponseCache {
     entries: BTreeMap<PreviousResponseCacheKey, PreviousResponseCacheEntry>,
+    tombstones: BTreeMap<PreviousResponseCacheKey, PreviousResponseTombstone>,
     total_bytes: usize,
     access_sequence: u64,
+    stats: PreviousResponseCacheStats,
 }
 
 impl PreviousResponseCache {
@@ -45,12 +91,43 @@ impl PreviousResponseCache {
         response_id: &str,
         now_ms: i64,
     ) -> Option<Vec<Value>> {
+        self.lookup(scope, response_id, now_ms).items
+    }
+
+    pub fn lookup(
+        &mut self,
+        scope: &PreviousResponseCacheScope,
+        response_id: &str,
+        now_ms: i64,
+    ) -> PreviousResponseCacheLookup {
         self.cleanup(now_ms);
-        let key = cache_key(scope, response_id)?;
+        let Some(key) = cache_key(scope, response_id) else {
+            self.stats.invalid_response_id_rejections =
+                self.stats.invalid_response_id_rejections.saturating_add(1);
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            return PreviousResponseCacheLookup {
+                items: None,
+                unavailable_reason: None,
+            };
+        };
         self.access_sequence = self.access_sequence.wrapping_add(1);
-        let entry = self.entries.get_mut(&key)?;
-        entry.access_sequence = self.access_sequence;
-        Some(entry.items.clone())
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.access_sequence = self.access_sequence;
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            return PreviousResponseCacheLookup {
+                items: Some(entry.items.clone()),
+                unavailable_reason: None,
+            };
+        }
+        self.stats.misses = self.stats.misses.saturating_add(1);
+        let unavailable_reason = self.tombstones.get_mut(&key).map(|tombstone| {
+            tombstone.access_sequence = self.access_sequence;
+            tombstone.reason
+        });
+        PreviousResponseCacheLookup {
+            items: None,
+            unavailable_reason,
+        }
     }
 
     pub fn insert(
@@ -62,23 +139,46 @@ impl PreviousResponseCache {
     ) -> bool {
         self.cleanup(now_ms);
         let Some(key) = cache_key(&scope, response_id) else {
+            self.stats.invalid_response_id_rejections =
+                self.stats.invalid_response_id_rejections.saturating_add(1);
             return false;
         };
-        if items.is_empty() || items.len() > CACHE_MAX_ITEMS_PER_ENTRY {
+        if items.is_empty() {
+            return false;
+        }
+        self.stats.max_observed_entry_items = self.stats.max_observed_entry_items.max(items.len());
+        if items.len() > CACHE_MAX_ITEMS_PER_ENTRY {
+            self.stats.too_many_items_rejections =
+                self.stats.too_many_items_rejections.saturating_add(1);
+            self.mark_tombstone(key, PreviousResponseUnavailableReason::TooManyItems, now_ms);
             return false;
         }
         let Some(bytes) = encoded_items_size(&items) else {
             return false;
         };
+        self.stats.max_observed_entry_bytes = self.stats.max_observed_entry_bytes.max(bytes);
         if bytes > CACHE_MAX_ENTRY_BYTES || bytes > CACHE_MAX_BYTES {
+            self.stats.oversize_entry_rejections =
+                self.stats.oversize_entry_rejections.saturating_add(1);
+            self.mark_tombstone(
+                key,
+                PreviousResponseUnavailableReason::EntryTooLarge,
+                now_ms,
+            );
             return false;
         }
+        self.tombstones.remove(&key);
         if let Some(previous) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
         }
         while self.entries.len() >= CACHE_MAX_ENTRIES
             || self.total_bytes.saturating_add(bytes) > CACHE_MAX_BYTES
         {
+            let reason = if self.entries.len() >= CACHE_MAX_ENTRIES {
+                PreviousResponseUnavailableReason::CountEvicted
+            } else {
+                PreviousResponseUnavailableReason::ByteEvicted
+            };
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -89,6 +189,16 @@ impl PreviousResponseCache {
             };
             if let Some(removed) = self.entries.remove(&oldest) {
                 self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+                match reason {
+                    PreviousResponseUnavailableReason::CountEvicted => {
+                        self.stats.count_evictions = self.stats.count_evictions.saturating_add(1)
+                    }
+                    PreviousResponseUnavailableReason::ByteEvicted => {
+                        self.stats.byte_evictions = self.stats.byte_evictions.saturating_add(1)
+                    }
+                    _ => {}
+                }
+                self.mark_tombstone(oldest, reason, now_ms);
             }
         }
         self.access_sequence = self.access_sequence.wrapping_add(1);
@@ -102,7 +212,17 @@ impl PreviousResponseCache {
             },
         );
         self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.refresh_current_stats();
         true
+    }
+
+    pub fn stats(&self) -> PreviousResponseCacheStats {
+        self.stats.clone()
+    }
+
+    pub fn record_required_context_unavailable(&mut self) {
+        self.stats.required_context_unavailable =
+            self.stats.required_context_unavailable.saturating_add(1);
     }
 
     fn cleanup(&mut self, now_ms: i64) {
@@ -115,8 +235,50 @@ impl PreviousResponseCache {
         for key in expired {
             if let Some(entry) = self.entries.remove(&key) {
                 self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+                self.stats.expired = self.stats.expired.saturating_add(1);
+                self.mark_tombstone(key, PreviousResponseUnavailableReason::Expired, now_ms);
             }
         }
+        self.tombstones
+            .retain(|_, tombstone| tombstone.expires_at_ms > now_ms);
+        self.refresh_current_stats();
+    }
+
+    fn mark_tombstone(
+        &mut self,
+        key: PreviousResponseCacheKey,
+        reason: PreviousResponseUnavailableReason,
+        now_ms: i64,
+    ) {
+        self.access_sequence = self.access_sequence.wrapping_add(1);
+        self.tombstones.insert(
+            key,
+            PreviousResponseTombstone {
+                reason,
+                expires_at_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
+                access_sequence: self.access_sequence,
+            },
+        );
+        while self.tombstones.len() > TOMBSTONE_MAX_ENTRIES {
+            let Some(oldest) = self
+                .tombstones
+                .iter()
+                .min_by_key(|(_, tombstone)| tombstone.access_sequence)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.tombstones.remove(&oldest);
+        }
+        self.refresh_current_stats();
+    }
+
+    fn refresh_current_stats(&mut self) {
+        self.stats.current_entries = self.entries.len();
+        self.stats.current_bytes = self.total_bytes;
+        self.stats.current_tombstones = self.tombstones.len();
+        self.stats.high_water_entries = self.stats.high_water_entries.max(self.entries.len());
+        self.stats.high_water_bytes = self.stats.high_water_bytes.max(self.total_bytes);
     }
 }
 
@@ -225,5 +387,68 @@ mod tests {
         assert!(cache.get(&scope, "resp-0", 1_003).is_some());
         assert!(cache.get(&scope, "resp-1", 1_003).is_none());
         assert!(cache.get(&scope, "resp-overflow", 1_003).is_some());
+        assert_eq!(cache.stats().count_evictions, 1);
+        assert_eq!(cache.stats().current_entries, CACHE_MAX_ENTRIES);
+        assert_eq!(
+            cache.lookup(&scope, "resp-1", 1_003).unavailable_reason,
+            Some(PreviousResponseUnavailableReason::CountEvicted)
+        );
+    }
+
+    #[test]
+    fn tombstones_are_scoped_bounded_and_expire() {
+        let mut cache = PreviousResponseCache::default();
+        let base = scope("share-a", "user@example.com");
+        assert!(!cache.insert(
+            base.clone(),
+            "resp-too-many",
+            (0..=CACHE_MAX_ITEMS_PER_ENTRY)
+                .map(|index| json!(index))
+                .collect(),
+            1_000,
+        ));
+        assert_eq!(
+            cache
+                .lookup(&base, "resp-too-many", 1_001)
+                .unavailable_reason,
+            Some(PreviousResponseUnavailableReason::TooManyItems)
+        );
+        assert!(cache
+            .lookup(
+                &scope("share-b", "user@example.com"),
+                "resp-too-many",
+                1_001,
+            )
+            .unavailable_reason
+            .is_none());
+        assert!(cache
+            .lookup(&base, "resp-too-many", 1_000 + TOMBSTONE_TTL_MS)
+            .unavailable_reason
+            .is_none());
+    }
+
+    #[test]
+    fn stats_cover_hits_misses_expiry_rejections_and_required_context() {
+        let mut cache = PreviousResponseCache::default();
+        let base = scope("share-a", "user@example.com");
+        assert!(cache.insert(
+            base.clone(),
+            "resp-a",
+            vec![json!({"type":"function_call","call_id":"call-a"})],
+            1_000,
+        ));
+        assert!(cache.get(&base, "resp-a", 1_001).is_some());
+        assert!(cache.get(&base, "missing", 1_001).is_none());
+        assert!(cache.get(&base, "", 1_001).is_none());
+        assert!(cache.get(&base, "resp-a", 1_000 + CACHE_TTL_MS).is_none());
+        cache.record_required_context_unavailable();
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert!(stats.misses >= 3);
+        assert_eq!(stats.invalid_response_id_rejections, 1);
+        assert_eq!(stats.expired, 1);
+        assert_eq!(stats.required_context_unavailable, 1);
+        assert!(stats.high_water_entries >= 1);
+        assert!(stats.max_observed_entry_bytes > 0);
     }
 }

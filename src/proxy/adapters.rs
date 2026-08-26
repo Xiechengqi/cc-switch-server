@@ -51,6 +51,8 @@ pub struct AdapterCapability {
     pub supports_stream_usage: bool,
     pub supports_oauth_refresh: bool,
     pub supports_model_list: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_responses_protocol: Option<super::protocol_compat::ResponsesProtocolCapability>,
 }
 
 pub trait ProviderAdapter {
@@ -641,6 +643,8 @@ fn adapter_capability(
         supports_stream_usage: supports_stream_usage(app, provider_type),
         supports_oauth_refresh: false,
         supports_model_list: supports_model_list(app, provider_type),
+        upstream_responses_protocol: (provider_type == ProviderType::GrokOAuth)
+            .then(super::protocol_compat::grok_responses_capability),
     }
 }
 
@@ -5552,6 +5556,36 @@ mod tests {
                     && item.support == AdapterSupport::Native
             }));
         }
+    }
+
+    #[test]
+    fn grok_capability_declares_responses_item_and_tool_boundaries() {
+        let capability = capability_for(AppKind::Codex, ProviderType::GrokOAuth);
+        let responses = capability
+            .upstream_responses_protocol
+            .expect("Grok must publish its Responses protocol boundary");
+
+        assert_eq!(responses.endpoint, "/v1/responses");
+        assert_eq!(responses.provider_protocol, "grok_responses");
+        assert!(responses.accepted_input_item_types.contains(&"message"));
+        assert!(responses
+            .accepted_input_item_types
+            .contains(&"shell_call_output"));
+        assert!(responses
+            .adapted_input_item_types
+            .contains(&"additional_tools"));
+        assert!(responses
+            .accepted_top_level_tool_types
+            .contains(&"function"));
+        assert!(!responses.accepted_top_level_tool_types.contains(&"custom"));
+        assert_eq!(
+            responses.additional_tools_policy,
+            crate::proxy::protocol_compat::AdditionalToolsPolicy::LosslessTopLevelMergeOrReject
+        );
+        assert_eq!(
+            responses.unknown_input_item_policy,
+            crate::proxy::protocol_compat::UnknownInputItemPolicy::Reject
+        );
     }
 
     #[test]

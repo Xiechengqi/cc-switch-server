@@ -4,6 +4,7 @@ use anyhow::Context;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use crate::domain::health::ProviderRequestOutcome;
+use crate::domain::sharing::previous_response_cache::PreviousResponseCacheStats;
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -70,6 +71,83 @@ pub fn record_codex_websocket_fallback(source: &'static str, result: &'static st
         "result" => result
     )
     .increment(1);
+}
+
+pub fn record_codex_responses_lite_decision(decision: &'static str) {
+    metrics::counter!(
+        "cc_switch_codex_responses_lite_total",
+        "decision" => decision
+    )
+    .increment(1);
+}
+
+pub fn record_codex_metadata_decision(decision: &'static str) {
+    metrics::counter!(
+        "cc_switch_codex_metadata_total",
+        "decision" => decision
+    )
+    .increment(1);
+}
+
+pub fn record_codex_routing_hint(decision: &'static str) {
+    metrics::counter!(
+        "cc_switch_codex_routing_hint_total",
+        "decision" => decision
+    )
+    .increment(1);
+}
+
+pub fn record_responses_downstream_keepalive(surface: &'static str) {
+    metrics::counter!(
+        "cc_switch_responses_downstream_keepalives_total",
+        "surface" => surface
+    )
+    .increment(1);
+}
+
+pub fn set_previous_response_cache_stats(stats: &PreviousResponseCacheStats) {
+    for (name, value) in [
+        ("current_entries", stats.current_entries as f64),
+        ("current_bytes", stats.current_bytes as f64),
+        ("current_tombstones", stats.current_tombstones as f64),
+        ("high_water_entries", stats.high_water_entries as f64),
+        ("high_water_bytes", stats.high_water_bytes as f64),
+        (
+            "max_observed_entry_bytes",
+            stats.max_observed_entry_bytes as f64,
+        ),
+        (
+            "max_observed_entry_items",
+            stats.max_observed_entry_items as f64,
+        ),
+        ("hits_total", stats.hits as f64),
+        ("misses_total", stats.misses as f64),
+        ("expired_total", stats.expired as f64),
+        ("count_evictions_total", stats.count_evictions as f64),
+        ("byte_evictions_total", stats.byte_evictions as f64),
+        (
+            "oversize_entry_rejections_total",
+            stats.oversize_entry_rejections as f64,
+        ),
+        (
+            "too_many_items_rejections_total",
+            stats.too_many_items_rejections as f64,
+        ),
+        (
+            "invalid_response_id_rejections_total",
+            stats.invalid_response_id_rejections as f64,
+        ),
+        (
+            "required_context_unavailable_total",
+            stats.required_context_unavailable as f64,
+        ),
+    ] {
+        metrics::gauge!(
+            "cc_switch_previous_response_cache",
+            "stat" => name
+        )
+        .set(value);
+    }
 }
 
 pub fn record_codex_images_request(

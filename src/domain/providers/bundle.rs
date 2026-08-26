@@ -173,6 +173,10 @@ pub struct ProviderDriverOptionsWriteDraft {
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
     pub codex_websocket_enabled: Option<bool>,
+    #[serde(default)]
+    pub codex_responses_keepalive_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub codex_routing_hint_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +353,10 @@ impl ProviderBundleWriteDraft {
             codex_fast_mode: surface.driver_options.codex_fast_mode,
             codex_image_generation_enabled: surface.driver_options.codex_image_generation_enabled,
             codex_websocket_enabled: surface.driver_options.codex_websocket_enabled,
+            codex_responses_keepalive_interval_ms: surface
+                .driver_options
+                .codex_responses_keepalive_interval_ms,
+            codex_routing_hint_enabled: surface.driver_options.codex_routing_hint_enabled,
             ..ProviderMeta::default()
         };
         if let Some(account) = self.managed_account.as_ref() {
@@ -749,6 +757,12 @@ impl ProviderDriverOptionsWriteDraft {
         }
         if self.codex_websocket_enabled.is_some() {
             fields.insert("codexWebsocketEnabled");
+        }
+        if self.codex_responses_keepalive_interval_ms.is_some() {
+            fields.insert("codexResponsesKeepaliveIntervalMs");
+        }
+        if self.codex_routing_hint_enabled.is_some() {
+            fields.insert("codexRoutingHintEnabled");
         }
         fields
     }
@@ -1359,6 +1373,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires per-app model policies"));
+    }
+
+    #[test]
+    fn openai_oauth_bundle_materializes_keepalive_and_routing_driver_options() {
+        let mut draft = openai_oauth_bundle();
+        for surface in &mut draft.surfaces {
+            surface.driver_options.codex_responses_keepalive_interval_ms = Some(22_000);
+            surface.driver_options.codex_routing_hint_enabled = Some(false);
+        }
+
+        assert!(draft.validate().is_ok());
+        for surface in &draft.surfaces {
+            let provider = draft.provider_for_surface(surface).unwrap();
+            let meta = provider.meta.unwrap();
+            assert_eq!(meta.codex_responses_keepalive_interval_ms, Some(22_000));
+            assert_eq!(meta.codex_routing_hint_enabled, Some(false));
+        }
     }
 
     #[test]

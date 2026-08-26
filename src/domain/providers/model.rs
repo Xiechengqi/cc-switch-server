@@ -160,6 +160,10 @@ pub struct ProviderMeta {
     #[serde(default)]
     pub codex_websocket_enabled: Option<bool>,
     #[serde(default)]
+    pub codex_responses_keepalive_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub codex_routing_hint_enabled: Option<bool>,
+    #[serde(default)]
     pub codex_chat_reasoning: Option<Value>,
     #[serde(default)]
     pub local_proxy_request_overrides: Option<Value>,

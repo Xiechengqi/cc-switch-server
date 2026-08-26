@@ -111,21 +111,33 @@ OpenAI OAuth 的消耗策略保存在 Share，而不是账号池或全局调度�
 
 模型容量类 429 只为当前 Share 的 `(share, runtime fingerprint, lowercase model)` 写入五分钟 cooldown；明确 `usage_limit_reached` 或已耗尽的 Codex window 仍标记固定账号级 cooldown。模型 cooldown 不切模型，账号 cooldown 不换号，两者都不触发 Provider failover。
 
+## Responses 出站协议
+
+官方 OAuth 的 `POST /v1/responses/compact` 仍保留下游公开路由，但上游 transport 已统一为普通 `/responses`：Server 将 input 规范为数组，去重 direct input-level trigger，并把唯一的 `{"type":"compaction_trigger"}` 放在最后，同时强制 `stream=true`、`store=false` 并补齐 `reasoning.encrypted_content`。Server 消费完整上游 SSE 后向 compact 调用方返回一个 JSON response；`response.output_item.done` 可回补终态的空 output，failed、缺终态、超限、解析错误和断流都按协议失败。普通 `/responses` 自带 trigger 时只规范顺序，绝不再改道到 `/responses/compact`。非官方 Responses Provider 继续使用自身声明的 compact endpoint。
+
+最终 HTTP sanitizer 只删除顶层精确 `type=response.create`，不会触碰 input/content/tool 中的嵌套 `type`。工具 schema walker 会递归删除 schema 内的 `type:null`，覆盖 `properties`、`items`、`$defs`/`definitions`、dependent schemas 和组合器，并同样处理 Responses Lite 的 `input[].type=additional_tools`；function 根 schema 缺 type 时补为 object。`collaboration.*` 保留工具在任何 sanitizer 前即跳过，保证声明原样透传。
+
+Responses Lite 请求信号在模型 policy 完成后，以最终映射模型的 manifest `use_responses_lite` 能力门控。明确不支持时同时删除 HTTP header 和 WS metadata marker，且不执行 Lite body mutation；明确支持时保留；未知模型保持兼容透传。内置快照中 Sol/Terra/Luna 和 `codex-auto-review` 支持 Lite，5.5/5.4/5.4-mini/5.3 Codex Spark/5.2 不支持；实时 manifest 的明确值优先。
+
+已有 `x-codex-turn-metadata` 和 body `client_metadata` 会在 HTTP、同账号 401 replay、原生 WebSocket、WS→HTTP fallback 与 Dedicated Images 的最终出站点统一清洗：workspace path 变为 account/auth-generation/workspace/runtime 分域的稳定占位符，remote URL 集合删除，非空 commit hash 变为稳定 40 位十六进制占位值。清洗幂等，不凭空新增客户端未携带的身份字段；malformed 或超过 32 KiB 的可选 turn metadata header 直接丢弃且不回显原文。
+
+`x-codex-routing-hint` 是 Server 独占的可回滚 HTTP 行为。默认关闭；开启后只从最终 body 合成最终模型，已验证 `service_tier=priority` 时追加 `;tier=priority`。客户端值会被删除，Account extra header 同名值会被拒绝。WebSocket handshake 在首个 turn 最终模型未知且连接可复用，因此始终删除该 header，避免发送 stale hint。
+
 ## Previous Response 续传
 
 OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share 显式开启续传缓存后，Server 会在最终 body 清洗前尝试展开本地上下文，并在成功 `response.completed` 后记录下一轮所需的工具项：
 
 - namespace 为 Share id、规范化签名 principal、RuntimePlan fingerprint、verified workspace 和 response id；缺 principal 时禁用，不创建匿名共享空间。
 - 只缓存 tool call 和 tool call output，要求非空 `call_id` 并删除上游 server item `id`；message、reasoning、`encrypted_content`、image 和 web-search 内容都不缓存。
-- 当前 input 已有同一 `(type, call_id)` 时不重复注入；cache miss 保持原有清洗/转发行为。
+- 当前 input 已有同一 `(type, call_id)` 时不重复注入。普通 continuation 的 cache miss 保持原有清洗/转发行为；只有请求同时携带 `previous_response_id` 和当前未配对 tool output、因而确实依赖旧 call context 时，cache miss 才在下游提交前返回稳定 `409 invalid_request_error`，`code=response_context_unavailable`、`param=previous_response_id`。
 - HTTP 非流聚合、SSE、WebSocket 和 WS 到 HTTP fallback 共用该语义；只有 completed 写入，failed/incomplete/error 清空当前轮状态。
-- TTL 为 10 分钟；单条最多 8 MiB、200 items，全进程最多 64 MiB、2000 条，并按最近最少使用淘汰。
+- TTL 为 10 分钟；单条最多 8 MiB、200 items，全进程最多 64 MiB、2000 条，并按最近最少使用淘汰。expired、按条目/字节淘汰和 oversized/item-limit 拒绝会留下最多 2 分钟、全进程最多 4000 个且带完整 scope 的 tombstone；Prometheus 同时发布 current/high-water entries/bytes、tombstone、hit/miss/expiry/eviction/rejection 和 required-context-unavailable 统计。
 
 该缓存只弥补 ChatGPT OAuth `store=false` 下的工具续传，不保存完整对话，也不能跨 Share、用户、runtime、账号 workspace 或重绑后的 Provider 使用。
 
 ## HTTP、SSE 与 Images
 
-- Responses/Chat 请求先执行 Codex body sanitizer、model capability 和官方 CLI identity contract。最终出站契约始终覆盖为 `store=false`；除原生 compact 外，OpenAI OAuth Responses 上游始终使用 `stream=true`，不信任 Claude/Codex/Gemini 入站适配器或客户端传入的这两个字段。
+- Responses/Chat 请求先执行 Codex body sanitizer、model capability 和官方 CLI identity contract。最终出站契约始终覆盖为 `store=false`，OpenAI OAuth Responses（包括 compact body-signal）上游始终使用 `stream=true`，不信任 Claude/Codex/Gemini 入站适配器或客户端传入的这两个字段。
 - 客户端 `stream=true` 时继续得到协议转换后的 SSE；客户端 `stream=false` 时，Server 增量消费同一上游 SSE，在收到合法终止事件后聚合为单个 Responses JSON 文档。终止事件中的 usage 同时写入本地日志和 Router 同步；解析错误、缺终止事件、上游失败、超时或断流也各自写入一条终态日志并完成 Share/Provider outcome 收尾，不把“上游必须流”误报成“客户端请求了流”。
 - FAST 完全由 Provider 的 `codexFastMode` 控制：客户端的 `service_tier`/`serviceTier` 不能开启或关闭它。推理等级仍由客户端选择，OpenAI `reasoning.effort`/`reasoning_effort`、Claude `output_config.effort`/`thinking.effort` 和 Gemini `generationConfig.thinkingConfig.thinkingLevel` 的显式值均记录为 requested effort，转换后的最终出站值记录为 effective effort；`low`、`medium`、`high`、`xhigh`、`max` 保持不变，仅把非 wire 别名 `ultra` 规范为 `max`。
 - 首次 401 只允许对原账号强制 refresh 一次，再以同一 Provider、账号、workspace、session 和请求 body 重放。
@@ -136,6 +148,7 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 - Token 换票 / refresh / Device 流使用与推理同源的官方 `originator` + User-Agent，凭据面不发 `version` 头。推理面继续配对 `originator` / User-Agent / `version`。关闭 Codex 版本同步并长期停在内置 `0.144.1` 会提高被上游优先降载的概率。
 - 非流式 `response.failed` 和 SSE semantic failure 会保留 OpenAI 错误语义；容量降载的改码是唯一例外。
 - Responses Lite、custom/freeform tool、`tool_search`、usage 四桶和空 `response.completed.output` 恢复使用同一执行身份。
+- 普通文本 SSE 只在首个业务或终态事件已经提交后启动 `: keepalive`，默认 15 秒；首包前不发 comment。心跳有独立下游时钟，不推进上游 first-event/idle deadline，因而不会把真实上游静默伪装成健康流。`CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS=0` 可关闭，非零值限制为 5 到 60 秒。
 - Images generation/edit 使用固定 Codex bridge、身份头和 body 上限；401 重放后仍返回原始上游错误 body，不用另一个账号掩盖错误。
 - models manifest 与 alpha search 只访问固定 ChatGPT Codex endpoint，并采用同账号一次 401 refresh 边界。
 
@@ -236,7 +249,7 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 - 自动 Reset 的同一候选在并发请求、进程重启锁竞争和 401 重试下只使用同一幂等 ID，其他账号上游请求数为零。
 - SSE/WS 续传只保留 tool call/call output，failed/incomplete 不写入，缺签名 principal 时始终 cache miss。
 
-真实 OAuth、订阅权限、图片能力和长连接生产可用性仍需要按 [`real-acceptance-runbook.md`](../acceptance/real-acceptance-runbook.md) 使用专用测试账号取证；离线测试不能替代真实上游验收。
+真实 OAuth、compact body-signal、Lite capability、routing hint、订阅权限、图片能力和长连接生产可用性仍需要按 [`real-acceptance-runbook.md`](../acceptance/real-acceptance-runbook.md) 使用专用测试账号取证；当前没有可用真实 OAuth 凭据时统一标记为 `live_pending`，离线测试不能替代真实上游验收。
 
 ## 非目标
 

@@ -25,7 +25,7 @@
     },
     {
       "path": "src/domain/providers/model.rs",
-      "sha256": "43dcb55985927aa8cf05a55ce07d6fbd6b2e2e067394ccab5f7ddddfe71e430d"
+      "sha256": "53e71e1512cc59c02fd9319166006d0fdbad98c6f492e25089d9ecdc6cf580c4"
     },
     {
       "path": "src/domain/providers/model_routing.rs",
@@ -33,7 +33,7 @@
     },
     {
       "path": "src/domain/providers/runtime.rs",
-      "sha256": "035f1226c4e992b1dc78934dad6bef7d50916f5f8629ea9874528f7e14da7236"
+      "sha256": "baabe0a6edf94d34222c1295d951bb882d7b1adbf08b2f8cce22243152a7970c"
     },
     {
       "path": "src/domain/providers/store.rs",

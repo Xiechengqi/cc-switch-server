@@ -115,7 +115,9 @@ export type ProviderDriverOptionField =
   | "customUserAgent"
   | "codexFastMode"
   | "codexImageGenerationEnabled"
-  | "codexWebsocketEnabled";
+  | "codexWebsocketEnabled"
+  | "codexResponsesKeepaliveIntervalMs"
+  | "codexRoutingHintEnabled";
 
 export interface ProviderDriverOptionSchema {
   optionSchemaId: string;

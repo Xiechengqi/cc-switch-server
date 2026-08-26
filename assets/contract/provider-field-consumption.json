@@ -4779,6 +4779,44 @@
       "disposition": "migrate"
     },
     {
+      "locator": "provider.meta.codexResponsesKeepaliveIntervalMs",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
+      "locator": "provider.meta.codexRoutingHintEnabled",
+      "sourceFormat": "json_pointer",
+      "classification": "runtime",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/model.rs",
+        "src/proxy/adapters.rs"
+      ],
+      "writer": [
+        "src/api/providers.rs",
+        "src/api/invoke/dispatch.rs",
+        "web-src/src/components/providers/forms/ProviderForm.tsx"
+      ],
+      "targetOwner": "runtime_config",
+      "migration": "typed_s1_extractor",
+      "retirePhase": "phase-10",
+      "disposition": "migrate"
+    },
+    {
       "locator": "provider.meta.codexChatReasoning",
       "sourceFormat": "json_pointer",
       "classification": "runtime",

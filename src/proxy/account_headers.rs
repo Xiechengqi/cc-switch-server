@@ -130,6 +130,7 @@ pub(super) fn account_header_override_blocked(name: &str, provider_type: Provide
             | "session_id"
             | "x-client-request-id"
             | "x-codex-window-id"
+            | "x-codex-routing-hint"
             | "openai-beta"
     )
 }
@@ -182,6 +183,14 @@ mod tests {
                 ProviderType::KimiCode
             ));
         }
+    }
+
+    #[test]
+    fn codex_account_headers_cannot_override_routing_hint() {
+        assert!(account_header_override_blocked(
+            "X-Codex-Routing-Hint",
+            ProviderType::CodexOAuth
+        ));
     }
 
     #[test]

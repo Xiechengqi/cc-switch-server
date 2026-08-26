@@ -118,7 +118,8 @@ use crate::domain::settings::config::{
 use crate::domain::settings::ui_settings::{self, UiSettingsStore};
 use crate::domain::sharing::credential_source::resolve_provider_credential_source;
 use crate::domain::sharing::previous_response_cache::{
-    PreviousResponseCache, PreviousResponseCacheScope,
+    PreviousResponseCache, PreviousResponseCacheLookup, PreviousResponseCacheScope,
+    PreviousResponseCacheStats,
 };
 use crate::domain::sharing::router_contract::{
     descriptor_for_share_with_accounts_and_usage, static_descriptor_fingerprint, ShareAppProvider,
@@ -5211,16 +5212,30 @@ impl ServerStateInner {
             );
     }
 
+    pub(crate) fn previous_response_context_lookup(
+        &self,
+        scope: &PreviousResponseCacheScope,
+        response_id: &str,
+        now_ms: i64,
+    ) -> PreviousResponseCacheLookup {
+        let mut cache = self
+            .previous_response_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = cache.lookup(scope, response_id, now_ms);
+        crate::metrics::set_previous_response_cache_stats(&cache.stats());
+        result
+    }
+
+    #[cfg(test)]
     pub(crate) fn previous_response_context(
         &self,
         scope: &PreviousResponseCacheScope,
         response_id: &str,
         now_ms: i64,
     ) -> Option<Vec<Value>> {
-        self.previous_response_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(scope, response_id, now_ms)
+        self.previous_response_context_lookup(scope, response_id, now_ms)
+            .items
     }
 
     pub(crate) fn cache_previous_response_context(
@@ -5230,10 +5245,30 @@ impl ServerStateInner {
         items: Vec<Value>,
         now_ms: i64,
     ) -> bool {
+        let mut cache = self
+            .previous_response_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inserted = cache.insert(scope, response_id, items, now_ms);
+        crate::metrics::set_previous_response_cache_stats(&cache.stats());
+        inserted
+    }
+
+    pub(crate) fn record_previous_response_context_unavailable(&self) {
+        let mut cache = self
+            .previous_response_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.record_required_context_unavailable();
+        crate::metrics::set_previous_response_cache_stats(&cache.stats());
+    }
+
+    #[allow(dead_code)] // Reserved for admin/debug status export without exposing the cache lock.
+    pub(crate) fn previous_response_cache_stats(&self) -> PreviousResponseCacheStats {
         self.previous_response_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(scope, response_id, items, now_ms)
+            .stats()
     }
 
     pub(crate) async fn lock_codex_banked_reset(&self, account_id: &str) -> AccountRefreshGuard {

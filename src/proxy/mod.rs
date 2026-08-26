@@ -6,12 +6,16 @@ mod anthropic_semantics;
 mod antigravity_retry;
 mod cache_injector;
 pub(crate) mod claude_oauth;
+mod codex_compaction;
+mod codex_http;
+mod codex_metadata;
 pub(crate) mod codex_models;
 mod codex_request_policy;
 mod copilot_model_map;
 mod copilot_optimizer;
 pub(crate) mod cursor;
 mod deepseek;
+mod downstream_keepalive;
 mod forwarder;
 mod grok;
 pub(crate) mod kimi;
@@ -21,6 +25,7 @@ mod openai_capacity_shed;
 mod outbound_identity;
 pub(crate) mod outbound_request;
 mod overflow_compact;
+pub mod protocol_compat;
 pub(crate) mod provider_ops;
 pub(crate) mod qoder;
 pub(crate) mod qoder_runtime;
@@ -147,6 +152,8 @@ impl ProxyError {
     const CAPACITY_SHED_PREFIX: &'static str = "[CC_UPSTREAM_CAPACITY_SHED] ";
     const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
     const USER_IDENTITY_REQUIRED_PREFIX: &'static str = "[CC_USER_IDENTITY_REQUIRED] ";
+    const PROTOCOL_INCOMPATIBLE_PREFIX: &'static str = "[CC_PROTOCOL_INCOMPATIBLE] ";
+    const RESPONSE_CONTEXT_UNAVAILABLE_PREFIX: &'static str = "[CC_RESPONSE_CONTEXT_UNAVAILABLE] ";
 
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
@@ -198,6 +205,28 @@ impl ProxyError {
             status: axum::http::StatusCode::UNAUTHORIZED,
             message: format!("{}{}", Self::USER_IDENTITY_REQUIRED_PREFIX, message.into()),
         }
+    }
+
+    pub(super) fn protocol_incompatible(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("{}{}", Self::PROTOCOL_INCOMPATIBLE_PREFIX, message.into()),
+        }
+    }
+
+    pub(super) fn response_context_unavailable() -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!(
+                "{}Required previous response tool context is unavailable",
+                Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX
+            ),
+        }
+    }
+
+    pub(super) fn is_protocol_incompatible(&self) -> bool {
+        self.message_without_retry_metadata()
+            .starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX)
     }
 
     pub(super) fn cursor_session_lost(message: impl Into<String>) -> Self {
@@ -258,6 +287,8 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
+            .or_else(|| message.strip_prefix(Self::PROTOCOL_INCOMPATIBLE_PREFIX))
+            .or_else(|| message.strip_prefix(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX))
             .or_else(|| message.strip_prefix(Self::CAPACITY_SHED_PREFIX))
             .unwrap_or(message)
     }
@@ -318,6 +349,12 @@ impl ProxyError {
         if message.starts_with(Self::CAPACITY_SHED_PREFIX) {
             return "cc_switch_upstream_capacity_shed";
         }
+        if message.starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX) {
+            return "cc_switch_protocol_incompatible";
+        }
+        if message.starts_with(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX) {
+            return "response_context_unavailable";
+        }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX) {
             return "TOOL_JSON_INVALID";
         }
@@ -365,6 +402,12 @@ impl ProxyError {
         if self.concurrency_metadata().is_some() {
             return "concurrency_limit_error";
         }
+        if message.starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX) {
+            return "invalid_request_error";
+        }
+        if message.starts_with(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX) {
+            return "invalid_request_error";
+        }
         if message.starts_with(Self::TOOL_JSON_INVALID_PREFIX)
             || message.starts_with(Self::TOOL_JSON_INCOMPLETE_PREFIX)
             || message.starts_with(Self::TOOL_JSON_LIMIT_PREFIX)
@@ -398,6 +441,8 @@ impl ProxyError {
         let message = self.message_without_retry_metadata();
         if self.concurrency_metadata().is_some()
             || message.starts_with(Self::USER_IDENTITY_REQUIRED_PREFIX)
+            || message.starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX)
+            || message.starts_with(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX)
         {
             return false;
         }
@@ -414,6 +459,12 @@ impl ProxyError {
                 | axum::http::StatusCode::SERVICE_UNAVAILABLE
                 | axum::http::StatusCode::GATEWAY_TIMEOUT
         )
+    }
+
+    pub fn error_param(&self) -> Option<&'static str> {
+        self.message_without_retry_metadata()
+            .starts_with(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX)
+            .then_some("previous_response_id")
     }
 }
 

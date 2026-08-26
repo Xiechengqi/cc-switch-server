@@ -32,6 +32,7 @@ pub(crate) struct InferenceApiError {
     current: Option<u32>,
     limit: Option<u32>,
     request_id: Option<String>,
+    param: Option<&'static str>,
 }
 
 impl InferenceApiError {
@@ -53,6 +54,7 @@ impl InferenceApiError {
             current: concurrency.map(|metadata| metadata.current),
             limit: concurrency.map(|metadata| metadata.limit),
             request_id,
+            param: error.error_param(),
         }
     }
 
@@ -75,6 +77,7 @@ impl InferenceApiError {
             current: None,
             limit: None,
             request_id,
+            param: None,
         }
     }
 
@@ -100,7 +103,7 @@ impl InferenceApiError {
                     "message": self.message,
                     "type": self.error_type,
                     "code": self.code,
-                    "param": Value::Null,
+                    "param": self.param,
                     "details": self.details(),
                 },
                 "request_id": self.request_id,
@@ -754,6 +757,25 @@ mod tests {
         assert_eq!(body["details"]["currentConfigRevision"], 4);
         assert_eq!(body["details"]["currentShare"]["shareId"], "share-a");
         assert_eq!(body["details"]["currentShare"]["configRevision"], 4);
+    }
+
+    #[tokio::test]
+    async fn previous_response_context_error_uses_stable_openai_shape() {
+        let response = InferenceApiError::proxy(
+            InferenceSurface::OpenAi,
+            Some("request-previous-context".to_string()),
+            crate::proxy::ProxyError::response_context_unavailable(),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "response_context_unavailable");
+        assert_eq!(body["error"]["param"], "previous_response_id");
+        assert_eq!(
+            body["error"]["message"],
+            "Required previous response tool context is unavailable"
+        );
     }
 
     #[tokio::test]

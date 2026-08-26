@@ -696,14 +696,14 @@ impl ProviderExecution {
             )));
         }
 
-        let compact_request = route == ProxyRoute::CodexResponsesCompact
-            || (route == ProxyRoute::CodexResponses
-                && super::forwarder::codex_responses_body_has_compaction_trigger(&request.body));
-        if compact_request {
+        let explicit_compact = route == ProxyRoute::CodexResponsesCompact;
+        let body_signal =
+            super::forwarder::codex_responses_body_has_compaction_trigger(&request.body);
+        if explicit_compact {
             request.body =
                 super::forwarder::normalize_codex_oauth_compact_body_bytes(&request.body)?;
             request.stream_requested = false;
-            request.upstream_stream_requested = false;
+            request.upstream_stream_requested = true;
         } else {
             let image_tool_strip_policy = self
                 .stored
@@ -717,6 +717,13 @@ impl ProviderExecution {
                 prompt_cache_key,
                 image_tool_strip_policy,
             )?;
+            if body_signal {
+                request.body =
+                    super::forwarder::normalize_codex_oauth_compaction_signal_body_bytes(
+                        &request.body,
+                        false,
+                    )?;
+            }
             if responses_lite {
                 request.body = super::forwarder::normalize_codex_responses_lite_body_bytes(
                     &request.body,
@@ -743,8 +750,40 @@ impl ProviderExecution {
             fast_mode_enabled,
             intent,
         )?;
-        request.body = body;
+        request.body = super::codex_http::finalize_body(&body)?;
         Ok(metadata)
+    }
+
+    pub fn gate_openai_codex_responses_lite(
+        &self,
+        request: &AdapterRequest,
+        requested: bool,
+    ) -> bool {
+        if !requested || !self.driver_is("oauth.openai_codex") {
+            crate::metrics::record_codex_responses_lite_decision("not_requested");
+            return false;
+        }
+        let final_model = request_model(&request.body)
+            .or_else(|| request.actual_model.clone())
+            .or_else(|| request.model.clone());
+        match final_model.as_deref().map(|model| {
+            super::codex_models::responses_lite_support(&self.runtime_stored_view(), model)
+        }) {
+            Some(super::codex_models::CapabilitySupport::Supported) => {
+                crate::metrics::record_codex_responses_lite_decision("requested_supported");
+                true
+            }
+            Some(super::codex_models::CapabilitySupport::Unsupported) => {
+                crate::metrics::record_codex_responses_lite_decision(
+                    "requested_unsupported_stripped",
+                );
+                false
+            }
+            Some(super::codex_models::CapabilitySupport::Unknown) | None => {
+                crate::metrics::record_codex_responses_lite_decision("requested_unknown_preserved");
+                true
+            }
+        }
     }
 
     pub fn resolve_endpoint(
@@ -828,10 +867,8 @@ impl ProviderExecution {
         if self.driver_is("oauth.openai_codex") {
             let intent = super::codex_request_policy::extract_intent_from_bytes(&request.body);
             self.apply_openai_codex_final_request_contract(route, request, None, false, &intent)?;
-            if route == ProxyRoute::CodexResponses
-                && super::forwarder::codex_responses_body_has_compaction_trigger(&request.body)
-            {
-                *endpoint = super::forwarder::codex_compact_url(endpoint);
+            if route == ProxyRoute::CodexResponsesCompact {
+                *endpoint = super::codex_compaction::responses_url(endpoint);
             }
         }
         Ok(())
@@ -1608,6 +1645,173 @@ mod tests {
         assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("max")));
         assert!(!request.stream_requested);
         assert!(request.upstream_stream_requested);
+    }
+
+    #[test]
+    fn codex_explicit_compact_uses_responses_transport_and_json_downstream() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "codex-account".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+        let plan = Arc::make_mut(&mut execution.plan);
+        plan.driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+
+        let mut request = AdapterRequest {
+            body: bytes::Bytes::from_static(
+                br#"{"type":"response.create","model":"gpt-5.5","input":"compact me"}"#,
+            ),
+            upstream_endpoint: None,
+            upstream_headers: vec![],
+            model: Some("gpt-5.5".to_string()),
+            requested_model: Some("gpt-5.5".to_string()),
+            actual_model: Some("gpt-5.5".to_string()),
+            actual_model_source: Some("request".to_string()),
+            gemini_action: None,
+            stream_requested: false,
+            upstream_stream_requested: false,
+            custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        let mut endpoint = "https://chatgpt.com/backend-api/codex/responses/compact".to_string();
+
+        execution
+            .apply_test_forward_contract(
+                ProxyRoute::CodexResponsesCompact,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(endpoint, "https://chatgpt.com/backend-api/codex/responses");
+        assert!(!request.stream_requested);
+        assert!(request.upstream_stream_requested);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(body.get("type").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(
+            body.pointer("/input/1/type"),
+            Some(&json!("compaction_trigger"))
+        );
+    }
+
+    #[test]
+    fn codex_ordinary_compaction_signal_stays_on_responses_endpoint() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "codex-account".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+        Arc::make_mut(&mut execution.plan).driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+        let mut request = AdapterRequest {
+            body: bytes::Bytes::from_static(
+                br#"{"model":"gpt-5.5","input":[{"type":"compaction_trigger"},{"type":"message","role":"user","content":"keep"}]}"#,
+            ),
+            upstream_endpoint: None,
+            upstream_headers: vec![],
+            model: Some("gpt-5.5".to_string()),
+            requested_model: Some("gpt-5.5".to_string()),
+            actual_model: Some("gpt-5.5".to_string()),
+            actual_model_source: Some("request".to_string()),
+            gemini_action: None,
+            stream_requested: true,
+            upstream_stream_requested: false,
+            custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        let mut endpoint = "https://chatgpt.com/backend-api/codex/responses".to_string();
+
+        execution
+            .apply_test_forward_contract(
+                ProxyRoute::CodexResponses,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(endpoint, "https://chatgpt.com/backend-api/codex/responses");
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.last().unwrap()["type"], "compaction_trigger");
+    }
+
+    #[test]
+    fn codex_responses_lite_gate_uses_the_final_mapped_model() {
+        let request_for = |model: &'static str| AdapterRequest {
+            body: bytes::Bytes::from_static(match model {
+                "gpt-5.6-sol" => br#"{"model":"gpt-5.6-sol","input":[]}"#,
+                _ => br#"{"model":"gpt-5.4","input":[]}"#,
+            }),
+            upstream_endpoint: None,
+            upstream_headers: vec![],
+            model: Some(model.to_string()),
+            requested_model: Some(model.to_string()),
+            actual_model: None,
+            actual_model_source: None,
+            gemini_action: None,
+            stream_requested: true,
+            upstream_stream_requested: false,
+            custom_tool_names: Default::default(),
+            responses_tool_context: Default::default(),
+            claude_tool_name_map: Default::default(),
+        };
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "codex-account".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+        let plan = Arc::make_mut(&mut execution.plan);
+        plan.driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+
+        plan.model_policy = RuntimeModelPolicy::Single {
+            upstream_model: "gpt-5.4".to_string(),
+        };
+        let mut lite_requested = request_for("gpt-5.6-sol");
+        execution.enforce_model_policy(&mut lite_requested).unwrap();
+        assert_eq!(lite_requested.actual_model.as_deref(), Some("gpt-5.4"));
+        assert!(!execution.gate_openai_codex_responses_lite(&lite_requested, true));
+
+        Arc::make_mut(&mut execution.plan).model_policy = RuntimeModelPolicy::Single {
+            upstream_model: "gpt-5.6-sol".to_string(),
+        };
+        let mut legacy_requested = request_for("gpt-5.4");
+        execution
+            .enforce_model_policy(&mut legacy_requested)
+            .unwrap();
+        assert_eq!(
+            legacy_requested.actual_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert!(execution.gate_openai_codex_responses_lite(&legacy_requested, true));
     }
 
     #[test]

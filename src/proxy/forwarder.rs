@@ -34,13 +34,14 @@ use crate::domain::accounts::store::{
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::bundle::surface_enabled;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
+use crate::domain::providers::runtime::authoritative_managed_account;
 use crate::domain::providers::runtime::{managed_account_binding_with_generation, RuntimeAuthRef};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::previous_response_cache::PreviousResponseCacheScope;
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{
     usage_from_json_with_semantics, ImageUsageMetadata, InputTokenSemantics, TokenUsage,
-    UsageLogContext, UsageModelMetadata, UsageRecordKind, UsageState,
+    UsageLogContext, UsageModelMetadata, UsageOutcome, UsageRecordKind, UsageState,
 };
 use crate::infra::time::now_ms as current_time_ms;
 use crate::logging::{
@@ -207,6 +208,44 @@ fn image_keepalive_interval(execution: &ProviderExecution) -> Duration {
     #[cfg(not(test))]
     let _ = execution;
     CODEX_IMAGES_KEEPALIVE_INTERVAL
+}
+
+fn responses_text_keepalive_interval(execution: &ProviderExecution) -> Option<Duration> {
+    let provider_interval_ms = execution
+        .plan
+        .driver_options
+        .get("codexResponsesKeepaliveIntervalMs")
+        .and_then(Value::as_u64);
+    let environment_interval_ms = std::env::var("CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    resolve_responses_text_keepalive_interval(provider_interval_ms, environment_interval_ms)
+}
+
+fn resolve_responses_text_keepalive_interval(
+    provider_interval_ms: Option<u64>,
+    environment_interval_ms: Option<u64>,
+) -> Option<Duration> {
+    const DEFAULT_MS: u64 = 15_000;
+    const MIN_MS: u64 = 5_000;
+    const MAX_MS: u64 = 60_000;
+    let configured = provider_interval_ms
+        .or(environment_interval_ms)
+        .unwrap_or(DEFAULT_MS);
+    if configured == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(configured.clamp(MIN_MS, MAX_MS)))
+    }
+}
+
+fn responses_keepalive_surface(route: ProxyRoute) -> &'static str {
+    match route {
+        ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact => "responses",
+        ProxyRoute::CodexChatCompletions => "chat_completions",
+        ProxyRoute::ClaudeMessages => "anthropic_messages",
+        ProxyRoute::ClaudeCountTokens | ProxyRoute::Gemini => "other",
+    }
 }
 
 impl Drop for ImageTransportMetrics {
@@ -1484,8 +1523,11 @@ async fn forward_with_attempt(
             &copilot_metadata,
         )?;
         let mut adapter_request = adapter_request;
-        let codex_responses_lite = execution.driver_is("oauth.openai_codex")
-            && route == ProxyRoute::CodexResponses
+        let codex_responses_lite_requested = execution.driver_is("oauth.openai_codex")
+            && matches!(
+                route,
+                ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact
+            )
             && codex_responses_lite_requested(&headers, &adapter_request.body);
         if execution.driver_is("oauth.openai_codex") {
             if let Some(body) = attempt_context.codex_body_override.clone() {
@@ -1507,6 +1549,7 @@ async fn forward_with_attempt(
                             "invalid Codex Responses body for previous response expansion: {error}"
                         ))
                     })?;
+                let requires_history = requires_previous_response_tool_context(&value);
                 if inject_previous_response_context(
                     &state,
                     scope,
@@ -1521,10 +1564,15 @@ async fn forward_with_attempt(
                                     "encode expanded Codex Responses body: {error}"
                                 ))
                             })?;
+                } else if requires_history {
+                    state.record_previous_response_context_unavailable();
+                    return Err(ProxyError::response_context_unavailable());
                 }
             }
         }
         execution.enforce_model_policy(&mut adapter_request)?;
+        let codex_responses_lite = execution
+            .gate_openai_codex_responses_lite(&adapter_request, codex_responses_lite_requested);
         if execution.driver_is("special.qoder_cosy") {
             if !matches!(
                 route,
@@ -1565,7 +1613,7 @@ async fn forward_with_attempt(
                 .is_none()
                 .then(|| grok_tenant_scope(&request_context, &stored))
                 .flatten();
-            let contract = super::grok::apply_forward_contract(
+            let contract = match super::grok::apply_forward_contract(
                 &mut adapter_request.body,
                 &headers,
                 route,
@@ -1573,7 +1621,22 @@ async fn forward_with_attempt(
                 preserved_session_id,
                 tenant_scope.as_deref(),
                 cli_profile,
-            )?;
+            ) {
+                Ok(contract) => contract,
+                Err(error) if error.is_protocol_incompatible() => {
+                    record_local_protocol_rejection(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             attempt_context.grok_session_id = contract.session_id.clone();
             request_context.session_id = contract.session_id.clone();
             if adapter_request.actual_model.as_deref() != Some(contract.actual_model.as_str()) {
@@ -1638,10 +1701,9 @@ async fn forward_with_attempt(
                 url = super::grok::chat_upstream_url(&url, grok_cli_profile(&execution));
             }
             if execution.driver_is("oauth.openai_codex")
-                && route == ProxyRoute::CodexResponses
-                && codex_responses_body_has_compaction_trigger(&adapter_request.body)
+                && route == ProxyRoute::CodexResponsesCompact
             {
-                url = codex_compact_url(&url);
+                url = super::codex_compaction::responses_url(&url);
             }
             refresh_execution_managed_account_if_needed(&state, &execution).await?;
             if !adapter_request.is_gemini_count_tokens() {
@@ -1722,6 +1784,22 @@ async fn forward_with_attempt(
                 &mut url,
                 &mut target_headers,
             )?;
+            if execution.driver_is("oauth.openai_codex") {
+                if let Some(scope) = codex_metadata_scope(&execution, &accounts) {
+                    let (body, body_decision) =
+                        super::codex_metadata::scrub_body_bytes(&adapter_request.body, &scope)?;
+                    adapter_request.body = body;
+                    let header_decision =
+                        super::codex_metadata::scrub_owned_headers(&mut target_headers, &scope);
+                    crate::metrics::record_codex_metadata_decision(body_decision.as_str());
+                    crate::metrics::record_codex_metadata_decision(header_decision.as_str());
+                }
+                super::codex_http::finalize_routing_hint(
+                    &mut target_headers,
+                    &adapter_request.body,
+                    super::codex_http::routing_hint_enabled(&execution.plan.driver_options),
+                );
+            }
             execution.guard_coding_plan_request(route, &adapter_request, &url)?;
             (adapter_request, url, target_headers)
         };
@@ -3151,6 +3229,19 @@ async fn forward_with_attempt(
                 image_transport: responses_image_transport
                     .then(|| ImageTransportMetrics::new("responses", "sse", started)),
                 image_keepalive_interval: image_keepalive_interval(&execution),
+                text_upstream_deadline: (!responses_image_transport)
+                    .then(|| {
+                        timeouts
+                            .first_byte
+                            .map(|timeout| tokio::time::Instant::now() + timeout)
+                    })
+                    .flatten(),
+                downstream_keepalive: (execution.driver_is("oauth.openai_codex")
+                    && inspect_responses_semantics
+                    && !responses_image_transport)
+                    .then(|| responses_text_keepalive_interval(&execution))
+                    .flatten()
+                    .and_then(super::downstream_keepalive::DownstreamKeepalive::new),
                 account_in_flight_guard,
                 share_invocation_guard,
             };
@@ -3177,6 +3268,7 @@ async fn forward_with_attempt(
                     || stream_state.terminal_detector.terminal().is_some();
                 let mut chunk_already_inspected = false;
                 let mut image_heartbeat = false;
+                let mut text_keepalive = false;
                 let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
                     chunk_already_inspected = stream_state.pending_chunk_already_inspected;
                     stream_state.pending_chunk_already_inspected = false;
@@ -3219,18 +3311,52 @@ async fn forward_with_attempt(
                     }
                 } else {
                     let timeout_kind = stream_state.next_timeout_kind();
-                    match stream_state.next_timeout() {
-                        Some(timeout) => {
-                            match tokio::time::timeout(timeout, stream_state.inner.try_next()).await
-                            {
-                                Ok(result) => result.map_err(StreamReadError::Upstream),
-                                Err(_) => Err(StreamReadError::Timeout {
+                    match (
+                        stream_state.text_upstream_deadline,
+                        stream_state
+                            .downstream_keepalive
+                            .as_ref()
+                            .and_then(super::downstream_keepalive::DownstreamKeepalive::deadline),
+                    ) {
+                        (Some(upstream_deadline), Some(keepalive_deadline)) => tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(upstream_deadline) => {
+                                Err(StreamReadError::Timeout {
                                     kind: timeout_kind,
-                                    timeout,
-                                }),
+                                    timeout: stream_state.next_timeout().unwrap_or_default(),
+                                })
                             }
-                        }
-                        None => stream_state
+                            _ = tokio::time::sleep_until(keepalive_deadline) => {
+                                text_keepalive = true;
+                                Ok(Some(Bytes::new()))
+                            }
+                            result = stream_state.inner.try_next() => {
+                                result.map_err(StreamReadError::Upstream)
+                            }
+                        },
+                        (Some(upstream_deadline), None) => tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(upstream_deadline) => {
+                                Err(StreamReadError::Timeout {
+                                    kind: timeout_kind,
+                                    timeout: stream_state.next_timeout().unwrap_or_default(),
+                                })
+                            }
+                            result = stream_state.inner.try_next() => {
+                                result.map_err(StreamReadError::Upstream)
+                            }
+                        },
+                        (None, Some(keepalive_deadline)) => tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(keepalive_deadline) => {
+                                text_keepalive = true;
+                                Ok(Some(Bytes::new()))
+                            }
+                            result = stream_state.inner.try_next() => {
+                                result.map_err(StreamReadError::Upstream)
+                            }
+                        },
+                        (None, None) => stream_state
                             .inner
                             .try_next()
                             .await
@@ -3242,6 +3368,16 @@ async fn forward_with_attempt(
                     let heartbeat = Bytes::from_static(b": keepalive\n\n");
                     stream_state.record_image_transport_emit(&heartbeat, true);
                     return Ok(Some((heartbeat, stream_state)));
+                }
+                if text_keepalive {
+                    let now = tokio::time::Instant::now();
+                    if let Some(keepalive) = stream_state.downstream_keepalive.as_mut() {
+                        keepalive.emitted(now);
+                    }
+                    crate::metrics::record_responses_downstream_keepalive(
+                        responses_keepalive_surface(stream_state.route),
+                    );
+                    return Ok(Some((Bytes::from_static(b": keepalive\n\n"), stream_state)));
                 }
 
                 match next_chunk {
@@ -3354,6 +3490,8 @@ async fn forward_with_attempt(
                             }
                         }
                         stream_state.received_any_chunk |= committed_output;
+                        stream_state
+                            .observe_text_upstream_event(saw_business_output || committed_output);
                         stream_state.observe_image_upstream_chunk();
                         if !chunk_already_inspected && !stream_state.sse_error_outcome_recorded {
                             let sse_error_outcome = stream_state
@@ -3404,6 +3542,9 @@ async fn forward_with_attempt(
                             .push(transformed);
                         let transformed =
                             stream_state.sanitize_openai_capacity_shed_chunk(transformed);
+                        if committed_output && !transformed.is_empty() {
+                            stream_state.commit_text_downstream();
+                        }
                         stream_state.record_image_transport_emit(&transformed, false);
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(false).await;
@@ -4173,6 +4314,16 @@ pub async fn forward_codex_responses_ws(
     )
     .await?;
     append_codex_client_request_headers_owned(&mut target.headers, &headers, false);
+    if matches!(ws_mode, ResponsesWebsocketMode::Codex) {
+        let accounts = state.accounts_snapshot().await;
+        if let Some(scope) = codex_metadata_scope(&execution, &accounts) {
+            let decision = super::codex_metadata::scrub_owned_headers(&mut target.headers, &scope);
+            crate::metrics::record_codex_metadata_decision(decision.as_str());
+        }
+        target
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(super::codex_http::ROUTING_HINT_HEADER));
+    }
     let websocket_upstream_model = match &execution.plan.model_policy {
         crate::domain::providers::runtime::RuntimeModelPolicy::Single { upstream_model } => {
             Some(upstream_model.clone())
@@ -4395,6 +4546,28 @@ async fn codex_previous_response_cache_scope(
     })
 }
 
+fn codex_metadata_scope(
+    execution: &ProviderExecution,
+    accounts: &AccountStore,
+) -> Option<super::codex_metadata::CodexMetadataScope> {
+    let (ProviderType::CodexOAuth, account_id, auth_identity_generation) =
+        execution.managed_account_identity_target()?
+    else {
+        return None;
+    };
+    let account = authoritative_managed_account(&execution.stored, accounts)?;
+    if account.id != account_id || account.auth_identity_generation != auth_identity_generation {
+        return None;
+    }
+    Some(super::codex_metadata::CodexMetadataScope {
+        account_id: account_id.to_string(),
+        auth_identity_generation,
+        workspace_id: effective_codex_workspace_id(account)
+            .unwrap_or_else(|| "unbound-workspace".to_string()),
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+    })
+}
+
 fn previous_response_id_from_value(body: &Value) -> Option<String> {
     body.get("previous_response_id")
         .and_then(Value::as_str)
@@ -4420,7 +4593,8 @@ fn inject_previous_response_context(
         return false;
     };
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    let Some(cached) = state.previous_response_context(scope, previous_response_id, now) else {
+    let lookup = state.previous_response_context_lookup(scope, previous_response_id, now);
+    let Some(cached) = lookup.items else {
         return false;
     };
     let current = body
@@ -4442,6 +4616,36 @@ fn inject_previous_response_context(
     }
     body["input"] = Value::Array(injected.into_iter().chain(current).collect());
     true
+}
+
+fn requires_previous_response_tool_context(body: &Value) -> bool {
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let calls = items
+        .iter()
+        .filter(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(codex_tool_call_context_type)
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|call_id| !call_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    items.iter().any(|item| {
+        item.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(codex_tool_call_output_type)
+            && item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|call_id| !call_id.is_empty())
+                .is_some_and(|call_id| !calls.contains(call_id))
+    })
 }
 
 fn replayable_cached_input_item(item: &Value) -> Option<Value> {
@@ -6172,6 +6376,20 @@ async fn send_codex_images_attempt(
     execution.apply_auth(&mut target_headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut target_headers, stored, &accounts)?;
     execution.finalize_outbound_identity(&mut target_headers)?;
+    let mut body = adapter_request.body.clone();
+    if let Some(scope) = codex_metadata_scope(execution, &accounts) {
+        let (scrubbed, body_decision) = super::codex_metadata::scrub_body_bytes(&body, &scope)?;
+        body = scrubbed;
+        let header_decision =
+            super::codex_metadata::scrub_owned_headers(&mut target_headers, &scope);
+        crate::metrics::record_codex_metadata_decision(body_decision.as_str());
+        crate::metrics::record_codex_metadata_decision(header_decision.as_str());
+    }
+    super::codex_http::finalize_routing_hint(
+        &mut target_headers,
+        &body,
+        super::codex_http::routing_hint_enabled(&execution.plan.driver_options),
+    );
     target_headers.retain(|(name, _)| !name.eq_ignore_ascii_case(ACCEPT.as_str()));
     target_headers.push((ACCEPT.as_str().to_string(), "text/event-stream".to_string()));
     let access_token = bearer_token_from_owned_headers(&target_headers).map(str::to_string);
@@ -6179,7 +6397,7 @@ async fn send_codex_images_attempt(
     let mut request = http_client
         .post(&url)
         .header(CONTENT_TYPE, "application/json")
-        .body(adapter_request.body.clone());
+        .body(body);
     for (name, value) in &target_headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -8849,20 +9067,63 @@ async fn bridge_responses_websocket(
                     AxumWsMessage::Pong(_) => continue,
                     AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {}
                 }
-                let original_response_body = matches!(mode, ResponsesWebsocketMode::Codex)
-                    .then(|| axum_responses_websocket_http_body(&message))
-                    .transpose()?
-                    .flatten();
-                let Some(mut message) = axum_ws_message_to_tungstenite(
+                let original_response_body = axum_responses_websocket_http_body(&message)?
+                    .or_else(|| {
+                        matches!(mode, ResponsesWebsocketMode::Grok)
+                            .then(|| axum_grok_bare_responses_websocket_body(&message))
+                            .flatten()
+                    });
+                let raw_starts_response = original_response_body.is_some();
+                if raw_starts_response {
+                    if response_in_flight {
+                        return Err(ProxyError::bad_request(
+                            "responses websocket received response.create while a response is in flight",
+                        ));
+                    }
+                    ensure_responses_websocket_turn_allowed(state, &execution, mode).await?;
+                }
+                let mut message = match axum_ws_message_to_tungstenite(
                     message,
                     mode,
                     grok_session_id.as_deref(),
                     single_upstream_model.as_deref(),
-                ) else {
-                    break;
+                ) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) if raw_starts_response && error.is_protocol_incompatible() => {
+                        let requested = original_response_body
+                            .as_ref()
+                            .expect("a raw response start has a request body");
+                        active_usage_turn = Some(
+                            ResponsesWebsocketUsageTurn::start(
+                                state,
+                                &execution.runtime_stored_view(),
+                                codex_websocket_model_metadata(requested, requested),
+                                request_context.clone(),
+                                &connection_id,
+                            )
+                            .await?,
+                        );
+                        let error_body = websocket_proxy_error_body(&error);
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("client_protocol_incompatible"),
+                            error_body,
+                            None,
+                            &mut active_usage_turn,
+                        )
+                        .await;
+                    }
+                    Err(error) => return Err(error),
                 };
                 let starts_response = responses_websocket_request_starts_response(&message);
-                if starts_response {
+                if starts_response && !raw_starts_response {
                     ensure_responses_websocket_turn_allowed(state, &execution, mode).await?;
                 }
                 let previous_response_cache_scope = if starts_response
@@ -8892,6 +9153,14 @@ async fn bridge_responses_websocket(
                     .as_ref()
                     .map(super::codex_request_policy::extract_intent)
                     .unwrap_or_default();
+                let metadata_scope = if starts_response
+                    && matches!(mode, ResponsesWebsocketMode::Codex)
+                {
+                    let accounts = accounts_snapshot_for_execution_auth(state, &execution).await?;
+                    codex_metadata_scope(&execution, &accounts)
+                } else {
+                    None
+                };
                 let (message, policy_metadata) = if matches!(mode, ResponsesWebsocketMode::Codex) {
                     prepare_codex_responses_websocket_request(
                         message,
@@ -8899,17 +9168,13 @@ async fn bridge_responses_websocket(
                         codex_fast_mode_enabled(&execution),
                         codex_session_model.as_deref(),
                         &intent,
+                        metadata_scope.as_ref(),
                     )
                     .await?
                 } else {
                     (message, None)
                 };
                 if starts_response {
-                    if response_in_flight {
-                        return Err(ProxyError::bad_request(
-                            "responses websocket received response.create while a response is in flight",
-                        ));
-                    }
                     let effective_response_body = responses_websocket_http_body(&message)?;
                     if matches!(mode, ResponsesWebsocketMode::Codex) {
                         if let Some(model) = codex_model_from_value(&effective_response_body) {
@@ -10782,7 +11047,7 @@ async fn prepare_codex_http_fallback_target(
 ) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
     let stored = execution.runtime_stored_view();
     let grok = execution.driver_is("oauth.grok_responses");
-    let responses_lite = !grok && codex_responses_lite_requested_value(response_body);
+    let responses_lite_requested = !grok && codex_responses_lite_requested_value(response_body);
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let body = serde_json::to_vec(response_body)
         .map(Bytes::from)
@@ -10797,10 +11062,6 @@ async fn prepare_codex_http_fallback_target(
             session_id,
             codex_image_tool_strip_policy(&stored),
         )?;
-        if responses_lite {
-            adapter_request.body =
-                normalize_codex_responses_lite_body_bytes(&adapter_request.body, true, true)?;
-        }
         adapter_request.body =
             super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
     }
@@ -10827,6 +11088,14 @@ async fn prepare_codex_http_fallback_target(
     if !grok {
         execution.enforce_model_policy(&mut adapter_request)?;
     }
+    let responses_lite = !grok
+        && execution.gate_openai_codex_responses_lite(&adapter_request, responses_lite_requested);
+    if responses_lite {
+        adapter_request.body =
+            normalize_codex_responses_lite_body_bytes(&adapter_request.body, true, true)?;
+    } else if !grok {
+        adapter_request.body = clear_codex_responses_lite_marker_bytes(&adapter_request.body)?;
+    }
     execution.finalize_request(&mut adapter_request)?;
     if !grok {
         let final_model = codex_model_from_body(&adapter_request.body)
@@ -10839,7 +11108,7 @@ async fn prepare_codex_http_fallback_target(
             codex_fast_mode_enabled(execution),
             intent,
         )?;
-        adapter_request.body = body;
+        adapter_request.body = super::codex_http::finalize_body(&body)?;
     }
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
     if grok {
@@ -10871,6 +11140,21 @@ async fn prepare_codex_http_fallback_target(
     execution.apply_auth(&mut headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
+    if !grok {
+        if let Some(scope) = codex_metadata_scope(execution, &accounts) {
+            let (body, body_decision) =
+                super::codex_metadata::scrub_body_bytes(&adapter_request.body, &scope)?;
+            adapter_request.body = body;
+            let header_decision = super::codex_metadata::scrub_owned_headers(&mut headers, &scope);
+            crate::metrics::record_codex_metadata_decision(body_decision.as_str());
+            crate::metrics::record_codex_metadata_decision(header_decision.as_str());
+        }
+        super::codex_http::finalize_routing_hint(
+            &mut headers,
+            &adapter_request.body,
+            super::codex_http::routing_hint_enabled(&execution.plan.driver_options),
+        );
+    }
     execution.guard_coding_plan_request(ProxyRoute::CodexResponses, &adapter_request, &url)?;
 
     Ok(PreparedCodexHttpFallbackTarget {
@@ -10932,6 +11216,16 @@ fn axum_responses_websocket_http_body(
     Ok(Some(value))
 }
 
+fn axum_grok_bare_responses_websocket_body(message: &AxumWsMessage) -> Option<Value> {
+    let bytes = match message {
+        AxumWsMessage::Text(text) => text.as_bytes(),
+        AxumWsMessage::Binary(bytes) => bytes.as_ref(),
+        _ => return None,
+    };
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    (value.is_object() && value.get("type").is_none()).then_some(value)
+}
+
 fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, ProxyError> {
     let bytes = match message {
         TungsteniteMessage::Text(text) => text.as_bytes(),
@@ -10991,7 +11285,12 @@ fn inject_previous_response_context_into_websocket_message(
     } else {
         &mut frame
     };
+    let requires_history = requires_previous_response_tool_context(target);
     if !inject_previous_response_context(state, scope, previous_response_id, target) {
+        if requires_history {
+            state.record_previous_response_context_unavailable();
+            return Err(ProxyError::response_context_unavailable());
+        }
         return Ok(());
     }
     *message = if binary {
@@ -11016,6 +11315,7 @@ async fn prepare_codex_responses_websocket_request(
     fast_mode_enabled: bool,
     inherited_model: Option<&str>,
     intent: &super::codex_request_policy::CodexRequestIntent,
+    metadata_scope: Option<&super::codex_metadata::CodexMetadataScope>,
 ) -> Result<
     (
         TungsteniteMessage,
@@ -11043,11 +11343,10 @@ async fn prepare_codex_responses_websocket_request(
     } else {
         &mut frame
     };
+    let responses_lite_requested = codex_responses_lite_requested_value(target);
     sanitize_codex_oauth_request_body(target);
+    super::tool_schema::normalize_codex_tool_schemas(target);
     strip_codex_oauth_unsupported_responses_fields(target);
-    if codex_responses_lite_requested_value(target) {
-        normalize_codex_responses_lite_body(target, false, false);
-    }
     let target_body = serde_json::to_vec(target)
         .map(Bytes::from)
         .map_err(|error| {
@@ -11080,6 +11379,32 @@ async fn prepare_codex_responses_websocket_request(
                 .insert("model".to_string(), Value::String(model.clone()));
         }
     }
+    let responses_lite = match final_model
+        .as_deref()
+        .map(|model| super::codex_models::responses_lite_support(stored, model))
+    {
+        Some(super::codex_models::CapabilitySupport::Unsupported) => {
+            crate::metrics::record_codex_responses_lite_decision("requested_unsupported_stripped");
+            false
+        }
+        Some(super::codex_models::CapabilitySupport::Supported) => {
+            if responses_lite_requested {
+                crate::metrics::record_codex_responses_lite_decision("requested_supported");
+            }
+            responses_lite_requested
+        }
+        Some(super::codex_models::CapabilitySupport::Unknown) | None => {
+            if responses_lite_requested {
+                crate::metrics::record_codex_responses_lite_decision("requested_unknown_preserved");
+            }
+            responses_lite_requested
+        }
+    };
+    if responses_lite {
+        normalize_codex_responses_lite_body(target, false, false);
+    } else {
+        clear_codex_responses_lite_marker(target);
+    }
     let policy_metadata = super::codex_request_policy::apply(
         target,
         stored,
@@ -11087,6 +11412,10 @@ async fn prepare_codex_responses_websocket_request(
         fast_mode_enabled,
         intent,
     )?;
+    if let Some(scope) = metadata_scope {
+        let decision = super::codex_metadata::scrub_body_value(&mut frame, scope);
+        crate::metrics::record_codex_metadata_decision(decision.as_str());
+    }
 
     let message = if binary {
         serde_json::to_vec(&frame)
@@ -11778,14 +12107,17 @@ async fn terminate_responses_websocket_with_error(
     if let Some(outcome) = provider_outcome {
         record_provider_outcome(state, &execution.runtime_stored_view(), outcome).await;
     }
+    let stream_status = if error.is_protocol_incompatible() {
+        "protocol_incompatible"
+    } else if error.status.is_client_error() {
+        "client_error"
+    } else {
+        "interrupted"
+    };
     finish_active_websocket_usage(
         active_usage_turn,
         error.status.as_u16(),
-        if error.status.is_client_error() {
-            "client_error"
-        } else {
-            "interrupted"
-        },
+        stream_status,
         Some(error.client_message().to_string()),
     )
     .await;
@@ -11805,13 +12137,18 @@ async fn terminate_responses_websocket_with_error(
     {
         return Ok(());
     }
+    let close_reason = if error.status.is_client_error() {
+        "request rejected by protocol adapter"
+    } else {
+        "upstream response ended without terminal event"
+    };
     let _ = send_responses_websocket_message(
         downstream,
         output_patcher,
         mode,
         TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
             code: CloseCode::Error,
-            reason: "upstream response ended without terminal event".into(),
+            reason: close_reason.into(),
         })),
     )
     .await?;
@@ -11971,7 +12308,7 @@ fn axum_ws_message_to_tungstenite(
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<&str>,
     single_upstream_model: Option<&str>,
-) -> Option<TungsteniteMessage> {
+) -> Result<Option<TungsteniteMessage>, ProxyError> {
     match message {
         AxumWsMessage::Text(text) => {
             let text = transform_responses_websocket_request(
@@ -11979,33 +12316,35 @@ fn axum_ws_message_to_tungstenite(
                 mode,
                 grok_session_id,
                 single_upstream_model,
-            )
+            )?
             .unwrap_or(text);
-            Some(TungsteniteMessage::Text(text))
+            Ok(Some(TungsteniteMessage::Text(text)))
         }
         AxumWsMessage::Binary(bytes) => {
-            let transformed = std::str::from_utf8(&bytes).ok().and_then(|text| {
+            let transformed = if let Ok(text) = std::str::from_utf8(&bytes) {
                 transform_responses_websocket_request(
                     text,
                     mode,
                     grok_session_id,
                     single_upstream_model,
-                )
-            });
-            Some(TungsteniteMessage::Binary(
+                )?
+            } else {
+                None
+            };
+            Ok(Some(TungsteniteMessage::Binary(
                 transformed
                     .map(String::into_bytes)
                     .unwrap_or_else(|| bytes.to_vec()),
-            ))
+            )))
         }
-        AxumWsMessage::Ping(bytes) => Some(TungsteniteMessage::Ping(bytes.to_vec())),
-        AxumWsMessage::Pong(bytes) => Some(TungsteniteMessage::Pong(bytes.to_vec())),
-        AxumWsMessage::Close(frame) => Some(TungsteniteMessage::Close(frame.map(|frame| {
+        AxumWsMessage::Ping(bytes) => Ok(Some(TungsteniteMessage::Ping(bytes.to_vec()))),
+        AxumWsMessage::Pong(bytes) => Ok(Some(TungsteniteMessage::Pong(bytes.to_vec()))),
+        AxumWsMessage::Close(frame) => Ok(Some(TungsteniteMessage::Close(frame.map(|frame| {
             tokio_tungstenite::tungstenite::protocol::CloseFrame {
                 code: frame.code.into(),
                 reason: frame.reason.to_string().into(),
             }
-        }))),
+        })))),
     }
 }
 
@@ -12014,18 +12353,22 @@ fn transform_responses_websocket_request(
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<&str>,
     single_upstream_model: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, ProxyError> {
     if !matches!(mode, ResponsesWebsocketMode::Grok) && single_upstream_model.is_none() {
-        return None;
+        return Ok(None);
     }
-    let mut value = serde_json::from_str::<Value>(text).ok()?;
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        return Ok(None);
+    };
     if let Some(model) = single_upstream_model {
         enforce_responses_websocket_model(&mut value, model);
     }
     if matches!(mode, ResponsesWebsocketMode::Grok) {
-        value = super::grok::ws_message_body(value, grok_session_id);
+        value = super::grok::ws_message_body(value, grok_session_id)?;
     }
-    serde_json::to_string(&value).ok()
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| ProxyError::bad_request(format!("encode response.create frame: {error}")))
 }
 
 fn enforce_responses_websocket_model(value: &mut Value, model: &str) {
@@ -12179,6 +12522,18 @@ fn websocket_stream_error_body(message: &str, code: &str) -> String {
             "message": message,
             "type": "upstream_error",
             "code": code
+        }
+    })
+    .to_string()
+}
+
+fn websocket_proxy_error_body(error: &ProxyError) -> String {
+    json!({
+        "type": "error",
+        "error": {
+            "message": error.client_message(),
+            "type": error.error_type(),
+            "code": error.error_code(),
         }
     })
     .to_string()
@@ -17294,18 +17649,45 @@ fn normalize_codex_responses_lite_body(
     }
 }
 
+fn clear_codex_responses_lite_marker(body: &mut Value) {
+    if let Some(metadata) = body
+        .get_mut("client_metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove(CODEX_RESPONSES_LITE_WS_METADATA);
+        if metadata.is_empty() {
+            body.as_object_mut()
+                .expect("client_metadata requires an object body")
+                .remove("client_metadata");
+        }
+    }
+}
+
+fn clear_codex_responses_lite_marker_bytes(body: &Bytes) -> Result<Bytes, ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
+        ProxyError::bad_request(format!("invalid Codex Responses Lite body: {error}"))
+    })?;
+    clear_codex_responses_lite_marker(&mut value);
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("encode Codex Responses body: {error}")))
+}
+
 pub(super) fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<Bytes, ProxyError> {
     let mut value = serde_json::from_slice::<Value>(body).map_err(|error| ProxyError {
         status: StatusCode::BAD_REQUEST,
         message: format!("invalid codex oauth compact body: {error}"),
     })?;
     if let Some(object) = value.as_object_mut() {
-        object.remove("stream");
-        object.remove("store");
         object.remove("prompt_cache_key");
     }
     sanitize_codex_oauth_request_body(&mut value);
+    super::tool_schema::normalize_codex_tool_schemas(&mut value);
     strip_codex_oauth_unsupported_responses_fields(&mut value);
+    super::codex_compaction::normalize_compaction_trigger(
+        &mut value,
+        super::codex_compaction::CompactionSignalMode::AddIfMissing,
+    )?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -17314,29 +17696,28 @@ pub(super) fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<B
         })
 }
 
+pub(super) fn normalize_codex_oauth_compaction_signal_body_bytes(
+    body: &Bytes,
+    add_if_missing: bool,
+) -> Result<Bytes, ProxyError> {
+    let mut value = serde_json::from_slice::<Value>(body)
+        .map_err(|error| ProxyError::bad_request(format!("invalid Codex compact body: {error}")))?;
+    let mode = if add_if_missing {
+        super::codex_compaction::CompactionSignalMode::AddIfMissing
+    } else {
+        super::codex_compaction::CompactionSignalMode::PreserveIfAbsent
+    };
+    super::codex_compaction::normalize_compaction_trigger(&mut value, mode)?;
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::bad_request(format!("encode Codex compact body: {error}")))
+}
+
 pub(super) fn codex_responses_body_has_compaction_trigger(body: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
-    value
-        .get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
-        })
-}
-
-pub(super) fn codex_compact_url(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    if trimmed.ends_with("/responses/compact") {
-        trimmed.to_string()
-    } else if trimmed.ends_with("/responses") {
-        format!("{trimmed}/compact")
-    } else {
-        url.to_string()
-    }
+    super::codex_compaction::body_has_compaction_trigger(&value)
 }
 
 fn normalize_codex_oauth_responses_body(
@@ -17347,6 +17728,7 @@ fn normalize_codex_oauth_responses_body(
     body["store"] = Value::Bool(false);
     body["stream"] = Value::Bool(true);
     sanitize_codex_oauth_request_body(&mut body);
+    super::tool_schema::normalize_codex_tool_schemas(&mut body);
 
     if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
         for item in items {
@@ -17439,6 +17821,17 @@ fn sanitize_codex_oauth_request_body(body: &mut Value) {
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         let mut normalized_tools = Vec::with_capacity(tools.len());
         for tool in std::mem::take(tools) {
+            if super::tool_schema::is_reserved_codex_tool(&tool) {
+                if let Some(name) = tool
+                    .get("name")
+                    .or_else(|| tool.pointer("/function/name"))
+                    .and_then(normalized_codex_tool_name)
+                {
+                    valid_function_names.insert(name);
+                }
+                normalized_tools.push(tool);
+                continue;
+            }
             let Some(object) = tool.as_object() else {
                 continue;
             };
@@ -17617,8 +18010,8 @@ fn normalize_codex_function_tool(
                 .and_then(|function| function.get("parameters"))
                 .filter(|value| value.is_object())
         })
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+        .cloned();
+    let parameters = super::tool_schema::normalize_codex_function_parameters(parameters.as_ref());
     let strict = object
         .get("strict")
         .filter(|value| value.is_boolean())
@@ -18019,6 +18412,8 @@ struct StreamForwardState {
     image_upstream_deadline: Option<tokio::time::Instant>,
     image_transport: Option<ImageTransportMetrics>,
     image_keepalive_interval: Duration,
+    text_upstream_deadline: Option<tokio::time::Instant>,
+    downstream_keepalive: Option<super::downstream_keepalive::DownstreamKeepalive>,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 }
@@ -18387,6 +18782,24 @@ impl StreamForwardState {
                 .timeouts
                 .idle
                 .map(|timeout| tokio::time::Instant::now() + timeout);
+        }
+    }
+
+    fn observe_text_upstream_event(&mut self, semantic_event: bool) {
+        if self.image_transport.is_none() && semantic_event {
+            self.text_upstream_deadline = self
+                .timeouts
+                .idle
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+        }
+    }
+
+    fn commit_text_downstream(&mut self) {
+        if self.image_transport.is_some() {
+            return;
+        }
+        if let Some(keepalive) = self.downstream_keepalive.as_mut() {
+            keepalive.commit(tokio::time::Instant::now());
         }
     }
 
@@ -19406,6 +19819,52 @@ fn model_metadata(request: &adapters::AdapterRequest) -> UsageModelMetadata {
     }
 }
 
+async fn record_local_protocol_rejection(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request: &adapters::AdapterRequest,
+    request_context: &UsageLogContext,
+    started: Instant,
+    error: &ProxyError,
+) {
+    debug_assert!(error.is_protocol_incompatible());
+    let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
+    log_usage(
+        state,
+        stored,
+        error.status.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(request),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: request.stream_requested,
+            stream_status: request
+                .stream_requested
+                .then(|| "protocol_incompatible".to_string()),
+            outcome: Some(UsageOutcome::ClientError),
+            failure_kind: Some(error.error_code().to_string()),
+            error_message: Some(error.client_message().to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        state,
+        share_id.as_deref(),
+        user_email.as_deref(),
+        TokenUsage::default(),
+    )
+    .await;
+    tracing::info!(
+        provider_id = %stored.provider.id,
+        provider_type = stored.provider_type.as_str(),
+        status_code = error.status.as_u16(),
+        error_code = error.error_code(),
+        "rejected request before upstream transport due to protocol incompatibility"
+    );
+}
+
 fn provider_upstream_timeout(stored: &StoredProvider) -> std::time::Duration {
     let timeout_ms = setting(
         &stored.provider,
@@ -19521,6 +19980,10 @@ fn stream_error_code_and_message(message: &str) -> (&'static str, &str) {
             "[KIRO_UPSTREAM_STREAM_ERROR] ",
             "KIRO_UPSTREAM_STREAM_ERROR",
         ),
+        (
+            "[CC_PROTOCOL_INCOMPATIBLE] ",
+            "cc_switch_protocol_incompatible",
+        ),
     ] {
         if let Some(message) = message.strip_prefix(prefix) {
             return (code, message);
@@ -19546,6 +20009,30 @@ mod tests {
     use crate::domain::providers::model::{
         AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
     };
+
+    #[test]
+    fn responses_keepalive_provider_option_overrides_environment_and_preserves_zero() {
+        assert_eq!(
+            resolve_responses_text_keepalive_interval(Some(22_000), Some(9_000)),
+            Some(Duration::from_millis(22_000))
+        );
+        assert_eq!(
+            resolve_responses_text_keepalive_interval(Some(0), Some(9_000)),
+            None
+        );
+        assert_eq!(
+            resolve_responses_text_keepalive_interval(None, Some(1_000)),
+            Some(Duration::from_millis(5_000))
+        );
+        assert_eq!(
+            resolve_responses_text_keepalive_interval(None, Some(90_000)),
+            Some(Duration::from_millis(60_000))
+        );
+        assert_eq!(
+            resolve_responses_text_keepalive_interval(None, None),
+            Some(Duration::from_millis(15_000))
+        );
+    }
 
     #[test]
     fn request_context_ignores_unsigned_legacy_identity_headers() {
@@ -21006,6 +21493,22 @@ mod tests {
             runtime_fingerprint: "runtime-a".to_string(),
             workspace_id: "workspace-a".to_string(),
         }
+    }
+
+    #[test]
+    fn previous_response_409_requires_an_unpaired_tool_output() {
+        assert!(requires_previous_response_tool_context(&json!({
+            "input": [{"type":"function_call_output","call_id":"call-a","output":"ok"}]
+        })));
+        assert!(!requires_previous_response_tool_context(&json!({
+            "input": [
+                {"type":"function_call","call_id":"call-a","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call-a","output":"ok"}
+            ]
+        })));
+        assert!(!requires_previous_response_tool_context(&json!({
+            "input": [{"type":"message","role":"user","content":"continue"}]
+        })));
     }
 
     fn test_now_ms() -> i64 {
@@ -27781,6 +28284,15 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
         let request = json!({
             "type": "response.create",
+            "client_metadata": {
+                "nested": [{
+                    "workspaces": {
+                        "/home/alice/second-private-project": {
+                            "associated_remote_urls": ["https://example.test/alice/private.git"]
+                        }
+                    }
+                }]
+            },
             "response": {
                 "model": "gpt-5.5",
                 "input": [
@@ -27804,6 +28316,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             false,
             None,
             &intent,
+            None,
         )
         .await
         .unwrap();
@@ -27847,6 +28360,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             true,
             Some("gpt-5.4"),
             &intent,
+            None,
         )
         .await
         .unwrap();
@@ -27864,6 +28378,64 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             metadata.service_tier_decision.as_deref(),
             Some("server_forced_priority")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_request_scrubs_client_metadata_before_send() {
+        let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
+        let private_path = "/Users/alice/private-project";
+        let request = json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.5",
+                "input": "continue",
+                "client_metadata": {
+                    "workspaces": {
+                        (private_path): {
+                            "associated_remote_urls": ["git@github.com:alice/private.git"],
+                            "latest_git_commit_hash": "0123456789abcdef0123456789abcdef01234567",
+                            "has_changes": true
+                        }
+                    }
+                }
+            }
+        });
+        let intent = crate::proxy::codex_request_policy::extract_intent(&request["response"]);
+        let scope = crate::proxy::codex_metadata::CodexMetadataScope {
+            account_id: "account-a".to_string(),
+            auth_identity_generation: 7,
+            workspace_id: "workspace-a".to_string(),
+            runtime_fingerprint: "runtime-a".to_string(),
+        };
+
+        let (prepared, _) = prepare_codex_responses_websocket_request(
+            TungsteniteMessage::Text(request.to_string()),
+            &provider,
+            false,
+            None,
+            &intent,
+            Some(&scope),
+        )
+        .await
+        .unwrap();
+
+        let TungsteniteMessage::Text(prepared) = prepared else {
+            panic!("prepared request must remain a text frame");
+        };
+        assert!(!prepared.contains(private_path));
+        assert!(!prepared.contains("second-private-project"));
+        assert!(!prepared.contains("git@github.com"));
+        assert!(!prepared.contains("example.test/alice"));
+        assert!(!prepared.contains("0123456789abcdef"));
+        let prepared: Value = serde_json::from_str(&prepared).unwrap();
+        let workspaces = prepared
+            .pointer("/response/client_metadata/workspaces")
+            .and_then(Value::as_object)
+            .unwrap();
+        let (placeholder, entry) = workspaces.iter().next().unwrap();
+        assert!(placeholder.starts_with("/workspace/"));
+        assert_eq!(entry["latest_git_commit_hash"].as_str().unwrap().len(), 40);
+        assert_eq!(entry["has_changes"], true);
     }
 
     #[test]
@@ -27906,6 +28478,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             false,
             None,
             &crate::proxy::codex_request_policy::CodexRequestIntent::default(),
+            None,
         )
         .await
         .unwrap_err();
@@ -27959,16 +28532,36 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(codex_responses_body_has_compaction_trigger(&body));
         let normalized = normalize_codex_oauth_compact_body_bytes(&body).unwrap();
         let value: Value = serde_json::from_slice(&normalized).unwrap();
-        assert!(value.get("stream").is_none());
-        assert!(value.get("store").is_none());
+        assert_eq!(value.get("stream"), Some(&json!(true)));
+        assert_eq!(value.get("store"), Some(&json!(false)));
         assert!(value.get("prompt_cache_key").is_none());
         assert!(value.get("instructions").is_none());
         assert!(value.get("temperature").is_none());
         assert!(value.get("max_output_tokens").is_none());
         assert_eq!(
-            codex_compact_url("https://chatgpt.com/backend-api/codex/responses"),
-            "https://chatgpt.com/backend-api/codex/responses/compact"
+            value.pointer("/input/1/type"),
+            Some(&json!("compaction_trigger"))
         );
+        assert_eq!(
+            value.pointer("/include/0"),
+            Some(&json!("reasoning.encrypted_content"))
+        );
+    }
+
+    #[test]
+    fn codex_oauth_final_sanitizer_preserves_reserved_tools_verbatim() {
+        let reserved = json!({
+            "type": "function",
+            "name": "collaboration.spawn_agent",
+            "description": "must remain exact",
+            "parameters": {"type": null, "properties": {}}
+        });
+        let normalized = normalize_codex_oauth_responses_body(
+            json!({"model":"gpt-5.6-sol","input":[],"tools":[reserved.clone()]}),
+            None,
+            CodexImageToolStripPolicy::Never,
+        );
+        assert_eq!(normalized.pointer("/tools/0"), Some(&reserved));
     }
 
     #[test]
@@ -30151,6 +30744,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             Some("session-1"),
             Some("gpt-5.5"),
         )
+        .unwrap()
         .unwrap();
         let value: Value = serde_json::from_str(&transformed).unwrap();
 
@@ -33625,6 +34219,84 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     }
 
     #[tokio::test]
+    async fn grok_protocol_rejection_is_logged_as_client_error_without_upstream_call() {
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_requests_for_route = std::sync::Arc::clone(&upstream_requests);
+        let upstream_app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&upstream_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({"status": "unexpected"}))
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("grok-local-protocol-rejection");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-local-protocol-rejection",
+            format!("http://{upstream_address}/v1"),
+            None,
+            "grok-protocol-rejection-access",
+            None,
+            &[],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let error = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"grok-4.6","stream":true,"input":[{"type":"additional_tools","tools":[{"type":"custom","name":"private-tool","description":"private-description"}]}]}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.error_code(), "cc_switch_protocol_incompatible");
+        assert_eq!(
+            upstream_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let usage = state.usage_snapshot().await;
+        assert_eq!(usage.logs.len(), 1);
+        let log = &usage.logs[0];
+        assert_eq!(log.status_code, StatusCode::UNPROCESSABLE_ENTITY.as_u16());
+        assert_eq!(log.outcome, UsageOutcome::ClientError);
+        assert_eq!(
+            log.failure_kind.as_deref(),
+            Some("cc_switch_protocol_incompatible")
+        );
+        assert_eq!(log.stream_status.as_deref(), Some("protocol_incompatible"));
+        assert!(!log
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("private-tool"));
+        assert!(!log
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("private-description"));
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
     async fn grok_http_sse_401_refresh_reuses_authorization_context_and_client_turn() {
         let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -34701,6 +35373,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 Some("session-1"),
                 Some("grok-4.5"),
             )
+            .unwrap()
             .unwrap();
             let value: Value = serde_json::from_str(&transformed).unwrap();
 
@@ -34709,6 +35382,66 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 Some("grok-4.5")
             );
         }
+    }
+
+    #[test]
+    fn grok_websocket_normalizes_or_rejects_additional_tools_before_upstream() {
+        let transformed = transform_responses_websocket_request(
+            &json!({
+                "type": "response.create",
+                "response": {
+                    "model": "grok-4.6",
+                    "futureTopLevelField": true,
+                    "input": [
+                        {"type": "additional_tools", "tools": [
+                            {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+                        ]},
+                        {"type": "message", "role": "user", "content": "hello"}
+                    ]
+                }
+            })
+            .to_string(),
+            ResponsesWebsocketMode::Grok,
+            Some("session-compatible"),
+            Some("grok-4.6"),
+        )
+        .unwrap()
+        .unwrap();
+        let transformed: Value = serde_json::from_str(&transformed).unwrap();
+        assert_eq!(transformed["response"]["tools"][0]["name"], "lookup");
+        assert_eq!(
+            transformed["response"]["input"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(transformed["response"]["futureTopLevelField"], true);
+
+        let error = transform_responses_websocket_request(
+            &json!({
+                "type": "response.create",
+                "response": {
+                    "model": "grok-4.6",
+                    "input": [{"type": "unknown-private-item", "private": "do-not-log"}]
+                }
+            })
+            .to_string(),
+            ResponsesWebsocketMode::Grok,
+            Some("session-incompatible"),
+            Some("grok-4.6"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.error_code(), "cc_switch_protocol_incompatible");
+        assert!(!error.client_message().contains("unknown-private-item"));
+        assert!(!error.client_message().contains("do-not-log"));
+        let wire_error: Value = serde_json::from_str(&websocket_proxy_error_body(&error)).unwrap();
+        assert_eq!(
+            wire_error.pointer("/error/code"),
+            Some(&json!("cc_switch_protocol_incompatible"))
+        );
+        assert_eq!(
+            wire_error.pointer("/error/type"),
+            Some(&json!("invalid_request_error"))
+        );
     }
 
     #[test]
@@ -34739,6 +35472,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 Some("handshake-session"),
                 Some("grok-composer"),
             )
+            .unwrap()
             .unwrap();
             let value: Value = serde_json::from_str(&transformed).unwrap();
             assert_eq!(
@@ -34762,6 +35496,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             None,
             Some("grok-custom"),
         )
+        .unwrap()
         .unwrap();
         let value: Value = serde_json::from_str(&transformed).unwrap();
 

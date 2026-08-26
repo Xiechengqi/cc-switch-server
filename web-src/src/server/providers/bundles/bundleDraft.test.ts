@@ -273,6 +273,42 @@ describe("Provider Bundle drafts", () => {
     },
   );
 
+  it("round-trips OpenAI OAuth keepalive and routing options", () => {
+    const configured = openAiOAuthBundle();
+    for (const resource of Object.values(configured.surfaces)) {
+      if (!resource) continue;
+      resource.provider.meta = {
+        ...resource.provider.meta,
+        codexResponsesKeepaliveIntervalMs: 22_000,
+        codexRoutingHintEnabled: false,
+      };
+    }
+
+    const edited = editProviderBundleDraft(configured);
+    expect(
+      edited.surfaces.map(
+        (surface) => surface.driverOptions.codexResponsesKeepaliveIntervalMs,
+      ),
+    ).toEqual([22_000, 22_000]);
+    expect(
+      edited.surfaces.map(
+        (surface) => surface.driverOptions.codexRoutingHintEnabled,
+      ),
+    ).toEqual([false, false]);
+
+    const write = toProviderBundleWriteDraft(edited);
+    expect(
+      write.surfaces.map(
+        (surface) => surface.driverOptions?.codexResponsesKeepaliveIntervalMs,
+      ),
+    ).toEqual([22_000, 22_000]);
+    expect(
+      write.surfaces.map(
+        (surface) => surface.driverOptions?.codexRoutingHintEnabled,
+      ),
+    ).toEqual([false, false]);
+  });
+
   it("writes one shared model policy without Surface settings JSON", () => {
     const family = familyById("family.grok_oauth")!;
     const draft = updateBundleModel(

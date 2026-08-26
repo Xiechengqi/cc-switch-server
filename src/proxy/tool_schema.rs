@@ -15,6 +15,138 @@ pub(crate) fn normalize_function_parameters(parameters: Option<&Value>) -> Value
     parameters
 }
 
+/// Repairs the JSON Schema subset rejected by the official Codex Responses
+/// transport without weakening otherwise valid constraints.
+pub(crate) fn normalize_codex_function_parameters(parameters: Option<&Value>) -> Value {
+    let mut parameters = normalize_function_parameters(parameters);
+    normalize_codex_schema_node(&mut parameters);
+    if let Some(object) = parameters.as_object_mut() {
+        object.insert("type".to_string(), Value::String("object".to_string()));
+    }
+    parameters
+}
+
+pub(crate) fn normalize_codex_tool_schemas(request: &mut Value) {
+    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            normalize_codex_tool_schema(tool);
+        }
+    }
+    if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            if !item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("additional_tools"))
+            {
+                continue;
+            }
+            if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                for tool in tools {
+                    normalize_codex_tool_schema(tool);
+                }
+            }
+        }
+    }
+}
+
+fn normalize_codex_tool_schema(tool: &mut Value) {
+    let Some(object) = tool.as_object_mut() else {
+        return;
+    };
+    if is_reserved_codex_tool_object(object) {
+        return;
+    }
+    let is_function = object.get("type").and_then(Value::as_str) == Some("function");
+    let is_namespace = object.get("type").and_then(Value::as_str) == Some("namespace");
+    if is_function {
+        if let Some(nested) = object.get_mut("function").and_then(Value::as_object_mut) {
+            let normalized = normalize_codex_function_parameters(nested.get("parameters"));
+            nested.insert("parameters".to_string(), normalized);
+        } else {
+            let normalized = normalize_codex_function_parameters(object.get("parameters"));
+            object.insert("parameters".to_string(), normalized);
+        }
+    } else if let Some(parameters) = object.get_mut("parameters") {
+        normalize_codex_schema_node(parameters);
+    }
+    if is_namespace {
+        if let Some(children) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            for child in children {
+                normalize_codex_tool_schema(child);
+            }
+        }
+    }
+}
+
+pub(crate) fn is_reserved_codex_tool(tool: &Value) -> bool {
+    tool.as_object().is_some_and(is_reserved_codex_tool_object)
+}
+
+fn is_reserved_codex_tool_object(object: &Map<String, Value>) -> bool {
+    object
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("collaboration."))
+}
+
+fn normalize_codex_schema_node(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.get("type").is_some_and(Value::is_null) {
+        object.remove("type");
+    }
+    for key in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_codex_schema_node(child);
+            }
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contains",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            if let Some(children) = child.as_array_mut() {
+                for child in children {
+                    normalize_codex_schema_node(child);
+                }
+            } else {
+                normalize_codex_schema_node(child);
+            }
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for child in children {
+                normalize_codex_schema_node(child);
+            }
+        }
+    }
+}
+
 /// Normalizes the subset of JSON Schema accepted by Gemini/Code Assist tools.
 ///
 /// Keep this separate from `normalize_function_parameters`: other upstreams
@@ -349,5 +481,63 @@ mod tests {
         assert!(request
             .pointer("/tools/0/functionDeclarations/0/parameters/properties/limit/exclusiveMinimum")
             .is_none());
+    }
+
+    #[test]
+    fn codex_schema_removes_nested_null_types_without_weakening_constraints() {
+        let mut request = json!({
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {
+                    "type": null,
+                    "properties": {"q": {"type": null, "pattern": "^[a-z]+$"}},
+                    "$defs": {"item": {"type": null}},
+                    "items": [{"type": null}],
+                    "allOf": [{"type": null}]
+                }
+            }],
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{"type": "function", "name": "extra", "parameters": {"type": null}}]
+            }]
+        });
+        normalize_codex_tool_schemas(&mut request);
+        assert_eq!(
+            request.pointer("/tools/0/parameters/type"),
+            Some(&json!("object"))
+        );
+        assert!(request
+            .pointer("/tools/0/parameters/properties/q/type")
+            .is_none());
+        assert_eq!(
+            request.pointer("/tools/0/parameters/properties/q/pattern"),
+            Some(&json!("^[a-z]+$"))
+        );
+        assert!(request
+            .pointer("/tools/0/parameters/$defs/item/type")
+            .is_none());
+        assert!(request
+            .pointer("/tools/0/parameters/items/0/type")
+            .is_none());
+        assert!(request
+            .pointer("/tools/0/parameters/allOf/0/type")
+            .is_none());
+        assert_eq!(
+            request.pointer("/input/0/tools/0/parameters/type"),
+            Some(&json!("object"))
+        );
+    }
+
+    #[test]
+    fn codex_reserved_tool_is_value_identical() {
+        let reserved = json!({
+            "type": "function",
+            "name": "collaboration.spawn_agent",
+            "parameters": {"type": null}
+        });
+        let mut request = json!({"tools": [reserved.clone()]});
+        normalize_codex_tool_schemas(&mut request);
+        assert_eq!(request.pointer("/tools/0"), Some(&reserved));
     }
 }

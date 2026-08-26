@@ -298,6 +298,8 @@ export interface ProviderBundleSurfaceWriteDraft {
     codexFastMode?: boolean;
     codexImageGenerationEnabled?: boolean;
     codexWebsocketEnabled?: boolean;
+    codexResponsesKeepaliveIntervalMs?: number;
+    codexRoutingHintEnabled?: boolean;
   };
   extraHeaders?: string[];
   customBinding?: ProviderCustomBinding;

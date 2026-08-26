@@ -13,6 +13,7 @@ pub(crate) struct CodexModelCapability {
     pub reasoning_efforts: &'static [&'static str],
     pub input_modalities: &'static [&'static str],
     pub service_tiers: &'static [&'static str],
+    pub use_responses_lite: bool,
 }
 
 const GPT_56_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -29,54 +30,63 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         reasoning_efforts: GPT_56_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
+        use_responses_lite: true,
     },
     CodexModelCapability {
         id: "gpt-5.6-terra",
         reasoning_efforts: GPT_56_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
+        use_responses_lite: true,
     },
     CodexModelCapability {
         id: "gpt-5.6-luna",
         reasoning_efforts: GPT_56_LUNA_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
+        use_responses_lite: true,
     },
     CodexModelCapability {
         id: "gpt-5.5",
         reasoning_efforts: STANDARD_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
+        use_responses_lite: false,
     },
     CodexModelCapability {
         id: "gpt-5.4",
         reasoning_efforts: STANDARD_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
+        use_responses_lite: false,
     },
     CodexModelCapability {
         id: "gpt-5.4-mini",
         reasoning_efforts: STANDARD_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: NO_SERVICE_TIERS,
+        use_responses_lite: false,
     },
     CodexModelCapability {
         id: "gpt-5.3-codex-spark",
         reasoning_efforts: STANDARD_EFFORTS,
         input_modalities: TEXT_ONLY,
         service_tiers: NO_SERVICE_TIERS,
+        use_responses_lite: false,
     },
     CodexModelCapability {
         id: "gpt-5.2",
         reasoning_efforts: STANDARD_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: NO_SERVICE_TIERS,
+        use_responses_lite: false,
     },
     CodexModelCapability {
         id: "codex-auto-review",
         reasoning_efforts: STANDARD_EFFORTS,
         input_modalities: TEXT_IMAGE,
         service_tiers: NO_SERVICE_TIERS,
+        use_responses_lite: true,
     },
 ];
 
@@ -92,6 +102,7 @@ pub(crate) struct ResolvedCodexModelCapability {
     pub reasoning_efforts: Option<Vec<String>>,
     pub input_modalities: Option<Vec<String>>,
     pub service_tiers: Option<Vec<String>>,
+    pub use_responses_lite: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +111,7 @@ struct ManifestModelCapability {
     reasoning_efforts: Option<Vec<String>>,
     input_modalities: Option<Vec<String>>,
     service_tiers: Option<Vec<String>>,
+    use_responses_lite: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +237,7 @@ fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
                 ),
                 input_modalities: parse_string_capability_values(model, "input_modalities"),
                 service_tiers: parse_capability_values(model, "service_tiers", "id"),
+                use_responses_lite: model.get("use_responses_lite").and_then(Value::as_bool),
             },
         );
     }
@@ -304,7 +317,21 @@ pub(crate) fn resolved_capability_for_model(
             .as_ref()
             .and_then(|capability| capability.service_tiers.clone())
             .or_else(|| builtin.map(|capability| strings(capability.service_tiers))),
+        use_responses_lite: manifest
+            .as_ref()
+            .and_then(|capability| capability.use_responses_lite)
+            .or_else(|| builtin.map(|capability| capability.use_responses_lite)),
     })
+}
+
+pub(crate) fn responses_lite_support(provider: &StoredProvider, model: &str) -> CapabilitySupport {
+    match resolved_capability_for_model(provider, model)
+        .and_then(|capability| capability.use_responses_lite)
+    {
+        Some(true) => CapabilitySupport::Supported,
+        Some(false) => CapabilitySupport::Unsupported,
+        None => CapabilitySupport::Unknown,
+    }
 }
 
 pub(crate) fn service_tier_support(
@@ -428,6 +455,31 @@ mod tests {
     }
 
     #[test]
+    fn responses_lite_support_is_tri_state_and_manifest_overrides_builtin() {
+        let provider = manifest_provider("responses-lite-capability", 1);
+        update_manifest_models(
+            &provider,
+            br#"{"models":[{"slug":"gpt-5.6-sol","use_responses_lite":false},{"slug":"manifest-lite","use_responses_lite":true},{"slug":"manifest-unknown"}]}"#,
+        );
+        assert_eq!(
+            responses_lite_support(&provider, "gpt-5.6-sol"),
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            responses_lite_support(&provider, "manifest-lite"),
+            CapabilitySupport::Supported
+        );
+        assert_eq!(
+            responses_lite_support(&provider, "manifest-unknown"),
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            responses_lite_support(&provider, "future-model"),
+            CapabilitySupport::Unknown
+        );
+    }
+
+    #[test]
     fn manifest_service_tier_support_is_tri_state() {
         let provider = manifest_provider("service-tier-capability", 1);
         update_manifest_models(
@@ -538,6 +590,7 @@ mod tests {
             reasoning_efforts: None,
             input_modalities: None,
             service_tiers: None,
+            use_responses_lite: None,
         }
     }
 }

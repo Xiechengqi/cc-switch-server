@@ -167,6 +167,10 @@ export interface ProviderMeta {
   codexImageToolStripPolicy?: "never" | "on-error" | "always";
   // Per-provider incident rollback for the Codex Responses WebSocket path
   codexWebsocketEnabled?: boolean;
+  // Ordinary text Responses SSE downstream keepalive; 0 disables.
+  codexResponsesKeepaliveIntervalMs?: number;
+  // Server-owned HTTP routing hint; disabled by default.
+  codexRoutingHintEnabled?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
   // Custom User-Agent for local proxy routing. Only applied by the local proxy.

@@ -102,6 +102,8 @@ export interface BundleSurfaceEditorDraft {
     codexFastMode?: boolean;
     codexImageGenerationEnabled?: boolean;
     codexWebsocketEnabled?: boolean;
+    codexResponsesKeepaliveIntervalMs?: number;
+    codexRoutingHintEnabled?: boolean;
   };
   customBinding?: ProviderCustomBinding;
   secret: BundleSecretDraft;
@@ -440,6 +442,12 @@ function surfaceFromResource(
         booleanOption(runtimeOptions.codexImageGenerationEnabled) ??
         configuredMeta.codexImageGenerationEnabled,
       codexWebsocketEnabled,
+      codexResponsesKeepaliveIntervalMs:
+        numberOption(runtimeOptions.codexResponsesKeepaliveIntervalMs) ??
+        configuredMeta.codexResponsesKeepaliveIntervalMs,
+      codexRoutingHintEnabled:
+        booleanOption(runtimeOptions.codexRoutingHintEnabled) ??
+        configuredMeta.codexRoutingHintEnabled,
     },
     customBinding:
       resource?.customBinding ??
@@ -466,6 +474,12 @@ function stringOption(value: unknown): string | undefined {
 
 function booleanOption(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function numberOption(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
 }
 
 export function createProviderBundleDraft(
@@ -910,6 +924,14 @@ function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
       : undefined,
     codexWebsocketEnabled: fields.has("codexWebsocketEnabled")
       ? surface.driverOptions.codexWebsocketEnabled
+      : undefined,
+    codexResponsesKeepaliveIntervalMs: fields.has(
+      "codexResponsesKeepaliveIntervalMs",
+    )
+      ? surface.driverOptions.codexResponsesKeepaliveIntervalMs
+      : undefined,
+    codexRoutingHintEnabled: fields.has("codexRoutingHintEnabled")
+      ? surface.driverOptions.codexRoutingHintEnabled
       : undefined,
   } satisfies NonNullable<ProviderBundleSurfaceWriteDraft["driverOptions"]>;
 }

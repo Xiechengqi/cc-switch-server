@@ -107,6 +107,8 @@ pub enum DriverOptionField {
     CustomUserAgent,
     CodexFastMode,
     CodexImageGenerationEnabled,
+    CodexResponsesKeepaliveIntervalMs,
+    CodexRoutingHintEnabled,
     CodexWebsocketEnabled,
 }
 
@@ -117,6 +119,8 @@ impl DriverOptionField {
             Self::CustomUserAgent => "customUserAgent",
             Self::CodexFastMode => "codexFastMode",
             Self::CodexImageGenerationEnabled => "codexImageGenerationEnabled",
+            Self::CodexResponsesKeepaliveIntervalMs => "codexResponsesKeepaliveIntervalMs",
+            Self::CodexRoutingHintEnabled => "codexRoutingHintEnabled",
             Self::CodexWebsocketEnabled => "codexWebsocketEnabled",
         }
     }
