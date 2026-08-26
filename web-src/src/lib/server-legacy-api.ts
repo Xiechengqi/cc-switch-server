@@ -107,6 +107,7 @@ export interface AccountRecord {
   scopes?: string[];
   hasAccessToken: boolean;
   hasRefreshToken: boolean;
+  credentialCapability?: "refreshable_oauth" | "access_only_setup_token";
   hasIdToken: boolean;
   hasApiKey: boolean;
   hasExtraHeaders: boolean;
@@ -450,6 +451,7 @@ export interface AccountLoginAccountSummary {
   expiresAt?: number | null;
   hasAccessToken: boolean;
   hasRefreshToken: boolean;
+  credentialCapability?: "refreshable_oauth" | "access_only_setup_token";
   scopes: string[];
 }
 

@@ -2,15 +2,20 @@ use std::collections::HashSet;
 use std::io::Read;
 
 use axum::http::{HeaderMap, HeaderValue};
+use brotli::Decompressor as BrotliDecoder;
 use bytes::Bytes;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde_json::Value;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use super::tool_media::{replace_media_with_text, ToolMediaScope};
 
 use super::ProxyError;
 
+const EXTENDED_RESPONSE_DECODING_ENV: &str = "CC_SWITCH_RESPONSE_EXTENDED_DECODING";
+
 const UNSUPPORTED_IMAGE_MARKER: &str = "[Unsupported Image]";
+const MAX_CONTENT_CODING_LAYERS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RequestGovernanceConfig {
@@ -60,7 +65,9 @@ pub(crate) fn decode_request_body_for_proxy(
     let Some(codings) = content_encoding_tokens(headers) else {
         return Ok(body);
     };
-    if codings.iter().any(|coding| !is_supported_coding(coding)) {
+    if codings.len() > MAX_CONTENT_CODING_LAYERS
+        || codings.iter().any(|coding| !is_supported_coding(coding))
+    {
         return Err(ProxyError::bad_request(format!(
             "unsupported request content-encoding: {}",
             codings.join(", ")
@@ -85,7 +92,9 @@ pub(crate) fn decode_request_body_for_proxy_with_limit(
     let Some(codings) = content_encoding_tokens(headers) else {
         return Ok(body);
     };
-    if codings.iter().any(|coding| !is_supported_coding(coding)) {
+    if codings.len() > MAX_CONTENT_CODING_LAYERS
+        || codings.iter().any(|coding| !is_supported_coding(coding))
+    {
         return Err(ProxyError::bad_request(format!(
             "unsupported request content-encoding: {}",
             codings.join(", ")
@@ -118,13 +127,21 @@ pub(super) fn decode_response_body_for_proxy(
     headers: &HeaderMap,
     body: Bytes,
 ) -> ResponseDecodeResult {
-    let Some(codings) = content_encoding_tokens(headers) else {
+    let Some(codings) = content_encoding_tokens(headers).or_else(|| {
+        extended_response_decoding_enabled()
+            .then(|| sniff_response_coding(&body))
+            .flatten()
+    }) else {
         return ResponseDecodeResult {
             body,
             preserve_content_encoding: false,
         };
     };
-    if codings.iter().any(|coding| !is_supported_coding(coding)) {
+    if codings.len() > MAX_CONTENT_CODING_LAYERS
+        || codings
+            .iter()
+            .any(|coding| !is_supported_response_coding(coding))
+    {
         return ResponseDecodeResult {
             body,
             preserve_content_encoding: true,
@@ -150,17 +167,39 @@ pub(super) fn decode_response_body_for_proxy_with_limit(
     if body.len() > decoded_limit {
         return Err(decoded_response_body_too_large(decoded_limit));
     }
-    let Some(codings) = content_encoding_tokens(headers) else {
+    if response_content_encoding_header_invalid(headers) {
+        return Err(ProxyError::bad_gateway(
+            "invalid upstream response content-encoding header",
+        ));
+    }
+    let declared_codings = content_encoding_tokens(headers);
+    let sniffed_codings = sniff_response_coding(&body);
+    if declared_codings.is_none()
+        && sniffed_codings.is_some()
+        && !extended_response_decoding_enabled()
+    {
+        return Err(ProxyError::bad_gateway(
+            "headerless compressed upstream response decoding is disabled",
+        ));
+    }
+    let Some(codings) = declared_codings.or(sniffed_codings) else {
         return Ok(ResponseDecodeResult {
             body,
             preserve_content_encoding: false,
         });
     };
-    if codings.iter().any(|coding| !is_supported_coding(coding)) {
-        return Ok(ResponseDecodeResult {
-            body,
-            preserve_content_encoding: true,
-        });
+    if codings.len() > MAX_CONTENT_CODING_LAYERS {
+        return Err(ProxyError::bad_gateway(format!(
+            "upstream response content-encoding exceeds the {MAX_CONTENT_CODING_LAYERS} layer limit"
+        )));
+    }
+    if codings
+        .iter()
+        .any(|coding| !is_supported_response_coding(coding))
+    {
+        return Err(ProxyError::bad_gateway(
+            "unsupported upstream response content-encoding",
+        ));
     }
     match decode_content_codings_bounded(body.clone(), &codings, decoded_limit) {
         Ok(decoded) => Ok(ResponseDecodeResult {
@@ -168,10 +207,10 @@ pub(super) fn decode_response_body_for_proxy_with_limit(
             preserve_content_encoding: false,
         }),
         Err(BoundedDecodeError::TooLarge) => Err(decoded_response_body_too_large(decoded_limit)),
-        Err(BoundedDecodeError::Io(_)) => Ok(ResponseDecodeResult {
-            body,
-            preserve_content_encoding: true,
-        }),
+        Err(BoundedDecodeError::Io(_)) => Err(ProxyError::bad_gateway(format!(
+            "failed to decode upstream response content-encoding {}",
+            codings.join(", ")
+        ))),
     }
 }
 
@@ -184,6 +223,21 @@ fn decoded_response_body_too_large(limit: usize) -> ProxyError {
 
 pub(super) fn content_encoding_value(headers: &HeaderMap) -> Option<HeaderValue> {
     headers.get(axum::http::header::CONTENT_ENCODING).cloned()
+}
+
+pub(super) fn response_decoding_required(headers: &HeaderMap, prefix: &[u8]) -> bool {
+    content_encoding_tokens(headers).is_some() || sniff_response_coding(prefix).is_some()
+}
+
+pub(super) fn extended_response_decoding_enabled() -> bool {
+    let Ok(value) = std::env::var(EXTENDED_RESPONSE_DECODING_ENV) else {
+        return true;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => true,
+        "0" | "false" | "no" | "off" | "disabled" => false,
+        _ => true,
+    }
 }
 
 fn filter_private_params_with_whitelist(body: &mut Value, whitelist: &[String]) {
@@ -394,12 +448,11 @@ fn is_known_text_only_model(model: &str) -> bool {
 }
 
 fn content_encoding_tokens(headers: &HeaderMap) -> Option<Vec<String>> {
-    let value = headers
-        .get(axum::http::header::CONTENT_ENCODING)?
-        .to_str()
-        .ok()?;
-    let codings = value
-        .split(',')
+    let codings = headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
         .map(|coding| coding.trim().to_ascii_lowercase())
         .filter(|coding| !coding.is_empty() && coding != "identity")
         .collect::<Vec<_>>();
@@ -410,8 +463,30 @@ fn content_encoding_tokens(headers: &HeaderMap) -> Option<Vec<String>> {
     }
 }
 
+fn response_content_encoding_header_invalid(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| value.to_str().is_err())
+}
+
 fn is_supported_coding(coding: &str) -> bool {
+    matches!(coding, "gzip" | "x-gzip" | "deflate" | "br" | "zstd")
+}
+
+fn is_supported_response_coding(coding: &str) -> bool {
     matches!(coding, "gzip" | "x-gzip" | "deflate")
+        || (extended_response_decoding_enabled() && matches!(coding, "br" | "zstd"))
+}
+
+fn sniff_response_coding(body: &[u8]) -> Option<Vec<String>> {
+    if body.starts_with(&[0x1f, 0x8b]) {
+        Some(vec!["gzip".to_string()])
+    } else if body.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some(vec!["zstd".to_string()])
+    } else {
+        None
+    }
 }
 
 fn decode_content_codings(body: Bytes, codings: &[String]) -> std::io::Result<Bytes> {
@@ -445,6 +520,8 @@ fn decode_single_coding(coding: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
         "deflate" => {
             read_all(ZlibDecoder::new(body)).or_else(|_| read_all(DeflateDecoder::new(body)))
         }
+        "br" => read_all(BrotliDecoder::new(body, 8 * 1024)),
+        "zstd" => read_all(ZstdDecoder::new(body)?),
         _ => Ok(body.to_vec()),
     }
 }
@@ -460,6 +537,10 @@ fn decode_single_coding_bounded(
             Err(BoundedDecodeError::Io(_)) => read_all_bounded(DeflateDecoder::new(body), limit),
             result => result,
         },
+        "br" => read_all_bounded(BrotliDecoder::new(body, 8 * 1024), limit),
+        "zstd" => ZstdDecoder::new(body)
+            .map_err(BoundedDecodeError::Io)
+            .and_then(|decoder| read_all_bounded(decoder, limit)),
         _ => Ok(body.to_vec()),
     }
 }
@@ -542,6 +623,103 @@ mod tests {
             decode_response_body_for_proxy_with_limit(&gzip_headers, Bytes::from(compressed), 128)
                 .unwrap_err();
         assert_eq!(expanded_error.status, axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn bounded_response_decode_rejects_invalid_unknown_and_excessive_encodings() {
+        let mut truncated_headers = HeaderMap::new();
+        truncated_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let truncated = decode_response_body_for_proxy_with_limit(
+            &truncated_headers,
+            Bytes::from_static(&[0x1f, 0x8b, 0x08, 0x00]),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(truncated.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(truncated.message.contains("failed to decode"));
+
+        let mut unknown_headers = HeaderMap::new();
+        unknown_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("custom"));
+        let unknown = decode_response_body_for_proxy_with_limit(
+            &unknown_headers,
+            Bytes::from_static(b"opaque"),
+            1024,
+        )
+        .unwrap_err();
+        assert!(unknown.message.contains("unsupported"));
+
+        let mut layered_headers = HeaderMap::new();
+        layered_headers.insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_static("gzip, br, zstd, deflate, gzip"),
+        );
+        let layered = decode_response_body_for_proxy_with_limit(
+            &layered_headers,
+            Bytes::from_static(b"opaque"),
+            1024,
+        )
+        .unwrap_err();
+        assert!(layered.message.contains("layer limit"));
+    }
+
+    #[test]
+    fn decodes_brotli_zstd_and_stacked_response_encodings() {
+        let body = br#"{"type":"message","content":"ok"}"#;
+
+        let mut brotli = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut brotli, 8 * 1024, 5, 22);
+            encoder.write_all(body).unwrap();
+        }
+        let mut br_headers = HeaderMap::new();
+        br_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        let decoded =
+            decode_response_body_for_proxy_with_limit(&br_headers, Bytes::from(brotli), 1024)
+                .unwrap();
+        assert_eq!(decoded.body.as_ref(), body);
+        assert!(!decoded.preserve_content_encoding);
+
+        let zstd = zstd::stream::encode_all(body.as_slice(), 1).unwrap();
+        let mut zstd_headers = HeaderMap::new();
+        zstd_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        let decoded =
+            decode_response_body_for_proxy_with_limit(&zstd_headers, Bytes::from(zstd), 1024)
+                .unwrap();
+        assert_eq!(decoded.body.as_ref(), body);
+
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(body).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let mut stacked = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut stacked, 8 * 1024, 5, 22);
+            encoder.write_all(&gzip).unwrap();
+        }
+        let mut stacked_headers = HeaderMap::new();
+        stacked_headers.append(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        stacked_headers.append(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        let decoded =
+            decode_response_body_for_proxy_with_limit(&stacked_headers, Bytes::from(stacked), 1024)
+                .unwrap();
+        assert_eq!(decoded.body.as_ref(), body);
+    }
+
+    #[test]
+    fn sniffs_headerless_gzip_and_zstd_responses() {
+        let body = br#"{"error":{"message":"limited"}}"#;
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(body).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let decoded =
+            decode_response_body_for_proxy_with_limit(&HeaderMap::new(), Bytes::from(gzip), 1024)
+                .unwrap();
+        assert_eq!(decoded.body.as_ref(), body);
+
+        let zstd = zstd::stream::encode_all(body.as_slice(), 1).unwrap();
+        let decoded =
+            decode_response_body_for_proxy_with_limit(&HeaderMap::new(), Bytes::from(zstd), 1024)
+                .unwrap();
+        assert_eq!(decoded.body.as_ref(), body);
     }
 
     #[test]

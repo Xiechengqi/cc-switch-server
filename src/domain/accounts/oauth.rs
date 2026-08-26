@@ -186,6 +186,91 @@ pub struct OAuthIdentity {
     pub organizations: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCredentialCapability {
+    RefreshableOAuth,
+    AccessOnlySetupToken,
+}
+
+impl ClaudeCredentialCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RefreshableOAuth => "refreshable_oauth",
+            Self::AccessOnlySetupToken => "access_only_setup_token",
+        }
+    }
+}
+
+/// Returns whether a Claude token scope is explicitly inference-only.
+///
+/// This decision is shared by login enrichment and credential persistence so
+/// setup-token/access-only credentials never have to call profile endpoints
+/// they are not authorized to use.
+pub fn claude_scope_is_inference_only(scope: Option<&str>) -> bool {
+    let scopes = scope.map(split_scopes).unwrap_or_default();
+    !scopes.is_empty()
+        && scopes.iter().any(|scope| scope == "user:inference")
+        && !scopes
+            .iter()
+            .any(|scope| matches!(scope.as_str(), "user:profile" | "user:office"))
+}
+
+pub fn claude_setup_token_enabled() -> bool {
+    let Ok(value) = std::env::var("CC_SWITCH_CLAUDE_SETUP_TOKEN") else {
+        return true;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => true,
+        "0" | "false" | "no" | "off" | "disabled" => false,
+        _ => true,
+    }
+}
+
+fn stable_claude_setup_token_account_id(access_token: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:claude-setup-token:v1\0");
+    digest.update(access_token.as_bytes());
+    format!("claude-setup-{}", hex::encode(&digest.finalize()[..12]))
+}
+
+pub fn set_claude_credential_capability(
+    profile: &mut Option<Value>,
+    capability: ClaudeCredentialCapability,
+) {
+    let value = profile.get_or_insert_with(|| json!({}));
+    if !value.is_object() {
+        *value = json!({});
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "credentialCapability".to_string(),
+            Value::String(capability.as_str().to_string()),
+        );
+        object.insert(
+            "profileEnrichment".to_string(),
+            Value::String(
+                if capability == ClaudeCredentialCapability::AccessOnlySetupToken {
+                    "fail_soft"
+                } else {
+                    "supported"
+                }
+                .to_string(),
+            ),
+        );
+    }
+}
+
+pub fn claude_credential_capability_from_profile(
+    profile: Option<&Value>,
+) -> Option<ClaudeCredentialCapability> {
+    match profile?.get("credentialCapability")?.as_str()? {
+        "refreshable_oauth" => Some(ClaudeCredentialCapability::RefreshableOAuth),
+        "access_only_setup_token" => Some(ClaudeCredentialCapability::AccessOnlySetupToken),
+        _ => None,
+    }
+}
+
 static CODEX_TOKEN_URLS: &[&str] = &["https://auth.openai.com/oauth/token"];
 static CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const CODEX_CLI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
@@ -1475,6 +1560,33 @@ fn upsert_input_from_login_response_inner(
     quota_refresh_interval_ms: i64,
     verified_identity: Option<&OAuthIdentity>,
 ) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    if provider_type == ProviderType::ClaudeOAuth
+        && claude_scope_is_inference_only(response.scope.as_deref())
+        && response
+            .refresh_token
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && !claude_setup_token_enabled()
+    {
+        return Err(missing_credential(
+            "Claude access-only setup-token support is disabled",
+        ));
+    }
+    let claude_credential_capability = (provider_type == ProviderType::ClaudeOAuth).then(|| {
+        if response
+            .refresh_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            ClaudeCredentialCapability::RefreshableOAuth
+        } else if claude_scope_is_inference_only(response.scope.as_deref()) {
+            ClaudeCredentialCapability::AccessOnlySetupToken
+        } else {
+            ClaudeCredentialCapability::RefreshableOAuth
+        }
+    });
+    let claude_access_only =
+        claude_credential_capability == Some(ClaudeCredentialCapability::AccessOnlySetupToken);
     let identity = match provider_type {
         ProviderType::CodexOAuth => verified_identity.cloned().ok_or_else(|| {
             missing_credential("codex_oauth account import requires verified OpenAI identity")
@@ -1511,6 +1623,10 @@ fn upsert_input_from_login_response_inner(
             .ok_or_else(|| {
                 missing_credential("grok_oauth verified identity does not contain subject")
             })?,
+        ProviderType::ClaudeOAuth if claude_access_only => identity
+            .account_id
+            .clone()
+            .unwrap_or_else(|| stable_claude_setup_token_account_id(&response.access_token)),
         _ => identity.account_id.clone().ok_or_else(|| {
             missing_credential(format!(
                 "{} token response does not contain an account id",
@@ -1519,6 +1635,7 @@ fn upsert_input_from_login_response_inner(
         })?,
     };
     if provider_token_exchange_available(provider_type)
+        && !claude_access_only
         && response
             .refresh_token
             .as_deref()
@@ -1562,6 +1679,9 @@ fn upsert_input_from_login_response_inner(
     update.profile =
         login_profile_value(provider_type, &identity, &token_raw, profile_raw.as_ref())
             .or(update.profile);
+    if let Some(capability) = claude_credential_capability {
+        set_claude_credential_capability(&mut update.profile, capability);
+    }
     if provider_type == ProviderType::GrokOAuth {
         crate::domain::accounts::store::set_verified_grok_claims(
             &mut update.profile,
@@ -1618,7 +1738,11 @@ pub fn merge_refresh_updates(
         base.scopes = overlay.scopes;
     }
     if overlay.profile.is_some() {
+        let claude_capability = claude_credential_capability_from_profile(base.profile.as_ref());
         base.profile = overlay.profile;
+        if let Some(capability) = claude_capability {
+            set_claude_credential_capability(&mut base.profile, capability);
+        }
     }
     if overlay.raw.is_some() {
         base.raw = overlay.raw;
@@ -3196,6 +3320,71 @@ mod tests {
                 .and_then(|value| value["source"].as_str()),
             Some("login_exchange")
         );
+    }
+
+    #[test]
+    fn claude_inference_only_token_is_explicitly_access_only() {
+        let raw = json!({
+            "access_token": "setup-token-secret",
+            "scope": "user:inference user:ccr_inference user:file_upload"
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let input = upsert_input_from_login_response(
+            ProviderType::ClaudeOAuth,
+            &response,
+            raw,
+            None,
+            1_000,
+            30 * 60 * 1000,
+        )
+        .expect("inference-only setup token");
+
+        assert!(input.id.as_deref().unwrap().starts_with("claude-setup-"));
+        assert_eq!(input.refresh_token, None);
+        assert_eq!(input.expires_at, None);
+        assert_eq!(
+            input.profile.as_ref().unwrap()["credentialCapability"],
+            "access_only_setup_token"
+        );
+        assert_eq!(
+            input.profile.as_ref().unwrap()["profileEnrichment"],
+            "fail_soft"
+        );
+        assert_eq!(
+            input.scopes,
+            vec!["user:inference", "user:ccr_inference", "user:file_upload"]
+        );
+    }
+
+    #[test]
+    fn claude_inference_only_scope_requires_inference_and_excludes_profile_scopes() {
+        assert!(claude_scope_is_inference_only(Some(
+            "user:inference user:ccr_inference user:file_upload"
+        )));
+        assert!(!claude_scope_is_inference_only(Some(
+            "user:inference user:profile"
+        )));
+        assert!(!claude_scope_is_inference_only(Some(
+            "user:inference user:office"
+        )));
+        assert!(!claude_scope_is_inference_only(Some("user:file_upload")));
+        assert!(!claude_scope_is_inference_only(None));
+    }
+
+    #[test]
+    fn claude_missing_refresh_is_not_inferred_as_setup_token_without_scope() {
+        let raw = json!({"access_token": "ambiguous-token"});
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let error = upsert_input_from_login_response(
+            ProviderType::ClaudeOAuth,
+            &response,
+            raw,
+            None,
+            1_000,
+            30 * 60 * 1000,
+        )
+        .expect_err("missing explicit inference-only scope");
+        assert!(error.message.contains("account id") || error.message.contains("refresh_token"));
     }
 
     #[test]

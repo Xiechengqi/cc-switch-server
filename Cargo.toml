@@ -13,6 +13,7 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
+brotli = "8"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -42,6 +43,7 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 md5 = "0.7"
 multer = "3"
 rand = "0.8"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls-webpki-roots", "stream"] }
 rsa = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -60,6 +62,7 @@ tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 twox-hash = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
 zeroize = { version = "1", features = ["derive"] }
 portable-pty = "0.8"
 

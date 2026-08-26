@@ -338,6 +338,23 @@ pub fn record_claude_beta_decision(operation: &'static str, decision: &'static s
     .increment(1);
 }
 
+pub fn record_claude_client_class(class: &'static str, operation: &'static str) {
+    metrics::counter!(
+        "cc_switch_claude_client_class_total",
+        "class" => class,
+        "operation" => operation
+    )
+    .increment(1);
+}
+
+pub fn record_claude_rate_limit_scope(scope: &'static str) {
+    metrics::counter!("cc_switch_claude_rate_limit_scope_total", "scope" => scope).increment(1);
+}
+
+pub fn record_claude_optional_rewrite(kind: &'static str) {
+    metrics::counter!("cc_switch_claude_optional_rewrite_total", "kind" => kind).increment(1);
+}
+
 pub fn record_claude_ttfb(elapsed: std::time::Duration) {
     metrics::histogram!("cc_switch_claude_ttfb_seconds").record(elapsed.as_secs_f64());
 }
@@ -355,6 +372,15 @@ pub fn record_claude_semantic_failure(stage: &'static str, kind: &'static str) {
         "cc_switch_claude_semantic_failure_total",
         "stage" => stage,
         "kind" => kind
+    )
+    .increment(1);
+}
+
+pub fn record_claude_response_decoding(surface: &'static str, result: &'static str) {
+    metrics::counter!(
+        "cc_switch_claude_response_decoding_total",
+        "surface" => surface,
+        "result" => result
     )
     .increment(1);
 }
@@ -538,6 +564,18 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_claude_beta_decision_total",
         "Bounded Claude beta policy decisions"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_client_class_total",
+        "Claude OAuth requests by fail-closed client class and operation"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_rate_limit_scope_total",
+        "Claude OAuth 429 responses by bounded local cooldown scope"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_optional_rewrite_total",
+        "Bounded optional Claude wire rewrites"
     );
     metrics::describe_histogram!(
         "cc_switch_claude_ttfb_seconds",

@@ -4,7 +4,8 @@ use crate::domain::accounts::capability_evidence::{
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::login::{OAuthLoginCancellation, OAuthLoginFinish, OAuthLoginStart};
 use crate::domain::accounts::oauth::{
-    OAuthErrorKind, OAuthHttpRequest, OAuthQuotaStrategy, OAuthSupportStage,
+    claude_credential_capability_from_profile, ClaudeCredentialCapability, OAuthErrorKind,
+    OAuthHttpRequest, OAuthQuotaStrategy, OAuthSupportStage,
 };
 use crate::domain::accounts::store::{Account, AccountQuota, CodexOAuthAccountSelection};
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRule;
@@ -79,6 +80,8 @@ pub(in crate::api) struct AccountPublicView {
     pub(in crate::api) rate_limited_until: Option<i64>,
     pub(in crate::api) has_access_token: bool,
     pub(in crate::api) has_refresh_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) credential_capability: Option<ClaudeCredentialCapability>,
     pub(in crate::api) has_id_token: bool,
     pub(in crate::api) has_api_key: bool,
     pub(in crate::api) has_extra_headers: bool,
@@ -115,6 +118,9 @@ impl From<&Account> for AccountPublicView {
             rate_limited_until: account.rate_limited_until,
             has_access_token: has_non_empty_secret(account.access_token.as_deref()),
             has_refresh_token: has_non_empty_secret(account.refresh_token.as_deref()),
+            credential_capability: (account.provider_type == ProviderType::ClaudeOAuth)
+                .then(|| claude_credential_capability_from_profile(account.profile.as_ref()))
+                .flatten(),
             has_id_token: has_non_empty_secret(account.id_token.as_deref()),
             has_api_key: has_non_empty_secret(account.api_key.as_deref()),
             has_extra_headers: !account.extra_headers.is_empty(),
@@ -788,6 +794,8 @@ pub(in crate::api) struct AccountLoginAccountSummary {
     pub(in crate::api) expires_at: Option<i64>,
     pub(in crate::api) has_access_token: bool,
     pub(in crate::api) has_refresh_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) credential_capability: Option<ClaudeCredentialCapability>,
     pub(in crate::api) scopes: Vec<String>,
 }
 
@@ -810,6 +818,9 @@ impl AccountLoginAccountSummary {
                 .refresh_token
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty()),
+            credential_capability: (account.provider_type == ProviderType::ClaudeOAuth)
+                .then(|| claude_credential_capability_from_profile(account.profile.as_ref()))
+                .flatten(),
             scopes: account.scopes.clone(),
         }
     }

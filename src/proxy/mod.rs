@@ -2,9 +2,12 @@
 
 mod account_headers;
 pub mod adapters;
+mod anthropic_cache_control;
+mod anthropic_dateline;
 mod anthropic_semantics;
 mod antigravity_retry;
 mod cache_injector;
+mod claude_client_detection;
 pub(crate) mod claude_oauth;
 mod codex_compaction;
 mod codex_http;

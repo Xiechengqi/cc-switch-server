@@ -81,7 +81,7 @@ use super::provider_ops::{ProviderExecution, ProviderOperation};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
-    ResponseDecodeResult,
+    response_decoding_required, ResponseDecodeResult,
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesSseInspector, SemanticFailure, SemanticObservation,
@@ -2594,7 +2594,76 @@ async fn forward_with_attempt(
                 first_byte: execution.stream_first_byte_timeout(),
                 idle: execution.stream_idle_timeout(),
             };
-            let mut inner = upstream.bytes_stream().boxed();
+            let stream_first_event_deadline = timeouts
+                .first_byte
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+            let mut inner = if stored.provider_type == ProviderType::ClaudeOAuth
+                && route == ProxyRoute::ClaudeMessages
+            {
+                match prepare_claude_streaming_response(
+                    upstream,
+                    &response_headers,
+                    timeouts,
+                    stream_first_event_deadline,
+                    PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                )
+                .await
+                {
+                    Ok(prepared) => {
+                        crate::metrics::record_claude_response_decoding(
+                            "sse",
+                            if prepared.decoded {
+                                "decoded"
+                            } else {
+                                "identity"
+                            },
+                        );
+                        if prepared.decoded {
+                            response_headers.remove(CONTENT_ENCODING);
+                            response_headers.remove(CONTENT_LENGTH);
+                        }
+                        prepared.inner
+                    }
+                    Err(StreamingResponsePreparationError::Transport(error)) => {
+                        crate::metrics::record_claude_response_decoding("sse", "transport_error");
+                        record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
+                            .await;
+                        if let Some(next_attempt) = next_claude_transport_attempt(
+                            &state,
+                            route,
+                            &headers,
+                            &request_context,
+                            &attempt_context,
+                            &execution,
+                            "compressed_stream_prepare",
+                        )
+                        .await
+                        {
+                            attempt_context = next_attempt;
+                            drop(account_in_flight_guard);
+                            drop(share_invocation_guard);
+                            continue 'attempt;
+                        }
+                        return Err(ProxyError {
+                            status: StatusCode::from_u16(error.status_code())
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            message: error.to_string(),
+                        });
+                    }
+                    Err(StreamingResponsePreparationError::Protocol(error)) => {
+                        crate::metrics::record_claude_response_decoding("sse", "protocol_error");
+                        record_provider_outcome(
+                            &state,
+                            &stored,
+                            ProviderOutcome::Failure { status_code: 502 },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                upstream.bytes_stream().boxed()
+            };
             let mut pending_chunk = None;
             let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
             let mut sse_error_outcome_recorded = false;
@@ -2655,15 +2724,11 @@ async fn forward_with_attempt(
                 let mut semantic_decision = None;
                 let mut semantic_protocol_error = None;
                 let mut anthropic_event_ready = false;
-                let semantic_commit_deadline = inspect_responses_semantics
-                    .then_some(timeouts.first_byte)
-                    .flatten()
-                    .or_else(|| {
-                        inspect_anthropic_semantics
-                            .then_some(timeouts.first_byte)
-                            .flatten()
-                    })
-                    .map(|timeout| tokio::time::Instant::now() + timeout);
+                let semantic_commit_deadline = (inspect_responses_semantics
+                    || inspect_anthropic_semantics
+                    || sse_error_detector.is_some())
+                .then_some(stream_first_event_deadline)
+                .flatten();
                 let first_chunk = loop {
                     let next = if let Some(deadline) = semantic_commit_deadline {
                         let timeout = timeouts
@@ -3840,11 +3905,45 @@ async fn forward_with_attempt(
                     return Err(ProxyError::bad_gateway(error));
                 }
             };
-            decode_response_body_for_proxy_with_limit(
+            let decoding_required =
+                response_decoding_required(&response_headers, &bytes[..bytes.len().min(4)]);
+            let decoded = decode_response_body_for_proxy_with_limit(
                 &response_headers,
                 bytes,
                 PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-            )?
+            );
+            if stored.provider_type == ProviderType::ClaudeOAuth {
+                let surface = if !status.is_success() {
+                    "error"
+                } else if route == ProxyRoute::ClaudeCountTokens {
+                    "count_tokens"
+                } else {
+                    "json"
+                };
+                crate::metrics::record_claude_response_decoding(
+                    surface,
+                    match &decoded {
+                        Ok(decoded) if decoded.preserve_content_encoding => "preserved",
+                        Ok(_) if decoding_required => "decoded",
+                        Ok(_) => "identity",
+                        Err(_) => "protocol_error",
+                    },
+                );
+            }
+            match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    if stored.provider_type == ProviderType::ClaudeOAuth {
+                        record_provider_outcome(
+                            &state,
+                            &stored,
+                            ProviderOutcome::Failure { status_code: 502 },
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
         };
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
@@ -12552,6 +12651,51 @@ async fn maybe_mark_upstream_rate_limited(
         return;
     }
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    if execution.stored.provider_type == ProviderType::ClaudeOAuth {
+        match classify_claude_rate_limit(headers, body, now) {
+            ClaudeRateLimitScope::RequestEntitlement => {
+                crate::metrics::record_claude_rate_limit_scope("request_entitlement");
+                return;
+            }
+            ClaudeRateLimitScope::ShareModel { until, reason } => {
+                crate::metrics::record_claude_rate_limit_scope("share_model");
+                if let (Some(share_id), Some(model)) = (
+                    share_id.map(str::trim).filter(|value| !value.is_empty()),
+                    model.map(str::trim).filter(|value| !value.is_empty()),
+                ) {
+                    state.mark_share_model_cooldown(
+                        share_id,
+                        &execution.plan.runtime_fingerprint,
+                        model,
+                        until,
+                        reason,
+                        now,
+                    );
+                }
+                return;
+            }
+            ClaudeRateLimitScope::AccountUnified { until } => {
+                crate::metrics::record_claude_rate_limit_scope("account_unified");
+                let Some((provider_type, account_id, auth_identity_generation)) =
+                    execution.managed_account_identity_target()
+                else {
+                    return;
+                };
+                state
+                    .mark_account_rate_limited_until_if_current(
+                        account_id,
+                        provider_type,
+                        auth_identity_generation,
+                        until,
+                        Some(format!(
+                            "Anthropic unified subscription window is rate limited until {until}"
+                        )),
+                    )
+                    .await;
+                return;
+            }
+        }
+    }
     if execution.stored.provider_type == ProviderType::CodexOAuth
         && !codex_account_rate_limit_evidence(headers, body)
     {
@@ -12593,6 +12737,133 @@ async fn maybe_mark_upstream_rate_limited(
             Some(message),
         )
         .await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeRateLimitScope {
+    AccountUnified { until: i64 },
+    ShareModel { until: i64, reason: &'static str },
+    RequestEntitlement,
+}
+
+fn classify_claude_rate_limit(headers: &HeaderMap, body: &[u8], now: i64) -> ClaudeRateLimitScope {
+    if claude_fast_credit_refusal(body) {
+        return ClaudeRateLimitScope::RequestEntitlement;
+    }
+    let unified = header_lower(headers, "anthropic-ratelimit-unified-status");
+    let status_5h = header_lower(headers, "anthropic-ratelimit-unified-5h-status");
+    let status_7d = header_lower(headers, "anthropic-ratelimit-unified-7d-status");
+    let status_7d_oi = header_lower(headers, "anthropic-ratelimit-unified-7d_oi-status");
+    let account_window_rejected =
+        status_5h.as_deref() == Some("rejected") || status_7d.as_deref() == Some("rejected");
+    if account_window_rejected {
+        let until = [
+            "anthropic-ratelimit-unified-reset",
+            "anthropic-ratelimit-unified-5h-reset",
+            "anthropic-ratelimit-unified-7d-reset",
+        ]
+        .into_iter()
+        .filter_map(|name| parse_anthropic_reset_header(headers, name, now))
+        .chain(super::grok::retry_after_until_ms(headers, now))
+        .max()
+        .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
+        return ClaudeRateLimitScope::AccountUnified {
+            until: super::bounded_upstream_rate_limit_until(now, until),
+        };
+    }
+
+    if status_7d_oi.as_deref() == Some("rejected") {
+        let until =
+            parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-7d_oi-reset", now)
+                .or_else(|| super::grok::retry_after_until_ms(headers, now))
+                .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
+        return ClaudeRateLimitScope::ShareModel {
+            until: super::bounded_upstream_rate_limit_until(now, until),
+            reason: "anthropic_fable_7d_oi",
+        };
+    }
+
+    if unified.as_deref() == Some("rejected") {
+        let until = parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-reset", now)
+            .or_else(|| super::grok::retry_after_until_ms(headers, now))
+            .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
+        return ClaudeRateLimitScope::AccountUnified {
+            until: super::bounded_upstream_rate_limit_until(now, until),
+        };
+    }
+
+    let retry_after = super::grok::retry_after_until_ms(headers, now);
+    ClaudeRateLimitScope::ShareModel {
+        until: super::bounded_upstream_rate_limit_until(
+            now,
+            retry_after
+                .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
+        ),
+        reason: if retry_after.is_some() {
+            "anthropic_model_rate_limit"
+        } else {
+            "anthropic_unknown_429"
+        },
+    }
+}
+
+fn header_lower(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn parse_anthropic_reset_header(headers: &HeaderMap, name: &str, now: i64) -> Option<i64> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(number) = value.parse::<f64>() {
+        if !number.is_finite() || number <= 0.0 {
+            return None;
+        }
+        let timestamp = if number < 10_000_000.0 {
+            now.saturating_add((number * 1_000.0).min(i64::MAX as f64) as i64)
+        } else if number > 10_000_000_000.0 {
+            number.min(i64::MAX as f64) as i64
+        } else {
+            (number * 1_000.0).min(i64::MAX as f64) as i64
+        };
+        if timestamp > now {
+            return Some(timestamp);
+        }
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.timestamp_millis())
+        .or_else(|| {
+            httpdate::parse_http_date(value).ok().and_then(|value| {
+                value
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            })
+        })
+        .filter(|until| *until > now)
+}
+
+fn claude_fast_credit_refusal(body: &[u8]) -> bool {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+        .to_ascii_lowercase();
+    message.contains("fast request rejected")
+        || (message.contains("fast")
+            && (message.contains("usage credits") || message.contains("credits are required")))
 }
 
 fn antigravity_limit_info(
@@ -19466,6 +19737,171 @@ struct StreamTimeoutConfig {
     idle: Option<Duration>,
 }
 
+struct PreparedStreamingResponse {
+    inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    decoded: bool,
+}
+
+enum StreamingResponsePreparationError {
+    Transport(StreamReadError),
+    Protocol(ProxyError),
+}
+
+async fn prepare_claude_streaming_response(
+    upstream: reqwest::Response,
+    response_headers: &HeaderMap,
+    timeouts: StreamTimeoutConfig,
+    first_event_deadline: Option<tokio::time::Instant>,
+    decoded_limit: usize,
+) -> Result<PreparedStreamingResponse, StreamingResponsePreparationError> {
+    let mut inner = upstream.bytes_stream().boxed();
+    let mut invalid_declared_encoding = false;
+    let mut declared_encoding = false;
+    for value in response_headers.get_all(CONTENT_ENCODING) {
+        match value.to_str() {
+            Ok(value) => {
+                declared_encoding |= value.split(',').any(|coding| {
+                    let coding = coding.trim();
+                    !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")
+                });
+            }
+            Err(_) => invalid_declared_encoding = true,
+        }
+    }
+    if invalid_declared_encoding {
+        return Err(StreamingResponsePreparationError::Protocol(
+            ProxyError::bad_gateway("invalid upstream SSE content-encoding header"),
+        ));
+    }
+
+    let mut prefix = Vec::with_capacity(4);
+    let mut prefetched_remainder = None;
+    if !declared_encoding {
+        while prefix.len() < 4 {
+            let next = next_stream_chunk_for_preparation(
+                &mut inner,
+                first_event_deadline,
+                timeouts,
+                prefix.is_empty(),
+            )
+            .await
+            .map_err(StreamingResponsePreparationError::Transport)?;
+            let Some(chunk) = next else {
+                break;
+            };
+            let take = (4 - prefix.len()).min(chunk.len());
+            prefix.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                prefetched_remainder = Some(chunk.slice(take..));
+                break;
+            }
+        }
+        if !response_decoding_required(response_headers, &prefix) {
+            let mut prefetched = Vec::with_capacity(2);
+            if !prefix.is_empty() {
+                prefetched.push(Bytes::from(prefix));
+            }
+            if let Some(remainder) = prefetched_remainder {
+                prefetched.push(remainder);
+            }
+            let inner = if prefetched.is_empty() {
+                inner
+            } else {
+                stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>))
+                    .chain(inner)
+                    .boxed()
+            };
+            return Ok(PreparedStreamingResponse {
+                inner,
+                decoded: false,
+            });
+        }
+    }
+
+    let mut wire_body = prefix;
+    if let Some(remainder) = prefetched_remainder {
+        if remainder.len() > decoded_limit.saturating_sub(wire_body.len()) {
+            return Err(StreamingResponsePreparationError::Protocol(
+                ProxyError::bad_gateway(format!(
+                    "compressed upstream SSE response exceeds the {decoded_limit} byte limit"
+                )),
+            ));
+        }
+        wire_body.extend_from_slice(&remainder);
+    }
+    loop {
+        let next = next_stream_chunk_for_preparation(
+            &mut inner,
+            first_event_deadline,
+            timeouts,
+            wire_body.is_empty(),
+        )
+        .await
+        .map_err(StreamingResponsePreparationError::Transport)?;
+        let Some(chunk) = next else {
+            break;
+        };
+        if chunk.len() > decoded_limit.saturating_sub(wire_body.len()) {
+            return Err(StreamingResponsePreparationError::Protocol(
+                ProxyError::bad_gateway(format!(
+                    "compressed upstream SSE response exceeds the {decoded_limit} byte limit"
+                )),
+            ));
+        }
+        wire_body.extend_from_slice(&chunk);
+    }
+
+    let decoded = decode_response_body_for_proxy_with_limit(
+        response_headers,
+        Bytes::from(wire_body),
+        decoded_limit,
+    )
+    .map_err(StreamingResponsePreparationError::Protocol)?;
+    if decoded.preserve_content_encoding {
+        return Err(StreamingResponsePreparationError::Protocol(
+            ProxyError::bad_gateway(
+                "unsupported, truncated, or invalid compressed upstream SSE response",
+            ),
+        ));
+    }
+    let body = decoded.body;
+    Ok(PreparedStreamingResponse {
+        inner: stream::once(async move { Ok::<Bytes, reqwest::Error>(body) }).boxed(),
+        decoded: true,
+    })
+}
+
+async fn next_stream_chunk_for_preparation(
+    inner: &mut BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    first_event_deadline: Option<tokio::time::Instant>,
+    timeouts: StreamTimeoutConfig,
+    waiting_for_first_byte: bool,
+) -> Result<Option<Bytes>, StreamReadError> {
+    if let Some(deadline) = first_event_deadline {
+        return match tokio::time::timeout_at(deadline, inner.try_next()).await {
+            Ok(result) => result.map_err(StreamReadError::Upstream),
+            Err(_) => Err(StreamReadError::Timeout {
+                kind: StreamTimeoutKind::FirstByte,
+                timeout: timeouts
+                    .first_byte
+                    .expect("a first-event deadline requires a first-byte timeout"),
+            }),
+        };
+    }
+    let (timeout, kind) = if waiting_for_first_byte {
+        (timeouts.first_byte, StreamTimeoutKind::FirstByte)
+    } else {
+        (timeouts.idle, StreamTimeoutKind::Idle)
+    };
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, inner.try_next()).await {
+            Ok(result) => result.map_err(StreamReadError::Upstream),
+            Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
+        },
+        None => inner.try_next().await.map_err(StreamReadError::Upstream),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum StreamTimeoutKind {
     FirstByte,
@@ -20009,6 +20445,102 @@ mod tests {
     use crate::domain::providers::model::{
         AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
     };
+
+    #[test]
+    fn claude_rate_limit_scope_distinguishes_account_model_and_entitlement() {
+        let now = 1_700_000_000_000_i64;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_static("1700003600"),
+        );
+        assert!(matches!(
+            classify_claude_rate_limit(&headers, b"{}", now),
+            ClaudeRateLimitScope::AccountUnified {
+                until: 1_700_003_600_000
+            }
+        ));
+
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            HeaderValue::from_static("rejected"),
+        );
+        headers.remove("anthropic-ratelimit-unified-5h-status");
+        headers.remove("anthropic-ratelimit-unified-7d-status");
+        assert!(matches!(
+            classify_claude_rate_limit(&headers, b"{}", now),
+            ClaudeRateLimitScope::ShareModel {
+                reason: "anthropic_fable_7d_oi",
+                ..
+            }
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            HeaderValue::from_static("rejected"),
+        );
+        assert!(matches!(
+            classify_claude_rate_limit(&headers, b"{}", now),
+            ClaudeRateLimitScope::ShareModel {
+                reason: "anthropic_fable_7d_oi",
+                ..
+            }
+        ));
+
+        assert_eq!(
+            classify_claude_rate_limit(
+                &HeaderMap::new(),
+                br#"{"error":{"message":"Fast request rejected: usage credits are required"}}"#,
+                now,
+            ),
+            ClaudeRateLimitScope::RequestEntitlement
+        );
+    }
+
+    #[test]
+    fn anthropic_reset_parser_accepts_seconds_milliseconds_and_dates() {
+        let now = 1_700_000_000_000_i64;
+        for value in [
+            "3600",
+            "1700003600",
+            "1700003600000",
+            "2023-11-14T23:13:20Z",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-reset", HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                parse_anthropic_reset_header(&headers, "x-reset", now),
+                Some(1_700_003_600_000),
+                "{value}"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-reset",
+            HeaderValue::from_static("Tue, 14 Nov 2023 23:13:20 GMT"),
+        );
+        assert_eq!(
+            parse_anthropic_reset_header(&headers, "x-reset", now),
+            Some(1_700_003_600_000)
+        );
+    }
 
     #[test]
     fn responses_keepalive_provider_option_overrides_environment_and_preserves_zero() {
@@ -21484,6 +22016,488 @@ mod tests {
             )),
         )
         .unwrap()
+    }
+
+    async fn install_claude_oauth_forwarder_test_provider(
+        state: &ServerState,
+        name: &str,
+        base_url: String,
+    ) -> String {
+        let account_id = format!("{name}-account");
+        let provider_id = format!("{name}-provider");
+        let account_id_for_state = account_id.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "claude_oauth",
+                        "email": "compressed-sse@example.com",
+                        "accessToken": "compressed-sse-access",
+                        "refreshToken": "compressed-sse-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"credentialCapability": "refreshable_oauth"}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let runtime_base_url = base_url.clone();
+        let provider_id_for_state = provider_id.clone();
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Claude,
+                    Provider {
+                        id: provider_id_for_state,
+                        name: "Compressed SSE Claude".to_string(),
+                        settings_config: json!({"env": {"ANTHROPIC_BASE_URL": base_url}}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("claude_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("claude_oauth".to_string()),
+                                account_id: Some(account_id),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..ProviderMeta::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .override_provider_runtime_endpoint_for_test(
+                AppKind::Claude,
+                &provider_id,
+                runtime_base_url,
+            )
+            .await
+            .unwrap();
+        provider_id
+    }
+
+    fn claude_success_sse() -> Bytes {
+        Bytes::from_static(
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_compressed\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello compressed\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn brotli_bytes(body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut encoded, 8 * 1024, 5, 22);
+            encoder.write_all(body).unwrap();
+        }
+        encoded
+    }
+
+    async fn streaming_test_response(
+        headers: HeaderMap,
+        wire_body: Vec<u8>,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move || {
+                let headers = headers.clone();
+                let wire_body = wire_body.clone();
+                async move {
+                    let mut response = Response::new(Body::from(wire_body));
+                    *response.headers_mut() = headers;
+                    response
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn claude_streaming_decoder_handles_real_http_encodings_and_failures() {
+        let expected = claude_success_sse();
+        let cases = [
+            ("identity", vec![], expected.to_vec(), false),
+            (
+                "gzip",
+                vec![(CONTENT_ENCODING, "gzip")],
+                gzip_bytes(&expected),
+                true,
+            ),
+            (
+                "brotli",
+                vec![(CONTENT_ENCODING, "br")],
+                brotli_bytes(&expected),
+                true,
+            ),
+            (
+                "zstd",
+                vec![(CONTENT_ENCODING, "zstd")],
+                zstd::stream::encode_all(expected.as_ref(), 1).unwrap(),
+                true,
+            ),
+            (
+                "stacked",
+                vec![(CONTENT_ENCODING, "gzip, br")],
+                brotli_bytes(&gzip_bytes(&expected)),
+                true,
+            ),
+            (
+                "stacked-repeated",
+                vec![(CONTENT_ENCODING, "gzip"), (CONTENT_ENCODING, "br")],
+                brotli_bytes(&gzip_bytes(&expected)),
+                true,
+            ),
+            ("headerless-gzip", vec![], gzip_bytes(&expected), true),
+            (
+                "headerless-zstd",
+                vec![],
+                zstd::stream::encode_all(expected.as_ref(), 1).unwrap(),
+                true,
+            ),
+        ];
+        for (name, header_values, wire_body, expected_decoded) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            for (header, value) in header_values {
+                headers.append(header, HeaderValue::from_str(value).unwrap());
+            }
+            let (response, server) = streaming_test_response(headers.clone(), wire_body).await;
+            let prepared = prepare_claude_streaming_response(
+                response,
+                &headers,
+                StreamTimeoutConfig {
+                    first_byte: Some(Duration::from_secs(2)),
+                    idle: Some(Duration::from_secs(2)),
+                },
+                None,
+                1024 * 1024,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} should decode"));
+            assert_eq!(prepared.decoded, expected_decoded, "{name}");
+            let actual = prepared
+                .inner
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .concat();
+            assert_eq!(actual, expected.as_ref(), "{name}");
+            server.abort();
+        }
+
+        let mut truncated_headers = HeaderMap::new();
+        truncated_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let mut truncated = gzip_bytes(&expected);
+        truncated.truncate(truncated.len() / 2);
+        let (response, server) =
+            streaming_test_response(truncated_headers.clone(), truncated).await;
+        assert!(matches!(
+            prepare_claude_streaming_response(
+                response,
+                &truncated_headers,
+                StreamTimeoutConfig {
+                    first_byte: None,
+                    idle: None,
+                },
+                None,
+                1024 * 1024,
+            )
+            .await,
+            Err(StreamingResponsePreparationError::Protocol(_))
+        ));
+        server.abort();
+
+        let oversized_plain = vec![b'x'; 4096];
+        let mut overflow_headers = HeaderMap::new();
+        overflow_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let (response, server) =
+            streaming_test_response(overflow_headers.clone(), gzip_bytes(&oversized_plain)).await;
+        assert!(matches!(
+            prepare_claude_streaming_response(
+                response,
+                &overflow_headers,
+                StreamTimeoutConfig {
+                    first_byte: None,
+                    idle: None,
+                },
+                None,
+                1024,
+            )
+            .await,
+            Err(StreamingResponsePreparationError::Protocol(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_forwarder_decodes_gzip_sse_without_retry_or_failover() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let wire_body = gzip_bytes(&claude_success_sse());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let wire_body = wire_body.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .header(CONTENT_ENCODING, "gzip")
+                        .body(Body::from(wire_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("claude-compressed-sse-integration");
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-compressed-sse",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ping"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("hello compressed"), "{body}");
+        assert!(body.contains("event: message_stop"), "{body}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "compressed SSE must stay on the single bound Provider/account without replay"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_forwarder_decodes_compressed_json_error_and_count_tokens() {
+        let message_requests = Arc::new(AtomicUsize::new(0));
+        let count_requests = Arc::new(AtomicUsize::new(0));
+        let message_requests_for_route = Arc::clone(&message_requests);
+        let count_requests_for_route = Arc::clone(&count_requests);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/v1/messages",
+                axum::routing::post(move || {
+                    let requests = Arc::clone(&message_requests_for_route);
+                    async move {
+                        let request = requests.fetch_add(1, Ordering::SeqCst);
+                        if request == 0 {
+                            let body = json!({
+                                "id": "msg_compressed_json",
+                                "type": "message",
+                                "role": "assistant",
+                                "model": "claude-sonnet-4-6",
+                                "content": [{"type": "text", "text": "brotli json"}],
+                                "stop_reason": "end_turn",
+                                "usage": {"input_tokens": 2, "output_tokens": 2}
+                            })
+                            .to_string();
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .header(CONTENT_ENCODING, "br")
+                                .body(Body::from(brotli_bytes(body.as_bytes())))
+                                .unwrap()
+                        } else {
+                            let body = json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "rate_limit_error",
+                                    "message": "fixture model limit"
+                                }
+                            })
+                            .to_string();
+                            let stacked = brotli_bytes(&gzip_bytes(body.as_bytes()));
+                            let mut response = Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .header(CONTENT_TYPE, "application/json")
+                                .header("retry-after", "1")
+                                .body(Body::from(stacked))
+                                .unwrap();
+                            response
+                                .headers_mut()
+                                .append(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+                            response
+                                .headers_mut()
+                                .append(CONTENT_ENCODING, HeaderValue::from_static("br"));
+                            response
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/messages/count_tokens",
+                axum::routing::post(move || {
+                    let requests = Arc::clone(&count_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let body = zstd::stream::encode_all(
+                            json!({"input_tokens": 9}).to_string().as_bytes(),
+                            1,
+                        )
+                        .unwrap();
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("claude-compressed-nonstream-integration");
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-compressed-nonstream",
+            format!("http://{address}"),
+        )
+        .await;
+        let request_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers
+        };
+        let message_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+        );
+
+        let success = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            request_headers(),
+            message_body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(success.status(), StatusCode::OK);
+        assert!(success.headers().get(CONTENT_ENCODING).is_none());
+        let success = axum::body::to_bytes(success.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&success).unwrap()["content"][0]["text"],
+            "brotli json"
+        );
+
+        let count = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeCountTokens,
+            provider_id.clone(),
+            None,
+            request_headers(),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"count"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count.status(), StatusCode::OK);
+        let count = axum::body::to_bytes(count.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&count).unwrap()["input_tokens"],
+            9
+        );
+
+        let error = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            request_headers(),
+            message_body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.headers().get(CONTENT_ENCODING).is_none());
+        let error = axum::body::to_bytes(error.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&error).unwrap()["error"]["type"],
+            "rate_limit_error"
+        );
+        assert_eq!(message_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(count_requests.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     fn previous_response_test_scope() -> PreviousResponseCacheScope {

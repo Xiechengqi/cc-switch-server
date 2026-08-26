@@ -8,17 +8,20 @@ pub struct ClaudeWireProfile {
     pub node_version: &'static str,
     pub axios_version: &'static str,
     pub cch_seed: u64,
+    pub cch_excluded_keys: &'static [&'static str],
     pub billing_version_strategy: &'static str,
 }
 
 pub const CLAUDE_WIRE_PROFILE: ClaudeWireProfile = ClaudeWireProfile {
-    id: "claude-code-2.1.220-captured-2026-08-09",
-    claude_code_version: "2.1.220",
-    stainless_package_version: "0.94.0",
+    id: "claude-code-2.1.234-audited-2026-08-26",
+    claude_code_version: "2.1.234",
+    stainless_package_version: "0.112.1",
     node_version: "v26.3.0",
     axios_version: "1.15.2",
-    cch_seed: 0x6E52736AC806831E,
-    // Capture evidence does not expose a trustworthy private build suffix.
+    cch_seed: 0x4D659218E32A3268,
+    cch_excluded_keys: &["max_tokens", "fallbacks", "fallback_credit_token"],
+    // The installed binary exposes the public version but the wire profile does
+    // not invent a private build suffix.
     billing_version_strategy: "public_cli_version_without_guessed_build_suffix",
 };
 

@@ -579,7 +579,15 @@ impl AccountManager for AccountProviderDriver {
             .expires_at
             .is_some_and(|expires_at| expires_at <= now_ms)
         {
-            let message = if oauth_provider_spec(provider_type)
+            let message = if provider_type == ProviderType::ClaudeOAuth
+                && crate::domain::accounts::oauth::claude_credential_capability_from_profile(
+                    account.profile.as_ref(),
+                ) == Some(
+                    crate::domain::accounts::oauth::ClaudeCredentialCapability::AccessOnlySetupToken,
+                )
+            {
+                "access-only Claude setup token expired; import a new setup token"
+            } else if oauth_provider_spec(provider_type)
                 .is_some_and(|spec| spec.server_native_refresh_enabled())
             {
                 "access token expired; refreshToken is required for server-native refresh"

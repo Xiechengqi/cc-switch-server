@@ -67,7 +67,8 @@ export function accountProviderIcon(providerType: string): { icon?: string; colo
 
 export function credentialFlags(account: AccountRecord): string[] {
   const flags: string[] = [];
-  if (account.hasAccessToken) flags.push("access");
+  if (account.credentialCapability === "access_only_setup_token") flags.push("setup token");
+  else if (account.hasAccessToken) flags.push("access");
   if (account.hasRefreshToken) flags.push("refresh");
   if (account.hasApiKey) flags.push("api key");
   if (account.hasIdToken) flags.push("id token");
@@ -200,6 +201,9 @@ function refreshRegressionBadge(
   account: AccountRecord,
   capability?: AccountManagerCapability,
 ): AccountRegressionBadge {
+  if (account.credentialCapability === "access_only_setup_token") {
+    return { label: "refresh", value: "access-only", tone: "success" };
+  }
   if (account.needsRelogin) {
     return { label: "refresh", value: "relogin", tone: "danger" };
   }

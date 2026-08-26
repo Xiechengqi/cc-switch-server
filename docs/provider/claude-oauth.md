@@ -60,7 +60,9 @@ OAuth endpoint fallback 只用于明确的 connect-stage 网络失败（请求�
 
 ## Wire profile、控制面与模型目录
 
-Claude OAuth wire 身份固定在脱敏 capture `assets/contract/claude-oauth-wire-profile.json`，当前 profile 为 Claude Code `2.1.220`、Stainless `0.94.0`、Node `v26.3.0` 和 Axios `1.15.2`。usage 使用 `claude-code/2.1.220`，bootstrap/inference 使用 CLI identity，profile、roles 和 token endpoint 使用 Axios identity；CCH 在最终 body 归一化完成后计算，不猜测未被 capture 证明的私有 build suffix。
+Claude OAuth wire 身份固定在脱敏合同 `assets/contract/claude-oauth-wire-profile.json`，当前 profile 为 `claude-code-2.1.234-audited-2026-08-26`：Claude Code `2.1.234`、Stainless `0.112.1`、Node `v26.3.0` 和 Axios `1.15.2`。该版本来自本机已安装官方 Claude Code 二进制的静态审计，并由脱敏参考 fixture 交叉校验；没有保存 token、账号标识或真实请求正文。usage 使用 `claude-code/2.1.234`，bootstrap/inference 使用 CLI identity，profile、roles 和 token endpoint 使用 Axios identity。
+
+CCH 仍按当前官方二进制中的 `cch=00000` 占位行为生成，seed 为 `0x4D659218E32A3268`。签名在日期、工具、thinking、cache-control 等 body rewrite 全部完成后计算；所有 `model` 字符串递归置空，并递归排除 `max_tokens`、`fallbacks`、`fallback_credit_token`。golden vector 固化了当前 seed、字段保序和排除规则。紧急回滚可设置 `CC_SWITCH_CLAUDE_CCH_POLICY=disabled`，此时 billing block 中的 CCH 成员会被移除，不会回退到旧 seed。
 
 quota refresh 并行获取 usage、profile、bootstrap 和 `/api/oauth/claude_cli/roles`。四路 enrichment 都有超时和有界响应读取；roles/profile/bootstrap 失败只影响辅助证据，不覆盖已经成功的 token 或 usage quota，也不在日志、指标或公开 API 中暴露原始 OAuth body。
 
@@ -71,8 +73,39 @@ Claude OAuth 模型发现不调用 Anthropic，也不会为了列模型刷新 to
 - `claude-opus-4-6`
 - `claude-sonnet-4-6`
 - `claude-haiku-4-5-20251001`
+- `claude-fable-5`
+- `claude-opus-5`
+- `claude-opus-4-8`
+- `claude-sonnet-5`
 
 Share 响应同时公开 `source=claude_code_wire_profile`、`stale=false` 和 capture 的 `fetchedAtMs`。更新 Claude Code wire profile 时必须一起 review capture、Rust 常量、beta 矩阵、endpoint identity 和模型目录，不能只改 User-Agent 字符串。
+
+## 请求分类、beta 与缓存
+
+客户端分类采用 fail-closed 多信号：精确 Claude CLI User-Agent、`x-app=cli`、metadata/session 关系和 beta/body profile 必须共同成立，才进入 Native CLI、SDK CLI、VSCode 或 helper 最小修改路径。UA 或 billing 单信号不能伪装成 native；不确定请求按第三方 Anthropic 客户端处理。确认的 native/helper 请求不会被补入 `tools: []`、默认 `max_tokens`、thinking 或 identity block，只保留 credential-scoped OAuth/extended-cache beta 与最终 CCH。可用 `CC_SWITCH_CLAUDE_NATIVE_PASSTHROUGH=disabled` 强制回到第三方规范化路径。
+
+Messages beta 由确定顺序的 capability engine 生成，未知客户端 beta 不透传。当前固定集合包含 Claude Code、OAuth、interleaved/redacted thinking、thinking-token-count、context-management、prompt-caching-scope、effort、fallback-credit 与 extended-cache；1M context、mid-system、advanced tools、server fallback、structured output、fast mode 和 diagnostics 只在相应 model/body shape 满足时加入。`thinking.display` 与 redact beta 互斥。fine-grained tool streaming 已不再是 beta，旧 computer-use beta 也不自动注入。`count_tokens` 使用独立小集合，不继承 generation-only beta。模型 fixture 逐模型固化目前唯一有已安装二进制证据的 `midConversationSystem` 能力；其余规则明确标记为 shape-driven，未知模型不乐观注入 model-gated beta。可用 `CC_SWITCH_CLAUDE_BETA_PROFILE=minimal` 回退到只含 Claude Code/OAuth（以及 `count_tokens` 所需 token-counting）的最小服务端 profile，不改变账号绑定。
+
+cache-control pass 在 CCH 前全局扫描 tools、system 和 messages，规范化 TTL/order、最多保留 4 个 breakpoint，并优先保留最后 tool、最后 system 和最近 message marker；重复执行幂等。forced `tool_choice` 会同步移除不兼容的 thinking/context-management。可用 `CC_SWITCH_CLAUDE_CACHE_REWRITE=disabled` 关闭该 pass。
+
+## 凭据形态与可选隐私增强
+
+Claude 凭据显式区分 `refreshable_oauth` 与 `access_only_setup_token`。OAuth exchange 只有在 scope 明确包含 `user:inference` 且不含 profile/office scope 时，才允许缺失 refresh token；该 scope 会在任何 bootstrap/profile 请求之前识别并直接跳过无权访问的 enrichment。手工 credentials import 则由 access-only 凭据拓扑标记 setup-token。setup-token 不进入 refresh，profile/quota 403 只降低 enrichment，不阻断 inference；缺失账号 UUID 时使用带域分离的 credential digest 生成不可逆内部 ID。过期后直接要求重新导入，不形成 refresh loop。可用 `CC_SWITCH_CLAUDE_SETUP_TOKEN=disabled` 关闭 access-only exchange/import 入口，标准 refreshable OAuth 不受影响。
+
+两个证据门控的隐私增强默认关闭：
+
+- `CC_SWITCH_CLAUDE_DATELINE_NORMALIZATION=enabled` 只规范 system text 和 `<system-reminder>` 内已验证的日期指纹，不修改普通用户正文、assistant 正文或 tool input/result。
+- `CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS=enabled` 只对确认的非原生客户端启用 session-scoped custom/MCP alias；没有显式 session 标识时 fail closed 并跳过 alias。declaration、forced choice、历史引用以及 JSON/SSE 响应全链路回映，保留 Claude server tools，映射最多 128 项且碰撞 fail closed。
+
+没有上游拒绝证据，因此 TLS ClientHello/header-order 模拟仍不实现；当前继续使用 rustls transport。
+
+## 429 与响应编码
+
+Claude 429 不再默认升级为账号 cooldown：只有明确 unified 5h/7d rejected 才通过 AccountStore CAS 写当前账号 cooldown；Fable `7d_oi`、普通 `Retry-After` 和未知 429 只写当前 Share+model cooldown；Fast credits/entitlement refusal 不写任何 cooldown。解析支持 RFC3339、epoch seconds、epoch milliseconds 和 HTTP-date，并对异常未来时间应用全局上限。429 不 replay、不换账号、不换 Provider、不换模型。
+
+统一响应解码支持 gzip/x-gzip、deflate、brotli 和 zstd，支持逗号分隔或重复 `Content-Encoding` 的最多 4 层堆叠；无 header 时只对强 gzip/zstd magic 做 sniff。每层和最终 body 均受累计大小限制。成功、错误、SSE 和 `count_tokens` 共用该治理入口；解码后失效的 `Content-Encoding`/`Content-Length` 不会继续透传。普通无压缩 SSE 只预读足够判断 magic 的最多 4 字节后继续增量转发，因此仍保留首事件、idle timeout 和客户端取消语义；只有明确压缩或强 magic 命中的 SSE 才在 64 MiB 上限内缓冲解码，截断、未知编码或解压超限返回不含上游正文的 `502`，不会透明重放。可用 `CC_SWITCH_RESPONSE_EXTENDED_DECODING=disabled` 关闭 br/zstd/magic 扩展，gzip/x-gzip/deflate 的既有显式编码解码仍保留。
+
+高风险行为按 wire profile 独立回滚：CCH、beta profile、native passthrough、cache rewrite、扩展响应解码、setup-token、dateline 和 tool alias 均有单独开关。Claude 429 scope classifier 不提供会重新启用“普通 429 写账号 cooldown”的 legacy 开关，因为该旧行为会在单账号场景错误阻断其他模型；必要时只能回滚完整版本。TLS/header-order 模拟因没有可重复拒绝证据而未实现，也没有伪造一个无效开关。
 
 ## 重放矩阵
 
@@ -116,6 +149,10 @@ Messages 的建连重放只发生在请求尚未到达可产生计费副作用�
 - `cc_switch_provider_outcome_total{app,provider_type,outcome}`：按有限 app、Provider 类型和结果聚合的上游终态。
 - `cc_switch_claude_roles_total`、`cc_switch_claude_ttfb_seconds`、`cc_switch_claude_stream_duration_seconds`、`cc_switch_claude_semantic_failure_total`：roles enrichment 和流语义时延/终态。
 - `cc_switch_claude_wire_profile_info`：当前固定 wire profile 的版本信息。
+- `cc_switch_claude_client_class_total`：按有界客户端分类和请求类型计数。
+- `cc_switch_claude_rate_limit_scope_total`：按 request、Share+model、account unified 作用域计数。
+- `cc_switch_claude_optional_rewrite_total`：只记录有界 rewrite 类型，不记录日期或工具名。
+- `cc_switch_claude_response_decoding_total{surface,result}`：按 `json`、`error`、`sse`、`count_tokens` 与有界解码结果计数，不记录编码正文或客户端值。
 
 Prometheus 标签禁止包含账号 ID、Provider ID 或 request ID；这些实例标识只留在受访问控制且已脱敏的诊断数据中，不能进入长期时序基数。
 

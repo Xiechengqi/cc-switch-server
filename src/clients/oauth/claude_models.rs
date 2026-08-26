@@ -1,7 +1,11 @@
 use crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
 
-pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_786_233_600_000;
+pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_787_702_400_000;
 pub const CLAUDE_MODEL_IDS: &[&str] = &[
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
@@ -49,6 +53,10 @@ mod tests {
         assert_eq!(
             catalog.models,
             vec![
+                "claude-fable-5",
+                "claude-opus-5",
+                "claude-opus-4-8",
+                "claude-sonnet-5",
                 "claude-opus-4-6",
                 "claude-sonnet-4-6",
                 "claude-haiku-4-5-20251001"

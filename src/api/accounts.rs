@@ -532,6 +532,15 @@ fn upsert_input_from_claude_credentials(
             "Claude credentials import requires accessToken/access_token or refreshToken/refresh_token",
         ));
     }
+    if refresh_token
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && !crate::domain::accounts::oauth::claude_setup_token_enabled()
+    {
+        return Err(ApiError::bad_request(
+            "Claude access-only setup-token support is disabled",
+        ));
+    }
     let account_id = first_json_string(
         &credentials,
         &[
@@ -580,6 +589,20 @@ fn upsert_input_from_claude_credentials(
         ],
     )
     .or_else(|| Some("Bearer".to_string()));
+    let scopes = claude_import_scopes(&credentials);
+    let capability = if refresh_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        crate::domain::accounts::oauth::ClaudeCredentialCapability::RefreshableOAuth
+    } else {
+        crate::domain::accounts::oauth::ClaudeCredentialCapability::AccessOnlySetupToken
+    };
+    let mut profile = Some(json!({
+        "providerType": ProviderType::ClaudeOAuth.as_str(),
+        "source": "claude_credentials_import"
+    }));
+    crate::domain::accounts::oauth::set_claude_credential_capability(&mut profile, capability);
     Ok(UpsertAccountInput {
         id: Some(account_id),
         provider_type: ProviderType::ClaudeOAuth,
@@ -590,11 +613,8 @@ fn upsert_input_from_claude_credentials(
         token_type,
         api_key: None,
         extra_headers: None,
-        scopes: Vec::new(),
-        profile: Some(json!({
-            "providerType": ProviderType::ClaudeOAuth.as_str(),
-            "source": "claude_credentials_import"
-        })),
+        scopes,
+        profile,
         raw: Some(json!({
             "source": "claude_credentials_import",
             "importedAtMs": now_ms(),
@@ -756,13 +776,55 @@ fn first_json_i64(value: &Value, pointers: &[&str]) -> Option<i64> {
 
 fn stable_import_account_id(access_token: Option<&str>, refresh_token: Option<&str>) -> String {
     let seed = refresh_token.or(access_token).unwrap_or("claude-oauth");
-    let digest = Sha256::digest(seed.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(b"cc-switch-server:claude-credential-import:v1\0");
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
     let suffix = digest
         .iter()
         .take(8)
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("claude-oauth-{suffix}")
+}
+
+fn claude_import_scopes(credentials: &Value) -> Vec<String> {
+    for pointer in [
+        "/scopes",
+        "/scope",
+        "/claudeAiOauth/scopes",
+        "/claudeAiOauth/scope",
+        "/oauth/scopes",
+        "/oauth/scope",
+    ] {
+        match credentials.pointer(pointer) {
+            Some(Value::String(value)) => {
+                let scopes = value
+                    .split(|character: char| character.is_ascii_whitespace() || character == ',')
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !scopes.is_empty() {
+                    return scopes;
+                }
+            }
+            Some(Value::Array(values)) => {
+                let scopes = values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !scopes.is_empty() {
+                    return scopes;
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
 }
 
 fn device_flow_expires_at(now_ms: i64, expires_in_secs: u64) -> i64 {
@@ -2120,6 +2182,7 @@ pub(in crate::api) async fn execute_account_login_token_exchange(
         finish.provider_type,
         finish.flow,
         &token_response.access_token,
+        token_response.scope.as_deref(),
     )
     .await
     {
@@ -2384,8 +2447,12 @@ pub(in crate::api) async fn execute_account_login_profile_request(
     provider_type: ProviderType,
     flow: OAuthAuthorizeFlow,
     access_token: &str,
+    token_scope: Option<&str>,
 ) -> Result<Option<serde_json::Value>, AccountRefreshFailure> {
     if provider_type == ProviderType::ClaudeOAuth {
+        if crate::domain::accounts::oauth::claude_scope_is_inference_only(token_scope) {
+            return Ok(None);
+        }
         let http_client = state.http_client().await;
         return Ok(
             crate::clients::oauth::quota::fetch_claude_bootstrap_profile(
@@ -3267,6 +3334,21 @@ mod tests {
             "OAuth credentials were rejected; sign in again"
         );
         assert!(!error.message.contains("refresh-secret"));
+    }
+
+    #[tokio::test]
+    async fn claude_inference_only_login_skips_bootstrap_profile_request() {
+        let state = account_api_test_state("claude-inference-only-profile-skip");
+        let profile = execute_account_login_profile_request(
+            &state,
+            ProviderType::ClaudeOAuth,
+            OAuthAuthorizeFlow::AuthorizationCodePkce,
+            "setup-token-must-not-be-sent",
+            Some("user:inference user:ccr_inference user:file_upload"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile, None);
     }
 
     #[test]
