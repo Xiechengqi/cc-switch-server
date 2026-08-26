@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "maxAttempts": 3,
+  "cases": [
+    { "name": "required_prose_then_tool", "retry": true },
+    { "name": "named_wrong_tool_then_named", "retry": true },
+    { "name": "auto_prose", "retry": false },
+    { "name": "tool_result_continuation", "retry": false },
+    { "name": "rate_limited", "retry": false },
+    { "name": "client_cancelled", "retry": false }
+  ]
+}

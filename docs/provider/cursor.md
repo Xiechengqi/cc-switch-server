@@ -24,6 +24,30 @@ Cursor Provider profiles remain `experimental` until OAuth and API-key credentia
 - Truncated protobuf, invalid UTF-8, incomplete/oversized/compressed frames, malformed or failed end-stream envelopes, data after a terminal in the same decoded frame batch, and plain EOF fail with 502 when observed before business completion.
 - `TurnEnded` without text, reasoning, or a surfaced tool call is an empty failure. Non-stream requests return 502; streams emit an in-band protocol error, never a normal success terminal, and persist failed usage.
 
+## Tool, Responses, and concurrency contract
+
+- Client tool schemas use a bounded Cursor-local JSON Schema 2020-12 evaluator. It supports the object/array/string/number/composition keywords used by OpenCode, Pi, and MCP tools, exact `oneOf`, and local JSON Pointer `$ref`. Remote or recursive refs, excessive depth/nodes/patterns, and arguments larger than 1 MiB fail closed. The Server never resolves paths or executes client tools.
+- Builtin/MCP normalization is limited to fixed aliases and argument adapters. A surfaced call must resolve to one declared tool and pass that tool's schema; unknown fields are preserved when JSON Schema leaves `additionalProperties` open. Resolution exposes only low-cardinality reason metrics, not arguments or schemas.
+- `tool_choice=required` and named tool choice are buffered before client business output. A prose-only turn or a different named tool is discarded and retried on the same Provider, credential generation, rail, runtime, and conversation, with three total attempts. `auto`, parked tool-result continuation, 429, client cancellation, and committed output are never semantically retried. Streaming clients receive the accepted attempt as a buffered SSE sequence.
+- Completed OpenAI Responses turns with `store != false` enter a process-local, scope-isolated cache (10-minute TTL, 2,000 entries, 64 MiB total, 8 MiB/200 items per entry). `previous_response_id` expands normalized prior input/output into a new h2 run. Restart, expiry, or any scope mismatch returns `409 cursor_response_state_lost`; it never cold-starts from the response id.
+- Parked tool continuation remains separate from completed Responses state and must resume the original h2 stream. Missing parked state returns `409 cursor_session_lost`. A second ordinary request for the same running conversation returns `409 cursor_conversation_busy`; different conversations remain parallel.
+- `/v1/responses/compact` is non-streaming and side-effect free. It rejects tools/background/stream, returns `object=response.compaction` with a `compaction` item, and accepts that item as later Responses input. `encrypted_content` is the OpenAI-compatible field name; this implementation does not claim server-side encryption.
+- `/v1/responses/input_tokens` estimates the same canonical Cursor prompt used by the request builder. Responses include `object=response.input_tokens`, `estimated=true`, `estimation_method=cursor_canonical_prompt_characters`, and `x-cc-switch-token-count: estimated`.
+
+## API-key verified identity
+
+- Successful Provider validation stores only a Server-owned `cursorVerifiedIdentity` containing schema version, non-sensitive stable account id, principal source, and verification time. Client Provider payloads cannot supply this resource metadata.
+- `/v1/me` identity selection is `userId/id/sub/user_id`, then normalized lowercase email, then an API-key hash fallback. The verified account id seeds Cursor machine/config identity; API-key digest plus `credentialGeneration` still fences exchange tokens, endpoint discovery, live sessions, cooldown, and completed response state.
+- Rotating to a key verified for the same account preserves machine/config identity while incrementing credential generation. A different verified principal returns `cc_switch_cursor_identity_conflict`; delete and recreate the Provider to perform the explicit operator-visible rebind. Fallback identities intentionally cannot remain stable across keys.
+- Legacy Providers without this metadata keep key-hash identity until their next explicit validation/edit. Startup performs no network migration.
+
+## Unsupported parameters and transient retry
+
+- Cursor is a single-candidate text rail: Chat `n != 1`, log probabilities, audio/non-text modalities, legacy functions, Responses background/hosted tools, Gemini `candidateCount != 1`, and compact stream/tools/background are explicit 400 errors. Max tokens, stop, and JSON output constraints remain prompt-enforced best effort.
+- Generic transient 5xx/transport replay remains disabled. No production feature gate is exposed until both OAuth and API-key rails have real evidence that a new Run before first business output is idempotent for billing and agent side effects. This does not affect the exactly-once same-binding 401 recovery or the explicit required-tool semantic retry above.
+
+Metrics: `cursor_tool_resolution_total`, `cursor_tool_retry_total`, `cursor_response_cache_total`, and `cursor_session_conflict_total`. Labels are fixed outcome/reason/rail/state values and contain no credential, prompt, schema, or tool arguments.
+
 ## Model selection contract
 
 - Router Share resolution selects the Cursor Provider before model parsing. A `cursor:*` name can only change the wire model or mode inside that already-selected Provider; it never selects another Provider, account, key, or Share.
@@ -34,9 +58,9 @@ Cursor Provider profiles remain `experimental` until OAuth and API-key credentia
 
 ## Required real matrix
 
-Run every row independently for OAuth and API key: Anthropic Messages, OpenAI Chat, OpenAI Responses, and Gemini ingress; non-stream text; stream text and terminal event; Agent/Ask/Plan modes; arbitrary `-fast` model; reasoning; data-URI image; remote image; declared tool call; tool result continuation; client cancellation; first-frame timeout; inter-frame timeout; 401 recovery; second 401; 403; 429 with `Retry-After`; 5xx before output; disconnect after output; malformed and oversized Connect frame; invalid gzip; missing/malformed/failed Connect terminal before business completion; nonzero gRPC trailer before business completion; concurrent limit saturation; parked session after server restart; alias and namespaced model discovery; collision handling; log and error redaction.
+Run every row independently for OAuth and API key: Anthropic Messages, OpenAI Chat, OpenAI Responses, and Gemini ingress; non-stream text; stream text and terminal event; Agent/Ask/Plan modes; arbitrary `-fast` model; reasoning; data-URI image; remote image; declared auto/required/named tool call; required-tool retry; invalid schema; tool result continuation; completed `previous_response_id`; `store=false`; compact; input-token estimate; client cancellation; first-frame timeout; inter-frame timeout; 401 recovery; second 401; 403; 429 with `Retry-After`; 5xx before output; disconnect after output; malformed and oversized Connect frame; invalid gzip; missing/malformed/failed Connect terminal before business completion; nonzero gRPC trailer before business completion; concurrent limit saturation; same-conversation conflict; parked/completed state after server restart; API-key rotation; alias and namespaced model discovery; collision handling; log and error redaction.
 
-Expected invariants: 401 recovery retains the original principal; 429 and saturation never select another identity; malformed frames, gzip failures, and nonzero trailers observed before a business completion never produce a successful response; restart returns `409 cursor_session_lost`; Cursor usage records set `usageEstimated=true`; no access token, refresh token, exchange token, API key, or private runtime endpoint appears in logs or evidence.
+Expected invariants: 401 recovery retains the original principal; 429 and saturation never select another identity; malformed frames, gzip failures, and nonzero trailers observed before a business completion never produce a successful response; restart returns `409 cursor_session_lost` for parked tool continuation and `409 cursor_response_state_lost` for completed Responses continuation; Cursor usage records set `usageEstimated=true`; no access token, refresh token, exchange token, API key, or private runtime endpoint appears in logs or evidence.
 
 ## SDK differential oracle
 

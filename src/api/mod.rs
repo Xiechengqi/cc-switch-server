@@ -2032,24 +2032,13 @@ fn responses_input_tokens_response(
         .map_err(ApiError::proxy)?;
     let request = serde_json::from_slice::<Value>(&body)
         .map_err(|error| ApiError::bad_request(format!("invalid token count JSON: {error}")))?;
-    let payload = json!({
-        "instructions": request.get("instructions"),
-        "input": request.get("input"),
-        "tools": request.get("tools"),
-    });
-    let characters = serde_json::to_string(&payload)
-        .map_err(ApiError::internal)?
-        .chars()
-        .count();
-    let input_tokens = if characters == 0 {
-        0
-    } else {
-        characters.saturating_add(2) / 3 + 8
-    };
+    let input_tokens =
+        crate::proxy::cursor::request_builder::estimate_responses_input_tokens(&request);
     let mut response = Json(json!({
+        "object": "response.input_tokens",
         "input_tokens": input_tokens,
         "estimated": true,
-        "estimation_method": "json_characters_div_3_plus_8"
+        "estimation_method": "cursor_canonical_prompt_characters"
     }))
     .into_response();
     response.headers_mut().insert(
@@ -2265,6 +2254,7 @@ mod grok_catalog_provider_tests {
         ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
             Ok(VerifiedCursorApiKey {
                 account_id: "cursor-catalog-fixture".to_string(),
+                principal_source: "user_id".to_string(),
                 email: Some("cursor-catalog@example.com".to_string()),
                 profile: json!({"source": "cursor_catalog_fixture"}),
             })

@@ -467,7 +467,7 @@ mod tests {
             "cursor-apikey-principal",
             "bound-session-token",
         );
-        let account = cursor_account_for_api_key("crsr_fixture");
+        let account = cursor_account_for_api_key("crsr_fixture", None);
         let discovery_url =
             format!("http://{address}/aiserver.v1.ServerConfigService/GetServerConfig");
         let client = reqwest::Client::new();

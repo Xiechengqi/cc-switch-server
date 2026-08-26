@@ -109,7 +109,9 @@ use crate::domain::providers::runtime::{
     compile_runtime_plan_with_defaults, managed_account_binding, managed_account_provider_type,
     ProviderHealthCheckConfig, ProviderRequestDefaults, ProviderRuntimeDefaults,
 };
-use crate::domain::providers::store::{ProviderResourceMetadata, ProviderStore, StoredProvider};
+use crate::domain::providers::store::{
+    CursorVerifiedIdentity, ProviderResourceMetadata, ProviderStore, StoredProvider,
+};
 use crate::domain::router::{ClientSubdomain, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{
     ClientSubdomainAdoption, ClientSubdomainAdoptionStatus, ClientTunnelClaimIntent,
@@ -743,6 +745,8 @@ pub struct ServerStateInner {
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
+    pub cursor_completed_responses:
+        crate::proxy::cursor::response_state::CursorCompletedResponseStore,
     pub cursor_agent_endpoints: crate::proxy::cursor::agent_endpoint::CursorAgentEndpointCache,
     pub cursor_api_key_tokens: crate::proxy::cursor::credential_cache::CursorApiKeyTokenCache,
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
@@ -4247,6 +4251,8 @@ fn resolve_provider_resource_metadata(
         create_request_id: existing
             .and_then(|item| item.resource.create_request_id.clone())
             .or(client_request_id),
+        cursor_verified_identity: existing
+            .and_then(|item| item.resource.cursor_verified_identity.clone()),
     })
 }
 
@@ -4260,6 +4266,37 @@ fn provider_resource_content_eq(left: &StoredProvider, right: &StoredProvider) -
         && left.resource.credential_generation == right.resource.credential_generation
         && left.resource.custom_binding == right.resource.custom_binding
         && left.resource.create_request_id == right.resource.create_request_id
+        && left.resource.cursor_verified_identity == right.resource.cursor_verified_identity
+}
+
+fn apply_cursor_verified_identities(
+    store: &mut ProviderStore,
+    stored: &mut [StoredProvider],
+    original: &ProviderStore,
+    identities: &[Option<CursorVerifiedIdentity>],
+) -> bool {
+    let mut changed = false;
+    for (item, identity) in stored.iter_mut().zip(identities.iter()) {
+        let Some(identity) = identity.as_ref() else {
+            continue;
+        };
+        if item.resource.cursor_verified_identity.as_ref() == Some(identity) {
+            continue;
+        }
+        if let Some(previous) = original
+            .providers
+            .iter()
+            .find(|previous| previous.app == item.app && previous.provider.id == item.provider.id)
+        {
+            if item.resource.revision <= previous.resource.revision {
+                item.resource.revision = previous.resource.revision.saturating_add(1);
+            }
+        }
+        item.resource.cursor_verified_identity = Some(identity.clone());
+        *item = store.upsert_with_resource(item.app, item.provider.clone(), item.resource.clone());
+        changed = true;
+    }
+    changed
 }
 
 fn prepare_provider_import(
@@ -5802,6 +5839,8 @@ impl ServerStateInner {
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
+            cursor_completed_responses:
+                crate::proxy::cursor::response_state::CursorCompletedResponseStore::default(),
             cursor_agent_endpoints:
                 crate::proxy::cursor::agent_endpoint::CursorAgentEndpointCache::default(),
             cursor_api_key_tokens:
@@ -8038,7 +8077,7 @@ impl ServerStateInner {
         &self,
         drafts: &[ProviderWriteDraft],
         allow_bundle_managed: bool,
-    ) -> Result<(), ProviderCommandError> {
+    ) -> Result<Vec<Option<CursorVerifiedIdentity>>, ProviderCommandError> {
         let mut candidate_store =
             self.providers
                 .read()
@@ -8055,10 +8094,11 @@ impl ServerStateInner {
         let accounts = self.accounts.read().await.clone();
         let (candidates, _) =
             apply_provider_write_drafts(&mut candidate_store, drafts.to_vec(), &accounts)?;
-        for candidate in candidates
-            .iter()
-            .filter(|candidate| candidate.provider_type == ProviderType::CursorApiKey)
-        {
+        let mut verified_identities = vec![None; candidates.len()];
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.provider_type != ProviderType::CursorApiKey {
+                continue;
+            }
             let api_key = [
                 "apiKey",
                 "CURSOR_API_KEY",
@@ -8074,7 +8114,8 @@ impl ServerStateInner {
                     "Cursor API-key Provider requires one API key".to_string(),
                 )
             })?;
-            self.cursor_api_key_verifier
+            let verified = self
+                .cursor_api_key_verifier
                 .verify(&self.http_client().await, &api_key)
                 .await
                 .map_err(|error| {
@@ -8083,8 +8124,32 @@ impl ServerStateInner {
                         error.message
                     ))
                 })?;
+            if let Some(existing) = candidate.resource.cursor_verified_identity.as_ref() {
+                if existing.account_id != verified.account_id {
+                    return Err(ProviderCommandError::Conflict {
+                        code: "cc_switch_cursor_identity_conflict",
+                        message: "Cursor API key belongs to a different verified account; delete and recreate the Provider to rebind it".to_string(),
+                    });
+                }
+            }
+            let identity = candidate
+                .resource
+                .cursor_verified_identity
+                .as_ref()
+                .filter(|existing| {
+                    existing.account_id == verified.account_id
+                        && existing.principal_source == verified.principal_source
+                })
+                .cloned()
+                .unwrap_or_else(|| CursorVerifiedIdentity {
+                    schema_version: 1,
+                    account_id: verified.account_id,
+                    principal_source: verified.principal_source,
+                    verified_at_ms: now_ms_i64(),
+                });
+            verified_identities[index] = Some(identity);
         }
-        Ok(())
+        Ok(verified_identities)
     }
 
     pub async fn upsert_provider_command(
@@ -8192,13 +8257,13 @@ impl ServerStateInner {
                 credential_patches,
             });
         }
-        if let Err(error) = self
+        let cursor_verified_identities = match self
             .validate_cursor_api_key_provider_drafts(&provider_drafts, true)
             .await
         {
-            return Ok(Err(error));
-        }
-
+            Ok(identities) => identities,
+            Err(error) => return Ok(Err(error)),
+        };
         let bundle_id = draft.id.clone();
         let family_id = draft.family_id.clone();
         let expected_revision = draft.expected_revision;
@@ -8290,6 +8355,12 @@ impl ServerStateInner {
             }
             let current = store.clone();
             let mut result = apply_provider_write_drafts(store, provider_drafts, &accounts)?;
+            result.1 |= apply_cursor_verified_identities(
+                store,
+                &mut result.0,
+                &current,
+                &cursor_verified_identities,
+            );
             if result.1 {
                 let bundle_revision = actual_revision.saturating_add(1);
                 for surface in &mut result.0 {
@@ -8358,19 +8429,26 @@ impl ServerStateInner {
         self: &Arc<Self>,
         drafts: Vec<ProviderWriteDraft>,
     ) -> anyhow::Result<Result<Vec<StoredProvider>, ProviderCommandError>> {
-        if let Err(error) = self
+        let cursor_verified_identities = match self
             .validate_cursor_api_key_provider_drafts(&drafts, false)
             .await
         {
-            return Ok(Err(error));
-        }
+            Ok(identities) => identities,
+            Err(error) => return Ok(Err(error)),
+        };
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
         let shares = self.shares.read().await.clone();
         self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
             validate_ordinary_provider_write_drafts(store, &drafts)?;
             let current = store.clone();
-            let result = apply_provider_write_drafts(store, drafts, &accounts)?;
+            let mut result = apply_provider_write_drafts(store, drafts, &accounts)?;
+            result.1 |= apply_cursor_verified_identities(
+                store,
+                &mut result.0,
+                &current,
+                &cursor_verified_identities,
+            );
             if result.1 {
                 validate_ordinary_provider_subscription_change(
                     &current, store, &accounts, &shares,
@@ -8401,18 +8479,31 @@ impl ServerStateInner {
         drafts: Vec<ProviderWriteDraft>,
         expected_preview_token: String,
     ) -> anyhow::Result<Result<ProviderImportPreview, ProviderCommandError>> {
-        if let Err(error) = self
+        let cursor_verified_identities = match self
             .validate_cursor_api_key_provider_drafts(&drafts, false)
             .await
         {
-            return Ok(Err(error));
-        }
+            Ok(identities) => identities,
+            Err(error) => return Ok(Err(error)),
+        };
+        let cursor_identity_selectors = drafts
+            .iter()
+            .map(|draft| {
+                (
+                    draft.app,
+                    draft.provider.id.clone(),
+                    draft.client_request_id.clone(),
+                    draft.profile_id.clone(),
+                    draft.provider.name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         let reference_guard = self.reference_mutations.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
         let shares = self.shares.read().await.clone();
         let preview_key = self.provider_import_preview_key;
         self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
-            let prepared = prepare_provider_import(store, drafts, &preview_key, &accounts)?;
+            let mut prepared = prepare_provider_import(store, drafts, &preview_key, &accounts)?;
             if expected_preview_token.trim().is_empty()
                 || prepared.preview.preview_token != expected_preview_token
             {
@@ -8422,7 +8513,48 @@ impl ServerStateInner {
                         .to_string(),
                 });
             }
-            let changed = prepared.preview.create_count + prepared.preview.update_count > 0;
+            let mut changed = prepared.preview.create_count + prepared.preview.update_count > 0;
+            let mut cursor_candidates = Vec::new();
+            let mut selected_identities = Vec::new();
+            for (selector, identity) in cursor_identity_selectors
+                .iter()
+                .zip(cursor_verified_identities.iter())
+            {
+                let Some(identity) = identity else {
+                    continue;
+                };
+                let (app, provider_id, request_id, profile_id, provider_name) = selector;
+                let candidate = prepared
+                    .candidate
+                    .providers
+                    .iter()
+                    .find(|candidate| {
+                        candidate.app == *app
+                            && if !provider_id.trim().is_empty() {
+                                candidate.provider.id == *provider_id
+                            } else if let Some(request_id) = request_id.as_deref() {
+                                candidate.resource.create_request_id.as_deref() == Some(request_id)
+                            } else {
+                                candidate.resource.profile_id.as_ref() == profile_id.as_ref()
+                                    && candidate.provider.name == *provider_name
+                            }
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProviderCommandError::Invalid(
+                            "Cursor verified identity could not be associated with the imported Provider"
+                                .to_string(),
+                        )
+                    })?;
+                cursor_candidates.push(candidate);
+                selected_identities.push(Some(identity.clone()));
+            }
+            changed |= apply_cursor_verified_identities(
+                &mut prepared.candidate,
+                &mut cursor_candidates,
+                store,
+                &selected_identities,
+            );
             if changed {
                 validate_ordinary_provider_subscription_change(
                     store,
@@ -18108,90 +18240,96 @@ async fn build_router_share_upsert_ops(
     build_router_share_upsert_ops_with_policy(state, share_ids, false).await
 }
 
-async fn build_router_share_upsert_ops_with_policy(
-    state: &ServerState,
-    share_ids: &BTreeSet<String>,
+type ShareSyncOperationsFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<Vec<ShareSyncOperation>>> + Send + 'a>,
+>;
+
+fn build_router_share_upsert_ops_with_policy<'a>(
+    state: &'a ServerState,
+    share_ids: &'a BTreeSet<String>,
     force: bool,
-) -> anyhow::Result<Vec<ShareSyncOperation>> {
-    if share_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let providers = state.providers.read().await.clone();
-    let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
-    let config = state.config_snapshot().await;
-    let shares = state
-        .shares
-        .read()
-        .await
-        .shares
-        .iter()
-        .filter(|share| share_ids.contains(&share.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let prepared = shares
-        .iter()
-        .map(|share| {
-            let descriptor = descriptor_for_share_with_accounts_and_usage(
-                share,
-                &providers,
-                Some(&accounts),
-                Some(&usage),
-            );
-            let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
-            let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
-            state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
-            Ok((share.id.clone(), descriptor, fingerprint))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let needs_prepare = prepared.iter().any(|(share_id, _, fingerprint)| {
-        shares
+) -> ShareSyncOperationsFuture<'a> {
+    Box::pin(async move {
+        if share_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let providers = state.providers.read().await.clone();
+        let accounts = state.accounts.read().await.clone();
+        let usage = state.usage.read().await.clone();
+        let config = state.config_snapshot().await;
+        let shares = state
+            .shares
+            .read()
+            .await
+            .shares
             .iter()
-            .find(|share| &share.id == share_id)
-            .is_some_and(|share| {
-                share.descriptor_generation == 0
-                    || share.descriptor_fingerprint.as_deref() != Some(fingerprint.as_str())
-                    || share.router_synced_revision < share.config_revision
-            })
-    });
-    if needs_prepare {
-        let identities = prepared
-            .iter()
-            .map(|(share_id, _, fingerprint)| (share_id.clone(), fingerprint.clone()))
+            .filter(|share| share_ids.contains(&share.id))
+            .cloned()
             .collect::<Vec<_>>();
-        state
-            .mutate_shares_immediate(|store| {
-                for (share_id, fingerprint) in identities {
-                    store.prepare_descriptor_projection(&share_id, fingerprint);
-                }
+        let prepared = shares
+            .iter()
+            .map(|share| {
+                let descriptor = descriptor_for_share_with_accounts_and_usage(
+                    share,
+                    &providers,
+                    Some(&accounts),
+                    Some(&usage),
+                );
+                let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
+                let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+                state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
+                Ok((share.id.clone(), descriptor, fingerprint))
             })
-            .await?;
-    }
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let projection_state = state.shares.read().await.clone();
-    Ok(prepared
-        .into_iter()
-        .filter_map(|(share_id, mut descriptor, _)| {
-            let share = projection_state.get(&share_id)?;
-            if !force
-                && !projection_state.descriptor_projection_pending(share)
-                && share.router_last_sync_error.is_none()
-            {
-                return None;
-            }
-            descriptor.descriptor_generation = share.descriptor_generation;
-            descriptor.descriptor_fingerprint = share
-                .descriptor_fingerprint
-                .clone()
-                .expect("prepared Share projection has a fingerprint");
-            Some(ShareSyncOperation {
-                kind: "upsert".to_string(),
-                share_id: None,
-                share: Some(descriptor),
+        let needs_prepare = prepared.iter().any(|(share_id, _, fingerprint)| {
+            shares
+                .iter()
+                .find(|share| &share.id == share_id)
+                .is_some_and(|share| {
+                    share.descriptor_generation == 0
+                        || share.descriptor_fingerprint.as_deref() != Some(fingerprint.as_str())
+                        || share.router_synced_revision < share.config_revision
+                })
+        });
+        if needs_prepare {
+            let identities = prepared
+                .iter()
+                .map(|(share_id, _, fingerprint)| (share_id.clone(), fingerprint.clone()))
+                .collect::<Vec<_>>();
+            state
+                .mutate_shares_immediate(|store| {
+                    for (share_id, fingerprint) in identities {
+                        store.prepare_descriptor_projection(&share_id, fingerprint);
+                    }
+                })
+                .await?;
+        }
+
+        let projection_state = state.shares.read().await.clone();
+        Ok(prepared
+            .into_iter()
+            .filter_map(|(share_id, mut descriptor, _)| {
+                let share = projection_state.get(&share_id)?;
+                if !force
+                    && !projection_state.descriptor_projection_pending(share)
+                    && share.router_last_sync_error.is_none()
+                {
+                    return None;
+                }
+                descriptor.descriptor_generation = share.descriptor_generation;
+                descriptor.descriptor_fingerprint = share
+                    .descriptor_fingerprint
+                    .clone()
+                    .expect("prepared Share projection has a fingerprint");
+                Some(ShareSyncOperation {
+                    kind: "upsert".to_string(),
+                    share_id: None,
+                    share: Some(descriptor),
+                })
             })
-        })
-        .collect())
+            .collect())
+    })
 }
 
 async fn mark_router_share_upserts_synced_with_outcome(

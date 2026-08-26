@@ -21,7 +21,10 @@ use crate::infra::credentials::{
 
 use super::model::{AppKind, AuthBinding, Provider, ProviderMeta, ProviderType};
 use super::registry::{CustomBindingInput, ProfileId, ProviderKey};
-use super::store::{ProviderResourceMetadata, ProviderStore, ProviderStoreFormat, StoredProvider};
+use super::store::{
+    CursorVerifiedIdentity, ProviderResourceMetadata, ProviderStore, ProviderStoreFormat,
+    StoredProvider,
+};
 
 pub(crate) const PROVIDER_STORE_FORMAT: &str = "cc-switch-provider-store";
 pub(crate) const PROVIDER_STORE_SCHEMA_VERSION: u32 = 4;
@@ -127,6 +130,8 @@ struct ProviderRecordS2 {
     legacy_payload: Option<LegacyPayloadS2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     create_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor_verified_identity: Option<CursorVerifiedIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +475,7 @@ fn record_from_stored(
         custom_binding: stored.resource.custom_binding.clone(),
         legacy_payload,
         create_request_id: stored.resource.create_request_id.clone(),
+        cursor_verified_identity: stored.resource.cursor_verified_identity.clone(),
     })
 }
 
@@ -520,6 +526,7 @@ fn stored_from_record(
         credential_generation: record.credential_generation,
         custom_binding: record.custom_binding,
         create_request_id: record.create_request_id,
+        cursor_verified_identity: record.cursor_verified_identity,
     };
     let (provider_type, provider_type_id) = match record.legacy_payload {
         Some(legacy) => (legacy.provider_type, legacy.provider_type_id),
@@ -732,6 +739,12 @@ mod tests {
                     profile_schema_revision: Some(1),
                     revision: 3,
                     credential_generation: 2,
+                    cursor_verified_identity: Some(CursorVerifiedIdentity {
+                        schema_version: 1,
+                        account_id: "cursor_apikey_fixture".to_string(),
+                        principal_source: "user_id".to_string(),
+                        verified_at_ms: 1_700_000_000_000,
+                    }),
                     ..Default::default()
                 },
             }],
@@ -775,6 +788,14 @@ mod tests {
         assert_eq!(
             provider.settings_config["auth"]["OPENAI_API_KEY"],
             "secret-value"
+        );
+        assert_eq!(
+            decoded.providers[0]
+                .resource
+                .cursor_verified_identity
+                .as_ref()
+                .map(|identity| identity.account_id.as_str()),
+            Some("cursor_apikey_fixture")
         );
 
         let mut materialized = decoded.materialized_clone().unwrap();

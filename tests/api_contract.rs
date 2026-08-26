@@ -209,6 +209,7 @@ impl CursorApiKeyVerifier for AcceptCursorApiKeyVerifier {
     ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
         Ok(VerifiedCursorApiKey {
             account_id: "cursor_apikey_contract_fixture".to_string(),
+            principal_source: "user_id".to_string(),
             email: Some("fixture@example.com".to_string()),
             profile: json!({"source": "api_contract_fixture"}),
         })
@@ -5972,7 +5973,6 @@ async fn provider_share_settings_are_saved_atomically() {
         .mutate_shares_immediate(|store| store.upsert(input).unwrap())
         .await
         .unwrap();
-
     let response = app
         .clone()
         .oneshot(json_request(
@@ -9091,7 +9091,7 @@ async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
         })
         .await
         .unwrap();
-    let app = app_router(state);
+    let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
 
     for profile in provider_registry()
@@ -9175,6 +9175,19 @@ async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
         );
         assert_eq!(body["stored"]["profileId"], profile.profile_id.as_str());
         assert_eq!(body["stored"]["app"], profile.app.as_str());
+        if profile.compatibility_provider_type == Some(ProviderType::CursorApiKey) {
+            let provider_id = body["stored"]["provider"]["id"].as_str().unwrap();
+            let snapshot = state.providers_snapshot().await;
+            let identity = snapshot
+                .providers
+                .iter()
+                .find(|stored| stored.app == profile.app && stored.provider.id == provider_id)
+                .and_then(|stored| stored.resource.cursor_verified_identity.as_ref())
+                .expect("Cursor API-key Provider must persist verified identity");
+            assert_eq!(identity.account_id, "cursor_apikey_contract_fixture");
+            assert_eq!(identity.principal_source, "user_id");
+            assert_eq!(identity.schema_version, 1);
+        }
     }
 }
 
@@ -13719,6 +13732,12 @@ fn rebase_save_params_with_share_usage_edit(
 /// on top of the operator baseline, and every rejection carries a stable code.
 #[tokio::test]
 async fn share_user_usage_rebase_round_trips_over_the_invoke_wire() {
+    tokio::spawn(share_user_usage_rebase_round_trips_over_the_invoke_wire_inner())
+        .await
+        .unwrap();
+}
+
+async fn share_user_usage_rebase_round_trips_over_the_invoke_wire_inner() {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();

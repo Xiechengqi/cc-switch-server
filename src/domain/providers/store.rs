@@ -100,6 +100,23 @@ pub struct ProviderResourceMetadata {
     pub custom_binding: Option<CustomBindingInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_verified_identity: Option<CursorVerifiedIdentity>,
+}
+
+/// Server-owned identity established by the Cursor public API verifier.
+///
+/// The stable account id is safe to persist and is deliberately separate from
+/// credential generation. It may seed Cursor's machine/config identity, but it
+/// must never be used to reuse tokens, live streams, or completed-response
+/// state across a credential rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CursorVerifiedIdentity {
+    pub schema_version: u32,
+    pub account_id: String,
+    pub principal_source: String,
+    pub verified_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

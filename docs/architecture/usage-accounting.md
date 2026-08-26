@@ -45,3 +45,5 @@ Stream 状态：
 - `client_cancelled`：Images 下游 Body 被取消；usage `statusCode` 为 499。
 
 Images 为穿过 Cloudflare 保持连接，可能在最终结果前提交 SSE comment 或 JSON 空白。因此 wire HTTP status 可能保持 200，终态应以完整 payload 和 usage log 的 `statusCode`/`streamStatus` 为准。
+
+Cursor required/named tool semantic retry 最多有三个同绑定 attempt。当前客户端 success usage 使用最终被提交 attempt 的估算值；每次被丢弃的 attempt 通过 `cursor_tool_retry_total{rail,reason,attempt}` 和脱敏 warning 审计，不把早期 prose 暴露给客户端。该 usage 是估算值并持续设置 `usageEstimated=true`。在上游提供逐 attempt 可归属的权威 usage 前，不将丢弃 attempt 伪装为客户端 token usage；订阅侧的实际消耗可能高于最终响应中的估算值。

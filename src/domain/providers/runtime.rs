@@ -739,6 +739,7 @@ pub fn compile_runtime_plan_with_defaults(
         "upstreamProtocol": driver.upstream_protocol,
         "outboundIdentityPolicy": outbound_identity_policy,
         "authRef": &auth_ref,
+        "cursorVerifiedIdentity": &stored.resource.cursor_verified_identity,
         "modelPolicy": &model_policy,
         "codingPlan": &coding_plan,
         "awsRegion": &aws_region,
@@ -2735,6 +2736,7 @@ mod tests {
                 credential_generation: 1,
                 custom_binding,
                 create_request_id: None,
+                cursor_verified_identity: None,
             },
         }
     }

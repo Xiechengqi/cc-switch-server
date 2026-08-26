@@ -9,6 +9,7 @@ const MAX_CURSOR_PUBLIC_BODY_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct VerifiedCursorApiKey {
     pub account_id: String,
+    pub principal_source: String,
     pub email: Option<String>,
     pub profile: Value,
 }
@@ -56,14 +57,11 @@ pub async fn verify_api_key(
     api_key: &str,
 ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
     let profile = cursor_public_json(client, api_key, "/v1/me").await?;
-    let principal = first_scalar_string(
-        &profile,
-        &["/userId", "/id", "/sub", "/user_id", "/userEmail", "/email"],
-    )
-    .unwrap_or_else(|| sha256_hex(api_key));
+    let (principal, principal_source) = verified_principal(&profile, api_key);
     let email = first_string(&profile, &["/userEmail", "/email", "/user/email"]);
     Ok(VerifiedCursorApiKey {
         account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
+        principal_source: principal_source.to_string(),
         email,
         profile: json!({
             "providerType": "cursor_apikey",
@@ -71,6 +69,16 @@ pub async fn verify_api_key(
             "cursorMe": profile,
         }),
     })
+}
+
+fn verified_principal(profile: &Value, api_key: &str) -> (String, &'static str) {
+    if let Some(value) = first_scalar_string(profile, &["/userId", "/id", "/sub", "/user_id"]) {
+        (value, "user_id")
+    } else if let Some(value) = first_string(profile, &["/userEmail", "/email", "/user/email"]) {
+        (value.trim().to_ascii_lowercase(), "email")
+    } else {
+        (sha256_hex(api_key), "api_key_fallback")
+    }
 }
 
 pub async fn available_models(
@@ -253,5 +261,23 @@ mod tests {
         assert!(transient.retryable);
         assert!(!malformed.retryable);
         assert!(!auth.retryable);
+    }
+
+    #[test]
+    fn principal_selection_prefers_user_id_then_normalized_email_then_key_fallback() {
+        assert_eq!(
+            verified_principal(
+                &json!({"userId":"stable-user", "userEmail":"UPPER@EXAMPLE.COM"}),
+                "key-one"
+            ),
+            ("stable-user".to_string(), "user_id")
+        );
+        assert_eq!(
+            verified_principal(&json!({"email":" UPPER@EXAMPLE.COM "}), "key-one"),
+            ("upper@example.com".to_string(), "email")
+        );
+        let (fallback, source) = verified_principal(&json!({}), "key-one");
+        assert_eq!(source, "api_key_fallback");
+        assert_eq!(fallback, sha256_hex("key-one"));
     }
 }

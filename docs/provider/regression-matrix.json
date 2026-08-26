@@ -11,6 +11,23 @@
       "failed": "A required contract or live probe failed."
     }
   },
+  "cursorImplementation": {
+    "scope": "single explicitly bound subscription account per Provider; no account pool or cross-binding fallback",
+    "contractState": "statically-tested",
+    "apiKeyLiveVerified": false,
+    "oauthLiveVerified": false,
+    "implementedContracts": [
+      "bounded_tool_schema_and_adapter",
+      "required_named_precommit_retry",
+      "completed_previous_response_state",
+      "same_conversation_conflict",
+      "response_compaction",
+      "canonical_input_token_estimate",
+      "verified_apikey_stable_identity",
+      "unsupported_parameter_rejection"
+    ],
+    "transientPrecommitRetry": "disabled_pending_separate_live_idempotency_evidence"
+  },
   "requiredFixtureFields": [
     "non_stream",
     "stream",

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    { "name": "same_user_id_new_key", "machineStable": true, "credentialFenceChanges": true },
+    { "name": "same_normalized_email_new_key", "machineStable": true, "credentialFenceChanges": true },
+    { "name": "different_principal", "ordinaryPatch": "conflict" },
+    { "name": "api_key_fallback_new_key", "machineStable": false, "ordinaryPatch": "conflict" }
+  ]
+}

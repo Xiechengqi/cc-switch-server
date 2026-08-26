@@ -56,6 +56,10 @@ pub struct AgentRunPlan {
     pub previous_response_id: Option<String>,
     /// Working directory surfaced in RequestContext ack (composer-api SDK).
     pub working_directory: String,
+    pub tool_choice: ExtractedToolChoice,
+    /// Credential-free Responses items retained across a parked tool turn and
+    /// copied into completed-response state after the final terminal.
+    pub response_input_items: Vec<Value>,
 }
 
 /// Validate tool-result context for AgentService routing. Returns an error
@@ -69,6 +73,41 @@ pub fn validate_tool_result_context(plan: &AgentRunPlan) -> Result<(), String> {
             return Err("function_call_output requires a non-empty call_id; \
                  continuation via previous_response_id without call_id is not supported"
                 .to_string());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_tool_choice_contract(plan: &AgentRunPlan) -> Result<(), String> {
+    if !plan.tool_results.is_empty() {
+        return Ok(());
+    }
+    let required_name = match &plan.tool_choice {
+        ExtractedToolChoice::Auto | ExtractedToolChoice::None => return Ok(()),
+        ExtractedToolChoice::Required => None,
+        ExtractedToolChoice::Named(name) => Some(name.as_str()),
+    };
+    if plan.tools.is_empty() {
+        return Err("tool_choice requires at least one declared client tool".to_string());
+    }
+    if let Some(required_name) = required_name {
+        let normalize = |value: &str| {
+            value
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        };
+        let required = normalize(required_name);
+        let matches = plan
+            .tools
+            .iter()
+            .filter(|tool| normalize(&tool.name) == required)
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "named tool_choice `{required_name}` must match exactly one declared client tool"
+            ));
         }
     }
     Ok(())
@@ -136,7 +175,209 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         model_id,
         previous_response_id,
         working_directory,
+        tool_choice,
+        response_input_items: if protocol == InboundProtocol::OpenAiResponses {
+            normalized_response_input_items(body)
+        } else {
+            Vec::new()
+        },
     }
+}
+
+pub fn estimate_responses_input_tokens(body: &Value) -> u32 {
+    let plan = build_plan(InboundProtocol::OpenAiResponses, body);
+    estimate_agent_plan_input_tokens(&plan)
+}
+
+pub fn estimate_agent_plan_input_tokens(plan: &AgentRunPlan) -> u32 {
+    let mut characters = plan.user_text.chars().count() as u64;
+    for tool in &plan.tools {
+        characters = characters
+            .saturating_add(tool.name.chars().count() as u64)
+            .saturating_add(tool.description.chars().count() as u64)
+            .saturating_add(tool.input_schema.len() as u64);
+    }
+    let estimated = characters.saturating_add(3) / 4;
+    estimated.min(u64::from(u32::MAX)) as u32
+}
+
+pub fn validate_request_contract(
+    protocol: InboundProtocol,
+    body: &Value,
+    compact: bool,
+) -> Result<(), String> {
+    if body
+        .get("n")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_u64() != Some(1))
+    {
+        return Err("unsupported parameter `n`: Cursor text responses only support n=1".into());
+    }
+    if body.get("logprobs").and_then(Value::as_bool) == Some(true)
+        || body.get("top_logprobs").is_some()
+    {
+        return Err("unsupported parameter `logprobs`: Cursor text responses do not expose log probabilities".into());
+    }
+    if body
+        .get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() != Some("text")))
+    {
+        return Err("unsupported parameter `modalities`: only text output is supported".into());
+    }
+    if body.get("audio").is_some() {
+        return Err("unsupported parameter `audio`: audio output is not supported".into());
+    }
+    if protocol == InboundProtocol::OpenAiChat
+        && (body.get("functions").is_some() || body.get("function_call").is_some())
+    {
+        return Err("unsupported parameter `functions`: use tools/tool_choice instead".into());
+    }
+    if protocol == InboundProtocol::OpenAiResponses
+        && body.get("background").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(
+            "unsupported parameter `background`: Cursor responses run synchronously".into(),
+        );
+    }
+    if protocol == InboundProtocol::OpenAiResponses {
+        const HOSTED_TOOL_TYPES: &[&str] = &[
+            "web_search",
+            "web_search_preview",
+            "file_search",
+            "computer_use_preview",
+            "code_interpreter",
+            "image_generation",
+        ];
+        if let Some(tool_type) = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+            .find(|tool_type| HOSTED_TOOL_TYPES.contains(tool_type))
+        {
+            return Err(format!(
+                "unsupported parameter `tools`: hosted tool type `{tool_type}` cannot run on the Cursor text rail"
+            ));
+        }
+    }
+    if protocol == InboundProtocol::GeminiNative
+        && body
+            .pointer("/generationConfig/candidateCount")
+            .or_else(|| body.pointer("/generation_config/candidate_count"))
+            .filter(|value| !value.is_null())
+            .is_some_and(|value| value.as_u64() != Some(1))
+    {
+        return Err(
+            "unsupported parameter `candidateCount`: Cursor only returns one candidate".into(),
+        );
+    }
+    if compact {
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            return Err(
+                "unsupported parameter `stream`: response compaction is non-streaming".into(),
+            );
+        }
+        if body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return Err(
+                "unsupported parameter `tools`: response compaction cannot execute tools".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn normalized_response_input_items(body: &Value) -> Vec<Value> {
+    match body.get("input") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(text)) => vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": text,
+        })],
+        Some(Value::Null) | None => Vec::new(),
+        Some(value) => vec![value.clone()],
+    }
+}
+
+pub fn prepend_response_context(body: &mut Value, previous: &[Value]) -> Result<(), String> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| "Responses request body must be an object".to_string())?;
+    let current = match object.remove("input") {
+        Some(Value::Array(items)) => items,
+        Some(Value::String(text)) => vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": text,
+        })],
+        Some(Value::Null) | None => Vec::new(),
+        Some(value) => vec![value],
+    };
+    let mut combined = Vec::with_capacity(previous.len().saturating_add(current.len()));
+    let mut call_memory = std::collections::HashMap::<(String, String), Value>::new();
+    for item in previous.iter().chain(current.iter()) {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("tool_call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if matches!(kind, "function_call" | "function_call_output") {
+            let call_id = call_id
+                .ok_or_else(|| format!("Responses {kind} item requires a non-empty call_id"))?;
+            let key = (kind.to_string(), call_id.to_string());
+            if let Some(existing) = call_memory.get(&key) {
+                if existing != item {
+                    return Err(format!(
+                        "Responses continuation contains conflicting {kind} items for call_id `{call_id}`"
+                    ));
+                }
+                continue;
+            }
+            call_memory.insert(key, item.clone());
+        }
+        combined.push(item.clone());
+    }
+    if combined.len() > 400 {
+        return Err("Responses expanded continuation exceeds 400 input items".to_string());
+    }
+    object.insert("input".to_string(), Value::Array(combined));
+    object.remove("previous_response_id");
+    Ok(())
+}
+
+pub fn prepare_response_compaction(body: &mut Value) -> Result<(), String> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| "response compaction body must be an object".to_string())?;
+    let requested = object
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut instructions = [
+        "You are compacting a long-running Responses API conversation.",
+        "Return only a concise continuation summary preserving user goals, decisions, constraints, important file paths, pending tasks, tool results, and unresolved errors.",
+        "Do not add new actions, execute tools, or answer the original request; summarize conversation state for a future model turn.",
+    ]
+    .join("\n");
+    if let Some(requested) = requested {
+        instructions.push_str("\n\nCOMPACTION INSTRUCTIONS:\n");
+        instructions.push_str(requested);
+    }
+    object.insert("instructions".to_string(), Value::String(instructions));
+    object.insert("stream".to_string(), Value::Bool(false));
+    object.insert("tool_choice".to_string(), Value::String("none".to_string()));
+    object.remove("tools");
+    object.remove("background");
+    Ok(())
 }
 
 // ─── Anthropic Messages ────────────────────────────────────────────────────
@@ -570,6 +811,17 @@ fn decompose_openai_responses(
                             });
                             conversation_lines.push(format!("Tool result ({call_id}): {output}"));
                         }
+                        "compaction" => {
+                            if let Some(summary) = item
+                                .get("encrypted_content")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|summary| !summary.is_empty())
+                            {
+                                conversation_lines
+                                    .push(format!("Prior conversation compaction: {summary}"));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -860,7 +1112,7 @@ fn role_label(role: &str) -> &'static str {
 
 // ─── Tool directives & output constraints (OmniRoute / composer-api) ───────
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ExtractedToolChoice {
     #[default]
     Auto,
@@ -870,6 +1122,37 @@ pub enum ExtractedToolChoice {
 }
 
 pub fn extract_tool_choice(body: &Value, protocol: InboundProtocol) -> ExtractedToolChoice {
+    if protocol == InboundProtocol::GeminiNative {
+        let config = body
+            .pointer("/toolConfig/functionCallingConfig")
+            .or_else(|| body.pointer("/tool_config/function_calling_config"));
+        if let Some(config) = config {
+            let mode = config
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("AUTO")
+                .to_ascii_uppercase();
+            if mode == "NONE" {
+                return ExtractedToolChoice::None;
+            }
+            if mode == "ANY" {
+                let allowed = config
+                    .get("allowedFunctionNames")
+                    .or_else(|| config.get("allowed_function_names"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>();
+                return match allowed.as_slice() {
+                    [name] => ExtractedToolChoice::Named((*name).to_string()),
+                    _ => ExtractedToolChoice::Required,
+                };
+            }
+        }
+    }
     let Some(raw) = body.get("tool_choice") else {
         return ExtractedToolChoice::Auto;
     };
@@ -895,6 +1178,7 @@ pub fn extract_tool_choice(body: &Value, protocol: InboundProtocol) -> Extracted
             } else if raw.get("type").and_then(Value::as_str) == Some("function") {
                 raw.get("function")
                     .and_then(|f| f.get("name"))
+                    .or_else(|| raw.get("name"))
                     .and_then(Value::as_str)
                     .map(|n| ExtractedToolChoice::Named(n.to_string()))
                     .unwrap_or(ExtractedToolChoice::Auto)
@@ -1408,6 +1692,17 @@ mod tests {
     fn estimate_input_tokens_nonzero_for_text() {
         assert!(estimate_input_tokens("hello world this is a test") > 0);
         assert_eq!(estimate_input_tokens(""), 0);
+        let plain = estimate_responses_input_tokens(&json!({"input":"hello"}));
+        let with_tool = estimate_responses_input_tokens(&json!({
+            "input":"hello",
+            "tools":[{
+                "type":"function",
+                "name":"lookup",
+                "description":"lookup a value",
+                "parameters":{"type":"object","properties":{"key":{"type":"string"}}}
+            }]
+        }));
+        assert!(with_tool > plain);
     }
 
     #[test]
@@ -1424,5 +1719,124 @@ mod tests {
         let body = json!({ "model": "composer-2.5", "input": "hi" });
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
         assert_eq!(plan.working_directory, ".");
+    }
+
+    #[test]
+    fn completed_response_context_deduplicates_and_rejects_conflicting_call_memory() {
+        let previous = vec![json!({
+            "type":"function_call",
+            "call_id":"call_1",
+            "name":"lookup",
+            "arguments":"{}"
+        })];
+        let mut identical = json!({
+            "input":[
+                {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ],
+            "previous_response_id":"resp_1"
+        });
+        prepend_response_context(&mut identical, &previous).unwrap();
+        assert_eq!(identical["input"].as_array().unwrap().len(), 2);
+        assert!(identical.get("previous_response_id").is_none());
+
+        let mut conflicting = json!({
+            "input":[{"type":"function_call","call_id":"call_1","name":"other","arguments":"{}"}]
+        });
+        assert!(prepend_response_context(&mut conflicting, &previous).is_err());
+    }
+
+    #[test]
+    fn compaction_plan_is_non_streaming_and_side_effect_free() {
+        let mut body = json!({
+            "model":"gpt-5",
+            "instructions":"Keep deployment constraints.",
+            "input":[{"type":"message","role":"user","content":"context"}],
+            "tools":[{"type":"function","name":"shell"}],
+            "background":true
+        });
+        prepare_response_compaction(&mut body).unwrap();
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tools").is_none());
+        assert!(body.get("background").is_none());
+        assert!(body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Keep deployment constraints"));
+
+        let continuation = build_plan(
+            InboundProtocol::OpenAiResponses,
+            &json!({
+                "input":[
+                    {"type":"compaction","encrypted_content":"Goal: finish review"},
+                    {"type":"message","role":"user","content":"continue"}
+                ]
+            }),
+        );
+        assert!(continuation
+            .user_text
+            .contains("Prior conversation compaction: Goal: finish review"));
+    }
+
+    #[test]
+    fn request_contract_rejects_silently_unimplementable_parameters() {
+        assert!(
+            validate_request_contract(InboundProtocol::OpenAiChat, &json!({"n":2}), false)
+                .unwrap_err()
+                .contains("`n`")
+        );
+        assert!(
+            validate_request_contract(InboundProtocol::OpenAiChat, &json!({"n":-1}), false)
+                .unwrap_err()
+                .contains("`n`")
+        );
+        assert!(validate_request_contract(
+            InboundProtocol::OpenAiResponses,
+            &json!({"tools":[{"type":"web_search_preview"}]}),
+            false
+        )
+        .unwrap_err()
+        .contains("hosted tool"));
+        assert!(validate_request_contract(
+            InboundProtocol::GeminiNative,
+            &json!({"generationConfig":{"candidateCount":2}}),
+            false
+        )
+        .unwrap_err()
+        .contains("candidateCount"));
+        assert!(validate_request_contract(
+            InboundProtocol::GeminiNative,
+            &json!({"generationConfig":{"candidateCount":"many"}}),
+            false
+        )
+        .unwrap_err()
+        .contains("candidateCount"));
+        assert_eq!(
+            extract_tool_choice(
+                &json!({
+                    "toolConfig":{"functionCallingConfig":{
+                        "mode":"ANY",
+                        "allowedFunctionNames":["lookup"]
+                    }}
+                }),
+                InboundProtocol::GeminiNative,
+            ),
+            ExtractedToolChoice::Named("lookup".to_string())
+        );
+        let required_without_tools = build_plan(
+            InboundProtocol::OpenAiResponses,
+            &json!({"input":"go","tool_choice":"required"}),
+        );
+        assert!(validate_tool_choice_contract(&required_without_tools).is_err());
+
+        let continuation = build_plan(
+            InboundProtocol::OpenAiResponses,
+            &json!({
+                "input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}],
+                "tool_choice":"required"
+            }),
+        );
+        assert!(validate_tool_choice_contract(&continuation).is_ok());
     }
 }

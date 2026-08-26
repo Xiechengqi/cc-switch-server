@@ -1,0 +1,91 @@
+{
+  "source": "neutralized composer-api OpenCode/Pi compatibility cases",
+  "tools": [
+    {
+      "id": "bash_seconds",
+      "name": "bash",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "command": { "type": "string" },
+          "timeout": { "type": "number", "description": "Timeout in seconds" }
+        },
+        "required": ["command"]
+      }
+    },
+    {
+      "id": "bash_strict",
+      "name": "bash",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "command": { "type": "string" },
+          "cwd": { "type": "string" },
+          "timeout_ms": { "type": "number" },
+          "description": { "type": "string" }
+        },
+        "required": ["command", "cwd", "timeout_ms", "description"]
+      }
+    },
+    {
+      "id": "edit",
+      "name": "edit",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "filePath": { "type": "string" },
+          "oldText": { "type": "string" },
+          "newText": { "type": "string" }
+        },
+        "required": ["filePath", "oldText", "newText"]
+      }
+    },
+    {
+      "id": "find",
+      "name": "find",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "pattern": { "type": "string" },
+          "path": { "type": "string" }
+        },
+        "required": ["pattern", "path"]
+      }
+    }
+  ],
+  "cases": [
+    {
+      "declared": "bash_seconds",
+      "emitted": "shell",
+      "args": { "command": "npm test", "timeout": 120000 },
+      "expected": { "command": "npm test", "timeout": 120 }
+    },
+    {
+      "declared": "bash_strict",
+      "emitted": "shell",
+      "args": { "command": "npm run build" },
+      "expected": {
+        "command": "npm run build",
+        "cwd": ".",
+        "timeout_ms": 120000,
+        "description": "Runs npm run build"
+      }
+    },
+    {
+      "declared": "edit",
+      "emitted": "edit",
+      "args": { "path": "src/main.rs", "oldString": "old", "newString": "new" },
+      "expected": { "filePath": "src/main.rs", "oldText": "old", "newText": "new" }
+    },
+    {
+      "declared": "find",
+      "emitted": "glob",
+      "args": { "targetDirectory": "src" },
+      "expected": { "pattern": "**/*", "path": "src" }
+    }
+  ]
+}

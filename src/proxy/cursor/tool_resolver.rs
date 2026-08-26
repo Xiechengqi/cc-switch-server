@@ -5,6 +5,7 @@
 //! client's declared inventory before surfacing a tool_use/tool_calls block.
 
 use super::agent_proto::McpToolDef;
+use super::tool_schema::{validate_tool_arguments, ToolSchemaError, ToolSchemaErrorKind};
 use bytes::Bytes;
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,7 @@ pub struct ResolvedToolCall {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InvalidToolCall {
     pub original_name: String,
+    pub reason_code: &'static str,
     pub reason: String,
 }
 
@@ -29,6 +31,7 @@ struct ToolSpec {
 
 #[derive(Debug, Clone, Default)]
 struct ToolSchema {
+    raw: Value,
     properties: HashMap<String, Value>,
     required: HashSet<String>,
     additional_properties: Option<bool>,
@@ -45,6 +48,7 @@ pub fn resolve_tool_call(
         other => {
             return Err(invalid(
                 emitted_name,
+                "invalid_arguments",
                 format!("arguments must be a JSON object, got {}", json_type(&other)),
             ))
         }
@@ -53,6 +57,7 @@ pub fn resolve_tool_call(
     if specs.is_empty() {
         return Err(invalid(
             emitted_name,
+            "undeclared_tool",
             "no client tool inventory is available",
         ));
     }
@@ -64,22 +69,41 @@ pub fn resolve_tool_call(
         }
     }
 
-    if let Some(spec) = find_tool(&specs, emitted_name) {
-        if let Some(args) = normalize_and_validate(&args_obj, spec, &emitted_canonical) {
-            return Ok(ResolvedToolCall {
-                name: spec.name.clone(),
-                args,
-            });
+    let exact = specs
+        .iter()
+        .filter(|spec| normalize_key(&spec.name) == normalize_key(emitted_name))
+        .collect::<Vec<_>>();
+    if exact.len() > 1 {
+        return Err(invalid(
+            emitted_name,
+            "ambiguous_tool",
+            "multiple declared tools have the same normalized name",
+        ));
+    }
+    if let Some(spec) = exact.first().copied() {
+        match normalize_and_validate(&args_obj, spec, &emitted_canonical) {
+            Ok(Some(args)) => {
+                return Ok(ResolvedToolCall {
+                    name: spec.name.clone(),
+                    args,
+                })
+            }
+            Ok(None) => {}
+            Err(error) => return Err(schema_invalid(emitted_name, error)),
         }
     }
 
     for candidate in candidate_tool_names(&emitted_canonical, &args_obj) {
-        if let Some(spec) = find_tool_by_canonical(&specs, candidate) {
-            if let Some(args) = normalize_and_validate(&args_obj, spec, candidate) {
-                return Ok(ResolvedToolCall {
-                    name: spec.name.clone(),
-                    args,
-                });
+        if let Some(spec) = unique_tool_by_canonical(&specs, candidate, emitted_name)? {
+            match normalize_and_validate(&args_obj, spec, candidate) {
+                Ok(Some(args)) => {
+                    return Ok(ResolvedToolCall {
+                        name: spec.name.clone(),
+                        args,
+                    })
+                }
+                Ok(None) => {}
+                Err(error) => return Err(schema_invalid(emitted_name, error)),
             }
         }
     }
@@ -91,6 +115,7 @@ pub fn resolve_tool_call(
         .join(", ");
     Err(invalid(
         emitted_name,
+        "invalid_arguments",
         format!("arguments do not satisfy any declared tool schema; allowed tools: {allowed}"),
     ))
 }
@@ -123,17 +148,26 @@ fn resolve_websearch_misroute(
         return None;
     };
     for target in order {
-        if let Some(spec) = find_tool_by_canonical(specs, target) {
-            if let Some(args) = normalize_and_validate(args, spec, target) {
-                return Some(Ok(ResolvedToolCall {
-                    name: spec.name.clone(),
-                    args,
-                }));
+        let spec = match unique_tool_by_canonical(specs, target, "WebSearch") {
+            Ok(spec) => spec,
+            Err(error) => return Some(Err(error)),
+        };
+        if let Some(spec) = spec {
+            match normalize_and_validate(args, spec, target) {
+                Ok(Some(args)) => {
+                    return Some(Ok(ResolvedToolCall {
+                        name: spec.name.clone(),
+                        args,
+                    }))
+                }
+                Ok(None) => {}
+                Err(error) => return Some(Err(schema_invalid("WebSearch", error))),
             }
         }
     }
     Some(Err(invalid(
         "WebSearch",
+        "invalid_arguments",
         "WebSearch was called with filesystem-search arguments, but no declared Glob/Grep schema accepted them",
     )))
 }
@@ -142,13 +176,15 @@ fn normalize_and_validate(
     args: &Map<String, Value>,
     spec: &ToolSpec,
     emitted_canonical: &str,
-) -> Option<Value> {
+) -> Result<Option<Value>, ToolSchemaError> {
     let mut normalized = normalize_arguments(args, spec, emitted_canonical);
     repair_glob_swapped_values(&mut normalized, spec);
-    if schema_accepts(&normalized, &spec.schema) {
-        Some(Value::Object(normalized))
-    } else {
-        None
+    normalize_shell_arguments(&mut normalized, args, spec);
+    let normalized = Value::Object(normalized);
+    match validate_tool_arguments(&spec.schema.raw, &normalized) {
+        Ok(()) => Ok(Some(normalized)),
+        Err(error) if error.kind == ToolSchemaErrorKind::Validation => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -176,7 +212,7 @@ fn normalize_arguments(
         {
             let prop_schema = spec.schema.properties.get(&target);
             out.insert(target, normalize_value_for_schema(value, prop_schema));
-        } else if spec.schema.additional_properties.unwrap_or(false) {
+        } else if spec.schema.additional_properties != Some(false) {
             out.insert(key.clone(), value.clone());
         }
     }
@@ -211,6 +247,8 @@ fn apply_required_defaults(
                     ],
                 ) {
                     out.insert(pattern_key, Value::String(pattern));
+                } else {
+                    out.insert(pattern_key, Value::String("**/*".to_string()));
                 }
             }
         }
@@ -232,6 +270,77 @@ fn apply_required_defaults(
                 }
             }
         }
+    } else if canonical == "shell" {
+        if let Some(cwd_key) = first_property(
+            property_lookup,
+            &["cwd", "workdir", "workingDirectory", "working_directory"],
+        ) {
+            if spec.schema.required.contains(&cwd_key) && !out.contains_key(&cwd_key) {
+                let cwd = first_string(
+                    original,
+                    &["cwd", "workdir", "workingDirectory", "working_directory"],
+                )
+                .unwrap_or_else(|| ".".to_string());
+                out.insert(cwd_key, Value::String(cwd));
+            }
+        }
+        if let Some(timeout_key) =
+            first_property(property_lookup, &["timeout_ms", "timeoutMs", "timeout"])
+        {
+            if spec.schema.required.contains(&timeout_key) && !out.contains_key(&timeout_key) {
+                out.insert(timeout_key, Value::Number(120_000u64.into()));
+            }
+        }
+        if let Some(description_key) = first_property(property_lookup, &["description"]) {
+            if spec.schema.required.contains(&description_key)
+                && !out.contains_key(&description_key)
+            {
+                let command = first_string(original, &["command", "cmd", "script"])
+                    .unwrap_or_else(|| "shell command".to_string());
+                let summary = command.chars().take(80).collect::<String>();
+                out.insert(description_key, Value::String(format!("Runs {summary}")));
+            }
+        }
+    }
+}
+
+fn normalize_shell_arguments(
+    args: &mut Map<String, Value>,
+    original: &Map<String, Value>,
+    spec: &ToolSpec,
+) {
+    if canonical_tool_name(&spec.name) != "shell" {
+        return;
+    }
+    let lookup = normalized_property_lookup(&spec.schema);
+    let Some(timeout_key) = first_property(&lookup, &["timeout", "timeout_ms", "timeoutMs"]) else {
+        return;
+    };
+    let Some(value) = args
+        .get(&timeout_key)
+        .and_then(Value::as_f64)
+        .or_else(|| original.get("timeout").and_then(Value::as_f64))
+    else {
+        return;
+    };
+    let target_schema = spec.schema.properties.get(&timeout_key);
+    let target_is_seconds = normalize_key(&timeout_key) == "timeout"
+        && target_schema
+            .and_then(|schema| schema.get("description"))
+            .and_then(Value::as_str)
+            .is_some_and(|description| description.to_ascii_lowercase().contains("second"));
+    let normalized = if target_is_seconds && value >= 1_000.0 {
+        value / 1_000.0
+    } else {
+        value
+    };
+    let number = if normalized.fract() == 0.0 && normalized >= 0.0 {
+        Some(Number::from(normalized as u64))
+    } else {
+        Number::from_f64(normalized)
+    };
+    if let Some(number) = number {
+        args.insert(timeout_key, Value::Number(number));
     }
 }
 
@@ -270,81 +379,11 @@ fn repair_glob_swapped_values(args: &mut Map<String, Value>, spec: &ToolSpec) {
     }
 }
 
-fn schema_accepts(args: &Map<String, Value>, schema: &ToolSchema) -> bool {
-    for required in &schema.required {
-        if !args.contains_key(required) {
-            return false;
-        }
-    }
-    if schema.open {
-        return true;
-    }
-    for (key, value) in args {
-        if let Some(prop_schema) = schema.properties.get(key) {
-            if !value_matches_schema(value, prop_schema) {
-                return false;
-            }
-            continue;
-        }
-        if schema.additional_properties == Some(false) {
-            return false;
-        }
-    }
-    true
-}
-
-fn value_matches_schema(value: &Value, schema: &Value) -> bool {
-    let Some(obj) = schema.as_object() else {
-        return true;
-    };
-    if let Some(const_value) = obj.get("const") {
-        return value == const_value;
-    }
-    if let Some(enum_values) = obj.get("enum").and_then(Value::as_array) {
-        if !enum_values.iter().any(|v| v == value) {
-            return false;
-        }
-    }
-    if let Some(any_of) = obj.get("anyOf").and_then(Value::as_array) {
-        if !any_of.iter().any(|s| value_matches_schema(value, s)) {
-            return false;
-        }
-    }
-    if let Some(one_of) = obj.get("oneOf").and_then(Value::as_array) {
-        if !one_of.iter().any(|s| value_matches_schema(value, s)) {
-            return false;
-        }
-    }
-    if let Some(all_of) = obj.get("allOf").and_then(Value::as_array) {
-        if !all_of.iter().all(|s| value_matches_schema(value, s)) {
-            return false;
-        }
-    }
-    let types = schema_types(obj.get("type"));
-    if types.is_empty() {
-        return true;
-    }
-    types.iter().any(|ty| json_type_matches(value, ty))
-}
-
 fn schema_types(value: Option<&Value>) -> Vec<&str> {
     match value {
         Some(Value::String(s)) => vec![s.as_str()],
         Some(Value::Array(arr)) => arr.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
-    }
-}
-
-fn json_type_matches(value: &Value, ty: &str) -> bool {
-    match ty {
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "boolean" => value.is_boolean(),
-        "array" => value.is_array(),
-        "object" => value.is_object(),
-        "null" => value.is_null(),
-        _ => true,
     }
 }
 
@@ -359,6 +398,7 @@ fn parse_tool_schema(bytes: &Bytes) -> ToolSchema {
     let root = serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Object(Map::new()));
     let Some(obj) = root.as_object() else {
         return ToolSchema {
+            raw: Value::Bool(true),
             open: true,
             ..ToolSchema::default()
         };
@@ -386,6 +426,7 @@ fn parse_tool_schema(bytes: &Bytes) -> ToolSchema {
     let additional_properties = obj.get("additionalProperties").and_then(Value::as_bool);
     let open = properties.is_empty() && required.is_empty() && additional_properties != Some(false);
     ToolSchema {
+        raw: root,
         properties,
         required,
         additional_properties,
@@ -393,21 +434,28 @@ fn parse_tool_schema(bytes: &Bytes) -> ToolSchema {
     }
 }
 
-fn find_tool<'a>(specs: &'a [ToolSpec], name: &str) -> Option<&'a ToolSpec> {
-    let norm = normalize_key(name);
-    specs.iter().find(|s| normalize_key(&s.name) == norm)
-}
-
-fn find_tool_by_canonical<'a>(specs: &'a [ToolSpec], canonical: &str) -> Option<&'a ToolSpec> {
-    specs
+fn unique_tool_by_canonical<'a>(
+    specs: &'a [ToolSpec],
+    canonical: &str,
+    emitted_name: &str,
+) -> Result<Option<&'a ToolSpec>, InvalidToolCall> {
+    let matches = specs
         .iter()
-        .find(|s| canonical_tool_name(&s.name) == canonical)
-        .or_else(|| {
-            specs.iter().find(|s| {
-                let norm = normalize_key(&s.name);
-                norm == canonical || norm.contains(canonical)
-            })
+        .filter(|spec| {
+            let name = canonical_tool_name(&spec.name);
+            let normalized = normalize_key(&spec.name);
+            name == canonical || normalized == canonical || normalized.contains(canonical)
         })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [spec] => Ok(Some(*spec)),
+        _ => Err(invalid(
+            emitted_name,
+            "ambiguous_tool",
+            format!("multiple declared tools match canonical tool `{canonical}`"),
+        )),
+    }
 }
 
 fn candidate_tool_names(canonical: &str, args: &Map<String, Value>) -> Vec<&'static str> {
@@ -536,10 +584,10 @@ fn alias_property(canonical: &str, key: &str, props: &HashMap<String, String>) -
                 &["content", "file_text", "fileText", "contents"]
             }
             "oldstring" | "oldstr" | "oldtext" | "search" => {
-                &["old_string", "oldString", "old_str"]
+                &["old_string", "oldString", "old_str", "oldText"]
             }
             "newstring" | "newstr" | "newtext" | "replacement" => {
-                &["new_string", "newString", "new_str"]
+                &["new_string", "newString", "new_str", "newText"]
             }
             _ => &[],
         },
@@ -617,11 +665,29 @@ fn json_type(value: &Value) -> &'static str {
     }
 }
 
-fn invalid(name: impl Into<String>, reason: impl Into<String>) -> InvalidToolCall {
+fn invalid(
+    name: impl Into<String>,
+    reason_code: &'static str,
+    reason: impl Into<String>,
+) -> InvalidToolCall {
     InvalidToolCall {
         original_name: name.into(),
+        reason_code,
         reason: reason.into(),
     }
+}
+
+fn schema_invalid(name: &str, error: ToolSchemaError) -> InvalidToolCall {
+    let reason_code = match error.kind {
+        ToolSchemaErrorKind::InvalidSchema => "invalid_tool_schema",
+        ToolSchemaErrorKind::ComplexityLimit => "schema_complexity_limit",
+        ToolSchemaErrorKind::Validation => "invalid_arguments",
+    };
+    invalid(
+        name,
+        reason_code,
+        format!("{} at {}", error.message, error.path),
+    )
 }
 
 #[cfg(test)]
@@ -747,5 +813,56 @@ mod tests {
         let resolved =
             resolve_tool_call(&tools, "NumberTool", json!({"temperature":"0.5"})).unwrap();
         assert_eq!(resolved.args, json!({"temperature":0.5}));
+    }
+
+    #[test]
+    fn neutralized_opencode_and_pi_adapter_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/tools/adapter_matrix.json"
+        )))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let declared = case["declared"].as_str().unwrap();
+            let definition = fixture["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["id"].as_str() == Some(declared))
+                .unwrap();
+            let inventory = vec![tool(
+                definition["name"].as_str().unwrap(),
+                definition["schema"].clone(),
+            )];
+            let resolved = resolve_tool_call(
+                &inventory,
+                case["emitted"].as_str().unwrap(),
+                case["args"].clone(),
+            )
+            .unwrap_or_else(|error| panic!("fixture rejected: {error:?}"));
+            assert_eq!(resolved.args, case["expected"]);
+        }
+    }
+
+    #[test]
+    fn invalid_schema_has_a_stable_reason_code() {
+        let tools = vec![tool(
+            "broken",
+            json!({"type":"object","properties":{"x":{"pattern":"["}}}),
+        )];
+        let error = resolve_tool_call(&tools, "broken", json!({"x":"value"})).unwrap_err();
+        assert_eq!(error.reason_code, "invalid_tool_schema");
+    }
+
+    #[test]
+    fn ambiguous_aliases_are_rejected_instead_of_selected_by_order() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"command":{"type":"string"}},
+            "required":["command"]
+        });
+        let tools = vec![tool("bash", schema.clone()), tool("shell", schema)];
+        let error = resolve_tool_call(&tools, "terminal", json!({"command":"pwd"})).unwrap_err();
+        assert_eq!(error.reason_code, "ambiguous_tool");
     }
 }

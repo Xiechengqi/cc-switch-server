@@ -151,6 +151,8 @@ impl ProxyError {
     const KIRO_EVENT_STREAM_TIMEOUT_PREFIX: &'static str = "[KIRO_EVENT_STREAM_TIMEOUT] ";
     const KIRO_UPSTREAM_STREAM_ERROR_PREFIX: &'static str = "[KIRO_UPSTREAM_STREAM_ERROR] ";
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
+    const CURSOR_RESPONSE_STATE_LOST_PREFIX: &'static str = "[CURSOR_RESPONSE_STATE_LOST] ";
+    const CURSOR_CONVERSATION_BUSY_PREFIX: &'static str = "[CURSOR_CONVERSATION_BUSY] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
     const CAPACITY_SHED_PREFIX: &'static str = "[CC_UPSTREAM_CAPACITY_SHED] ";
     const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
@@ -239,6 +241,28 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn cursor_response_state_lost(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!(
+                "{}{}",
+                Self::CURSOR_RESPONSE_STATE_LOST_PREFIX,
+                message.into()
+            ),
+        }
+    }
+
+    pub(super) fn cursor_conversation_busy(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!(
+                "{}{}",
+                Self::CURSOR_CONVERSATION_BUSY_PREFIX,
+                message.into()
+            ),
+        }
+    }
+
     pub(super) fn bad_gateway(error: impl std::fmt::Display) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_GATEWAY,
@@ -289,6 +313,8 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::KIRO_EVENT_STREAM_TIMEOUT_PREFIX))
             .or_else(|| message.strip_prefix(Self::KIRO_UPSTREAM_STREAM_ERROR_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
+            .or_else(|| message.strip_prefix(Self::CURSOR_RESPONSE_STATE_LOST_PREFIX))
+            .or_else(|| message.strip_prefix(Self::CURSOR_CONVERSATION_BUSY_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
             .or_else(|| message.strip_prefix(Self::PROTOCOL_INCOMPATIBLE_PREFIX))
             .or_else(|| message.strip_prefix(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX))
@@ -382,6 +408,12 @@ impl ProxyError {
         if message.starts_with(Self::CURSOR_SESSION_LOST_PREFIX) {
             return "cursor_session_lost";
         }
+        if message.starts_with(Self::CURSOR_RESPONSE_STATE_LOST_PREFIX) {
+            return "cursor_response_state_lost";
+        }
+        if message.starts_with(Self::CURSOR_CONVERSATION_BUSY_PREFIX) {
+            return "cursor_conversation_busy";
+        }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "cc_switch_invalid_request",
             axum::http::StatusCode::UNAUTHORIZED => "cc_switch_auth_error",
@@ -465,9 +497,28 @@ impl ProxyError {
     }
 
     pub fn error_param(&self) -> Option<&'static str> {
-        self.message_without_retry_metadata()
-            .starts_with(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX)
-            .then_some("previous_response_id")
+        let message = self.message_without_retry_metadata();
+        if message.starts_with(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX)
+            || message.starts_with(Self::CURSOR_RESPONSE_STATE_LOST_PREFIX)
+        {
+            return Some("previous_response_id");
+        }
+        for (prefix, parameter) in [
+            ("unsupported parameter `n`", "n"),
+            ("unsupported parameter `logprobs`", "logprobs"),
+            ("unsupported parameter `modalities`", "modalities"),
+            ("unsupported parameter `audio`", "audio"),
+            ("unsupported parameter `functions`", "functions"),
+            ("unsupported parameter `background`", "background"),
+            ("unsupported parameter `candidateCount`", "candidateCount"),
+            ("unsupported parameter `stream`", "stream"),
+            ("unsupported parameter `tools`", "tools"),
+        ] {
+            if message.starts_with(prefix) {
+                return Some(parameter);
+            }
+        }
+        None
     }
 }
 
@@ -706,5 +757,22 @@ mod tests {
 
         assert_eq!(request.model.as_deref(), Some("glm-5.2"));
         assert_eq!(value.get("model").and_then(Value::as_str), Some("glm-5.2"));
+    }
+
+    #[test]
+    fn cursor_state_conflicts_have_stable_public_codes() {
+        let lost = ProxyError::cursor_response_state_lost("expired");
+        assert_eq!(lost.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(lost.error_code(), "cursor_response_state_lost");
+        assert_eq!(lost.client_message(), "expired");
+
+        let busy = ProxyError::cursor_conversation_busy("running");
+        assert_eq!(busy.error_code(), "cursor_conversation_busy");
+        assert_eq!(busy.client_message(), "running");
+
+        let unsupported = ProxyError::bad_request(
+            "unsupported parameter `background`: Cursor responses run synchronously",
+        );
+        assert_eq!(unsupported.error_param(), Some("background"));
     }
 }

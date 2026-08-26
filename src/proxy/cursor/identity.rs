@@ -72,16 +72,28 @@ pub fn cursor_account_from_managed_account(account: &Account) -> CursorAccountDa
     }
 }
 
-pub fn cursor_account_for_api_key(api_key: &str) -> CursorAccountData {
-    let hash = sha256_hex(api_key);
+pub fn cursor_account_for_api_key(
+    api_key: &str,
+    verified_account_id: Option<&str>,
+) -> CursorAccountData {
+    let key_hash = sha256_hex(api_key);
+    let stable_seed = verified_account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&key_hash);
+    let identity_hash = sha256_hex(stable_seed);
     CursorAccountData {
-        account_id: format!("cursor_apikey_{}", &hash[..24]),
+        account_id: verified_account_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("cursor_apikey_{}", &key_hash[..24])),
         email: None,
         refresh_token: None,
         id_token: None,
-        cursor_service_machine_id: Some(hash.clone()),
+        cursor_service_machine_id: Some(identity_hash.clone()),
         cursor_client_version: None,
-        cursor_config_version: Some(stable_uuid_like(&format!("cursor-config:{hash}"))),
+        cursor_config_version: Some(stable_uuid_like(&format!("cursor-config:{identity_hash}"))),
         cursor_client_id: None,
     }
 }
@@ -363,13 +375,25 @@ mod tests {
 
     #[test]
     fn api_key_account_uses_stable_hash_identity() {
-        let account = cursor_account_for_api_key("cursor-key");
-        let repeated = cursor_account_for_api_key("cursor-key");
+        let account = cursor_account_for_api_key("cursor-key", None);
+        let repeated = cursor_account_for_api_key("cursor-key", None);
         assert!(account.account_id.starts_with("cursor_apikey_"));
         assert_eq!(account.machine_id().len(), 64);
         assert_eq!(account.account_id, repeated.account_id);
         assert_eq!(account.machine_id(), repeated.machine_id());
         assert_eq!(account.config_version(), repeated.config_version());
+    }
+
+    #[test]
+    fn verified_principal_stabilizes_machine_identity_across_key_rotation() {
+        let first = cursor_account_for_api_key("cursor-key-one", Some("cursor_apikey_account"));
+        let rotated = cursor_account_for_api_key("cursor-key-two", Some("cursor_apikey_account"));
+        let other = cursor_account_for_api_key("cursor-key-two", Some("cursor_apikey_other"));
+
+        assert_eq!(first.account_id, rotated.account_id);
+        assert_eq!(first.machine_id(), rotated.machine_id());
+        assert_eq!(first.config_version(), rotated.config_version());
+        assert_ne!(first.machine_id(), other.machine_id());
     }
 
     #[test]
@@ -419,7 +443,7 @@ mod tests {
 
     #[test]
     fn agentservice_headers_are_rail_specific_and_strip_composite_tokens() {
-        let account = cursor_account_for_api_key("cursor-key");
+        let account = cursor_account_for_api_key("cursor-key", None);
         let cli = cursor_agentservice_headers(
             CursorProtocolRail::OAuthCli,
             &account,

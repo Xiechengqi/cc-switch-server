@@ -163,6 +163,11 @@ pub enum SessionState {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorSessionOpenConflict {
+    pub state: SessionState,
+}
+
 /// Live state of a single AgentService run.
 pub struct CursorSession {
     pub key: CursorSessionKey,
@@ -172,6 +177,7 @@ pub struct CursorSession {
     pub declared_tool_names: Vec<String>,
     /// Full declared MCP tool definitions for response-side schema validation.
     pub declared_tools: Vec<McpToolDef>,
+    pub semantic_items: Vec<serde_json::Value>,
     /// Working directory for RequestContext ack.
     pub working_directory: String,
     /// Map: client-facing tool call id → cursor exec metadata.
@@ -285,41 +291,29 @@ impl CursorSessionManager {
         Some(reference.entry.clone())
     }
 
-    /// Register a freshly-opened h2 stream as the session for this
-    /// conversation. If a session for the same key already exists, it is
-    /// closed (the request body channel is dropped, releasing hyper).
-    pub async fn open(
+    /// Reserve this conversation before any AgentService request is sent.
+    ///
+    /// A live entry is never replaced. Reserving before the outbound open also
+    /// prevents a rejected concurrent request from starting an orphaned
+    /// upstream run with possible side effects.
+    pub async fn reserve(
         &self,
         key: CursorSessionKey,
         rail: CursorProtocolRail,
-        stream: CursorH2Stream,
         blob_store: HashMap<String, Bytes>,
         declared_tools: Vec<McpToolDef>,
+        semantic_items: Vec<serde_json::Value>,
         working_directory: String,
-    ) -> Arc<Mutex<CursorSession>> {
-        // Close any existing entry first.
-        let existing = {
-            let mut map = self.inner.sessions.write().await;
-            map.remove(&key)
-        };
-        if let Some(prev) = existing {
-            let mut guard = prev.lock().await;
-            guard.state = SessionState::Closed;
-            guard.stream = None;
-            // Dropping the CursorH2Stream's writer drops the body sender; we
-            // intentionally leave the response side ungathered — hyper will
-            // drop the stream when the response goes out of scope.
-            drop(guard);
-            self.remove_indexes_for_session(&prev).await;
-        }
-
+    ) -> Result<Arc<Mutex<CursorSession>>, CursorSessionOpenConflict> {
+        self.evict_expired().await;
         let declared_tool_names = declared_tools.iter().map(|t| t.name.clone()).collect();
         let session = CursorSession {
             key: key.clone(),
             rail,
-            stream: Some(stream),
+            stream: None,
             declared_tool_names,
             declared_tools,
+            semantic_items,
             working_directory,
             pending_tool_calls: HashMap::new(),
             blob_store,
@@ -327,12 +321,44 @@ impl CursorSessionManager {
             last_activity: Instant::now(),
         };
         let entry = Arc::new(Mutex::new(session));
+        self.insert_new_entry(key, entry.clone()).await?;
+        self.enforce_max_sessions().await;
+        Ok(entry)
+    }
+
+    pub async fn attach_stream(
+        &self,
+        entry: &Arc<Mutex<CursorSession>>,
+        stream: CursorH2Stream,
+    ) -> Result<(), CursorSessionOpenConflict> {
+        let mut session = entry.lock().await;
+        if session.state != SessionState::Running || session.stream.is_some() {
+            return Err(CursorSessionOpenConflict {
+                state: session.state,
+            });
+        }
+        session.stream = Some(stream);
+        session.touch();
+        Ok(())
+    }
+
+    async fn insert_new_entry(
+        &self,
+        key: CursorSessionKey,
+        entry: Arc<Mutex<CursorSession>>,
+    ) -> Result<(), CursorSessionOpenConflict> {
         {
             let mut map = self.inner.sessions.write().await;
+            if let Some(existing) = map.get(&key) {
+                let state = existing
+                    .try_lock()
+                    .map(|session| session.state)
+                    .unwrap_or(SessionState::Running);
+                return Err(CursorSessionOpenConflict { state });
+            }
             map.insert(key, entry.clone());
         }
-        self.enforce_max_sessions().await;
-        entry
+        Ok(())
     }
 
     /// Mark a session as no longer in-flight. `AwaitingToolResult` parks it
@@ -600,6 +626,7 @@ mod tests {
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
+            semantic_items: Vec::new(),
             working_directory: String::new(),
             pending_tool_calls: HashMap::new(),
             blob_store: HashMap::new(),
@@ -745,6 +772,39 @@ mod tests {
         assert_eq!(mgr.size().await, 2);
         assert!(Arc::ptr_eq(&mgr.acquire(&key_a).await.unwrap(), &entry_a));
         assert!(Arc::ptr_eq(&mgr.acquire(&key_b).await.unwrap(), &entry_b));
+    }
+
+    #[tokio::test]
+    async fn same_running_conversation_is_rejected_without_replacement() {
+        let mgr = CursorSessionManager::default();
+        let key = session_key(&CursorSessionScope::fixture("share-a"));
+        let first = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+
+        let conflict = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(conflict.state, SessionState::Running);
+        let current = mgr.inner.sessions.read().await.get(&key).cloned().unwrap();
+        assert!(Arc::ptr_eq(&current, &first));
     }
 
     #[test]
