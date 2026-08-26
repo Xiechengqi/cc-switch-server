@@ -1789,7 +1789,7 @@ mod tests {
             "futureTopLevelField": {"preserve": true},
             "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
             "input": [
-                {"type": "additional_tools", "tools": [
+                {"type": "additional_tools", "role": "developer", "tools": [
                     {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
                     {"type": "function", "name": "write", "parameters": {"type": "object"}}
                 ]},
@@ -1951,7 +1951,7 @@ mod tests {
                 "type": "response.create",
                 "response": {
                     "model": "grok-4.6",
-                    "input": [{"type": "additional_tools", "tools": [
+                    "input": [{"type": "additional_tools", "role": "developer", "tools": [
                         {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
                     ]}]
                 }

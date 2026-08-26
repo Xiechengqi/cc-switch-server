@@ -36551,7 +36551,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                     "model": "grok-4.6",
                     "futureTopLevelField": true,
                     "input": [
-                        {"type": "additional_tools", "tools": [
+                        {"type": "additional_tools", "role": "developer", "tools": [
                             {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
                         ]},
                         {"type": "message", "role": "user", "content": "hello"}

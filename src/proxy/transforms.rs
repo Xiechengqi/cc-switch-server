@@ -2126,7 +2126,7 @@ pub fn anthropic_to_openai_chat(input: &Value) -> Result<Value, TransformError> 
     if let Some(reasoning) = anthropic_reasoning_to_openai(input) {
         output.insert("reasoning".to_string(), reasoning);
     }
-    if let Some(tools) = anthropic_tools_to_openai(input.get("tools")) {
+    if let Some(tools) = anthropic_tools_to_openai_chat(input.get("tools")) {
         output.insert("tools".to_string(), tools);
     }
     apply_anthropic_request_controls_to_openai_chat(input, &mut output);
@@ -2159,7 +2159,7 @@ fn anthropic_to_openai_responses_with_system_mode(
     if let Some(reasoning) = anthropic_reasoning_to_openai(input) {
         output.insert("reasoning".to_string(), reasoning);
     }
-    if let Some(tools) = anthropic_tools_to_openai(input.get("tools")) {
+    if let Some(tools) = anthropic_tools_to_openai_responses(input.get("tools")) {
         output.insert("tools".to_string(), tools);
     }
     apply_anthropic_request_controls_to_openai_responses(input, &mut output);
@@ -5416,7 +5416,7 @@ fn gemini_tools_to_anthropic(
     Some(Value::Array(output))
 }
 
-fn anthropic_tools_to_openai(tools: Option<&Value>) -> Option<Value> {
+fn anthropic_tools_to_openai_chat(tools: Option<&Value>) -> Option<Value> {
     let tools = tools?.as_array()?;
     Some(Value::Array(
         tools
@@ -5430,6 +5430,45 @@ fn anthropic_tools_to_openai(tools: Option<&Value>) -> Option<Value> {
                         "parameters": normalize_function_parameters(tool.get("input_schema"))
                     }
                 })
+            })
+            .collect(),
+    ))
+}
+
+fn anthropic_tools_to_openai_responses(tools: Option<&Value>) -> Option<Value> {
+    let tools = tools?.as_array()?;
+    Some(Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                if is_anthropic_web_search_tool(tool) {
+                    return json!({"type": "web_search"});
+                }
+                let mut output = Map::new();
+                output.insert("type".to_string(), json!("function"));
+                output.insert(
+                    "name".to_string(),
+                    Value::String(
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string(),
+                    ),
+                );
+                output.insert(
+                    "description".to_string(),
+                    tool.get("description")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new())),
+                );
+                output.insert(
+                    "parameters".to_string(),
+                    normalize_function_parameters(tool.get("input_schema")),
+                );
+                if let Some(strict) = tool.get("strict").and_then(Value::as_bool) {
+                    output.insert("strict".to_string(), Value::Bool(strict));
+                }
+                Value::Object(output)
             })
             .collect(),
     ))
@@ -7449,9 +7488,7 @@ mod tests {
             Some("input_image")
         );
         assert_eq!(
-            responses
-                .pointer("/tools/0/function/name")
-                .and_then(Value::as_str),
+            responses.pointer("/tools/0/name").and_then(Value::as_str),
             Some("lookup")
         );
     }
@@ -7762,6 +7799,37 @@ mod tests {
         );
         assert!(output.pointer("/tools/1/googleSearch").is_some());
         assert_eq!(output["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn anthropic_to_openai_responses_uses_flat_function_and_hosted_tool_shapes() {
+        let output = anthropic_to_openai_responses(&json!({
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Lookup a value",
+                    "input_schema": {"type": "object", "required": ["query"]},
+                    "strict": true
+                },
+                {"type": "web_search_20250305", "name": "web_search"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(output.pointer("/tools/0/type"), Some(&json!("function")));
+        assert_eq!(output.pointer("/tools/0/name"), Some(&json!("lookup")));
+        assert_eq!(
+            output.pointer("/tools/0/parameters/required"),
+            Some(&json!(["query"]))
+        );
+        assert_eq!(output.pointer("/tools/0/strict"), Some(&json!(true)));
+        assert!(output.pointer("/tools/0/function").is_none());
+        assert_eq!(
+            output.pointer("/tools/1"),
+            Some(&json!({"type": "web_search"}))
+        );
     }
 
     #[test]

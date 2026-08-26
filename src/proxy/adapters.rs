@@ -7169,6 +7169,31 @@ mod tests {
     }
 
     #[test]
+    fn claude_grok_oauth_uses_responses_function_tool_shape() {
+        let stored = stored_provider(AppKind::Claude, ProviderType::GrokOAuth, json!({"env": {}}));
+        let adapter = adapter_for(AppKind::Claude, ProviderType::GrokOAuth);
+        let request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br#"{"model":"grok-4.6","messages":[{"role":"user","content":"ping"}],"tools":[{"name":"lookup","description":"Lookup","input_schema":{"type":"object"}}]}"#,
+                ),
+                &stored,
+                ProxyRoute::ClaudeMessages,
+                None,
+            )
+            .unwrap();
+        let endpoint = adapter
+            .resolve_endpoint_for_request(ProxyRoute::ClaudeMessages, None, &stored, &request)
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(endpoint, "https://api.x.ai/v1/responses");
+        assert_eq!(value.pointer("/tools/0/type"), Some(&json!("function")));
+        assert_eq!(value.pointer("/tools/0/name"), Some(&json!("lookup")));
+        assert!(value.pointer("/tools/0/function").is_none());
+    }
+
+    #[test]
     fn codex_oauth_responses_output_is_bridged_to_chat_completions_downstream() {
         let stored = stored_provider(
             AppKind::Codex,

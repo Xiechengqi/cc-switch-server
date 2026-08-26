@@ -190,7 +190,7 @@ impl ProtocolCompatibilityError {
                 self.input_index
             ),
             (ProtocolIncompatibilityReason::InvalidAdditionalToolsItem, _) => format!(
-                "Grok Responses input[{}] additional_tools must contain only a tools array",
+                "Grok Responses input[{}] additional_tools must contain a tools array and may include only role=developer",
                 self.input_index
             ),
             (ProtocolIncompatibilityReason::InvalidAdditionalTool, Some(tool_index)) => format!(
@@ -287,7 +287,12 @@ pub(crate) fn normalize_grok_responses_request(
         })?;
         if object
             .keys()
-            .any(|key| !matches!(key.as_str(), "type" | "tools"))
+            .any(|key| !matches!(key.as_str(), "type" | "role" | "tools"))
+            || object.get("role").is_some_and(|role| {
+                role.as_str()
+                    .map(str::trim)
+                    .is_none_or(|role| role != "developer")
+            })
         {
             return Err(ProtocolCompatibilityError::new(
                 ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
@@ -449,7 +454,7 @@ mod tests {
             "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
             "input": [
                 {"type": "message", "role": "user", "content": "hello", "futureItemField": 1},
-                {"type": "additional_tools", "tools": [
+                {"type": "additional_tools", "role": "developer", "tools": [
                     {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
                     {"type": "function", "name": "write", "parameters": {"type": "object"}},
                     {"type": "web_search"}
@@ -514,6 +519,14 @@ mod tests {
             ),
             (
                 json!({"input": [{"type": "additional_tools", "tools": [], "unexpected": true}]}),
+                ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
+            ),
+            (
+                json!({"input": [{"type": "additional_tools", "role": "user", "tools": []}]}),
+                ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
+            ),
+            (
+                json!({"input": [{"type": "additional_tools", "role": 1, "tools": []}]}),
                 ProtocolIncompatibilityReason::InvalidAdditionalToolsItem,
             ),
         ] {

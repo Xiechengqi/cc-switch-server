@@ -53,7 +53,8 @@ HTTP 和 SSE 共用同一份 Grok request contract：
 - Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.5`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
 - 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。
 - 账号 `extraHeaders` 不能覆盖 Authorization、CLI identity、conversation/cache identity、turn、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。
-- Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。
+- Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。Codex Responses Lite 的 `additional_tools` 接受可选的规范 `role=developer`，随后把工具提升到 xAI 顶层 tools；完全相同的声明会去重，同名不同定义、其他 role、未知字段或无法无损映射的工具仍在本地 `422` fail closed。
+- Claude Messages 的客户端 function tools 会转换为 xAI Responses 的扁平声明（顶层 `name` / `description` / `parameters`），Anthropic hosted web search 会转换为 xAI `web_search`，不会把 Chat Completions 专用的嵌套 `function` 对象发给 xAI。
 - 普通 Responses HTTP/WS body 的 `prompt_cache_key` 由 Server 强制绑定到隔离后的 conversation id，客户端值不能覆盖；compact 请求只保留会话 header，body 必须省略 `prompt_cache_key`。
 - 首次 401 允许对原账号强制 refresh 一次，再用新 Authorization 重放原请求；第二次 401 直接返回并只冷却原账号。
 - 429、403、5xx、网络错误或流内错误都不能触发跨 Provider/账号重放。
