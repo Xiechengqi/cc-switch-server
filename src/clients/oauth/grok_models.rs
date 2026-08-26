@@ -208,10 +208,19 @@ fn parse_models(raw: &Value) -> Vec<String> {
         .or_else(|| raw.get("models").and_then(Value::as_array));
     let mut models = BTreeMap::new();
     for value in values.into_iter().flatten() {
+        if value.get("hidden").and_then(Value::as_bool) == Some(true)
+            || value.pointer("/_meta/hidden").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
         let id = value
             .as_str()
             .or_else(|| value.get("id").and_then(Value::as_str))
+            .or_else(|| value.get("model").and_then(Value::as_str))
+            .or_else(|| value.get("modelId").and_then(Value::as_str))
             .or_else(|| value.get("name").and_then(Value::as_str))
+            .or_else(|| value.pointer("/_meta/model").and_then(Value::as_str))
+            .or_else(|| value.pointer("/_meta/modelId").and_then(Value::as_str))
             .map(str::trim)
             .filter(|id| !id.is_empty());
         if let Some(id) = id {
@@ -235,12 +244,23 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn parses_openai_and_named_model_shapes() {
+    fn parses_known_model_shapes_hides_entries_and_preserves_identifier_priority() {
         assert_eq!(
             parse_models(&serde_json::json!({
-                "data": [{"id": "grok-b"}, {"name": "models/grok-a"}, "grok-b"]
+                "data": [
+                    {"id": "grok-b", "model": "ignored-model", "name": "ignored-name"},
+                    {"name": "models/grok-a"},
+                    {"model": "grok-c"},
+                    {"modelId": "grok-d"},
+                    {"_meta": {"model": "grok-e"}},
+                    {"_meta": {"modelId": "models/grok-f"}},
+                    {"id": "hidden-top", "hidden": true},
+                    {"id": "hidden-meta", "_meta": {"hidden": true}},
+                    "grok-b",
+                    {"id": "  "}
+                ]
             })),
-            vec!["grok-a", "grok-b"]
+            vec!["grok-a", "grok-b", "grok-c", "grok-d", "grok-e", "grok-f"]
         );
     }
 

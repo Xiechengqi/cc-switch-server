@@ -1,7 +1,58 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const MAX_SEMANTIC_PENDING_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEMANTIC_EVENT_BYTES: usize = 128 * 1024 * 1024;
+const RESPONSES_CONTENT_REPEAT_LIMIT: usize = 128;
+const RESPONSES_REASONING_REPEAT_LIMIT: usize = 256;
+
+#[derive(Debug, Default)]
+pub(super) struct ResponsesRepeatTracker {
+    content: RepeatLane,
+    reasoning: RepeatLane,
+}
+
+#[derive(Debug, Default)]
+struct RepeatLane {
+    last: Option<(usize, [u8; 32])>,
+    repeats: usize,
+}
+
+impl ResponsesRepeatTracker {
+    pub(super) fn observe_value(&mut self, value: &Value) -> Result<(), SemanticProtocolError> {
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let (lane, limit, kind) = match event_type {
+            "response.output_text.delta" => {
+                (&mut self.content, RESPONSES_CONTENT_REPEAT_LIMIT, "content")
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => (
+                &mut self.reasoning,
+                RESPONSES_REASONING_REPEAT_LIMIT,
+                "reasoning",
+            ),
+            _ => return Ok(()),
+        };
+        let fingerprint = (delta.len(), Sha256::digest(delta.as_bytes()).into());
+        if lane.last == Some(fingerprint) {
+            lane.repeats = lane.repeats.saturating_add(1);
+        } else {
+            lane.last = Some(fingerprint);
+            lane.repeats = 1;
+        }
+        if lane.repeats > limit {
+            return Err(SemanticProtocolError::new(format!(
+                "Responses {kind} output repeat limit exceeded"
+            )));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailureOrigin {
@@ -316,6 +367,8 @@ pub(super) struct ResponsesSseInspector {
     pending_error: Option<SemanticFailure>,
     terminal_from_error_frame: bool,
     done_seen: bool,
+    repeats: ResponsesRepeatTracker,
+    repeat_guard_enabled: bool,
 }
 
 impl Default for ResponsesSseInspector {
@@ -328,11 +381,27 @@ impl Default for ResponsesSseInspector {
             pending_error: None,
             terminal_from_error_frame: false,
             done_seen: false,
+            repeats: ResponsesRepeatTracker::default(),
+            repeat_guard_enabled: false,
         }
     }
 }
 
 impl ResponsesSseInspector {
+    pub(super) fn with_repeat_guard(enabled: bool) -> Self {
+        Self {
+            repeat_guard_enabled: enabled,
+            ..Self::default()
+        }
+    }
+
+    fn observe_repeat(&mut self, value: &Value) -> Result<(), SemanticProtocolError> {
+        if self.repeat_guard_enabled {
+            self.repeats.observe_value(value)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn push(
         &mut self,
         chunk: &[u8],
@@ -448,6 +517,7 @@ impl ResponsesSseInspector {
                 if self.terminal.is_some() {
                     return Ok(Vec::new());
                 }
+                self.observe_repeat(&value)?;
                 let observation = classify_value(&value);
                 self.record(&observation);
                 Ok(vec![observation])
@@ -480,6 +550,7 @@ impl ResponsesSseInspector {
                     match serde_json::from_slice::<Value>(line) {
                         Ok(value) => {
                             ensure_event_bounded(line.len(), max_event_bytes)?;
+                            self.observe_repeat(&value)?;
                             let observation = classify_value(&value);
                             self.record(&observation);
                             observations.push(observation);
@@ -525,6 +596,7 @@ impl ResponsesSseInspector {
                     }
                 };
                 ensure_event_bounded(remaining.len(), max_event_bytes)?;
+                self.observe_repeat(&value)?;
                 let observation = classify_value(&value);
                 self.record(&observation);
                 observations.push(observation);
@@ -594,6 +666,7 @@ impl ResponsesSseInspector {
         let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
             SemanticProtocolError::new(format!("Responses SSE data is not valid JSON: {error}"))
         })?;
+        self.observe_repeat(&value)?;
         let observation = classify_value(&value);
         self.record(&observation);
         Ok(Some(observation))
@@ -705,6 +778,43 @@ mod tests {
             classify_value(&json!({"status": "incomplete", "output": []})),
             SemanticObservation::IncompleteTerminal
         );
+    }
+
+    #[test]
+    fn repeat_tracker_separates_content_and_reasoning_and_resets_on_change() {
+        let mut tracker = ResponsesRepeatTracker::default();
+        for _ in 0..RESPONSES_CONTENT_REPEAT_LIMIT {
+            tracker
+                .observe_value(&json!({"type":"response.output_text.delta","delta":"x"}))
+                .unwrap();
+        }
+        tracker
+            .observe_value(&json!({"type":"response.output_text.delta","delta":"y"}))
+            .unwrap();
+        for _ in 1..RESPONSES_CONTENT_REPEAT_LIMIT {
+            tracker
+                .observe_value(&json!({"type":"response.output_text.delta","delta":"y"}))
+                .unwrap();
+        }
+        assert!(tracker
+            .observe_value(&json!({"type":"response.output_text.delta","delta":"y"}))
+            .is_err());
+
+        let mut reasoning = ResponsesRepeatTracker::default();
+        for _ in 0..RESPONSES_REASONING_REPEAT_LIMIT {
+            reasoning
+                .observe_value(&json!({
+                    "type":"response.reasoning_summary_text.delta",
+                    "delta":"."
+                }))
+                .unwrap();
+        }
+        assert!(reasoning
+            .observe_value(&json!({
+                "type":"response.reasoning_text.delta",
+                "delta":"."
+            }))
+            .is_err());
     }
 
     #[test]

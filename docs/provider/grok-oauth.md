@@ -49,6 +49,7 @@ Provider 不存在、绑定缺失、账号不可用、并发饱和或处于 cool
 
 HTTP 和 SSE 共用同一份 Grok request contract：
 
+- OpenAI Chat Completions 先无损规范化为 Responses，请求上游固定使用 Grok CLI `/v1/responses`；非流式和 SSE 再恢复为 Chat contract。Grok 数据面不再向上游发送 `/v1/chat/completions`。
 - Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.5`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
 - 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。
 - 账号 `extraHeaders` 不能覆盖 Authorization、CLI identity、conversation/cache identity、turn、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。
@@ -57,6 +58,7 @@ HTTP 和 SSE 共用同一份 Grok request contract：
 - 首次 401 允许对原账号强制 refresh 一次，再用新 Authorization 重放原请求；第二次 401 直接返回并只冷却原账号。
 - 429、403、5xx、网络错误或流内错误都不能触发跨 Provider/账号重放。
 - SSE 已向下游提交业务事件后不会透明重放完整请求。
+- first-event deadline 只由完整业务/终态事件满足；SSE comment、ping、空 data、生命周期事件和部分 JSON 字节不续命。content 与 reasoning delta 分开做有界重复输出保护，HTTP/SSE、WebSocket 和 WS→HTTP fallback 使用同一阈值合同，触发后终止当前请求且不切换账号或 Provider。
 
 OAuth 凭据发生轮换时，Server 先原子持久化候选账号快照，再发布内存状态。若 durable write 失败，新 token 会保留在内存并由后台退避重试，但 Grok 新数据面请求和 WebSocket 会返回 `503`，`/ready` 同时进入 degraded，避免重启后继续使用未持久化的旋转凭据。
 
@@ -105,11 +107,13 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 2. 成功的真实上游响应会把 `supported` evidence 持久化到绑定账号。
 3. 后续可移除显式开关，由持久化 evidence 继续开放能力。
 
-媒体首次 401 同样只允许原账号强刷一次。视频创建成功后，request id 到 Provider/账号的 sticky binding 保存在进程内，用于后续状态查询；它不是账号调度机制，内部 `grok-video:<request-id>` 键也绝不作为 `x-grok-conv-id` 发往上游。绑定存在时，显式指定其他 Provider 或 Provider 已重绑其他账号都会以 `409` fail closed。进程重启会丢失该短期 sticky 状态，因此真实验收应覆盖创建后查询和重启边界。
+媒体首次 401 同样只允许原账号强刷一次。视频创建成功后，request id 的 durable binding 写入 `grok-media-tasks.json`，固定 Provider、账号、`authIdentityGeneration`、Share、runtime、用户命名空间、TTL 和 `upstreamPlane`；它不是账号调度机制。schema v1 的历史任务只有一个 direct-XAI endpoint，因此精确迁移为 `xai` plane；未知 schema/plane fail closed。状态查询只读取创建时的 binding，Provider 重绑、身份代际、runtime 或 plane 变化均返回 `409`，重启后不会丢失有效绑定。
 
 媒体请求复用文本/WS 的 CLI identity family；客户端显式提供的 `x-grok-conv-id` 在 Share/user 边界内做同样的命名空间隔离。媒体 POST 的 wire body 和逐层 gzip/deflate 解码结果都使用 32 MiB 硬上限，避免 Axum 默认 2 MiB 误拒合法图片，同时阻止压缩膨胀绕过内存边界。媒体上游 wire response 和逐层解压结果使用 64 MiB 硬上限，避免 base64 图片响应形成无界内存读取。视频状态 request id 只接受 1-128 字节 ASCII 字母、数字、`-` 和 `_`，禁止把路径、query 或 fragment 注入固定上游 URL。
 
-Grok 图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers 后，SSE 立即提交 `: connected` 并按完整事件边界转发，JSON 先提交合法空白、完整缓冲并校验一个 JSON 文档；两种模式空闲时都每 15 秒发送心跳，且逐块执行 64 MiB 上限。首个 comment/空白提交后 wire status 固定为 `200`，后续读失败、超限或 JSON 无效只能返回流内 error，不能透明换 Provider 或替换 HTTP 状态；Provider/Share 终态记账仍使用实际结果，客户端必须消费完整 Body。
+Grok 图片是 direct-XAI 实验能力，不代表 Build OAuth 官方保证。图片 multipart edit 最多接受 3 张图，每张都复用统一 image primitive 校验非空、大小、允许 MIME 和 magic bytes；声明 MIME 不匹配、未知签名、超数量以及未经验证的 `mask`/`quality`/`size`/`style` 均在出站前返回 4xx，不再静默丢弃。图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers 后，SSE 立即提交 `: connected` 并按完整事件边界转发，JSON 先提交合法空白、完整缓冲并校验一个 JSON 文档；两种模式空闲时都每 15 秒发送心跳，且逐块执行 64 MiB 上限。首个 comment/空白提交后 wire status 固定为 `200`，后续读失败、超限或 JSON 无效只能返回流内 error，不能透明换 Provider 或替换 HTTP 状态；Provider/Share 终态记账仍使用实际结果，客户端必须消费完整 Body。
+
+视频创建在出站前执行本地 DTO 校验：模型、prompt、1..15 秒 duration、aspect ratio、720p/1080p、reference 数量/互斥和 reference 最高 720p 均有稳定 4xx；`video`、`output`、`storage_options` 在透明代理模式明确拒绝。本版本维持 direct-XAI `Xai` plane，不启用无真实 entitlement/evidence 支持的 Build→XAI fallback。阶段 5 本地 worker、upload callback 和媒体归档评审结论为 **no-go**：透明代理无需持有本地媒体任务或资产，后续只有上游强制 upload callback 或产品明确要求归档时才独立立项。
 
 ## 模型目录
 
@@ -120,6 +124,7 @@ Share URL 下的 `GET /v1/models` 使用该 Share 的 Codex Surface 绑定账号
 - 上游失败且有缓存时返回 last-known-good，并标记 `stale=true`。
 - 没有可用缓存时返回静态 `grok-4.5` fallback。
 - 上游目录响应体上限为 1 MiB，超限按上游失败处理。
+- entry 支持纯字符串以及 `id`、`model`、`modelId`、`name`、`_meta.model`、`_meta.modelId`，按该优先级选取标识；`hidden=true` 或 `_meta.hidden=true` 不对外发布。
 - 顶层元数据 `source`、`stale`、`fetchedAtMs` 用于区分 upstream、fresh cache、304、last-known-good 和 static fallback。
 
 模型目录降级不会绕过 single-model policy，也不会选择另一个 Grok 账号。credential persistence degraded 时不会访问上游目录，只返回明确来源的静态 fallback；刷新前已 degraded 和本次 refresh 因旋转 token 落盘失败而刚进入 degraded 都执行同一零上游门禁。生成数据面仍返回 `503`。

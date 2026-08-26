@@ -1808,6 +1808,18 @@ fn ollama_cloud_cache_keys_from_store(providers: &ProviderStore) -> BTreeSet<Oll
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokVideoPlane {
+    Build,
+    Xai,
+}
+
+const fn default_grok_video_plane() -> GrokVideoPlane {
+    // Schema v1 only supported the direct api.x.ai endpoint.
+    GrokVideoPlane::Xai
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrokMediaTaskBinding {
@@ -1818,6 +1830,8 @@ pub struct GrokMediaTaskBinding {
     pub share_id: String,
     pub runtime_fingerprint: String,
     pub user_namespace: String,
+    #[serde(default = "default_grok_video_plane")]
+    pub upstream_plane: GrokVideoPlane,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -1863,12 +1877,19 @@ impl GrokMediaTaskStore {
         };
         let mut store: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse Grok media task store {}", path.display()))?;
-        if store.schema_version != grok_media_task_schema_version() {
+        if !matches!(
+            store.schema_version,
+            1 | GROK_MEDIA_TASK_STORE_SCHEMA_VERSION
+        ) {
             anyhow::bail!(
                 "unsupported Grok media task store schema version {}",
                 store.schema_version
             );
         }
+        // Version 1 had one hard-coded plane: direct api.x.ai. The serde default above is
+        // therefore an exact migration, not a guessed route. A later successful domain write
+        // persists the upgraded schema atomically through the normal snapshot path.
+        store.schema_version = grok_media_task_schema_version();
         for (key, binding) in &store.bindings {
             validate_grok_media_task_binding(key, binding)?;
         }
@@ -1919,7 +1940,7 @@ impl PersistedStateSnapshot for GrokMediaTaskStore {
 }
 
 const GROK_MEDIA_TASK_STORE_FILE: &str = "grok-media-tasks.json";
-const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 1;
+const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 2;
 const GROK_MEDIA_TASK_MAX_BINDINGS: usize = 4_096;
 const GROK_MEDIA_TASK_MAX_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -12589,6 +12610,7 @@ impl ServerStateInner {
             share_id,
             runtime_fingerprint,
             user_namespace,
+            upstream_plane: GrokVideoPlane::Xai,
             created_at_ms: now_ms,
             expires_at_ms,
         };
@@ -27790,6 +27812,7 @@ mod tests {
             share_id: share_id.clone(),
             runtime_fingerprint: "runtime-a".to_string(),
             user_namespace: user_namespace.clone(),
+            upstream_plane: GrokVideoPlane::Xai,
             created_at_ms,
             expires_at_ms: created_at_ms.saturating_add(120_000),
         };
@@ -27871,6 +27894,34 @@ mod tests {
         assert!(
             format!("{error:#}").contains("exceeds the maximum lifetime"),
             "{error:#}"
+        );
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn grok_media_task_schema_v1_migrates_only_to_the_historical_xai_plane() {
+        let config_dir = provider_restore_test_dir("grok-media-task-v1-plane");
+        let (key, binding) = grok_media_task_binding_for_test("video-v1", 1_000);
+        let mut binding_value = serde_json::to_value(binding).unwrap();
+        binding_value
+            .as_object_mut()
+            .unwrap()
+            .remove("upstreamPlane");
+        std::fs::write(
+            grok_media_tasks_path(&config_dir),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "bindings": {key: binding_value}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = GrokMediaTaskStore::load_or_default(&config_dir, 1_001).unwrap();
+        assert_eq!(loaded.schema_version, GROK_MEDIA_TASK_STORE_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.bindings.values().next().unwrap().upstream_plane,
+            GrokVideoPlane::Xai
         );
         std::fs::remove_dir_all(config_dir).unwrap();
     }

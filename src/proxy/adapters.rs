@@ -1432,7 +1432,7 @@ pub(super) fn upstream_format_for_route(
     }
     if stored.provider_type == ProviderType::GrokOAuth {
         if matches!(route, Some(ProxyRoute::CodexChatCompletions)) {
-            return Some(UpstreamFormat::OpenAiChat);
+            return Some(UpstreamFormat::OpenAiResponses);
         }
         if matches!(
             route,
@@ -7138,6 +7138,34 @@ mod tests {
         );
         assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
         assert!(!request.stream_requested);
+    }
+
+    #[test]
+    fn grok_oauth_chat_completions_use_the_responses_upstream_contract() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::GrokOAuth, json!({"env": {}}));
+        let adapter = adapter_for(AppKind::Codex, ProviderType::GrokOAuth);
+        let request = adapter
+            .transform_request(
+                Bytes::from_static(
+                    br#"{"model":"grok-4.6","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+                ),
+                &stored,
+            )
+            .unwrap();
+        let endpoint = adapter
+            .resolve_endpoint_for_request(ProxyRoute::CodexChatCompletions, None, &stored, &request)
+            .unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+
+        assert_eq!(endpoint, "https://api.x.ai/v1/responses");
+        assert!(value.get("messages").is_none());
+        assert_eq!(
+            value
+                .pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("ping")
+        );
+        assert!(request.stream_requested);
     }
 
     #[test]

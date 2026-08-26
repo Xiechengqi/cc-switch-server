@@ -490,6 +490,177 @@ pub(super) fn validate_media_request(method: &Method, path: &str) -> Result<(), 
     ))
 }
 
+pub(super) fn validate_video_generation_body(body: &Bytes) -> Result<(), ProxyError> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| ProxyError::bad_request("Grok video request must be one JSON document"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProxyError::bad_request("Grok video request must be a JSON object"))?;
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("Grok video request requires model"))?;
+    if model != "grok-imagine-video" && model != "grok-imagine-video-1.5" {
+        return Err(ProxyError::bad_request(
+            "Grok video model is not supported by the verified contract",
+        ));
+    }
+    const VIDEO_FIELDS: &[&str] = &[
+        "model",
+        "prompt",
+        "duration",
+        "aspect_ratio",
+        "resolution",
+        "image",
+        "reference_images",
+        "reference_audios",
+        "video",
+        "output",
+        "storage_options",
+    ];
+    if object
+        .keys()
+        .any(|field| !VIDEO_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ProxyError::bad_request(
+            "Grok video request contains an unsupported field",
+        ));
+    }
+    for unsupported in ["video", "output", "storage_options"] {
+        if object.contains_key(unsupported) {
+            return Err(ProxyError::bad_request(format!(
+                "Grok video request does not support {unsupported}"
+            )));
+        }
+    }
+    if let Some(duration) = object.get("duration") {
+        let parsed = duration
+            .as_u64()
+            .or_else(|| duration.as_str()?.trim().parse::<u64>().ok())
+            .filter(|value| (1..=15).contains(value));
+        if parsed.is_none() {
+            return Err(ProxyError::bad_request(
+                "Grok video duration must be an integer from 1 through 15",
+            ));
+        }
+    }
+    if let Some(ratio) = object.get("aspect_ratio") {
+        let ratio = ratio.as_str().map(str::trim).unwrap_or_default();
+        if !matches!(ratio, "16:9" | "9:16" | "1:1" | "4:3" | "3:4") {
+            return Err(ProxyError::bad_request(
+                "Grok video aspect_ratio is not supported",
+            ));
+        }
+    }
+    let resolution = object
+        .get("resolution")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    if resolution.is_some_and(|value| !matches!(value, "720p" | "1080p")) {
+        return Err(ProxyError::bad_request(
+            "Grok video resolution is not supported",
+        ));
+    }
+    let has_image = object.get("image").is_some_and(|value| !value.is_null());
+    if let Some(image) = object.get("image").filter(|value| !value.is_null()) {
+        validate_video_image_reference(image)?;
+    }
+    let references = match object.get("reference_images") {
+        Some(value) => match value.as_array() {
+            Some(items) if !items.is_empty() && items.len() <= 8 => Some(items),
+            _ => {
+                return Err(ProxyError::bad_request(
+                    "Grok video reference_images must contain 1 through 8 images",
+                ));
+            }
+        },
+        None => None,
+    };
+    if let Some(references) = references {
+        for reference in references {
+            validate_video_image_reference(reference)?;
+        }
+    }
+    let audio_count = object
+        .get("reference_audios")
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    if object.contains_key("reference_audios")
+        && audio_count.is_none_or(|count| count == 0 || count > 3)
+    {
+        return Err(ProxyError::bad_request(
+            "Grok video reference_audios must contain 1 through 3 entries",
+        ));
+    }
+    if let Some(audios) = object.get("reference_audios").and_then(Value::as_array) {
+        for audio in audios {
+            let voice_id = audio
+                .get("voice_id")
+                .and_then(Value::as_str)
+                .or_else(|| audio.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.len() <= 128);
+            if voice_id.is_none() {
+                return Err(ProxyError::bad_request(
+                    "Grok video reference audio requires a bounded voice_id",
+                ));
+            }
+        }
+    }
+    let has_references = references.is_some() || audio_count.is_some();
+    if has_image && has_references {
+        return Err(ProxyError::bad_request(
+            "Grok video image cannot be combined with reference inputs",
+        ));
+    }
+    if has_references && resolution == Some("1080p") {
+        return Err(ProxyError::bad_request(
+            "Grok reference video supports at most 720p",
+        ));
+    }
+    let has_prompt = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if (!has_image || has_references) && !has_prompt {
+        return Err(ProxyError::bad_request(
+            "Grok text and reference video requests require prompt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_video_image_reference(value: &Value) -> Result<(), ProxyError> {
+    let reference = value
+        .as_str()
+        .or_else(|| value.get("url").and_then(Value::as_str))
+        .or_else(|| value.get("image_url").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("Grok video image reference is invalid"))?;
+    if reference.starts_with("data:") {
+        super::remote_image::decode_image_data_uri(
+            reference,
+            super::remote_image::MAX_CODEX_IMAGE_BYTES,
+        )?;
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(reference)
+        .map_err(|_| ProxyError::bad_request("Grok video image URL is invalid"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(ProxyError::bad_request(
+            "Grok video image URL must be credential-free HTTPS",
+        ));
+    }
+    Ok(())
+}
+
 fn valid_video_request_id(request_id: &str) -> bool {
     !request_id.is_empty()
         && request_id.len() <= GROK_VIDEO_REQUEST_ID_MAX_LEN
@@ -546,16 +717,12 @@ fn remove_prompt_cache_key(body: &mut Bytes) -> Result<(), ProxyError> {
 
 fn patch_grok_request_value(
     value: &mut Value,
-    route: ProxyRoute,
+    _route: ProxyRoute,
 ) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
-    let protocol_transform = if route == ProxyRoute::CodexChatCompletions {
-        super::protocol_compat::TransformPlan::unchanged()
-    } else {
-        let (normalized, plan) = super::protocol_compat::normalize_grok_responses_request(value)
+    let (normalized, protocol_transform) =
+        super::protocol_compat::normalize_grok_responses_request(value)
             .map_err(|error| ProxyError::protocol_incompatible(error.client_message()))?;
-        *value = normalized;
-        plan
-    };
+    *value = normalized;
     let model = {
         let Some(object) = value.as_object_mut() else {
             return Ok(protocol_transform);
@@ -572,9 +739,7 @@ fn patch_grok_request_value(
     remove_recursive(value, "external_web_access");
     let store_false = value.get("store").and_then(Value::as_bool) == Some(false);
     if let Some(object) = value.as_object_mut() {
-        if route != ProxyRoute::CodexChatCompletions {
-            object.remove("stream_options");
-        }
+        object.remove("stream_options");
         object.remove("background");
         remove_keys(
             object,
@@ -737,14 +902,17 @@ pub(super) fn image_edit_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes,
     {
         return multipart_image_edit_body(&content_type, &body);
     }
-    let mut output = serde_json::from_slice::<Value>(&body).map_err(|error| {
+    let output = serde_json::from_slice::<Value>(&body).map_err(|error| {
         ProxyError::bad_request(format!("Grok image edit JSON body is invalid: {error}"))
     })?;
-    if let Some(object) = output.as_object_mut() {
-        object.remove("quality");
-        object.remove("size");
-        object.remove("style");
-        object.remove("mask");
+    if let Some(object) = output.as_object() {
+        for field in ["quality", "size", "style", "mask"] {
+            if object.contains_key(field) {
+                return Err(ProxyError::bad_request(format!(
+                    "Grok direct-XAI image edit does not support {field}"
+                )));
+            }
+        }
     }
     serde_json::to_vec(&output)
         .map(Bytes::from)
@@ -756,13 +924,21 @@ fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, P
         .split(';')
         .find_map(|part| part.trim().strip_prefix("boundary="))
         .map(|value| value.trim_matches('"').to_string())
-        .filter(|value| !value.is_empty())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 70
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+        })
         .ok_or_else(|| ProxyError::bad_request("multipart image edit is missing boundary"))?;
     let mut fields = Map::new();
     let mut image_urls = Vec::new();
     for part in split_multipart_parts(body, &boundary) {
         let Some((headers, data)) = split_part_headers(part) else {
-            continue;
+            return Err(ProxyError::bad_request(
+                "multipart image edit contains a malformed part",
+            ));
         };
         let disposition = headers
             .iter()
@@ -776,18 +952,32 @@ fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, P
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.as_str())
-            .unwrap_or("image/png");
+            .ok_or_else(|| {
+                ProxyError::bad_request("multipart image part is missing Content-Type")
+            })?;
         if name == "image" || name == "images" || name == "image[]" {
             if image_urls.len() >= 3 {
-                continue;
+                return Err(ProxyError::bad_request(
+                    "multipart image edit accepts at most 3 images",
+                ));
             }
-            let data_url = format!(
-                "data:{};base64,{}",
-                content_type,
-                STANDARD.encode(trim_part_data(data))
-            );
+            let data = trim_part_data(data);
+            let detected_mime = super::remote_image::validate_image_bytes(
+                data,
+                Some(content_type),
+                super::remote_image::MAX_CODEX_IMAGE_BYTES,
+            )?;
+            let data_url = format!("data:{};base64,{}", detected_mime, STANDARD.encode(data));
             image_urls.push(json!({"type": "image_url", "url": data_url}));
-        } else if !matches!(name.as_str(), "quality" | "size" | "style" | "mask") {
+        } else if name == "mask" {
+            return Err(ProxyError::bad_request(
+                "Grok direct-XAI image edit does not support mask input",
+            ));
+        } else if matches!(name.as_str(), "quality" | "size" | "style") {
+            return Err(ProxyError::bad_request(format!(
+                "Grok direct-XAI image edit does not support {name}"
+            )));
+        } else {
             let text = String::from_utf8_lossy(trim_part_data(data))
                 .trim()
                 .to_string();
@@ -923,6 +1113,57 @@ pub(super) fn video_task_id_from_response(body: &[u8]) -> Option<String> {
     .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
     .filter(|request_id| valid_video_request_id(request_id))
     .map(str::to_string)
+}
+
+pub(super) fn sanitized_video_error_body(status: StatusCode, body: &[u8]) -> Bytes {
+    let value = serde_json::from_slice::<Value>(body).ok();
+    let code = value.as_ref().and_then(|value| {
+        ["/error/code", "/error/type", "/code", "/type"]
+            .into_iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    });
+    let message = value.as_ref().and_then(|value| {
+        ["/error/message", "/error/detail", "/message", "/detail"]
+            .into_iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    });
+    let safe_code = code
+        .map(redact_video_diagnostic)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "grok_video_upstream_error".to_string());
+    let safe_message = message
+        .map(redact_video_diagnostic)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("Grok video upstream returned HTTP {}", status.as_u16()));
+    Bytes::from(
+        serde_json::to_vec(&json!({
+            "error": {
+                "code": safe_code,
+                "type": "grok_video_upstream_error",
+                "message": safe_message
+            }
+        }))
+        .unwrap_or_else(|_| br#"{"error":{"code":"grok_video_upstream_error","message":"Grok video upstream failed"}}"#.to_vec()),
+    )
+}
+
+fn redact_video_diagnostic(value: &str) -> String {
+    let bounded: String = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect();
+    let mut output = Vec::new();
+    for token in bounded.split_whitespace() {
+        let secret = token.contains("http://")
+            || token.contains("https://")
+            || token
+                .split(|character: char| !character.is_ascii_hexdigit())
+                .any(|candidate| candidate.len() >= 64);
+        output.push(if secret { "[REDACTED]" } else { token });
+    }
+    output.join(" ")
 }
 
 fn normalize_ws_response_body(
@@ -1592,20 +1833,17 @@ mod tests {
     }
 
     #[test]
-    fn chat_route_does_not_apply_responses_input_item_validation() {
+    fn chat_route_uses_the_same_responses_input_item_validation() {
         let mut body = json_body(json!({
             "model": "grok-4.6",
-            "messages": [{"role": "user", "content": "hello"}],
             "input": [{"type": "future_chat_metadata"}]
         }));
 
-        let plan = patch_grok_request_body(&mut body, ProxyRoute::CodexChatCompletions).unwrap();
+        let error =
+            patch_grok_request_body(&mut body, ProxyRoute::CodexChatCompletions).unwrap_err();
 
-        assert!(plan.actions.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["input"][0]["type"],
-            "future_chat_metadata"
-        );
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.error_code(), "cc_switch_protocol_incompatible");
     }
 
     #[test]
@@ -1769,6 +2007,78 @@ mod tests {
     }
 
     #[test]
+    fn multipart_image_edit_validates_signature_mime_count_and_unsupported_fields() {
+        fn multipart(parts: &[(&str, &str, &[u8])]) -> (HeaderMap, Bytes) {
+            let boundary = "cc-switch-test-boundary";
+            let mut body = Vec::new();
+            for (name, content_type, data) in parts {
+                body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{name}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(data);
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "content-type",
+                HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
+                    .unwrap(),
+            );
+            (headers, Bytes::from(body))
+        }
+
+        let png = b"\x89PNG\r\n\x1a\nfixture".as_slice();
+        let (headers, body) = multipart(&[("image", "image/png", png)]);
+        let converted = image_edit_body(&headers, body).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        assert!(value["image"]["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+
+        let (headers, body) = multipart(&[("image", "image/jpeg", png)]);
+        assert_eq!(
+            image_edit_body(&headers, body).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let four = [
+            ("image", "image/png", png),
+            ("image", "image/png", png),
+            ("image", "image/png", png),
+            ("image", "image/png", png),
+        ];
+        let (headers, body) = multipart(&four);
+        assert_eq!(
+            image_edit_body(&headers, body).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let (headers, body) = multipart(&[("mask", "image/png", png)]);
+        assert_eq!(
+            image_edit_body(&headers, body).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn json_image_edit_rejects_fields_that_direct_xai_does_not_verify() {
+        for field in ["quality", "size", "style", "mask"] {
+            let mut value = json!({"model": "grok-imagine", "prompt": "edit"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), json!("x"));
+            let error = image_edit_body(&HeaderMap::new(), json_body(value)).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{field}");
+        }
+    }
+
+    #[test]
     fn video_task_id_from_response_accepts_common_shapes() {
         assert_eq!(
             video_task_id_from_response(br#"{"request_id":"vid_1"}"#).as_deref(),
@@ -1790,6 +2100,55 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(video_task_id_from_response(&oversized), None);
+    }
+
+    #[test]
+    fn video_generation_dto_rejects_invalid_or_unimplemented_semantics() {
+        let valid = json_body(json!({
+            "model": "grok-imagine-video-1.5",
+            "prompt": "animate",
+            "duration": "6",
+            "aspect_ratio": "16:9",
+            "resolution": "720p"
+        }));
+        validate_video_generation_body(&valid).unwrap();
+
+        for value in [
+            json!({"model":"grok-imagine-video","prompt":"","duration":6}),
+            json!({"model":"grok-imagine-video","prompt":"animate","duration":0}),
+            json!({"model":"grok-imagine-video","prompt":"animate","aspect_ratio":"2:1"}),
+            json!({"model":"grok-imagine-video","prompt":"animate","output":{"upload_url":"https://secret.invalid"}}),
+            json!({"model":"grok-imagine-video","prompt":"animate","image":"data:image/png;base64,x","reference_images":[{"url":"https://example.test/a.png"}]}),
+            json!({"model":"grok-imagine-video","prompt":"animate","resolution":"1080p","reference_images":[{"url":"https://example.test/a.png"}]}),
+        ] {
+            assert_eq!(
+                validate_video_generation_body(&json_body(value))
+                    .unwrap_err()
+                    .status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn video_error_body_is_bounded_structured_and_redacts_urls_and_tokens() {
+        let token = "a".repeat(64);
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "code": "submit_failed",
+                "message": format!("upload https://example.test/v1/media/uploads/{token} token {token}")
+            },
+            "raw": "must-not-pass-through"
+        }))
+        .unwrap();
+        let safe = sanitized_video_error_body(StatusCode::BAD_GATEWAY, &body);
+        let text = String::from_utf8(safe.to_vec()).unwrap();
+        assert!(text.contains("submit_failed"));
+        assert!(text.contains("[REDACTED]"));
+        assert!(!text.contains("https://"));
+        assert!(!text.contains(&token));
+        assert!(!text.contains("must-not-pass-through"));
+        assert!(safe.len() < 512);
     }
 
     #[test]

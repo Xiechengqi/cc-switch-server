@@ -49,8 +49,8 @@ use crate::logging::{
 };
 use crate::state::{
     AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
-    GrokMediaTaskBinding, GrokMediaTaskCommitError, ManagedAccountRefreshError, QoderRuntimeError,
-    ServerState, ShareInFlightGuard,
+    GrokMediaTaskBinding, GrokMediaTaskCommitError, GrokVideoPlane, ManagedAccountRefreshError,
+    QoderRuntimeError, ServerState, ShareInFlightGuard,
 };
 
 #[cfg(test)]
@@ -84,8 +84,8 @@ use super::request_governance::{
     response_decoding_required, ResponseDecodeResult,
 };
 use super::response_semantics::{
-    self, FailureOrigin, ResponsesSseInspector, SemanticFailure, SemanticObservation,
-    SemanticTerminal,
+    self, FailureOrigin, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
+    SemanticObservation, SemanticTerminal,
 };
 use super::retry_policy::{self, AuthRecoveryDecision};
 #[cfg(test)]
@@ -2702,8 +2702,11 @@ async fn forward_with_attempt(
                 && (response_semantics::semantic_guard_enabled() || mandatory_semantic_contract)
                 && route == ProxyRoute::ClaudeMessages
                 && upstream_format == UpstreamFormat::AnthropicMessages;
-            let mut responses_semantics =
-                inspect_responses_semantics.then(ResponsesSseInspector::default);
+            let mut responses_semantics = inspect_responses_semantics.then(|| {
+                ResponsesSseInspector::with_repeat_guard(
+                    stored.provider_type == ProviderType::GrokOAuth,
+                )
+            });
             let mut anthropic_semantics =
                 inspect_anthropic_semantics.then(AnthropicSseInspector::default);
             if inspect_anthropic_semantics {
@@ -5272,6 +5275,9 @@ async fn forward_grok_media_with_execution(
     if let Some(binding) = sticky_media_binding.as_ref() {
         ensure_grok_media_task_binding(&execution, binding)?;
     }
+    if method == Method::POST && upstream_path == "/videos/generations" {
+        super::grok::validate_video_generation_body(&body)?;
+    }
     ensure_managed_credential_persistence_available(&state, &execution)?;
     let capability = grok_media_capability(&method, &upstream_path);
     ensure_grok_account_capability(&state, &execution, capability).await?;
@@ -5432,7 +5438,7 @@ async fn forward_grok_media_with_execution(
     strip_hop_by_hop_response_headers(&mut response_headers);
     maybe_update_grok_entitlement(&state, &execution, &response_headers).await;
     maybe_mark_grok_cooldown(&state, &execution, status, &response_headers).await;
-    let content_type = response_headers
+    let mut content_type = response_headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
@@ -5530,10 +5536,15 @@ async fn forward_grok_media_with_execution(
         }
     };
     let mut preserve_content_encoding = decoded.preserve_content_encoding;
-    let (response_body, version_gate_rewritten) =
+    let (mut response_body, version_gate_rewritten) =
         maybe_rewrite_grok_cli_version_gate_body(status, &stored, decoded.body);
     if version_gate_rewritten {
         preserve_content_encoding = false;
+    }
+    if !status.is_success() && upstream_path.contains("/videos/") {
+        response_body = super::grok::sanitized_video_error_body(status, &response_body);
+        preserve_content_encoding = false;
+        content_type = Some("application/json".to_string());
     }
     maybe_mark_upstream_rate_limited(
         &state,
@@ -5945,6 +5956,7 @@ fn ensure_grok_media_task_binding(
     if binding.provider_id == execution.stored.provider.id
         && account_matches
         && binding.runtime_fingerprint == execution.plan.runtime_fingerprint
+        && binding.upstream_plane == GrokVideoPlane::Xai
     {
         return Ok(());
     }
@@ -9129,6 +9141,8 @@ async fn bridge_responses_websocket(
     let mut refresh_target_before_connect = false;
     let mut upstream_read_deadline = None;
     let mut output_patcher = CodexWebsocketOutputPatcher::default();
+    let mut response_repeat_tracker =
+        matches!(mode, ResponsesWebsocketMode::Grok).then(ResponsesRepeatTracker::default);
     let connection_id = new_audit_correlation_id("connection");
     loop {
         tokio::select! {
@@ -9326,6 +9340,9 @@ async fn bridge_responses_websocket(
                     response_in_flight = true;
                     response_create_committed = false;
                     emitted_business_event = false;
+                    if matches!(mode, ResponsesWebsocketMode::Grok) {
+                        response_repeat_tracker = Some(ResponsesRepeatTracker::default());
+                    }
                     pending_lifecycle_messages.clear();
                     semantic_provider_outcome_recorded = false;
                     auth_refresh_attempted = false;
@@ -9846,7 +9863,10 @@ async fn bridge_responses_websocket(
                     .await;
                 }
                 let semantic_observation = if response_in_flight {
-                    match classify_responses_websocket_message(&message) {
+                    match classify_responses_websocket_message(
+                        &message,
+                        response_repeat_tracker.as_mut(),
+                    ) {
                         Ok(observation) => observation,
                         Err(error) => {
                             crate::metrics::record_proxy_semantic_guard(
@@ -10783,6 +10803,7 @@ async fn run_codex_websocket_http_fallback(
             first_event_deadline,
             first_event_timeout,
             stream_idle_timeout,
+            stored.provider_type == ProviderType::GrokOAuth,
             output_patcher,
             active_usage_turn,
         )
@@ -11538,6 +11559,7 @@ async fn relay_codex_http_fallback_stream(
     first_event_deadline: Option<tokio::time::Instant>,
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
+    repeat_guard_enabled: bool,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpRelayOutcome, ProxyError> {
@@ -11547,6 +11569,7 @@ async fn relay_codex_http_fallback_stream(
     let mut pending_lifecycle_payloads = Vec::new();
     let mut last_error = None;
     let mut deadline = first_event_deadline;
+    let mut response_repeat_tracker = repeat_guard_enabled.then(ResponsesRepeatTracker::default);
 
     let relay_result: Result<CodexHttpRelayOutcome, CodexHttpRelayFailure> = async {
         loop {
@@ -11625,6 +11648,7 @@ async fn relay_codex_http_fallback_stream(
                         payloads,
                         &mut pending_lifecycle_payloads,
                         &mut committed_business_event,
+                        response_repeat_tracker.as_mut(),
                         active_usage_turn,
                     )
                     .await?
@@ -11647,6 +11671,7 @@ async fn relay_codex_http_fallback_stream(
                         payloads,
                         &mut pending_lifecycle_payloads,
                         &mut committed_business_event,
+                        response_repeat_tracker.as_mut(),
                         active_usage_turn,
                     )
                     .await?
@@ -11681,6 +11706,7 @@ async fn relay_codex_http_fallback_payloads(
     payloads: Vec<String>,
     pending_lifecycle_payloads: &mut Vec<String>,
     committed_business_event: &mut bool,
+    mut response_repeat_tracker: Option<&mut ResponsesRepeatTracker>,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<Option<CodexHttpRelayOutcome>, CodexHttpRelayFailure> {
     if !*committed_business_event {
@@ -11704,11 +11730,18 @@ async fn relay_codex_http_fallback_payloads(
     }
 
     for payload in payloads {
+        let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
+            CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(format!(
+                "invalid Responses event: {error}"
+            )))
+        })?;
+        if let Some(response_repeat_tracker) = response_repeat_tracker.as_deref_mut() {
+            response_repeat_tracker
+                .observe_value(&value)
+                .map_err(|error| CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(error)))?;
+        }
         if let Some(turn) = active_usage_turn.as_mut() {
-            let business = serde_json::from_str::<Value>(&payload)
-                .ok()
-                .map(|value| response_semantics::classify_value(&value))
-                .is_some_and(|observation| observation.counts_as_business_output());
+            let business = response_semantics::classify_value(&value).counts_as_business_output();
             turn.observe_payload(payload.as_bytes(), business);
         }
         match relay_codex_http_fallback_semantic_event(
@@ -12069,6 +12102,7 @@ fn codex_websocket_session_update_model(message: &TungsteniteMessage) -> Option<
 
 fn classify_responses_websocket_message(
     message: &TungsteniteMessage,
+    repeats: Option<&mut ResponsesRepeatTracker>,
 ) -> Result<Option<SemanticObservation>, ProxyError> {
     if !response_semantics::semantic_guard_enabled() {
         return Ok(None);
@@ -12078,9 +12112,15 @@ fn classify_responses_websocket_message(
         TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
         _ => return Ok(None),
     };
-    response_semantics::classify_json_document(bytes)
-        .map(Some)
-        .map_err(ProxyError::bad_gateway)
+    let value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+        ProxyError::bad_gateway(format!("Responses body is not valid JSON: {error}"))
+    })?;
+    if let Some(repeats) = repeats {
+        repeats
+            .observe_value(&value)
+            .map_err(ProxyError::bad_gateway)?;
+    }
+    Ok(Some(response_semantics::classify_value(&value)))
 }
 
 fn semantic_prelude_decision(observations: &[SemanticObservation]) -> Option<SemanticObservation> {
@@ -35233,6 +35273,102 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     }
 
     #[tokio::test]
+    async fn grok_chat_uses_only_responses_upstream_and_restores_chat_json() {
+        let response_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_body = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let responses_for_route = Arc::clone(&response_calls);
+        let observed_for_route = Arc::clone(&observed_body);
+        let chat_for_route = Arc::clone(&chat_calls);
+        let upstream = axum::Router::new()
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |body: Bytes| {
+                    let calls = Arc::clone(&responses_for_route);
+                    let observed = Arc::clone(&observed_for_route);
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        *observed.lock().unwrap() = serde_json::from_slice(&body).ok();
+                        axum::Json(json!({
+                            "id":"resp-chat-bridge",
+                            "object":"response",
+                            "created_at":1,
+                            "model":"grok-4.6",
+                            "status":"completed",
+                            "output":[{
+                                "id":"msg-1",
+                                "type":"message",
+                                "role":"assistant",
+                                "status":"completed",
+                                "content":[{"type":"output_text","text":"pong"}]
+                            }],
+                            "usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let calls = Arc::clone(&chat_for_route);
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let state = forwarder_test_state("grok-chat-via-responses");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-chat-via-responses",
+            format!("http://{address}/v1"),
+            None,
+            "grok-chat-access",
+            None,
+            &[],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::CodexChatCompletions,
+            execution.stored.provider.id.clone(),
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"grok-4.6","messages":[{"role":"user","content":"ping"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(
+            body.pointer("/choices/0/message/content"),
+            Some(&json!("pong"))
+        );
+        assert_eq!(response_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(chat_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let observed = observed_body.lock().unwrap().clone().unwrap();
+        assert!(observed.get("messages").is_none());
+        assert_eq!(
+            observed.pointer("/input/0/content/0/text"),
+            Some(&json!("ping"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn grok_protocol_rejection_is_logged_as_client_error_without_upstream_call() {
         let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -36042,6 +36178,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             share_id: format!("test-share:{provider_id}"),
             runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
             user_namespace: "principal-test".to_string(),
+            upstream_plane: GrokVideoPlane::Xai,
             created_at_ms: 1,
             expires_at_ms: i64::MAX,
         };
@@ -36071,6 +36208,13 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 "runtime",
                 GrokMediaTaskBinding {
                     runtime_fingerprint: "different-runtime".to_string(),
+                    ..base_binding.clone()
+                },
+            ),
+            (
+                "plane",
+                GrokMediaTaskBinding {
+                    upstream_plane: GrokVideoPlane::Build,
                     ..base_binding.clone()
                 },
             ),
