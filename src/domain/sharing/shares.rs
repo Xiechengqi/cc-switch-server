@@ -3818,7 +3818,7 @@ fn normalize_user_grants(
             .map_err(SharePatchError::Invalid)?;
         let previous = existing.get(&email);
         if let Some(previous) = previous {
-            if previous.manager == ShareGrantManager::RouterShareMarket {
+            if previous.active && previous.manager == ShareGrantManager::RouterShareMarket {
                 if incoming_grant.active != previous.active
                     || !email.eq_ignore_ascii_case(&previous.email)
                     || incoming_grant.role != previous.role
@@ -3832,6 +3832,15 @@ fn normalize_user_grants(
                 }
                 normalized.insert(email, previous.clone());
                 continue;
+            }
+            if !previous.active
+                && previous.manager == ShareGrantManager::RouterShareMarket
+                && (incoming_grant.manager == ShareGrantManager::RouterShareMarket
+                    || incoming_grant.entitlement_id.is_some())
+            {
+                return Err(SharePatchError::Invalid(
+                    "Share Market managed users are read-only".to_string(),
+                ));
             }
         }
         let mut grant = incoming_grant.clone();
@@ -4442,6 +4451,33 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("managed users are read-only"));
+
+        let mut restored = revoked.user_grants.clone();
+        restored.get_mut("renter@example.com").unwrap().active = true;
+        restored.get_mut("renter@example.com").unwrap().manager = ShareGrantManager::Manual;
+        restored
+            .get_mut("renter@example.com")
+            .unwrap()
+            .entitlement_id = None;
+        restored
+            .get_mut("renter@example.com")
+            .unwrap()
+            .policy
+            .token_limit = Some(800);
+        let updated = store
+            .apply_settings_patch(
+                "managed-revoke",
+                ShareSettingsPatch {
+                    user_grants: Some(restored),
+                    ..ShareSettingsPatch::default()
+                },
+            )
+            .unwrap();
+        let grant = updated.user_grants.get("renter@example.com").unwrap();
+        assert!(grant.active);
+        assert_eq!(grant.manager, ShareGrantManager::Manual);
+        assert_eq!(grant.entitlement_id, None);
+        assert_eq!(grant.policy.token_limit, Some(800));
     }
 
     #[test]

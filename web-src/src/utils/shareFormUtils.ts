@@ -43,21 +43,26 @@ export function buildShareUserGrants({
   const next: ShareUserGrantMap = {};
 
   for (const [email, grant] of sourceByEmail) {
-    if (email && grant.manager === "routerShareMarket") {
+    if (email && grant.manager === "routerShareMarket" && grant.active !== false) {
       next[email] = grant;
     }
   }
   for (const email of allowedEmails) {
     const previous = sourceByEmail.get(email);
-    if (previous?.manager === "routerShareMarket") {
+    if (previous?.manager === "routerShareMarket" && previous.active !== false) {
       next[email] = previous;
       continue;
     }
+    const reuseMarketTombstone =
+      previous?.manager === "routerShareMarket" && previous.active === false;
     next[email] = {
-      ...previous,
+      ...(reuseMarketTombstone ? undefined : previous),
       email,
       role: email === normalizedOwnerEmail ? "owner" : "shareto",
       active: true,
+      manager: email === normalizedOwnerEmail ? "owner" : "manual",
+      entitlementId: undefined,
+      revokedAtMs: undefined,
       policy: previous?.policy ?? { ...defaultPolicy },
     };
   }

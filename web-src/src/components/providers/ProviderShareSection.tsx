@@ -454,7 +454,7 @@ export function ProviderShareSection({
 
   const routerManagedGrantEmails = new Set(
     Object.values(userGrants)
-      .filter((grant) => grant.manager === "routerShareMarket")
+      .filter((grant) => grant.manager === "routerShareMarket" && grant.active !== false)
       .map((grant) => grant.email.trim().toLowerCase()),
   );
   const protectedGrantEmails = routerManagedGrantEmails;

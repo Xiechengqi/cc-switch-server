@@ -355,7 +355,10 @@ export function ShareUserGrantsEditor({
       ? Number(draft.consumedTokens)
       : undefined;
     const previous = value[editingEmail ?? email];
-    const observedTokens = previous ? observedGrantTokens(previous) : 0;
+    const reuseMarketTombstone =
+      previous?.manager === "routerShareMarket" && previous.active === false;
+    const observedTokens =
+      previous && !reuseMarketTombstone ? observedGrantTokens(previous) : 0;
     const usageInvalid =
       draft.usageAction === "set" &&
       (consumedTokens == null ||
@@ -394,10 +397,13 @@ export function ShareUserGrantsEditor({
     }
     setDraftError("");
     const next: ShareUserGrant = {
-      ...previous,
+      ...(reuseMarketTombstone ? undefined : previous),
       email,
       role: email === normalizedOwner ? "owner" : "shareto",
       active: true,
+      manager: email === normalizedOwner ? "owner" : "manual",
+      entitlementId: undefined,
+      revokedAtMs: undefined,
       policy: {
         parallelLimit,
         tokenLimit,
@@ -764,7 +770,7 @@ export function ShareUserGrantsEditor({
                   <div className="flex min-w-0 flex-wrap items-start gap-2">
                     <span className="min-w-0 whitespace-normal break-all">{grant.email}</span>
                     {grant.role === "owner" ? <Badge variant="secondary">Owner</Badge> : null}
-                    {grant.manager === "routerShareMarket" ? (
+                    {grant.manager === "routerShareMarket" && grant.active !== false ? (
                       <Badge variant="secondary">Share Market</Badge>
                     ) : null}
                   </div>
@@ -785,7 +791,7 @@ export function ShareUserGrantsEditor({
                       })}
                     </div>
                   ) : null}
-                  {grant.manager === "routerShareMarket" ? (
+                  {grant.manager === "routerShareMarket" && grant.active !== false ? (
                     <div className="text-[11px] text-muted-foreground">
                       {t("share.userLimit.readOnly", {
                         defaultValue: "Share Market 管理，只读",

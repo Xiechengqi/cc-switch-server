@@ -51,13 +51,53 @@ describe("buildShareUserGrants", () => {
     });
 
     expect(result["renter@example.com"]).toBe(source["renter@example.com"]);
-    expect(result["former@example.com"]).toBe(source["former@example.com"]);
+    expect(result["former@example.com"]).toBeUndefined();
     expect(result["old@example.com"]).toBeUndefined();
     expect(result["new@example.com"]).toMatchObject({
       email: "new@example.com",
       role: "shareto",
       active: true,
+      manager: "manual",
       policy: DEFAULT_POLICY,
     });
+  });
+
+  it("writes a manual shareto over a revoked Share Market tombstone", () => {
+    const source: ShareUserGrantMap = {
+      "owner@example.com": {
+        email: "owner@example.com",
+        role: "owner",
+        active: true,
+        policy: DEFAULT_POLICY,
+        manager: "owner",
+      },
+      "former@example.com": {
+        email: "former@example.com",
+        role: "shareto",
+        active: false,
+        policy: { tokenPeriod: "week", tokenLimit: 5_000 },
+        manager: "routerShareMarket",
+        entitlementId: "entitlement-revoked",
+        revokedAtMs: 1,
+        revision: 4,
+      },
+    };
+
+    const result = buildShareUserGrants({
+      source,
+      ownerEmail: "owner@example.com",
+      aclEmails: ["former@example.com"],
+      defaultPolicy: DEFAULT_POLICY,
+    });
+
+    expect(result["former@example.com"]).toMatchObject({
+      email: "former@example.com",
+      role: "shareto",
+      active: true,
+      manager: "manual",
+      policy: { tokenPeriod: "week", tokenLimit: 5_000 },
+    });
+    expect(result["former@example.com"]?.entitlementId).toBeUndefined();
+    expect(result["former@example.com"]?.revokedAtMs).toBeUndefined();
   });
 });
