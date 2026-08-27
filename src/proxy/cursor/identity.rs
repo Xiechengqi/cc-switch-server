@@ -3,6 +3,10 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::cursor_client_contract::{
+    sdk_client_version, CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, GHOST_MODE_ENABLED,
+    GHOST_MODE_HEADER, SDK_CLIENT_TYPE,
+};
 use crate::domain::accounts::cursor_import::normalize_cursor_access_token;
 use crate::domain::accounts::store::Account;
 
@@ -10,7 +14,6 @@ use super::h2_client::agent_connect_headers;
 use super::profile::CursorProtocolRail;
 
 pub const DEFAULT_CURSOR_CLI_VERSION: &str = "cli-2026.07.08-0c04a8a";
-pub const DEFAULT_CURSOR_SDK_VERSION: &str = "sdk-1.0.13";
 const CURSOR_CLIENT_ID: &str = "cc-switch-server";
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,18 +114,21 @@ pub fn cursor_agentservice_headers(
             format!("Bearer {}", normalize_cursor_access_token(token)),
         ),
         (
-            "x-cursor-client-type".to_string(),
+            CLIENT_TYPE_HEADER.to_string(),
             match rail {
                 CursorProtocolRail::OAuthCli => "cli",
-                CursorProtocolRail::ApiKeySdk => "sdk",
+                CursorProtocolRail::ApiKeySdk => SDK_CLIENT_TYPE,
             }
             .to_string(),
         ),
         (
-            "x-cursor-client-version".to_string(),
+            CLIENT_VERSION_HEADER.to_string(),
             cursor_client_version_for_rail(rail, account),
         ),
-        ("x-ghost-mode".to_string(), "true".to_string()),
+        (
+            GHOST_MODE_HEADER.to_string(),
+            GHOST_MODE_ENABLED.to_string(),
+        ),
         ("x-request-id".to_string(), request_id.clone()),
         ("x-original-request-id".to_string(), request_id),
     ]);
@@ -224,16 +230,8 @@ pub(crate) fn cursor_client_version_for_rail(
 ) -> String {
     match rail {
         CursorProtocolRail::OAuthCli => account.resolved_client_version(),
-        CursorProtocolRail::ApiKeySdk => cursor_sdk_client_version(),
+        CursorProtocolRail::ApiKeySdk => sdk_client_version(),
     }
-}
-
-fn cursor_sdk_client_version() -> String {
-    std::env::var("CC_SWITCH_CURSOR_SDK_CLIENT_VERSION")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| value.starts_with("sdk-") && value.len() > 4)
-        .unwrap_or_else(|| DEFAULT_CURSOR_SDK_VERSION.to_string())
 }
 
 fn string_path(account: &Account, paths: &[&str]) -> Option<String> {
@@ -444,6 +442,7 @@ mod tests {
     #[test]
     fn agentservice_headers_are_rail_specific_and_strip_composite_tokens() {
         let account = cursor_account_for_api_key("cursor-key", None);
+        let expected_sdk_version = sdk_client_version();
         let cli = cursor_agentservice_headers(
             CursorProtocolRail::OAuthCli,
             &account,
@@ -456,7 +455,7 @@ mod tests {
             .any(|(key, value)| { key == "authorization" && value == "Bearer access-token" }));
         assert!(cli
             .iter()
-            .any(|(key, value)| key == "x-cursor-client-type" && value == "cli"));
+            .any(|(key, value)| key == CLIENT_TYPE_HEADER && value == "cli"));
         assert!(cli.iter().any(|(key, _)| key == "traceparent"));
         assert!(cli.iter().any(|(key, _)| key == "backend-traceparent"));
         assert!(cli
@@ -464,9 +463,9 @@ mod tests {
             .any(|(key, value)| key == "connect-accept-encoding" && value == "gzip"));
         assert!(sdk
             .iter()
-            .any(|(key, value)| key == "x-cursor-client-type" && value == "sdk"));
+            .any(|(key, value)| key == CLIENT_TYPE_HEADER && value == SDK_CLIENT_TYPE));
         assert!(sdk.iter().any(|(key, value)| {
-            key == "x-cursor-client-version" && value == DEFAULT_CURSOR_SDK_VERSION
+            key == CLIENT_VERSION_HEADER && value == &expected_sdk_version
         }));
         assert!(!sdk.iter().any(|(key, _)| key == "traceparent"));
         assert!(!sdk.iter().any(|(key, _)| key == "backend-traceparent"));

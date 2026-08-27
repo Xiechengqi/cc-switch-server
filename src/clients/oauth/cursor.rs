@@ -3,6 +3,11 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::cursor_client_contract::{
+    sdk_client_version, CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, GHOST_MODE_ENABLED,
+    GHOST_MODE_HEADER, SDK_CLIENT_TYPE,
+};
+
 const CURSOR_PUBLIC_API_ORIGIN: &str = "https://api.cursor.com";
 const MAX_CURSOR_PUBLIC_BODY_BYTES: usize = 1024 * 1024;
 
@@ -56,7 +61,15 @@ pub async fn verify_api_key(
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
-    let profile = cursor_public_json(client, api_key, "/v1/me").await?;
+    verify_api_key_at_origin(client, api_key, CURSOR_PUBLIC_API_ORIGIN).await
+}
+
+async fn verify_api_key_at_origin(
+    client: &reqwest::Client,
+    api_key: &str,
+    origin: &str,
+) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
+    let profile = cursor_public_json_at_origin(client, api_key, origin, "/v1/me").await?;
     let (principal, principal_source) = verified_principal(&profile, api_key);
     let email = first_string(&profile, &["/userEmail", "/email", "/user/email"]);
     Ok(VerifiedCursorApiKey {
@@ -85,7 +98,15 @@ pub async fn available_models(
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<Vec<String>, CursorPublicApiError> {
-    let value = cursor_public_json(client, api_key, "/v1/models").await?;
+    available_models_at_origin(client, api_key, CURSOR_PUBLIC_API_ORIGIN).await
+}
+
+async fn available_models_at_origin(
+    client: &reqwest::Client,
+    api_key: &str,
+    origin: &str,
+) -> Result<Vec<String>, CursorPublicApiError> {
+    let value = cursor_public_json_at_origin(client, api_key, origin, "/v1/models").await?;
     let items = model_items(&value).ok_or_else(|| CursorPublicApiError {
         status_code: 502,
         retryable: false,
@@ -105,16 +126,20 @@ pub async fn available_models(
     Ok(models)
 }
 
-async fn cursor_public_json(
+async fn cursor_public_json_at_origin(
     client: &reqwest::Client,
     api_key: &str,
+    origin: &str,
     path: &str,
 ) -> Result<Value, CursorPublicApiError> {
     let response = client
-        .get(format!("{CURSOR_PUBLIC_API_ORIGIN}{path}"))
+        .get(format!("{}{path}", origin.trim_end_matches('/')))
         .timeout(std::time::Duration::from_secs(10))
         .bearer_auth(api_key)
         .header("accept", "application/json")
+        .header(CLIENT_TYPE_HEADER, SDK_CLIENT_TYPE)
+        .header(CLIENT_VERSION_HEADER, sdk_client_version())
+        .header(GHOST_MODE_HEADER, GHOST_MODE_ENABLED)
         .send()
         .await
         .map_err(|error| CursorPublicApiError {
@@ -129,7 +154,8 @@ async fn cursor_public_json(
             status_code: status.as_u16(),
             retryable: status.as_u16() == 429 || status.is_server_error(),
             message: match status.as_u16() {
-                401 | 403 => "Cursor API key was rejected".to_string(),
+                401 => "Cursor API key was rejected".to_string(),
+                403 => "Cursor API key validation was forbidden; verify API access and SDK client permissions".to_string(),
                 429 => "Cursor API key validation was rate limited".to_string(),
                 _ => format!("Cursor public API returned HTTP {}", status.as_u16()),
             },
@@ -212,6 +238,59 @@ fn sha256_hex(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    #[derive(Clone)]
+    struct ExpectedSdkIdentity {
+        authorization: String,
+        version: String,
+    }
+
+    async fn sdk_identity_gate(
+        State(expected): State<ExpectedSdkIdentity>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Response {
+        let matches = header_matches(&headers, AUTHORIZATION.as_str(), &expected.authorization)
+            && header_matches(&headers, CLIENT_TYPE_HEADER, SDK_CLIENT_TYPE)
+            && header_matches(&headers, CLIENT_VERSION_HEADER, &expected.version)
+            && header_matches(&headers, GHOST_MODE_HEADER, GHOST_MODE_ENABLED)
+            && header_matches(&headers, "accept", "application/json");
+        if !matches {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        match uri.path() {
+            "/v1/me" => Json(json!({
+                "userId":"verified-user",
+                "userEmail":"owner@example.com"
+            }))
+            .into_response(),
+            "/v1/models" => Json(json!({
+                "items":[{"id":"composer-2.5"}]
+            }))
+            .into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    fn header_matches(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+        headers.get(name).and_then(|value| value.to_str().ok()) == Some(expected)
+    }
+
+    async fn spawn_public_api(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (origin, server)
+    }
 
     #[test]
     fn model_shapes_and_principal_fields_are_stable() {
@@ -279,5 +358,56 @@ mod tests {
         let (fallback, source) = verified_principal(&json!({}), "key-one");
         assert_eq!(source, "api_key_fallback");
         assert_eq!(fallback, sha256_hex("key-one"));
+    }
+
+    #[tokio::test]
+    async fn public_api_profile_and_models_send_the_sdk_identity_contract() {
+        let api_key = "fixture-cursor-key";
+        let version = sdk_client_version();
+        let router = Router::new()
+            .route("/v1/me", get(sdk_identity_gate))
+            .route("/v1/models", get(sdk_identity_gate))
+            .with_state(ExpectedSdkIdentity {
+                authorization: format!("Bearer {api_key}"),
+                version,
+            });
+        let (origin, server) = spawn_public_api(router).await;
+        let client = reqwest::Client::new();
+
+        let profile = verify_api_key_at_origin(&client, api_key, &origin)
+            .await
+            .unwrap();
+        assert_eq!(profile.principal_source, "user_id");
+        assert_eq!(profile.email.as_deref(), Some("owner@example.com"));
+        let models = available_models_at_origin(&client, api_key, &origin)
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["composer-2.5"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_api_distinguishes_invalid_keys_from_forbidden_sdk_access() {
+        let router = Router::new()
+            .route("/unauthorized", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route("/forbidden", get(|| async { StatusCode::FORBIDDEN }));
+        let (origin, server) = spawn_public_api(router).await;
+        let client = reqwest::Client::new();
+
+        let unauthorized =
+            cursor_public_json_at_origin(&client, "fixture-key", &origin, "/unauthorized")
+                .await
+                .unwrap_err();
+        assert_eq!(unauthorized.status_code, 401);
+        assert!(!unauthorized.retryable);
+        assert_eq!(unauthorized.message, "Cursor API key was rejected");
+
+        let forbidden = cursor_public_json_at_origin(&client, "fixture-key", &origin, "/forbidden")
+            .await
+            .unwrap_err();
+        assert_eq!(forbidden.status_code, 403);
+        assert!(!forbidden.retryable);
+        assert!(forbidden.message.contains("SDK client permissions"));
+        server.abort();
     }
 }

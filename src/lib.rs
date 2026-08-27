@@ -5,6 +5,7 @@ pub mod cli;
 pub mod client_tunnel_provision;
 pub mod clients;
 pub(crate) mod codex_identity;
+pub(crate) mod cursor_client_contract;
 pub mod domain;
 pub(crate) mod image_store;
 pub mod infra;

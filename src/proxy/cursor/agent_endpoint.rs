@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
+use crate::cursor_client_contract::{CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, SDK_CLIENT_TYPE};
 use crate::proxy::ProxyError;
 
 use super::agent_proto::{FieldIter, FieldValue};
@@ -165,14 +166,14 @@ pub async fn resolve_cursor_agent_endpoint(
         .header("content-type", "application/proto")
         .header("user-agent", "connect-es/1.6.1")
         .header(
-            "x-cursor-client-type",
+            CLIENT_TYPE_HEADER,
             match rail {
                 CursorProtocolRail::OAuthCli => "cli",
-                CursorProtocolRail::ApiKeySdk => "sdk",
+                CursorProtocolRail::ApiKeySdk => SDK_CLIENT_TYPE,
             },
         )
         .header(
-            "x-cursor-client-version",
+            CLIENT_VERSION_HEADER,
             cursor_client_version_for_rail(rail, account),
         )
         .body(Vec::new())
