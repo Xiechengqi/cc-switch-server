@@ -499,8 +499,31 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     [/let app_settings_json = "\{\}";/, "empty legacy app settings storage write"],
     [/params!\[[\s\S]*"selected",[\s\S]*"No",[\s\S]*share\.free_access/, "fixed legacy storage sentinels and canonical free access"],
     [/fn list_shares[\s\S]*COALESCE\(s\.user_grants_json, '\{\}'\)[\s\S]*COALESCE\(s\.free_access, 0\)/, "canonical Share read projection"],
-    [/parse canonical Share user grants failed/, "fail-closed canonical grant decoding"],
   ]);
+  requireBlock(
+    routerRoot,
+    "src/store.rs",
+    "fn parse_share_user_grants(",
+    "\n}",
+    {
+      label: "fail-closed canonical grant decoder",
+      required: [
+        [/serde_json::from_str\(&value\)/, "fallible JSON decoding"],
+        [/\.map_err\(/, "decode error propagation"],
+        [/FromSqlConversionFailure/, "database conversion failure mapping"],
+        [/CanonicalShareUserGrantsDecodeError/, "stable contextual decode error"],
+      ],
+      forbidden: [
+        [/unwrap_or_default|unwrap_or_else/, "fail-open decode fallback"],
+      ],
+    },
+  );
+  requireText(
+    routerRoot,
+    "src/store.rs",
+    /malformed_canonical_user_grants_fail_closed_without_legacy_acl_fallback/,
+    "malformed canonical grant fail-closed regression test",
+  );
   requireText(
     routerRoot,
     "src/share_market.rs",

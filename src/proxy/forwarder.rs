@@ -10442,6 +10442,38 @@ enum CodexHttpRelayFailure {
     DownstreamClosed,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CodexHttpFirstEventBudget {
+    deadline: tokio::time::Instant,
+    configured_timeout: Duration,
+}
+
+impl CodexHttpFirstEventBudget {
+    fn new(configured_timeout: Duration) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + configured_timeout,
+            configured_timeout,
+        }
+    }
+
+    fn timeout_error(self) -> ProxyError {
+        ProxyError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: format!(
+                "Responses HTTP fallback first event timeout after {}ms",
+                self.configured_timeout.as_millis()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexHttpRelayPolicy {
+    first_event: Option<CodexHttpFirstEventBudget>,
+    idle_timeout: Option<Duration>,
+    repeat_guard_enabled: bool,
+}
+
 struct PreparedCodexHttpFallbackTarget {
     http_client: reqwest::Client,
     url: String,
@@ -10517,12 +10549,11 @@ async fn run_codex_websocket_http_fallback(
                 .await;
             }
         };
-        let first_event_deadline =
-            first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-        let send_result = match first_event_deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, request.send())
+        let first_event_budget = first_event_timeout.map(CodexHttpFirstEventBudget::new);
+        let send_result = match first_event_budget {
+            Some(budget) => tokio::time::timeout_at(budget.deadline, request.send())
                 .await
-                .map_err(|_| ()),
+                .map_err(|_| budget.timeout_error()),
             None => Ok(request.send().await),
         };
         let mut upstream = match send_result {
@@ -10543,17 +10574,8 @@ async fn run_codex_websocket_http_fallback(
                 )
                 .await;
             }
-            Err(_) => {
+            Err(error) => {
                 record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                let error = ProxyError {
-                    status: StatusCode::GATEWAY_TIMEOUT,
-                    message: format!(
-                        "Responses HTTP fallback first event timeout after {}ms",
-                        first_event_timeout
-                            .expect("a deadline exists only when the timeout is enabled")
-                            .as_millis()
-                    ),
-                };
                 return terminate_codex_http_fallback_with_error(
                     downstream,
                     state,
@@ -10661,9 +10683,9 @@ async fn run_codex_websocket_http_fallback(
             .await;
         }
         if !status.is_success() {
-            let body_result = match first_event_deadline {
-                Some(deadline) => match tokio::time::timeout_at(
-                    deadline,
+            let body_result = match first_event_budget {
+                Some(budget) => match tokio::time::timeout_at(
+                    budget.deadline,
                     crate::infra::http::read_response_body_limited(
                         &mut upstream,
                         PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
@@ -10672,15 +10694,7 @@ async fn run_codex_websocket_http_fallback(
                 .await
                 {
                     Ok(body) => body.map_err(ProxyError::bad_gateway),
-                    Err(_) => Err(ProxyError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: format!(
-                            "Responses HTTP fallback first event timeout after {}ms",
-                            first_event_timeout
-                                .expect("a deadline exists only when the timeout is enabled")
-                                .as_millis()
-                        ),
-                    }),
+                    Err(_) => Err(budget.timeout_error()),
                 },
                 None => crate::infra::http::read_response_body_limited(
                     &mut upstream,
@@ -10807,10 +10821,11 @@ async fn run_codex_websocket_http_fallback(
         match relay_codex_http_fallback_stream(
             downstream,
             upstream,
-            first_event_deadline,
-            first_event_timeout,
-            stream_idle_timeout,
-            stored.provider_type == ProviderType::GrokOAuth,
+            CodexHttpRelayPolicy {
+                first_event: first_event_budget,
+                idle_timeout: stream_idle_timeout,
+                repeat_guard_enabled: stored.provider_type == ProviderType::GrokOAuth,
+            },
             output_patcher,
             active_usage_turn,
         )
@@ -11563,10 +11578,7 @@ async fn prepare_codex_responses_websocket_request(
 async fn relay_codex_http_fallback_stream(
     downstream: &mut WebSocket,
     upstream: reqwest::Response,
-    first_event_deadline: Option<tokio::time::Instant>,
-    first_event_timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
-    repeat_guard_enabled: bool,
+    policy: CodexHttpRelayPolicy,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpRelayOutcome, ProxyError> {
@@ -11575,8 +11587,10 @@ async fn relay_codex_http_fallback_stream(
     let mut committed_business_event = false;
     let mut pending_lifecycle_payloads = Vec::new();
     let mut last_error = None;
-    let mut deadline = first_event_deadline;
-    let mut response_repeat_tracker = repeat_guard_enabled.then(ResponsesRepeatTracker::default);
+    let mut deadline = policy.first_event.map(|budget| budget.deadline);
+    let mut response_repeat_tracker = policy
+        .repeat_guard_enabled
+        .then(ResponsesRepeatTracker::default);
 
     let relay_result: Result<CodexHttpRelayOutcome, CodexHttpRelayFailure> = async {
         loop {
@@ -11589,17 +11603,14 @@ async fn relay_codex_http_fallback_stream(
                         .map_err(|_| {
                             CodexHttpRelayFailure::Upstream(ProxyError {
                                 status: StatusCode::GATEWAY_TIMEOUT,
-                                message: if waiting_for_first_event {
-                                    format!(
-                                        "Responses HTTP fallback first event timeout after {}ms",
-                                        first_event_timeout
-                                            .expect(
-                                                "a first-event deadline has a configured timeout",
-                                            )
-                                            .as_millis()
-                                    )
-                                } else {
-                                    "Responses HTTP fallback stream idle timeout".to_string()
+                                message: match (waiting_for_first_event, policy.first_event) {
+                                    (true, Some(budget)) => budget.timeout_error().message,
+                                    (true, None) => {
+                                        "Responses HTTP fallback first event timeout".to_string()
+                                    }
+                                    (false, _) => {
+                                        "Responses HTTP fallback stream idle timeout".to_string()
+                                    }
                                 },
                             })
                         })?
@@ -11663,8 +11674,9 @@ async fn relay_codex_http_fallback_stream(
                         return Ok(outcome);
                     }
                     if committed_business_event {
-                        deadline =
-                            idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+                        deadline = policy
+                            .idle_timeout
+                            .map(|timeout| tokio::time::Instant::now() + timeout);
                     }
                 }
                 None => {

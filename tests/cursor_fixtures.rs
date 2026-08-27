@@ -9,6 +9,7 @@ fn fixture(relative: &str) -> Value {
 fn cursor_neutral_fixtures_are_versioned_and_non_empty() {
     for path in [
         "tests/fixtures/cursor/responses/continuation_matrix.json",
+        "tests/fixtures/cursor/responses/codex_0144_additional_tools.json",
         "tests/fixtures/cursor/retry/semantic_matrix.json",
         "tests/fixtures/cursor/identity/rotation_matrix.json",
     ] {

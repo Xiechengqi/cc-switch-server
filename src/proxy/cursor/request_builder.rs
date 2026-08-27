@@ -22,6 +22,9 @@ Do not emit duplicate tool calls: call each operation once, then continue after 
 Never claim that tools are unavailable.";
 
 const DEFAULT_WORKING_DIRECTORY: &str = ".";
+const MAX_RESPONSE_TOOL_COUNT: usize = 128;
+const MAX_RESPONSE_TOOL_NAMESPACE_DEPTH: usize = 4;
+const MAX_RESPONSE_TOOL_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundProtocol {
@@ -47,6 +50,15 @@ pub struct CompletedToolCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseToolNamespace {
+    /// Flattened name exposed to Cursor's MCP inventory.
+    pub internal_name: String,
+    /// Original OpenAI Responses namespace and leaf name restored on output.
+    pub namespace: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolContinuationKind {
     #[default]
@@ -60,6 +72,13 @@ pub struct AgentRunPlan {
     pub system_prompt: Option<String>,
     pub user_text: String,
     pub tools: Vec<McpToolDef>,
+    /// OpenAI Responses tools that must be surfaced as `custom_tool_call`
+    /// rather than ordinary `function_call` items. Cursor still sees these
+    /// through a JSON MCP wrapper, but Codex receives its original wire kind.
+    pub custom_tool_names: Vec<String>,
+    /// Namespace metadata removed while adapting Responses tools to Cursor's
+    /// flat MCP inventory and restored on downstream function-call items.
+    pub response_tool_namespaces: Vec<ResponseToolNamespace>,
     pub images: Vec<ImageRef>,
     /// Tool results from completed earlier turns. They are retained in the
     /// flattened transcript for cold resume, but must never by themselves
@@ -89,6 +108,14 @@ pub struct AgentRunPlan {
     /// A conservative semantic signal used to reject a promise-only response
     /// when the latest request plainly requires local project inspection.
     pub local_tool_required_by_intent: bool,
+}
+
+#[derive(Default)]
+struct OpenAiResponseToolInventory {
+    tools: Vec<McpToolDef>,
+    custom_tool_names: Vec<String>,
+    namespaces: Vec<ResponseToolNamespace>,
+    registrations: std::collections::HashMap<String, String>,
 }
 
 /// Validate tool-result context for AgentService routing. Returns an error
@@ -208,7 +235,12 @@ fn active_openai_response_tool_results(
     let mut results = items
         .iter()
         .rev()
-        .take_while(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .take_while(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
         .map(|item| ToolResultBlock {
             tool_call_id: item
                 .get("call_id")
@@ -217,7 +249,7 @@ fn active_openai_response_tool_results(
                 .to_string(),
             content: item
                 .get("output")
-                .map(stringify_json_text)
+                .map(response_tool_output_text)
                 .unwrap_or_default(),
             is_error: false,
         })
@@ -302,6 +334,38 @@ fn stringify_json_text(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn response_tool_output_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => {
+            let rendered = items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(text.clone()),
+                    Value::Object(object) => object
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| Some(Value::Object(object.clone()).to_string())),
+                    other if !other.is_null() => Some(other.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if rendered.is_empty() {
+                value.to_string()
+            } else {
+                rendered.join("\n")
+            }
+        }
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string()),
+        _ => stringify_json_text(value),
+    }
+}
+
 fn tool_call_context_complete(
     protocol: InboundProtocol,
     body: &Value,
@@ -359,7 +423,12 @@ fn tool_call_context_complete(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+                .filter(|item| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call")
+                    )
+                })
             {
                 if let Some(id) = item
                     .get("call_id")
@@ -471,8 +540,14 @@ fn completed_tool_calls(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+                .filter(|item| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call")
+                    )
+                })
             {
+                let custom = call.get("type").and_then(Value::as_str) == Some("custom_tool_call");
                 let id = call
                     .get("call_id")
                     .or_else(|| call.get("id"))
@@ -480,16 +555,23 @@ fn completed_tool_calls(
                     .unwrap_or("");
                 if active.contains(id) {
                     calls.push(CompletedToolCall {
-                        name: call
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        arguments: call
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .and_then(|arguments| serde_json::from_str(arguments).ok())
-                            .unwrap_or_else(|| json!({})),
+                        name: qualify_response_tool_name(
+                            call.get("namespace").and_then(Value::as_str),
+                            call.get("name").and_then(Value::as_str).unwrap_or(""),
+                        ),
+                        arguments: if custom {
+                            json!({
+                                "input": call
+                                    .get("input")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                            })
+                        } else {
+                            call.get("arguments")
+                                .and_then(Value::as_str)
+                                .and_then(|arguments| serde_json::from_str(arguments).ok())
+                                .unwrap_or_else(|| json!({}))
+                        },
                     });
                 }
             }
@@ -523,6 +605,218 @@ fn completed_tool_calls(
         }
     }
     calls
+}
+
+fn openai_response_tool_inventory(body: &Value) -> Result<OpenAiResponseToolInventory, String> {
+    let mut inventory = OpenAiResponseToolInventory::default();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            collect_openai_response_tool(tool, None, 0, &mut inventory)?;
+        }
+    }
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        {
+            let tools = item.get("tools").and_then(Value::as_array).ok_or_else(|| {
+                "Responses additional_tools item requires a tools array".to_string()
+            })?;
+            for tool in tools {
+                collect_openai_response_tool(tool, None, 0, &mut inventory)?;
+            }
+        }
+    }
+    Ok(inventory)
+}
+
+fn collect_openai_response_tool(
+    tool: &Value,
+    namespace: Option<&str>,
+    depth: usize,
+    inventory: &mut OpenAiResponseToolInventory,
+) -> Result<(), String> {
+    if inventory.tools.len() >= MAX_RESPONSE_TOOL_COUNT {
+        return Err(format!(
+            "Responses tool inventory exceeds {MAX_RESPONSE_TOOL_COUNT} tools"
+        ));
+    }
+    let kind = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+    if kind == "namespace" {
+        if depth >= MAX_RESPONSE_TOOL_NAMESPACE_DEPTH {
+            return Err(format!(
+                "Responses tool namespace exceeds depth {MAX_RESPONSE_TOOL_NAMESPACE_DEPTH}"
+            ));
+        }
+        let name = response_tool_name(tool)
+            .ok_or_else(|| "Responses namespace tool requires a non-empty name".to_string())?;
+        let full_namespace = qualify_response_tool_name(namespace, name);
+        let children = tool.get("tools").and_then(Value::as_array).ok_or_else(|| {
+            format!("Responses namespace `{full_namespace}` requires a tools array")
+        })?;
+        for child in children {
+            collect_openai_response_tool(child, Some(&full_namespace), depth + 1, inventory)?;
+        }
+        return Ok(());
+    }
+
+    let name = response_tool_name(tool)
+        .ok_or_else(|| format!("Responses {kind} tool requires a non-empty name"))?;
+    let full_name = qualify_response_tool_name(namespace, name);
+    if full_name.len() > 256 {
+        return Err("Responses tool name exceeds 256 bytes".to_string());
+    }
+    let description = response_tool_description(tool);
+    if description.len() > MAX_RESPONSE_TOOL_TEXT_BYTES {
+        return Err(format!(
+            "Responses tool `{full_name}` description exceeds {MAX_RESPONSE_TOOL_TEXT_BYTES} bytes"
+        ));
+    }
+
+    let (definition, custom) = match kind {
+        "function" => {
+            let parameters = response_function_parameters(tool)
+                .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+            (
+                McpToolDef {
+                    name: full_name.clone(),
+                    description,
+                    input_schema: Bytes::from(
+                        serde_json::to_vec(&parameters)
+                            .unwrap_or_else(|_| br#"{"type":"object","properties":{}}"#.to_vec()),
+                    ),
+                    provider_identifier: "cc-switch".to_string(),
+                    tool_name: full_name.clone(),
+                },
+                false,
+            )
+        }
+        "custom" => {
+            let format = tool
+                .get("format")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("Responses custom tool `{full_name}` requires format"))?;
+            if format.get("type").and_then(Value::as_str) != Some("grammar")
+                || format.get("syntax").and_then(Value::as_str) != Some("lark")
+            {
+                return Err(format!(
+                    "Responses custom tool `{full_name}` only supports Lark grammar format"
+                ));
+            }
+            let grammar = format
+                .get("definition")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("Responses custom tool `{full_name}` requires grammar definition")
+                })?;
+            if grammar.is_empty() || grammar.len() > MAX_RESPONSE_TOOL_TEXT_BYTES {
+                return Err(format!(
+                    "Responses custom tool `{full_name}` grammar must be 1..={MAX_RESPONSE_TOOL_TEXT_BYTES} bytes"
+                ));
+            }
+            let description = format!(
+                "{description}\n\nCUSTOM TOOL INPUT CONTRACT:\nCall this tool with a JSON object containing exactly one string field named `input`. The value is the raw custom-tool source and must satisfy this Lark grammar:\n{grammar}"
+            );
+            let schema = json!({
+                "type":"object",
+                "properties":{
+                    "input":{
+                        "type":"string",
+                        "description":"Raw custom tool input satisfying the declared Lark grammar"
+                    }
+                },
+                "required":["input"],
+                "additionalProperties":false
+            });
+            (
+                McpToolDef {
+                    name: full_name.clone(),
+                    description,
+                    input_schema: Bytes::from(serde_json::to_vec(&schema).unwrap_or_default()),
+                    provider_identifier: "cc-switch".to_string(),
+                    tool_name: full_name.clone(),
+                },
+                true,
+            )
+        }
+        other => {
+            return Err(format!(
+                "unsupported Responses tool type `{other}` in Cursor AgentService inventory"
+            ))
+        }
+    };
+
+    let normalized = normalize_response_tool_identity(&full_name);
+    let signature = format!(
+        "{}\0{}\0{}",
+        custom,
+        definition.description,
+        String::from_utf8_lossy(&definition.input_schema)
+    );
+    if let Some(existing) = inventory.registrations.get(&normalized) {
+        if existing == &signature {
+            return Ok(());
+        }
+        return Err(format!(
+            "Responses tool `{full_name}` conflicts with another normalized tool name"
+        ));
+    }
+    inventory.registrations.insert(normalized, signature);
+    if custom {
+        inventory.custom_tool_names.push(full_name.clone());
+    }
+    if let Some(namespace) = namespace {
+        inventory.namespaces.push(ResponseToolNamespace {
+            internal_name: full_name,
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        });
+    }
+    inventory.tools.push(definition);
+    Ok(())
+}
+
+fn response_tool_name(tool: &Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .or_else(|| tool.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn response_tool_description(tool: &Value) -> String {
+    tool.get("function")
+        .and_then(|function| function.get("description"))
+        .or_else(|| tool.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn response_function_parameters(tool: &Value) -> Option<Value> {
+    tool.get("function")
+        .and_then(|function| function.get("parameters"))
+        .or_else(|| tool.get("parameters"))
+        .or_else(|| tool.get("input_schema"))
+        .cloned()
+}
+
+fn qualify_response_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("{namespace}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+fn normalize_response_tool_identity(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 pub fn validate_tool_choice_contract(plan: &AgentRunPlan) -> Result<(), String> {
@@ -580,22 +874,51 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         InboundProtocol::OpenAiResponses => decompose_openai_responses(body),
         InboundProtocol::GeminiNative => decompose_gemini_native(body),
     };
-    let tools = match protocol {
-        InboundProtocol::AnthropicMessages => body
-            .get("tools")
-            .map(anthropic_tools_to_mcp_defs)
+    let (tools, custom_tool_names, response_tool_namespaces) = match protocol {
+        InboundProtocol::AnthropicMessages => (
+            body.get("tools")
+                .map(anthropic_tools_to_mcp_defs)
+                .unwrap_or_default(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        InboundProtocol::OpenAiChat => (
+            body.get("tools")
+                .map(openai_tools_to_mcp_defs)
+                .unwrap_or_default(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        InboundProtocol::OpenAiResponses => openai_response_tool_inventory(body)
+            .map(|inventory| {
+                (
+                    inventory.tools,
+                    inventory.custom_tool_names,
+                    inventory.namespaces,
+                )
+            })
             .unwrap_or_default(),
-        InboundProtocol::OpenAiChat | InboundProtocol::OpenAiResponses => body
-            .get("tools")
-            .map(openai_tools_to_mcp_defs)
-            .unwrap_or_default(),
-        InboundProtocol::GeminiNative => gemini_tools_to_mcp_defs(body.get("tools")),
+        InboundProtocol::GeminiNative => (
+            gemini_tools_to_mcp_defs(body.get("tools")),
+            Vec::new(),
+            Vec::new(),
+        ),
     };
     let tool_choice = extract_tool_choice(body, protocol);
     let mut tools = tools;
     if tool_choice_disables_tools(&tool_choice) {
         tools.clear();
     }
+    let custom_tool_names = if tools.is_empty() {
+        Vec::new()
+    } else {
+        custom_tool_names
+    };
+    let response_tool_namespaces = if tools.is_empty() {
+        Vec::new()
+    } else {
+        response_tool_namespaces
+    };
     let working_directory = extract_working_directory(body);
     let (tool_results, continuation_kind) = active_tool_results(protocol, body);
     let historical_count = all_tool_results.len().saturating_sub(tool_results.len());
@@ -629,6 +952,8 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         system_prompt,
         user_text,
         tools,
+        custom_tool_names,
+        response_tool_namespaces,
         images,
         historical_tool_results,
         tool_results,
@@ -733,6 +1058,12 @@ pub fn validate_request_contract(
                 "unsupported parameter `tools`: hosted tool type `{tool_type}` cannot run on the Cursor text rail"
             ));
         }
+        let inventory = openai_response_tool_inventory(body)?;
+        if compact && !inventory.tools.is_empty() {
+            return Err(
+                "unsupported parameter `tools`: response compaction cannot execute tools".into(),
+            );
+        }
     }
     if protocol == InboundProtocol::GeminiNative
         && body
@@ -751,10 +1082,11 @@ pub fn validate_request_contract(
                 "unsupported parameter `stream`: response compaction is non-streaming".into(),
             );
         }
-        if body
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty())
+        if protocol != InboundProtocol::OpenAiResponses
+            && body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
         {
             return Err(
                 "unsupported parameter `tools`: response compaction cannot execute tools".into(),
@@ -801,7 +1133,13 @@ pub fn prepend_response_context(body: &mut Value, previous: &[Value]) -> Result<
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if matches!(kind, "function_call" | "function_call_output") {
+        if matches!(
+            kind,
+            "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+        ) {
             let call_id = call_id
                 .ok_or_else(|| format!("Responses {kind} item requires a non-empty call_id"))?;
             let key = (kind.to_string(), call_id.to_string());
@@ -1265,7 +1603,19 @@ fn decompose_openai_responses(
                                 "Assistant called tool {name} ({call_id}) with arguments: {args}"
                             ));
                         }
-                        "function_call_output" => {
+                        "custom_tool_call" => {
+                            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                            let call_id = item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                            conversation_lines.push(format!(
+                                "Assistant called custom tool {name} ({call_id}) with input: {input}"
+                            ));
+                        }
+                        "function_call_output" | "custom_tool_call_output" => {
                             let call_id = item
                                 .get("call_id")
                                 .and_then(Value::as_str)
@@ -1273,9 +1623,8 @@ fn decompose_openai_responses(
                                 .to_string();
                             let output = item
                                 .get("output")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
+                                .map(response_tool_output_text)
+                                .unwrap_or_default();
                             tool_results.push(ToolResultBlock {
                                 tool_call_id: call_id.clone(),
                                 content: output.clone(),
@@ -1648,12 +1997,23 @@ pub fn extract_tool_choice(body: &Value, protocol: InboundProtocol) -> Extracted
             } else if raw.as_str() == Some("required") {
                 ExtractedToolChoice::Required
             } else if raw.get("type").and_then(Value::as_str) == Some("function") {
-                raw.get("function")
+                let name = raw
+                    .get("function")
                     .and_then(|f| f.get("name"))
                     .or_else(|| raw.get("name"))
-                    .and_then(Value::as_str)
-                    .map(|n| ExtractedToolChoice::Named(n.to_string()))
-                    .unwrap_or(ExtractedToolChoice::Auto)
+                    .and_then(Value::as_str);
+                match name {
+                    Some(name) if protocol == InboundProtocol::OpenAiResponses => {
+                        let namespace = raw
+                            .get("function")
+                            .and_then(|function| function.get("namespace"))
+                            .or_else(|| raw.get("namespace"))
+                            .and_then(Value::as_str);
+                        ExtractedToolChoice::Named(qualify_response_tool_name(namespace, name))
+                    }
+                    Some(name) => ExtractedToolChoice::Named(name.to_string()),
+                    None => ExtractedToolChoice::Auto,
+                }
             } else {
                 ExtractedToolChoice::Auto
             }
@@ -2259,6 +2619,213 @@ mod tests {
         });
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
         assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn codex_additional_tools_builds_custom_function_and_namespace_inventory() {
+        let body = json!({
+            "model":"gpt-5.6-sol",
+            "tool_choice":{
+                "type":"function",
+                "name":"list_agents",
+                "namespace":"collaboration"
+            },
+            "input":[
+                {
+                    "type":"additional_tools",
+                    "role":"developer",
+                    "tools":[
+                        {
+                            "type":"custom",
+                            "name":"exec",
+                            "description":"Run unified local tools",
+                            "format":{
+                                "type":"grammar",
+                                "syntax":"lark",
+                                "definition":"start: SOURCE\nSOURCE: /[\\s\\S]+/"
+                            }
+                        },
+                        {
+                            "type":"function",
+                            "name":"wait",
+                            "parameters":{
+                                "type":"object",
+                                "properties":{"cell_id":{"type":"string"}},
+                                "required":["cell_id"]
+                            }
+                        },
+                        {
+                            "type":"namespace",
+                            "name":"collaboration",
+                            "tools":[{
+                                "type":"function",
+                                "name":"list_agents",
+                                "parameters":{"type":"object","properties":{}}
+                            }]
+                        }
+                    ]
+                },
+                {"type":"message","role":"user","content":"深入解读当前项目"}
+            ]
+        });
+        validate_request_contract(InboundProtocol::OpenAiResponses, &body, false).unwrap();
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert_eq!(
+            plan.tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec", "wait", "collaboration.list_agents"]
+        );
+        assert_eq!(plan.custom_tool_names, vec!["exec"]);
+        assert_eq!(
+            plan.tool_choice,
+            ExtractedToolChoice::Named("collaboration.list_agents".to_string())
+        );
+        assert_eq!(
+            plan.response_tool_namespaces,
+            vec![ResponseToolNamespace {
+                internal_name: "collaboration.list_agents".to_string(),
+                namespace: "collaboration".to_string(),
+                name: "list_agents".to_string(),
+            }]
+        );
+        let exec_schema: Value = serde_json::from_slice(&plan.tools[0].input_schema).unwrap();
+        assert_eq!(exec_schema["required"], json!(["input"]));
+        assert!(plan.tools[0].description.contains("Lark grammar"));
+        assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn codex_custom_tool_output_forms_a_cold_resumable_continuation() {
+        let body = json!({
+            "input":[
+                {
+                    "type":"additional_tools",
+                    "role":"developer",
+                    "tools":[{
+                        "type":"custom",
+                        "name":"exec",
+                        "format":{
+                            "type":"grammar",
+                            "syntax":"lark",
+                            "definition":"start: SOURCE\nSOURCE: /[\\s\\S]+/"
+                        }
+                    }]
+                },
+                {"type":"message","role":"user","content":"inspect this project"},
+                {
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call_exec_1",
+                    "input":"const r=await tools.exec_command({cmd:\"pwd\"}); text(r.output);"
+                },
+                {
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_exec_1",
+                    "output":[{"type":"input_text","text":"/workspace\n"}]
+                }
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert_eq!(
+            plan.continuation_kind,
+            ToolContinuationKind::PureToolResults
+        );
+        assert_eq!(plan.tool_results.len(), 1);
+        assert_eq!(plan.tool_results[0].content, "/workspace\n");
+        assert!(plan.cold_resume_ready);
+        assert_eq!(plan.completed_tool_calls.len(), 1);
+        assert_eq!(plan.completed_tool_calls[0].name, "exec");
+        assert!(plan.completed_tool_calls[0].arguments["input"]
+            .as_str()
+            .unwrap()
+            .contains("tools.exec_command"));
+    }
+
+    #[test]
+    fn codex_0144_neutral_fixture_matches_inventory_and_continuation_contract() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/responses/codex_0144_additional_tools.json"
+        )))
+        .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+
+        let initial = &cases[0];
+        let initial_plan = build_plan(InboundProtocol::OpenAiResponses, &initial["request"]);
+        assert_eq!(
+            initial_plan
+                .tools
+                .iter()
+                .map(|tool| Value::String(tool.name.clone()))
+                .collect::<Vec<_>>(),
+            initial["expectedToolNames"].as_array().unwrap().clone()
+        );
+        assert_eq!(
+            initial_plan
+                .custom_tool_names
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+            initial["expectedCustomToolNames"]
+                .as_array()
+                .unwrap()
+                .clone()
+        );
+
+        let continuation = &cases[1];
+        let continuation_plan =
+            build_plan(InboundProtocol::OpenAiResponses, &continuation["request"]);
+        assert_eq!(
+            continuation_plan.continuation_kind,
+            ToolContinuationKind::PureToolResults
+        );
+        assert!(continuation_plan.cold_resume_ready);
+        assert_eq!(
+            continuation_plan.tool_results[0].content,
+            continuation["expectedOutputText"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn responses_additional_tools_rejects_unsupported_custom_formats_and_conflicts() {
+        let unsupported = json!({
+            "input":[{
+                "type":"additional_tools",
+                "tools":[{
+                    "type":"custom",
+                    "name":"exec",
+                    "format":{"type":"text"}
+                }]
+            }]
+        });
+        assert!(
+            validate_request_contract(InboundProtocol::OpenAiResponses, &unsupported, false)
+                .is_err()
+        );
+
+        let conflict = json!({
+            "tools":[{
+                "type":"function",
+                "name":"wait",
+                "parameters":{"type":"object","properties":{}}
+            }],
+            "input":[{
+                "type":"additional_tools",
+                "tools":[{
+                    "type":"function",
+                    "name":"wait",
+                    "parameters":{"type":"object","required":["id"]}
+                }]
+            }]
+        });
+        assert!(
+            validate_request_contract(InboundProtocol::OpenAiResponses, &conflict, false)
+                .unwrap_err()
+                .contains("conflicts")
+        );
     }
 
     #[test]

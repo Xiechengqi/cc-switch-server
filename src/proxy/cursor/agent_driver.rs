@@ -728,11 +728,17 @@ async fn stream_response(
     share_invocation_guard: Option<ShareInFlightGuard>,
     response_state: Option<CursorResponseStateContext>,
 ) -> Response {
-    let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
-    let rail = {
+    let (rail, custom_tool_names, response_tool_namespaces) = {
         let session = session_entry.lock().await;
-        session.rail
+        (
+            session.rail,
+            session.custom_tool_names.clone(),
+            session.response_tool_namespaces.clone(),
+        )
     };
+    let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens)
+        .with_custom_tool_names(custom_tool_names)
+        .with_response_tool_namespaces(response_tool_namespaces);
     state
         .cursor_sessions
         .bind_response_id(&session_key, &session_entry, writer.message_id())
@@ -1097,11 +1103,17 @@ async fn drive_non_stream(
     response_model: String,
     input_tokens: u32,
 ) -> Result<DriveOutcome, ProxyError> {
-    let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens);
-    let rail = {
+    let (rail, custom_tool_names, response_tool_namespaces) = {
         let session = session_entry.lock().await;
-        session.rail
+        (
+            session.rail,
+            session.custom_tool_names.clone(),
+            session.response_tool_namespaces.clone(),
+        )
     };
+    let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens)
+        .with_custom_tool_names(custom_tool_names)
+        .with_response_tool_namespaces(response_tool_namespaces);
     state
         .cursor_sessions
         .bind_response_id(session_key, &session_entry, writer.message_id())
@@ -2057,11 +2069,19 @@ async fn resume_tool_results(
         stream.send_frame(frame)?;
         session.pending_tool_calls.remove(&result.tool_call_id);
         if !session.semantic_items.is_empty() {
-            session.semantic_items.push(json!({
-                "type": "function_call_output",
-                "call_id": result.tool_call_id,
-                "output": result.content,
-            }));
+            session.semantic_items.push(if pending.custom {
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": result.tool_call_id,
+                    "output": result.content,
+                })
+            } else {
+                json!({
+                    "type": "function_call_output",
+                    "call_id": result.tool_call_id,
+                    "output": result.content,
+                })
+            });
         }
     }
     if !unique_results.is_empty() {
@@ -2313,9 +2333,14 @@ async fn surface_mcp_tool_call(
     tool_call_id: &str,
     args: Value,
 ) -> Result<ExecHandling, ProxyError> {
-    let (declared_tools, session_key) = {
+    let (declared_tools, session_key, custom_tool_names, response_tool_namespaces) = {
         let session = session_entry.lock().await;
-        (session.declared_tools.clone(), session.key.clone())
+        (
+            session.declared_tools.clone(),
+            session.key.clone(),
+            session.custom_tool_names.clone(),
+            session.response_tool_namespaces.clone(),
+        )
     };
     let resolved = match resolve_tool_call(&declared_tools, tool_name, args) {
         Ok(resolved) => resolved,
@@ -2380,6 +2405,12 @@ async fn surface_mcp_tool_call(
     } else {
         tool_call_id.to_string()
     };
+    let custom = custom_tool_names
+        .iter()
+        .any(|name| tool_names_equal(name, &resolved.name));
+    let response_namespace = response_tool_namespaces
+        .iter()
+        .find(|wire| tool_names_equal(&wire.internal_name, &resolved.name));
     let arguments_json = serde_json::to_string(&resolved.args).unwrap_or_else(|_| "{}".to_string());
     {
         let mut session = session_entry.lock().await;
@@ -2389,15 +2420,35 @@ async fn surface_mcp_tool_call(
                 exec_msg_id,
                 exec_id: exec_id.to_string(),
                 tool_name: resolved.name.clone(),
+                custom,
             },
         );
         if !session.semantic_items.is_empty() {
-            session.semantic_items.push(json!({
-                "type": "function_call",
-                "call_id": client_call_id.clone(),
-                "name": resolved.name.clone(),
-                "arguments": arguments_json.clone(),
-            }));
+            if custom {
+                session.semantic_items.push(json!({
+                    "type": "custom_tool_call",
+                    "call_id": client_call_id.clone(),
+                    "name": resolved.name.clone(),
+                    "input": resolved
+                        .args
+                        .get("input")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                }));
+            } else {
+                let mut item = json!({
+                    "type": "function_call",
+                    "call_id": client_call_id.clone(),
+                    "name": response_namespace
+                        .map(|wire| wire.name.as_str())
+                        .unwrap_or(&resolved.name),
+                    "arguments": arguments_json.clone(),
+                });
+                if let Some(namespace) = response_namespace.map(|wire| wire.namespace.as_str()) {
+                    item["namespace"] = Value::String(namespace.to_string());
+                }
+                session.semantic_items.push(item);
+            }
         }
     }
     state
@@ -2700,13 +2751,17 @@ async fn open_agent_stream(
                 conflict.state
             ))
         })?;
-    if !plan.tool_results.is_empty() && plan.cold_resume_ready {
+    {
         let mut session = entry.lock().await;
-        session.cold_resume_completed_calls = plan
-            .completed_tool_calls
-            .iter()
-            .map(|call| (call.name.clone(), call.arguments.clone()))
-            .collect();
+        session.custom_tool_names = plan.custom_tool_names.clone();
+        session.response_tool_namespaces = plan.response_tool_namespaces.clone();
+        if !plan.tool_results.is_empty() && plan.cold_resume_ready {
+            session.cold_resume_completed_calls = plan
+                .completed_tool_calls
+                .iter()
+                .map(|call| (call.name.clone(), call.arguments.clone()))
+                .collect();
+        }
     }
     let mut reservation_guard =
         CursorSessionReservationGuard::new(state.cursor_sessions.clone(), entry.clone());
@@ -3322,6 +3377,8 @@ mod tests {
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
+            custom_tool_names: Vec::new(),
+            response_tool_namespaces: Vec::new(),
             semantic_items: Vec::new(),
             working_directory: "/workspace".to_string(),
             pending_tool_calls: HashMap::new(),

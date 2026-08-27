@@ -14,6 +14,7 @@
 use super::agent_proto::McpToolDef;
 use super::h2_client::CursorH2Stream;
 use super::profile::CursorProtocolRail;
+use super::request_builder::ResponseToolNamespace;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -149,6 +150,7 @@ pub struct PendingToolCall {
     pub exec_msg_id: u64,
     pub exec_id: String,
     pub tool_name: String,
+    pub custom: bool,
 }
 
 /// Lifecycle state of a session held by the registry.
@@ -177,6 +179,11 @@ pub struct CursorSession {
     pub declared_tool_names: Vec<String>,
     /// Full declared MCP tool definitions for response-side schema validation.
     pub declared_tools: Vec<McpToolDef>,
+    /// Declared OpenAI custom tools. Cursor receives JSON MCP wrappers for
+    /// these names, while the downstream Responses client must receive
+    /// `custom_tool_call` / `custom_tool_call_output` items.
+    pub custom_tool_names: Vec<String>,
+    pub response_tool_namespaces: Vec<ResponseToolNamespace>,
     pub semantic_items: Vec<serde_json::Value>,
     /// Working directory for RequestContext ack.
     pub working_directory: String,
@@ -329,6 +336,8 @@ impl CursorSessionManager {
             stream: None,
             declared_tool_names,
             declared_tools,
+            custom_tool_names: Vec::new(),
+            response_tool_namespaces: Vec::new(),
             semantic_items,
             working_directory,
             pending_tool_calls: HashMap::new(),
@@ -644,6 +653,8 @@ mod tests {
             stream: None,
             declared_tool_names: Vec::new(),
             declared_tools: Vec::new(),
+            custom_tool_names: Vec::new(),
+            response_tool_namespaces: Vec::new(),
             semantic_items: Vec::new(),
             working_directory: String::new(),
             pending_tool_calls: HashMap::new(),
@@ -672,11 +683,13 @@ mod tests {
                 exec_msg_id: 7,
                 exec_id: "exec-x".to_string(),
                 tool_name: "weather".to_string(),
+                custom: false,
             },
         );
         let got = pending.get("tc_1").unwrap();
         assert_eq!(got.exec_msg_id, 7);
         assert_eq!(got.exec_id, "exec-x");
+        assert!(!got.custom);
     }
 
     #[tokio::test]

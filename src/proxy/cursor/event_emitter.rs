@@ -14,9 +14,10 @@
 //! tool_calls events instead of leaking the markers as text.
 
 use super::protocol::CursorResponseFormat;
+use super::request_builder::ResponseToolNamespace;
 use rand::RngCore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ─── Internal event vocabulary ─────────────────────────────────────────────
 
@@ -60,6 +61,25 @@ fn random_id_hex() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn normalize_tool_identity(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn custom_tool_input(arguments_json: &str) -> String {
+    serde_json::from_str::<Value>(arguments_json)
+        .ok()
+        .and_then(|arguments| {
+            arguments
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 /// State machine that consumes raw text deltas and yields either `Text` or
@@ -258,6 +278,8 @@ pub struct AgentSseWriter {
     reasoning_item: Option<OutputRef>,
     text_item: Option<OutputRef>,
     tool_items: HashMap<String, OutputRef>, // by capture id
+    custom_tool_names: HashSet<String>,
+    response_tool_namespaces: HashMap<String, ResponseToolNamespace>,
     // Anthropic message_start sent?
     started: bool,
     input_tokens: u32,
@@ -295,6 +317,8 @@ impl AgentSseWriter {
             reasoning_item: None,
             text_item: None,
             tool_items: HashMap::new(),
+            custom_tool_names: HashSet::new(),
+            response_tool_namespaces: HashMap::new(),
             started: false,
             input_tokens,
             output_tokens: 0,
@@ -303,6 +327,52 @@ impl AgentSseWriter {
             aggregate_tool_calls: Vec::new(),
             error_mode: false,
         }
+    }
+
+    pub fn with_custom_tool_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.custom_tool_names = names
+            .into_iter()
+            .map(|name| normalize_tool_identity(&name))
+            .collect();
+        self
+    }
+
+    pub fn with_response_tool_namespaces(
+        mut self,
+        namespaces: impl IntoIterator<Item = ResponseToolNamespace>,
+    ) -> Self {
+        self.response_tool_namespaces = namespaces
+            .into_iter()
+            .map(|namespace| (normalize_tool_identity(&namespace.internal_name), namespace))
+            .collect();
+        self
+    }
+
+    fn is_custom_tool(&self, name: &str) -> bool {
+        self.custom_tool_names
+            .contains(&normalize_tool_identity(name))
+    }
+
+    fn responses_function_call_item(
+        &self,
+        item_id: &str,
+        tool_call: &CapturedToolCall,
+        arguments: &str,
+    ) -> Value {
+        let wire = self
+            .response_tool_namespaces
+            .get(&normalize_tool_identity(&tool_call.name));
+        let mut item = json!({
+            "id": item_id,
+            "type": "function_call",
+            "name": wire.map(|wire| wire.name.as_str()).unwrap_or(&tool_call.name),
+            "call_id": tool_call.id,
+            "arguments": arguments
+        });
+        if let Some(namespace) = wire.map(|wire| wire.namespace.as_str()) {
+            item["namespace"] = Value::String(namespace.to_string());
+        }
+        item
     }
 
     pub fn message_id(&self) -> &str {
@@ -1044,7 +1114,8 @@ impl AgentSseWriter {
             }
             CursorResponseFormat::OpenAiResponses => {
                 let idx = self.alloc_output();
-                let item_id = format!("fc_{}", random_id_hex());
+                let custom = self.is_custom_tool(&tc.name);
+                let item_id = format!("{}_{}", if custom { "ctc" } else { "fc" }, random_id_hex());
                 self.tool_items.insert(
                     tc.id.clone(),
                     OutputRef {
@@ -1057,44 +1128,78 @@ impl AgentSseWriter {
                     json!({
                         "type": "response.output_item.added",
                         "output_index": idx,
-                        "item": {
-                            "id": item_id,
-                            "type": "function_call",
-                            "name": tc.name,
-                            "call_id": tc.id,
-                            "arguments": ""
+                        "item": if custom {
+                            json!({
+                                "id": item_id,
+                                "type": "custom_tool_call",
+                                "name": tc.name,
+                                "call_id": tc.id,
+                                "input": ""
+                            })
+                        } else {
+                            self.responses_function_call_item(&item_id, tc, "")
                         }
                     }),
                 ));
-                out.push(event(
-                    "response.function_call_arguments.delta",
-                    json!({
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": item_id,
-                        "output_index": idx,
-                        "delta": tc.arguments_json
-                    }),
-                ));
-                out.push(event(
-                    "response.function_call_arguments.done",
-                    json!({
-                        "type": "response.function_call_arguments.done",
-                        "item_id": item_id,
-                        "output_index": idx,
-                        "arguments": tc.arguments_json
-                    }),
-                ));
+                let custom_input = custom.then(|| custom_tool_input(&tc.arguments_json));
+                if let Some(input) = custom_input.as_deref() {
+                    out.push(event(
+                        "response.custom_tool_call_input.delta",
+                        json!({
+                            "type": "response.custom_tool_call_input.delta",
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "delta": input
+                        }),
+                    ));
+                    out.push(event(
+                        "response.custom_tool_call_input.done",
+                        json!({
+                            "type": "response.custom_tool_call_input.done",
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "input": input
+                        }),
+                    ));
+                } else {
+                    out.push(event(
+                        "response.function_call_arguments.delta",
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "delta": tc.arguments_json
+                        }),
+                    ));
+                    out.push(event(
+                        "response.function_call_arguments.done",
+                        json!({
+                            "type": "response.function_call_arguments.done",
+                            "item_id": item_id,
+                            "output_index": idx,
+                            "arguments": tc.arguments_json
+                        }),
+                    ));
+                }
                 out.push(event(
                     "response.output_item.done",
                     json!({
                         "type": "response.output_item.done",
                         "output_index": idx,
-                        "item": {
-                            "id": item_id,
-                            "type": "function_call",
-                            "name": tc.name,
-                            "call_id": tc.id,
-                            "arguments": tc.arguments_json
+                        "item": if let Some(input) = custom_input {
+                            json!({
+                                "id": item_id,
+                                "type": "custom_tool_call",
+                                "name": tc.name,
+                                "call_id": tc.id,
+                                "input": input
+                            })
+                        } else {
+                            self.responses_function_call_item(
+                                &item_id,
+                                tc,
+                                &tc.arguments_json,
+                            )
                         }
                     }),
                 ));
@@ -1186,13 +1291,21 @@ impl AgentSseWriter {
             }));
         }
         for tc in &self.aggregate_tool_calls {
-            output.push(json!({
-                "id": format!("fc_{}", tc.id),
-                "type": "function_call",
-                "name": tc.name,
-                "call_id": tc.id,
-                "arguments": tc.arguments_json
-            }));
+            if self.is_custom_tool(&tc.name) {
+                output.push(json!({
+                    "id": format!("ctc_{}", tc.id),
+                    "type": "custom_tool_call",
+                    "name": tc.name,
+                    "call_id": tc.id,
+                    "input": custom_tool_input(&tc.arguments_json)
+                }));
+            } else {
+                output.push(self.responses_function_call_item(
+                    &format!("fc_{}", tc.id),
+                    tc,
+                    &tc.arguments_json,
+                ));
+            }
         }
         Value::Array(output)
     }
@@ -1498,6 +1611,62 @@ mod tests {
         assert!(joined.contains("function_call_arguments.delta"));
         assert!(joined.contains("function_call_arguments.done"));
         assert!(joined.contains("response.completed"));
+    }
+
+    #[test]
+    fn responses_custom_tool_call_emits_codex_custom_input_contract() {
+        let mut writer = AgentSseWriter::new(
+            "gpt-5.6-sol".to_string(),
+            CursorResponseFormat::OpenAiResponses,
+            0,
+        )
+        .with_custom_tool_names(vec!["exec".to_string()]);
+        writer.start_events();
+        let source = "const r=await tools.exec_command({cmd:\"pwd\"}); text(r.output);";
+        let mut events = writer.event(&AgentEvent::ToolCall(CapturedToolCall {
+            id: "call_exec_1".to_string(),
+            name: "exec".to_string(),
+            arguments_json: json!({"input":source}).to_string(),
+        }));
+        events.extend(writer.done_events());
+        let joined = events.join("");
+        assert!(joined.contains("response.custom_tool_call_input.delta"));
+        assert!(joined.contains("response.custom_tool_call_input.done"));
+        assert!(joined.contains("\"type\":\"custom_tool_call\""));
+        assert!(!joined.contains("response.function_call_arguments.delta"));
+        let response = writer.json_response();
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(response["output"][0]["input"], source);
+        assert_eq!(response["output"][0]["call_id"], "call_exec_1");
+    }
+
+    #[test]
+    fn responses_namespace_tool_call_restores_wire_identity() {
+        let mut writer = AgentSseWriter::new(
+            "gpt-5.6-sol".to_string(),
+            CursorResponseFormat::OpenAiResponses,
+            0,
+        )
+        .with_response_tool_namespaces(vec![ResponseToolNamespace {
+            internal_name: "collaboration.list_agents".to_string(),
+            namespace: "collaboration".to_string(),
+            name: "list_agents".to_string(),
+        }]);
+        writer.start_events();
+        let mut events = writer.event(&AgentEvent::ToolCall(CapturedToolCall {
+            id: "call_list_1".to_string(),
+            name: "collaboration.list_agents".to_string(),
+            arguments_json: "{}".to_string(),
+        }));
+        events.extend(writer.done_events());
+        let joined = events.join("");
+        assert!(joined.contains("\"name\":\"list_agents\""));
+        assert!(joined.contains("\"namespace\":\"collaboration\""));
+        assert!(!joined.contains("\"name\":\"collaboration.list_agents\""));
+        let response = writer.json_response();
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["name"], "list_agents");
+        assert_eq!(response["output"][0]["namespace"], "collaboration");
     }
 
     #[test]

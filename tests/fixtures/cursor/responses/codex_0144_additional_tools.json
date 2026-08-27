@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "source": "Neutralized Codex CLI 0.144.6 Responses request shapes",
+  "cases": [
+    {
+      "name": "initial_additional_tools_inventory",
+      "request": {
+        "model": "gpt-5.6-sol",
+        "stream": true,
+        "tools": [],
+        "tool_choice": "auto",
+        "input": [
+          {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+              {
+                "type": "custom",
+                "name": "exec",
+                "description": "Run JavaScript that orchestrates local tools",
+                "format": {
+                  "type": "grammar",
+                  "syntax": "lark",
+                  "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+                }
+              },
+              {
+                "type": "function",
+                "name": "wait",
+                "description": "Wait for an executing cell",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "cell_id": { "type": "string" }
+                  },
+                  "required": ["cell_id"],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "request_user_input",
+                "description": "Request structured user input",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "questions": { "type": "array" }
+                  },
+                  "required": ["questions"],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Team-agent coordination tools",
+                "tools": [
+                  {
+                    "type": "function",
+                    "name": "list_agents",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {},
+                      "additionalProperties": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": "Inspect this project"
+          }
+        ]
+      },
+      "expectedToolNames": [
+        "exec",
+        "wait",
+        "request_user_input",
+        "collaboration.list_agents"
+      ],
+      "expectedCustomToolNames": ["exec"]
+    },
+    {
+      "name": "custom_tool_continuation",
+      "request": {
+        "model": "gpt-5.6-sol",
+        "stream": true,
+        "input": [
+          {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+              {
+                "type": "custom",
+                "name": "exec",
+                "format": {
+                  "type": "grammar",
+                  "syntax": "lark",
+                  "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+                }
+              }
+            ]
+          },
+          {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call_exec_fixture_1",
+            "input": "const r = await tools.exec_command({cmd: \"pwd\"}); text(r.output);"
+          },
+          {
+            "type": "custom_tool_call_output",
+            "call_id": "call_exec_fixture_1",
+            "output": [
+              {
+                "type": "input_text",
+                "text": "/workspace\n"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedOutputText": "/workspace\n"
+    }
+  ]
+}
