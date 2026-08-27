@@ -10,6 +10,8 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 
 use crate::domain::router::{ClientSubdomain, ShareSlug, PROTOCOL_EPOCH};
 use crate::domain::settings::config::{RouterIdentity, ServerConfig, UpgradePolicyConfig};
@@ -482,7 +484,7 @@ struct IssueLeaseRequest {
     share: Option<ShareDescriptor>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareBatchSyncRequest {
     protocol_epoch: &'static str,
@@ -490,7 +492,7 @@ struct ShareBatchSyncRequest {
     timestamp_ms: i64,
     nonce: String,
     signature: String,
-    ops: Vec<ShareSyncOperation>,
+    ops: Box<RawValue>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -635,7 +637,7 @@ pub struct ShareEditAvailableEvent {
     pub revision: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareClaimSubdomainRequest {
     protocol_epoch: &'static str,
@@ -643,8 +645,8 @@ struct ShareClaimSubdomainRequest {
     timestamp_ms: i64,
     nonce: String,
     signature: String,
-    claim: ShareClaimPayload,
-    share: ShareDescriptor,
+    claim: Box<RawValue>,
+    share: Box<RawValue>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -654,6 +656,25 @@ struct ShareClaimPayload {
     subdomain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    share_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareEditAckRequest {
+    protocol_epoch: &'static str,
+    installation_id: String,
+    timestamp_ms: i64,
+    nonce: String,
+    signature: String,
+    ack: Box<RawValue>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawShareEditAckEnvelope<'a> {
+    ack: &'a RawValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,6 +726,21 @@ pub struct NamespaceLeasePayload {
     pub tunnel_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<ShareDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NamespaceLeaseWirePayload<'a> {
+    protocol_epoch: &'a str,
+    router_id: &'a str,
+    route_id: &'a str,
+    rotation_id: &'a str,
+    generation: u64,
+    expected_generation: u64,
+    requested_subdomain: &'a str,
+    tunnel_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    share: Option<&'a RawValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1618,7 +1654,23 @@ pub async fn issue_namespace_lease(
     let identity = config
         .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
-    let request = tunnel_signed_request(identity, "tunnel_lease_issue", payload.clone())?;
+    let raw_share = payload
+        .share
+        .as_ref()
+        .map(|share| serialize_raw_json(share, "serialize namespace lease Share descriptor"))
+        .transpose()?;
+    let wire_payload = NamespaceLeaseWirePayload {
+        protocol_epoch: &payload.protocol_epoch,
+        router_id: &payload.router_id,
+        route_id: &payload.route_id,
+        rotation_id: &payload.rotation_id,
+        generation: payload.generation,
+        expected_generation: payload.expected_generation,
+        requested_subdomain: &payload.requested_subdomain,
+        tunnel_type: &payload.tunnel_type,
+        share: raw_share.as_deref(),
+    };
+    let request = tunnel_signed_request(identity, "tunnel_lease_issue", wire_payload)?;
     let response = http
         .post(format!("{api_base}/v1/tunnels/lease"))
         .json(&request)
@@ -1904,17 +1956,20 @@ pub async fn claim_share_subdomain(
     let identity = config
         .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
+    let raw_share = serialize_raw_json(&share, "serialize Share claim descriptor")?;
     let claim = ShareClaimPayload {
         share_id: share.share_id.clone(),
         subdomain: share.subdomain.clone(),
         owner_email: share.owner_email.clone(),
+        share_sha256: Some(hex::encode(Sha256::digest(raw_share.get().as_bytes()))),
     };
+    let claim = serialize_raw_json(&claim, "serialize Share claim payload")?;
     let timestamp_ms = now_ms();
     let nonce = nonce();
-    let signature = sign_payload(
+    let signature = sign_payload_json(
         identity,
         "share_claim_subdomain",
-        &claim,
+        claim.get(),
         timestamp_ms,
         &nonce,
     )?;
@@ -1925,7 +1980,7 @@ pub async fn claim_share_subdomain(
         nonce,
         signature,
         claim,
-        share,
+        share: raw_share,
     };
     let response = http
         .post(format!("{api_base}/v1/shares/claim-subdomain"))
@@ -2257,10 +2312,11 @@ async fn send_share_descriptor_ops_request(
 ) -> anyhow::Result<reqwest::Response> {
     let timestamp_ms = now_ms();
     let nonce = nonce();
-    let signature = sign_payload(
+    let ops = serialize_raw_json(&ops, "serialize strict Share descriptor operations")?;
+    let signature = sign_payload_json(
         identity,
         "share_descriptor_batch_sync",
-        &ops,
+        ops.get(),
         timestamp_ms,
         &nonce,
     )?;
@@ -2287,7 +2343,14 @@ async fn send_share_ops_request(
 ) -> anyhow::Result<reqwest::Response> {
     let timestamp_ms = now_ms();
     let nonce = nonce();
-    let signature = sign_payload(identity, "share_batch_sync", &ops, timestamp_ms, &nonce)?;
+    let ops = serialize_raw_json(&ops, "serialize legacy Share operations")?;
+    let signature = sign_payload_json(
+        identity,
+        "share_batch_sync",
+        ops.get(),
+        timestamp_ms,
+        &nonce,
+    )?;
     let request = ShareBatchSyncRequest {
         protocol_epoch: PROTOCOL_EPOCH,
         installation_id: identity.installation_id.clone(),
@@ -2447,7 +2510,26 @@ pub async fn ack_share_edit(
     let identity = config
         .registered_router_identity()
         .ok_or_else(|| anyhow::anyhow!("router installation is not registered"))?;
-    let request = signed_request(identity, "share_edit_ack", ShareEditAckEnvelope { ack })?;
+    let ack = serialize_raw_json(&ack, "serialize Share edit acknowledgement")?;
+    let payload_json = serde_json::to_string(&RawShareEditAckEnvelope { ack: ack.as_ref() })
+        .context("serialize Share edit acknowledgement envelope")?;
+    let timestamp_ms = now_ms();
+    let nonce = nonce();
+    let signature = sign_payload_json(
+        identity,
+        "share_edit_ack",
+        &payload_json,
+        timestamp_ms,
+        &nonce,
+    )?;
+    let request = ShareEditAckRequest {
+        protocol_epoch: PROTOCOL_EPOCH,
+        installation_id: identity.installation_id.clone(),
+        timestamp_ms,
+        nonce,
+        signature,
+        ack,
+    };
     let response = http
         .post(format!("{api_base}/v1/shares/edit-ack"))
         .json(&request)
@@ -2586,6 +2668,13 @@ pub fn sign_payload<T: Serialize>(
 ) -> anyhow::Result<String> {
     let payload_json = serde_json::to_string(payload).context("serialize signed payload")?;
     sign_payload_json(identity, action, &payload_json, timestamp_ms, nonce)
+}
+
+fn serialize_raw_json<T: Serialize>(
+    value: &T,
+    context: &'static str,
+) -> anyhow::Result<Box<RawValue>> {
+    serde_json::value::to_raw_value(value).with_context(|| context)
 }
 
 fn sign_payload_json(
@@ -4599,6 +4688,220 @@ mod tests {
     }
 
     #[test]
+    fn share_batch_request_embeds_the_exact_signed_ops_json() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-raw-ops".into();
+        let ops = vec![ShareSyncOperation {
+            kind: "upsert".into(),
+            share_id: None,
+            share: Some(ShareDescriptor {
+                contract_version: SHARE_CONTRACT_VERSION,
+                share_id: "share-raw-ops".into(),
+                share_name: "Raw operations".into(),
+                created_at: "2026-08-27T00:00:00Z".into(),
+                ..ShareDescriptor::default()
+            }),
+        }];
+        let raw_ops = serialize_raw_json(&ops, "serialize test Share operations").unwrap();
+        assert!(
+            !raw_ops.get().contains("grokMediaPolicy"),
+            "the current Server omits the default Grok media policy"
+        );
+        let signature = sign_payload_json(
+            &identity,
+            "share_descriptor_batch_sync",
+            raw_ops.get(),
+            123,
+            "nonce-raw-ops",
+        )
+        .unwrap();
+        let request = ShareBatchSyncRequest {
+            protocol_epoch: PROTOCOL_EPOCH,
+            installation_id: identity.installation_id.clone(),
+            timestamp_ms: 123,
+            nonce: "nonce-raw-ops".into(),
+            signature: signature.clone(),
+            ops: raw_ops,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+        #[derive(Deserialize)]
+        struct Captured {
+            ops: Box<RawValue>,
+        }
+        let captured: Captured = serde_json::from_str(&body).unwrap();
+        let expected = serde_json::to_string(&ops).unwrap();
+        assert_eq!(captured.ops.get(), expected);
+        assert_eq!(
+            signature,
+            sign_payload_json(
+                &identity,
+                "share_descriptor_batch_sync",
+                captured.ops.get(),
+                123,
+                "nonce-raw-ops",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn namespace_lease_reuses_the_exact_signed_share_json() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-raw-namespace-lease".into();
+        let share = ShareDescriptor {
+            contract_version: SHARE_CONTRACT_VERSION,
+            share_id: "share-raw-namespace-lease".into(),
+            share_name: "Raw namespace lease".into(),
+            created_at: "2026-08-27T00:00:00Z".into(),
+            ..ShareDescriptor::default()
+        };
+        let raw_share = serialize_raw_json(&share, "serialize test namespace lease Share").unwrap();
+        assert!(!raw_share.get().contains("grokMediaPolicy"));
+        let typed_payload = NamespaceLeasePayload {
+            protocol_epoch: PROTOCOL_EPOCH.into(),
+            router_id: "router.example.com".into(),
+            route_id: "share:share-raw-namespace-lease".into(),
+            rotation_id: "rotation-raw-namespace-lease".into(),
+            generation: 2,
+            expected_generation: 1,
+            requested_subdomain: "raw-namespace-lease--client".into(),
+            tunnel_type: "http".into(),
+            share: Some(share),
+        };
+        let payload = NamespaceLeaseWirePayload {
+            protocol_epoch: &typed_payload.protocol_epoch,
+            router_id: &typed_payload.router_id,
+            route_id: &typed_payload.route_id,
+            rotation_id: &typed_payload.rotation_id,
+            generation: typed_payload.generation,
+            expected_generation: typed_payload.expected_generation,
+            requested_subdomain: &typed_payload.requested_subdomain,
+            tunnel_type: &typed_payload.tunnel_type,
+            share: Some(raw_share.as_ref()),
+        };
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            serde_json::to_value(&typed_payload).unwrap(),
+            "the raw wire wrapper must cover every namespace lease field"
+        );
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let request = tunnel_signed_request(&identity, "tunnel_lease_issue", payload).unwrap();
+        assert_eq!(
+            request.signature,
+            sign_payload_json(
+                &identity,
+                "tunnel_lease_issue",
+                &payload_json,
+                request.timestamp_ms,
+                &request.nonce,
+            )
+            .unwrap()
+        );
+
+        let body = serde_json::to_string(&request).unwrap();
+        #[derive(Deserialize)]
+        struct Captured {
+            share: Box<RawValue>,
+        }
+        let captured: Captured = serde_json::from_str(&body).unwrap();
+        assert_eq!(captured.share.get(), raw_share.get());
+    }
+
+    #[test]
+    fn share_claim_v2_binds_the_exact_embedded_descriptor_json() {
+        let mut identity = generate_identity_without_installation();
+        identity.installation_id = "inst-claim-v2".into();
+        let share = ShareDescriptor {
+            contract_version: SHARE_CONTRACT_VERSION,
+            share_id: "share-claim-v2".into(),
+            share_name: "Claim v2".into(),
+            subdomain: "claim-v2--client".into(),
+            owner_email: Some("owner@example.com".into()),
+            created_at: "2026-08-27T00:00:00Z".into(),
+            ..ShareDescriptor::default()
+        };
+        let raw_share = serialize_raw_json(&share, "serialize test claim descriptor").unwrap();
+        let claim = ShareClaimPayload {
+            share_id: share.share_id.clone(),
+            subdomain: share.subdomain.clone(),
+            owner_email: share.owner_email.clone(),
+            share_sha256: Some(hex::encode(Sha256::digest(raw_share.get().as_bytes()))),
+        };
+        let raw_claim = serialize_raw_json(&claim, "serialize test claim").unwrap();
+        let signature = sign_payload_json(
+            &identity,
+            "share_claim_subdomain",
+            raw_claim.get(),
+            123,
+            "nonce-claim-v2",
+        )
+        .unwrap();
+        let request = ShareClaimSubdomainRequest {
+            protocol_epoch: PROTOCOL_EPOCH,
+            installation_id: identity.installation_id.clone(),
+            timestamp_ms: 123,
+            nonce: "nonce-claim-v2".into(),
+            signature: signature.clone(),
+            claim: raw_claim,
+            share: raw_share,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Captured {
+            claim: Box<RawValue>,
+            share: Box<RawValue>,
+        }
+        let captured: Captured = serde_json::from_str(&body).unwrap();
+        let parsed_claim: serde_json::Value = serde_json::from_str(captured.claim.get()).unwrap();
+        assert_eq!(
+            parsed_claim["shareSha256"],
+            hex::encode(Sha256::digest(captured.share.get().as_bytes()))
+        );
+        assert_eq!(
+            signature,
+            sign_payload_json(
+                &identity,
+                "share_claim_subdomain",
+                captured.claim.get(),
+                123,
+                "nonce-claim-v2",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn share_edit_ack_envelope_reuses_the_exact_raw_ack() {
+        let ack = ShareEditAckPayload {
+            edit_id: "edit-raw-ack".into(),
+            revision: 7,
+            status: "rejected".into(),
+            error_message: Some("conflict".into()),
+            error_code: Some("cc_switch_share_revision_conflict".into()),
+            retryable: Some(true),
+            current_config_revision: Some(2),
+            current_share: Some(ShareDescriptor {
+                contract_version: SHARE_CONTRACT_VERSION,
+                share_id: "share-raw-ack".into(),
+                share_name: "Raw ACK".into(),
+                created_at: "2026-08-27T00:00:00Z".into(),
+                config_revision: 2,
+                ..ShareDescriptor::default()
+            }),
+            applied_at_ms: None,
+            effective_policy: None,
+        };
+        let raw_ack = serialize_raw_json(&ack, "serialize test Share edit ACK").unwrap();
+        assert!(!raw_ack.get().contains("grokMediaPolicy"));
+        let envelope = serde_json::to_string(&RawShareEditAckEnvelope {
+            ack: raw_ack.as_ref(),
+        })
+        .unwrap();
+        assert_eq!(envelope, format!(r#"{{"ack":{}}}"#, raw_ack.get()));
+    }
+
+    #[test]
     fn share_claim_signature_matches_router_canonical_format() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-1".to_string();
@@ -4606,6 +4909,7 @@ mod tests {
             share_id: "share-1".to_string(),
             subdomain: "share-sub".to_string(),
             owner_email: Some("owner@example.com".to_string()),
+            share_sha256: None,
         };
         let signature =
             sign_payload(&identity, "share_claim_subdomain", &claim, 123, "nonce-1").unwrap();
