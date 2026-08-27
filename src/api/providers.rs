@@ -1,9 +1,144 @@
 use super::*;
 use crate::domain::providers::registry::ProviderKey;
 use crate::domain::providers::runtime::{build_provider_model_probe, PROVIDER_MODEL_PROBE_PROMPT};
+use base64::Engine;
+use serde::Serialize;
 
 const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const PROVIDER_MEDIA_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::api) struct ProviderInferenceTestRequest {
+    operation: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ProviderInferenceTestResponse {
+    ok: bool,
+    operation: String,
+    status_code: u16,
+    latency_ms: u64,
+    content_type: Option<String>,
+    body_text: String,
+    body_truncated: bool,
+}
+
+pub(in crate::api) async fn test_provider_inference(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ProviderInferenceTestRequest>,
+) -> Result<Json<ProviderInferenceTestResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    let operation = input.operation.trim().to_ascii_lowercase();
+    if !matches!(
+        operation.as_str(),
+        "image_generation" | "image_edit" | "video_generation"
+    ) {
+        return Err(ApiError::bad_request(
+            "operation must be image_generation, image_edit, or video_generation",
+        ));
+    }
+    let execution = resolve_provider_execution_by_key(&state, AppKind::Codex, &id).await?;
+    let (path, content_type, body) = match operation.as_str() {
+        "image_generation" => (
+            "/images/generations".to_string(),
+            "application/json".to_string(),
+            Bytes::from(
+                json!({
+                    "model": "grok-imagine",
+                    "prompt": "A small blue circle on a plain white background",
+                    "n": 1,
+                    "response_format": "b64_json"
+                })
+                .to_string(),
+            ),
+        ),
+        "image_edit" => {
+            const TEST_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+            let image = base64::engine::general_purpose::STANDARD
+                .decode(TEST_PNG_BASE64)
+                .map_err(ApiError::internal)?;
+            let boundary = "cc-switch-grok-media-test";
+            let mut multipart = Vec::new();
+            multipart.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngrok-imagine\r\n").as_bytes());
+            multipart.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nMake the dot green\r\n").as_bytes());
+            multipart.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"test.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes());
+            multipart.extend_from_slice(&image);
+            multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (
+                "/images/edits".to_string(),
+                format!("multipart/form-data; boundary={boundary}"),
+                Bytes::from(multipart),
+            )
+        }
+        "video_generation" => (
+            "/videos/generations".to_string(),
+            "application/json".to_string(),
+            Bytes::from(
+                json!({
+                    "model": "grok-imagine-video",
+                    "prompt": "A blue circle slowly moving from left to right",
+                    "duration": 6,
+                    "resolution": "720p",
+                    "aspect_ratio": "16:9"
+                })
+                .to_string(),
+            ),
+        ),
+        _ => unreachable!("operation was validated"),
+    };
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type).map_err(ApiError::internal)?,
+    );
+    request_headers.insert("x-cc-switch-health-check", HeaderValue::from_static("1"));
+    request_headers.insert(
+        "x-cc-switch-share-id",
+        HeaderValue::from_str(&format!("test-share:{id}")).map_err(ApiError::internal)?,
+    );
+    request_headers.insert(
+        "x-cc-switch-request-id",
+        HeaderValue::from_str(&new_transport_request_id().0).map_err(ApiError::internal)?,
+    );
+    let started = std::time::Instant::now();
+    let response = proxy::forward_grok_media_provider_test(
+        state,
+        execution,
+        Method::POST,
+        path,
+        request_headers,
+        body,
+    )
+    .await
+    .map_err(ApiError::proxy)?;
+    let status_code = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = axum::body::to_bytes(
+        response.into_body(),
+        PROVIDER_MEDIA_TEST_RESPONSE_BODY_LIMIT_BYTES,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let preview_len = bytes.len().min(PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES);
+    Ok(Json(ProviderInferenceTestResponse {
+        ok: (200..300).contains(&status_code),
+        operation,
+        status_code,
+        latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        content_type,
+        body_text: String::from_utf8_lossy(&bytes[..preview_len]).into_owned(),
+        body_truncated: preview_len < bytes.len(),
+    }))
+}
 
 pub(in crate::api) async fn list_provider_bundles(
     State(state): State<ServerState>,
@@ -2495,15 +2630,20 @@ fn kiro_provider_models_fetch_result(
     url: &str,
 ) -> ProviderModelsFetchResult {
     let models = catalog
-        .models
+        .descriptors
         .iter()
-        .map(|id| FetchedProviderModel {
-            id: id.clone(),
-            upstream_model: id.clone(),
-            display_name: None,
+        .map(|descriptor| FetchedProviderModel {
+            id: descriptor.model_id.clone(),
+            upstream_model: descriptor.model_id.clone(),
+            display_name: descriptor.display_name.clone(),
             raw: serde_json::json!({
-                "id": id,
+                "id": descriptor.model_id,
                 "object": "model",
+                "description": descriptor.description,
+                "token_limits": {
+                    "max_input_tokens": descriptor.max_input_tokens,
+                    "max_output_tokens": descriptor.max_output_tokens,
+                }
             }),
         })
         .collect();

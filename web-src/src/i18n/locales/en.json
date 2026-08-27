@@ -3343,7 +3343,15 @@
     "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... or paste only the code",
     "finishLogin": "Complete sign-in",
     "loginRequired": "Sign in to a Grok account first",
-    "selectAccountRequired": "Grok OAuth must be bound to a Grok account"
+    "selectAccountRequired": "Grok OAuth must be bound to a Grok account",
+    "featureOptionsTitle": "Grok OAuth media capabilities",
+    "shareMediaPolicy": "Share media permissions",
+    "grokImageGenerationEnabled": "Image generation",
+    "grokImageGenerationEnabledDescription": "Allow this Grok OAuth Provider or Share to generate images.",
+    "grokImageEditEnabled": "Image editing",
+    "grokImageEditEnabledDescription": "Allow this Grok OAuth Provider or Share to edit images.",
+    "grokVideoGenerationEnabled": "Video generation",
+    "grokVideoGenerationEnabledDescription": "Allow this Grok OAuth Provider or Share to create and query video tasks."
   },
   "kimiOauth": {
     "description": "Manage Kimi Code subscription accounts",

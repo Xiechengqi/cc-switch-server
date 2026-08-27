@@ -49,6 +49,8 @@ AD3 已将本页矩阵固化为 `docs/provider/regression-matrix.json`。`script
 
 `staticCoverage` 只表示本地 contract 和 fixture 已覆盖；`adapterStatus: mixed` 仍会被计入 mixed/skeleton，直到真实 provider 和 Router Share/Gateway URL 都有 non-stream/stream 证据。
 
+Kiro text 的 2026-08-27 回归合同覆盖单一模型 resolver、绑定账号目录授权与 token limits、profile-aware 有界 discovery、request-scoped session/cache、严格工具桥与 EventStream、独立 keepalive 时钟、同账号 throttle/cooldown，以及不进入 token quota 的 supplemental credits。三个 text surface 均保持 `fixture_verified`/`live_pending`；Gemini 仍不开放，且不允许账号池、轮换、跨账号目录 union 或跨 Provider failover。
+
 | App 入口 | 路径 | 已有 native/static contract | 仍未真实关闭 |
 | --- | --- | --- | --- |
 | Claude | `/v1/messages` | Claude API/Auth/OAuth、Codex Responses、Gemini/Gemini CLI、OpenRouter、Antigravity/Agy、Ollama、Nvidia、DeepSeek API key；Kimi native Messages/count_tokens、权威目录、thinking replay 与同账号 401 已 fixture-verified；Qoder COSY 固定 site/signing、model/session/quota scope、SSE terminal 与同账号 pre-commit replay 已 fixture-verified；Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan 固定 route/model/quota contract 已覆盖；Kiro Claude→CodeWhisperer 与 GitHub Copilot Claude→Chat 均有 fixture-verified Native 合同；Cursor AgentService text/image/tool、精确 session/index scope、初始/恢复绝对业务输出 deadline、builtin 协议拒绝、同绑定 credential/catalog/401/429 已 fixture-verified | Kimi、Qoder 与 API-key coding plans 真实登录/订阅/inference/tool/quota 仍 pending；Cursor 仍为 Experimental/live-unverified；Bedrock 只有 SigV4/Converse request parts；DeepSeek account 仍需真实验收；Copilot github.com/GHES、Kiro 与 Cursor 真实账号验收仍 pending |

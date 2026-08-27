@@ -386,6 +386,10 @@ fn apply_stream_usage_fields(
         router_visible_changed |= log.total_tokens != Some(total_tokens);
         log.total_tokens = Some(total_tokens);
     }
+    if let Some(credit_usage) = usage.credit_usage {
+        router_visible_changed |= log.credit_usage != Some(credit_usage);
+        log.credit_usage = Some(credit_usage);
+    }
     let next_stream_status = stream_status
         .map(str::to_string)
         .or_else(|| log.stream_status.clone());
@@ -555,6 +559,7 @@ mod tests {
                         auto_consume_banked_reset: None,
                         banked_reset_expiry_lead_minutes: None,
                         previous_response_cache_enabled: None,
+                        grok_media_policy: None,
                         auto_start: None,
                         description: None,
                         enabled_apps: None,

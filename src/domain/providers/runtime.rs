@@ -1151,6 +1151,18 @@ fn runtime_driver_options(
                 .map(|value| json!(value)),
         ),
         (
+            "grokImageGenerationEnabled",
+            meta.grok_image_generation_enabled.map(|value| json!(value)),
+        ),
+        (
+            "grokImageEditEnabled",
+            meta.grok_image_edit_enabled.map(|value| json!(value)),
+        ),
+        (
+            "grokVideoGenerationEnabled",
+            meta.grok_video_generation_enabled.map(|value| json!(value)),
+        ),
+        (
             "codexWebsocketEnabled",
             meta.codex_websocket_enabled.map(|value| json!(value)),
         ),

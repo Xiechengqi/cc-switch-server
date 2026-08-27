@@ -12,14 +12,20 @@ const LEGACY_ENTERPRISE_PROFILE_ACCOUNT_ID: &str = "610548660232";
 const LEGACY_ENTERPRISE_PROFILE_ID: &str = "VNECVYCYYAWN";
 
 pub(crate) const STATIC_MODEL_IDS: &[&str] = &[
+    "claude-fable-5",
     "claude-haiku-4.5",
     "claude-opus-4.5",
     "claude-opus-4.6",
     "claude-opus-4.7",
     "claude-opus-4.8",
+    "claude-opus-5",
     "claude-sonnet-4.5",
     "claude-sonnet-4.6",
     "claude-sonnet-4.8",
+    "claude-sonnet-5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
 ];
 
 pub(crate) fn normalize_region(raw: &str) -> Option<String> {

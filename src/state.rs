@@ -1828,6 +1828,8 @@ const fn default_grok_video_plane() -> GrokVideoPlane {
 #[serde(rename_all = "camelCase")]
 pub struct GrokMediaTaskBinding {
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_request_id: Option<String>,
     pub provider_id: String,
     pub account_id: String,
     pub auth_identity_generation: u64,
@@ -1883,7 +1885,7 @@ impl GrokMediaTaskStore {
             .with_context(|| format!("parse Grok media task store {}", path.display()))?;
         if !matches!(
             store.schema_version,
-            1 | GROK_MEDIA_TASK_STORE_SCHEMA_VERSION
+            1 | 2 | GROK_MEDIA_TASK_STORE_SCHEMA_VERSION
         ) {
             anyhow::bail!(
                 "unsupported Grok media task store schema version {}",
@@ -1944,7 +1946,7 @@ impl PersistedStateSnapshot for GrokMediaTaskStore {
 }
 
 const GROK_MEDIA_TASK_STORE_FILE: &str = "grok-media-tasks.json";
-const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 2;
+const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 3;
 const GROK_MEDIA_TASK_MAX_BINDINGS: usize = 4_096;
 const GROK_MEDIA_TASK_MAX_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -7027,6 +7029,38 @@ impl ServerStateInner {
 
     pub(crate) async fn kiro_ide_version(&self) -> String {
         crate::clients::oauth::kiro_runtime::effective_ide_version(&self.http_client().await).await
+    }
+
+    pub(crate) async fn kiro_catalog_model(
+        &self,
+        account: &crate::domain::accounts::store::Account,
+        model_id: &str,
+        endpoint_override: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Option<(String, Option<u64>)> {
+        let catalog = crate::clients::oauth::kiro_runtime::model_catalog_with_timeout(
+            &self.http_client().await,
+            account,
+            endpoint_override,
+            timeout,
+        )
+        .await;
+        catalog
+            .descriptors
+            .iter()
+            .find(|model| model.model_id.eq_ignore_ascii_case(model_id))
+            .map(|model| (model.model_id.clone(), model.max_input_tokens))
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) async fn kiro_cached_catalog_model(
+        &self,
+        account: &crate::domain::accounts::store::Account,
+        model_id: &str,
+    ) -> Option<Option<(String, Option<u64>)>> {
+        crate::clients::oauth::kiro_runtime::cached_model_descriptor(account, model_id)
+            .await
+            .map(|model| model.map(|model| (model.model_id, model.max_input_tokens)))
     }
 
     pub fn emit_event(&self, event: ServerEvent) {
@@ -12633,6 +12667,7 @@ impl ServerStateInner {
     pub async fn remember_grok_media_task(
         &self,
         task_id: String,
+        creation_request_id: Option<String>,
         provider_id: String,
         account_id: String,
         auth_identity_generation: u64,
@@ -12644,6 +12679,7 @@ impl ServerStateInner {
         let _persistence = self.grok_media_task_persistence.lock().await;
         self.remember_grok_media_task_under_persistence(
             task_id,
+            creation_request_id,
             provider_id,
             account_id,
             auth_identity_generation,
@@ -12665,6 +12701,7 @@ impl ServerStateInner {
         account_id: String,
         auth_identity_generation: u64,
         task_id: String,
+        creation_request_id: Option<String>,
         share_id: String,
         user_identity: Option<&str>,
         ttl_ms: i64,
@@ -12704,6 +12741,7 @@ impl ServerStateInner {
         }
         self.remember_grok_media_task_under_persistence(
             task_id,
+            creation_request_id,
             provider_id,
             account_id,
             auth_identity_generation,
@@ -12720,6 +12758,7 @@ impl ServerStateInner {
     async fn remember_grok_media_task_under_persistence(
         &self,
         task_id: String,
+        creation_request_id: Option<String>,
         provider_id: String,
         account_id: String,
         auth_identity_generation: u64,
@@ -12736,6 +12775,7 @@ impl ServerStateInner {
         let expires_at_ms = now_ms.saturating_add(ttl_ms.clamp(1, GROK_MEDIA_TASK_MAX_TTL_MS));
         let binding = GrokMediaTaskBinding {
             task_id,
+            creation_request_id,
             provider_id,
             account_id,
             auth_identity_generation,
@@ -18689,6 +18729,9 @@ pub(crate) async fn share_request_log_entry(
     Some(ShareRequestLogEntry {
         export_sequence: log.router_export_sequence,
         request_id: log.request_id.clone(),
+        request_kind: log.request_kind.as_str().to_string(),
+        operation: log.operation.as_str().to_string(),
+        parent_request_id: log.parent_request_id.clone(),
         share_id,
         share_name,
         provider_id: log.provider_id.clone(),
@@ -18711,6 +18754,7 @@ pub(crate) async fn share_request_log_entry(
         usage_state: log.usage_state.as_str().to_string(),
         stream_status: log.stream_status.clone(),
         usage_revision: log.usage_revision,
+        error_message: log.error_message.clone(),
         status_code: log.status_code,
         latency_ms: clamp_u128_to_u64(log.duration_ms),
         first_token_ms: log.first_token_ms.map(clamp_u128_to_u64),
@@ -18724,6 +18768,11 @@ pub(crate) async fn share_request_log_entry(
         user_country: log.user_country.clone(),
         user_country_iso3: log.user_country_iso3.clone(),
         user_email: log.user_email.clone(),
+        media_task_id: log.media_task_id.clone(),
+        media_status: log.media_status.clone(),
+        video_duration_seconds: log.video_duration_seconds,
+        video_resolution: log.video_resolution.clone(),
+        video_aspect_ratio: log.video_aspect_ratio.clone(),
         created_at: (log.created_at_ms / 1000) as i64,
         is_health_check: log.is_health_check,
     })
@@ -19114,6 +19163,7 @@ mod tests {
             auto_consume_banked_reset: None,
             banked_reset_expiry_lead_minutes: None,
             previous_response_cache_enabled: None,
+            grok_media_policy: None,
             auto_start: None,
             description: None,
             enabled_apps: None,
@@ -20405,6 +20455,7 @@ mod tests {
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
                 previous_response_cache_enabled: None,
+                grok_media_policy: None,
                 auto_start: None,
                 description: None,
                 enabled_apps: None,
@@ -20434,6 +20485,7 @@ mod tests {
                 cache_read_tokens: Some(30),
                 cache_creation_tokens: Some(5),
                 total_tokens: Some(110),
+                credit_usage: None,
             },
         );
         log.first_token_ms = Some(42);
@@ -21109,6 +21161,7 @@ mod tests {
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
                 previous_response_cache_enabled: None,
+                grok_media_policy: None,
                 auto_start: None,
                 description: None,
                 enabled_apps: None,
@@ -27944,6 +27997,7 @@ mod tests {
         let user_namespace = grok_media_task_user_namespace(Some("owner@example.com"));
         let binding = GrokMediaTaskBinding {
             task_id: task_id.to_string(),
+            creation_request_id: None,
             provider_id: "grok-provider".to_string(),
             account_id: "grok-account".to_string(),
             auth_identity_generation: 1,
@@ -28076,6 +28130,7 @@ mod tests {
         let binding = state
             .remember_grok_media_task(
                 "video-1".to_string(),
+                Some("creation-request-1".to_string()),
                 "provider-a".to_string(),
                 "account-a".to_string(),
                 7,
@@ -28087,6 +28142,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(binding.task_id, "video-1");
+        assert_eq!(
+            binding.creation_request_id.as_deref(),
+            Some("creation-request-1")
+        );
         assert_eq!(binding.share_id, "share-a");
         let persisted = std::fs::read_to_string(grok_media_tasks_path(&config_dir)).unwrap();
         assert!(!persisted.contains("Owner@Example.com"));

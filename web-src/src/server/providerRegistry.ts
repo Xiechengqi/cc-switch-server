@@ -115,6 +115,9 @@ export type ProviderDriverOptionField =
   | "customUserAgent"
   | "codexFastMode"
   | "codexImageGenerationEnabled"
+  | "grokImageGenerationEnabled"
+  | "grokImageEditEnabled"
+  | "grokVideoGenerationEnabled"
   | "codexWebsocketEnabled"
   | "codexResponsesKeepaliveIntervalMs"
   | "codexRoutingHintEnabled";

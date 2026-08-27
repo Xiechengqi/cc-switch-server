@@ -3347,7 +3347,15 @@
     "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... 或只粘贴 code",
     "finishLogin": "完成登录",
     "loginRequired": "请先登录 Grok 账号",
-    "selectAccountRequired": "Grok OAuth 必须绑定一个 Grok 账号"
+    "selectAccountRequired": "Grok OAuth 必须绑定一个 Grok 账号",
+    "featureOptionsTitle": "Grok OAuth 媒体能力",
+    "shareMediaPolicy": "Share 媒体权限",
+    "grokImageGenerationEnabled": "图片生成",
+    "grokImageGenerationEnabledDescription": "允许该 Grok OAuth Provider 或 Share 生成图片。",
+    "grokImageEditEnabled": "图片编辑",
+    "grokImageEditEnabledDescription": "允许该 Grok OAuth Provider 或 Share 编辑图片。",
+    "grokVideoGenerationEnabled": "视频生成",
+    "grokVideoGenerationEnabledDescription": "允许该 Grok OAuth Provider 或 Share 创建并查询视频任务。"
   },
   "kimiOauth": {
     "description": "管理 Kimi Code 订阅账号",

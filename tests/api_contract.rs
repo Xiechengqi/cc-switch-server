@@ -7079,6 +7079,7 @@ async fn web_usage_requests_uses_stable_filters_and_cursor_pagination() {
                 cache_read_tokens: Some(3),
                 cache_creation_tokens: Some(2),
                 total_tokens: Some(23),
+                credit_usage: None,
             },
         );
         log.request_agent = Some("codex-cli".to_string());
@@ -7278,6 +7279,7 @@ async fn web_usage_rest_aggregates_bundles_surfaces_models_and_share_users() {
                 cache_read_tokens: Some(3),
                 cache_creation_tokens: Some(2),
                 total_tokens: Some(23),
+                credit_usage: None,
             },
         );
         log.bundle_id = "bundle-shared".to_string();
@@ -7571,7 +7573,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
-    assert_eq!(registry["registry"]["schemaVersion"], 7);
+    assert_eq!(registry["registry"]["schemaVersion"], 8);
     assert_eq!(
         registry["registry"]["optionSchemas"]
             .as_array()
@@ -13258,6 +13260,7 @@ async fn router_ingress_request(
         user_email: Some("owner@example.com".to_string()),
         user_role: share_id.is_none().then(|| "owner".to_string()),
         user_country: Some("JP".to_string()),
+        is_health_check: false,
         method,
         path_and_query,
         body_sha256: cc_switch_server::clients::router::ingress::body_sha256_hex(&body),
@@ -13305,6 +13308,7 @@ async fn client_router_ingress_request(request: Request<Body>, request_id: &str)
         user_email: Some("owner@example.com".to_string()),
         user_role: Some("owner".to_string()),
         user_country: Some("JP".to_string()),
+        is_health_check: false,
         method,
         path_and_query,
         body_sha256: cc_switch_server::clients::router::ingress::body_sha256_hex(&body),
@@ -13372,6 +13376,7 @@ fn share_router_request(
             user_email: Some("owner@example.com".to_string()),
             user_role: None,
             user_country: Some("JP".to_string()),
+            is_health_check: false,
             method: method.as_str().to_string(),
             path_and_query: uri.to_string(),
             body_sha256: cc_switch_server::clients::router::ingress::body_sha256_hex(&body),
@@ -13426,6 +13431,7 @@ fn test_share_input_for_app(
         auto_consume_banked_reset: None,
         banked_reset_expiry_lead_minutes: None,
         previous_response_cache_enabled: None,
+        grok_media_policy: None,
         enabled_apps: None,
         bindings: Vec::new(),
         runtime_snapshot: None,
@@ -13653,6 +13659,7 @@ fn share_user_quota_log(share_id: &str, user_email: &str, tokens: u64) -> UsageL
             cache_read_tokens: Some(0),
             cache_creation_tokens: Some(0),
             total_tokens: Some(tokens),
+            credit_usage: None,
         },
     );
     log.record_kind = UsageRecordKind::UserInference;

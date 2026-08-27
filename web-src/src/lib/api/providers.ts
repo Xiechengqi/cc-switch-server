@@ -1,4 +1,4 @@
-import { invokeCommand } from "@/lib/runtime";
+import { invokeCommand, jsonFetch } from "@/lib/runtime";
 import type { Provider } from "@/types";
 import type { CoreProviderApp } from "@/server/providerRegistry";
 import type { AppId } from "./types";
@@ -6,6 +6,16 @@ import type { AppId } from "./types";
 export interface ProviderSortUpdate {
   id: string;
   sortIndex: number;
+}
+
+export interface ProviderInferenceTestResponse {
+  ok: boolean;
+  operation: "image_generation" | "image_edit" | "video_generation";
+  statusCode: number;
+  latencyMs: number;
+  contentType?: string;
+  bodyText: string;
+  bodyTruncated: boolean;
 }
 
 export type ProviderUpstreamProtocol =
@@ -297,6 +307,9 @@ export interface ProviderBundleSurfaceWriteDraft {
     customUserAgent?: string;
     codexFastMode?: boolean;
     codexImageGenerationEnabled?: boolean;
+    grokImageGenerationEnabled?: boolean;
+    grokImageEditEnabled?: boolean;
+    grokVideoGenerationEnabled?: boolean;
     codexWebsocketEnabled?: boolean;
     codexResponsesKeepaliveIntervalMs?: number;
     codexRoutingHintEnabled?: boolean;
@@ -414,6 +427,16 @@ export interface ClaudeDesktopDefaultRoute {
 }
 
 export const providersApi = {
+  async testGrokMedia(
+    providerId: string,
+    operation: ProviderInferenceTestResponse["operation"],
+  ): Promise<ProviderInferenceTestResponse> {
+    return jsonFetch(`/api/providers/${encodeURIComponent(providerId)}/inference-test`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation }),
+    });
+  },
   async getRequestDefaults(): Promise<ProviderRequestDefaults> {
     return await invokeCommand("get_provider_request_defaults");
   },

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::coding_plan::CodingPlanProfileSpec;
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 7;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 8;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,6 +107,9 @@ pub enum DriverOptionField {
     CustomUserAgent,
     CodexFastMode,
     CodexImageGenerationEnabled,
+    GrokImageGenerationEnabled,
+    GrokImageEditEnabled,
+    GrokVideoGenerationEnabled,
     CodexResponsesKeepaliveIntervalMs,
     CodexRoutingHintEnabled,
     CodexWebsocketEnabled,
@@ -119,6 +122,9 @@ impl DriverOptionField {
             Self::CustomUserAgent => "customUserAgent",
             Self::CodexFastMode => "codexFastMode",
             Self::CodexImageGenerationEnabled => "codexImageGenerationEnabled",
+            Self::GrokImageGenerationEnabled => "grokImageGenerationEnabled",
+            Self::GrokImageEditEnabled => "grokImageEditEnabled",
+            Self::GrokVideoGenerationEnabled => "grokVideoGenerationEnabled",
             Self::CodexResponsesKeepaliveIntervalMs => "codexResponsesKeepaliveIntervalMs",
             Self::CodexRoutingHintEnabled => "codexRoutingHintEnabled",
             Self::CodexWebsocketEnabled => "codexWebsocketEnabled",

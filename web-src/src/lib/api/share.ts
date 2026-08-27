@@ -153,7 +153,14 @@ export interface ShareRecord {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
+  grokMediaPolicy?: GrokMediaPolicy;
   userGrants: ShareUserGrantMap;
+}
+
+export interface GrokMediaPolicy {
+  imageGenerationEnabled: boolean;
+  imageEditEnabled: boolean;
+  videoGenerationEnabled: boolean;
 }
 
 export interface CreateShareParams {
@@ -170,6 +177,7 @@ export interface CreateShareParams {
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
   previousResponseCacheEnabled?: boolean;
+  grokMediaPolicy?: GrokMediaPolicy;
   userGrants?: ShareUserGrantMap;
 }
 
@@ -242,6 +250,7 @@ export interface SaveProviderShareParams {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
+  grokMediaPolicy?: GrokMediaPolicy;
   userGrants: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
   shareUsageEdit?: ShareTotalUsageEdit;
@@ -263,6 +272,7 @@ export interface SaveProviderBundleShareParams {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
+  grokMediaPolicy: GrokMediaPolicy;
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
   shareUsageEdit?: ShareTotalUsageEdit;

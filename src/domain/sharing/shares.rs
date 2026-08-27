@@ -14,10 +14,10 @@ use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::store::ProviderStore;
 use crate::domain::router::{ClientSubdomain, ShareSlug};
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareAnchoredUsageBucket, ShareGrantManager,
-    ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch, ShareTokenPeriod,
-    ShareTotalUsageEdit, ShareUserGrant, ShareUserPolicy, ShareUserQuotaView, ShareUserUsage,
-    ShareUserUsageBucket, ShareUserUsageEdit, ShareUserUsageEditAction,
+    descriptor_for_share_with_accounts_and_usage, GrokMediaPolicy, ShareAnchoredUsageBucket,
+    ShareGrantManager, ShareManagedGrantAction, ShareManagedGrantOperation, ShareSettingsPatch,
+    ShareTokenPeriod, ShareTotalUsageEdit, ShareUserGrant, ShareUserPolicy, ShareUserQuotaView,
+    ShareUserUsage, ShareUserUsageBucket, ShareUserUsageEdit, ShareUserUsageEditAction,
 };
 use crate::domain::sharing::token_period::{token_period_window, validate_user_policy};
 use crate::domain::usage::store::UsageStore;
@@ -540,6 +540,8 @@ pub struct SharePolicy {
     pub banked_reset_expiry_lead_minutes: u32,
     #[serde(default)]
     pub previous_response_cache_enabled: bool,
+    #[serde(default)]
+    pub grok_media_policy: GrokMediaPolicy,
 }
 
 impl Default for SharePolicy {
@@ -553,6 +555,7 @@ impl Default for SharePolicy {
             auto_consume_banked_reset: false,
             banked_reset_expiry_lead_minutes: DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: true,
+            grok_media_policy: GrokMediaPolicy::default(),
         }
     }
 }
@@ -795,6 +798,8 @@ pub struct UpsertShareInput {
     #[serde(default)]
     pub previous_response_cache_enabled: Option<bool>,
     #[serde(default)]
+    pub grok_media_policy: Option<GrokMediaPolicy>,
+    #[serde(default)]
     pub auto_start: Option<bool>,
     #[serde(default)]
     pub description: Option<String>,
@@ -1013,6 +1018,9 @@ impl ShareStore {
                 previous_response_cache_enabled: input
                     .previous_response_cache_enabled
                     .unwrap_or(existing_policy.previous_response_cache_enabled),
+                grok_media_policy: input
+                    .grok_media_policy
+                    .unwrap_or(existing_policy.grok_media_policy),
             },
             tokens_used,
             requests_count,
@@ -2246,6 +2254,9 @@ impl ShareStore {
         }
         if let Some(enabled) = patch.previous_response_cache_enabled {
             share.previous_response_cache_enabled = enabled;
+        }
+        if let Some(policy) = patch.grok_media_policy {
+            share.grok_media_policy = policy;
         }
         let explicit_user_grants = patch.user_grants;
         if let Some(user_grants) = explicit_user_grants.as_ref() {
@@ -4694,6 +4705,7 @@ mod tests {
             auto_consume_banked_reset: None,
             banked_reset_expiry_lead_minutes: None,
             previous_response_cache_enabled: None,
+            grok_media_policy: None,
             auto_start: None,
             description: None,
             enabled_apps: None,
@@ -5962,6 +5974,7 @@ mod tests {
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
                 previous_response_cache_enabled: None,
+                grok_media_policy: None,
                 auto_start: Some(true),
                 description: Some("test".to_string()),
                 enabled_apps: None,
@@ -6268,6 +6281,7 @@ mod tests {
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
                 previous_response_cache_enabled: None,
+                grok_media_policy: None,
                 auto_start: None,
                 description: None,
                 enabled_apps: None,
@@ -6306,6 +6320,7 @@ mod tests {
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
                 previous_response_cache_enabled: None,
+                grok_media_policy: None,
                 auto_start: None,
                 description: None,
                 enabled_apps: None,
@@ -6516,6 +6531,7 @@ mod tests {
                 auto_consume_banked_reset: None,
                 banked_reset_expiry_lead_minutes: None,
                 previous_response_cache_enabled: None,
+                grok_media_policy: None,
                 auto_start: None,
                 description: None,
                 enabled_apps: None,

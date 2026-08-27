@@ -28,6 +28,23 @@
     ],
     "transientPrecommitRetry": "disabled_pending_separate_live_idempotency_evidence"
   },
+  "kiroTextImplementation": {
+    "scope": "single explicitly bound subscription account per Provider; no pool, rotation, cross-account union, or cross-Provider failover",
+    "contractState": "fixture_verified_live_pending",
+    "surfaces": ["claude_messages", "codex_responses", "codex_chat_completions"],
+    "implementedContracts": [
+      "single_model_resolver_and_catalog_authorization",
+      "profile_aware_bounded_model_discovery",
+      "dynamic_context_window_usage",
+      "request_scoped_session_and_cache_identity",
+      "strict_tool_bridge_and_eventstream",
+      "downstream_keepalive_independent_of_upstream_deadlines",
+      "same_account_quota_throttle_cooldown",
+      "supplemental_credit_metering"
+    ],
+    "geminiSurface": "unsupported",
+    "realAccountAcceptance": "live_pending"
+  },
   "requiredFixtureFields": [
     "non_stream",
     "stream",

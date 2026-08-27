@@ -102,17 +102,23 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 
 ## 媒体能力
 
-图片生成、图片编辑和视频生成分别对应 `image_generation`、`image_edit`、`video_generation` capability。默认都不开放：
+图片生成、图片编辑和视频生成分别对应 `image_generation`、`image_edit`、`video_generation` capability。三个入口各自执行三层 fail-closed 门禁，顺序固定为：
 
-1. 运维可通过 `CC_SWITCH_GROK_OAUTH_CAPABILITIES` 显式启用一个待验证能力。
-2. 成功的真实上游响应会把 `supported` evidence 持久化到绑定账号。
-3. 后续可移除显式开关，由持久化 evidence 继续开放能力。
+1. Grok Provider Bundle 的 `grokImageGenerationEnabled`、`grokImageEditEnabled`、`grokVideoGenerationEnabled` 必须分别开启；旧配置和缺字段配置均按关闭处理。
+2. Share 的 `grokMediaPolicy.imageGenerationEnabled`、`imageEditEnabled`、`videoGenerationEnabled` 必须分别授权；Share Contract v5 缺字段时同样默认关闭。
+3. 当前绑定账号必须具有对应 capability evidence；`CC_SWITCH_GROK_OAUTH_CAPABILITIES` 只可 bootstrap 待验证 evidence，不能绕过 Provider 或 Share 策略。
 
-媒体首次 401 同样只允许原账号强刷一次。视频创建成功后，request id 的 durable binding 写入 `grok-media-tasks.json`，固定 Provider、账号、`authIdentityGeneration`、Share、runtime、用户命名空间、TTL 和 `upstreamPlane`；它不是账号调度机制。schema v1 的历史任务只有一个 direct-XAI endpoint，因此精确迁移为 `xai` plane；未知 schema/plane fail closed。状态查询只读取创建时的 binding，Provider 重绑、身份代际、runtime 或 plane 变化均返回 `409`，重启后不会丢失有效绑定。
+Provider 管理页可对已经开启的单项能力发起真实媒体测试；测试使用 `POST /api/providers/:id/inference-test`、当前 Provider 唯一绑定账号和隔离的 `test-share:<provider-id>` scope，尊重 Provider 开关但不伪造 Share 授权。Router Share 连接测试支持 `text`、`image_generation`、`image_edit`、`video_generation`；媒体测试只允许 Codex binding，并同时尊重 Share 和 Server 的 Provider 门禁。两种测试都使用固定安全 payload，不选择其他账号或 Provider。
+
+成功的真实上游响应会把 `supported` evidence 持久化到绑定账号。媒体策略检查发生在 credential refresh 和上游访问之前，关闭时分别返回 `403 grok_media_disabled_by_provider` 或 `403 grok_media_disabled_by_share`，不会消耗上游请求。
+
+媒体首次 401 同样只允许原账号强刷一次。视频创建成功后，request id 的 durable binding 写入 `grok-media-tasks.json`，固定创建请求 id、Provider、账号、`authIdentityGeneration`、Share、runtime、用户命名空间、TTL 和 `upstreamPlane`；它不是账号调度机制。schema v1/v2 兼容迁移到当前 schema v3，历史任务缺少创建请求 id 时保持 `None`；历史任务只有一个 direct-XAI endpoint，因此精确迁移为 `xai` plane。未知 schema/plane fail closed。状态查询只读取创建时的 binding，Provider 重绑、身份代际、runtime 或 plane 变化均返回 `409`，重启后不会丢失有效绑定；新任务的状态记录通过 `parentRequestId` 关联创建记录。
 
 媒体请求复用文本/WS 的 CLI identity family；客户端显式提供的 `x-grok-conv-id` 在 Share/user 边界内做同样的命名空间隔离。媒体 POST 的 wire body 和逐层 gzip/deflate 解码结果都使用 32 MiB 硬上限，避免 Axum 默认 2 MiB 误拒合法图片，同时阻止压缩膨胀绕过内存边界。媒体上游 wire response 和逐层解压结果使用 64 MiB 硬上限，避免 base64 图片响应形成无界内存读取。视频状态 request id 只接受 1-128 字节 ASCII 字母、数字、`-` 和 `_`，禁止把路径、query 或 fragment 注入固定上游 URL。
 
 Grok 图片是 direct-XAI 实验能力，不代表 Build OAuth 官方保证。图片 multipart edit 最多接受 3 张图，每张都复用统一 image primitive 校验非空、大小、允许 MIME 和 magic bytes；声明 MIME 不匹配、未知签名、超数量以及未经验证的 `mask`/`quality`/`size`/`style` 均在出站前返回 4xx，不再静默丢弃。图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers 后，SSE 立即提交 `: connected` 并按完整事件边界转发，JSON 先提交合法空白、完整缓冲并校验一个 JSON 文档；两种模式空闲时都每 15 秒发送心跳，且逐块执行 64 MiB 上限。首个 comment/空白提交后 wire status 固定为 `200`，后续读失败、超限或 JSON 无效只能返回流内 error，不能透明换 Provider 或替换 HTTP 状态；Provider/Share 终态记账仍使用实际结果，客户端必须消费完整 Body。
+
+媒体请求进入与文本相同的 Usage/Router request-log 管道，但 `requestKind=image|video`、`operation` 和媒体元数据独立记录，`usageState=not_applicable`，不会伪造 token，也不会把无 token 标为 `missing` 或 `transform_error`。图片/视频记录可携带 task/status、视频 duration/resolution/aspect ratio 和有界错误信息；不保存 prompt、原始图片字节、Authorization、token 或上游私有 URL。Router 侧 Text/Image/Video 三个 Tab 读取同一 request-log 接口；Image Tab 仅按相同 canonical request id 关联 Router 已有的受控预览结果。
 
 视频创建在出站前执行本地 DTO 校验：模型、prompt、1..15 秒 duration、aspect ratio、720p/1080p、reference 数量/互斥和 reference 最高 720p 均有稳定 4xx；`video`、`output`、`storage_options` 在透明代理模式明确拒绝。本版本维持 direct-XAI `Xai` plane，不启用无真实 entitlement/evidence 支持的 Build→XAI fallback。阶段 5 本地 worker、upload callback 和媒体归档评审结论为 **no-go**：透明代理无需持有本地媒体任务或资产，后续只有上游强制 upload callback 或产品明确要求归档时才独立立项。
 

@@ -1,7 +1,7 @@
 {
   "format": "cc-switch-kiro-wire-protocol",
-  "schemaVersion": 1,
-  "capturedAt": "2026-08-10T00:00:00Z",
+  "schemaVersion": 2,
+  "capturedAt": "2026-08-27T00:00:00Z",
   "provenance": {
     "kind": "sanitized_protocol_comparison",
     "reference": "kiro.rs external protocol implementation",
@@ -40,7 +40,10 @@
     },
     "models": {
       "method": "GET",
-      "url": "https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+      "url": "https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR",
+      "profileArnQuery": "percent_encoded_when_runtime_identity_has_authoritative_profile",
+      "apiKeyProfileArnQuery": false,
+      "productionRegions": ["us-east-1", "eu-central-1"]
     }
   },
   "downstreamSurfaces": {
@@ -134,6 +137,15 @@
     "duplicatePolicy": "keep_newest"
   },
   "modelDiscovery": {
+    "descriptorFields": [
+      "modelId",
+      "modelName",
+      "description",
+      "tokenLimits.maxInputTokens",
+      "tokenLimits.maxOutputTokens"
+    ],
+    "profileAttemptPolicy": "authoritative_profile_then_profileless_only_after_403",
+    "regionAttemptPolicy": "bounded_us_eu_auth_region_order",
     "cacheScope": [
       "account_id",
       "auth_identity_generation",
@@ -168,11 +180,81 @@
     },
     "successfulEmptyCatalogPolicy": "authoritative_empty"
   },
+  "modelCapabilities": {
+    "singleResolver": true,
+    "staticAuthorization": "exact_audited_model_id_after_alias_normalization",
+    "catalogAuthorizedFutureModelPassThrough": true,
+    "arbitraryUnknownModelPassThrough": false,
+    "catalogModelIdPolicy": "preserve_authoritative_descriptor_id_verbatim",
+    "unknownReasoningCapabilityPolicy": "omit_unproven_reasoning_fields",
+    "contextWindowPrecedence": [
+      "catalog_token_limits_max_input_tokens",
+      "audited_static_capability",
+      "conservative_200k_default"
+    ],
+    "staticContextWindows": {
+      "gptFamily": 272000,
+      "largeClaudeFamily": 1000000,
+      "default": 200000
+    },
+    "reasoningShapes": {
+      "gpt-5.6-sol": "reasoning.effort",
+      "gpt-5.6-terra": "reasoning.effort",
+      "gpt-5.6-luna": "reasoning.effort",
+      "supportedClaude": "output_config.effort"
+    }
+  },
   "promptCache": {
     "namespaceComponents": ["provider_id", "account_id", "auth_identity_generation", "route", "session"],
     "capacity": 4096,
     "defaultTtlSeconds": 300,
-    "maxTtlSeconds": 3600
+    "maxTtlSeconds": 3600,
+    "sessionPrecedence": {
+      "claude": [
+        "x-cc-switch-session-id",
+        "x-claude-code-session-id",
+        "metadata.user_id.json.session_id",
+        "metadata.user_id.legacy_session",
+        "metadata.session_id"
+      ],
+      "codex": [
+        "x-cc-switch-session-id",
+        "prompt_cache_key",
+        "x-session-affinity",
+        "x-client-request-id",
+        "session_fields"
+      ]
+    },
+    "missingSessionPolicy": "request_scoped_anonymous"
+  },
+  "downstreamKeepalive": {
+    "defaultIntervalMs": 25000,
+    "claudeMessages": "anthropic_ping_event",
+    "codexChatAndResponses": "sse_comment",
+    "armedAfterDownstreamCommit": true,
+    "satisfiesFirstFrameDeadline": false,
+    "resetsUpstreamIdleDeadline": false,
+    "countsAsFirstToken": false,
+    "continuesAfterTerminal": false
+  },
+  "throttleClassification": {
+    "scope": "same_bound_account_only",
+    "classes": [
+      "monthly_quota_exhausted",
+      "overage_limit_exceeded",
+      "suspicious_activity_temporary_limit",
+      "ordinary_overload"
+    ],
+    "crossAccountRecovery": false,
+    "retryAfterPrecedence": true
+  },
+  "providerMetering": {
+    "tokenUsageIndependent": true,
+    "fields": ["credit_usage", "credit_unit", "credit_unit_plural"],
+    "multipleEventSemantics": "usage_increment_sum_latest_unit",
+    "explicitZeroPreserved": true,
+    "invalidAmountPolicy": "omit_negative_non_finite_or_total_above_1000000000",
+    "liveVerification": "pending"
   },
   "errorCodes": {
     "invalidEventStream": "KIRO_EVENT_STREAM_INVALID",

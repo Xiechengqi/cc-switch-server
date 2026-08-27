@@ -776,6 +776,7 @@ mod tests {
             auto_consume_banked_reset: None,
             banked_reset_expiry_lead_minutes: None,
             previous_response_cache_enabled: None,
+            grok_media_policy: None,
             auto_start: None,
             description: None,
             enabled_apps: None,

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::cursor_client_contract::DEFAULT_API_KEY_EXCHANGE_URL;
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::model::ProviderType;
 use crate::domain::providers::runtime::{
@@ -4518,7 +4519,7 @@ fn cursor_api_key_exchange_url(stored: &StoredProvider) -> Result<String, ProxyE
         &["CURSOR_APIKEY_EXCHANGE_ENDPOINT"],
         &["CC_SWITCH_CURSOR_APIKEY_EXCHANGE_ENDPOINT"],
         "Cursor API key exchange endpoint",
-        "https://api2.cursor.sh/auth/exchange_user_api_key",
+        DEFAULT_API_KEY_EXCHANGE_URL,
     )
 }
 

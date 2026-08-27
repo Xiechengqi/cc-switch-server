@@ -3272,7 +3272,15 @@
     "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... またはコードのみ貼り付け",
     "finishLogin": "ログインを完了",
     "loginRequired": "先に Grok アカウントへログインしてください",
-    "selectAccountRequired": "Grok OAuth を Grok アカウントに関連付けてください"
+    "selectAccountRequired": "Grok OAuth を Grok アカウントに関連付けてください",
+    "featureOptionsTitle": "Grok OAuth メディア機能",
+    "shareMediaPolicy": "Share メディア権限",
+    "grokImageGenerationEnabled": "画像生成",
+    "grokImageGenerationEnabledDescription": "この Grok OAuth Provider または Share に画像生成を許可します。",
+    "grokImageEditEnabled": "画像編集",
+    "grokImageEditEnabledDescription": "この Grok OAuth Provider または Share に画像編集を許可します。",
+    "grokVideoGenerationEnabled": "動画生成",
+    "grokVideoGenerationEnabledDescription": "この Grok OAuth Provider または Share に動画タスクの作成と照会を許可します。"
   },
   "kimiOauth": {
     "description": "Kimi Code サブスクリプションアカウントを管理",

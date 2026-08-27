@@ -160,6 +160,9 @@ impl MetricsAccumulator {
                     self.metrics.interrupted_usage_count.saturating_add(1);
                 self.usage_terminal_count = self.usage_terminal_count.saturating_add(1);
             }
+            UsageState::NotApplicable => {
+                self.usage_terminal_count = self.usage_terminal_count.saturating_add(1);
+            }
             UsageState::Pending => {}
         }
         if log.completed_at_ms > 0 && log.outcome != UsageOutcome::Pending {

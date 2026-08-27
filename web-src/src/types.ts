@@ -163,6 +163,10 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
   // Codex OAuth image generation via ChatGPT Codex backend
   codexImageGenerationEnabled?: boolean;
+  // Grok OAuth media policy. Each operation is independently opt-in.
+  grokImageGenerationEnabled?: boolean;
+  grokImageEditEnabled?: boolean;
+  grokVideoGenerationEnabled?: boolean;
   // Strip image_generation tools from Codex Responses requests.
   codexImageToolStripPolicy?: "never" | "on-error" | "always";
   // Per-provider incident rollback for the Codex Responses WebSocket path

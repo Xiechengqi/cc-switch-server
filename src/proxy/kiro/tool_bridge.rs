@@ -13,15 +13,15 @@ pub(super) fn builtin_name(client_name: &str, mode: ToolCompatibilityMode) -> Op
     if mode != ToolCompatibilityMode::ClaudeCode {
         return None;
     }
-    match client_name {
-        "Write" => Some("fs_write"),
-        "Edit" => Some("str_replace"),
-        "Bash" => Some("execute_bash"),
-        "Read" => Some("read_file"),
-        "Glob" => Some("file_search"),
-        "Grep" => Some("grep_search"),
-        "LS" => Some("list_directory"),
-        "WebSearch" => Some("web_search"),
+    match client_name.to_ascii_lowercase().as_str() {
+        "write" => Some("fs_write"),
+        "edit" => Some("str_replace"),
+        "bash" => Some("execute_bash"),
+        "read" => Some("read_file"),
+        "glob" => Some("file_search"),
+        "grep" => Some("grep_search"),
+        "ls" => Some("list_directory"),
+        "websearch" => Some("web_search"),
         _ => None,
     }
 }
@@ -119,8 +119,12 @@ fn outbound_key<'a>(kiro_name: &str, key: &'a str) -> Option<&'a str> {
         ("str_replace", "new_string") => Some("newStr"),
         ("read_file", "file_path") => Some("path"),
         ("file_search", "pattern") => Some("query"),
+        ("file_search", "exclude") => Some("excludePattern"),
+        ("file_search", "include_ignored") => Some("includeIgnoredFiles"),
         ("grep_search", "pattern") => Some("query"),
         ("grep_search", "glob") => Some("includePattern"),
+        ("grep_search", "exclude") => Some("excludePattern"),
+        ("grep_search", "case_sensitive") => Some("caseSensitive"),
         ("list_directory", "path") => Some("path"),
         _ => None,
     }
@@ -135,8 +139,12 @@ fn inbound_key<'a>(kiro_name: &str, key: &'a str) -> Option<&'a str> {
         ("str_replace", "newStr") => Some("new_string"),
         ("read_file", "path") => Some("file_path"),
         ("file_search", "query") => Some("pattern"),
+        ("file_search", "excludePattern") => Some("exclude"),
+        ("file_search", "includeIgnoredFiles") => Some("include_ignored"),
         ("grep_search", "query") => Some("pattern"),
         ("grep_search", "includePattern") => Some("glob"),
+        ("grep_search", "excludePattern") => Some("exclude"),
+        ("grep_search", "caseSensitive") => Some("case_sensitive"),
         _ => None,
     }
 }
@@ -205,5 +213,84 @@ mod tests {
         let mut map = HashMap::new();
         assert!(map_name("Read", ToolCompatibilityMode::Raw, &mut map).is_none());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn claude_code_builtin_names_and_inputs_round_trip() {
+        let fixtures = [
+            (
+                "Write",
+                "fs_write",
+                json!({"file_path":"a.txt","content":"hello"}),
+            ),
+            (
+                "Edit",
+                "str_replace",
+                json!({"file_path":"a.txt","old_string":"a","new_string":"b"}),
+            ),
+            ("Bash", "execute_bash", json!({"command":"pwd"})),
+            (
+                "Glob",
+                "file_search",
+                json!({"pattern":"**/*.rs","exclude":"target/**","include_ignored":true}),
+            ),
+            (
+                "Grep",
+                "grep_search",
+                json!({"pattern":"needle","glob":"*.rs","exclude":"vendor/**","case_sensitive":true}),
+            ),
+            ("LS", "list_directory", json!({"path":"src"})),
+            ("WebSearch", "web_search", json!({"query":"Kiro API"})),
+        ];
+
+        for (client_name, kiro_name, input) in fixtures {
+            assert_eq!(
+                builtin_name(
+                    &client_name.to_ascii_lowercase(),
+                    ToolCompatibilityMode::ClaudeCode
+                ),
+                Some(kiro_name)
+            );
+            let outbound = input_to_kiro(client_name, input.clone());
+            let inbound = input_from_kiro(kiro_name, outbound);
+            assert_eq!(inbound, input, "{client_name}");
+        }
+    }
+
+    #[test]
+    fn glob_and_grep_schema_keys_round_trip() {
+        for (client_name, kiro_name, schema) in [
+            (
+                "Glob",
+                "file_search",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "pattern":{"type":"string"},
+                        "exclude":{"type":"string"},
+                        "include_ignored":{"type":"boolean"}
+                    },
+                    "required":["pattern"]
+                }),
+            ),
+            (
+                "Grep",
+                "grep_search",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "pattern":{"type":"string"},
+                        "glob":{"type":"string"},
+                        "exclude":{"type":"string"},
+                        "case_sensitive":{"type":"boolean"}
+                    },
+                    "required":["pattern"]
+                }),
+            ),
+        ] {
+            let outbound = schema_to_kiro(client_name, schema.clone());
+            let inbound = rewrite_schema_keys(outbound, |key| inbound_key(kiro_name, key));
+            assert_eq!(inbound, schema, "{client_name}");
+        }
     }
 }

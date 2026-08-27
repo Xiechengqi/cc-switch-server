@@ -36,6 +36,58 @@ pub enum UsageRecordKind {
     HealthProbe,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    #[default]
+    Text,
+    Image,
+    Video,
+}
+
+impl RequestKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceOperation {
+    #[default]
+    Unknown,
+    Responses,
+    ResponsesCompact,
+    ChatCompletions,
+    Messages,
+    GeminiGenerateContent,
+    ImageGeneration,
+    ImageEdit,
+    VideoGeneration,
+    VideoStatus,
+}
+
+impl InferenceOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Responses => "responses",
+            Self::ResponsesCompact => "responses_compact",
+            Self::ChatCompletions => "chat_completions",
+            Self::Messages => "messages",
+            Self::GeminiGenerateContent => "gemini_generate_content",
+            Self::ImageGeneration => "image_generation",
+            Self::ImageEdit => "image_edit",
+            Self::VideoGeneration => "video_generation",
+            Self::VideoStatus => "video_status",
+        }
+    }
+}
+
 impl UsageRecordKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -189,6 +241,10 @@ pub struct UsageProviderHealthResult {
 pub struct UsageLog {
     pub request_id: String,
     pub record_kind: UsageRecordKind,
+    #[serde(default)]
+    pub request_kind: RequestKind,
+    #[serde(default)]
+    pub operation: InferenceOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_request_id: Option<String>,
     pub app: AppKind,
@@ -255,6 +311,8 @@ pub struct UsageLog {
     pub cache_creation_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_usage: Option<f64>,
     #[serde(default)]
     pub image_count: Option<u32>,
     #[serde(default)]
@@ -267,6 +325,16 @@ pub struct UsageLog {
     pub image_height: Option<u32>,
     #[serde(default)]
     pub image_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_duration_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_aspect_ratio: Option<String>,
     #[serde(default)]
     pub share_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,6 +418,8 @@ impl UsageLog {
 pub struct UsageLogContext {
     pub request_id: Option<String>,
     pub record_kind: UsageRecordKind,
+    pub request_kind: RequestKind,
+    pub operation: InferenceOperation,
     pub parent_request_id: Option<String>,
     pub share_id: Option<String>,
     pub share_name: Option<String>,
@@ -366,6 +436,11 @@ pub struct UsageLogContext {
     pub usage_estimated: bool,
     pub error_message: Option<String>,
     pub image: Option<ImageUsageMetadata>,
+    pub media_task_id: Option<String>,
+    pub media_status: Option<String>,
+    pub video_duration_seconds: Option<u32>,
+    pub video_resolution: Option<String>,
+    pub video_aspect_ratio: Option<String>,
     pub requested_reasoning_effort: Option<String>,
     pub effective_reasoning_effort: Option<String>,
     pub client_service_tier: Option<String>,
@@ -399,6 +474,7 @@ pub enum UsageState {
     Missing,
     ParseError,
     Interrupted,
+    NotApplicable,
 }
 
 impl UsageState {
@@ -409,6 +485,7 @@ impl UsageState {
             Self::Missing => "missing",
             Self::ParseError => "parse_error",
             Self::Interrupted => "interrupted",
+            Self::NotApplicable => "not_applicable",
         }
     }
 }
@@ -808,6 +885,8 @@ impl UsageLog {
         Self {
             request_id: generate_request_id(),
             record_kind: UsageRecordKind::UserInference,
+            request_kind: RequestKind::Text,
+            operation: InferenceOperation::Unknown,
             parent_request_id: None,
             app,
             bundle_id: provider_id.clone(),
@@ -848,12 +927,18 @@ impl UsageLog {
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             total_tokens: usage.total_tokens,
+            credit_usage: usage.credit_usage,
             image_count: None,
             image_bytes: None,
             image_format: None,
             image_width: None,
             image_height: None,
             image_size: None,
+            media_task_id: None,
+            media_status: None,
+            video_duration_seconds: None,
+            video_resolution: None,
+            video_aspect_ratio: None,
             share_id: None,
             share_slug: None,
             user_email: None,
@@ -897,6 +982,8 @@ impl UsageLog {
             context.record_kind
         };
         self.parent_request_id = context.parent_request_id;
+        self.request_kind = context.request_kind;
+        self.operation = context.operation;
         self.share_id = context.share_id;
         self.share_name = context.share_name;
         self.share_slug = context.share_slug;
@@ -958,6 +1045,11 @@ impl UsageLog {
             self.image_height = image.height;
             self.image_size = image.size;
         }
+        self.media_task_id = context.media_task_id;
+        self.media_status = context.media_status;
+        self.video_duration_seconds = context.video_duration_seconds;
+        self.video_resolution = context.video_resolution;
+        self.video_aspect_ratio = context.video_aspect_ratio;
     }
 }
 
@@ -1066,6 +1158,7 @@ pub struct TokenUsage {
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub credit_usage: Option<f64>,
 }
 
 impl TokenUsage {
@@ -1076,6 +1169,7 @@ impl TokenUsage {
             || self.cache_read_tokens.is_some()
             || self.cache_creation_tokens.is_some()
             || self.total_tokens.is_some()
+            || self.credit_usage.is_some()
     }
 }
 
@@ -1227,6 +1321,11 @@ pub fn usage_from_json_with_semantics(
                 None
             }
         });
+    let credit_usage = usage
+        .get("credit_usage")
+        .or_else(|| usage.get("creditUsage"))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=1_000_000_000.0).contains(value));
 
     TokenUsage {
         input_tokens,
@@ -1235,6 +1334,7 @@ pub fn usage_from_json_with_semantics(
         cache_read_tokens,
         cache_creation_tokens,
         total_tokens,
+        credit_usage,
     }
 }
 
@@ -1766,6 +1866,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_credit_usage_is_supplemental_and_preserves_explicit_zero() {
+        let metered = usage_from_json(&json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "credit_usage": 0.75
+            }
+        }));
+        assert_eq!(metered.credit_usage, Some(0.75));
+        assert_eq!(metered.total_tokens, Some(12));
+
+        let zero = usage_from_json(&json!({"usage":{"credit_usage":0.0}}));
+        assert_eq!(zero.credit_usage, Some(0.0));
+        assert_eq!(zero.total_tokens, None);
+
+        let invalid = usage_from_json(&json!({"usage":{"credit_usage":1_000_000_001.0}}));
+        assert_eq!(invalid.credit_usage, None);
+    }
+
+    #[test]
     fn parses_nested_cache_write_and_preserves_explicit_zero() {
         let written = usage_from_json_with_semantics(
             &json!({
@@ -2274,6 +2394,7 @@ mod tests {
                 cache_read_tokens: Some(0),
                 cache_creation_tokens: Some(0),
                 total_tokens: Some(175_018),
+                credit_usage: None,
             },
         );
         direct.apply_context(UsageLogContext {
@@ -2347,6 +2468,7 @@ mod tests {
                 cache_read_tokens: Some(60),
                 cache_creation_tokens: None,
                 total_tokens: Some(110),
+                credit_usage: None,
             },
         );
         completed.apply_context(UsageLogContext {

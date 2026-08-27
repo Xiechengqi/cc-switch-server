@@ -83,6 +83,10 @@ import {
   CodexFeatureOptions,
   type CodexFeatureOptionKey,
 } from "@/server/providers/CodexFeatureOptions";
+import {
+  GrokFeatureOptions,
+  type GrokFeatureOptionKey,
+} from "@/server/providers/GrokFeatureOptions";
 import { profileAllowsEndpointEditing } from "@/server/providers/editor/providerDraft";
 import {
   credentialInputValue,
@@ -752,6 +756,7 @@ function BundleShareEditor({
   onChange,
   ownerEmail,
   shareUrl,
+  showGrokMedia,
 }: {
   draft: ProviderBundleShareDraft;
   /**
@@ -763,6 +768,7 @@ function BundleShareEditor({
   onChange: Dispatch<SetStateAction<ProviderBundleShareDraft>>;
   ownerEmail: string;
   shareUrl?: string | null;
+  showGrokMedia: boolean;
 }) {
   const { t } = useTranslation();
   const routerManagedEmails = useMemo(
@@ -914,6 +920,28 @@ function BundleShareEditor({
               }
             />
           </div>
+          {showGrokMedia ? (
+            <div className="space-y-2 md:col-span-2">
+              <Label>{t("grokOauth.shareMediaPolicy", { defaultValue: "Share 媒体权限" })}</Label>
+              <GrokFeatureOptions
+                values={{
+                  grokImageGenerationEnabled: draft.grokMediaPolicy.imageGenerationEnabled,
+                  grokImageEditEnabled: draft.grokMediaPolicy.imageEditEnabled,
+                  grokVideoGenerationEnabled: draft.grokMediaPolicy.videoGenerationEnabled,
+                }}
+                onChange={(key, enabled) => {
+                  const field = key === "grokImageGenerationEnabled"
+                    ? "imageGenerationEnabled"
+                    : key === "grokImageEditEnabled"
+                      ? "imageEditEnabled"
+                      : "videoGenerationEnabled";
+                  updateDraft({
+                    grokMediaPolicy: { ...draft.grokMediaPolicy, [field]: enabled },
+                  });
+                }}
+              />
+            </div>
+          ) : null}
           <ShareUserGrantsEditor
             value={displayedUserGrants}
             ownerEmail={normalizedOwnerEmail}
@@ -1158,6 +1186,12 @@ export function ProviderBundleEditor({
     const profile = profileById(surface.profileId);
     return profile
       ? driverForProfile(profile)?.driverId === "oauth.openai_codex"
+      : false;
+  });
+  const grokDriverOptions = draft.surfaces.some((surface) => {
+    const profile = profileById(surface.profileId);
+    return profile
+      ? driverForProfile(profile)?.driverId === "oauth.grok_responses"
       : false;
   });
   const ownerEmail =
@@ -1423,6 +1457,20 @@ export function ProviderBundleEditor({
       surfaces: current.surfaces.map((surface) => {
         const profile = profileById(surface.profileId);
         if (driverForProfile(profile!)?.driverId !== "oauth.openai_codex")
+          return surface;
+        return {
+          ...surface,
+          driverOptions: { ...surface.driverOptions, [key]: checked },
+        };
+      }),
+    }));
+
+  const setGrokDriverOption = (key: GrokFeatureOptionKey, checked: boolean) =>
+    setDraft((current) => ({
+      ...current,
+      surfaces: current.surfaces.map((surface) => {
+        const profile = profileById(surface.profileId);
+        if (driverForProfile(profile!)?.driverId !== "oauth.grok_responses")
           return surface;
         return {
           ...surface,
@@ -2315,6 +2363,30 @@ export function ProviderBundleEditor({
                   </Section>
                 ) : null}
 
+                {grokDriverOptions ? (
+                  <Section
+                    title={t("grokOauth.featureOptionsTitle", {
+                      defaultValue: "Grok OAuth 媒体能力",
+                    })}
+                  >
+                    <GrokFeatureOptions
+                      providerId={bundle?.surfaces.codex?.provider.id}
+                      values={{
+                        grokImageGenerationEnabled: draft.surfaces.some(
+                          (surface) => surface.driverOptions.grokImageGenerationEnabled === true,
+                        ),
+                        grokImageEditEnabled: draft.surfaces.some(
+                          (surface) => surface.driverOptions.grokImageEditEnabled === true,
+                        ),
+                        grokVideoGenerationEnabled: draft.surfaces.some(
+                          (surface) => surface.driverOptions.grokVideoGenerationEnabled === true,
+                        ),
+                      }}
+                      onChange={setGrokDriverOption}
+                    />
+                  </Section>
+                ) : null}
+
                 {codexDriverOptions &&
                 persisted &&
                 draft.accountId &&
@@ -2406,6 +2478,7 @@ export function ProviderBundleEditor({
               onChange={setShareDraft}
               ownerEmail={ownerEmail}
               shareUrl={shareUrl}
+              showGrokMedia={grokDriverOptions}
             />
           </div>
         ) : null}

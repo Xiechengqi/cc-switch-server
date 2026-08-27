@@ -2928,7 +2928,15 @@
     "callbackPlaceholder": "http://127.0.0.1:56121/callback?code=...&state=... 或只貼上 code",
     "finishLogin": "完成登入",
     "loginRequired": "請先登入 Grok 帳號",
-    "selectAccountRequired": "Grok OAuth 必須綁定一個 Grok 帳號"
+    "selectAccountRequired": "Grok OAuth 必須綁定一個 Grok 帳號",
+    "featureOptionsTitle": "Grok OAuth 媒體能力",
+    "shareMediaPolicy": "Share 媒體權限",
+    "grokImageGenerationEnabled": "圖片生成",
+    "grokImageGenerationEnabledDescription": "允許此 Grok OAuth Provider 或 Share 生成圖片。",
+    "grokImageEditEnabled": "圖片編輯",
+    "grokImageEditEnabledDescription": "允許此 Grok OAuth Provider 或 Share 編輯圖片。",
+    "grokVideoGenerationEnabled": "影片生成",
+    "grokVideoGenerationEnabledDescription": "允許此 Grok OAuth Provider 或 Share 建立並查詢影片任務。"
   },
   "kimiOauth": {
     "description": "管理 Kimi Code 訂閱帳號",

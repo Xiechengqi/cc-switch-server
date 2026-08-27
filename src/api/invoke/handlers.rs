@@ -611,6 +611,7 @@ pub(in crate::api) async fn web_share_upsert_input(
                 "previous_response_cache_enabled",
             ],
         ),
+        grok_media_policy: web_optional_deserialize(value, "grokMediaPolicy")?,
         auto_start: web_optional_bool(value, &["autoStart", "auto_start"]),
         description: web_optional_string_any(value, &["description"]),
         enabled_apps: None,
@@ -952,6 +953,8 @@ struct SaveProviderBundleShareCommand {
     banked_reset_expiry_lead_minutes: u32,
     #[serde(default = "default_provider_bundle_previous_response_cache_enabled")]
     previous_response_cache_enabled: bool,
+    #[serde(default)]
+    grok_media_policy: crate::domain::sharing::router_contract::GrokMediaPolicy,
 }
 
 fn default_provider_bundle_banked_reset_expiry_lead_minutes() -> u32 {
@@ -1192,6 +1195,7 @@ fn stage_provider_bundle_share(
                 auto_consume_banked_reset: Some(command.auto_consume_banked_reset),
                 banked_reset_expiry_lead_minutes: Some(command.banked_reset_expiry_lead_minutes),
                 previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
+                grok_media_policy: Some(command.grok_media_policy),
                 auto_start: Some(true),
                 description,
                 enabled_apps: {

@@ -4,12 +4,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::cursor_client_contract::{
-    sdk_client_version, CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, GHOST_MODE_ENABLED,
-    GHOST_MODE_HEADER, SDK_CLIENT_TYPE,
+    CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, DEFAULT_API_KEY_EXCHANGE_URL, GHOST_MODE_ENABLED,
+    GHOST_MODE_HEADER, PUBLIC_API_CLIENT_VERSION, SDK_CLIENT_TYPE,
 };
 
 const CURSOR_PUBLIC_API_ORIGIN: &str = "https://api.cursor.com";
 const MAX_CURSOR_PUBLIC_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CURSOR_ERROR_DETAIL_CHARS: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct VerifiedCursorApiKey {
@@ -61,18 +62,41 @@ pub async fn verify_api_key(
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
-    verify_api_key_at_origin(client, api_key, CURSOR_PUBLIC_API_ORIGIN).await
+    verify_api_key_at_endpoints(
+        client,
+        api_key,
+        CURSOR_PUBLIC_API_ORIGIN,
+        DEFAULT_API_KEY_EXCHANGE_URL,
+    )
+    .await
 }
 
-async fn verify_api_key_at_origin(
+async fn verify_api_key_at_endpoints(
     client: &reqwest::Client,
     api_key: &str,
-    origin: &str,
+    public_origin: &str,
+    exchange_url: &str,
 ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
-    let profile = cursor_public_json_at_origin(client, api_key, origin, "/v1/me").await?;
+    let profile = match cursor_public_json_at_origin(client, api_key, public_origin, "/v1/me").await
+    {
+        Ok(profile) => profile,
+        Err(public_error) if public_error.status_code == 403 => {
+            verify_api_key_exchange(client, api_key, exchange_url)
+                .await
+                .map_err(|exchange_error| {
+                    cursor_fallback_verification_error(public_error, exchange_error)
+                })?;
+            return Ok(verified_api_key_from_exchange(api_key));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(verified_api_key_from_profile(profile, api_key))
+}
+
+fn verified_api_key_from_profile(profile: Value, api_key: &str) -> VerifiedCursorApiKey {
     let (principal, principal_source) = verified_principal(&profile, api_key);
     let email = first_string(&profile, &["/userEmail", "/email", "/user/email"]);
-    Ok(VerifiedCursorApiKey {
+    VerifiedCursorApiKey {
         account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
         principal_source: principal_source.to_string(),
         email,
@@ -81,7 +105,20 @@ async fn verify_api_key_at_origin(
             "source": "cursor_public_api",
             "cursorMe": profile,
         }),
-    })
+    }
+}
+
+fn verified_api_key_from_exchange(api_key: &str) -> VerifiedCursorApiKey {
+    let (principal, principal_source) = verified_principal(&Value::Null, api_key);
+    VerifiedCursorApiKey {
+        account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
+        principal_source: principal_source.to_string(),
+        email: None,
+        profile: json!({
+            "providerType": "cursor_apikey",
+            "source": "cursor_api_key_exchange",
+        }),
+    }
 }
 
 fn verified_principal(profile: &Value, api_key: &str) -> (String, &'static str) {
@@ -137,8 +174,9 @@ async fn cursor_public_json_at_origin(
         .timeout(std::time::Duration::from_secs(10))
         .bearer_auth(api_key)
         .header("accept", "application/json")
+        .header("content-type", "application/json")
         .header(CLIENT_TYPE_HEADER, SDK_CLIENT_TYPE)
-        .header(CLIENT_VERSION_HEADER, sdk_client_version())
+        .header(CLIENT_VERSION_HEADER, PUBLIC_API_CLIENT_VERSION)
         .header(GHOST_MODE_HEADER, GHOST_MODE_ENABLED)
         .send()
         .await
@@ -148,18 +186,14 @@ async fn cursor_public_json_at_origin(
             message: format!("Cursor public API request failed: {error}"),
         })?;
     let status = response.status();
-    let body = read_limited(response).await?;
+    let body = read_limited(response, "public API").await?;
     if !status.is_success() {
-        return Err(CursorPublicApiError {
-            status_code: status.as_u16(),
-            retryable: status.as_u16() == 429 || status.is_server_error(),
-            message: match status.as_u16() {
-                401 => "Cursor API key was rejected".to_string(),
-                403 => "Cursor API key validation was forbidden; verify API access and SDK client permissions".to_string(),
-                429 => "Cursor API key validation was rate limited".to_string(),
-                _ => format!("Cursor public API returned HTTP {}", status.as_u16()),
-            },
-        });
+        return Err(cursor_http_error(
+            "public API validation",
+            status,
+            &body,
+            api_key,
+        ));
     }
     serde_json::from_slice(&body).map_err(|error| CursorPublicApiError {
         status_code: 502,
@@ -168,12 +202,116 @@ async fn cursor_public_json_at_origin(
     })
 }
 
-async fn read_limited(response: reqwest::Response) -> Result<Vec<u8>, CursorPublicApiError> {
+async fn verify_api_key_exchange(
+    client: &reqwest::Client,
+    api_key: &str,
+    exchange_url: &str,
+) -> Result<(), CursorPublicApiError> {
+    let response = client
+        .post(exchange_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .bearer_auth(api_key)
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .map_err(|error| CursorPublicApiError {
+            status_code: 502,
+            retryable: true,
+            message: format!("Cursor API key exchange request failed: {error}"),
+        })?;
+    let status = response.status();
+    let body = read_limited(response, "API key exchange").await?;
+    if !status.is_success() {
+        return Err(cursor_http_error(
+            "API key exchange",
+            status,
+            &body,
+            api_key,
+        ));
+    }
+    let value = serde_json::from_slice::<Value>(&body).map_err(|error| CursorPublicApiError {
+        status_code: 502,
+        retryable: false,
+        message: format!("Cursor API key exchange returned invalid JSON: {error}"),
+    })?;
+    if first_string(&value, &["/accessToken", "/access_token"]).is_none() {
+        return Err(CursorPublicApiError {
+            status_code: 502,
+            retryable: false,
+            message: "Cursor API key exchange response missing access token".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn cursor_http_error(
+    surface: &str,
+    status: reqwest::StatusCode,
+    body: &[u8],
+    api_key: &str,
+) -> CursorPublicApiError {
+    let base = match status.as_u16() {
+        401 => format!("Cursor {surface} rejected the API key"),
+        403 => format!("Cursor {surface} was forbidden"),
+        429 => format!("Cursor {surface} was rate limited"),
+        _ => format!("Cursor {surface} returned HTTP {}", status.as_u16()),
+    };
+    let detail = cursor_error_detail(body, api_key)
+        .map(|detail| format!("; {detail}"))
+        .unwrap_or_default();
+    CursorPublicApiError {
+        status_code: status.as_u16(),
+        retryable: status.as_u16() == 429 || status.is_server_error(),
+        message: format!("{base}{detail}"),
+    }
+}
+
+fn cursor_fallback_verification_error(
+    public_error: CursorPublicApiError,
+    exchange_error: CursorPublicApiError,
+) -> CursorPublicApiError {
+    CursorPublicApiError {
+        status_code: exchange_error.status_code,
+        retryable: exchange_error.retryable,
+        message: format!(
+            "{}; same-key exchange verification also failed: {}",
+            public_error.message, exchange_error.message
+        ),
+    }
+}
+
+fn cursor_error_detail(body: &[u8], api_key: &str) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let message = first_scalar_string(
+        &value,
+        &["/error/message", "/message", "/details/0/message", "/error"],
+    );
+    let code = first_scalar_string(&value, &["/error/code", "/code"]);
+    let detail = match (code, message) {
+        (Some(code), Some(message)) if code != message => format!("{code}: {message}"),
+        (_, Some(message)) => message,
+        (Some(code), None) => code,
+        _ => return None,
+    };
+    let redacted = crate::logging::redact_sensitive_text_with_values(&detail, [api_key]);
+    let bounded = redacted
+        .chars()
+        .take(MAX_CURSOR_ERROR_DETAIL_CHARS)
+        .collect::<String>();
+    (!bounded.trim().is_empty()).then_some(bounded)
+}
+
+async fn read_limited(
+    response: reqwest::Response,
+    surface: &str,
+) -> Result<Vec<u8>, CursorPublicApiError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_CURSOR_PUBLIC_BODY_BYTES as u64)
     {
-        return Err(body_too_large());
+        return Err(body_too_large(surface));
     }
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
@@ -181,21 +319,21 @@ async fn read_limited(response: reqwest::Response) -> Result<Vec<u8>, CursorPubl
         let chunk = chunk.map_err(|error| CursorPublicApiError {
             status_code: 502,
             retryable: true,
-            message: format!("Cursor public API response read failed: {error}"),
+            message: format!("Cursor {surface} response read failed: {error}"),
         })?;
         if body.len().saturating_add(chunk.len()) > MAX_CURSOR_PUBLIC_BODY_BYTES {
-            return Err(body_too_large());
+            return Err(body_too_large(surface));
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
 
-fn body_too_large() -> CursorPublicApiError {
+fn body_too_large(surface: &str) -> CursorPublicApiError {
     CursorPublicApiError {
         status_code: 502,
         retryable: false,
-        message: "Cursor public API response exceeded 1 MiB".to_string(),
+        message: format!("Cursor {surface} response exceeded 1 MiB"),
     }
 }
 
@@ -241,25 +379,25 @@ mod tests {
     use axum::extract::State;
     use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode, Uri};
     use axum::response::{IntoResponse, Response};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
 
     #[derive(Clone)]
-    struct ExpectedSdkIdentity {
+    struct ExpectedPublicIdentity {
         authorization: String,
-        version: String,
     }
 
-    async fn sdk_identity_gate(
-        State(expected): State<ExpectedSdkIdentity>,
+    async fn public_identity_gate(
+        State(expected): State<ExpectedPublicIdentity>,
         uri: Uri,
         headers: HeaderMap,
     ) -> Response {
         let matches = header_matches(&headers, AUTHORIZATION.as_str(), &expected.authorization)
             && header_matches(&headers, CLIENT_TYPE_HEADER, SDK_CLIENT_TYPE)
-            && header_matches(&headers, CLIENT_VERSION_HEADER, &expected.version)
+            && header_matches(&headers, CLIENT_VERSION_HEADER, PUBLIC_API_CLIENT_VERSION)
             && header_matches(&headers, GHOST_MODE_HEADER, GHOST_MODE_ENABLED)
-            && header_matches(&headers, "accept", "application/json");
+            && header_matches(&headers, "accept", "application/json")
+            && header_matches(&headers, "content-type", "application/json");
         if !matches {
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -275,6 +413,37 @@ mod tests {
             .into_response(),
             _ => StatusCode::NOT_FOUND.into_response(),
         }
+    }
+
+    async fn exchange_identity_gate(
+        State(expected): State<ExpectedPublicIdentity>,
+        headers: HeaderMap,
+        body: String,
+    ) -> Response {
+        let matches = header_matches(&headers, AUTHORIZATION.as_str(), &expected.authorization)
+            && header_matches(&headers, "accept", "application/json")
+            && header_matches(&headers, "content-type", "application/json")
+            && headers.get(CLIENT_TYPE_HEADER).is_none()
+            && headers.get(CLIENT_VERSION_HEADER).is_none()
+            && headers.get(GHOST_MODE_HEADER).is_none()
+            && body == "{}";
+        if !matches {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Json(json!({"accessToken":"fixture-exchanged-token"})).into_response()
+    }
+
+    async fn forbidden_with_sensitive_detail() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": {
+                    "code": "permission_denied",
+                    "message": "fixture-cursor-key denied for owner@example.com"
+                }
+            })),
+        )
+            .into_response()
     }
 
     fn header_matches(headers: &HeaderMap, name: &str, expected: &str) -> bool {
@@ -361,22 +530,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_api_profile_and_models_send_the_sdk_identity_contract() {
+    async fn public_api_profile_and_models_send_the_public_identity_contract() {
         let api_key = "fixture-cursor-key";
-        let version = sdk_client_version();
         let router = Router::new()
-            .route("/v1/me", get(sdk_identity_gate))
-            .route("/v1/models", get(sdk_identity_gate))
-            .with_state(ExpectedSdkIdentity {
+            .route("/v1/me", get(public_identity_gate))
+            .route("/v1/models", get(public_identity_gate))
+            .with_state(ExpectedPublicIdentity {
                 authorization: format!("Bearer {api_key}"),
-                version,
             });
         let (origin, server) = spawn_public_api(router).await;
         let client = reqwest::Client::new();
 
-        let profile = verify_api_key_at_origin(&client, api_key, &origin)
-            .await
-            .unwrap();
+        let profile = verify_api_key_at_endpoints(
+            &client,
+            api_key,
+            &origin,
+            &format!("{origin}/unused-exchange"),
+        )
+        .await
+        .unwrap();
         assert_eq!(profile.principal_source, "user_id");
         assert_eq!(profile.email.as_deref(), Some("owner@example.com"));
         let models = available_models_at_origin(&client, api_key, &origin)
@@ -400,14 +572,125 @@ mod tests {
                 .unwrap_err();
         assert_eq!(unauthorized.status_code, 401);
         assert!(!unauthorized.retryable);
-        assert_eq!(unauthorized.message, "Cursor API key was rejected");
+        assert_eq!(
+            unauthorized.message,
+            "Cursor public API validation rejected the API key"
+        );
 
         let forbidden = cursor_public_json_at_origin(&client, "fixture-key", &origin, "/forbidden")
             .await
             .unwrap_err();
         assert_eq!(forbidden.status_code, 403);
         assert!(!forbidden.retryable);
-        assert!(forbidden.message.contains("SDK client permissions"));
+        assert_eq!(
+            forbidden.message,
+            "Cursor public API validation was forbidden"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn forbidden_profile_falls_back_to_strict_same_key_exchange() {
+        let api_key = "fixture-cursor-key";
+        let router = Router::new()
+            .route(
+                "/v1/me",
+                get(|| async { StatusCode::FORBIDDEN.into_response() }),
+            )
+            .route("/auth/exchange_user_api_key", post(exchange_identity_gate))
+            .with_state(ExpectedPublicIdentity {
+                authorization: format!("Bearer {api_key}"),
+            });
+        let (origin, server) = spawn_public_api(router).await;
+
+        let verified = verify_api_key_at_endpoints(
+            &reqwest::Client::new(),
+            api_key,
+            &origin,
+            &format!("{origin}/auth/exchange_user_api_key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.principal_source, "api_key_fallback");
+        assert!(verified.email.is_none());
+        assert_eq!(verified.profile["source"], "cursor_api_key_exchange");
+        assert!(verified.profile.get("accessToken").is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_profile_never_falls_back_to_exchange() {
+        let router = Router::new()
+            .route(
+                "/v1/me",
+                get(|| async { StatusCode::UNAUTHORIZED.into_response() }),
+            )
+            .route(
+                "/auth/exchange_user_api_key",
+                post(|| async { Json(json!({"accessToken":"must-not-be-used"})) }),
+            );
+        let (origin, server) = spawn_public_api(router).await;
+
+        let error = verify_api_key_at_endpoints(
+            &reqwest::Client::new(),
+            "fixture-cursor-key",
+            &origin,
+            &format!("{origin}/auth/exchange_user_api_key"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status_code, 401);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exchange_fallback_fails_closed_without_an_access_token() {
+        let router = Router::new()
+            .route(
+                "/v1/me",
+                get(|| async { StatusCode::FORBIDDEN.into_response() }),
+            )
+            .route(
+                "/auth/exchange_user_api_key",
+                post(|| async { Json(json!({})) }),
+            );
+        let (origin, server) = spawn_public_api(router).await;
+
+        let error = verify_api_key_at_endpoints(
+            &reqwest::Client::new(),
+            "fixture-cursor-key",
+            &origin,
+            &format!("{origin}/auth/exchange_user_api_key"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status_code, 502);
+        assert!(error.message.contains("missing access token"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_errors_include_bounded_diagnostics_without_secrets() {
+        let router = Router::new()
+            .route("/v1/me", get(forbidden_with_sensitive_detail))
+            .route(
+                "/auth/exchange_user_api_key",
+                post(forbidden_with_sensitive_detail),
+            );
+        let (origin, server) = spawn_public_api(router).await;
+
+        let error = verify_api_key_at_endpoints(
+            &reqwest::Client::new(),
+            "fixture-cursor-key",
+            &origin,
+            &format!("{origin}/auth/exchange_user_api_key"),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.message.contains("fixture-cursor-key"));
+        assert!(!error.message.contains("owner@example.com"));
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(error.message.contains("same-key exchange verification"));
         server.abort();
     }
 }

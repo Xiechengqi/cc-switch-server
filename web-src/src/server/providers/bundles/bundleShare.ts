@@ -30,6 +30,11 @@ export interface ProviderBundleShareDraft {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: string;
   previousResponseCacheEnabled: boolean;
+  grokMediaPolicy: {
+    imageGenerationEnabled: boolean;
+    imageEditEnabled: boolean;
+    videoGenerationEnabled: boolean;
+  };
 }
 
 export const BUNDLE_SHARE_EXPIRY_PRESETS = [
@@ -137,6 +142,11 @@ export function createBundleShareDraft(
     previousResponseCacheEnabled: share
       ? Boolean(share.previousResponseCacheEnabled)
       : true,
+    grokMediaPolicy: share?.grokMediaPolicy ?? {
+      imageGenerationEnabled: false,
+      imageEditEnabled: false,
+      videoGenerationEnabled: false,
+    },
   };
 }
 
@@ -240,6 +250,7 @@ export async function saveBundleShare(
     autoConsumeBankedReset: draft.autoConsumeBankedReset,
     bankedResetExpiryLeadMinutes,
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
+    grokMediaPolicy: draft.grokMediaPolicy,
     userGrants,
     userUsageEdits,
   });

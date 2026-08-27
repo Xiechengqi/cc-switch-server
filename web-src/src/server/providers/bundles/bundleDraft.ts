@@ -101,6 +101,9 @@ export interface BundleSurfaceEditorDraft {
     customUserAgent?: string;
     codexFastMode?: boolean;
     codexImageGenerationEnabled?: boolean;
+    grokImageGenerationEnabled?: boolean;
+    grokImageEditEnabled?: boolean;
+    grokVideoGenerationEnabled?: boolean;
     codexWebsocketEnabled?: boolean;
     codexResponsesKeepaliveIntervalMs?: number;
     codexRoutingHintEnabled?: boolean;
@@ -441,6 +444,15 @@ function surfaceFromResource(
       codexImageGenerationEnabled:
         booleanOption(runtimeOptions.codexImageGenerationEnabled) ??
         configuredMeta.codexImageGenerationEnabled,
+      grokImageGenerationEnabled:
+        booleanOption(runtimeOptions.grokImageGenerationEnabled) ??
+        configuredMeta.grokImageGenerationEnabled ?? false,
+      grokImageEditEnabled:
+        booleanOption(runtimeOptions.grokImageEditEnabled) ??
+        configuredMeta.grokImageEditEnabled ?? false,
+      grokVideoGenerationEnabled:
+        booleanOption(runtimeOptions.grokVideoGenerationEnabled) ??
+        configuredMeta.grokVideoGenerationEnabled ?? false,
       codexWebsocketEnabled,
       codexResponsesKeepaliveIntervalMs:
         numberOption(runtimeOptions.codexResponsesKeepaliveIntervalMs) ??
@@ -921,6 +933,15 @@ function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
       : undefined,
     codexImageGenerationEnabled: fields.has("codexImageGenerationEnabled")
       ? surface.driverOptions.codexImageGenerationEnabled
+      : undefined,
+    grokImageGenerationEnabled: fields.has("grokImageGenerationEnabled")
+      ? surface.driverOptions.grokImageGenerationEnabled
+      : undefined,
+    grokImageEditEnabled: fields.has("grokImageEditEnabled")
+      ? surface.driverOptions.grokImageEditEnabled
+      : undefined,
+    grokVideoGenerationEnabled: fields.has("grokVideoGenerationEnabled")
+      ? surface.driverOptions.grokVideoGenerationEnabled
       : undefined,
     codexWebsocketEnabled: fields.has("codexWebsocketEnabled")
       ? surface.driverOptions.codexWebsocketEnabled

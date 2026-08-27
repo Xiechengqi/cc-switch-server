@@ -11,6 +11,15 @@
 
 Server 只记录上述 Token 桶，不按模型价格计算或保存成本金额。
 
+Kiro `meteringEvent` 的 credits 是独立的 Provider 计量，不是 Token：
+
+- `creditUsage`：usage log 中可选的本次 credit 合计；上游明确报告 `0` 时保留为零，旧记录或未报告时为 `null`/缺失。
+- Kiro 三种 text surface 的响应 usage 还会按需保留 `credit_usage`、`credit_unit`、`credit_unit_plural`；多次有效事件按增量求和，单位标签取最后一个非空值。
+- 非有限、负数、单事件或累计超过 `1_000_000_000` 的值不进入计量。
+- credits 不加入 `inputTokens`、`outputTokens`、cache token、`totalTokens`、Share token 用量或 token quota。
+
+该口径来自脱敏 fixture 和对照实现证据；真实订阅账号的多事件语义仍为 `live_pending`，在完成 live 验收前不把 credits 用作扣费或配额决策。
+
 Codex OAuth Images 在同一 usage log 额外记录独立的输出元数据，不把图片字节换算成 Token 或费用：
 
 - `imageCount`：语义完成并成功渲染的图片数。
@@ -30,8 +39,10 @@ Codex OAuth Images 在同一 usage log 额外记录独立的输出元数据，�
 会话关联：
 
 - `sessionId` 会写入本地 usage log，并在 Router Share request log sync 时传给 router。
-- Claude 从 session header、`metadata.user_id` 的 `_session_` 后缀和 `metadata.session_id/sessionId` 提取。
-- Codex 从 `session_id`、`x-session-id`、`x-codex-session-id`、`x-client-request-id`、`x-codex-window-id` 和 metadata 提取。
+- 外层 `x-cc-switch-session-id` 优先于各 surface 自身候选；候选值最长 256 字节，且只接受字母、数字、`-`、`_`、`.`、`:`。
+- Claude 从 session header、JSON 字符串形式的 `metadata.user_id.session_id`、legacy `_session_` 后缀和 `metadata.session_id/sessionId` 提取。
+- Codex 优先从 body `prompt_cache_key` 提取，再读取 `x-session-affinity`、`x-client-request-id`、`session_id`、`x-session-id`、`x-codex-session-id`、`x-codex-window-id` 和 metadata/session 字段。
+- Kiro 找不到有效 session 时生成 request-scoped anonymous ID；同一请求的 conversation、prompt-cache namespace 和 usage correlation 复用该 ID，不同请求不会共享固定 `anonymous` scope。
 
 Stream 状态：
 
@@ -45,5 +56,13 @@ Stream 状态：
 - `client_cancelled`：Images 下游 Body 被取消；usage `statusCode` 为 499。
 
 Images 为穿过 Cloudflare 保持连接，可能在最终结果前提交 SSE comment 或 JSON 空白。因此 wire HTTP status 可能保持 200，终态应以完整 payload 和 usage log 的 `statusCode`/`streamStatus` 为准。
+
+Grok OAuth 媒体与文本共用同一终态 Usage 记录模型，但媒体没有 token 语义：
+
+- `requestKind` 固定为 `image` 或 `video`；`operation` 区分 `image_generation`、`image_edit`、`video_generation` 和 `video_status`。
+- `usageState=not_applicable` 是正常终态，不计入 missing/parse/transform error，也不把 token 兼容字段当作真实零值。
+- 视频创建记录保存 `mediaTaskId` 和 submitted/status；状态查询通过 durable task binding 写入 `parentRequestId`，关联原创建请求。
+- 视频参数只保留有界的 `videoDurationSeconds`、`videoResolution`、`videoAspectRatio`；错误只保留有界摘要。prompt、图片原始字节、凭据和原始私有响应 URL 不进入 Usage。
+- Router Share 同步合同 v5 携带上述字段。Router 普通请求列表排除签名的 `HealthProbe`，并可按 `requestKind=text|image|video` 在数据库查询前过滤和分页。
 
 Cursor required/named tool semantic retry 最多有三个同绑定 attempt。当前客户端 success usage 使用最终被提交 attempt 的估算值；每次被丢弃的 attempt 通过 `cursor_tool_retry_total{rail,reason,attempt}` 和脱敏 warning 审计，不把早期 prose 暴露给客户端。该 usage 是估算值并持续设置 `usageEstimated=true`。在上游提供逐 attempt 可归属的权威 usage 前，不将丢弃 attempt 伪装为客户端 token usage；订阅侧的实际消耗可能高于最终响应中的估算值。

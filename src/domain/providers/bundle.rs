@@ -172,6 +172,12 @@ pub struct ProviderDriverOptionsWriteDraft {
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
+    pub grok_image_generation_enabled: Option<bool>,
+    #[serde(default)]
+    pub grok_image_edit_enabled: Option<bool>,
+    #[serde(default)]
+    pub grok_video_generation_enabled: Option<bool>,
+    #[serde(default)]
     pub codex_websocket_enabled: Option<bool>,
     #[serde(default)]
     pub codex_responses_keepalive_interval_ms: Option<u64>,
@@ -352,6 +358,9 @@ impl ProviderBundleWriteDraft {
             ),
             codex_fast_mode: surface.driver_options.codex_fast_mode,
             codex_image_generation_enabled: surface.driver_options.codex_image_generation_enabled,
+            grok_image_generation_enabled: surface.driver_options.grok_image_generation_enabled,
+            grok_image_edit_enabled: surface.driver_options.grok_image_edit_enabled,
+            grok_video_generation_enabled: surface.driver_options.grok_video_generation_enabled,
             codex_websocket_enabled: surface.driver_options.codex_websocket_enabled,
             codex_responses_keepalive_interval_ms: surface
                 .driver_options
@@ -754,6 +763,15 @@ impl ProviderDriverOptionsWriteDraft {
         }
         if self.codex_image_generation_enabled.is_some() {
             fields.insert("codexImageGenerationEnabled");
+        }
+        if self.grok_image_generation_enabled.is_some() {
+            fields.insert("grokImageGenerationEnabled");
+        }
+        if self.grok_image_edit_enabled.is_some() {
+            fields.insert("grokImageEditEnabled");
+        }
+        if self.grok_video_generation_enabled.is_some() {
+            fields.insert("grokVideoGenerationEnabled");
         }
         if self.codex_websocket_enabled.is_some() {
             fields.insert("codexWebsocketEnabled");

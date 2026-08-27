@@ -55,6 +55,8 @@ pub struct IngressContext {
     pub user_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_country: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_health_check: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub method: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -62,6 +64,10 @@ pub struct IngressContext {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body_sha256: String,
     pub issued_at_ms: i64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -378,6 +384,7 @@ mod tests {
             user_email: Some("owner@example.com".to_string()),
             user_role: None,
             user_country: None,
+            is_health_check: false,
             method: "POST".to_string(),
             path_and_query: "/v1/messages".to_string(),
             body_sha256: body_sha256_hex(b""),

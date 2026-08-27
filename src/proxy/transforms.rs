@@ -6415,6 +6415,7 @@ pub(super) fn anthropic_usage_from_openai_usage(usage: Option<&Value>) -> Value 
             json!(cache_creation),
         );
     }
+    copy_provider_metering(usage, &mut output);
     Value::Object(output)
 }
 
@@ -6470,6 +6471,9 @@ fn openai_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
         output["cache_creation_input_tokens"] = json!(cache_creation);
         output["prompt_tokens_details"]["cached_creation_tokens"] = json!(cache_creation);
     }
+    if let Some(output) = output.as_object_mut() {
+        copy_provider_metering(usage, output);
+    }
     output
 }
 
@@ -6490,6 +6494,9 @@ pub(super) fn openai_responses_usage_from_anthropic_usage(usage: Option<&Value>)
     if let Some(cache_creation) = cache_creation {
         output["cache_creation_input_tokens"] = json!(cache_creation);
         output["input_tokens_details"]["cache_write_tokens"] = json!(cache_creation);
+    }
+    if let Some(output) = output.as_object_mut() {
+        copy_provider_metering(usage, output);
     }
     output
 }
@@ -6537,6 +6544,7 @@ pub(super) fn openai_chat_usage_from_responses_usage(usage: Option<&Value>) -> V
     {
         output.insert("completion_tokens_details".to_string(), details.clone());
     }
+    copy_provider_metering(usage, &mut output);
     Value::Object(output)
 }
 
@@ -6584,7 +6592,19 @@ pub(super) fn openai_responses_usage_from_chat_usage(usage: Option<&Value>) -> V
     {
         output.insert("output_tokens_details".to_string(), details.clone());
     }
+    copy_provider_metering(usage, &mut output);
     Value::Object(output)
+}
+
+fn copy_provider_metering(source: Option<&Value>, target: &mut Map<String, Value>) {
+    let Some(source) = source.and_then(Value::as_object) else {
+        return;
+    };
+    for key in ["credit_usage", "credit_unit", "credit_unit_plural"] {
+        if let Some(value) = source.get(key) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 fn openai_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
@@ -8739,12 +8759,17 @@ mod tests {
             "input_tokens": 100,
             "output_tokens": 8,
             "cache_creation_input_tokens": 20,
-            "input_tokens_details": {"cached_tokens": 60}
+            "input_tokens_details": {"cached_tokens": 60},
+            "credit_usage": 0.75,
+            "credit_unit": "credit",
+            "credit_unit_plural": "credits"
         });
         let anthropic = anthropic_usage_from_openai_usage(Some(&responses_usage));
         assert_eq!(anthropic["input_tokens"], json!(20));
         assert_eq!(anthropic["cache_read_input_tokens"], json!(60));
         assert_eq!(anthropic["cache_creation_input_tokens"], json!(20));
+        assert_eq!(anthropic["credit_usage"], json!(0.75));
+        assert_eq!(anthropic["credit_unit"], json!("credit"));
 
         let round_trip = openai_responses_usage_from_anthropic_usage(Some(&anthropic));
         assert_eq!(round_trip["input_tokens"], json!(100));
@@ -8758,6 +8783,8 @@ mod tests {
             round_trip["input_tokens_details"]["cache_write_tokens"],
             json!(20)
         );
+        assert_eq!(round_trip["credit_usage"], json!(0.75));
+        assert_eq!(round_trip["credit_unit_plural"], json!("credits"));
 
         let chat = openai_chat_usage_from_responses_usage(Some(&json!({
             "input_tokens": 10,
@@ -8768,6 +8795,11 @@ mod tests {
             chat["prompt_tokens_details"]["cached_creation_tokens"],
             json!(0)
         );
+        let chat_with_metering = openai_chat_usage_from_responses_usage(Some(&responses_usage));
+        assert_eq!(chat_with_metering["credit_usage"], json!(0.75));
+        let responses_round_trip =
+            openai_responses_usage_from_chat_usage(Some(&chat_with_metering));
+        assert_eq!(responses_round_trip["credit_unit"], json!("credit"));
     }
 
     #[test]

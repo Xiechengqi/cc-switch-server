@@ -1,11 +1,11 @@
 {
   "format": "cc-switch-provider-registry",
-  "schemaVersion": 7,
+  "schemaVersion": 8,
   "optionSchemas": [
     {"optionSchemaId":"oauth.claude.v1","fields":[]},
     {"optionSchemaId":"http.anthropic.v1","fields":["apiKeyField","customUserAgent"]},
     {"optionSchemaId":"oauth.openai_codex.v1","fields":["codexFastMode","codexImageGenerationEnabled","codexWebsocketEnabled","codexResponsesKeepaliveIntervalMs","codexRoutingHintEnabled"]},
-    {"optionSchemaId":"oauth.grok.v1","fields":[]},
+    {"optionSchemaId":"oauth.grok.v1","fields":["grokImageGenerationEnabled","grokImageEditEnabled","grokVideoGenerationEnabled"]},
     {"optionSchemaId":"oauth.kimi_code.v1","fields":[]},
     {"optionSchemaId":"special.qoder_cosy.v1","fields":[]},
     {"optionSchemaId":"special.kiro.v1","fields":[]},
@@ -138,7 +138,7 @@
     {"driverId":"oauth.claude_messages","driverContractRevision":3,"upstreamProtocol":"anthropic_messages","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"managed_identity","family":"claude_code"},"optionSchemaId":"oauth.claude.v1"},
     {"driverId":"http.anthropic_messages","driverContractRevision":2,"upstreamProtocol":"anthropic_messages","acceptedAuthSchemes":["api_key","bearer","custom_header"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"server_identity"},"optionSchemaId":"http.anthropic.v1"},
     {"driverId":"oauth.openai_codex","driverContractRevision":2,"upstreamProtocol":"open_ai_responses","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"supported","discovery":"unsupported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"managed_identity","family":"codex_cli"},"optionSchemaId":"oauth.openai_codex.v1"},
-    {"driverId":"oauth.grok_responses","driverContractRevision":2,"upstreamProtocol":"open_ai_responses","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"managed_identity","family":"grok_cli"},"optionSchemaId":"oauth.grok.v1"},
+    {"driverId":"oauth.grok_responses","driverContractRevision":3,"upstreamProtocol":"open_ai_responses","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"managed_identity","family":"grok_cli"},"optionSchemaId":"oauth.grok.v1"},
     {"driverId":"oauth.kimi_code","driverContractRevision":2,"upstreamProtocol":"special","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"managed_identity","family":"kimi_cli"},"optionSchemaId":"oauth.kimi_code.v1"},
     {"driverId":"special.qoder_cosy","driverContractRevision":1,"upstreamProtocol":"special","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"supported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":false},"outboundIdentityPolicy":{"kind":"managed_identity","family":"qoder"},"optionSchemaId":"special.qoder_cosy.v1"},
     {"driverId":"special.kiro","driverContractRevision":3,"upstreamProtocol":"special","acceptedAuthSchemes":["oauth"],"operations":{"forward":"supported","test":"unsupported","discovery":"supported","connectivity":"supported"},"capabilities":{"stream":true,"tools":true,"images":true},"outboundIdentityPolicy":{"kind":"managed_identity","family":"kiro"},"optionSchemaId":"special.kiro.v1"},

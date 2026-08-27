@@ -156,6 +156,12 @@ pub struct ProviderMeta {
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
+    pub grok_image_generation_enabled: Option<bool>,
+    #[serde(default)]
+    pub grok_image_edit_enabled: Option<bool>,
+    #[serde(default)]
+    pub grok_video_generation_enabled: Option<bool>,
+    #[serde(default)]
     pub codex_image_tool_strip_policy: Option<CodexImageToolStripPolicy>,
     #[serde(default)]
     pub codex_websocket_enabled: Option<bool>,

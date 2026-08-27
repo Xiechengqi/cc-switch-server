@@ -2,6 +2,7 @@
 
 mod endpoint;
 mod image;
+mod model;
 mod tool_bridge;
 mod wire;
 
@@ -93,6 +94,7 @@ pub(crate) struct KiroAccountData {
 struct KiroRequestBuild {
     body: Value,
     tool_name_map: HashMap<String, String>,
+    resolved_model: model::KiroResolvedModel,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +105,8 @@ pub(crate) struct KiroPreparedRequest {
     pub body: Value,
     pub tool_name_map: HashMap<String, String>,
     pub cache_namespace: String,
+    pub upstream_model_id: String,
+    pub context_window: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +114,9 @@ pub(crate) struct KiroCallContext {
     pub ide_version: String,
     pub claude_code_tools: bool,
     pub cache_namespace: String,
+    pub catalog_model_id: Option<String>,
+    pub catalog_max_input_tokens: Option<u64>,
+    pub session_id: Option<String>,
 }
 
 impl KiroCallContext {
@@ -123,6 +130,9 @@ impl KiroCallContext {
                 account.auth_identity_generation,
                 cache_scope_seed(body)
             ),
+            catalog_model_id: None,
+            catalog_max_input_tokens: None,
+            session_id: None,
         }
     }
 }
@@ -272,13 +282,33 @@ pub(crate) fn prepare_kiro_request_with_context(
     let account_data = KiroAccountData::from_account(account)?;
     let access_token = account_data.access_token(account)?;
     let mut body = body.clone();
+    if let Some(session_id) = context.session_id.as_deref() {
+        if !body.get("metadata").is_some_and(Value::is_object) {
+            body["metadata"] = json!({});
+        }
+        body["metadata"]["session_id"] = json!(session_id);
+    }
     image::prepare_anthropic_images(&mut body)?;
     let tool_mode = if context.claude_code_tools {
         ToolCompatibilityMode::ClaudeCode
     } else {
         ToolCompatibilityMode::Raw
     };
-    let request = anthropic_to_kiro_request(&body, &account_data, tool_mode)?;
+    let request = anthropic_to_kiro_request_with_catalog(
+        &body,
+        &account_data,
+        tool_mode,
+        context.catalog_model_id.as_deref(),
+        context.catalog_max_input_tokens,
+    )?;
+    tracing::debug!(
+        model_id = %request.resolved_model.upstream_model_id,
+        family = ?request.resolved_model.family,
+        context_window = request.resolved_model.context_window,
+        context_source = ?request.resolved_model.context_window_source,
+        reasoning_shape = ?request.resolved_model.reasoning_shape,
+        "resolved Kiro model capability"
+    );
     let prepared = endpoint::prepare(
         endpoint::EndpointKind::from_account(&account_data),
         &account_data,
@@ -293,6 +323,8 @@ pub(crate) fn prepare_kiro_request_with_context(
         body: prepared.body,
         tool_name_map: request.tool_name_map,
         cache_namespace: context.cache_namespace.clone(),
+        upstream_model_id: request.resolved_model.upstream_model_id,
+        context_window: request.resolved_model.context_window,
     })
 }
 
@@ -301,18 +333,40 @@ fn anthropic_to_kiro_request(
     account: &KiroAccountData,
     tool_mode: ToolCompatibilityMode,
 ) -> Result<KiroRequestBuild, ProxyError> {
+    anthropic_to_kiro_request_with_catalog(body, account, tool_mode, None, None)
+}
+
+fn anthropic_to_kiro_request_with_catalog(
+    body: &Value,
+    account: &KiroAccountData,
+    tool_mode: ToolCompatibilityMode,
+    catalog_model_id: Option<&str>,
+    catalog_max_input_tokens: Option<u64>,
+) -> Result<KiroRequestBuild, ProxyError> {
     let model = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProxyError::bad_request("missing model"))?;
-    let model_id = map_model(model)
-        .ok_or_else(|| ProxyError::bad_request(format!("Kiro OAuth 不支持该模型: {model}")))?;
+    let resolved_model = catalog_model_id
+        .map(|model_id| model::resolve_catalog_authorized(model_id, catalog_max_input_tokens))
+        .or_else(|| model::resolve_static(model))
+        .ok_or_else(|| {
+            ProxyError::bad_request(format!("Kiro model identifier is invalid: {model}"))
+        })?;
+    let model_id = resolved_model.upstream_model_id.as_str();
     let raw_messages = body
         .get("messages")
         .and_then(|v| v.as_array())
         .ok_or_else(|| ProxyError::bad_request("missing messages"))?;
     if raw_messages.is_empty() {
         return Err(ProxyError::bad_request("messages is empty"));
+    }
+    if tool_mode == ToolCompatibilityMode::ClaudeCode
+        && contains_unsupported_read_pages(raw_messages)
+    {
+        return Err(ProxyError::bad_request(
+            "Kiro Claude Code tool bridge cannot preserve Read.pages",
+        ));
     }
 
     let last_user_idx = raw_messages
@@ -322,7 +376,7 @@ fn anthropic_to_kiro_request(
     let messages = &raw_messages[..=last_user_idx];
 
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(body.get("tools"), &mut tool_name_map, tool_mode);
+    let mut tools = convert_tools(body.get("tools"), &mut tool_name_map, tool_mode)?;
     let (content, images, tool_results) =
         parse_user_content(messages[last_user_idx].get("content"));
     let mut history = build_history(body, messages, model_id, &mut tool_name_map, tool_mode);
@@ -358,115 +412,49 @@ fn anthropic_to_kiro_request(
     if let Some(profile_arn) = endpoint::profile_arn(account)? {
         request_body["profileArn"] = json!(profile_arn);
     }
-    if let Some(additional_model_request_fields) = additional_model_request_fields(body, model_id) {
+    if let Some(additional_model_request_fields) =
+        model::additional_request_fields(body, &resolved_model).map_err(ProxyError::bad_request)?
+    {
         request_body["additionalModelRequestFields"] = additional_model_request_fields;
     }
 
     Ok(KiroRequestBuild {
         body: request_body,
         tool_name_map,
+        resolved_model,
     })
 }
 
-fn additional_model_request_fields(body: &Value, model_id: &str) -> Option<Value> {
-    if thinking_type(body) == Some("disabled") {
-        return None;
-    }
-    let config = thinking_config_for_model(model_id)?;
-    let wants_adaptive = thinking_type(body) == Some("adaptive")
-        || body
-            .get("output_config")
-            .and_then(|v| v.get("effort"))
-            .is_some();
-    if !wants_adaptive {
-        return None;
-    }
-    let effort = body
-        .get("output_config")
-        .and_then(|v| v.get("effort"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or(config.default_effort);
-    let effort = config.normalize_effort(effort);
-
-    Some(json!({
-        "thinking": {
-            "type": "adaptive",
-            "display": "summarized"
-        },
-        "output_config": {
-            "effort": effort
-        }
-    }))
-}
-
-#[derive(Debug, Clone, Copy)]
-struct KiroThinkingConfig {
-    efforts: &'static [&'static str],
-    default_effort: &'static str,
-}
-
-impl KiroThinkingConfig {
-    fn normalize_effort(&self, effort: &str) -> &'static str {
-        let effort = effort.to_ascii_lowercase();
-        self.efforts
-            .iter()
-            .copied()
-            .find(|candidate| *candidate == effort)
-            .unwrap_or_else(|| self.efforts.last().copied().unwrap_or(self.default_effort))
-    }
-}
-
-fn thinking_config_for_model(model_id: &str) -> Option<KiroThinkingConfig> {
-    let lower = model_id.to_ascii_lowercase();
-    let supports_output_config = ["4.6", "4-6", "4.7", "4-7", "4.8", "4-8"]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    supports_output_config.then_some(KiroThinkingConfig {
-        efforts: &["low", "medium", "high", "xhigh", "max"],
-        default_effort: "high",
+fn contains_unsupported_read_pages(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case("Read"))
+                        && block
+                            .pointer("/input/pages")
+                            .is_some_and(|pages| !pages.is_null())
+                })
+            })
     })
-}
-
-pub(super) fn map_model(model: &str) -> Option<&'static str> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("sonnet") {
-        if m.contains("4-8") || m.contains("4.8") {
-            Some("claude-sonnet-4.8")
-        } else if m.contains("4-6") || m.contains("4.6") {
-            Some("claude-sonnet-4.6")
-        } else {
-            Some("claude-sonnet-4.5")
-        }
-    } else if m.contains("opus") {
-        if m.contains("4-8") || m.contains("4.8") {
-            Some("claude-opus-4.8")
-        } else if m.contains("4-7") || m.contains("4.7") {
-            Some("claude-opus-4.7")
-        } else if m.contains("4-6") || m.contains("4.6") {
-            Some("claude-opus-4.6")
-        } else {
-            Some("claude-opus-4.5")
-        }
-    } else if m.contains("haiku") {
-        Some("claude-haiku-4.5")
-    } else {
-        None
-    }
 }
 
 pub(crate) fn resolve_model(model: &str) -> Option<String> {
-    if let Some(model) = map_model(model) {
-        return Some(model.to_string());
+    if let Some(model) = model::resolve_static(model) {
+        return Some(model.upstream_model_id);
     }
     let model = model.trim();
-    (!model.is_empty()
-        && model.len() <= 128
-        && model.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'[' | b']')
-        }))
-    .then(|| model.to_string())
+    model::valid_model_id(model).then(|| model.to_string())
+}
+
+pub(crate) fn static_model_context_window(model: &str) -> Option<u64> {
+    model::resolve_static(model).map(|model| model.context_window)
 }
 
 pub(crate) fn supported_models() -> Vec<String> {
@@ -516,7 +504,7 @@ fn cache_scope_seed(body: &Value) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(stable_uuid_like)
-        .unwrap_or_else(|| "anonymous".to_string())
+        .unwrap_or_else(request_scoped_session_id)
 }
 
 fn stable_uuid_like(input: &str) -> String {
@@ -551,7 +539,18 @@ fn stable_uuid_like(input: &str) -> String {
 
 fn next_uuid_like(scope: &str) -> String {
     let counter = KIRO_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    stable_uuid_like(&format!("{scope}:{counter}:{}", unix_timestamp_secs()))
+    let timestamp_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    stable_uuid_like(&format!(
+        "{scope}:{}:{counter}:{timestamp_nanos}",
+        std::process::id()
+    ))
+}
+
+pub(crate) fn request_scoped_session_id() -> String {
+    next_uuid_like("request-session")
 }
 
 fn next_message_id() -> String {
@@ -574,55 +573,71 @@ fn convert_tools(
     tools: Option<&Value>,
     tool_name_map: &mut HashMap<String, String>,
     tool_mode: ToolCompatibilityMode,
-) -> Vec<Value> {
-    tools
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|tool| {
-                    let name = tool.get("name")?.as_str()?;
-                    let mapped_name = map_tool_name(name, tool_name_map, tool_mode);
-                    let mut description = tool
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    match name {
-                        "Write" => {
-                            description.push('\n');
-                            description.push_str(WRITE_TOOL_DESCRIPTION_SUFFIX);
-                        }
-                        "Edit" => {
-                            description.push('\n');
-                            description.push_str(EDIT_TOOL_DESCRIPTION_SUFFIX);
-                        }
-                        _ => {}
-                    }
-                    if description.trim().is_empty() {
-                        description = name.to_string();
-                    }
-                    description = truncate_chars(description, 10_000);
-                    let schema = tool
-                        .get("input_schema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type":"object","properties":{}}));
-                    let schema = if tool_mode == ToolCompatibilityMode::ClaudeCode {
-                        tool_bridge::schema_to_kiro(name, schema)
-                    } else {
-                        schema
-                    };
-                    Some(json!({
-                        "toolSpecification": {
-                            "name": mapped_name,
-                            "description": description,
-                            "inputSchema": { "json": normalize_schema(schema) }
-                        }
-                    }))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+) -> Result<Vec<Value>, ProxyError> {
+    let mut converted = Vec::new();
+    let mut mapped_names = HashSet::new();
+    let Some(items) = tools.and_then(Value::as_array) else {
+        return Ok(converted);
+    };
+    for tool in items {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if tool_mode == ToolCompatibilityMode::ClaudeCode && name.eq_ignore_ascii_case("fs_append")
+        {
+            continue;
+        }
+        if tool_mode == ToolCompatibilityMode::ClaudeCode
+            && name.eq_ignore_ascii_case("Read")
+            && tool.pointer("/input_schema/properties/pages").is_some()
+        {
+            return Err(ProxyError::bad_request(
+                "Kiro Claude Code tool bridge cannot preserve Read.pages",
+            ));
+        }
+        let mapped_name = map_tool_name(name, tool_name_map, tool_mode);
+        if !mapped_names.insert(mapped_name.to_ascii_lowercase()) {
+            tracing::warn!(tool = %name, mapped_tool = %mapped_name, "dropping duplicate Kiro tool after name mapping");
+            continue;
+        }
+        let mut description = tool
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match name {
+            "Write" => {
+                description.push('\n');
+                description.push_str(WRITE_TOOL_DESCRIPTION_SUFFIX);
+            }
+            "Edit" => {
+                description.push('\n');
+                description.push_str(EDIT_TOOL_DESCRIPTION_SUFFIX);
+            }
+            _ => {}
+        }
+        if description.trim().is_empty() {
+            description = name.to_string();
+        }
+        description = truncate_chars(description, 10_000);
+        let schema = tool
+            .get("input_schema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        let schema = if tool_mode == ToolCompatibilityMode::ClaudeCode {
+            tool_bridge::schema_to_kiro(name, schema)
+        } else {
+            schema
+        };
+        converted.push(json!({
+            "toolSpecification": {
+                "name": mapped_name,
+                "description": description,
+                "inputSchema": { "json": normalize_schema(schema) }
+            }
+        }));
+    }
+    Ok(converted)
 }
 
 fn normalize_schema(schema: Value) -> Value {
@@ -1091,7 +1106,7 @@ fn add_missing_history_tools(tools: &mut Vec<Value>, history: &[Value]) {
         .filter_map(|tool| {
             tool.pointer("/toolSpecification/name")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(|name| name.to_ascii_lowercase())
         })
         .collect();
     let mut missing = Vec::new();
@@ -1107,7 +1122,7 @@ fn add_missing_history_tools(tools: &mut Vec<Value>, history: &[Value]) {
             let Some(name) = tool_use.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if existing_names.insert(name.to_string()) {
+            if existing_names.insert(name.to_ascii_lowercase()) {
                 missing.push(json!({
                     "toolSpecification": {
                         "name": name,
@@ -1499,10 +1514,20 @@ struct SseBuilder {
 
 impl SseBuilder {
     fn new(model: String, tool_name_map: HashMap<String, String>) -> Self {
+        let context_window = context_window_size(&model);
+        Self::new_with_context_window(model, tool_name_map, context_window)
+    }
+
+    fn new_with_context_window(
+        model: String,
+        tool_name_map: HashMap<String, String>,
+        context_window: u64,
+    ) -> Self {
         Self {
             message_id: next_message_id(),
             model,
             tool_name_map,
+            usage: KiroUsageAccumulator::with_context_window(context_window),
             ..Default::default()
         }
     }
@@ -1779,17 +1804,19 @@ impl SseBuilder {
             "tool_use"
         };
         let usage = self.usage.final_usage(self.output_tokens);
+        let mut usage_json = json!({
+            "input_tokens":usage.input_tokens,
+            "output_tokens":usage.output_tokens,
+            "cache_read_input_tokens":usage.cache_read_tokens,
+            "cache_creation_input_tokens":usage.cache_creation_tokens
+        });
+        usage.apply_metering_fields(&mut usage_json);
         out.push(sse(
             "message_delta",
             json!({
                 "type":"message_delta",
                 "delta":{"stop_reason":stop_reason,"stop_sequence":null},
-                "usage":{
-                    "input_tokens":usage.input_tokens,
-                    "output_tokens":usage.output_tokens,
-                    "cache_read_input_tokens":usage.cache_read_tokens,
-                    "cache_creation_input_tokens":usage.cache_creation_tokens
-                }
+                "usage":usage_json
             }),
         ));
         out.push(sse("message_stop", json!({"type":"message_stop"})));
@@ -1797,7 +1824,7 @@ impl SseBuilder {
     }
 
     fn usage_event(&mut self, event_type: &str, payload: &Value) {
-        self.usage.apply_event(event_type, payload, &self.model);
+        self.usage.apply_event(event_type, payload);
     }
 
     fn set_prompt_cache_usage(&mut self, usage: KiroPromptCacheUsage) {
@@ -2112,6 +2139,30 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts(
     first_frame_deadline: Option<tokio::time::Instant>,
     idle_timeout: Option<Duration>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let context_window = context_window_size(&model);
+    kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
+        stream,
+        model,
+        tool_name_map,
+        request_body,
+        cache_namespace,
+        first_frame_deadline,
+        idle_timeout,
+        context_window,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps the stream contract and its timeout/context bounds explicit.
+pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    model: String,
+    tool_name_map: HashMap<String, String>,
+    request_body: &Value,
+    cache_namespace: &str,
+    first_frame_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Option<Duration>,
+    context_window: u64,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
     kiro_event_stream_to_anthropic_sse(
         stream,
@@ -2120,6 +2171,7 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts(
         prompt_cache_usage,
         first_frame_deadline,
         idle_timeout,
+        context_window,
     )
 }
 
@@ -2130,10 +2182,11 @@ fn kiro_event_stream_to_anthropic_sse(
     prompt_cache_usage: KiroPromptCacheUsage,
     first_frame_deadline: Option<tokio::time::Instant>,
     idle_timeout: Option<Duration>,
+    context_window: u64,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut decoder = wire::EventStreamDecoder::strict();
-        let mut builder = SseBuilder::new(model, tool_name_map);
+        let mut builder = SseBuilder::new_with_context_window(model, tool_name_map, context_window);
         builder.set_prompt_cache_usage(prompt_cache_usage);
         yield Ok(builder.initial());
         tokio::pin!(stream);
@@ -2291,8 +2344,32 @@ pub(crate) fn kiro_event_bytes_to_claude_json_scoped(
     request_body: &Value,
     cache_namespace: &str,
 ) -> Result<Value, KiroToolJsonError> {
+    kiro_event_bytes_to_claude_json_scoped_with_context_window(
+        bytes,
+        model,
+        tool_name_map,
+        request_body,
+        cache_namespace,
+        context_window_size(model),
+    )
+}
+
+pub(crate) fn kiro_event_bytes_to_claude_json_scoped_with_context_window(
+    bytes: &[u8],
+    model: &str,
+    tool_name_map: &HashMap<String, String>,
+    request_body: &Value,
+    cache_namespace: &str,
+    context_window: u64,
+) -> Result<Value, KiroToolJsonError> {
     let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
-    kiro_event_bytes_to_anthropic_json(bytes, model, tool_name_map, prompt_cache_usage)
+    kiro_event_bytes_to_anthropic_json_with_context_window(
+        bytes,
+        model,
+        tool_name_map,
+        prompt_cache_usage,
+        context_window,
+    )
 }
 
 fn kiro_event_bytes_to_anthropic_json(
@@ -2300,6 +2377,22 @@ fn kiro_event_bytes_to_anthropic_json(
     model: &str,
     tool_name_map: &HashMap<String, String>,
     prompt_cache_usage: KiroPromptCacheUsage,
+) -> Result<Value, KiroToolJsonError> {
+    kiro_event_bytes_to_anthropic_json_with_context_window(
+        bytes,
+        model,
+        tool_name_map,
+        prompt_cache_usage,
+        context_window_size(model),
+    )
+}
+
+fn kiro_event_bytes_to_anthropic_json_with_context_window(
+    bytes: &[u8],
+    model: &str,
+    tool_name_map: &HashMap<String, String>,
+    prompt_cache_usage: KiroPromptCacheUsage,
+    context_window: u64,
 ) -> Result<Value, KiroToolJsonError> {
     let mut decoder = wire::EventStreamDecoder::strict();
     let mut frames = decoder.feed(bytes)?;
@@ -2314,7 +2407,7 @@ fn kiro_event_bytes_to_anthropic_json(
     let mut tool_errors = Vec::new();
     let mut seen_tool_signatures = HashSet::new();
     let mut tool_leak_filter = ToolLeakFilter::default();
-    let mut usage = KiroUsageAccumulator::default();
+    let mut usage = KiroUsageAccumulator::with_context_window(context_window);
     usage.set_prompt_cache_usage(prompt_cache_usage);
     let mut saw_end = false;
     for frame in frames {
@@ -2368,7 +2461,7 @@ fn kiro_event_bytes_to_anthropic_json(
                 event_type,
                 payload,
             } => {
-                usage.apply_event(&event_type, &payload, model);
+                usage.apply_event(&event_type, &payload);
             }
             wire::Event::End => saw_end = true,
             wire::Event::Unknown { .. } => {}
@@ -2429,6 +2522,13 @@ fn kiro_event_bytes_to_anthropic_json(
         "end_turn"
     };
     let usage = usage.final_usage(fallback_output_tokens);
+    let mut usage_json = json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_input_tokens": usage.cache_read_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_tokens
+    });
+    usage.apply_metering_fields(&mut usage_json);
     Ok(json!({
         "id": next_message_id(),
         "type": "message",
@@ -2437,12 +2537,7 @@ fn kiro_event_bytes_to_anthropic_json(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cache_read_input_tokens": usage.cache_read_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_tokens
-        }
+        "usage": usage_json
     }))
 }
 
@@ -2762,16 +2857,34 @@ fn unix_timestamp_secs() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct KiroUsage {
     input_tokens: i32,
     output_tokens: i32,
     cache_read_tokens: i32,
     cache_creation_tokens: i32,
+    credit_usage: Option<f64>,
+    credit_unit: Option<String>,
+    credit_unit_plural: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+impl KiroUsage {
+    fn apply_metering_fields(&self, usage: &mut Value) {
+        if let Some(value) = self.credit_usage {
+            usage["credit_usage"] = json!(value);
+        }
+        if let Some(value) = self.credit_unit.as_deref() {
+            usage["credit_unit"] = json!(value);
+        }
+        if let Some(value) = self.credit_unit_plural.as_deref() {
+            usage["credit_unit_plural"] = json!(value);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct KiroUsageAccumulator {
+    context_window: u64,
     context_input_tokens: Option<i32>,
     metrics_input_tokens: Option<i32>,
     output_tokens: Option<i32>,
@@ -2779,29 +2892,83 @@ struct KiroUsageAccumulator {
     cache_creation_tokens: Option<i32>,
     prompt_cache_read_tokens: i32,
     prompt_cache_creation_tokens: i32,
+    credit_usage: Option<f64>,
+    credit_unit: Option<String>,
+    credit_unit_plural: Option<String>,
+}
+
+impl Default for KiroUsageAccumulator {
+    fn default() -> Self {
+        Self::with_context_window(200_000)
+    }
 }
 
 impl KiroUsageAccumulator {
+    fn with_context_window(context_window: u64) -> Self {
+        Self {
+            context_window: context_window.max(1),
+            context_input_tokens: None,
+            metrics_input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            prompt_cache_read_tokens: 0,
+            prompt_cache_creation_tokens: 0,
+            credit_usage: None,
+            credit_unit: None,
+            credit_unit_plural: None,
+        }
+    }
     fn set_prompt_cache_usage(&mut self, usage: KiroPromptCacheUsage) {
         self.prompt_cache_read_tokens = usage.cache_read_tokens;
         self.prompt_cache_creation_tokens = usage.cache_creation_tokens;
     }
 
-    fn apply_event(&mut self, event_type: &str, payload: &Value, model: &str) {
+    fn apply_event(&mut self, event_type: &str, payload: &Value) {
         match event_type {
             "contextUsageEvent" => {
-                if let Some(tokens) = context_usage_input_tokens(payload, model) {
+                if let Some(tokens) = context_usage_input_tokens(payload, self.context_window) {
                     self.context_input_tokens = Some(tokens);
                 }
             }
             "metricsEvent" => self.apply_metrics(payload),
-            "messageMetadataEvent" | "metadataEvent" => self.apply_metadata(payload, model),
-            "meteringEvent" => {}
+            "messageMetadataEvent" | "metadataEvent" => self.apply_metadata(payload),
+            "meteringEvent" => self.apply_metering(payload),
             _ => {}
         }
     }
 
-    fn apply_metadata(&mut self, payload: &Value, model: &str) {
+    fn apply_metering(&mut self, payload: &Value) {
+        const MAX_CREDIT_USAGE: f64 = 1_000_000_000.0;
+        let metering = payload.get("meteringEvent").unwrap_or(payload);
+        let Some(usage) = number_f64_field(metering, &["usage", "creditUsage", "credit_usage"])
+            .filter(|usage| (0.0..=MAX_CREDIT_USAGE).contains(usage))
+        else {
+            return;
+        };
+        let next = self.credit_usage.unwrap_or(0.0) + usage;
+        if !next.is_finite() || next > MAX_CREDIT_USAGE {
+            return;
+        }
+        self.credit_usage = Some(next);
+        self.credit_unit = metering
+            .get("unit")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.credit_unit.take());
+        self.credit_unit_plural = metering
+            .get("unitPlural")
+            .or_else(|| metering.get("unit_plural"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.credit_unit_plural.take());
+    }
+
+    fn apply_metadata(&mut self, payload: &Value) {
         let metadata = payload
             .get("messageMetadataEvent")
             .or_else(|| payload.get("metadataEvent"))
@@ -2863,8 +3030,7 @@ impl KiroUsageAccumulator {
                 token_usage,
                 &["contextUsagePercentage", "context_usage_percentage"],
             ) {
-                let tokens =
-                    (percentage * context_window_size(model) as f64 / 100.0).floor() as i32;
+                let tokens = (percentage * self.context_window as f64 / 100.0).floor() as i32;
                 if tokens > 0 && self.metrics_input_tokens.is_none() {
                     self.context_input_tokens = Some(tokens);
                 }
@@ -2941,6 +3107,9 @@ impl KiroUsageAccumulator {
             output_tokens: self.output_tokens.unwrap_or(fallback_output_tokens).max(0),
             cache_read_tokens,
             cache_creation_tokens,
+            credit_usage: self.credit_usage,
+            credit_unit: self.credit_unit.clone(),
+            credit_unit_plural: self.credit_unit_plural.clone(),
         }
     }
 }
@@ -2981,11 +3150,10 @@ fn sse(event: &str, data: Value) -> Bytes {
     ))
 }
 
-fn context_usage_input_tokens(payload: &Value, model: &str) -> Option<i32> {
+fn context_usage_input_tokens(payload: &Value, context_window: u64) -> Option<i32> {
     let value = payload.get("contextUsageEvent").unwrap_or(payload);
     let percentage = number_f64_field(value, &["contextUsagePercentage"])?;
-    Some((percentage * context_window_size(model) as f64 / 100.0).floor() as i32)
-        .filter(|tokens| *tokens > 0)
+    Some((percentage * context_window as f64 / 100.0).floor() as i32).filter(|tokens| *tokens > 0)
 }
 
 fn number_field(value: &Value, keys: &[&str]) -> Option<i32> {
@@ -3024,13 +3192,8 @@ fn number_f64_value(value: &Value) -> Option<f64> {
     value.as_u64().map(|n| n as f64)
 }
 
-fn context_window_size(model: &str) -> i32 {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.contains("[1m]") || normalized.contains("-1m") {
-        1_000_000
-    } else {
-        200_000
-    }
+fn context_window_size(model: &str) -> u64 {
+    model::fallback_context_window(model).0
 }
 
 fn estimate_tokens(text: &str) -> i32 {
@@ -3157,6 +3320,37 @@ fn count_image_tokens(object: &serde_json::Map<String, Value>) -> Result<u64, Pr
         .saturating_add(749)
         / 750;
     Ok((tiles as u64).max(85))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KiroThrottleClass {
+    QuotaExhausted,
+    SuspiciousActivity,
+    OrdinaryOverload,
+}
+
+pub(crate) fn classify_throttle(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> Option<KiroThrottleClass> {
+    let body = String::from_utf8_lossy(body);
+    if is_quota_exhausted(&body) {
+        Some(KiroThrottleClass::QuotaExhausted)
+    } else if is_account_throttled(status, &body) {
+        Some(KiroThrottleClass::SuspiciousActivity)
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        Some(KiroThrottleClass::OrdinaryOverload)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn throttle_default_cooldown(class: KiroThrottleClass) -> Duration {
+    Duration::from_secs(match class {
+        KiroThrottleClass::QuotaExhausted => QUOTA_EXHAUSTED_COOLDOWN_SECS as u64,
+        KiroThrottleClass::SuspiciousActivity => ACCOUNT_THROTTLE_COOLDOWN_SECS as u64,
+        KiroThrottleClass::OrdinaryOverload => 60,
+    })
 }
 
 fn is_quota_exhausted(body: &str) -> bool {
@@ -3290,12 +3484,43 @@ mod tests {
 
         let fixture: Value = serde_json::from_str(WIRE_PROTOCOL_JSON).unwrap();
         assert_eq!(fixture["format"], "cc-switch-kiro-wire-protocol");
-        assert_eq!(fixture["schemaVersion"], 1);
+        assert_eq!(fixture["schemaVersion"], 2);
         assert_eq!(fixture["accountBinding"]["mode"], "single_explicit_account");
         assert_eq!(fixture["accountBinding"]["accountPool"], false);
         assert_eq!(fixture["accountBinding"]["rotation"], false);
         assert_eq!(fixture["accountBinding"]["crossAccountFailover"], false);
         assert_eq!(fixture["accountBinding"]["crossProviderFailover"], false);
+        assert_eq!(fixture["modelCapabilities"]["singleResolver"], true);
+        assert_eq!(
+            fixture["modelCapabilities"]["catalogAuthorizedFutureModelPassThrough"],
+            true
+        );
+        assert_eq!(
+            fixture["modelCapabilities"]["arbitraryUnknownModelPassThrough"],
+            false
+        );
+        assert_eq!(
+            fixture["modelCapabilities"]["staticAuthorization"],
+            "exact_audited_model_id_after_alias_normalization"
+        );
+        assert_eq!(
+            fixture["modelCapabilities"]["catalogModelIdPolicy"],
+            "preserve_authoritative_descriptor_id_verbatim"
+        );
+        assert_eq!(
+            fixture["promptCache"]["missingSessionPolicy"],
+            "request_scoped_anonymous"
+        );
+        assert_eq!(
+            fixture["downstreamKeepalive"]["satisfiesFirstFrameDeadline"],
+            false
+        );
+        assert_eq!(
+            fixture["downstreamKeepalive"]["resetsUpstreamIdleDeadline"],
+            false
+        );
+        assert_eq!(fixture["providerMetering"]["tokenUsageIndependent"], true);
+        assert_eq!(fixture["providerMetering"]["explicitZeroPreserved"], true);
 
         let recovery = &fixture["accountBinding"]["unauthorizedRecovery"];
         assert_eq!(recovery["refreshAttempts"], 1);
@@ -3394,6 +3619,15 @@ mod tests {
             fixture["promptCache"]["maxTtlSeconds"],
             PROMPT_CACHE_MAX_TTL_SECS
         );
+    }
+
+    #[test]
+    fn anonymous_request_sessions_never_share_a_cache_scope() {
+        let first = request_scoped_session_id();
+        let second = request_scoped_session_id();
+        assert_ne!(first, second);
+        assert!(looks_uuid_like(&first));
+        assert!(looks_uuid_like(&second));
     }
 
     #[test]
@@ -3599,10 +3833,19 @@ mod tests {
     }
 
     #[test]
-    fn map_model_supports_4_8_aliases() {
-        assert_eq!(map_model("claude-sonnet-4-8"), Some("claude-sonnet-4.8"));
-        assert_eq!(map_model("claude-opus-4.8"), Some("claude-opus-4.8"));
-        assert_eq!(map_model("claude-haiku-4-5"), Some("claude-haiku-4.5"));
+    fn resolver_supports_4_8_aliases() {
+        assert_eq!(
+            resolve_model("claude-sonnet-4-8").as_deref(),
+            Some("claude-sonnet-4.8")
+        );
+        assert_eq!(
+            resolve_model("claude-opus-4.8").as_deref(),
+            Some("claude-opus-4.8")
+        );
+        assert_eq!(
+            resolve_model("claude-haiku-4-5").as_deref(),
+            Some("claude-haiku-4.5")
+        );
     }
 
     #[test]
@@ -3714,14 +3957,14 @@ mod tests {
             request
                 .body
                 .pointer("/additionalModelRequestFields/thinking/type"),
-            Some(&json!("adaptive"))
+            None
         );
     }
 
     #[test]
-    fn conversion_emits_output_config_for_new_4_8_models() {
+    fn conversion_emits_output_config_for_confirmed_opus_4_8() {
         let body = json!({
-            "model": "claude-sonnet-4-8-thinking",
+            "model": "claude-opus-4-8-thinking",
             "thinking": { "type": "adaptive" },
             "output_config": { "effort": "max" },
             "messages": [{ "role": "user", "content": "think" }]
@@ -3749,6 +3992,82 @@ mod tests {
         let request =
             anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
         assert!(request.body.get("additionalModelRequestFields").is_none());
+    }
+
+    #[test]
+    fn claude_code_tool_bridge_dedupes_mapped_names_and_rejects_read_pages() {
+        let mut tool_name_map = HashMap::new();
+        let tools = json!([
+            {"name":"Read","input_schema":{"type":"object","properties":{}}},
+            {"name":"read","input_schema":{"type":"object","properties":{}}},
+            {"name":"FS_APPEND","input_schema":{"type":"object","properties":{}}}
+        ]);
+        let converted = convert_tools(
+            Some(&tools),
+            &mut tool_name_map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(converted.len(), 1);
+
+        let pages = json!([{
+            "name":"Read",
+            "input_schema":{"type":"object","properties":{"pages":{"type":"string"}}}
+        }]);
+        assert!(convert_tools(
+            Some(&pages),
+            &mut HashMap::new(),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn metering_credits_are_supplemental_to_token_usage() {
+        let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+        builder.usage_event(
+            "metricsEvent",
+            &json!({"metricsEvent":{"inputTokens":100,"outputTokens":10}}),
+        );
+        builder.usage_event(
+            "meteringEvent",
+            &json!({"meteringEvent":{"usage":0.25,"unit":"credit","unitPlural":"credits"}}),
+        );
+        builder.usage_event(
+            "meteringEvent",
+            &json!({"usage":0.5,"unit":"credit","unitPlural":"credits"}),
+        );
+        let output = builder
+            .final_events()
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.contains("\"credit_usage\":0.75"));
+        assert!(output.contains("\"credit_unit\":\"credit\""));
+        assert!(output.contains("\"input_tokens\":100"));
+        assert!(output.contains("\"output_tokens\":10"));
+    }
+
+    #[test]
+    fn metering_preserves_explicit_zero_and_ignores_invalid_amounts() {
+        let mut usage = KiroUsageAccumulator::default();
+        usage.apply_event("meteringEvent", &json!({"usage":-1.0,"unit":"invalid"}));
+        let absent = usage.final_usage(0);
+        assert_eq!(absent.credit_usage, None);
+        assert_eq!(absent.credit_unit, None);
+
+        usage.apply_event(
+            "meteringEvent",
+            &json!({"usage":0.0,"unit":"credit","unitPlural":"credits"}),
+        );
+        usage.apply_event(
+            "meteringEvent",
+            &json!({"usage":1_000_000_001.0,"unit":"invalid","unitPlural":"invalids"}),
+        );
+        let explicit_zero = usage.final_usage(0);
+        assert_eq!(explicit_zero.credit_usage, Some(0.0));
+        assert_eq!(explicit_zero.credit_unit.as_deref(), Some("credit"));
+        assert_eq!(explicit_zero.credit_unit_plural.as_deref(), Some("credits"));
     }
 
     #[test]
@@ -4007,7 +4326,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(bytes.contains("\"input_tokens\":2982"));
+        assert!(bytes.contains("\"input_tokens\":14982"));
         assert!(bytes.contains("\"output_tokens\":42"));
         assert!(bytes.contains("\"cache_read_input_tokens\":7"));
         assert!(bytes.contains("\"cache_creation_input_tokens\":11"));
@@ -4132,7 +4451,6 @@ mod tests {
         usage.apply_event(
             "metricsEvent",
             &json!({ "metricsEvent": { "inputTokens": 1_000, "outputTokens": 9 } }),
-            "claude-opus-4-7",
         );
 
         let usage = usage.final_usage(1);
@@ -4144,16 +4462,14 @@ mod tests {
 
     #[test]
     fn kiro_metrics_input_overrides_context_usage_when_available() {
-        let mut usage = KiroUsageAccumulator::default();
+        let mut usage = KiroUsageAccumulator::with_context_window(1_000_000);
         usage.apply_event(
             "contextUsageEvent",
             &json!({ "contextUsageEvent": { "contextUsagePercentage": 2.0 } }),
-            "claude-sonnet-4-8[1m]",
         );
         usage.apply_event(
             "metricsEvent",
             &json!({ "inputTokens": 123, "outputTokens": 9 }),
-            "claude-sonnet-4-8[1m]",
         );
 
         let usage = usage.final_usage(1);
@@ -4167,12 +4483,10 @@ mod tests {
         usage.apply_event(
             "metricsEvent",
             &json!({ "metricsEvent": { "inputTokens": 123, "outputTokens": 9 } }),
-            "claude-sonnet-4-8",
         );
         usage.apply_event(
             "contextUsageEvent",
             &json!({ "contextUsagePercentage": 2.0 }),
-            "claude-sonnet-4-8",
         );
 
         let usage = usage.final_usage(1);
@@ -4195,7 +4509,6 @@ mod tests {
                     }
                 }
             }),
-            "claude-sonnet-4-8",
         );
 
         let usage = usage.final_usage(1);
@@ -4207,13 +4520,33 @@ mod tests {
 
     #[test]
     fn detects_kiro_quota_and_account_throttle_errors() {
-        assert!(is_quota_exhausted(
-            r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#
-        ));
-        assert!(is_account_throttled(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "Due to suspicious activity, we are imposing temporary limits"
-        ));
+        let quota = br#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
+        assert_eq!(
+            classify_throttle(reqwest::StatusCode::FORBIDDEN, quota),
+            Some(KiroThrottleClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_throttle(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                b"Due to suspicious activity, we are imposing temporary limits"
+            ),
+            Some(KiroThrottleClass::SuspiciousActivity)
+        );
+        assert_eq!(
+            classify_throttle(reqwest::StatusCode::TOO_MANY_REQUESTS, b"busy"),
+            Some(KiroThrottleClass::OrdinaryOverload)
+        );
+        assert_eq!(
+            classify_throttle(reqwest::StatusCode::SERVICE_UNAVAILABLE, b"busy"),
+            None
+        );
+        assert_eq!(
+            classify_throttle(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                br#"{"message":"MONTHLY_REQUEST_COUNT-like text","reason":"OTHER"}"#
+            ),
+            Some(KiroThrottleClass::OrdinaryOverload)
+        );
     }
 
     #[test]

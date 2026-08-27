@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -18,7 +18,7 @@ const STALE_MODEL_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub struct KiroModelCatalog {
-    pub models: Vec<String>,
+    pub descriptors: Vec<KiroModelDescriptor>,
     pub source: &'static str,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
@@ -26,7 +26,7 @@ pub struct KiroModelCatalog {
 
 #[derive(Debug, Clone)]
 struct CachedModels {
-    models: Vec<String>,
+    descriptors: Vec<KiroModelDescriptor>,
     fetched_at_ms: i64,
 }
 
@@ -65,6 +65,43 @@ struct AvailableModelsResponse {
 #[serde(rename_all = "camelCase")]
 struct AvailableModel {
     model_id: String,
+    #[serde(default, alias = "name")]
+    model_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    token_limits: Option<AvailableModelTokenLimits>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableModelTokenLimits {
+    #[serde(default)]
+    max_input_tokens: Option<i64>,
+    #[serde(default)]
+    max_output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroModelDescriptor {
+    pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
+impl KiroModelCatalog {
+    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
+        self.descriptors
+            .iter()
+            .map(|descriptor| descriptor.model_id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +114,7 @@ enum ModelDiscoveryFailureKind {
 struct ModelDiscoveryFailure {
     kind: ModelDiscoveryFailureKind,
     message: String,
+    status: Option<reqwest::StatusCode>,
 }
 
 impl ModelDiscoveryFailure {
@@ -84,6 +122,7 @@ impl ModelDiscoveryFailure {
         Self {
             kind: ModelDiscoveryFailureKind::Transient,
             message: message.into(),
+            status: None,
         }
     }
 
@@ -91,6 +130,23 @@ impl ModelDiscoveryFailure {
         Self {
             kind: ModelDiscoveryFailureKind::Unavailable,
             message: message.into(),
+            status: None,
+        }
+    }
+
+    fn transient_with_status(message: impl Into<String>, status: reqwest::StatusCode) -> Self {
+        Self {
+            kind: ModelDiscoveryFailureKind::Transient,
+            message: message.into(),
+            status: Some(status),
+        }
+    }
+
+    fn unavailable_with_status(message: impl Into<String>, status: reqwest::StatusCode) -> Self {
+        Self {
+            kind: ModelDiscoveryFailureKind::Unavailable,
+            message: message.into(),
+            status: Some(status),
         }
     }
 }
@@ -205,7 +261,7 @@ pub async fn model_catalog_with_timeout(
         .cloned()
     {
         return KiroModelCatalog {
-            models: cached.models,
+            descriptors: cached.descriptors,
             source: "kiro_account_cache",
             stale: false,
             fetched_at_ms: Some(cached.fetched_at_ms),
@@ -215,23 +271,23 @@ pub async fn model_catalog_with_timeout(
     let fetched = fetch_models(
         http,
         account,
-        &identity.runtime_region,
+        &identity,
         access_token,
         endpoint_override,
         request_timeout,
     )
     .await;
     match fetched {
-        Ok(models) => {
+        Ok(descriptors) => {
             CACHE.lock().await.models.insert(
                 cache_key,
                 CachedModels {
-                    models: models.clone(),
+                    descriptors: descriptors.clone(),
                     fetched_at_ms: now,
                 },
             );
             KiroModelCatalog {
-                models,
+                descriptors,
                 source: "kiro_list_available_models",
                 stale: false,
                 fetched_at_ms: Some(now),
@@ -254,7 +310,7 @@ pub async fn model_catalog_with_timeout(
                 .cloned()
             {
                 KiroModelCatalog {
-                    models: cached.models,
+                    descriptors: cached.descriptors,
                     source: "kiro_account_cache",
                     stale: true,
                     fetched_at_ms: Some(cached.fetched_at_ms),
@@ -266,12 +322,50 @@ pub async fn model_catalog_with_timeout(
     }
 }
 
+pub(crate) async fn cached_model_descriptor(
+    account: &Account,
+    model_id: &str,
+) -> Option<Option<KiroModelDescriptor>> {
+    let now = now_ms().min(i64::MAX as u128) as i64;
+    let identity =
+        crate::domain::providers::kiro::operational_runtime_identity_from_account(account).ok()?;
+    let cache_key = ModelCacheKey {
+        account_id: account.id.clone(),
+        auth_identity_generation: account.auth_identity_generation,
+        token_refresh_generation: account.token_refresh_generation,
+        profile_scope: identity
+            .profile_arn
+            .unwrap_or_else(|| "profileless_api_key".to_string()),
+        runtime_region: identity.runtime_region,
+    };
+    CACHE
+        .lock()
+        .await
+        .models
+        .get(&cache_key)
+        .filter(|cached| now.saturating_sub(cached.fetched_at_ms) < STALE_MODEL_CACHE_TTL_MS)
+        .map(|cached| {
+            cached
+                .descriptors
+                .iter()
+                .find(|model| model.model_id.eq_ignore_ascii_case(model_id))
+                .cloned()
+        })
+}
+
 pub fn static_model_catalog(source: &'static str) -> KiroModelCatalog {
+    let descriptors = crate::domain::providers::kiro::STATIC_MODEL_IDS
+        .iter()
+        .map(|model_id| KiroModelDescriptor {
+            model_id: (*model_id).to_string(),
+            display_name: None,
+            description: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+        })
+        .collect();
     KiroModelCatalog {
-        models: crate::domain::providers::kiro::STATIC_MODEL_IDS
-            .iter()
-            .map(|model| (*model).to_string())
-            .collect(),
+        descriptors,
         source,
         stale: true,
         fetched_at_ms: None,
@@ -280,7 +374,7 @@ pub fn static_model_catalog(source: &'static str) -> KiroModelCatalog {
 
 pub fn unavailable_model_catalog(source: &'static str) -> KiroModelCatalog {
     KiroModelCatalog {
-        models: Vec::new(),
+        descriptors: Vec::new(),
         source,
         stale: false,
         fetched_at_ms: None,
@@ -290,27 +384,94 @@ pub fn unavailable_model_catalog(source: &'static str) -> KiroModelCatalog {
 async fn fetch_models(
     http: &reqwest::Client,
     account: &Account,
-    region: &str,
+    identity: &crate::domain::providers::kiro::KiroRuntimeIdentity,
     access_token: &str,
     endpoint_override: Option<&str>,
     request_timeout: Duration,
-) -> Result<Vec<String>, ModelDiscoveryFailure> {
-    let host = format!("q.{region}.amazonaws.com");
-    let url = endpoint_override
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("https://{host}/ListAvailableModels?origin=AI_EDITOR"));
+) -> Result<Vec<KiroModelDescriptor>, ModelDiscoveryFailure> {
     let machine_id = account_string(account, &["/machineId", "/machine_id"])
         .unwrap_or_else(|| account.id.clone());
-    fetch_models_request(
-        http,
-        &url,
-        &host,
-        access_token,
-        &machine_id,
-        kiro_token_type(account),
-        request_timeout,
-    )
-    .await
+    if let Some(endpoint) = endpoint_override {
+        let host = reqwest::Url::parse(endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| format!("q.{}.amazonaws.com", identity.runtime_region));
+        let mut attempts = Vec::new();
+        if let Some(profile_arn) = identity.profile_arn.as_deref() {
+            attempts.push(Some(profile_arn));
+        }
+        attempts.push(None);
+        let mut last_failure = None;
+        for profile_arn in attempts {
+            let url = discovery_url(endpoint, profile_arn)?;
+            match fetch_models_request(
+                http,
+                &url,
+                &host,
+                access_token,
+                &machine_id,
+                kiro_token_type(account),
+                request_timeout,
+            )
+            .await
+            {
+                Ok(models) => return Ok(models),
+                Err(error)
+                    if error.status == Some(reqwest::StatusCode::FORBIDDEN)
+                        && profile_arn.is_some() =>
+                {
+                    last_failure = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return Err(last_failure.unwrap_or_else(|| {
+            ModelDiscoveryFailure::transient("Kiro model discovery produced no attempt")
+        }));
+    }
+
+    let mut last_failure = None;
+    for region in discovery_region_candidates(&identity.runtime_region) {
+        let host = format!("q.{region}.amazonaws.com");
+        let base = format!("https://{host}/ListAvailableModels?origin=AI_EDITOR");
+        let mut profile_attempts = Vec::new();
+        if let Some(profile_arn) = identity.profile_arn.as_deref() {
+            profile_attempts.push(Some(profile_arn));
+        }
+        profile_attempts.push(None);
+        for profile_arn in profile_attempts {
+            let url = discovery_url(&base, profile_arn)?;
+            match fetch_models_request(
+                http,
+                &url,
+                &host,
+                access_token,
+                &machine_id,
+                kiro_token_type(account),
+                request_timeout,
+            )
+            .await
+            {
+                Ok(models) => return Ok(models),
+                Err(error)
+                    if error.status == Some(reqwest::StatusCode::FORBIDDEN)
+                        && profile_arn.is_some() =>
+                {
+                    last_failure = Some(error);
+                }
+                Err(error) => {
+                    let retry_region = error.status == Some(reqwest::StatusCode::FORBIDDEN);
+                    last_failure = Some(error);
+                    if !retry_region {
+                        return Err(last_failure.expect("failure was set"));
+                    }
+                }
+            }
+        }
+    }
+    Err(last_failure.unwrap_or_else(|| {
+        ModelDiscoveryFailure::transient("no Kiro discovery endpoint candidates")
+    }))
 }
 
 pub(crate) async fn fetch_models_for_api_key(
@@ -333,6 +494,7 @@ pub(crate) async fn fetch_models_for_api_key(
         request_timeout,
     )
     .await
+    .map(|models| models.into_iter().map(|model| model.model_id).collect())
     .map_err(|error| error.to_string())
 }
 
@@ -344,7 +506,7 @@ async fn fetch_models_request(
     machine_id: &str,
     token_type: Option<&str>,
     request_timeout: Duration,
-) -> Result<Vec<String>, ModelDiscoveryFailure> {
+) -> Result<Vec<KiroModelDescriptor>, ModelDiscoveryFailure> {
     let mut request = http
         .get(url)
         .header(
@@ -366,7 +528,20 @@ async fn fetch_models_request(
     let response = tokio::time::timeout(request_timeout, request.send())
         .await
         .map_err(|_| ModelDiscoveryFailure::transient("model discovery timed out"))?
-        .map_err(|error| ModelDiscoveryFailure::transient(error.to_string()))?;
+        .map_err(|error| {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else if error.is_request() {
+                "request"
+            } else if error.is_body() {
+                "body"
+            } else {
+                "transport"
+            };
+            ModelDiscoveryFailure::transient(format!("model discovery transport failed ({kind})"))
+        })?;
     if !response.status().is_success() {
         let status = response.status();
         let message = format!("model discovery returned {status}");
@@ -377,38 +552,135 @@ async fn fetch_models_request(
                     reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
                 )
             {
-                ModelDiscoveryFailure::transient(message)
+                ModelDiscoveryFailure::transient_with_status(message, status)
             } else {
-                ModelDiscoveryFailure::unavailable(message)
+                ModelDiscoveryFailure::unavailable_with_status(message, status)
             },
         );
     }
     let payload = response
         .json::<AvailableModelsResponse>()
         .await
-        .map_err(|error| ModelDiscoveryFailure::transient(error.to_string()))?;
-    let mut models = payload
+        .map_err(|_| {
+            ModelDiscoveryFailure::transient("model discovery response was not valid JSON")
+        })?;
+    let models = payload
         .models
         .into_iter()
-        .map(|model| model.model_id.trim().to_string())
-        .filter(|model| !model.is_empty())
+        .filter_map(|model| {
+            let model_id = model.model_id.trim().to_string();
+            valid_model_id(&model_id).then(|| KiroModelDescriptor {
+                model_id,
+                display_name: clean_optional(model.model_name),
+                description: clean_optional(model.description),
+                max_input_tokens: valid_token_limit(
+                    model
+                        .token_limits
+                        .as_ref()
+                        .and_then(|limits| limits.max_input_tokens),
+                ),
+                max_output_tokens: valid_token_limit(
+                    model
+                        .token_limits
+                        .as_ref()
+                        .and_then(|limits| limits.max_output_tokens),
+                ),
+            })
+        })
         .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
-    Ok(models)
+    let mut by_id = BTreeMap::<String, KiroModelDescriptor>::new();
+    for descriptor in models {
+        by_id
+            .entry(descriptor.model_id.to_ascii_lowercase())
+            .and_modify(|existing| merge_descriptor(existing, &descriptor))
+            .or_insert(descriptor);
+    }
+    Ok(by_id.into_values().collect())
 }
 
 pub fn model_discovery_url(account: &Account) -> Result<String, String> {
-    let region = account_runtime_region(account)?;
-    Ok(format!(
-        "https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
-    ))
+    let identity =
+        crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
+            .map_err(|error| format!("bound account has {error}"))?;
+    let region = discovery_region_candidates(&identity.runtime_region)[0];
+    discovery_url(
+        &format!("https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"),
+        identity.profile_arn.as_deref(),
+    )
+    .map_err(|error| error.to_string())
 }
 
-fn account_runtime_region(account: &Account) -> Result<String, String> {
-    crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
-        .map(|identity| identity.runtime_region)
-        .map_err(|error| format!("bound account has {error}"))
+fn discovery_region_candidates(region: &str) -> [&'static str; 2] {
+    if region.starts_with("eu-") {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
+    }
+}
+
+fn discovery_url(base: &str, profile_arn: Option<&str>) -> Result<String, ModelDiscoveryFailure> {
+    let mut url = reqwest::Url::parse(base).map_err(|error| {
+        ModelDiscoveryFailure::unavailable(format!("invalid model discovery URL: {error}"))
+    })?;
+    if !url.query_pairs().any(|(key, _)| key == "origin") {
+        url.query_pairs_mut().append_pair("origin", "AI_EDITOR");
+    }
+    if let Some(profile_arn) = profile_arn {
+        url.query_pairs_mut().append_pair("profileArn", profile_arn);
+    }
+    Ok(url.to_string())
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn valid_token_limit(value: Option<i64>) -> Option<u64> {
+    value
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| (1..=10_000_000).contains(value))
+}
+
+fn valid_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 128
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'[' | b']')
+        })
+}
+
+fn merge_descriptor(target: &mut KiroModelDescriptor, source: &KiroModelDescriptor) {
+    if source.model_id < target.model_id {
+        target.model_id.clone_from(&source.model_id);
+    }
+    merge_optional_text(&mut target.display_name, &source.display_name);
+    merge_optional_text(&mut target.description, &source.description);
+    target.max_input_tokens = minimum_optional(target.max_input_tokens, source.max_input_tokens);
+    target.max_output_tokens = minimum_optional(target.max_output_tokens, source.max_output_tokens);
+}
+
+fn merge_optional_text(target: &mut Option<String>, source: &Option<String>) {
+    let replace = match (target.as_deref(), source.as_deref()) {
+        (None, Some(_)) => true,
+        (Some(current), Some(candidate)) => {
+            candidate.len() > current.len()
+                || (candidate.len() == current.len() && candidate < current)
+        }
+        _ => false,
+    };
+    if replace {
+        target.clone_from(source);
+    }
+}
+
+fn minimum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn account_string(account: &Account, pointers: &[&str]) -> Option<String> {
@@ -457,10 +729,43 @@ mod tests {
     #[test]
     fn static_catalog_is_sorted_and_unique() {
         let catalog = static_model_catalog("test");
-        let mut sorted = catalog.models.clone();
+        let ids = catalog.model_ids().collect::<Vec<_>>();
+        let mut sorted = ids.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(catalog.models, sorted);
+        assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    fn duplicate_descriptors_merge_deterministically_and_conservatively() {
+        let mut first = KiroModelDescriptor {
+            model_id: "Model-A".to_string(),
+            display_name: Some("A".to_string()),
+            description: None,
+            max_input_tokens: Some(1_000_000),
+            max_output_tokens: None,
+        };
+        let second = KiroModelDescriptor {
+            model_id: "model-a".to_string(),
+            display_name: Some("Model A".to_string()),
+            description: Some("complete description".to_string()),
+            max_input_tokens: Some(200_000),
+            max_output_tokens: Some(32_000),
+        };
+        merge_descriptor(&mut first, &second);
+        assert_eq!(first.model_id, "Model-A");
+        assert_eq!(first.display_name.as_deref(), Some("Model A"));
+        assert_eq!(first.description.as_deref(), Some("complete description"));
+        assert_eq!(first.max_input_tokens, Some(200_000));
+        assert_eq!(first.max_output_tokens, Some(32_000));
+    }
+
+    #[test]
+    fn descriptor_token_limits_reject_invalid_values() {
+        assert_eq!(valid_token_limit(Some(-1)), None);
+        assert_eq!(valid_token_limit(Some(0)), None);
+        assert_eq!(valid_token_limit(Some(10_000_001)), None);
+        assert_eq!(valid_token_limit(Some(1_000_000)), Some(1_000_000));
     }
 
     #[test]
@@ -517,10 +822,11 @@ mod tests {
             "profile": {"apiRegion": "eu-west-1"}
         }))
         .unwrap();
-        assert_eq!(
-            model_discovery_url(&account).unwrap(),
-            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
-        );
+        let url = model_discovery_url(&account).unwrap();
+        assert!(url.starts_with(
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn="
+        ));
+        assert!(url.contains("arn%3Aaws%3Acodewhisperer"));
         assert_eq!(
             fixture["endpoints"]["models"]["url"],
             "https://q.{region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
@@ -540,8 +846,27 @@ mod tests {
             }
         }))
         .unwrap();
+        let url = model_discovery_url(&account).unwrap();
+        assert!(url.starts_with(
+            "https://q.eu-central-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn="
+        ));
+        assert!(url.contains("profile%2Fprofile-id"));
+    }
+
+    #[test]
+    fn api_key_model_discovery_remains_profileless() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "profileless-api-key",
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "accessToken": "ksk_fixture",
+            "profile": {"authMethod":"api_key","apiRegion":"eu-west-1"},
+            "raw": {"authMethod":"api_key"}
+        }))
+        .unwrap();
+        let url = model_discovery_url(&account).unwrap();
         assert_eq!(
-            model_discovery_url(&account).unwrap(),
+            url,
             "https://q.eu-central-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
     }
@@ -614,7 +939,12 @@ mod tests {
                         "Bearer account-b-token" => "model-account-b",
                         _ => "unexpected-model",
                     };
-                    axum::Json(json!({"models": [{"modelId": model}]}))
+                    axum::Json(json!({"models": [{
+                        "modelId": model,
+                        "modelName": "Bound model",
+                        "description": "sanitized fixture",
+                        "tokenLimits": {"maxInputTokens": 900000, "maxOutputTokens": 32000}
+                    }]}))
                 }
             }),
         );
@@ -652,12 +982,27 @@ mod tests {
         let second_generation =
             model_catalog(&http, &account_a_generation_2, Some(&endpoint)).await;
 
-        assert_eq!(first_a.models, ["model-account-a"]);
-        assert_eq!(cached_a.models, ["model-account-a"]);
+        assert_eq!(first_a.model_ids().collect::<Vec<_>>(), ["model-account-a"]);
+        assert_eq!(
+            first_a.descriptors[0].display_name.as_deref(),
+            Some("Bound model")
+        );
+        assert_eq!(first_a.descriptors[0].max_input_tokens, Some(900_000));
+        assert_eq!(first_a.descriptors[0].max_output_tokens, Some(32_000));
+        assert_eq!(
+            cached_a.model_ids().collect::<Vec<_>>(),
+            ["model-account-a"]
+        );
         assert_eq!(cached_a.source, "kiro_account_cache");
-        assert_eq!(first_b.models, ["model-account-b"]);
-        assert_eq!(refreshed.models, ["model-account-a-refreshed"]);
-        assert_eq!(second_generation.models, ["model-account-a-generation-2"]);
+        assert_eq!(first_b.model_ids().collect::<Vec<_>>(), ["model-account-b"]);
+        assert_eq!(
+            refreshed.model_ids().collect::<Vec<_>>(),
+            ["model-account-a-refreshed"]
+        );
+        assert_eq!(
+            second_generation.model_ids().collect::<Vec<_>>(),
+            ["model-account-a-generation-2"]
+        );
         assert_eq!(
             observed.lock().unwrap().as_slice(),
             [
@@ -731,8 +1076,14 @@ mod tests {
             Some(&endpoint),
         )
         .await;
-        assert_eq!(profile_a.models, ["profile-a-model"]);
-        assert_eq!(profile_b.models, ["profile-b-model"]);
+        assert_eq!(
+            profile_a.model_ids().collect::<Vec<_>>(),
+            ["profile-a-model"]
+        );
+        assert_eq!(
+            profile_b.model_ids().collect::<Vec<_>>(),
+            ["profile-b-model"]
+        );
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         let unresolved: Account = serde_json::from_value(json!({
@@ -748,10 +1099,71 @@ mod tests {
         }))
         .unwrap();
         let catalog = model_catalog(&http, &unresolved, Some(&endpoint)).await;
-        assert!(catalog.models.is_empty());
+        assert!(catalog.descriptors.is_empty());
         assert_eq!(catalog.source, "kiro_identity_unresolved");
         assert!(!catalog.stale);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_retries_profileless_only_after_profile_forbidden() {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_route = std::sync::Arc::clone(&observed);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    let query = uri.query().unwrap_or_default().to_string();
+                    observed.lock().unwrap().push(query.clone());
+                    if query.contains("profileArn=") {
+                        (
+                            axum::http::StatusCode::FORBIDDEN,
+                            axum::Json(json!({"message":"profile denied"})),
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(json!({"models":[{"modelId":"profileless-model"}]}))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-profile-fallback-{}", crate::infra::time::now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "accessToken": "valid-token",
+            "profile": {
+                "authMethod": "social",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test"
+            }
+        }))
+        .unwrap();
+        let catalog = model_catalog(
+            &reqwest::Client::new(),
+            &account,
+            Some(&format!("http://{address}/models?origin=AI_EDITOR")),
+        )
+        .await;
+        assert_eq!(
+            catalog.model_ids().collect::<Vec<_>>(),
+            ["profileless-model"]
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].contains("profileArn="));
+        assert!(!observed[1].contains("profileArn="));
         server.abort();
     }
 
@@ -809,7 +1221,7 @@ mod tests {
             Some(&format!("http://{address}/empty")),
         )
         .await;
-        assert!(empty.models.is_empty());
+        assert!(empty.descriptors.is_empty());
         assert_eq!(empty.source, "kiro_list_available_models");
         assert!(!empty.stale);
 
@@ -819,7 +1231,7 @@ mod tests {
             Some(&format!("http://{address}/denied")),
         )
         .await;
-        assert!(denied.models.is_empty());
+        assert!(denied.descriptors.is_empty());
         assert_eq!(denied.source, "kiro_model_access_unavailable");
         assert!(!denied.stale);
 
@@ -830,11 +1242,57 @@ mod tests {
         )
         .await;
         assert_eq!(
-            transient.models,
+            transient.model_ids().collect::<Vec<_>>(),
             crate::domain::providers::kiro::STATIC_MODEL_IDS
         );
         assert_eq!(transient.source, "kiro_static_fallback");
         assert!(transient.stale);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn hot_path_ignores_catalog_entries_beyond_the_stale_ttl() {
+        let account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-expired-cache-{}", crate::infra::time::now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 7,
+            "tokenRefreshGeneration": 3,
+            "accessToken": "fixture-token",
+            "profile": {
+                "authMethod": "social",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test"
+            }
+        }))
+        .unwrap();
+        let identity =
+            crate::domain::providers::kiro::operational_runtime_identity_from_account(&account)
+                .unwrap();
+        let key = ModelCacheKey {
+            account_id: account.id.clone(),
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+            profile_scope: identity.profile_arn.unwrap(),
+            runtime_region: identity.runtime_region,
+        };
+        let descriptor = KiroModelDescriptor {
+            model_id: "expired-model".to_string(),
+            display_name: None,
+            description: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+        };
+        CACHE.lock().await.models.insert(
+            key,
+            CachedModels {
+                descriptors: vec![descriptor],
+                fetched_at_ms: (now_ms().min(i64::MAX as u128) as i64)
+                    .saturating_sub(STALE_MODEL_CACHE_TTL_MS),
+            },
+        );
+
+        assert_eq!(
+            cached_model_descriptor(&account, "expired-model").await,
+            None
+        );
     }
 }

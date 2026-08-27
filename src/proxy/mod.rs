@@ -55,6 +55,7 @@ pub use forwarder::forward_codex_alpha_search;
 pub use forwarder::forward_codex_models_manifest;
 pub use forwarder::forward_codex_responses_ws;
 pub use forwarder::forward_grok_media;
+pub(crate) use forwarder::forward_grok_media_provider_test;
 pub(crate) use forwarder::forward_provider_test;
 
 pub(crate) fn grok_fixed_api_base_url() -> &'static str {

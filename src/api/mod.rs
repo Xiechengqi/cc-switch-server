@@ -353,6 +353,10 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/providers/test", post(test_providers))
         .route("/api/providers/:id/test", post(test_provider))
         .route(
+            "/api/providers/:id/inference-test",
+            post(test_provider_inference),
+        )
+        .route(
             "/api/providers/:id/coding-plan-quota",
             get(get_coding_plan_quota).post(refresh_coding_plan_quota),
         )
@@ -1036,6 +1040,9 @@ async fn verify_router_ingress(
             headers.insert(name, value);
         }
     }
+    if context.is_health_check {
+        headers.insert("x-cc-switch-health-check", HeaderValue::from_static("1"));
+    }
     if context.share_id.is_none() {
         for (name, value) in [
             ("x-cc-switch-web-user-email", context.user_email.as_deref()),
@@ -1434,10 +1441,10 @@ async fn proxy_models_for_selection(
         // A live bound-account catalog replaces the static fallback for this exact Provider.
         data.clear();
         let owned_by = model_owner(provider);
-        for id in &catalog.models {
-            if !data.iter().any(|model| model.id == *id) {
+        for id in catalog.model_ids() {
+            if !data.iter().any(|model| model.id == id) {
                 data.push(OpenAiModel {
-                    id: id.clone(),
+                    id: id.to_string(),
                     object: "model",
                     owned_by: owned_by.clone(),
                     reasoning_efforts: None,
@@ -2441,6 +2448,7 @@ mod grok_catalog_provider_tests {
                         auto_consume_banked_reset: None,
                         banked_reset_expiry_lead_minutes: None,
                         previous_response_cache_enabled: None,
+                        grok_media_policy: None,
                         auto_start: Some(true),
                         description: None,
                         enabled_apps: None,
@@ -2528,6 +2536,7 @@ mod grok_catalog_provider_tests {
             user_email: Some("owner@example.com".to_string()),
             user_role: share_id.is_none().then(|| "owner".to_string()),
             user_country: Some("JP".to_string()),
+            is_health_check: false,
             method,
             path_and_query,
             body_sha256,

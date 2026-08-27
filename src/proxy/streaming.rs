@@ -905,6 +905,9 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
     if next.cache_creation_tokens.is_some() {
         target.cache_creation_tokens = next.cache_creation_tokens;
     }
+    if next.credit_usage.is_some() {
+        target.credit_usage = next.credit_usage;
+    }
     if !next_has_raw_input && next_has_cache {
         if let Some(raw_input_tokens) = target.raw_input_tokens {
             target.input_tokens = Some(

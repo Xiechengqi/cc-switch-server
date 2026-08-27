@@ -40,8 +40,9 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::previous_response_cache::PreviousResponseCacheScope;
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{
-    usage_from_json_with_semantics, ImageUsageMetadata, InputTokenSemantics, TokenUsage,
-    UsageLogContext, UsageModelMetadata, UsageOutcome, UsageRecordKind, UsageState,
+    usage_from_json_with_semantics, ImageUsageMetadata, InferenceOperation, InputTokenSemantics,
+    RequestKind, TokenUsage, UsageLogContext, UsageModelMetadata, UsageOutcome, UsageRecordKind,
+    UsageState,
 };
 use crate::infra::time::now_ms as current_time_ms;
 use crate::logging::{
@@ -246,6 +247,41 @@ fn responses_keepalive_surface(route: ProxyRoute) -> &'static str {
         ProxyRoute::CodexChatCompletions => "chat_completions",
         ProxyRoute::ClaudeMessages => "anthropic_messages",
         ProxyRoute::ClaudeCountTokens | ProxyRoute::Gemini => "other",
+    }
+}
+
+fn kiro_text_keepalive_interval(execution: &ProviderExecution) -> Option<Duration> {
+    let configured = execution
+        .plan
+        .driver_options
+        .get("kiroKeepaliveIntervalMs")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            std::env::var("CC_SWITCH_KIRO_KEEPALIVE_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(25_000);
+    if configured == 0 {
+        None
+    } else {
+        #[cfg(test)]
+        let interval = configured;
+        #[cfg(not(test))]
+        let interval = configured.clamp(5_000, 60_000);
+        Some(Duration::from_millis(interval))
+    }
+}
+
+fn kiro_downstream_keepalive_frame(route: ProxyRoute) -> Bytes {
+    match route {
+        ProxyRoute::ClaudeMessages => {
+            Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+        }
+        ProxyRoute::CodexChatCompletions
+        | ProxyRoute::CodexResponses
+        | ProxyRoute::CodexResponsesCompact => Bytes::from_static(b": keepalive\n\n"),
+        ProxyRoute::ClaudeCountTokens | ProxyRoute::Gemini => Bytes::new(),
     }
 }
 
@@ -1360,6 +1396,7 @@ async fn forward_with_attempt(
         let app = route.app();
         let claude_body_retry_stage = attempt_context.body_retry_stage;
         let mut request_context = request_context_from_headers(&headers);
+        request_context.operation = inference_operation_for_route(route);
         request_context.started_at_ms = Some(attempt_context.request_started_at_ms);
         request_context.attempt_count = Some(attempt_context.attempt.saturating_add(1));
         request_context.session_id = session_id_from_request(route, &headers, &body);
@@ -4343,6 +4380,7 @@ pub async fn forward_codex_responses_ws(
     let route = ProxyRoute::CodexResponses;
     let app = route.app();
     let mut request_context = request_context_from_headers(&headers);
+    request_context.operation = InferenceOperation::Responses;
     request_context.session_id = session_id_from_request(route, &headers, b"");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
@@ -4955,6 +4993,39 @@ async fn forward_grok_media_for_test_surface(
     .await
 }
 
+pub(crate) async fn forward_grok_media_provider_test(
+    state: ServerState,
+    execution: ProviderExecution,
+    method: Method,
+    upstream_path: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProxyError> {
+    if !execution.driver_is("oauth.grok_responses") {
+        return Err(ProxyError::bad_request(
+            "Grok media tests require a grok_oauth Provider",
+        ));
+    }
+    let request_context = request_context_from_headers(&headers);
+    let accounts = state.accounts_snapshot().await;
+    let snapshot = state.account_in_flight.snapshot();
+    let account_in_flight_guard =
+        acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
+    forward_grok_media_with_execution(
+        state,
+        execution,
+        method,
+        upstream_path,
+        headers,
+        body,
+        None,
+        request_context,
+        account_in_flight_guard,
+        None,
+    )
+    .await
+}
+
 pub async fn forward_grok_media(
     state: ServerState,
     method: Method,
@@ -5258,7 +5329,7 @@ async fn forward_grok_media_with_execution(
     headers: HeaderMap,
     body: Bytes,
     sticky_media_binding: Option<GrokMediaTaskBinding>,
-    request_context: UsageLogContext,
+    mut request_context: UsageLogContext,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
@@ -5275,19 +5346,52 @@ async fn forward_grok_media_with_execution(
     let user_email = request_context.user_email.clone();
     if let Some(binding) = sticky_media_binding.as_ref() {
         ensure_grok_media_task_binding(&execution, binding)?;
+        request_context.parent_request_id = binding.creation_request_id.clone();
     }
     if method == Method::POST && upstream_path == "/videos/generations" {
         super::grok::validate_video_generation_body(&body)?;
     }
     ensure_managed_credential_persistence_available(&state, &execution)?;
     let capability = grok_media_capability(&method, &upstream_path);
-    ensure_grok_account_capability(&state, &execution, capability).await?;
+    request_context.request_kind = if matches!(
+        capability,
+        GrokAccountCapability::ImageGeneration | GrokAccountCapability::ImageEdit
+    ) {
+        RequestKind::Image
+    } else {
+        RequestKind::Video
+    };
+    request_context.operation = match capability {
+        GrokAccountCapability::ImageGeneration => InferenceOperation::ImageGeneration,
+        GrokAccountCapability::ImageEdit => InferenceOperation::ImageEdit,
+        GrokAccountCapability::VideoGeneration if method == Method::POST => {
+            InferenceOperation::VideoGeneration
+        }
+        GrokAccountCapability::VideoGeneration => InferenceOperation::VideoStatus,
+        _ => InferenceOperation::Unknown,
+    };
+    request_context.usage_state = Some(UsageState::NotApplicable);
+    if request_context.request_kind == RequestKind::Video {
+        apply_grok_video_usage_metadata(&mut request_context, &body);
+    }
+    if request_context.operation == InferenceOperation::VideoStatus {
+        request_context.media_task_id = upstream_path.rsplit('/').next().map(str::to_string);
+    }
+    ensure_grok_media_policy(&state, &execution, share_id.as_deref(), capability).await?;
+    let provider_probe = request_context.is_health_check
+        && share_id
+            .as_deref()
+            .is_some_and(|share_id| share_id.starts_with("test-share:"));
+    if !provider_probe {
+        ensure_grok_account_capability(&state, &execution, capability).await?;
+    }
     if let Err(error) = refresh_execution_managed_account_if_needed(&state, &execution).await {
         record_grok_media_terminal(
             &state,
             &stored,
             share_id.as_deref(),
             user_email.as_deref(),
+            request_context.is_health_check,
             provider_outcome_from_status(error.status.as_u16()),
         )
         .await;
@@ -5315,6 +5419,7 @@ async fn forward_grok_media_with_execution(
                 .unwrap_or_else(|| "application/json".to_string()),
         )
     };
+    let media_model = grok_media_usage_model(&body);
     let http_client = forward_http_client(&state, &stored).await?;
     let started = Instant::now();
     let mut auth_refresh_attempted = false;
@@ -5368,6 +5473,7 @@ async fn forward_grok_media_with_execution(
                     &stored,
                     share_id.as_deref(),
                     user_email.as_deref(),
+                    request_context.is_health_check,
                     ProviderOutcome::NetworkFailure,
                 )
                 .await;
@@ -5415,6 +5521,7 @@ async fn forward_grok_media_with_execution(
                 &stored,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                request_context.is_health_check,
                 ProviderOutcome::Failure {
                     status_code: StatusCode::UNAUTHORIZED.as_u16(),
                 },
@@ -5457,6 +5564,7 @@ async fn forward_grok_media_with_execution(
                 &stored,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                request_context.is_health_check,
                 ProviderOutcome::Failure { status_code: 502 },
             )
             .await;
@@ -5472,6 +5580,7 @@ async fn forward_grok_media_with_execution(
                 &stored,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                request_context.is_health_check,
                 ProviderOutcome::Failure { status_code: 502 },
             )
             .await;
@@ -5493,6 +5602,8 @@ async fn forward_grok_media_with_execution(
             share_id,
             user_email,
             started,
+            request_context,
+            media_model,
             account_in_flight_guard,
             share_invocation_guard,
         }));
@@ -5510,6 +5621,7 @@ async fn forward_grok_media_with_execution(
                 &stored,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                request_context.is_health_check,
                 ProviderOutcome::NetworkFailure,
             )
             .await;
@@ -5528,6 +5640,7 @@ async fn forward_grok_media_with_execution(
                 &stored,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                request_context.is_health_check,
                 ProviderOutcome::Failure {
                     status_code: error.status.as_u16(),
                 },
@@ -5577,6 +5690,7 @@ async fn forward_grok_media_with_execution(
                     &stored,
                     share_id.as_deref(),
                     user_email.as_deref(),
+                    request_context.is_health_check,
                     ProviderOutcome::Failure {
                         status_code: error.status.as_u16(),
                     },
@@ -5599,6 +5713,8 @@ async fn forward_grok_media_with_execution(
         let owner_share_id = share_id
             .clone()
             .unwrap_or_else(|| format!("test-share:{}", stored.provider.id));
+        request_context.media_task_id = Some(task_id.clone());
+        request_context.media_status = Some("submitted".to_string());
         if let Err(error) = state
             .remember_grok_media_task_if_current(
                 stored.app,
@@ -5608,6 +5724,7 @@ async fn forward_grok_media_with_execution(
                 account_id.to_string(),
                 auth_identity_generation,
                 task_id,
+                request_context.request_id.clone(),
                 owner_share_id,
                 user_email.as_deref(),
                 24 * 60 * 60 * 1000,
@@ -5620,6 +5737,7 @@ async fn forward_grok_media_with_execution(
                 &stored,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                request_context.is_health_check,
                 ProviderOutcome::Failure {
                     status_code: error.status.as_u16(),
                 },
@@ -5627,6 +5745,8 @@ async fn forward_grok_media_with_execution(
             .await;
             return Err(error);
         }
+    } else if request_context.operation == InferenceOperation::VideoStatus {
+        request_context.media_status = grok_video_status_from_response(&response_body);
     }
     if status.is_success() {
         record_grok_capability_evidence(&state, &execution, capability).await;
@@ -5636,7 +5756,21 @@ async fn forward_grok_media_with_execution(
         &stored,
         share_id.as_deref(),
         user_email.as_deref(),
+        request_context.is_health_check,
         provider_outcome_from_status(status_code),
+    )
+    .await;
+    request_context.stream_status = request_context.media_status.clone();
+    request_context.error_message =
+        (!status.is_success()).then(|| format!("Grok media upstream returned HTTP {status_code}"));
+    log_usage(
+        &state,
+        &stored,
+        status_code,
+        started.elapsed().as_millis(),
+        media_model,
+        TokenUsage::default(),
+        request_context,
     )
     .await;
     let mut response = Response::new(Body::from(response_body));
@@ -5674,6 +5808,8 @@ struct GrokImageHeartbeatArgs {
     share_id: Option<String>,
     user_email: Option<String>,
     started: Instant,
+    request_context: UsageLogContext,
+    media_model: UsageModelMetadata,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 }
@@ -5697,6 +5833,8 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
         share_id,
         user_email,
         started,
+        request_context,
+        media_model,
         account_in_flight_guard,
         share_invocation_guard,
     } = args;
@@ -5713,6 +5851,8 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
         share_id,
         user_email,
         started,
+        request_context,
+        media_model,
         account_in_flight_guard,
         share_invocation_guard,
     };
@@ -5869,6 +6009,8 @@ struct GrokImageLifecycleGuard {
     share_id: Option<String>,
     user_email: Option<String>,
     started: Instant,
+    request_context: UsageLogContext,
+    media_model: UsageModelMetadata,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 }
@@ -5878,10 +6020,13 @@ async fn record_grok_media_terminal(
     stored: &StoredProvider,
     share_id: Option<&str>,
     user_email: Option<&str>,
+    is_health_check: bool,
     outcome: ProviderOutcome,
 ) {
     record_provider_outcome(state, stored, outcome).await;
-    record_share_invocation_result(state, share_id, user_email, TokenUsage::default()).await;
+    if !is_health_check {
+        record_share_invocation_result(state, share_id, user_email, TokenUsage::default()).await;
+    }
 }
 
 impl GrokImageLifecycleGuard {
@@ -5892,9 +6037,11 @@ impl GrokImageLifecycleGuard {
             &self.stored,
             self.share_id.as_deref(),
             self.user_email.as_deref(),
+            self.request_context.is_health_check,
             provider_outcome_from_status(StatusCode::OK.as_u16()),
         )
         .await;
+        self.finish_usage(StatusCode::OK, None, "completed").await;
         self.disarm();
     }
 
@@ -5904,10 +6051,42 @@ impl GrokImageLifecycleGuard {
             &self.stored,
             self.share_id.as_deref(),
             self.user_email.as_deref(),
+            self.request_context.is_health_check,
             outcome,
         )
         .await;
+        let status = match outcome {
+            ProviderOutcome::Failure { status_code } => {
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
+            ProviderOutcome::NetworkFailure => StatusCode::BAD_GATEWAY,
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        self.finish_usage(status, Some("Grok image response failed"), "failed")
+            .await;
         self.disarm();
+    }
+
+    async fn finish_usage(
+        &self,
+        status: StatusCode,
+        error_message: Option<&str>,
+        stream_status: &str,
+    ) {
+        let mut context = self.request_context.clone();
+        context.is_streaming = true;
+        context.stream_status = Some(stream_status.to_string());
+        context.error_message = error_message.map(str::to_string);
+        log_usage(
+            &self.state,
+            &self.stored,
+            status.as_u16(),
+            self.started.elapsed().as_millis(),
+            self.media_model.clone(),
+            TokenUsage::default(),
+            context,
+        )
+        .await;
     }
 
     fn disarm(&mut self) {
@@ -5926,16 +6105,39 @@ impl Drop for GrokImageLifecycleGuard {
         let stored = self.stored.clone();
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
+        let request_context = self.request_context.clone();
+        let media_model = self.media_model.clone();
+        let started = self.started;
         let account_in_flight_guard = self.account_in_flight_guard.take();
         let share_invocation_guard = self.share_invocation_guard.take();
         tokio::spawn(async move {
-            record_share_invocation_result(
+            let mut request_context = request_context;
+            let is_health_check = request_context.is_health_check;
+            request_context.is_streaming = true;
+            request_context.stream_status = Some("client_cancelled".to_string());
+            request_context.usage_state = Some(UsageState::Interrupted);
+            request_context.outcome = Some(UsageOutcome::Interrupted);
+            request_context.failure_kind = Some("client_cancelled".to_string());
+            request_context.error_message = Some(IMAGE_CLIENT_CANCELLED_MESSAGE.to_string());
+            log_usage(
                 &state,
-                share_id.as_deref(),
-                user_email.as_deref(),
+                &stored,
+                499,
+                started.elapsed().as_millis(),
+                media_model,
                 TokenUsage::default(),
+                request_context,
             )
             .await;
+            if !is_health_check {
+                record_share_invocation_result(
+                    &state,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    TokenUsage::default(),
+                )
+                .await;
+            }
             drop(account_in_flight_guard);
             drop(share_invocation_guard);
             crate::metrics::record_stream_client_cancelled(stored.app.as_str());
@@ -12758,6 +12960,36 @@ async fn maybe_mark_upstream_rate_limited(
     share_id: Option<&str>,
     model: Option<&str>,
 ) {
+    if execution.stored.provider_type == ProviderType::KiroOAuth {
+        if let Some(class) = kiro::classify_throttle(status, body) {
+            if class != kiro::KiroThrottleClass::OrdinaryOverload {
+                let Some((provider_type, account_id, auth_identity_generation)) =
+                    execution.managed_account_identity_target()
+                else {
+                    return;
+                };
+                let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                let fallback = now.saturating_add(
+                    i64::try_from(kiro::throttle_default_cooldown(class).as_millis())
+                        .unwrap_or(i64::MAX),
+                );
+                let until = super::grok::retry_after_until_ms(headers, now).unwrap_or(fallback);
+                let until = super::bounded_upstream_rate_limit_until(now, until);
+                state
+                    .mark_account_rate_limited_until_if_current(
+                        account_id,
+                        provider_type,
+                        auth_identity_generation,
+                        until,
+                        Some(format!(
+                            "Kiro subscription throttle classified as {class:?}"
+                        )),
+                    )
+                    .await;
+                return;
+            }
+        }
+    }
     if status != StatusCode::TOO_MANY_REQUESTS {
         return;
     }
@@ -15045,6 +15277,10 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     let request_body: Value = serde_json::from_slice(&runtime_request.body).map_err(|error| {
         ProxyError::bad_request(format!("invalid Kiro canonical request body: {error}"))
     })?;
+    let mut request_context = request_context;
+    if request_context.session_id.is_none() {
+        request_context.session_id = Some(kiro::request_scoped_session_id());
+    }
     let routed_model = request_body
         .get("model")
         .and_then(Value::as_str)
@@ -15059,12 +15295,6 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     let actual_model = kiro::resolve_model(&routed_model).ok_or_else(|| {
         ProxyError::bad_request(format!("Kiro model identifier is invalid: {routed_model}"))
     })?;
-    let model_metadata = routed_model_metadata(
-        &response_model,
-        &actual_model,
-        runtime_request.actual_model_source.as_deref(),
-        "kiro_model_normalization",
-    );
     let stream_requested = runtime_request.stream_requested;
 
     if route == ProxyRoute::ClaudeCountTokens {
@@ -15112,15 +15342,56 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             .refresh_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty());
+        #[cfg(test)]
+        let models_endpoint_override = execution
+            .plan
+            .driver_options
+            .get("testKiroModelsUrl")
+            .and_then(Value::as_str);
+        #[cfg(not(test))]
+        let models_endpoint_override: Option<&str> = None;
+        #[cfg(test)]
+        let catalog_model = if models_endpoint_override.is_none() {
+            Some((actual_model.clone(), None))
+        } else {
+            state
+                .kiro_catalog_model(
+                    &account,
+                    &actual_model,
+                    models_endpoint_override,
+                    execution.request_timeout(),
+                )
+                .await
+        };
+        #[cfg(not(test))]
+        let catalog_model = match state
+            .kiro_cached_catalog_model(&account, &actual_model)
+            .await
+        {
+            Some(authoritative) => authoritative,
+            None if kiro::static_model_context_window(&actual_model).is_some() => {
+                Some((actual_model.clone(), None))
+            }
+            None => {
+                state
+                    .kiro_catalog_model(
+                        &account,
+                        &actual_model,
+                        models_endpoint_override,
+                        execution.request_timeout(),
+                    )
+                    .await
+            }
+        };
+        let (catalog_model_id, catalog_max_input_tokens) = catalog_model.ok_or_else(|| {
+            ProxyError::bad_request(format!(
+                "Kiro model is not available to the bound account: {actual_model}"
+            ))
+        })?;
         let cache_session = request_context
             .session_id
             .as_deref()
-            .or_else(|| {
-                request_body
-                    .pointer("/metadata/session_id")
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("anonymous");
+            .expect("Kiro request session identity is always resolved");
         let call_context = kiro::KiroCallContext {
             ide_version: ide_version.clone(),
             claude_code_tools,
@@ -15128,6 +15399,9 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 "provider:{}:account:{}:generation:{}:route:{route:?}:session:{cache_session}",
                 stored.provider.id, account.id, account.auth_identity_generation
             ),
+            catalog_model_id: Some(catalog_model_id),
+            catalog_max_input_tokens,
+            session_id: Some(cache_session.to_string()),
         };
         let mut prepared =
             kiro::prepare_kiro_request_with_context(&account, &request_body, &call_context)?;
@@ -15243,6 +15517,12 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             None => break (upstream, prepared, first_frame_deadline),
         }
     };
+    let model_metadata = routed_model_metadata(
+        &response_model,
+        &prepared.upstream_model_id,
+        runtime_request.actual_model_source.as_deref(),
+        "kiro_model_resolver",
+    );
     let status = upstream.status();
     let status_code = status.as_u16();
     let mut response_headers = upstream.headers().clone();
@@ -15268,6 +15548,8 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             status_code,
             first_frame_deadline,
             idle_timeout: execution.stream_idle_timeout(),
+            context_window: prepared.context_window,
+            keepalive_interval: kiro_text_keepalive_interval(&execution),
         })
         .await;
     }
@@ -15320,12 +15602,13 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         return Ok(response);
     }
 
-    let message = match kiro::kiro_event_bytes_to_claude_json_scoped(
+    let message = match kiro::kiro_event_bytes_to_claude_json_scoped_with_context_window(
         &bytes,
         &response_model,
         &prepared.tool_name_map,
         &request_body,
         &prepared.cache_namespace,
+        prepared.context_window,
     ) {
         Ok(message) => message,
         Err(error) => {
@@ -15430,6 +15713,8 @@ struct ClaudeKiroStreamOptions {
     status_code: u16,
     first_frame_deadline: Option<tokio::time::Instant>,
     idle_timeout: Option<Duration>,
+    context_window: u64,
+    keepalive_interval: Option<Duration>,
 }
 
 async fn forward_claude_kiro_stream(
@@ -15454,6 +15739,8 @@ async fn forward_claude_kiro_stream(
         status_code,
         first_frame_deadline,
         idle_timeout,
+        context_window,
+        keepalive_interval,
     } = options;
     let request_id = log_usage(
         &state,
@@ -15471,7 +15758,7 @@ async fn forward_claude_kiro_stream(
     .await;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
-    let stream = kiro::kiro_event_stream_to_claude_sse_scoped_with_timeouts(
+    let stream = kiro::kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
         upstream.bytes_stream(),
         response_model,
         tool_name_map,
@@ -15479,6 +15766,7 @@ async fn forward_claude_kiro_stream(
         &cache_namespace,
         first_frame_deadline,
         idle_timeout,
+        context_window,
     );
     let stream_transform = super::stream_transforms::StreamEventTransformer::new(
         &stored,
@@ -15502,8 +15790,37 @@ async fn forward_claude_kiro_stream(
         };
         let mut first_token_ms = None;
         let mut stream_transform = stream_transform;
+        let mut downstream_keepalive = keepalive_interval
+            .and_then(super::downstream_keepalive::DownstreamKeepalive::new);
+        if let Some(keepalive) = downstream_keepalive.as_mut() {
+            keepalive.commit(tokio::time::Instant::now());
+        }
         tokio::pin!(stream);
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = if let Some(deadline) = downstream_keepalive
+                .as_ref()
+                .and_then(super::downstream_keepalive::DownstreamKeepalive::deadline)
+            {
+                tokio::select! {
+                    next = stream.next() => next,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        let now = tokio::time::Instant::now();
+                        if let Some(keepalive) = downstream_keepalive.as_mut() {
+                            keepalive.emitted(now);
+                        }
+                        let frame = kiro_downstream_keepalive_frame(route);
+                        if !frame.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(frame);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let canonical_chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -16478,6 +16795,118 @@ fn grok_media_capability(method: &Method, upstream_path: &str) -> GrokAccountCap
     } else {
         GrokAccountCapability::ImageGeneration
     }
+}
+
+fn grok_media_usage_model(body: &[u8]) -> UsageModelMetadata {
+    let model = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    UsageModelMetadata {
+        model: model.clone(),
+        requested_model: model.clone(),
+        actual_model: model,
+        actual_model_source: Some("grok_media".to_string()),
+    }
+}
+
+fn grok_video_status_from_response(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    value
+        .get("status")
+        .or_else(|| value.pointer("/data/status"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .map(str::to_ascii_lowercase)
+}
+
+fn apply_grok_video_usage_metadata(context: &mut UsageLogContext, body: &[u8]) {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    context.video_duration_seconds = value
+        .get("duration")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    context.video_resolution = value
+        .get("resolution")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .map(str::to_string);
+    context.video_aspect_ratio = value
+        .get("aspect_ratio")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .map(str::to_string);
+}
+
+async fn ensure_grok_media_policy(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    share_id: Option<&str>,
+    capability: GrokAccountCapability,
+) -> Result<(), ProxyError> {
+    let meta = execution.stored.provider.meta.as_ref();
+    let provider_enabled = match capability {
+        GrokAccountCapability::ImageGeneration => meta
+            .and_then(|meta| meta.grok_image_generation_enabled)
+            .unwrap_or(false),
+        GrokAccountCapability::ImageEdit => meta
+            .and_then(|meta| meta.grok_image_edit_enabled)
+            .unwrap_or(false),
+        GrokAccountCapability::VideoGeneration => meta
+            .and_then(|meta| meta.grok_video_generation_enabled)
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !provider_enabled {
+        return Err(ProxyError {
+            status: StatusCode::FORBIDDEN,
+            message: format!(
+                "grok_media_disabled_by_provider: Grok OAuth {} is disabled by Provider policy",
+                capability.as_str()
+            ),
+        });
+    }
+
+    let Some(share_id) = share_id else {
+        return Ok(());
+    };
+    // Provider tests use an isolated synthetic scope and never represent a
+    // Router Share policy decision.
+    if share_id.starts_with("test-share:") {
+        return Ok(());
+    }
+    let shares = state.shares.read().await;
+    let share = shares
+        .shares
+        .iter()
+        .find(|share| share.id == share_id)
+        .ok_or_else(|| ProxyError::bad_request("Grok media Share is unavailable"))?;
+    let policy = share.grok_media_policy;
+    let share_enabled = match capability {
+        GrokAccountCapability::ImageGeneration => policy.image_generation_enabled,
+        GrokAccountCapability::ImageEdit => policy.image_edit_enabled,
+        GrokAccountCapability::VideoGeneration => policy.video_generation_enabled,
+        _ => false,
+    };
+    if !share_enabled {
+        return Err(ProxyError {
+            status: StatusCode::FORBIDDEN,
+            message: format!(
+                "grok_media_disabled_by_share: Grok OAuth {} is disabled by Share policy",
+                capability.as_str()
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn record_grok_capability_evidence(
@@ -17808,18 +18237,20 @@ async fn aggregate_gemini_v1internal_upstream(
 }
 
 fn codex_oauth_session_id_from_request(headers: &HeaderMap, body: &[u8]) -> Option<String> {
-    optional_header(headers, "session_id")
+    codex_oauth_session_id_from_body(body)
+        .or_else(|| optional_header(headers, "x-session-affinity"))
+        .or_else(|| optional_header(headers, "x-client-request-id"))
+        .or_else(|| optional_header(headers, "session_id"))
         .or_else(|| optional_header(headers, "x-session-id"))
         .or_else(|| optional_header(headers, "x-codex-session-id"))
-        .or_else(|| optional_header(headers, "x-client-request-id"))
         .or_else(|| optional_header(headers, "x-codex-window-id"))
-        .or_else(|| codex_oauth_session_id_from_body(body))
         .and_then(|value| codex_oauth_upstream_session_id(&value))
 }
 
 fn codex_oauth_session_id_from_body(body: &[u8]) -> Option<String> {
     let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
     [
+        "/prompt_cache_key",
         "/metadata/session_id",
         "/metadata/sessionId",
         "/session_id",
@@ -17850,7 +18281,7 @@ fn codex_oauth_upstream_session_id(session_id: &str) -> Option<String> {
         .map(|(id, _)| id)
         .unwrap_or(session_id)
         .trim();
-    (!session_id.is_empty()).then(|| session_id.to_string())
+    validated_session_id(session_id)
 }
 
 fn append_codex_oauth_session_headers(
@@ -20208,21 +20639,37 @@ fn request_context_from_headers(headers: &HeaderMap) -> UsageLogContext {
         user_email: optional_header(headers, "x-cc-switch-user-email"),
         data_source,
         user_country: optional_header(headers, "x-cc-switch-user-country"),
+        is_health_check: optional_header(headers, "x-cc-switch-health-check")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         started_at_ms: Some(current_time_ms()),
         ..UsageLogContext::default()
     }
 }
 
+fn inference_operation_for_route(route: ProxyRoute) -> InferenceOperation {
+    match route {
+        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => InferenceOperation::Messages,
+        ProxyRoute::CodexChatCompletions => InferenceOperation::ChatCompletions,
+        ProxyRoute::CodexResponses => InferenceOperation::Responses,
+        ProxyRoute::CodexResponsesCompact => InferenceOperation::ResponsesCompact,
+        ProxyRoute::Gemini => InferenceOperation::GeminiGenerateContent,
+    }
+}
+
 fn session_id_from_request(route: ProxyRoute, headers: &HeaderMap, body: &[u8]) -> Option<String> {
-    optional_header(headers, "x-cc-switch-session-id").or_else(|| match route {
-        ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
-            claude_session_id_from_request(headers, body)
-        }
-        ProxyRoute::CodexChatCompletions
-        | ProxyRoute::CodexResponses
-        | ProxyRoute::CodexResponsesCompact => codex_oauth_session_id_from_request(headers, body),
-        ProxyRoute::Gemini => None,
-    })
+    optional_header(headers, "x-cc-switch-session-id")
+        .or_else(|| match route {
+            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens => {
+                claude_session_id_from_request(headers, body)
+            }
+            ProxyRoute::CodexChatCompletions
+            | ProxyRoute::CodexResponses
+            | ProxyRoute::CodexResponsesCompact => {
+                codex_oauth_session_id_from_request(headers, body)
+            }
+            ProxyRoute::Gemini => None,
+        })
+        .and_then(|value| validated_session_id(&value))
 }
 
 fn claude_session_id_from_request(headers: &HeaderMap, body: &[u8]) -> Option<String> {
@@ -20244,16 +20691,34 @@ fn claude_session_id_from_body(body: &[u8]) -> Option<String> {
                     value
                         .pointer(pointer)
                         .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|item| !item.is_empty())
-                        .map(str::to_string)
+                        .and_then(validated_session_id)
                 })
         })
 }
 
 fn parse_session_from_user_id(user_id: &str) -> Option<String> {
-    let session_id = user_id.split_once("_session_")?.1.trim();
-    (!session_id.is_empty()).then(|| session_id.to_string())
+    if let Ok(value) = serde_json::from_str::<Value>(user_id) {
+        if let Some(session_id) = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(validated_session_id)
+        {
+            return Some(session_id);
+        }
+    }
+    user_id
+        .split_once("_session_")
+        .and_then(|(_, session_id)| validated_session_id(session_id))
+}
+
+fn validated_session_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')))
+    .then(|| value.to_string())
 }
 
 fn select_share_provider(
@@ -22011,6 +22476,12 @@ mod tests {
                         auth_identity_generation: Some(1),
                     }),
                     provider_type: Some(provider_type.as_str().to_string()),
+                    grok_image_generation_enabled: (provider_type == ProviderType::GrokOAuth)
+                        .then_some(true),
+                    grok_image_edit_enabled: (provider_type == ProviderType::GrokOAuth)
+                        .then_some(true),
+                    grok_video_generation_enabled: (provider_type == ProviderType::GrokOAuth)
+                        .then_some(true),
                     ..ProviderMeta::default()
                 }),
                 extra: Default::default(),
@@ -25334,6 +25805,149 @@ mod tests {
         execution
     }
 
+    #[tokio::test]
+    async fn grok_media_requires_independent_provider_and_share_opt_in() {
+        let state = forwarder_test_state("grok-media-policy-gates");
+        let mut execution = install_grok_test_execution(
+            &state,
+            "grok-media-policy-gates",
+            super::super::grok::default_base_url().to_string(),
+            None,
+            "grok-media-policy-access",
+            None,
+            &[GrokAccountCapability::ImageGeneration],
+        )
+        .await;
+        execution
+            .stored
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .grok_image_generation_enabled = Some(false);
+        let provider_error = ensure_grok_media_policy(
+            &state,
+            &execution,
+            None,
+            GrokAccountCapability::ImageGeneration,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(provider_error.status, StatusCode::FORBIDDEN);
+        assert!(provider_error
+            .message
+            .contains("grok_media_disabled_by_provider"));
+
+        execution
+            .stored
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .grok_image_generation_enabled = Some(true);
+        let share_id = "grok-media-policy-share";
+        let share: crate::domain::sharing::shares::Share = serde_json::from_value(json!({
+            "id": share_id,
+            "app": "codex",
+            "providerId": execution.stored.provider.id,
+            "providerType": "grok_oauth",
+            "enabled": true,
+            "status": "active",
+            "bindings": [{
+                "app": "codex",
+                "providerId": execution.stored.provider.id,
+                "providerType": "grok_oauth"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            share.grok_media_policy,
+            crate::domain::sharing::router_contract::GrokMediaPolicy::default()
+        );
+        state
+            .mutate_shares_immediate(move |shares| shares.shares.push(share))
+            .await
+            .unwrap();
+
+        let share_error = ensure_grok_media_policy(
+            &state,
+            &execution,
+            Some(share_id),
+            GrokAccountCapability::ImageGeneration,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(share_error.status, StatusCode::FORBIDDEN);
+        assert!(share_error.message.contains("grok_media_disabled_by_share"));
+
+        state
+            .mutate_shares_immediate(|shares| {
+                shares
+                    .shares
+                    .iter_mut()
+                    .find(|share| share.id == share_id)
+                    .unwrap()
+                    .grok_media_policy
+                    .image_generation_enabled = true;
+            })
+            .await
+            .unwrap();
+        ensure_grok_media_policy(
+            &state,
+            &execution,
+            Some(share_id),
+            GrokAccountCapability::ImageGeneration,
+        )
+        .await
+        .unwrap();
+
+        record_grok_media_terminal(
+            &state,
+            &execution.stored,
+            Some(share_id),
+            Some("owner@example.com"),
+            true,
+            provider_outcome_from_status(200),
+        )
+        .await;
+        assert_eq!(
+            state
+                .shares
+                .read()
+                .await
+                .shares
+                .iter()
+                .find(|share| share.id == share_id)
+                .unwrap()
+                .requests_count,
+            0,
+            "dashboard media tests must not consume the Share request count"
+        );
+
+        record_grok_media_terminal(
+            &state,
+            &execution.stored,
+            Some(share_id),
+            Some("owner@example.com"),
+            false,
+            provider_outcome_from_status(200),
+        )
+        .await;
+        assert_eq!(
+            state
+                .shares
+                .read()
+                .await
+                .shares
+                .iter()
+                .find(|share| share.id == share_id)
+                .unwrap()
+                .requests_count,
+            1,
+            "ordinary media requests must still count"
+        );
+    }
+
     async fn install_kiro_test_provider(
         state: &ServerState,
         name: &str,
@@ -25425,6 +26039,8 @@ mod tests {
             .clone();
         plan.transport_policy.stream_first_byte_timeout_ms = Some(first_frame_timeout_ms);
         plan.transport_policy.stream_idle_timeout_ms = Some(idle_timeout_ms);
+        plan.driver_options
+            .insert("kiroKeepaliveIntervalMs".to_string(), json!(10));
         std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
         state.replace_provider_store_for_test(providers).await;
     }
@@ -25643,6 +26259,15 @@ mod tests {
             "{route:?}: {terminal}"
         );
         assert!(terminal.contains("\"status\":504"), "{route:?}: {terminal}");
+        match route {
+            ProxyRoute::ClaudeMessages => {
+                assert!(terminal.contains("event: ping"), "{route:?}: {terminal}");
+            }
+            ProxyRoute::CodexChatCompletions | ProxyRoute::CodexResponses => {
+                assert!(terminal.contains(": keepalive"), "{route:?}: {terminal}");
+            }
+            _ => unreachable!("unsupported Kiro timeout surface"),
+        }
         assert_eq!(
             upstream_requests.load(std::sync::atomic::Ordering::SeqCst),
             expected_request_count,
@@ -26298,6 +26923,8 @@ mod tests {
             status_code: StatusCode::OK.as_u16(),
             first_frame_deadline: None,
             idle_timeout: None,
+            context_window: 200_000,
+            keepalive_interval: None,
         })
         .await
         .unwrap();
@@ -30779,6 +31406,13 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 .as_deref(),
             Some("my-session-123")
         );
+        assert_eq!(
+            claude_session_id_from_body(
+                br#"{"metadata":{"user_id":"{\"device_id\":\"device\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}"}}"#
+            )
+            .as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -30806,6 +31440,30 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         );
         codex_headers.clear();
         codex_headers.insert(
+            "x-session-affinity",
+            HeaderValue::from_static("affinity-session-1"),
+        );
+        assert_eq!(
+            session_id_from_request(
+                ProxyRoute::CodexResponses,
+                &codex_headers,
+                br#"{"prompt_cache_key":"body-session"}"#,
+            )
+            .as_deref(),
+            Some("body-session")
+        );
+        codex_headers.clear();
+        assert_eq!(
+            session_id_from_request(
+                ProxyRoute::CodexResponses,
+                &codex_headers,
+                br#"{"prompt_cache_key":"body-session"}"#,
+            )
+            .as_deref(),
+            Some("body-session")
+        );
+        codex_headers.clear();
+        codex_headers.insert(
             "x-codex-window-id",
             HeaderValue::from_static("session-456:0"),
         );
@@ -30813,6 +31471,19 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             session_id_from_request(ProxyRoute::CodexResponses, &codex_headers, b"{}").as_deref(),
             Some("session-456")
         );
+    }
+
+    #[test]
+    fn kiro_keepalive_frames_match_each_downstream_surface() {
+        assert_eq!(
+            kiro_downstream_keepalive_frame(ProxyRoute::ClaudeMessages),
+            Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+        );
+        assert_eq!(
+            kiro_downstream_keepalive_frame(ProxyRoute::CodexResponses),
+            Bytes::from_static(b": keepalive\n\n")
+        );
+        assert!(kiro_downstream_keepalive_frame(ProxyRoute::ClaudeCountTokens).is_empty());
     }
 
     #[test]
@@ -31410,14 +32081,17 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let execution =
             grok_image_test_execution(&state, "grok-image-json-heartbeat", upstream.address).await;
         let response = forward_grok_media_with_execution(
-            state,
+            state.clone(),
             execution,
             Method::POST,
             "/images/generations".to_string(),
             HeaderMap::new(),
             Bytes::from_static(br#"{"model":"grok-imagine","prompt":"draw"}"#),
             None,
-            UsageLogContext::default(),
+            UsageLogContext {
+                request_id: Some("req_grok_image_usage".to_string()),
+                ..UsageLogContext::default()
+            },
             None,
             None,
         )
@@ -31447,6 +32121,17 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             upstream.accept_encodings.lock().unwrap().as_slice(),
             ["identity"]
         );
+        let usage = state.usage.read().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_grok_image_usage")
+            .unwrap();
+        assert_eq!(log.request_kind, RequestKind::Image);
+        assert_eq!(log.operation, InferenceOperation::ImageGeneration);
+        assert_eq!(log.usage_state, UsageState::NotApplicable);
+        assert_eq!(log.input_tokens, None);
+        assert_eq!(log.output_tokens, None);
         upstream.server.abort();
     }
 
@@ -31521,7 +32206,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .account_in_flight
             .try_acquire(ProviderType::GrokOAuth, &account_id, 1)
             .unwrap();
-        let share_id = "grok-image-cancel-share";
+        let share_id = "test-share:grok-image-cancel-share";
         let share_guard = state.share_in_flight.try_acquire(share_id, None).unwrap();
         let response = forward_grok_media_with_execution(
             state.clone(),
@@ -36323,9 +37008,14 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let (_, account_id, auth_identity_generation) =
             execution.managed_account_identity_target().unwrap();
         let account_id = account_id.to_string();
-        let headers = HeaderMap::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_grok_video_status"),
+        );
         let base_binding = GrokMediaTaskBinding {
             task_id: "request-1".to_string(),
+            creation_request_id: None,
             provider_id: provider_id.clone(),
             account_id: account_id.clone(),
             auth_identity_generation,
@@ -36381,6 +37071,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         state
             .remember_grok_media_task(
                 "request-1".to_string(),
+                Some("req_grok_video_creation".to_string()),
                 provider_id,
                 account_id,
                 auth_identity_generation,
@@ -36392,7 +37083,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .await
             .unwrap();
         let response = forward_grok_media_for_test_surface(
-            state,
+            state.clone(),
             execution.stored.provider.id.clone(),
             Method::GET,
             "/videos/request-1".to_string(),
@@ -36403,6 +37094,20 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(*observed_conversation_id.lock().unwrap(), None);
+        let usage = state.usage.read().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_grok_video_status")
+            .unwrap();
+        assert_eq!(log.request_kind, RequestKind::Video);
+        assert_eq!(log.operation, InferenceOperation::VideoStatus);
+        assert_eq!(
+            log.parent_request_id.as_deref(),
+            Some("req_grok_video_creation")
+        );
+        assert_eq!(log.media_task_id.as_deref(), Some("request-1"));
+        assert_eq!(log.usage_state, UsageState::NotApplicable);
         upstream_server.abort();
     }
 
@@ -36843,7 +37548,10 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             Some("claude-haiku-4-5")
         );
         assert_eq!(kiro_routed, "claude-opus-4-8");
-        assert_eq!(kiro::map_model(kiro_routed), Some("claude-opus-4.8"));
+        assert_eq!(
+            kiro::resolve_model(kiro_routed).as_deref(),
+            Some("claude-opus-4.8")
+        );
 
         let deepseek = stored_provider(
             AppKind::Claude,
