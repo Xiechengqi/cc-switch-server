@@ -1050,32 +1050,79 @@ fn decode_proto_list_strict(src: &[u8]) -> ProtoResult<Vec<Value>> {
 
 // ─── McpToolDefinition ─────────────────────────────────────────────────────
 
-#[derive(Debug)]
+/// Semantic JSON Schema for a Cursor MCP tool.
+///
+/// The schema deliberately remains a `serde_json::Value` until the final
+/// AgentService encoding boundary. `McpToolDefinition.input_schema` is a
+/// serialized `google.protobuf.Value`, not UTF-8 JSON bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolSchema(Value);
+
+impl McpToolSchema {
+    fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_json(&self) -> &Value {
+        &self.0
+    }
+
+    pub(crate) fn encoded_json_len(&self) -> usize {
+        fn canonicalize(value: &Value) -> Value {
+            match value {
+                Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+                Value::Object(object) => {
+                    let mut keys = object.keys().collect::<Vec<_>>();
+                    keys.sort_unstable();
+                    let mut canonical = serde_json::Map::with_capacity(object.len());
+                    for key in keys {
+                        canonical.insert(key.clone(), canonicalize(&object[key]));
+                    }
+                    Value::Object(canonical)
+                }
+                value => value.clone(),
+            }
+        }
+
+        serde_json::to_vec(&canonicalize(&self.0))
+            .expect("serde_json::Value is always serializable")
+            .len()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct McpToolDef {
     pub name: String,
     pub description: String,
-    pub input_schema: Bytes,
+    pub input_schema: McpToolSchema,
     pub provider_identifier: String,
     pub tool_name: String,
 }
 
-impl Clone for McpToolDef {
-    fn clone(&self) -> Self {
+impl McpToolDef {
+    pub(crate) fn new(
+        name: String,
+        description: String,
+        input_schema: Value,
+        provider_identifier: String,
+        tool_name: String,
+    ) -> Self {
         Self {
-            name: self.name.clone(),
-            description: self.description.clone(),
-            input_schema: self.input_schema.clone(),
-            provider_identifier: self.provider_identifier.clone(),
-            tool_name: self.tool_name.clone(),
+            name,
+            description,
+            input_schema: McpToolSchema::new(input_schema),
+            provider_identifier,
+            tool_name,
         }
     }
 }
 
 pub fn encode_mcp_tool_def_body(def: &McpToolDef) -> Bytes {
+    let input_schema = json_to_value_bytes(def.input_schema.as_json());
     let mut parts = vec![
         encode_string(MTD_NAME, &def.name),
         encode_string(MTD_DESCRIPTION, &def.description),
-        encode_bytes(MTD_INPUT_SCHEMA, &def.input_schema),
+        encode_bytes(MTD_INPUT_SCHEMA, &input_schema),
     ];
     if !def.provider_identifier.is_empty() {
         parts.push(encode_string(
@@ -1132,13 +1179,13 @@ pub fn openai_tools_to_mcp_defs(tools: &Value) -> Vec<McpToolDef> {
         }
         let schema =
             parameters.unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
-        out.push(McpToolDef {
-            name: name.clone(),
+        out.push(McpToolDef::new(
+            name.clone(),
             description,
-            input_schema: json_to_value_bytes(&schema),
-            provider_identifier: "cc-switch".to_string(),
-            tool_name: name,
-        });
+            schema,
+            "cc-switch".to_string(),
+            name,
+        ));
     }
     out
 }
@@ -1168,13 +1215,13 @@ pub fn anthropic_tools_to_mcp_defs(tools: &Value) -> Vec<McpToolDef> {
             .get("input_schema")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
-        out.push(McpToolDef {
-            name: name.clone(),
+        out.push(McpToolDef::new(
+            name.clone(),
             description,
-            input_schema: json_to_value_bytes(&schema),
-            provider_identifier: "cc-switch".to_string(),
-            tool_name: name,
-        });
+            schema,
+            "cc-switch".to_string(),
+            name,
+        ));
     }
     out
 }
@@ -2082,6 +2129,7 @@ pub fn decode_exec_server_event(payload: &[u8]) -> ProtoResult<Option<ExecServer
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::cursor::request_builder::{build_plan, InboundProtocol};
 
     #[test]
     fn varint_roundtrip() {
@@ -2435,6 +2483,82 @@ mod tests {
     }
 
     #[test]
+    fn every_ingress_tool_schema_round_trips_through_final_run_request_wire() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/responses/codex_0144_additional_tools.json"
+        )))
+        .unwrap();
+        let cases = vec![
+            (
+                InboundProtocol::OpenAiResponses,
+                fixture["cases"][0]["request"].clone(),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                serde_json::json!({
+                    "tools":[{"type":"function","name":"lookup","parameters":{"type":"object","required":["q"],"properties":{"q":{"type":"string"}}}}],
+                    "input":"lookup"
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiChat,
+                serde_json::json!({
+                    "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}],
+                    "messages":[{"role":"user","content":"lookup"}]
+                }),
+            ),
+            (
+                InboundProtocol::AnthropicMessages,
+                serde_json::json!({
+                    "tools":[{"name":"lookup","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}],
+                    "messages":[{"role":"user","content":"lookup"}]
+                }),
+            ),
+            (
+                InboundProtocol::GeminiNative,
+                serde_json::json!({
+                    "tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}]}],
+                    "contents":[{"role":"user","parts":[{"text":"lookup"}]}]
+                }),
+            ),
+        ];
+
+        for (protocol, request) in cases {
+            let plan = build_plan(protocol, &request);
+            for rail in [CursorProtocolRail::OAuthCli, CursorProtocolRail::ApiKeySdk] {
+                let mut input = AgentRunInput {
+                    rail,
+                    model_id: &plan.model_id,
+                    user_text: &plan.user_text,
+                    conversation_id: Some("tool-wire-fixture"),
+                    message_id: Some("tool-wire-message"),
+                    tools: plan.tools.clone(),
+                    system_prompt: plan.system_prompt.as_deref(),
+                    blob_store: None,
+                    images: Vec::new(),
+                };
+                let body = encode_agent_run_request(&mut input).unwrap();
+                let run_request = field_bytes(&body, ACM_RUN_REQUEST);
+                let tools = field_bytes(run_request, ARR_MCP_TOOLS);
+                let wire_tools = repeated_field_bytes(tools, ARR_MCP_TOOLS_INNER);
+                assert_eq!(wire_tools.len(), plan.tools.len());
+                for (wire_tool, planned_tool) in wire_tools.into_iter().zip(&plan.tools) {
+                    assert_eq!(field_string(wire_tool, MTD_NAME), planned_tool.name);
+                    let wire_schema = field_bytes(wire_tool, MTD_INPUT_SCHEMA);
+                    assert_eq!(
+                        decode_proto_value_strict(wire_schema).unwrap(),
+                        planned_tool.input_schema.as_json().clone(),
+                        "schema wire mismatch for tool {} in {protocol:?} on {}",
+                        planned_tool.name,
+                        rail.label()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn agent_run_request_builds() {
         let mut input = AgentRunInput {
             rail: CursorProtocolRail::OAuthCli,
@@ -2541,6 +2665,19 @@ mod tests {
             .unwrap_or_else(|| panic!("missing bytes field {field}"))
     }
 
+    fn repeated_field_bytes(source: &[u8], field: u64) -> Vec<&[u8]> {
+        FieldIter::new(source)
+            .flatten()
+            .filter_map(|candidate| match candidate {
+                Field {
+                    field: candidate_field,
+                    value: FieldValue::Bytes(value),
+                } if candidate_field == field => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn field_varint(source: &[u8], field: u64) -> u64 {
         FieldIter::new(source)
             .flatten()
@@ -2603,13 +2740,13 @@ mod tests {
 
     #[test]
     fn request_context_empty_ack_smaller_than_tools_ack() {
-        let tool = McpToolDef {
-            name: "Bash".to_string(),
-            description: "run bash".to_string(),
-            input_schema: Bytes::from_static(br#"{"type":"object"}"#),
-            provider_identifier: "cc-switch".to_string(),
-            tool_name: "Bash".to_string(),
-        };
+        let tool = McpToolDef::new(
+            "Bash".to_string(),
+            "run bash".to_string(),
+            serde_json::json!({"type":"object"}),
+            "cc-switch".to_string(),
+            "Bash".to_string(),
+        );
         let empty = encode_request_context_response(1, "exec-a", &[]);
         let with_tools = encode_request_context_response(1, "exec-a", &[tool]);
         assert!(

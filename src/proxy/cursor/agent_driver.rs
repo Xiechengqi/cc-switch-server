@@ -64,11 +64,11 @@ use super::identity::{
 use super::image::load_images;
 use super::profile::CursorProtocolRail;
 use super::request_builder::{
-    build_plan, estimate_agent_plan_input_tokens, prepare_response_compaction,
-    prepend_response_context, preserve_current_continuation, retry_prompt_after_invalid_tool,
-    retry_prompt_after_missing_tool, validate_request_contract, validate_tool_choice_contract,
-    validate_tool_result_context, AgentRunPlan, ExtractedToolChoice, InboundProtocol,
-    ToolContinuationKind,
+    estimate_agent_plan_input_tokens, prepare_response_compaction, prepend_response_context,
+    preserve_current_continuation, retry_prompt_after_invalid_tool,
+    retry_prompt_after_missing_tool, try_build_plan, validate_request_contract,
+    validate_tool_choice_contract, validate_tool_result_context, AgentRunPlan, ExtractedToolChoice,
+    InboundProtocol, ToolContinuationKind,
 };
 use super::response_state::{CursorResponseScope, CursorResponseScopeInput};
 use super::session::{
@@ -263,7 +263,8 @@ pub async fn forward_agentservice(
     if compact {
         prepare_response_compaction(&mut body_value).map_err(ProxyError::bad_request)?;
     }
-    let preliminary_plan = build_plan(inbound_protocol, &body_value);
+    let preliminary_plan =
+        try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
     let response_scope = if inbound_protocol == InboundProtocol::OpenAiResponses {
         Some(
             cursor_completed_response_scope(
@@ -309,7 +310,8 @@ pub async fn forward_agentservice(
             response_context_prepended = true;
         }
     }
-    let mut plan = build_plan(inbound_protocol, &body_value);
+    let mut plan =
+        try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
     if response_context_prepended {
         preserve_current_continuation(&mut plan, &preliminary_plan);
     }
@@ -639,6 +641,17 @@ async fn ensure_cursor_success_status(
     if status.is_success() {
         return Ok(());
     }
+    let failure_reason = cursor_http_failure_reason(status);
+    let rail = CursorProtocolRail::for_provider(stored.provider_type)
+        .map(CursorProtocolRail::label)
+        .unwrap_or("unknown");
+    record_cursor_agentservice_failure("open_status", failure_reason, rail);
+    tracing::warn!(
+        upstream_status = status.as_u16(),
+        reason = failure_reason,
+        rail,
+        "Cursor AgentService rejected a request before business output"
+    );
     let upstream_error = read_cursor_upstream_error(session_entry).await;
     maybe_mark_cursor_rate_limited(
         state,
@@ -671,6 +684,31 @@ async fn ensure_cursor_success_status(
         },
         message,
     })
+}
+
+fn cursor_http_failure_reason(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => "upstream_authentication",
+        StatusCode::FORBIDDEN => "upstream_authorization",
+        StatusCode::TOO_MANY_REQUESTS => "upstream_rate_limit",
+        status if status.is_server_error() => "upstream_server",
+        status if status.is_client_error() => "upstream_request_rejected",
+        _ => "upstream_http",
+    }
+}
+
+fn record_cursor_agentservice_failure(
+    phase: &'static str,
+    reason: &'static str,
+    rail: &'static str,
+) {
+    metrics::counter!(
+        "cursor_agentservice_failure_total",
+        "phase" => phase,
+        "reason" => reason,
+        "rail" => rail
+    )
+    .increment(1);
 }
 
 fn tool_names_equal(left: &str, right: &str) -> bool {
@@ -803,6 +841,11 @@ async fn stream_response(
                     break;
                 }
                 Err(error) => {
+                    record_cursor_agentservice_failure(
+                        "stream_read",
+                        "transport_or_session",
+                        rail.label(),
+                    );
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
                     for event in writer.error_events(&error.message) {
@@ -811,7 +854,9 @@ async fn stream_response(
                     break;
                 }
             };
-            let kv_event = match decode_kv_server_event(&frame.payload).map_err(cursor_proto_error) {
+            let kv_event = match decode_kv_server_event(&frame.payload)
+                .map_err(|error| cursor_proto_error(rail, error))
+            {
                 Ok(event) => event,
                 Err(error) => {
                     final_status = error.status.as_u16();
@@ -831,7 +876,9 @@ async fn stream_response(
                 }
                 break;
             }
-            let exec_event = match decode_exec_server_event(&frame.payload).map_err(cursor_proto_error) {
+            let exec_event = match decode_exec_server_event(&frame.payload)
+                .map_err(|error| cursor_proto_error(rail, error))
+            {
                 Ok(event) => event,
                 Err(error) => {
                     final_status = error.status.as_u16();
@@ -906,7 +953,9 @@ async fn stream_response(
                     break;
                 }
             }
-            let deltas = match decode_agent_server_message(&frame.payload).map_err(cursor_proto_error) {
+            let deltas = match decode_agent_server_message(&frame.payload)
+                .map_err(|error| cursor_proto_error(rail, error))
+            {
                 Ok(deltas) => deltas,
                 Err(error) => {
                     final_status = error.status.as_u16();
@@ -1122,13 +1171,24 @@ async fn drive_non_stream(
     let mut filter = ComposerMarkerFilter::default();
     let mut exec_dedup = ExecDedup::default();
     loop {
-        let Some(frame) = next_session_frame(&session_entry).await? else {
+        let Some(frame) = next_session_frame(&session_entry)
+            .await
+            .inspect_err(|_error| {
+                record_cursor_agentservice_failure(
+                    "stream_read",
+                    "transport_or_session",
+                    rail.label(),
+                );
+            })?
+        else {
             return Err(cursor_incomplete_response_error(rail));
         };
-        let kv_event = decode_kv_server_event(&frame.payload).map_err(cursor_proto_error)?;
+        let kv_event = decode_kv_server_event(&frame.payload)
+            .map_err(|error| cursor_proto_error(rail, error))?;
         let kv_terminal_candidate = kv_event.is_some();
         handle_kv_event(&session_entry, kv_event).await?;
-        let exec_event = decode_exec_server_event(&frame.payload).map_err(cursor_proto_error)?;
+        let exec_event = decode_exec_server_event(&frame.payload)
+            .map_err(|error| cursor_proto_error(rail, error))?;
         match handle_exec_event(state, &session_entry, &mut exec_dedup, exec_event).await? {
             ExecHandling::Continue => {}
             ExecHandling::ToolCall(tool_call) => {
@@ -1149,7 +1209,9 @@ async fn drive_non_stream(
                 });
             }
         }
-        for delta in decode_agent_server_message(&frame.payload).map_err(cursor_proto_error)? {
+        for delta in decode_agent_server_message(&frame.payload)
+            .map_err(|error| cursor_proto_error(rail, error))?
+        {
             let content_delta = cursor_delta_is_business_output(&delta);
             let had_response_content = writer.has_response_content();
             let outcome = cursor_delta_events(delta, &mut writer, &mut filter)?;
@@ -1260,7 +1322,8 @@ fn encode_optional_millis(value: u128) -> u64 {
     value.min(u128::from(u64::MAX - 1)) as u64 + 1
 }
 
-fn cursor_proto_error(error: ProtoError) -> ProxyError {
+fn cursor_proto_error(rail: CursorProtocolRail, error: ProtoError) -> ProxyError {
+    record_cursor_agentservice_failure("decode", "wire_protocol", rail.label());
     ProxyError {
         status: StatusCode::BAD_GATEWAY,
         message: format!("Cursor Connect-RPC protobuf decode failed: {error}"),
@@ -1268,6 +1331,7 @@ fn cursor_proto_error(error: ProtoError) -> ProxyError {
 }
 
 fn cursor_incomplete_response_error(rail: CursorProtocolRail) -> ProxyError {
+    record_cursor_agentservice_failure("completion", "incomplete_response", rail.label());
     ProxyError {
         status: StatusCode::BAD_GATEWAY,
         message: format!(
@@ -1278,6 +1342,7 @@ fn cursor_incomplete_response_error(rail: CursorProtocolRail) -> ProxyError {
 }
 
 fn cursor_empty_response_error(rail: CursorProtocolRail) -> ProxyError {
+    record_cursor_agentservice_failure("completion", "empty_response", rail.label());
     ProxyError {
         status: StatusCode::BAD_GATEWAY,
         message: format!(
@@ -2779,6 +2844,11 @@ async fn open_agent_stream(
     {
         Ok(stream) => stream,
         Err(error) => {
+            record_cursor_agentservice_failure(
+                "open_transport",
+                "transport_or_session",
+                credential.rail().label(),
+            );
             state
                 .cursor_sessions
                 .release(entry.clone(), SessionState::Closed)
@@ -3867,6 +3937,26 @@ mod tests {
         assert!(redacted.contains("[REDACTED_CURSOR_URL]"));
         assert!(!redacted.contains("private.example"));
         assert!(!redacted.contains("/internal/run"));
+    }
+
+    #[test]
+    fn cursor_http_failures_have_low_cardinality_reasons() {
+        assert_eq!(
+            cursor_http_failure_reason(StatusCode::UNAUTHORIZED),
+            "upstream_authentication"
+        );
+        assert_eq!(
+            cursor_http_failure_reason(StatusCode::TOO_MANY_REQUESTS),
+            "upstream_rate_limit"
+        );
+        assert_eq!(
+            cursor_http_failure_reason(StatusCode::BAD_GATEWAY),
+            "upstream_server"
+        );
+        assert_eq!(
+            cursor_http_failure_reason(StatusCode::BAD_REQUEST),
+            "upstream_request_rejected"
+        );
     }
 
     #[test]

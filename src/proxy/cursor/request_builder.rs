@@ -9,6 +9,7 @@
 
 use super::agent_proto::{anthropic_tools_to_mcp_defs, openai_tools_to_mcp_defs, McpToolDef};
 use super::image::ImageRef;
+use super::tool_schema::{validate_tool_schema, ToolSchemaErrorKind};
 use bytes::Bytes;
 use serde_json::{json, Value};
 
@@ -115,7 +116,31 @@ struct OpenAiResponseToolInventory {
     tools: Vec<McpToolDef>,
     custom_tool_names: Vec<String>,
     namespaces: Vec<ResponseToolNamespace>,
-    registrations: std::collections::HashMap<String, String>,
+    registrations: std::collections::HashMap<String, ToolRegistrationSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolRegistrationSignature {
+    custom: bool,
+    description: String,
+    schema: super::agent_proto::McpToolSchema,
+}
+
+fn validate_mcp_tool_schemas(tools: &[McpToolDef]) -> Result<(), String> {
+    for tool in tools {
+        validate_tool_schema(tool.input_schema.as_json()).map_err(|error| {
+            let reason = match error.kind {
+                ToolSchemaErrorKind::InvalidSchema => "invalid_tool_schema",
+                ToolSchemaErrorKind::ComplexityLimit => "schema_complexity_limit",
+                ToolSchemaErrorKind::Validation => "invalid_tool_schema",
+            };
+            format!(
+                "Cursor tool `{}` schema is invalid ({reason}): {} at {}",
+                tool.name, error.message, error.path
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Validate tool-result context for AgentService routing. Returns an error
@@ -681,16 +706,13 @@ fn collect_openai_response_tool(
             let parameters = response_function_parameters(tool)
                 .unwrap_or_else(|| json!({"type":"object","properties":{}}));
             (
-                McpToolDef {
-                    name: full_name.clone(),
+                McpToolDef::new(
+                    full_name.clone(),
                     description,
-                    input_schema: Bytes::from(
-                        serde_json::to_vec(&parameters)
-                            .unwrap_or_else(|_| br#"{"type":"object","properties":{}}"#.to_vec()),
-                    ),
-                    provider_identifier: "cc-switch".to_string(),
-                    tool_name: full_name.clone(),
-                },
+                    parameters,
+                    "cc-switch".to_string(),
+                    full_name.clone(),
+                ),
                 false,
             )
         }
@@ -732,13 +754,13 @@ fn collect_openai_response_tool(
                 "additionalProperties":false
             });
             (
-                McpToolDef {
-                    name: full_name.clone(),
+                McpToolDef::new(
+                    full_name.clone(),
                     description,
-                    input_schema: Bytes::from(serde_json::to_vec(&schema).unwrap_or_default()),
-                    provider_identifier: "cc-switch".to_string(),
-                    tool_name: full_name.clone(),
-                },
+                    schema,
+                    "cc-switch".to_string(),
+                    full_name.clone(),
+                ),
                 true,
             )
         }
@@ -750,12 +772,11 @@ fn collect_openai_response_tool(
     };
 
     let normalized = normalize_response_tool_identity(&full_name);
-    let signature = format!(
-        "{}\0{}\0{}",
+    let signature = ToolRegistrationSignature {
         custom,
-        definition.description,
-        String::from_utf8_lossy(&definition.input_schema)
-    );
+        description: definition.description.clone(),
+        schema: definition.input_schema.clone(),
+    };
     if let Some(existing) = inventory.registrations.get(&normalized) {
         if existing == &signature {
             return Ok(());
@@ -857,7 +878,7 @@ pub fn validate_tool_choice_contract(plan: &AgentRunPlan) -> Result<(), String> 
 /// Build a plan from a request body. The body is the **upstream-mapped**
 /// version (after `apply_model_mapping`), so `model_id` here is what cursor
 /// will see on the wire.
-pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
+pub fn try_build_plan(protocol: InboundProtocol, body: &Value) -> Result<AgentRunPlan, String> {
     let model_id = body
         .get("model")
         .and_then(Value::as_str)
@@ -889,21 +910,21 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
             Vec::new(),
             Vec::new(),
         ),
-        InboundProtocol::OpenAiResponses => openai_response_tool_inventory(body)
-            .map(|inventory| {
-                (
-                    inventory.tools,
-                    inventory.custom_tool_names,
-                    inventory.namespaces,
-                )
-            })
-            .unwrap_or_default(),
+        InboundProtocol::OpenAiResponses => {
+            let inventory = openai_response_tool_inventory(body)?;
+            (
+                inventory.tools,
+                inventory.custom_tool_names,
+                inventory.namespaces,
+            )
+        }
         InboundProtocol::GeminiNative => (
             gemini_tools_to_mcp_defs(body.get("tools")),
             Vec::new(),
             Vec::new(),
         ),
     };
+    validate_mcp_tool_schemas(&tools)?;
     let tool_choice = extract_tool_choice(body, protocol);
     let mut tools = tools;
     if tool_choice_disables_tools(&tool_choice) {
@@ -948,7 +969,7 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
         );
     }
 
-    AgentRunPlan {
+    Ok(AgentRunPlan {
         system_prompt,
         user_text,
         tools,
@@ -970,7 +991,15 @@ pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
             Vec::new()
         },
         local_tool_required_by_intent,
-    }
+    })
+}
+
+/// Test helper for request bodies whose contract has already been validated.
+/// Production paths use [`try_build_plan`] so an invalid tool inventory can
+/// never be silently replaced with an empty one.
+#[cfg(test)]
+pub fn build_plan(protocol: InboundProtocol, body: &Value) -> AgentRunPlan {
+    try_build_plan(protocol, body).expect("validated Cursor request plan")
 }
 
 /// Preserve the continuation classification from the original inbound delta
@@ -981,9 +1010,9 @@ pub fn preserve_current_continuation(plan: &mut AgentRunPlan, original: &AgentRu
     plan.continuation_kind = original.continuation_kind;
 }
 
-pub fn estimate_responses_input_tokens(body: &Value) -> u32 {
-    let plan = build_plan(InboundProtocol::OpenAiResponses, body);
-    estimate_agent_plan_input_tokens(&plan)
+pub fn estimate_responses_input_tokens(body: &Value) -> Result<u32, String> {
+    let plan = try_build_plan(InboundProtocol::OpenAiResponses, body)?;
+    Ok(estimate_agent_plan_input_tokens(&plan))
 }
 
 pub fn estimate_agent_plan_input_tokens(plan: &AgentRunPlan) -> u32 {
@@ -992,7 +1021,7 @@ pub fn estimate_agent_plan_input_tokens(plan: &AgentRunPlan) -> u32 {
         characters = characters
             .saturating_add(tool.name.chars().count() as u64)
             .saturating_add(tool.description.chars().count() as u64)
-            .saturating_add(tool.input_schema.len() as u64);
+            .saturating_add(tool.input_schema.encoded_json_len() as u64);
     }
     let estimated = characters.saturating_add(3) / 4;
     estimated.min(u64::from(u32::MAX)) as u32
@@ -1059,11 +1088,27 @@ pub fn validate_request_contract(
             ));
         }
         let inventory = openai_response_tool_inventory(body)?;
+        validate_mcp_tool_schemas(&inventory.tools)?;
         if compact && !inventory.tools.is_empty() {
             return Err(
                 "unsupported parameter `tools`: response compaction cannot execute tools".into(),
             );
         }
+    }
+    if protocol != InboundProtocol::OpenAiResponses {
+        let tools = match protocol {
+            InboundProtocol::AnthropicMessages => body
+                .get("tools")
+                .map(anthropic_tools_to_mcp_defs)
+                .unwrap_or_default(),
+            InboundProtocol::OpenAiChat => body
+                .get("tools")
+                .map(openai_tools_to_mcp_defs)
+                .unwrap_or_default(),
+            InboundProtocol::GeminiNative => gemini_tools_to_mcp_defs(body.get("tools")),
+            InboundProtocol::OpenAiResponses => unreachable!(),
+        };
+        validate_mcp_tool_schemas(&tools)?;
     }
     if protocol == InboundProtocol::GeminiNative
         && body
@@ -1906,17 +1951,17 @@ fn gemini_tools_to_mcp_defs(tools: Option<&Value>) -> Vec<McpToolDef> {
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            out.push(McpToolDef {
-                name: name.clone(),
-                description: declaration
+            out.push(McpToolDef::new(
+                name.clone(),
+                declaration
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                input_schema: Bytes::from(schema.to_string()),
-                provider_identifier: "cc-switch".to_string(),
-                tool_name: name,
-            });
+                schema,
+                "cc-switch".to_string(),
+                name,
+            ));
         }
     }
     out
@@ -2690,7 +2735,7 @@ mod tests {
                 name: "list_agents".to_string(),
             }]
         );
-        let exec_schema: Value = serde_json::from_slice(&plan.tools[0].input_schema).unwrap();
+        let exec_schema = plan.tools[0].input_schema.as_json();
         assert_eq!(exec_schema["required"], json!(["input"]));
         assert!(plan.tools[0].description.contains("Lark grammar"));
         assert!(plan.local_tool_required_by_intent);
@@ -2826,6 +2871,37 @@ mod tests {
                 .unwrap_err()
                 .contains("conflicts")
         );
+    }
+
+    #[test]
+    fn request_contract_rejects_invalid_tool_schemas_before_agentservice() {
+        let invalid_branch = json!({
+            "tools":[{
+                "type":"function",
+                "function":{
+                    "name":"lookup",
+                    "parameters":{
+                        "type":"object",
+                        "oneOf":[
+                            {"properties":{"q":{"type":"string"}}},
+                            {"properties":{"path":{"type":"string","pattern":"["}}}
+                        ]
+                    }
+                }
+            }]
+        });
+        let error = validate_request_contract(InboundProtocol::OpenAiChat, &invalid_branch, false)
+            .unwrap_err();
+        assert!(error.contains("invalid_tool_schema"));
+        assert!(error.contains("lookup"));
+
+        let invalid_root = json!({
+            "tools":[{"name":"lookup","input_schema":true}]
+        });
+        let error =
+            validate_request_contract(InboundProtocol::AnthropicMessages, &invalid_root, false)
+                .unwrap_err();
+        assert!(error.contains("root must be a JSON object"));
     }
 
     #[test]
@@ -3026,7 +3102,7 @@ mod tests {
     fn estimate_input_tokens_nonzero_for_text() {
         assert!(estimate_input_tokens("hello world this is a test") > 0);
         assert_eq!(estimate_input_tokens(""), 0);
-        let plain = estimate_responses_input_tokens(&json!({"input":"hello"}));
+        let plain = estimate_responses_input_tokens(&json!({"input":"hello"})).unwrap();
         let with_tool = estimate_responses_input_tokens(&json!({
             "input":"hello",
             "tools":[{
@@ -3035,7 +3111,8 @@ mod tests {
                 "description":"lookup a value",
                 "parameters":{"type":"object","properties":{"key":{"type":"string"}}}
             }]
-        }));
+        }))
+        .unwrap();
         assert!(with_tool > plain);
     }
 

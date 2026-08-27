@@ -693,6 +693,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parked_session_preserves_semantic_schema_and_multiple_custom_calls() {
+        let mgr = CursorSessionManager::default();
+        let key = session_key(&CursorSessionScope::fixture("custom-tools"));
+        let schema = serde_json::json!({
+            "type":"object",
+            "properties":{"input":{"type":"string"}},
+            "required":["input"],
+            "additionalProperties":false
+        });
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                vec![McpToolDef::new(
+                    "exec".to_string(),
+                    "run tool".to_string(),
+                    schema.clone(),
+                    "cc-switch".to_string(),
+                    "exec".to_string(),
+                )],
+                Vec::new(),
+                ".".to_string(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut session = entry.lock().await;
+            session.custom_tool_names = vec!["exec".to_string()];
+            for index in 1..=2 {
+                session.pending_tool_calls.insert(
+                    format!("call_{index}"),
+                    PendingToolCall {
+                        exec_msg_id: index,
+                        exec_id: format!("exec-{index}"),
+                        tool_name: "exec".to_string(),
+                        custom: true,
+                    },
+                );
+            }
+        }
+        mgr.bind_tool_call_id(&key, &entry, "call_1").await;
+        mgr.bind_tool_call_id(&key, &entry, "call_2").await;
+        mgr.release(entry.clone(), SessionState::AwaitingToolResult)
+            .await;
+
+        let reference = mgr
+            .resolve_tool_call_id(key.scope(), "call_1")
+            .await
+            .unwrap();
+        let acquired = mgr.acquire_resolved(&reference).await.unwrap();
+        let session = acquired.lock().await;
+        assert_eq!(session.declared_tools[0].input_schema.as_json(), &schema);
+        assert_eq!(session.custom_tool_names, vec!["exec"]);
+        assert_eq!(session.pending_tool_calls.len(), 2);
+        assert!(session.pending_tool_calls.values().all(|call| call.custom));
+    }
+
+    #[tokio::test]
     async fn response_and_tool_indexes_are_scoped() {
         let mgr = CursorSessionManager::default();
         let scope_a = CursorSessionScope::fixture("share-a");

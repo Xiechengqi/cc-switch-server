@@ -34,7 +34,10 @@ use super::router::ProxyRoute;
 use super::{setting, ProxyError};
 
 use protocol::CursorResponseFormat;
-use request_builder::{build_plan, validate_tool_result_context, AgentRunPlan, InboundProtocol};
+use request_builder::{
+    try_build_plan, validate_request_contract, validate_tool_result_context, AgentRunPlan,
+    InboundProtocol,
+};
 
 pub use agent_driver::{forward_agentservice, AgentServiceForwardOptions};
 
@@ -225,7 +228,9 @@ pub fn build_agent_plan_preview(
     let value = serde_json::from_slice::<Value>(body).map_err(|error| {
         ProxyError::bad_request(format!("invalid cursor request JSON: {error}"))
     })?;
-    let plan = build_plan(protocol, &value);
+    validate_request_contract(protocol, &value, route == ProxyRoute::CodexResponsesCompact)
+        .map_err(ProxyError::bad_request)?;
+    let plan = try_build_plan(protocol, &value).map_err(ProxyError::bad_request)?;
     validate_tool_result_context(&plan).map_err(|message| {
         ProxyError::bad_request(format!("invalid cursor tool result context: {message}"))
     })?;

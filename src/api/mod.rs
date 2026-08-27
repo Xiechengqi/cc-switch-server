@@ -2033,7 +2033,8 @@ fn responses_input_tokens_response(
     let request = serde_json::from_slice::<Value>(&body)
         .map_err(|error| ApiError::bad_request(format!("invalid token count JSON: {error}")))?;
     let input_tokens =
-        crate::proxy::cursor::request_builder::estimate_responses_input_tokens(&request);
+        crate::proxy::cursor::request_builder::estimate_responses_input_tokens(&request)
+            .map_err(ApiError::bad_request)?;
     let mut response = Json(json!({
         "object": "response.input_tokens",
         "input_tokens": input_tokens,
@@ -2092,6 +2093,25 @@ mod responses_input_token_tests {
         let response =
             responses_input_tokens_response(&headers, body, 8 * 1024 * 1024).expect("within limit");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn input_token_estimate_rejects_invalid_tool_schema() {
+        let body = Bytes::from(
+            json!({
+                "input":"lookup",
+                "tools":[{
+                    "type":"function",
+                    "name":"lookup",
+                    "parameters":{"type":"object","properties":{"q":{"type":"wat"}}}
+                }]
+            })
+            .to_string(),
+        );
+        let error =
+            responses_input_tokens_response(&HeaderMap::new(), body, 1024 * 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("invalid_tool_schema"));
     }
 }
 

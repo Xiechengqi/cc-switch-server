@@ -16,6 +16,7 @@ const MAX_REF_HOPS: usize = 64;
 const MAX_PATTERNS: usize = 256;
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_SCHEMA_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSchemaErrorKind {
@@ -73,6 +74,255 @@ pub fn validate_tool_arguments(schema: &Value, instance: &Value) -> Result<(), T
         active_refs: HashSet::new(),
     };
     context.validate(schema, instance, "$", 0, 0).map(|_| ())
+}
+
+/// Validate every schema-bearing branch before opening an AgentService run.
+///
+/// Argument validation is necessarily instance-directed; this separate pass
+/// prevents malformed declarations in an unvisited `oneOf`, `$defs`, or
+/// conditional branch from being deferred to Cursor (where they otherwise
+/// surface as an opaque upstream 5xx).
+pub fn validate_tool_schema(schema: &Value) -> Result<(), ToolSchemaError> {
+    if serde_json::to_vec(schema)
+        .map(|encoded| encoded.len() > MAX_SCHEMA_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(ToolSchemaError::complexity(
+            "Cursor tool schema exceeds the 1 MiB declaration limit",
+        ));
+    }
+    if !schema.is_object() {
+        return Err(ToolSchemaError::schema(
+            "MCP input schema root must be a JSON object",
+        ));
+    }
+    let mut inspection = SchemaInspection {
+        root: schema,
+        schema_nodes: 0,
+        patterns: 0,
+        active_refs: HashSet::new(),
+    };
+    inspection.visit(schema, 0)
+}
+
+struct SchemaInspection<'a> {
+    root: &'a Value,
+    schema_nodes: usize,
+    patterns: usize,
+    active_refs: HashSet<String>,
+}
+
+impl SchemaInspection<'_> {
+    fn visit(&mut self, schema: &Value, depth: usize) -> Result<(), ToolSchemaError> {
+        self.schema_nodes = self.schema_nodes.saturating_add(1);
+        if self.schema_nodes > MAX_SCHEMA_NODES || depth > MAX_SCHEMA_DEPTH {
+            return Err(ToolSchemaError::complexity(
+                "Cursor tool schema exceeds validation complexity limits",
+            ));
+        }
+        let object = match schema {
+            Value::Bool(_) => return Ok(()),
+            Value::Object(object) => object,
+            _ => {
+                return Err(ToolSchemaError::schema(
+                    "tool schema nodes must be objects or booleans",
+                ))
+            }
+        };
+
+        if let Some(types) = object.get("type") {
+            match types {
+                Value::String(value) => ensure_known_type(value)?,
+                Value::Array(values) if !values.is_empty() => {
+                    for value in values {
+                        ensure_known_type(value.as_str().ok_or_else(|| {
+                            ToolSchemaError::schema("type array must contain strings")
+                        })?)?;
+                    }
+                }
+                Value::Array(_) => {
+                    return Err(ToolSchemaError::schema("type array must not be empty"))
+                }
+                _ => return Err(ToolSchemaError::schema("type must be a string or array")),
+            }
+        }
+        if let Some(reference) = object.get("$ref") {
+            let reference = reference
+                .as_str()
+                .ok_or_else(|| ToolSchemaError::schema("$ref must be a string"))?;
+            if !reference.starts_with('#') {
+                return Err(ToolSchemaError::schema(
+                    "only local JSON Pointer $ref is supported",
+                ));
+            }
+            let pointer = reference.strip_prefix('#').unwrap_or(reference);
+            let target = self
+                .root
+                .pointer(pointer)
+                .cloned()
+                .ok_or_else(|| ToolSchemaError::schema("local $ref target does not exist"))?;
+            if self.active_refs.len() >= MAX_REF_HOPS
+                || !self.active_refs.insert(reference.to_string())
+            {
+                return Err(ToolSchemaError::complexity(
+                    "Cursor tool schema contains a recursive or excessive $ref chain",
+                ));
+            }
+            let result = self.visit(&target, depth + 1);
+            self.active_refs.remove(reference);
+            result?;
+        }
+        if let Some(required) = object.get("required") {
+            let values = required
+                .as_array()
+                .ok_or_else(|| ToolSchemaError::schema("required must be an array"))?;
+            if values.iter().any(|value| !value.is_string()) {
+                return Err(ToolSchemaError::schema("required must contain strings"));
+            }
+        }
+        if let Some(values) = object.get("enum") {
+            let values = values
+                .as_array()
+                .ok_or_else(|| ToolSchemaError::schema("enum must be an array"))?;
+            if values.is_empty() {
+                return Err(ToolSchemaError::schema("enum must not be empty"));
+            }
+        }
+        for key in [
+            "minProperties",
+            "maxProperties",
+            "minItems",
+            "maxItems",
+            "minContains",
+            "maxContains",
+            "minLength",
+            "maxLength",
+        ] {
+            if object
+                .get(key)
+                .is_some_and(|value| value.as_u64().is_none())
+            {
+                return Err(ToolSchemaError::schema(format!(
+                    "{key} must be a non-negative integer"
+                )));
+            }
+        }
+        for key in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
+            if object
+                .get(key)
+                .is_some_and(|value| value.as_f64().is_none())
+            {
+                return Err(ToolSchemaError::schema(format!("{key} must be numeric")));
+            }
+        }
+        if let Some(multiple) = object.get("multipleOf") {
+            if multiple.as_f64().is_none_or(|value| value <= 0.0) {
+                return Err(ToolSchemaError::schema("multipleOf must be positive"));
+            }
+        }
+        if object
+            .get("uniqueItems")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(ToolSchemaError::schema("uniqueItems must be boolean"));
+        }
+        if let Some(dependencies) = object.get("dependentRequired") {
+            let dependencies = dependencies
+                .as_object()
+                .ok_or_else(|| ToolSchemaError::schema("dependentRequired must be an object"))?;
+            for required in dependencies.values() {
+                let required = required.as_array().ok_or_else(|| {
+                    ToolSchemaError::schema("dependentRequired values must be arrays")
+                })?;
+                if required.iter().any(|value| !value.is_string()) {
+                    return Err(ToolSchemaError::schema(
+                        "dependentRequired arrays must contain strings",
+                    ));
+                }
+            }
+        }
+        if let Some(pattern) = object.get("pattern") {
+            self.validate_pattern(
+                pattern
+                    .as_str()
+                    .ok_or_else(|| ToolSchemaError::schema("pattern must be a string"))?,
+            )?;
+        }
+
+        for key in [
+            "$defs",
+            "definitions",
+            "properties",
+            "patternProperties",
+            "dependentSchemas",
+        ] {
+            let Some(children) = object.get(key) else {
+                continue;
+            };
+            let children = children
+                .as_object()
+                .ok_or_else(|| ToolSchemaError::schema(format!("{key} must be an object")))?;
+            for (name, child) in children {
+                if key == "patternProperties" {
+                    self.validate_pattern(name)?;
+                }
+                self.visit(child, depth + 1)?;
+            }
+        }
+        for key in [
+            "additionalProperties",
+            "unevaluatedProperties",
+            "propertyNames",
+            "additionalItems",
+            "unevaluatedItems",
+            "contains",
+            "not",
+            "if",
+            "then",
+            "else",
+        ] {
+            if let Some(child) = object.get(key) {
+                self.visit(child, depth + 1)?;
+            }
+        }
+        if let Some(items) = object.get("items") {
+            match items {
+                Value::Array(children) => {
+                    for child in children {
+                        self.visit(child, depth + 1)?;
+                    }
+                }
+                child => self.visit(child, depth + 1)?,
+            }
+        }
+        for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            let Some(children) = object.get(key) else {
+                continue;
+            };
+            let children = children
+                .as_array()
+                .ok_or_else(|| ToolSchemaError::schema(format!("{key} must be an array")))?;
+            if key != "prefixItems" && children.is_empty() {
+                return Err(ToolSchemaError::schema(format!("{key} must not be empty")));
+            }
+            for child in children {
+                self.visit(child, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_pattern(&mut self, pattern: &str) -> Result<(), ToolSchemaError> {
+        self.patterns = self.patterns.saturating_add(1);
+        if self.patterns > MAX_PATTERNS || pattern.len() > MAX_PATTERN_BYTES {
+            return Err(ToolSchemaError::complexity(
+                "Cursor tool schema exceeds regex complexity limits",
+            ));
+        }
+        Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|_| ToolSchemaError::schema("invalid tool schema regex"))
+    }
 }
 
 struct ValidationContext<'a> {
@@ -801,6 +1051,37 @@ mod tests {
         let schema = json!({"oneOf":[{"type":"number"},{"minimum":0}]});
         assert!(validate_tool_arguments(&schema, &json!(-1)).is_ok());
         assert!(validate_tool_arguments(&schema, &json!(1)).is_err());
+    }
+
+    #[test]
+    fn declaration_preflight_visits_unselected_schema_branches() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "oneOf":[
+                {"required":["query"]},
+                {"properties":{"path":{"type":"string","pattern":"["}}}
+            ]
+        });
+        let error = validate_tool_schema(&schema).unwrap_err();
+        assert_eq!(error.kind, ToolSchemaErrorKind::InvalidSchema);
+        assert!(error.message.contains("regex"));
+    }
+
+    #[test]
+    fn declaration_preflight_rejects_non_object_mcp_roots_and_remote_refs() {
+        assert!(validate_tool_schema(&Value::Bool(true)).is_err());
+        assert!(validate_tool_schema(&json!({"$ref":"https://example.com/schema"})).is_err());
+        assert!(validate_tool_schema(&json!({
+            "$defs":{"node":{"type":"object","properties":{"next":{"$ref":"#/$defs/node"}}}},
+            "properties":{"root":{"$ref":"#/$defs/node"}}
+        }))
+        .is_err());
+        assert!(validate_tool_schema(&json!({
+            "$defs":{"input":{"type":"string"}},
+            "properties":{"input":{"$ref":"#/$defs/input"}}
+        }))
+        .is_ok());
     }
 
     #[test]

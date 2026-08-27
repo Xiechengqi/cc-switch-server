@@ -6,7 +6,6 @@
 
 use super::agent_proto::McpToolDef;
 use super::tool_schema::{validate_tool_arguments, ToolSchemaError, ToolSchemaErrorKind};
-use bytes::Bytes;
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -390,15 +389,14 @@ fn schema_types(value: Option<&Value>) -> Vec<&str> {
 fn tool_spec(tool: &McpToolDef) -> ToolSpec {
     ToolSpec {
         name: tool.name.clone(),
-        schema: parse_tool_schema(&tool.input_schema),
+        schema: parse_tool_schema(tool.input_schema.as_json()),
     }
 }
 
-fn parse_tool_schema(bytes: &Bytes) -> ToolSchema {
-    let root = serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Object(Map::new()));
+fn parse_tool_schema(root: &Value) -> ToolSchema {
     let Some(obj) = root.as_object() else {
         return ToolSchema {
-            raw: Value::Bool(true),
+            raw: root.clone(),
             open: true,
             ..ToolSchema::default()
         };
@@ -426,7 +424,7 @@ fn parse_tool_schema(bytes: &Bytes) -> ToolSchema {
     let additional_properties = obj.get("additionalProperties").and_then(Value::as_bool);
     let open = properties.is_empty() && required.is_empty() && additional_properties != Some(false);
     ToolSchema {
-        raw: root,
+        raw: root.clone(),
         properties,
         required,
         additional_properties,
@@ -696,13 +694,13 @@ mod tests {
     use serde_json::json;
 
     fn tool(name: &str, schema: Value) -> McpToolDef {
-        McpToolDef {
-            name: name.to_string(),
-            description: String::new(),
-            input_schema: Bytes::from(schema.to_string()),
-            provider_identifier: "cc-switch".to_string(),
-            tool_name: name.to_string(),
-        }
+        McpToolDef::new(
+            name.to_string(),
+            String::new(),
+            schema,
+            "cc-switch".to_string(),
+            name.to_string(),
+        )
     }
 
     #[test]
