@@ -211,6 +211,9 @@ impl CursorApiKeyVerifier for AcceptCursorApiKeyVerifier {
             account_id: "cursor_apikey_contract_fixture".to_string(),
             principal_source: "user_id".to_string(),
             email: Some("fixture@example.com".to_string()),
+            display_name: Some("Cursor Fixture".to_string()),
+            credential_name: Some("Contract key".to_string()),
+            subscription_level: Some("Cursor Pro".to_string()),
             profile: json!({"source": "api_contract_fixture"}),
         })
     }
@@ -9188,7 +9191,11 @@ async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
                 .expect("Cursor API-key Provider must persist verified identity");
             assert_eq!(identity.account_id, "cursor_apikey_contract_fixture");
             assert_eq!(identity.principal_source, "user_id");
-            assert_eq!(identity.schema_version, 1);
+            assert_eq!(identity.schema_version, 2);
+            assert_eq!(identity.email.as_deref(), Some("fixture@example.com"));
+            assert_eq!(identity.display_name.as_deref(), Some("Cursor Fixture"));
+            assert_eq!(identity.credential_name.as_deref(), Some("Contract key"));
+            assert_eq!(identity.subscription_level.as_deref(), Some("Cursor Pro"));
         }
     }
 }

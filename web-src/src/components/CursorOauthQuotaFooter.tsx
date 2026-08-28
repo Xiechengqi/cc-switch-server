@@ -26,6 +26,8 @@ interface CursorOauthQuotaFooterProps {
   meta?: ProviderMeta;
   appId?: AppId;
   providerId?: string;
+  accountLabel?: string;
+  subscriptionLevel?: string;
   inline?: boolean;
   isCurrent?: boolean;
 }
@@ -34,6 +36,8 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
   meta,
   appId,
   providerId,
+  accountLabel,
+  subscriptionLevel,
   inline = false,
 }) => {
   const { t, i18n } = useTranslation();
@@ -119,7 +123,9 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     return () => clearInterval(interval);
   }, [displayQueriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
 
-  const membership = quota?.credentialMessage ?? undefined;
+  const membership = isCursorApiKey
+    ? accountLabel?.trim() || quota?.credentialMessage || undefined
+    : subscriptionLevel?.trim() || quota?.credentialMessage || undefined;
   const tier = quota?.tiers?.find(
     (item) =>
       item.name === "cursor_credits" || item.name === "cursor_included_usage",
@@ -132,11 +138,38 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     typeof creditLimit === "number" &&
     Number.isFinite(creditLimit);
 
+  if (!quota && membership && inline) {
+    return (
+      <ProviderQuotaMetaRow
+        timeLabel={t("provider.quotaNeverUpdated", {
+          defaultValue: "从未更新",
+        })}
+        loading={effectiveLoading}
+        onRefresh={(event) => {
+          event.stopPropagation();
+          void handleRefresh().catch(reportRefreshError);
+        }}
+        refreshTitle={refreshTitle}
+        leading={
+          <span className="text-[10px] font-medium text-foreground">
+            {membership}
+          </span>
+        }
+      />
+    );
+  }
+
   // 无 usage tier 时（如 Stripe 成功但 Usage 接口失败），仍展示会员等级标签
   if (!quota?.success || !tier) {
+    const displayQuota =
+      quota && membership ? { ...quota, credentialMessage: membership } : quota;
     return (
       <SubscriptionQuotaView
-        quota={quota && membership ? { ...quota, tiers: [] } : quota}
+        quota={
+          displayQuota && membership
+            ? { ...displayQuota, tiers: [] }
+            : displayQuota
+        }
         loading={effectiveLoading}
         refetch={handleRefresh}
         appIdForExpiredHint="cursor_oauth"

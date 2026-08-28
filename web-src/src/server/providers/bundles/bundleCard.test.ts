@@ -106,6 +106,7 @@ function account(): ManagedAuthAccount {
     authIdentityGeneration: 3,
     login: "openai-login",
     email: "owner@example.com",
+    subscriptionLevel: "ChatGPT Plus",
     avatar_url: null,
     authenticated_at: 1,
     is_default: true,
@@ -208,6 +209,7 @@ describe("Provider Bundle card data", () => {
     expect(providerBundleDisplayTarget(view, [account()])).toEqual({
       kind: "oauth_account",
       value: "owner@example.com",
+      subscriptionLevel: "ChatGPT Plus",
     });
   });
 
@@ -231,6 +233,31 @@ describe("Provider Bundle card data", () => {
     expect(providerBundleDisplayTarget(view, [])).toEqual({
       kind: "oauth_account",
       value: "account-1",
+      subscriptionLevel: null,
+    });
+  });
+
+  it("shows the verified Cursor API-key account instead of the public API URL", () => {
+    const cursor = resource(
+      "codex",
+      "codex.cursor_api_key",
+      {},
+      { providerType: "cursor_apikey" },
+      "https://api.cursor.com",
+    );
+    cursor.cursorAccount = {
+      label: "cursor-owner@example.com",
+      email: "cursor-owner@example.com",
+      name: "Cursor Owner",
+      credentialName: "SDK key",
+      subscriptionLevel: "Cursor Pro+",
+    };
+    const view = bundle("family.cursor_api_key", { codex: cursor });
+
+    expect(providerBundleDisplayTarget(view, [])).toEqual({
+      kind: "api_key_account",
+      value: "cursor-owner@example.com",
+      subscriptionLevel: "Cursor Pro+",
     });
   });
 });

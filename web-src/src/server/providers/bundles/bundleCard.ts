@@ -9,8 +9,9 @@ const DEFAULT_API_URLS: Partial<Record<string, string>> = {
 };
 
 export interface ProviderBundleDisplayTarget {
-  kind: "oauth_account" | "api_url";
+  kind: "oauth_account" | "api_key_account" | "api_url";
   value: string | null;
+  subscriptionLevel?: string | null;
 }
 
 export function providerBundlePrimaryResource(
@@ -81,6 +82,21 @@ export function providerBundleDisplayTarget(
         account?.login?.trim() ||
         binding?.accountId?.trim() ||
         null,
+      subscriptionLevel: account?.subscriptionLevel?.trim() || null,
+    };
+  }
+
+  if (resource.cursorAccount) {
+    return {
+      kind: "api_key_account",
+      value:
+        resource.cursorAccount.label?.trim() ||
+        resource.cursorAccount.email?.trim() ||
+        resource.cursorAccount.name?.trim() ||
+        resource.cursorAccount.credentialName?.trim() ||
+        null,
+      subscriptionLevel:
+        resource.cursorAccount.subscriptionLevel?.trim() || null,
     };
   }
 

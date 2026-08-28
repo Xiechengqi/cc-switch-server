@@ -202,6 +202,8 @@
     "managedOauthWebsiteLockedHint": "OAuth アカウントの Web サイト URL はプリセットで管理されるため、手動では変更できません。",
     "oauthAccountDisplay": "OAuth アカウント：{{account}}",
     "oauthAccountResolving": "OAuth アカウント",
+    "apiKeyAccountDisplay": "API キーアカウント：{{account}}",
+    "apiKeyAccountResolving": "API キーアカウント",
     "websiteUrl": "Web サイト URL",
     "notes": "メモ",
     "notesPlaceholder": "例: 会社用アカウント",

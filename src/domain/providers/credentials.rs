@@ -194,7 +194,24 @@ pub struct ProviderView {
     pub credential_configured: bool,
     pub credential_slots: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_account: Option<ProviderCursorAccountView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<super::runtime::ProviderRuntimePlan>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCursorAccountView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_level: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -247,9 +264,26 @@ impl ProviderView {
             order_index,
             credential_configured: credentials.configured,
             credential_slots: credentials.slots,
+            cursor_account: cursor_account_view(stored),
             runtime,
         }
     }
+}
+
+fn cursor_account_view(stored: &StoredProvider) -> Option<ProviderCursorAccountView> {
+    let identity = stored.resource.cursor_verified_identity.as_ref()?;
+    let label = identity
+        .email
+        .clone()
+        .or_else(|| identity.display_name.clone())
+        .or_else(|| identity.credential_name.clone());
+    Some(ProviderCursorAccountView {
+        label,
+        email: identity.email.clone(),
+        name: identity.display_name.clone(),
+        credential_name: identity.credential_name.clone(),
+        subscription_level: identity.subscription_level.clone(),
+    })
 }
 
 fn provider_identity_view(stored: &StoredProvider) -> ProviderIdentityView {

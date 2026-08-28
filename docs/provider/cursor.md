@@ -37,12 +37,26 @@ Cursor Provider profiles remain `experimental` until OAuth and API-key credentia
 
 ## API-key verified identity
 
-- Successful Provider validation stores only a Server-owned `cursorVerifiedIdentity` containing schema version, non-sensitive stable account id, principal source, and verification time. Client Provider payloads cannot supply this resource metadata.
+- Successful Provider validation stores only a Server-owned `cursorVerifiedIdentity`. In addition to the schema version, non-sensitive stable account id, principal source, and verification time, schema v2 may contain bounded display-only email, display name, API-key name, and normalized subscription label. Client Provider payloads cannot supply this resource metadata, and no API key or exchanged token is stored in it.
 - Provider validation (`/v1/me`) and API-key model discovery (`/v1/models`) use the audited Public API profile: Bearer authentication, JSON content type, `x-cursor-client-type=sdk`, `x-cursor-client-version=composer-api-0.1.0`, and `x-ghost-mode=true`. AgentService keeps its independent `sdk-1.0.13` version contract.
-- A `/v1/me` 401 is terminal and never falls back. A 403 triggers one bounded validation-only POST to the normal same-key `/auth/exchange_user_api_key` endpoint; saving is allowed only when that exchange returns a non-empty access token, which is immediately discarded. This fallback stores `principalSource=api_key_fallback`, never fabricates `/v1/me` identity, and never permits cross-key or cross-Provider selection. Failed Public API/exchange diagnostics expose only bounded, redacted known JSON fields.
+- `/v1/me` display extraction follows the dashboard-compatible fields (`userEmail`, first/last name, `apiKeyName`, and membership fields). Every persisted display value is trimmed and limited to 256 characters; membership values such as `pro_plus` are normalized to labels such as `Cursor Pro+`.
+- A `/v1/me` 401 is terminal and never falls back. A 403 triggers one bounded validation-only POST to the normal same-key `/auth/exchange_user_api_key` endpoint; saving is allowed only when that exchange returns a non-empty access token. The temporary token is zeroized after one best-effort `GET https://cursor.com/api/auth/me` enrichment using its WorkOS subject. Enrichment failure does not invalidate an exchange-verified key, and the token never reaches Provider resources, account profiles, logs, errors, or Router descriptors. This fallback keeps `principalSource=api_key_fallback`, never fabricates a stable dashboard identity, and never permits cross-key or cross-Provider selection. Failed Public API/exchange diagnostics expose only bounded, redacted known JSON fields.
 - `/v1/me` identity selection is `userId/id/sub/user_id`, then normalized lowercase email, then an API-key hash fallback. The verified account id seeds Cursor machine/config identity; API-key digest plus `credentialGeneration` still fences exchange tokens, endpoint discovery, live sessions, cooldown, and completed response state.
 - Rotating to a key verified for the same account preserves machine/config identity while incrementing credential generation. A different verified principal returns `cc_switch_cursor_identity_conflict`; delete and recreate the Provider to perform the explicit operator-visible rebind. Fallback identities intentionally cannot remain stable across keys.
-- Legacy Providers without this metadata keep key-hash identity until their next explicit validation/edit. Startup performs no network migration.
+- Provider views expose the schema-v2 fields as a read-only `cursorAccount`; Share descriptors project only `accountLabel`, `accountEmail`, and `subscriptionLevel`. Server and Router cards prefer the real account/subscription over the generic `Cursor API Key` Provider name.
+- Legacy Providers without schema-v2 presentation fields keep their previous display fallback until their next explicit validation/edit. Startup performs no network migration.
+
+## OAuth account presentation
+
+- Browser login and refresh profile parsing accept Cursor dashboard fields including `userEmail`, `stripeStatus.membershipType`, and `membershipType`. The normalized membership label is persisted as the managed Account `subscriptionLevel`, while the email is persisted as the Account identity display.
+- When the OAuth token already supplies a stable WorkOS subject, dashboard profile email, membership, and expiry still enrich that same Account; profile enrichment never changes the Provider's explicit account binding.
+- Share descriptors project the managed Account label, email, and subscription level. Server and Router cards therefore show the subscription tier (for example `Cursor Pro+`) and the account email instead of the generic `Cursor OAuth` label when the data is available.
+
+## Usage and streaming timing
+
+- AgentService does not report a cache-read/cache-write token breakdown. Cursor usage therefore keeps both cache fields unknown, exports `cacheUsageObserved=false`, and never infers cache tokens from the canonical prompt estimate. Router request cards render Cache R, Cache W, and cache-hit rate as unavailable instead of observed zero.
+- Cursor input/output counts are local estimates and export `usageEstimated=true`. Router labels them as estimates; input is the full canonical prompt and may include reused conversation context, so it must not be described as fresh uncached input.
+- `firstTokenMs` is recorded only when a non-terminal AgentService batch produces progressive business output. Content delivered only with `TurnEnded`, KV completion, or the final writer flush has no reliable TTFT. Router TPS aggregation additionally rejects generation windows shorter than `max(100 ms, 1% of total latency)`.
 
 ## Unsupported parameters and transient retry
 

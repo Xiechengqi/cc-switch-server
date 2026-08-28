@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::cursor_client_contract::{
+    cursor_membership_label, DASHBOARD_ORIGIN, DASHBOARD_REFERER, DASHBOARD_USER_AGENT,
+    DEFAULT_DASHBOARD_PROFILE_URL,
+};
 use crate::domain::accounts::claude_subscription::{
     resolve_claude_subscription, ClaudeSubscriptionCandidate, ClaudeSubscriptionResolution,
     ClaudeSubscriptionSource,
@@ -286,7 +290,6 @@ static GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/aut
 static CURSOR_TOKEN_URLS: &[&str] = &["https://api2.cursor.sh/auth/exchange_user_api_key"];
 static CURSOR_AUTHORIZE_URL: &str = "https://cursor.com/loginDeepControl";
 static CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
-static CURSOR_USER_AGENT: &str = "Cursor/1.1.6 (cc-switch browser login)";
 static ANTIGRAVITY_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static ANTIGRAVITY_AUTHORIZE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 static XAI_TOKEN_URLS: &[&str] = &["https://auth.x.ai/oauth2/token"];
@@ -649,7 +652,7 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             client_secret: None,
             client_secret_env: None,
             refresh_scope: None,
-            user_agent: Some(CURSOR_USER_AGENT),
+            user_agent: Some(DASHBOARD_USER_AGENT),
             profile_url: Some("https://cursor.com/api/auth/me"),
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
@@ -1051,7 +1054,7 @@ pub fn build_cursor_poll_request(
                 "Accept".to_string(),
                 "application/json, text/plain, */*".to_string(),
             ),
-            ("User-Agent".to_string(), CURSOR_USER_AGENT.to_string()),
+            ("User-Agent".to_string(), DASHBOARD_USER_AGENT.to_string()),
         ],
         body: Value::Null,
         body_format: OAuthRequestBodyFormat::Json,
@@ -1209,22 +1212,19 @@ pub fn build_cursor_profile_request(
     }
     Some(OAuthHttpRequest {
         method: "GET",
-        url: "https://cursor.com/api/auth/me".to_string(),
+        url: DEFAULT_DASHBOARD_PROFILE_URL.to_string(),
         headers: vec![
             (
                 "Cookie".to_string(),
                 format!("WorkosCursorSessionToken={workos_user_id}::{access_token}"),
             ),
-            ("Origin".to_string(), "https://cursor.com".to_string()),
-            (
-                "Referer".to_string(),
-                "https://cursor.com/dashboard".to_string(),
-            ),
+            ("Origin".to_string(), DASHBOARD_ORIGIN.to_string()),
+            ("Referer".to_string(), DASHBOARD_REFERER.to_string()),
             (
                 "Accept".to_string(),
                 "application/json, text/plain, */*".to_string(),
             ),
-            ("User-Agent".to_string(), CURSOR_USER_AGENT.to_string()),
+            ("User-Agent".to_string(), DASHBOARD_USER_AGENT.to_string()),
         ],
         body: Value::Null,
         body_format: OAuthRequestBodyFormat::Json,
@@ -1405,7 +1405,13 @@ pub fn refresh_update_from_profile_response(
     now_ms: i64,
     quota_refresh_interval_ms: i64,
 ) -> AccountRefreshUpdate {
-    let identity = identity_from_provider_value(&raw).unwrap_or_default();
+    let mut identity = identity_from_provider_value(&raw).unwrap_or_default();
+    if provider_type == ProviderType::CursorOAuth {
+        identity.plan_type = identity
+            .plan_type
+            .as_deref()
+            .and_then(cursor_membership_label);
+    }
     let claude_subscription = (provider_type == ProviderType::ClaudeOAuth)
         .then(|| claude_subscription_from_bootstrap_profile(&raw))
         .flatten();
@@ -2250,6 +2256,17 @@ fn login_identity(
         }
     }
     if provider_type == ProviderType::CursorOAuth {
+        if let Some(profile_identity) = profile_raw.and_then(identity_from_provider_value) {
+            if identity.email.is_none() {
+                identity.email = profile_identity.email;
+            }
+            if identity.plan_type.is_none() {
+                identity.plan_type = profile_identity.plan_type;
+            }
+            if identity.subscription_expires_at.is_none() {
+                identity.subscription_expires_at = profile_identity.subscription_expires_at;
+            }
+        }
         let stable_subject = cursor_workos_user_id_from_access_token(&response.access_token)
             .or_else(|| {
                 response
@@ -2270,12 +2287,17 @@ fn login_identity(
         {
             identity.account_id = Some(cursor_account_id_from_refresh_token(refresh_token));
         }
+        identity.plan_type = identity
+            .plan_type
+            .as_deref()
+            .and_then(cursor_membership_label);
     }
     if identity.email.is_none() {
         identity.email = profile_raw.and_then(|value| {
             string_at(
                 value,
                 &[
+                    "/userEmail",
                     "/email",
                     "/email_address",
                     "/user/email",
@@ -2428,6 +2450,7 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/account/email",
                 "/account/uuid",
                 "/accountUUID",
+                "/userId",
                 "/user_id",
                 "/user/email",
                 "/profile/email",
@@ -2441,6 +2464,7 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
         email: string_at(
             value,
             &[
+                "/userEmail",
                 "/account/email_address",
                 "/account/email",
                 "/user/email",
@@ -2464,6 +2488,10 @@ fn identity_from_provider_value(value: &Value) -> Option<OAuthIdentity> {
                 "/profile/plan",
                 "/tier",
                 "/subscription_tier",
+                "/stripeStatus/membershipType",
+                "/stripe_status/membership_type",
+                "/membershipType",
+                "/membership_type",
             ],
         ),
         subscription_expires_at: string_or_integer_at(
@@ -3545,6 +3573,59 @@ mod tests {
         );
         assert_eq!(input.email.as_deref(), Some("cursor@example.com"));
         assert_eq!(input.refresh_token.as_deref(), Some("refresh-new"));
+    }
+
+    #[test]
+    fn cursor_login_import_persists_dashboard_account_and_membership() {
+        let access_token = jwt(r#"{"sub":"workos-subject"}"#);
+        let raw = json!({
+            "accessToken": access_token,
+            "refreshToken": "refresh-new"
+        });
+        let profile = json!({
+            "userEmail": "owner@example.com",
+            "stripeStatus": {"membershipType": "pro_plus"}
+        });
+        let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
+        let input = upsert_input_from_login_response(
+            ProviderType::CursorOAuth,
+            &response,
+            raw,
+            Some(profile),
+            1_000,
+            30 * 60 * 1000,
+        )
+        .expect("account input");
+
+        assert_eq!(input.email.as_deref(), Some("owner@example.com"));
+        assert_eq!(input.subscription_level.as_deref(), Some("Cursor Pro+"));
+        let stored_profile = input.profile.expect("profile");
+        assert_eq!(stored_profile["email"], "owner@example.com");
+        assert_eq!(stored_profile["planType"], "Cursor Pro+");
+        assert_eq!(
+            stored_profile["profileRaw"]["stripeStatus"]["membershipType"],
+            "pro_plus"
+        );
+    }
+
+    #[test]
+    fn cursor_profile_refresh_persists_dashboard_account_and_membership() {
+        let update = refresh_update_from_profile_response(
+            ProviderType::CursorOAuth,
+            json!({
+                "userEmail": "owner@example.com",
+                "stripeStatus": {"membershipType": "pro_plus"}
+            }),
+            1_000,
+            30 * 60 * 1000,
+        );
+
+        assert_eq!(update.email.as_deref(), Some("owner@example.com"));
+        assert_eq!(update.subscription_level.as_deref(), Some("Cursor Pro+"));
+        let profile = update.profile.expect("profile");
+        assert_eq!(profile["email"], "owner@example.com");
+        assert_eq!(profile["planType"], "Cursor Pro+");
+        assert_eq!(profile["raw"]["stripeStatus"]["membershipType"], "pro_plus");
     }
 
     #[test]

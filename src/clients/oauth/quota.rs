@@ -13,6 +13,7 @@ use crate::clients::oauth::kiro_device::{
     agentic_quota_percent, fetch_usage_limits, machine_id_from_refresh_token,
     quota_from_usage_limits,
 };
+use crate::cursor_client_contract::cursor_membership_label;
 use crate::domain::accounts::capability_evidence::{
     AccountCapabilityObservationDraft, AccountCapabilityObservationState,
     CLAUDE_QUOTA_FAMILY_DIMENSION, GEMINI_QUOTA_FAMILY_DIMENSION, MEDIA_ENTITLEMENT_DIMENSION,
@@ -4645,17 +4646,23 @@ fn parse_cursor_imported_quota(
     let plan_paths = [
         "/stripeStatus/membershipType",
         "/stripe_status/membership_type",
+        "/profile/stripeStatus/membershipType",
+        "/profile/stripe_status/membership_type",
         "/membershipType",
         "/membership_type",
+        "/profile/membershipType",
+        "/profile/membership_type",
         "/subscription/planLabel",
+        "/profile/subscription/planLabel",
         "/plan",
+        "/profile/plan",
     ];
     let plan = account
         .raw
         .as_ref()
         .and_then(|raw| string_at(raw, &plan_paths))
         .or_else(|| string_at(&snapshot, &plan_paths))
-        .map(|value| format_cursor_membership_label(&value))
+        .and_then(|value| cursor_membership_label(&value))
         .or_else(|| Some("Cursor".to_string()));
     let resets_at = number_at(&usage, &["/billingCycleEnd", "/billing_cycle_end"])
         .and_then(timestamp_number_to_unix_ms)
@@ -6133,17 +6140,6 @@ fn format_copilot_plan_label(plan: &str) -> String {
         "free" => "Copilot Free".to_string(),
         other if !other.is_empty() => format!("Copilot {other}"),
         _ => "GitHub Copilot".to_string(),
-    }
-}
-
-fn format_cursor_membership_label(membership_type: &str) -> String {
-    match membership_type.trim().to_ascii_lowercase().as_str() {
-        "free" => "Cursor Free".to_string(),
-        "pro" => "Cursor Pro".to_string(),
-        "pro_plus" | "pro+" => "Cursor Pro+".to_string(),
-        "ultra" => "Cursor Ultra".to_string(),
-        other if !other.is_empty() => format!("Cursor {other}"),
-        _ => "Cursor".to_string(),
     }
 }
 

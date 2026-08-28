@@ -967,6 +967,10 @@ async fn stream_response(
                     break;
                 }
             };
+            let terminal_batch = kv_terminal_candidate
+                || deltas
+                    .iter()
+                    .any(|delta| matches!(delta, InteractionDelta::TurnEnded));
             let mut ended = false;
             for delta in deltas {
                 let content_delta = cursor_delta_is_business_output(&delta);
@@ -1009,7 +1013,11 @@ async fn stream_response(
                         break;
                     }
                 }
-                if first_token_ms.is_none() && business_output && !events.is_empty() {
+                if should_record_progressive_first_output(
+                    first_token_ms.is_some(),
+                    business_output,
+                    terminal_batch,
+                ) {
                     record_cursor_first_output(
                         &state,
                         &stored,
@@ -1043,17 +1051,6 @@ async fn stream_response(
                             }
                         } else {
                             completed_response = true;
-                            if first_token_ms.is_none() && !events.is_empty() {
-                                record_cursor_first_output(
-                                    &state,
-                                    &stored,
-                                    &request_id,
-                                    started,
-                                    &mut first_token_ms,
-                                    &first_token_ms_shared,
-                                )
-                                .await;
-                            }
                             for event in events {
                                 yield Ok::<_, std::io::Error>(Bytes::from(event));
                             }
@@ -1076,20 +1073,7 @@ async fn stream_response(
             }
         }
 
-        let deferred_business_output =
-            final_stream_status != "failed" && writer.has_deferred_business_output();
         let done_events = writer.done_events();
-        if first_token_ms.is_none() && deferred_business_output && !done_events.is_empty() {
-            record_cursor_first_output(
-                &state,
-                &stored,
-                &request_id,
-                started,
-                &mut first_token_ms,
-                &first_token_ms_shared,
-            )
-            .await;
-        }
         for event in done_events {
             yield Ok::<_, std::io::Error>(Bytes::from(event));
         }
@@ -1290,6 +1274,14 @@ fn cursor_events_are_business_output(
     has_response_content: bool,
 ) -> bool {
     valid_output && (content_delta || (!had_response_content && has_response_content))
+}
+
+fn should_record_progressive_first_output(
+    already_recorded: bool,
+    business_output: bool,
+    terminal_batch: bool,
+) -> bool {
+    !already_recorded && business_output && !terminal_batch
 }
 
 async fn record_cursor_first_output(
@@ -3302,6 +3294,14 @@ mod tests {
         assert!(cursor_events_are_business_output(true, true, false, true));
         assert!(cursor_events_are_business_output(true, false, false, true));
         assert!(!cursor_events_are_business_output(false, true, false, true));
+    }
+
+    #[test]
+    fn cursor_first_output_requires_a_progressive_non_terminal_batch() {
+        assert!(should_record_progressive_first_output(false, true, false));
+        assert!(!should_record_progressive_first_output(true, true, false));
+        assert!(!should_record_progressive_first_output(false, false, false));
+        assert!(!should_record_progressive_first_output(false, true, true));
     }
 
     #[test]

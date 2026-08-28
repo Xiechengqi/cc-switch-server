@@ -744,6 +744,10 @@ mod tests {
                         account_id: "cursor_apikey_fixture".to_string(),
                         principal_source: "user_id".to_string(),
                         verified_at_ms: 1_700_000_000_000,
+                        email: None,
+                        display_name: None,
+                        credential_name: None,
+                        subscription_level: None,
                     }),
                     ..Default::default()
                 },

@@ -520,6 +520,8 @@ pub struct ShareUpstreamProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_level: Option<String>,
@@ -578,6 +580,8 @@ pub struct ShareAppProvider {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub codex_image_generation_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -739,6 +743,13 @@ pub struct ShareRequestLogEntry {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    /// Whether the upstream protocol reported a cache-token breakdown. False means the
+    /// numeric cache fields are compatibility placeholders and must not be presented as zero.
+    #[serde(default)]
+    pub cache_usage_observed: bool,
+    /// Whether token counts were derived locally instead of reported by the upstream.
+    #[serde(default)]
+    pub usage_estimated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_tokens: Option<u32>,
     pub is_streaming: bool,
@@ -1163,6 +1174,7 @@ fn upstream_provider(
         app: app.to_string(),
         provider_name: Some(provider.provider.name.clone()),
         provider_type: Some(provider_type_id.clone()),
+        account_label: account_context.account_label,
         account_email: account_context.account_email,
         subscription_level: account_context.subscription_level,
         subscription_expires_at: account_context.subscription_expires_at,
@@ -1241,6 +1253,7 @@ fn app_provider(input: AppProviderInput<'_>) -> ShareAppProvider {
             .as_ref()
             .and_then(|meta| meta.codex_image_generation_enabled)
             .unwrap_or(false),
+        account_label: account_context.account_label,
         account_email: account_context.account_email,
         subscription_level: account_context.subscription_level,
         subscription_expires_at: account_context.subscription_expires_at,
@@ -1365,6 +1378,7 @@ fn current_account_usage_block(account: &Account, share: &Share) -> Option<Accou
 
 #[derive(Debug, Clone, Default)]
 struct ShareAccountContext {
+    account_label: Option<String>,
     account_email: Option<String>,
     subscription_level: Option<String>,
     subscription_expires_at: Option<String>,
@@ -1378,9 +1392,20 @@ fn account_context_for_share(
     accounts: Option<&AccountStore>,
 ) -> ShareAccountContext {
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
+    let cursor_identity = provider.resource.cursor_verified_identity.as_ref();
     ShareAccountContext {
+        account_label: account.and_then(account_display_label).or_else(|| {
+            cursor_identity.and_then(|identity| {
+                identity
+                    .email
+                    .clone()
+                    .or_else(|| identity.display_name.clone())
+                    .or_else(|| identity.credential_name.clone())
+            })
+        }),
         account_email: account
             .and_then(|account| account.email.clone())
+            .or_else(|| cursor_identity.and_then(|identity| identity.email.clone()))
             .or_else(|| share.account_email.clone()),
         subscription_level: account
             .and_then(|account| {
@@ -1389,6 +1414,7 @@ fn account_context_for_share(
                     account.subscription_level.as_deref(),
                 )
             })
+            .or_else(|| cursor_identity.and_then(|identity| identity.subscription_level.clone()))
             .or_else(|| {
                 canonical_provider_subscription_level(
                     provider.provider_type,
@@ -1401,6 +1427,30 @@ fn account_context_for_share(
             .and_then(|account| account.quota_percent)
             .or(share.quota_percent),
     }
+}
+
+fn account_display_label(account: &Account) -> Option<String> {
+    account.email.clone().or_else(|| {
+        let profile = account.profile.as_ref()?;
+        [
+            "/displayName",
+            "/name",
+            "/userEmail",
+            "/profileRaw/displayName",
+            "/profileRaw/name",
+            "/profileRaw/userEmail",
+            "/profileRaw/user/name",
+        ]
+        .iter()
+        .find_map(|pointer| {
+            profile
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
 }
 
 fn canonical_provider_subscription_level(
@@ -1911,6 +1961,57 @@ mod tests {
             Some(probe)
         );
         assert!(provider.enabled);
+    }
+
+    #[test]
+    fn cursor_api_key_descriptor_exposes_safe_verified_account_presentation() {
+        let provider_type = ProviderType::CursorApiKey;
+        let mut provider = test_provider(provider_type);
+        provider.resource.cursor_verified_identity =
+            Some(crate::domain::providers::store::CursorVerifiedIdentity {
+                schema_version: 2,
+                account_id: "cursor_apikey_fixture".to_string(),
+                principal_source: "user_id".to_string(),
+                verified_at_ms: 1_000,
+                email: Some("owner@example.com".to_string()),
+                display_name: Some("Ada Lovelace".to_string()),
+                credential_name: Some("Production key".to_string()),
+                subscription_level: Some("Cursor Pro+".to_string()),
+            });
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..ProviderStore::default()
+        };
+        let share = test_share(provider_type, None);
+
+        let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
+        let app_provider = descriptor.app_providers.codex.first().unwrap();
+        let upstream_provider = descriptor.upstream_provider.as_ref().unwrap();
+
+        assert_eq!(
+            app_provider.account_label.as_deref(),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            app_provider.account_email.as_deref(),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            app_provider.subscription_level.as_deref(),
+            Some("Cursor Pro+")
+        );
+        assert_eq!(
+            upstream_provider.account_label.as_deref(),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            upstream_provider.account_email.as_deref(),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            upstream_provider.subscription_level.as_deref(),
+            Some("Cursor Pro+")
+        );
     }
 
     #[test]

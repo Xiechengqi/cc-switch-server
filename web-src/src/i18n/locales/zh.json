@@ -212,6 +212,8 @@
     "managedOauthWebsiteLockedHint": "OAuth 账号供应商官网链接由预设管理，不能手动修改。",
     "oauthAccountDisplay": "OAuth 账号：{{account}}",
     "oauthAccountResolving": "OAuth 账号",
+    "apiKeyAccountDisplay": "API Key 账号：{{account}}",
+    "apiKeyAccountResolving": "API Key 账号",
     "websiteUrl": "官网链接",
     "notes": "备注",
     "notesPlaceholder": "例如：公司专用账号",

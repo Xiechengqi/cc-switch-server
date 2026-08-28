@@ -2283,6 +2283,9 @@ mod grok_catalog_provider_tests {
                 account_id: "cursor-catalog-fixture".to_string(),
                 principal_source: "user_id".to_string(),
                 email: Some("cursor-catalog@example.com".to_string()),
+                display_name: Some("Cursor Catalog Fixture".to_string()),
+                credential_name: Some("Fixture key".to_string()),
+                subscription_level: Some("Cursor Pro".to_string()),
                 profile: json!({"source": "cursor_catalog_fixture"}),
             })
         }

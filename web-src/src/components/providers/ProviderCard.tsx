@@ -187,7 +187,7 @@ const quotaSourceToAuthProvider = (
   return null;
 };
 
-function useManagedOauthAccountLogin(
+function useManagedOauthAccountPresentation(
   provider: Provider,
   quotaSource: ReturnType<typeof getProviderQuotaSource>,
 ) {
@@ -200,7 +200,7 @@ function useManagedOauthAccountLogin(
   });
 
   if (!authProvider) {
-    return null;
+    return { login: null, subscriptionLevel: null };
   }
 
   const accountId =
@@ -211,7 +211,10 @@ function useManagedOauthAccountLogin(
     ? authStatus?.accounts.find((item) => item.id === accountId)
     : undefined;
 
-  return account?.email || account?.login || null;
+  return {
+    login: account?.email || account?.login || null,
+    subscriptionLevel: account?.subscriptionLevel || null,
+  };
 }
 
 export function ProviderCard({
@@ -293,11 +296,11 @@ export function ProviderCard({
     defaultValue: "未配置接口地址",
   });
   const quotaSource = getProviderQuotaSource(provider, appId);
-  const managedOauthAccountLogin = useManagedOauthAccountLogin(
+  const managedOauthAccount = useManagedOauthAccountPresentation(
     provider,
     quotaSource,
   );
-  const oauthAccountLogin = managedOauthAccountLogin;
+  const oauthAccountLogin = managedOauthAccount.login;
 
   const displayUrl = useMemo(() => {
     if (isManagedOauthProvider(provider, appId)) {
@@ -547,6 +550,12 @@ export function ProviderCard({
                 inline={true}
                 appId={appId}
                 providerId={provider.id}
+                accountLabel={resource?.cursorAccount?.label}
+                subscriptionLevel={
+                  quotaSource === "cursor_oauth"
+                    ? (managedOauthAccount.subscriptionLevel ?? undefined)
+                    : resource?.cursorAccount?.subscriptionLevel
+                }
                 isCurrent={isCurrent}
               />
             ) : quotaSource === "kiro_oauth" ? (

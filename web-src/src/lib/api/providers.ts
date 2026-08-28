@@ -271,6 +271,13 @@ export interface ProviderResource {
   orderIndex?: number;
   credentialConfigured: boolean;
   credentialSlots: string[];
+  cursorAccount?: {
+    label?: string;
+    email?: string;
+    name?: string;
+    credentialName?: string;
+    subscriptionLevel?: string;
+  };
   runtime?: ProviderRuntimePlan;
 }
 

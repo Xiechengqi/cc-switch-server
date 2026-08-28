@@ -2390,6 +2390,7 @@ async fn verify_and_mark_managed_account_input(
                     })?;
             input.id = Some(verified.account_id);
             input.email = verified.email;
+            input.subscription_level = verified.subscription_level;
             input.profile = Some(verified.profile);
         }
         _ => {}

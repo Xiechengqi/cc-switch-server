@@ -2,21 +2,28 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::cursor_client_contract::{
-    CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, DEFAULT_API_KEY_EXCHANGE_URL, GHOST_MODE_ENABLED,
-    GHOST_MODE_HEADER, PUBLIC_API_CLIENT_VERSION, SDK_CLIENT_TYPE,
+    cursor_membership_label, CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, DASHBOARD_ORIGIN,
+    DASHBOARD_REFERER, DASHBOARD_USER_AGENT, DEFAULT_API_KEY_EXCHANGE_URL,
+    DEFAULT_DASHBOARD_PROFILE_URL, GHOST_MODE_ENABLED, GHOST_MODE_HEADER,
+    PUBLIC_API_CLIENT_VERSION, SDK_CLIENT_TYPE,
 };
 
 const CURSOR_PUBLIC_API_ORIGIN: &str = "https://api.cursor.com";
 const MAX_CURSOR_PUBLIC_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CURSOR_ERROR_DETAIL_CHARS: usize = 512;
+const MAX_CURSOR_PRESENTATION_CHARS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct VerifiedCursorApiKey {
     pub account_id: String,
     pub principal_source: String,
     pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub credential_name: Option<String>,
+    pub subscription_level: Option<String>,
     pub profile: Value,
 }
 
@@ -67,6 +74,7 @@ pub async fn verify_api_key(
         api_key,
         CURSOR_PUBLIC_API_ORIGIN,
         DEFAULT_API_KEY_EXCHANGE_URL,
+        DEFAULT_DASHBOARD_PROFILE_URL,
     )
     .await
 }
@@ -76,17 +84,26 @@ async fn verify_api_key_at_endpoints(
     api_key: &str,
     public_origin: &str,
     exchange_url: &str,
+    dashboard_profile_url: &str,
 ) -> Result<VerifiedCursorApiKey, CursorPublicApiError> {
     let profile = match cursor_public_json_at_origin(client, api_key, public_origin, "/v1/me").await
     {
         Ok(profile) => profile,
         Err(public_error) if public_error.status_code == 403 => {
-            verify_api_key_exchange(client, api_key, exchange_url)
+            let access_token = verify_api_key_exchange(client, api_key, exchange_url)
                 .await
                 .map_err(|exchange_error| {
                     cursor_fallback_verification_error(public_error, exchange_error)
                 })?;
-            return Ok(verified_api_key_from_exchange(api_key));
+            let dashboard_profile = fetch_cursor_dashboard_profile(
+                client,
+                access_token.as_str(),
+                dashboard_profile_url,
+            )
+            .await
+            .ok()
+            .flatten();
+            return Ok(verified_api_key_from_exchange(api_key, dashboard_profile));
         }
         Err(error) => return Err(error),
     };
@@ -95,30 +112,141 @@ async fn verify_api_key_at_endpoints(
 
 fn verified_api_key_from_profile(profile: Value, api_key: &str) -> VerifiedCursorApiKey {
     let (principal, principal_source) = verified_principal(&profile, api_key);
-    let email = first_string(&profile, &["/userEmail", "/email", "/user/email"]);
+    let presentation = cursor_account_presentation(&profile);
+    let safe_profile = presentation.safe_profile();
     VerifiedCursorApiKey {
         account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
         principal_source: principal_source.to_string(),
-        email,
+        email: presentation.email,
+        display_name: presentation.display_name,
+        credential_name: presentation.credential_name,
+        subscription_level: presentation.subscription_level,
         profile: json!({
             "providerType": "cursor_apikey",
             "source": "cursor_public_api",
+            "accountDisplay": safe_profile,
             "cursorMe": profile,
         }),
     }
 }
 
-fn verified_api_key_from_exchange(api_key: &str) -> VerifiedCursorApiKey {
+fn verified_api_key_from_exchange(
+    api_key: &str,
+    dashboard_profile: Option<Value>,
+) -> VerifiedCursorApiKey {
     let (principal, principal_source) = verified_principal(&Value::Null, api_key);
+    let presentation = dashboard_profile
+        .as_ref()
+        .map(cursor_account_presentation)
+        .unwrap_or_default();
+    let safe_profile = presentation.safe_profile();
     VerifiedCursorApiKey {
         account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
         principal_source: principal_source.to_string(),
-        email: None,
+        email: presentation.email,
+        display_name: presentation.display_name,
+        credential_name: presentation.credential_name,
+        subscription_level: presentation.subscription_level,
         profile: json!({
             "providerType": "cursor_apikey",
             "source": "cursor_api_key_exchange",
+            "accountDisplay": safe_profile,
         }),
     }
+}
+
+#[derive(Debug, Default)]
+struct CursorAccountPresentation {
+    email: Option<String>,
+    display_name: Option<String>,
+    credential_name: Option<String>,
+    subscription_level: Option<String>,
+}
+
+impl CursorAccountPresentation {
+    fn safe_profile(&self) -> Value {
+        json!({
+            "email": self.email,
+            "displayName": self.display_name,
+            "credentialName": self.credential_name,
+            "subscriptionLevel": self.subscription_level,
+        })
+    }
+}
+
+fn cursor_account_presentation(value: &Value) -> CursorAccountPresentation {
+    let first_name = first_presentation_string(
+        value,
+        &[
+            "/userFirstName",
+            "/firstName",
+            "/user/firstName",
+            "/user/first_name",
+        ],
+    );
+    let last_name = first_presentation_string(
+        value,
+        &[
+            "/userLastName",
+            "/lastName",
+            "/user/lastName",
+            "/user/last_name",
+        ],
+    );
+    let composed_name = bounded_presentation_value(
+        [first_name, last_name]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let display_name = (!composed_name.is_empty())
+        .then_some(composed_name)
+        .or_else(|| {
+            first_presentation_string(
+                value,
+                &["/name", "/displayName", "/user/name", "/profile/name"],
+            )
+        });
+    CursorAccountPresentation {
+        email: first_presentation_string(
+            value,
+            &[
+                "/userEmail",
+                "/email",
+                "/email_address",
+                "/user/email",
+                "/profile/email",
+                "/account/email",
+            ],
+        ),
+        display_name,
+        credential_name: first_presentation_string(
+            value,
+            &["/apiKeyName", "/api_key_name", "/credentialName"],
+        ),
+        subscription_level: first_presentation_string(
+            value,
+            &[
+                "/stripeStatus/membershipType",
+                "/stripe_status/membership_type",
+                "/membershipType",
+                "/membership_type",
+                "/subscription/planLabel",
+                "/plan",
+            ],
+        )
+        .and_then(|value| cursor_membership_label(&value))
+        .map(bounded_presentation_value),
+    }
+}
+
+fn first_presentation_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    first_string(value, pointers).map(bounded_presentation_value)
+}
+
+fn bounded_presentation_value(value: String) -> String {
+    value.chars().take(MAX_CURSOR_PRESENTATION_CHARS).collect()
 }
 
 fn verified_principal(profile: &Value, api_key: &str) -> (String, &'static str) {
@@ -206,7 +334,7 @@ async fn verify_api_key_exchange(
     client: &reqwest::Client,
     api_key: &str,
     exchange_url: &str,
-) -> Result<(), CursorPublicApiError> {
+) -> Result<Zeroizing<String>, CursorPublicApiError> {
     let response = client
         .post(exchange_url)
         .timeout(std::time::Duration::from_secs(10))
@@ -236,14 +364,59 @@ async fn verify_api_key_exchange(
         retryable: false,
         message: format!("Cursor API key exchange returned invalid JSON: {error}"),
     })?;
-    if first_string(&value, &["/accessToken", "/access_token"]).is_none() {
-        return Err(CursorPublicApiError {
+    let access_token = first_string(&value, &["/accessToken", "/access_token"])
+        .map(Zeroizing::new)
+        .ok_or_else(|| CursorPublicApiError {
             status_code: 502,
             retryable: false,
             message: "Cursor API key exchange response missing access token".to_string(),
-        });
+        })?;
+    Ok(access_token)
+}
+
+async fn fetch_cursor_dashboard_profile(
+    client: &reqwest::Client,
+    access_token: &str,
+    dashboard_profile_url: &str,
+) -> Result<Option<Value>, CursorPublicApiError> {
+    let Some(workos_user_id) =
+        crate::domain::accounts::cursor_import::cursor_workos_user_id_from_access_token(
+            access_token,
+        )
+    else {
+        return Ok(None);
+    };
+    let normalized_access_token =
+        crate::domain::accounts::cursor_import::normalize_cursor_access_token(access_token);
+    let response = client
+        .get(dashboard_profile_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .header(
+            "cookie",
+            format!("WorkosCursorSessionToken={workos_user_id}::{normalized_access_token}"),
+        )
+        .header("origin", DASHBOARD_ORIGIN)
+        .header("referer", DASHBOARD_REFERER)
+        .header("accept", "application/json, text/plain, */*")
+        .header("user-agent", DASHBOARD_USER_AGENT)
+        .send()
+        .await
+        .map_err(|error| CursorPublicApiError {
+            status_code: 502,
+            retryable: true,
+            message: format!("Cursor dashboard profile request failed: {error}"),
+        })?;
+    if !response.status().is_success() {
+        return Ok(None);
     }
-    Ok(())
+    let body = read_limited(response, "dashboard profile").await?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| CursorPublicApiError {
+            status_code: 502,
+            retryable: false,
+            message: format!("Cursor dashboard profile returned invalid JSON: {error}"),
+        })
 }
 
 fn cursor_http_error(
@@ -403,8 +576,12 @@ mod tests {
         }
         match uri.path() {
             "/v1/me" => Json(json!({
+                "apiKeyName":"Fixture key",
                 "userId":"verified-user",
-                "userEmail":"owner@example.com"
+                "userEmail":"owner@example.com",
+                "userFirstName":"Ada",
+                "userLastName":"Lovelace",
+                "stripeStatus":{"membershipType":"pro"}
             }))
             .into_response(),
             "/v1/models" => Json(json!({
@@ -430,7 +607,31 @@ mod tests {
         if !matches {
             return StatusCode::UNAUTHORIZED.into_response();
         }
-        Json(json!({"accessToken":"fixture-exchanged-token"})).into_response()
+        Json(json!({
+            "accessToken":"fixture-workos-user::fixture.eyJzdWIiOiJmaXh0dXJlLXdvcmtvcy11c2VyIn0.signature"
+        }))
+        .into_response()
+    }
+
+    async fn dashboard_profile_gate(headers: HeaderMap) -> Response {
+        let token = "fixture.eyJzdWIiOiJmaXh0dXJlLXdvcmtvcy11c2VyIn0.signature";
+        let matches = header_matches(
+            &headers,
+            "cookie",
+            &format!("WorkosCursorSessionToken=fixture-workos-user::{token}"),
+        ) && header_matches(&headers, "origin", DASHBOARD_ORIGIN)
+            && header_matches(&headers, "referer", DASHBOARD_REFERER)
+            && header_matches(&headers, "user-agent", DASHBOARD_USER_AGENT);
+        if !matches {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Json(json!({
+            "userEmail":"owner@example.com",
+            "userFirstName":"Ada",
+            "userLastName":"Lovelace",
+            "stripeStatus":{"membershipType":"pro_plus"}
+        }))
+        .into_response()
     }
 
     async fn forbidden_with_sensitive_detail() -> Response {
@@ -546,11 +747,15 @@ mod tests {
             api_key,
             &origin,
             &format!("{origin}/unused-exchange"),
+            &format!("{origin}/unused-dashboard-profile"),
         )
         .await
         .unwrap();
         assert_eq!(profile.principal_source, "user_id");
         assert_eq!(profile.email.as_deref(), Some("owner@example.com"));
+        assert_eq!(profile.display_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(profile.credential_name.as_deref(), Some("Fixture key"));
+        assert_eq!(profile.subscription_level.as_deref(), Some("Cursor Pro"));
         let models = available_models_at_origin(&client, api_key, &origin)
             .await
             .unwrap();
@@ -598,6 +803,7 @@ mod tests {
                 get(|| async { StatusCode::FORBIDDEN.into_response() }),
             )
             .route("/auth/exchange_user_api_key", post(exchange_identity_gate))
+            .route("/api/auth/me", get(dashboard_profile_gate))
             .with_state(ExpectedPublicIdentity {
                 authorization: format!("Bearer {api_key}"),
             });
@@ -608,13 +814,17 @@ mod tests {
             api_key,
             &origin,
             &format!("{origin}/auth/exchange_user_api_key"),
+            &format!("{origin}/api/auth/me"),
         )
         .await
         .unwrap();
         assert_eq!(verified.principal_source, "api_key_fallback");
-        assert!(verified.email.is_none());
+        assert_eq!(verified.email.as_deref(), Some("owner@example.com"));
+        assert_eq!(verified.display_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(verified.subscription_level.as_deref(), Some("Cursor Pro+"));
         assert_eq!(verified.profile["source"], "cursor_api_key_exchange");
         assert!(verified.profile.get("accessToken").is_none());
+        assert!(verified.profile.to_string().find("fixture.").is_none());
         server.abort();
     }
 
@@ -636,6 +846,7 @@ mod tests {
             "fixture-cursor-key",
             &origin,
             &format!("{origin}/auth/exchange_user_api_key"),
+            &format!("{origin}/unused-dashboard-profile"),
         )
         .await
         .unwrap_err();
@@ -661,6 +872,7 @@ mod tests {
             "fixture-cursor-key",
             &origin,
             &format!("{origin}/auth/exchange_user_api_key"),
+            &format!("{origin}/unused-dashboard-profile"),
         )
         .await
         .unwrap_err();
@@ -684,6 +896,7 @@ mod tests {
             "fixture-cursor-key",
             &origin,
             &format!("{origin}/auth/exchange_user_api_key"),
+            &format!("{origin}/unused-dashboard-profile"),
         )
         .await
         .unwrap_err();

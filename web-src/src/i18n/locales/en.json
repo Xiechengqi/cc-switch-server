@@ -208,6 +208,8 @@
     "managedOauthWebsiteLockedHint": "OAuth account provider website links are managed by the preset and cannot be edited.",
     "oauthAccountDisplay": "OAuth account: {{account}}",
     "oauthAccountResolving": "OAuth account",
+    "apiKeyAccountDisplay": "API key account: {{account}}",
+    "apiKeyAccountResolving": "API key account",
     "websiteUrl": "Website URL",
     "notes": "Notes",
     "notesPlaceholder": "e.g., Company dedicated account",

@@ -8166,7 +8166,7 @@ impl ServerStateInner {
                     });
                 }
             }
-            let identity = candidate
+            let verified_at_ms = candidate
                 .resource
                 .cursor_verified_identity
                 .as_ref()
@@ -8174,13 +8174,18 @@ impl ServerStateInner {
                     existing.account_id == verified.account_id
                         && existing.principal_source == verified.principal_source
                 })
-                .cloned()
-                .unwrap_or_else(|| CursorVerifiedIdentity {
-                    schema_version: 1,
-                    account_id: verified.account_id,
-                    principal_source: verified.principal_source,
-                    verified_at_ms: now_ms_i64(),
-                });
+                .map(|existing| existing.verified_at_ms)
+                .unwrap_or_else(now_ms_i64);
+            let identity = CursorVerifiedIdentity {
+                schema_version: 2,
+                account_id: verified.account_id,
+                principal_source: verified.principal_source,
+                verified_at_ms,
+                email: verified.email,
+                display_name: verified.display_name,
+                credential_name: verified.credential_name,
+                subscription_level: verified.subscription_level,
+            };
             verified_identities[index] = Some(identity);
         }
         Ok(verified_identities)
@@ -18762,6 +18767,9 @@ pub(crate) async fn share_request_log_entry(
         output_tokens: clamp_u64_to_u32(log.output_tokens.unwrap_or(0)),
         cache_read_tokens: clamp_u64_to_u32(log.cache_read_tokens.unwrap_or(0)),
         cache_creation_tokens: clamp_u64_to_u32(log.cache_creation_tokens.unwrap_or(0)),
+        cache_usage_observed: log.cache_read_tokens.is_some()
+            || log.cache_creation_tokens.is_some(),
+        usage_estimated: log.usage_estimated,
         quota_tokens: Some(clamp_u64_to_u32(log.quota_tokens())),
         is_streaming: log.is_streaming,
         session_id: log.session_id.clone(),
@@ -20531,6 +20539,74 @@ mod tests {
         assert!(entry.is_health_check);
         assert_eq!(entry.cache_read_tokens, 30);
         assert_eq!(entry.cache_creation_tokens, 5);
+        assert!(entry.cache_usage_observed);
+        assert!(!entry.usage_estimated);
+    }
+
+    #[tokio::test]
+    async fn share_request_log_preserves_unknown_cache_and_estimated_usage_semantics() {
+        let state = test_state();
+        state
+            .shares
+            .write()
+            .await
+            .upsert(UpsertShareInput {
+                id: Some("share-cursor-usage".into()),
+                owner_email: None,
+                app: AppKind::Codex,
+                provider_id: "cursor-provider".into(),
+                provider_type: ProviderType::CursorOAuth,
+                display_name: Some("Cursor Share".into()),
+                enabled: None,
+                status: None,
+                subscription_level: None,
+                account_email: None,
+                quota_percent: None,
+                tunnel_subdomain: None,
+                token_limit: None,
+                parallel_limit: None,
+                expires_at: None,
+                free_access: None,
+                allow_personal_credits: None,
+                auto_consume_banked_reset: None,
+                banked_reset_expiry_lead_minutes: None,
+                previous_response_cache_enabled: None,
+                grok_media_policy: None,
+                auto_start: None,
+                description: None,
+                enabled_apps: None,
+                bindings: Vec::new(),
+                runtime_snapshot: None,
+                user_grants: BTreeMap::new(),
+            })
+            .unwrap();
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "cursor-provider".into(),
+            "Cursor OAuth".into(),
+            ProviderType::CursorOAuth,
+            200,
+            100,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(6_435),
+                output_tokens: Some(361),
+                total_tokens: Some(6_796),
+                ..TokenUsage::default()
+            },
+        );
+        log.apply_context(UsageLogContext {
+            share_id: Some("share-cursor-usage".into()),
+            usage_estimated: true,
+            ..UsageLogContext::default()
+        });
+
+        let entry = share_request_log_entry(&state, &log).await.unwrap();
+
+        assert_eq!(entry.cache_read_tokens, 0);
+        assert_eq!(entry.cache_creation_tokens, 0);
+        assert!(!entry.cache_usage_observed);
+        assert!(entry.usage_estimated);
     }
 
     #[tokio::test]

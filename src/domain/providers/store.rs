@@ -117,6 +117,14 @@ pub struct CursorVerifiedIdentity {
     pub account_id: String,
     pub principal_source: String,
     pub verified_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_level: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

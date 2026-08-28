@@ -68,7 +68,15 @@ function AppLogo({ app }: { app: CoreProviderApp }) {
   return <GeminiIcon size={17} />;
 }
 
-function BundleQuotaSummary({ resource }: { resource?: ProviderResource }) {
+function BundleQuotaSummary({
+  resource,
+  cursorAccountLabel,
+  cursorSubscriptionLevel,
+}: {
+  resource?: ProviderResource;
+  cursorAccountLabel?: string;
+  cursorSubscriptionLevel?: string;
+}) {
   if (!resource) return null;
   if (resource.runtime?.codingPlan) {
     return <CodingPlanQuotaFooter resource={resource} inline />;
@@ -111,6 +119,8 @@ function BundleQuotaSummary({ resource }: { resource?: ProviderResource }) {
         meta={provider.meta}
         appId={app}
         providerId={provider.id}
+        accountLabel={cursorAccountLabel}
+        subscriptionLevel={cursorSubscriptionLevel}
         inline
       />
     );
@@ -218,10 +228,19 @@ export function ProviderBundleCard({
         : t("provider.oauthAccountResolving", {
             defaultValue: "OAuth account",
           })
-      : (target.value ??
-        t("providerBundle.apiUrlUnavailable", {
-          defaultValue: "API 地址未配置",
-        }));
+      : target.kind === "api_key_account"
+        ? target.value
+          ? t("provider.apiKeyAccountDisplay", {
+              account: target.value,
+              defaultValue: `API key account: ${target.value}`,
+            })
+          : t("provider.apiKeyAccountResolving", {
+              defaultValue: "API key account",
+            })
+        : (target.value ??
+          t("providerBundle.apiUrlUnavailable", {
+            defaultValue: "API 地址未配置",
+          }));
   const sharePhase = getProviderSharePhase(share);
   const isSharing = sharePhase === "sharing";
   const shareButtonLabel =
@@ -402,7 +421,15 @@ export function ProviderBundleCard({
 
         <div className="flex w-full min-w-0 flex-col gap-2 sm:ml-auto sm:w-auto sm:max-w-[58%]">
           <div className="flex min-h-5 min-w-0 max-w-full flex-wrap items-center justify-end gap-x-1 gap-y-1">
-            <BundleQuotaSummary resource={primaryResource} />
+            <BundleQuotaSummary
+              resource={primaryResource}
+              cursorAccountLabel={
+                target.kind === "api_key_account"
+                  ? (target.value ?? undefined)
+                  : undefined
+              }
+              cursorSubscriptionLevel={target.subscriptionLevel ?? undefined}
+            />
           </div>
 
           <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
