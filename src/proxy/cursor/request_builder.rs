@@ -7,20 +7,30 @@
 //! into `user_text` because Cursor's AgentService has no native equivalents
 //! (ported from OmniRoute / composer-api).
 
-use super::agent_proto::{anthropic_tools_to_mcp_defs, openai_tools_to_mcp_defs, McpToolDef};
+use super::agent_proto::{
+    anthropic_tools_to_mcp_defs, openai_tools_to_mcp_defs, McpToolDef,
+    CLIENT_MCP_PROVIDER_IDENTIFIER,
+};
 use super::image::ImageRef;
 use super::tool_schema::{validate_tool_schema, ToolSchemaErrorKind};
 use bytes::Bytes;
 use serde_json::{json, Value};
 
-/// Prepended when the client declares tools — measurably raises tool-call rate
-/// on Cursor's agent endpoint (OmniRoute A/B: ~53% → ~88%).
+/// Prepended when the client declares tools. Cursor exposes these through its
+/// SDK MCP execution path; naming that path explicitly is required for custom
+/// Codex tools such as `exec`, whose client-facing name is not an SDK builtin.
 const TOOL_COMMIT_DIRECTIVE: &str = "\
-You are serving an OpenAI-compatible API request and the client has provided executable tools.\n\
-When a tool is needed to answer (real-time data, web/search lookups, file or project operations), you MUST issue the actual tool call. Do NOT describe what you are about to do as prose and then stop — call the tool.\n\
+You are serving an OpenAI-compatible API request through Cursor SDK and the outer client has provided executable tools.\n\
+The declared client tool names are execution targets, not Cursor SDK builtin names. For local work, call the exact client target through SDK mcp with providerIdentifier \"client\", toolName set to the declared client tool name, and args matching its declared schema.\n\
+When a tool is needed to answer (real-time data, web/search lookups, file or project operations), you MUST issue the actual SDK tool call. Do NOT describe what you are about to do as prose and then stop — call the tool.\n\
 Answer directly only when no tool is needed.\n\
 Do not emit duplicate tool calls: call each operation once, then continue after the tool result is returned.\n\
 Never claim that tools are unavailable.";
+
+const LOCAL_TOOL_REQUIRED_DIRECTIVE: &str = "\
+\n\nLOCAL TOOL REQUIRED FOR THE LATEST USER REQUEST:\n\
+The latest request requires local filesystem or shell execution. The next response is invalid unless it contains exactly one SDK mcp tool call before any prose or progress text.\n\
+Use providerIdentifier \"client\" and an exact toolName from the SDK CLIENT TOOL ROUTING MAP, then wait for the outer client to return the tool result.";
 
 const DEFAULT_WORKING_DIRECTORY: &str = ".";
 const MAX_RESPONSE_TOOL_COUNT: usize = 128;
@@ -717,7 +727,7 @@ fn collect_openai_response_tool(
                     full_name.clone(),
                     description,
                     parameters,
-                    "cc-switch".to_string(),
+                    CLIENT_MCP_PROVIDER_IDENTIFIER.to_string(),
                     full_name.clone(),
                 ),
                 false,
@@ -765,7 +775,7 @@ fn collect_openai_response_tool(
                     full_name.clone(),
                     description,
                     schema,
-                    "cc-switch".to_string(),
+                    CLIENT_MCP_PROVIDER_IDENTIFIER.to_string(),
                     full_name.clone(),
                 ),
                 true,
@@ -970,6 +980,9 @@ pub fn try_build_plan(protocol: InboundProtocol, body: &Value) -> Result<AgentRu
     };
     let mut user_text =
         enhance_agent_user_text(&user_text_with_system, &tool_choice, &tools, body, protocol);
+    if local_tool_required_by_intent && tool_commit_enabled() {
+        user_text.push_str(LOCAL_TOOL_REQUIRED_DIRECTIVE);
+    }
     if !tool_results.is_empty() && cold_resume_ready {
         user_text.push_str(
             "\n\nTOOL CONTINUATION SAFETY:\nThe tool results in this request have already been executed by the client. Continue from those results. Do not repeat an identical tool call or repeat its side effects.",
@@ -1966,7 +1979,7 @@ fn gemini_tools_to_mcp_defs(tools: Option<&Value>) -> Vec<McpToolDef> {
                     .unwrap_or("")
                     .to_string(),
                 schema,
-                "cc-switch".to_string(),
+                CLIENT_MCP_PROVIDER_IDENTIFIER.to_string(),
                 name,
             ));
         }
@@ -2189,6 +2202,63 @@ fn tool_commit_enabled_from(configured: Option<&str>) -> bool {
     })
 }
 
+fn cursor_sdk_tool_routing_directive(tools: &[McpToolDef]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let routes = tools
+        .iter()
+        .map(|tool| {
+            let provider = serde_json::to_string(&tool.provider_identifier)
+                .unwrap_or_else(|_| "\"client\"".to_string());
+            let tool_name = serde_json::to_string(&tool.tool_name)
+                .unwrap_or_else(|_| "\"unknown\"".to_string());
+            let custom_input = tool
+                .input_schema
+                .as_json()
+                .get("properties")
+                .and_then(|properties| properties.get("input"))
+                .and_then(|input| input.get("type"))
+                .and_then(Value::as_str)
+                == Some("string")
+                && tool
+                    .input_schema
+                    .as_json()
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| required.iter().any(|field| field == "input"));
+            format!(
+                "- SDK mcp: providerIdentifier={provider}, toolName={tool_name}, args {}.",
+                if custom_input {
+                    "must be a JSON object with the raw custom-tool source in string field `input`"
+                } else {
+                    "must match the declared client tool schema"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preferred_local_route = tools
+        .iter()
+        .find(|tool| tool.tool_name.eq_ignore_ascii_case("exec"))
+        .map(|tool| {
+            let provider = serde_json::to_string(&tool.provider_identifier)
+                .unwrap_or_else(|_| "\"client\"".to_string());
+            let tool_name = serde_json::to_string(&tool.tool_name)
+                .unwrap_or_else(|_| "\"exec\"".to_string());
+            format!(
+                "\nFor local project inspection or changes, prefer SDK mcp with providerIdentifier={provider} and toolName={tool_name}; this is the outer client's unified local execution tool."
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "\nSDK CLIENT TOOL ROUTING MAP:\n\
+         Emit SDK `mcp` calls using these exact routes; the Server forwards them to the outer client:\n\
+         {routes}{preferred_local_route}\n\
+         Do not substitute an undeclared SDK builtin, a different tool name, or prose for these routes."
+    )
+}
+
 pub fn enhance_agent_user_text(
     user_text: &str,
     tool_choice: &ExtractedToolChoice,
@@ -2199,6 +2269,7 @@ pub fn enhance_agent_user_text(
     let mut prefix = String::new();
     if !tools.is_empty() && tool_commit_enabled() {
         prefix.push_str(TOOL_COMMIT_DIRECTIVE);
+        prefix.push_str(&cursor_sdk_tool_routing_directive(tools));
         if matches!(tool_choice, ExtractedToolChoice::Named(_)) {
             prefix.push_str(&tool_choice_named_suffix(tool_choice));
         } else {
@@ -2464,14 +2535,18 @@ pub fn extract_working_directory(body: &Value) -> String {
 /// Retry prompt when a tool-using turn ended without surfacing a tool call.
 pub fn retry_prompt_after_missing_tool(
     user_text: &str,
+    allowed_tools: &[McpToolDef],
     attempt: usize,
     max_attempts: usize,
 ) -> String {
+    let routes = cursor_sdk_tool_routing_directive(allowed_tools);
     format!(
         "{user_text}\n\n\
-         [cc-switch retry {attempt}/{max_attempts}] \
-         You declared tools but did not call any. You MUST call an appropriate tool now \
-         instead of describing what you would do."
+         TOOL CALL RETRY (attempt {attempt} of {max_attempts}):\n\
+         Your previous Cursor SDK response did not emit a local tool call, but the latest user request requires local execution.\n\
+         The next response is invalid unless it contains exactly one SDK mcp tool call.\n\
+         Do not answer in prose. Use providerIdentifier \"client\", an exact declared client toolName, and schema-valid args, then wait for the local tool result.\
+         {routes}"
     )
 }
 
@@ -2509,8 +2584,9 @@ pub fn retry_prompt_after_invalid_tool(
          [cc-switch retry {attempt}/{max_attempts}] \
          The previous tool call was rejected before reaching the client because its \
          arguments did not match the declared tool schema: {reason}. \
-         Allowed tool names: {allowed}. \
-         You MUST call one of the declared tools with valid arguments."
+         Allowed client tool targets: {allowed}. \
+         You MUST call the required target through SDK mcp with providerIdentifier \
+         \"client\", its exact client toolName, and schema-valid args. Do not answer in prose."
     )
 }
 
@@ -2911,6 +2987,22 @@ mod tests {
             vec!["exec", "wait", "collaboration.list_agents"]
         );
         assert_eq!(plan.custom_tool_names, vec!["exec"]);
+        assert!(plan
+            .tools
+            .iter()
+            .all(|tool| tool.provider_identifier == CLIENT_MCP_PROVIDER_IDENTIFIER));
+        assert!(plan.user_text.contains("SDK CLIENT TOOL ROUTING MAP"));
+        assert!(plan.user_text.contains("providerIdentifier=\"client\""));
+        assert!(plan.user_text.contains("toolName=\"exec\""));
+        assert!(plan.user_text.contains("raw custom-tool source"));
+        assert!(plan.user_text.contains("prefer SDK mcp"));
+        assert!(plan.user_text.contains("unified local execution tool"));
+        assert!(plan
+            .user_text
+            .contains("LOCAL TOOL REQUIRED FOR THE LATEST USER REQUEST"));
+        assert!(plan
+            .user_text
+            .contains("exactly one SDK mcp tool call before any prose"));
         assert_eq!(
             plan.tool_choice,
             ExtractedToolChoice::Named("collaboration.list_agents".to_string())
@@ -3181,8 +3273,34 @@ mod tests {
             "input": "run ls"
         });
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
-        assert!(plan.user_text.contains("MUST issue the actual tool call"));
+        assert!(plan
+            .user_text
+            .contains("MUST issue the actual SDK tool call"));
+        assert!(plan.user_text.contains("providerIdentifier=\"client\""));
+        assert!(plan.user_text.contains("toolName=\"Bash\""));
         assert!(plan.user_text.contains("run ls"));
+    }
+
+    #[test]
+    fn missing_tool_retry_repeats_the_exact_cursor_sdk_route() {
+        let tools = vec![McpToolDef::new(
+            "exec".to_string(),
+            "Run unified local tools".to_string(),
+            json!({
+                "type":"object",
+                "properties":{"input":{"type":"string"}},
+                "required":["input"]
+            }),
+            CLIENT_MCP_PROVIDER_IDENTIFIER.to_string(),
+            "exec".to_string(),
+        )];
+        let retry = retry_prompt_after_missing_tool("inspect the repo", &tools, 2, 3);
+        assert!(retry.contains("TOOL CALL RETRY (attempt 2 of 3)"));
+        assert!(retry.contains("exactly one SDK mcp tool call"));
+        assert!(retry.contains("providerIdentifier=\"client\""));
+        assert!(retry.contains("toolName=\"exec\""));
+        assert!(retry.contains("raw custom-tool source"));
+        assert!(retry.contains("unified local execution tool"));
     }
 
     #[test]

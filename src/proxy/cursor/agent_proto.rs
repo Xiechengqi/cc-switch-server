@@ -1099,6 +1099,12 @@ pub struct McpToolDef {
     pub tool_name: String,
 }
 
+/// Cursor SDK's conventional provider identifier for tools executed by the
+/// outer API client. The Server emulates this MCP provider over its tool
+/// continuation bridge; it must therefore use the same identity the model is
+/// instructed to call.
+pub const CLIENT_MCP_PROVIDER_IDENTIFIER: &str = "client";
+
 impl McpToolDef {
     pub(crate) fn new(
         name: String,
@@ -1183,7 +1189,7 @@ pub fn openai_tools_to_mcp_defs(tools: &Value) -> Vec<McpToolDef> {
             name.clone(),
             description,
             schema,
-            "cc-switch".to_string(),
+            CLIENT_MCP_PROVIDER_IDENTIFIER.to_string(),
             name,
         ));
     }
@@ -1219,7 +1225,7 @@ pub fn anthropic_tools_to_mcp_defs(tools: &Value) -> Vec<McpToolDef> {
             name.clone(),
             description,
             schema,
-            "cc-switch".to_string(),
+            CLIENT_MCP_PROVIDER_IDENTIFIER.to_string(),
             name,
         ));
     }
@@ -3056,6 +3062,13 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "weather");
         assert_eq!(defs[0].description, "wx");
+        assert_eq!(defs[0].provider_identifier, CLIENT_MCP_PROVIDER_IDENTIFIER);
+        let encoded = encode_mcp_tool_def_body(&defs[0]);
+        assert_eq!(
+            field_string(&encoded, MTD_PROVIDER_IDENTIFIER),
+            CLIENT_MCP_PROVIDER_IDENTIFIER
+        );
+        assert_eq!(field_string(&encoded, MTD_TOOL_NAME), "weather");
     }
 
     #[test]
@@ -3066,5 +3079,12 @@ mod tests {
         let defs = openai_tools_to_mcp_defs(&tools);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "weather");
+        assert_eq!(defs[0].provider_identifier, CLIENT_MCP_PROVIDER_IDENTIFIER);
+        let encoded = encode_mcp_tool_def_body(&defs[0]);
+        assert_eq!(
+            field_string(&encoded, MTD_PROVIDER_IDENTIFIER),
+            CLIENT_MCP_PROVIDER_IDENTIFIER
+        );
+        assert_eq!(field_string(&encoded, MTD_TOOL_NAME), "weather");
     }
 }

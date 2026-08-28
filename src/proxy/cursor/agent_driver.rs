@@ -641,6 +641,7 @@ async fn drive_semantic_attempts(
             SemanticToolConstraint::Required | SemanticToolConstraint::LocalIntent => {
                 retry_prompt_after_missing_tool(
                     &plan.user_text,
+                    &plan.tools,
                     semantic_attempt,
                     MAX_SEMANTIC_ATTEMPTS,
                 )
