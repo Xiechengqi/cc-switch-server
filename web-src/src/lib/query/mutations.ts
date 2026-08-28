@@ -51,6 +51,7 @@ async function refreshCursorApiKeyQuotaAfterProviderSave(
         appId,
       ],
     });
+    await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
   } catch (error) {
     console.warn("Failed to refresh Cursor API Key quota after provider save", {
       appId,
@@ -215,7 +216,8 @@ export const useUpdateProviderMutation = (appId: AppId) => {
           "providers",
           appId,
         ]);
-        const expectedRevision = baseline?.resources[originalId ?? provider.id]?.revision;
+        const expectedRevision =
+          baseline?.resources[originalId ?? provider.id]?.revision;
         if (expectedRevision === undefined) {
           throw new Error(
             "Provider revision is unavailable; refresh the Provider list before saving",

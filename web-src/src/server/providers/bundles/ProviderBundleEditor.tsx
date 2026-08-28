@@ -1111,7 +1111,6 @@ export function ProviderBundleEditor({
   const [validation, setValidation] = useState<BundleValidationIssue | null>(
     null,
   );
-  const [pendingFamilyId, setPendingFamilyId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [requestDefaults, setRequestDefaults] =
     useState<ProviderRequestDefaults | null>(null);
@@ -1368,10 +1367,6 @@ export function ProviderBundleEditor({
 
   const changeFamily = (familyId: string) => {
     if (persisted || familyId === draft.familyId) return;
-    if (dirty) {
-      setPendingFamilyId(familyId);
-      return;
-    }
     applyFamily(familyId);
   };
 
@@ -2522,26 +2517,6 @@ export function ProviderBundleEditor({
           </Button>
         )}
       </div>
-      <ConfirmDialog
-        isOpen={pendingFamilyId !== null}
-        title={t("providerBundle.changeFamilyTitle", {
-          defaultValue: "更换供应商类型？",
-        })}
-        message={t("providerBundle.changeFamilyMessage", {
-          defaultValue: "未保存的配置和分享设置将被新的类型默认值替换。",
-        })}
-        confirmText={t("providerBundle.changeFamilyConfirm", {
-          defaultValue: "更换类型",
-        })}
-        cancelText={t("common.cancel")}
-        variant="destructive"
-        zIndex="top"
-        onConfirm={() => {
-          if (pendingFamilyId) applyFamily(pendingFamilyId);
-          setPendingFamilyId(null);
-        }}
-        onCancel={() => setPendingFamilyId(null)}
-      />
       <ConfirmDialog
         isOpen={modelScopeConfirmOpen}
         title={t("providerBundle.modelScopeMergeTitle")}

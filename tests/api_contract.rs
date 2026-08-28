@@ -214,6 +214,8 @@ impl CursorApiKeyVerifier for AcceptCursorApiKeyVerifier {
             display_name: Some("Cursor Fixture".to_string()),
             credential_name: Some("Contract key".to_string()),
             subscription_level: Some("Cursor Pro".to_string()),
+            quota: None,
+            dashboard_errors: Vec::new(),
             profile: json!({"source": "api_contract_fixture"}),
         })
     }
@@ -9196,6 +9198,51 @@ async fn every_create_allowed_provider_profile_has_a_working_creation_bridge() {
             assert_eq!(identity.display_name.as_deref(), Some("Cursor Fixture"));
             assert_eq!(identity.credential_name.as_deref(), Some("Contract key"));
             assert_eq!(identity.subscription_level.as_deref(), Some("Cursor Pro"));
+
+            let account_count = state.accounts_snapshot().await.accounts.len();
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    Method::GET,
+                    &format!(
+                        "/api/providers/{provider_id}/cursor-account?app={}",
+                        profile.app.as_str()
+                    ),
+                    json!({}),
+                    Some(&token),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let snapshot = json_body(response).await;
+            assert_eq!(
+                snapshot["snapshot"]["account"]["data"]["email"],
+                "fixture@example.com"
+            );
+
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/web-api/invoke/refresh_oauth_quota",
+                    json!({
+                        "authProvider": "cursor_apikey",
+                        "appType": profile.app.as_str(),
+                        "providerId": provider_id,
+                    }),
+                    Some(&token),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let quota = json_body(response).await;
+            assert_eq!(quota["accountId"], "cursor_apikey_contract_fixture");
+            assert_eq!(quota["quota"]["credentialMessage"], "Cursor Pro");
+            assert_eq!(
+                state.accounts_snapshot().await.accounts.len(),
+                account_count,
+                "Cursor API-key presentation must not create a managed Account"
+            );
         }
     }
 }
@@ -11470,6 +11517,9 @@ async fn managed_oauth_manual_refresh_defaults_to_forcing_the_upstream_strategy(
         .mutate_accounts_immediate(|accounts| {
             let mut input =
                 test_account_input("acct-cursor-manual-refresh", ProviderType::CursorOAuth);
+            input.access_token = None;
+            input.refresh_token = None;
+            input.api_key = Some("legacy-import-fixture".to_string());
             input.raw = Some(json!({
                 "billingOrQuotaSnapshot": {
                     "stripeStatus": {"membershipType": "pro_plus"},

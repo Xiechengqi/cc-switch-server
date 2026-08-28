@@ -54,6 +54,7 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::state::spawn_periodic_installation_status_report(state.clone());
     cc_switch_server::state::spawn_installation_upgrade_task_reporter(state.clone());
     cc_switch_server::state::spawn_account_quota_refresh(state.clone());
+    cc_switch_server::state::spawn_cursor_account_refresh(state.clone());
     cc_switch_server::state::spawn_codex_cli_version_sync(state.clone());
     let status_state = state.clone();
     tokio::spawn(async move {

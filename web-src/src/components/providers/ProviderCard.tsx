@@ -550,7 +550,11 @@ export function ProviderCard({
                 inline={true}
                 appId={appId}
                 providerId={provider.id}
-                accountLabel={resource?.cursorAccount?.label}
+                accountLabel={
+                  quotaSource === "cursor_oauth"
+                    ? (managedOauthAccount.login ?? undefined)
+                    : resource?.cursorAccount?.label
+                }
                 subscriptionLevel={
                   quotaSource === "cursor_oauth"
                     ? (managedOauthAccount.subscriptionLevel ?? undefined)

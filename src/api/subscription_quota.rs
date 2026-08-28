@@ -9,6 +9,10 @@ use crate::domain::accounts::store::{Account, AccountQuota, AccountQuotaTier};
 use crate::domain::accounts::subscription_expiry::{
     resolved_subscription_expiry, SubscriptionExpirySource,
 };
+use crate::domain::providers::cursor_account::{
+    CursorAccountErrorKind, CursorAccountSectionState, CursorAccountSnapshot,
+    CursorAccountSnapshotStatus,
+};
 use crate::domain::providers::model::ProviderType;
 
 /// Convert stored account quota (0–1 utilization fractions) into the legacy
@@ -69,6 +73,83 @@ pub(in crate::api) fn cached_oauth_quota_from_response(
     })
 }
 
+pub(in crate::api) fn cached_cursor_account_quota(
+    snapshot: &CursorAccountSnapshot,
+    auth_provider: &str,
+    provider_id: &str,
+    app_type: &str,
+) -> Value {
+    let account = snapshot.account.data.as_ref();
+    let quota = snapshot.quota.data.as_ref();
+    let credential_status = match snapshot.account.state {
+        CursorAccountSectionState::Available | CursorAccountSectionState::Stale => "valid",
+        CursorAccountSectionState::Unavailable => "not_found",
+        CursorAccountSectionState::Error
+            if snapshot.account.error_kind == Some(CursorAccountErrorKind::Authentication) =>
+        {
+            "expired"
+        }
+        CursorAccountSectionState::Error => "parse_error",
+    };
+    let credential_message = account
+        .and_then(|account| account.subscription_level.clone())
+        .or_else(|| quota.and_then(|quota| quota.credential_message.clone()));
+    let queried_at = snapshot
+        .quota
+        .observed_at_ms
+        .or(snapshot.account.observed_at_ms)
+        .filter(|value| *value > 0);
+    let stale = snapshot.status == CursorAccountSnapshotStatus::Stale;
+    let partial = matches!(
+        snapshot.status,
+        CursorAccountSnapshotStatus::Partial | CursorAccountSnapshotStatus::Stale
+    );
+    let warning = snapshot
+        .quota
+        .reason
+        .as_ref()
+        .or(snapshot.account.reason.as_ref())
+        .cloned();
+    let quota_value = json!({
+        "tool": auth_provider,
+        "credentialStatus": credential_status,
+        "credentialMessage": credential_message,
+        "subscription": credential_message.as_ref().map(|plan| json!({
+            "planLabel": plan,
+            "planSource": "cursor_dashboard_api",
+            "planStale": stale,
+            "planObservedAt": snapshot.account.observed_at_ms.or(snapshot.quota.observed_at_ms),
+        })),
+        "success": credential_status == "valid" && quota.is_some_and(|quota| quota.success),
+        "quotaStatus": if partial { "partial" } else if quota.is_some() { "valid_numeric" } else { "unavailable" },
+        "warningCodes": if stale || partial { vec![if stale { "stale_snapshot" } else { "partial_snapshot" }] } else { Vec::<&str>::new() },
+        "warnings": warning.clone().into_iter().collect::<Vec<_>>(),
+        "staleTierNames": if stale { quota.map(|quota| quota.tiers.iter().map(|tier| tier.name.clone()).collect::<Vec<_>>()).unwrap_or_default() } else { Vec::<String>::new() },
+        "tiers": quota
+            .map(|quota| quota.tiers.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(subscription_tier_from_account_tier)
+            .collect::<Vec<_>>(),
+        "extraUsage": Value::Null,
+        "bankedReset": Value::Null,
+        "error": if quota.is_some() { Value::Null } else { warning.map(Value::String).unwrap_or(Value::Null) },
+        "queriedAt": queried_at,
+    });
+    json!({
+        "authProvider": auth_provider,
+        "accountId": account.map(|account| account.account_id.as_str()).unwrap_or(provider_id),
+        "authIdentityGeneration": snapshot.credential_generation,
+        "providerId": provider_id,
+        "providerName": Value::Null,
+        "appType": app_type,
+        "quota": quota_value,
+        "refreshedAt": queried_at,
+        "nextRefreshAt": Value::Null,
+        "source": snapshot.source,
+    })
+}
+
 pub(in crate::api) fn subscription_tool_provider_type(tool: &str) -> Option<ProviderType> {
     match tool.trim().to_ascii_lowercase().as_str() {
         "claude" => Some(ProviderType::ClaudeOAuth),
@@ -87,6 +168,7 @@ pub(in crate::api) fn subscription_tool_label(provider_type: ProviderType) -> &'
         ProviderType::GitHubCopilot => "github_copilot",
         ProviderType::AntigravityOAuth => "antigravity_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
+        ProviderType::CursorApiKey => "cursor_apikey",
         ProviderType::KiroOAuth => "kiro_oauth",
         ProviderType::GrokOAuth => "grok_oauth",
         _ => "unknown",
@@ -768,5 +850,55 @@ mod tests {
                 .and_then(|extra| extra.pointer("/subscription/expiresAt")),
             Some(&Value::Null)
         );
+    }
+
+    #[test]
+    fn cursor_provider_snapshot_maps_without_creating_managed_account() {
+        use crate::domain::providers::cursor_account::{
+            CursorAccountSection, CursorAccountSnapshot, CursorAccountSnapshotSource,
+            CursorAccountSnapshotStatus, CursorAccountView,
+        };
+        use crate::domain::providers::model::AppKind;
+        use crate::domain::providers::registry::ProviderKey;
+
+        let snapshot = CursorAccountSnapshot {
+            provider_key: ProviderKey::new(AppKind::Codex, "cursor-key").unwrap(),
+            provider_revision: 3,
+            credential_generation: 2,
+            source: CursorAccountSnapshotSource::Live,
+            status: CursorAccountSnapshotStatus::Complete,
+            account: CursorAccountSection::available(
+                CursorAccountView {
+                    account_id: "cursor-account".to_string(),
+                    email: Some("owner@example.com".to_string()),
+                    display_name: Some("Owner".to_string()),
+                    credential_name: Some("SDK key".to_string()),
+                    subscription_level: Some("Cursor Pro+".to_string()),
+                },
+                1_700_000_000_000,
+            ),
+            quota: CursorAccountSection::available(
+                AccountQuota {
+                    success: true,
+                    credential_message: Some("Cursor Pro+".to_string()),
+                    tiers: vec![AccountQuotaTier {
+                        name: "cursor_credits".to_string(),
+                        utilization: Some(0.25),
+                        used: Some(5.0),
+                        limit: Some(20.0),
+                        unit: Some("USD".to_string()),
+                        ..Default::default()
+                    }],
+                    extra_usage: None,
+                },
+                1_700_000_000_000,
+            ),
+        };
+
+        let value = cached_cursor_account_quota(&snapshot, "cursor_apikey", "cursor-key", "codex");
+        assert_eq!(value["accountId"], "cursor-account");
+        assert_eq!(value["quota"]["credentialMessage"], "Cursor Pro+");
+        assert_eq!(value["quota"]["tiers"][0]["utilization"], 25.0);
+        assert_eq!(value["authIdentityGeneration"], 2);
     }
 }

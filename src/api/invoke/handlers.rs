@@ -2,6 +2,7 @@ use super::super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::accounts::store::AccountStore;
+use crate::domain::providers::registry::ProviderKey;
 use crate::domain::providers::runtime::authoritative_managed_account;
 
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
@@ -373,6 +374,26 @@ pub(in crate::api) async fn web_cached_oauth_quota(
 ) -> Result<Value, ApiError> {
     require_session(state, headers).await?;
     let expected_provider_type = web_optional_auth_provider_type(args)?;
+    if expected_provider_type == Some(ProviderType::CursorApiKey) {
+        let provider_id = web_arg_string_any(args, &["providerId", "provider_id"])?;
+        let app_type = web_arg_string_any(args, &["appType", "app_type", "app"])?;
+        let app = parse_app_kind(&app_type)?;
+        let provider_key =
+            ProviderKey::new(app, provider_id.clone()).map_err(ApiError::bad_request)?;
+        let snapshot = state
+            .cursor_account_snapshot(provider_key, refresh && force.unwrap_or(true))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(map_provider_command_error)?;
+        let auth_provider = web_optional_string_any(args, &["authProvider", "auth_provider"])
+            .unwrap_or_else(|| ProviderType::CursorApiKey.as_str().to_string());
+        return Ok(cached_cursor_account_quota(
+            &snapshot,
+            &auth_provider,
+            &provider_id,
+            &app_type,
+        ));
+    }
     let account_id = web_resolve_account_id(state, args).await?;
     let Some(account_id) = account_id else {
         return Ok(Value::Null);

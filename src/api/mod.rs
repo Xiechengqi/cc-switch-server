@@ -365,6 +365,10 @@ pub fn app_router(state: ServerState) -> Router {
             get(get_provider_account_usage).post(refresh_provider_account_usage),
         )
         .route(
+            "/api/providers/:id/cursor-account",
+            get(get_cursor_account).post(refresh_cursor_account),
+        )
+        .route(
             "/api/providers/:id/fetch-models",
             post(fetch_provider_models),
         )
@@ -2286,6 +2290,8 @@ mod grok_catalog_provider_tests {
                 display_name: Some("Cursor Catalog Fixture".to_string()),
                 credential_name: Some("Fixture key".to_string()),
                 subscription_level: Some("Cursor Pro".to_string()),
+                quota: None,
+                dashboard_errors: Vec::new(),
                 profile: json!({"source": "cursor_catalog_fixture"}),
             })
         }
@@ -2739,6 +2745,38 @@ mod grok_catalog_provider_tests {
         .unwrap();
         assert!(persisted.contains("s2-encrypted-typed-records"));
         assert!(!persisted.contains(API_KEY));
+
+        let account_count_before = state.accounts_snapshot().await.accounts.len();
+        let account_snapshot = state
+            .cursor_account_snapshot(
+                crate::domain::providers::registry::ProviderKey::new(AppKind::Gemini, PROVIDER_ID)
+                    .unwrap(),
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            account_snapshot
+                .account
+                .data
+                .as_ref()
+                .and_then(|account| account.email.as_deref()),
+            Some("cursor-catalog@example.com")
+        );
+        assert_eq!(
+            account_snapshot
+                .account
+                .data
+                .as_ref()
+                .and_then(|account| account.subscription_level.as_deref()),
+            Some("Cursor Pro")
+        );
+        assert_eq!(
+            state.accounts_snapshot().await.accounts.len(),
+            account_count_before,
+            "Cursor API-key snapshots must remain Provider-owned"
+        );
 
         configure_test_share_binding(
             &state,

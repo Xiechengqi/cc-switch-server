@@ -1,6 +1,7 @@
 pub mod bundle;
 pub mod coding_plan;
 pub mod credentials;
+pub mod cursor_account;
 pub(crate) mod kiro;
 pub mod matrix;
 pub mod migrate;

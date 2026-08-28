@@ -4,6 +4,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::clients::oauth::cursor_dashboard::{
+    fetch_cursor_dashboard_snapshot, fetch_cursor_dashboard_snapshot_at_origin,
+    CursorDashboardSnapshot,
+};
 use crate::cursor_client_contract::{
     cursor_membership_label, CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, DASHBOARD_ORIGIN,
     DASHBOARD_REFERER, DASHBOARD_USER_AGENT, DEFAULT_API_KEY_EXCHANGE_URL,
@@ -24,6 +28,8 @@ pub struct VerifiedCursorApiKey {
     pub display_name: Option<String>,
     pub credential_name: Option<String>,
     pub subscription_level: Option<String>,
+    pub quota: Option<crate::domain::accounts::store::AccountQuota>,
+    pub dashboard_errors: Vec<crate::clients::oauth::cursor_dashboard::CursorDashboardError>,
     pub profile: Value,
 }
 
@@ -103,11 +109,39 @@ async fn verify_api_key_at_endpoints(
             .await
             .ok()
             .flatten();
-            return Ok(verified_api_key_from_exchange(api_key, dashboard_profile));
+            let dashboard =
+                fetch_verification_dashboard_snapshot(client, access_token.as_str(), public_origin)
+                    .await;
+            return Ok(verified_api_key_from_exchange(
+                api_key,
+                dashboard_profile,
+                Some(&dashboard),
+            ));
         }
         Err(error) => return Err(error),
     };
-    Ok(verified_api_key_from_profile(profile, api_key))
+    let mut verified = verified_api_key_from_profile(profile, api_key);
+    if let Ok(access_token) = verify_api_key_exchange(client, api_key, exchange_url).await {
+        let dashboard =
+            fetch_verification_dashboard_snapshot(client, access_token.as_str(), public_origin)
+                .await;
+        apply_dashboard_enrichment(&mut verified, &dashboard);
+    }
+    Ok(verified)
+}
+
+async fn fetch_verification_dashboard_snapshot(
+    client: &reqwest::Client,
+    access_token: &str,
+    public_origin: &str,
+) -> CursorDashboardSnapshot {
+    let timeout = std::time::Duration::from_secs(10);
+    if public_origin == CURSOR_PUBLIC_API_ORIGIN {
+        fetch_cursor_dashboard_snapshot(client, access_token, timeout).await
+    } else {
+        fetch_cursor_dashboard_snapshot_at_origin(client, access_token, public_origin, timeout)
+            .await
+    }
 }
 
 fn verified_api_key_from_profile(profile: Value, api_key: &str) -> VerifiedCursorApiKey {
@@ -121,6 +155,8 @@ fn verified_api_key_from_profile(profile: Value, api_key: &str) -> VerifiedCurso
         display_name: presentation.display_name,
         credential_name: presentation.credential_name,
         subscription_level: presentation.subscription_level,
+        quota: None,
+        dashboard_errors: Vec::new(),
         profile: json!({
             "providerType": "cursor_apikey",
             "source": "cursor_public_api",
@@ -133,6 +169,7 @@ fn verified_api_key_from_profile(profile: Value, api_key: &str) -> VerifiedCurso
 fn verified_api_key_from_exchange(
     api_key: &str,
     dashboard_profile: Option<Value>,
+    dashboard: Option<&CursorDashboardSnapshot>,
 ) -> VerifiedCursorApiKey {
     let (principal, principal_source) = verified_principal(&Value::Null, api_key);
     let presentation = dashboard_profile
@@ -140,27 +177,52 @@ fn verified_api_key_from_exchange(
         .map(cursor_account_presentation)
         .unwrap_or_default();
     let safe_profile = presentation.safe_profile();
-    VerifiedCursorApiKey {
+    let mut verified = VerifiedCursorApiKey {
         account_id: format!("cursor_apikey_{}", &sha256_hex(&principal)[..24]),
         principal_source: principal_source.to_string(),
         email: presentation.email,
         display_name: presentation.display_name,
         credential_name: presentation.credential_name,
         subscription_level: presentation.subscription_level,
+        quota: None,
+        dashboard_errors: Vec::new(),
         profile: json!({
             "providerType": "cursor_apikey",
             "source": "cursor_api_key_exchange",
             "accountDisplay": safe_profile,
         }),
+    };
+    if let Some(dashboard) = dashboard {
+        apply_dashboard_enrichment(&mut verified, dashboard);
     }
+    verified
 }
 
-#[derive(Debug, Default)]
-struct CursorAccountPresentation {
-    email: Option<String>,
-    display_name: Option<String>,
-    credential_name: Option<String>,
-    subscription_level: Option<String>,
+fn apply_dashboard_enrichment(
+    verified: &mut VerifiedCursorApiKey,
+    dashboard: &CursorDashboardSnapshot,
+) {
+    if verified.subscription_level.is_none() {
+        verified.subscription_level = dashboard.subscription_level();
+    }
+    if dashboard.has_data() {
+        verified.profile["dashboard"] = dashboard.safe_profile();
+        verified.profile["accountDisplay"]["subscriptionLevel"] = verified
+            .subscription_level
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+    }
+    verified.quota = dashboard.account_quota(crate::infra::time::now_ms() as i64);
+    verified.dashboard_errors = dashboard.errors.clone();
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CursorAccountPresentation {
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub credential_name: Option<String>,
+    pub subscription_level: Option<String>,
 }
 
 impl CursorAccountPresentation {
@@ -239,6 +301,15 @@ fn cursor_account_presentation(value: &Value) -> CursorAccountPresentation {
         .and_then(|value| cursor_membership_label(&value))
         .map(bounded_presentation_value),
     }
+}
+
+pub async fn fetch_cursor_oauth_presentation(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Option<CursorAccountPresentation>, CursorPublicApiError> {
+    fetch_cursor_dashboard_profile(client, access_token, DEFAULT_DASHBOARD_PROFILE_URL)
+        .await
+        .map(|profile| profile.as_ref().map(cursor_account_presentation))
 }
 
 fn first_presentation_string(value: &Value, pointers: &[&str]) -> Option<String> {

@@ -199,7 +199,21 @@ pub fn cursor_access_token_parts(access_token: &str) -> (Option<&str>, &str) {
             return (Some(subject), token);
         }
     }
+    if let Some(index) = find_encoded_cursor_token_delimiter(access_token) {
+        let subject = access_token[..index].trim();
+        let token = access_token[index + 6..].trim();
+        if !subject.is_empty() && !token.is_empty() {
+            return (Some(subject), token);
+        }
+    }
     (None, access_token)
+}
+
+fn find_encoded_cursor_token_delimiter(value: &str) -> Option<usize> {
+    value
+        .as_bytes()
+        .windows(6)
+        .position(|window| window.eq_ignore_ascii_case(b"%3a%3a"))
 }
 
 pub fn normalize_cursor_access_token(access_token: &str) -> &str {
@@ -937,6 +951,20 @@ mod tests {
                 .and_then(|profile| profile.pointer("/cursorIdentity/subject"))
                 .and_then(Value::as_str),
             Some("workos-subject")
+        );
+    }
+
+    #[test]
+    fn url_encoded_composite_cursor_token_preserves_subject() {
+        let bearer = "x".repeat(64);
+        let encoded = format!("google-oauth2|123%3A%3A{bearer}");
+        assert_eq!(
+            cursor_access_token_parts(&encoded),
+            (Some("google-oauth2|123"), bearer.as_str())
+        );
+        assert_eq!(
+            cursor_workos_user_id_from_access_token(&encoded).as_deref(),
+            Some("google-oauth2|123")
         );
     }
 

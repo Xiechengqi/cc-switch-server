@@ -123,9 +123,15 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
     return () => clearInterval(interval);
   }, [displayQueriedAt, quota?.subscription?.expiresAt, quota?.tiers]);
 
-  const membership = isCursorApiKey
-    ? accountLabel?.trim() || quota?.credentialMessage || undefined
-    : subscriptionLevel?.trim() || quota?.credentialMessage || undefined;
+  const membership =
+    subscriptionLevel?.trim() ||
+    quota?.credentialMessage?.trim() ||
+    (!effectiveLoading
+      ? t("subscription.cursorSubscriptionUnavailable", {
+          defaultValue: "订阅信息暂不可用",
+        })
+      : undefined);
+  const accountPresentation = accountLabel?.trim() || undefined;
   const tier = quota?.tiers?.find(
     (item) =>
       item.name === "cursor_credits" || item.name === "cursor_included_usage",
@@ -151,8 +157,16 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
         }}
         refreshTitle={refreshTitle}
         leading={
-          <span className="text-[10px] font-medium text-foreground">
-            {membership}
+          <span className="flex min-w-0 items-center gap-1.5 text-[10px] font-medium text-foreground">
+            <span>{membership}</span>
+            {accountPresentation ? (
+              <span
+                className="max-w-40 truncate text-muted-foreground"
+                title={accountPresentation}
+              >
+                {accountPresentation}
+              </span>
+            ) : null}
           </span>
         }
       />
@@ -207,8 +221,16 @@ const CursorOauthQuotaFooter: React.FC<CursorOauthQuotaFooterProps> = ({
           refreshTitle={refreshTitle}
           leading={
             membership ? (
-              <span className="text-[10px] font-medium text-foreground">
-                {membership}
+              <span className="flex min-w-0 items-center gap-1.5 text-[10px] font-medium text-foreground">
+                <span>{membership}</span>
+                {accountPresentation ? (
+                  <span
+                    className="max-w-40 truncate text-muted-foreground"
+                    title={accountPresentation}
+                  >
+                    {accountPresentation}
+                  </span>
+                ) : null}
               </span>
             ) : undefined
           }

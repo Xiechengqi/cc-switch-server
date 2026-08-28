@@ -708,6 +708,49 @@ pub(in crate::api) async fn refresh_provider_account_usage(
     ollama_cloud_snapshot_response(state, headers, id, query.app, true).await
 }
 
+pub(in crate::api) async fn get_cursor_account(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderResourceQuery>,
+) -> Result<(HeaderMap, Json<CursorAccountSnapshotResponse>), ApiError> {
+    cursor_account_snapshot_response(state, headers, id, query.app, false).await
+}
+
+pub(in crate::api) async fn refresh_cursor_account(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderResourceQuery>,
+) -> Result<(HeaderMap, Json<CursorAccountSnapshotResponse>), ApiError> {
+    cursor_account_snapshot_response(state, headers, id, query.app, true).await
+}
+
+async fn cursor_account_snapshot_response(
+    state: ServerState,
+    headers: HeaderMap,
+    provider_id: String,
+    app: AppKind,
+    force_refresh: bool,
+) -> Result<(HeaderMap, Json<CursorAccountSnapshotResponse>), ApiError> {
+    require_session(&state, &headers).await?;
+    let provider_key = ProviderKey::new(app, provider_id).map_err(ApiError::bad_request)?;
+    let snapshot = state
+        .cursor_account_snapshot(provider_key, force_refresh)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store, max-age=0"),
+    );
+    Ok((
+        response_headers,
+        Json(CursorAccountSnapshotResponse { ok: true, snapshot }),
+    ))
+}
+
 async fn ollama_cloud_snapshot_response(
     state: ServerState,
     headers: HeaderMap,

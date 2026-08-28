@@ -2466,17 +2466,37 @@ pub(in crate::api) async fn execute_account_login_profile_request(
         );
     }
     if flow == OAuthAuthorizeFlow::CursorDeepControl {
-        return match execute_cursor_profile_request(state, access_token, None).await {
-            Ok(profile) => Ok(profile),
+        let profile = match execute_cursor_profile_request(state, access_token, None).await {
+            Ok(profile) => profile,
             Err(error) => {
                 let diagnostic = crate::logging::redact_sensitive_text_with_values(
                     &error.message,
                     [access_token],
                 );
                 tracing::debug!(error = %diagnostic, "cursor oauth profile enrichment failed");
-                Ok(None)
+                None
             }
         };
+        let dashboard = crate::clients::oauth::cursor_dashboard::fetch_cursor_dashboard_snapshot(
+            &state.http_client().await,
+            access_token,
+            std::time::Duration::from_millis(
+                state.oauth_quota_refresh_timeout_ms().await.max(1_000) as u64,
+            ),
+        )
+        .await;
+        if !dashboard.has_data() {
+            return Ok(profile);
+        }
+        let mut merged = profile.unwrap_or_else(|| json!({}));
+        if let Some(subscription_level) = dashboard.subscription_level() {
+            merged["membershipType"] = Value::String(subscription_level);
+        }
+        if let Some(usage) = dashboard.current_period_usage.as_ref() {
+            merged["currentPeriodUsage"] = usage.clone();
+        }
+        merged["cursorDashboard"] = dashboard.safe_profile();
+        return Ok(Some(merged));
     }
     if !matches!(
         provider_type,

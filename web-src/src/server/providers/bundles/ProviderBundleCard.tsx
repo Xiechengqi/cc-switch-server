@@ -424,7 +424,8 @@ export function ProviderBundleCard({
             <BundleQuotaSummary
               resource={primaryResource}
               cursorAccountLabel={
-                target.kind === "api_key_account"
+                target.kind === "api_key_account" ||
+                target.kind === "oauth_account"
                   ? (target.value ?? undefined)
                   : undefined
               }

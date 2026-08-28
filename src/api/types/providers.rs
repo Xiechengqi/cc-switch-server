@@ -126,6 +126,13 @@ pub(in crate::api) struct OllamaCloudSnapshotResponse {
     pub(in crate::api) snapshot: crate::domain::providers::ollama_cloud::OllamaCloudSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CursorAccountSnapshotResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) snapshot: crate::domain::providers::cursor_account::CursorAccountSnapshot,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::api) struct DeleteProviderQuery {

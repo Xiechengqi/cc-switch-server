@@ -92,6 +92,11 @@ use crate::domain::providers::credentials::{
     ProviderImportPreview, ProviderReferencePreview, ProviderRuntimeTransitionPreview,
     ProviderView, ProviderWriteDraft,
 };
+use crate::domain::providers::cursor_account::{
+    snapshot_status as cursor_account_snapshot_status, CursorAccountCache, CursorAccountCacheKey,
+    CursorAccountErrorKind, CursorAccountSection, CursorAccountSectionState, CursorAccountSnapshot,
+    CursorAccountSnapshotSource, CursorAccountView,
+};
 use crate::domain::providers::model::{
     AppKind, AuthBinding, Provider, ProviderMeta, ProviderType, MANAGED_ACCOUNT_AUTH_BINDING_SOURCE,
 };
@@ -733,6 +738,9 @@ pub struct ServerStateInner {
     ollama_cloud_cache: Mutex<OllamaCloudCache>,
     ollama_cloud_refreshes: Mutex<BTreeMap<OllamaCloudCacheKey, Weak<OllamaCloudRefreshFlight>>>,
     ollama_cloud_client: RwLock<OllamaCloudClient>,
+    cursor_account_cache: Mutex<CursorAccountCache>,
+    cursor_account_refreshes:
+        Mutex<BTreeMap<CursorAccountCacheKey, Weak<CursorAccountRefreshFlight>>>,
     #[cfg(test)]
     ollama_cloud_post_commit_refresh_enabled: std::sync::atomic::AtomicBool,
     grok_media_tasks: Mutex<GrokMediaTaskStore>,
@@ -1434,6 +1442,58 @@ struct OllamaCloudTarget {
     cache_key: OllamaCloudCacheKey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorAccountTarget {
+    provider_key: ProviderKey,
+    provider_revision: u64,
+    cache_key: CursorAccountCacheKey,
+}
+
+#[derive(Debug, Clone)]
+struct CursorAccountRefreshResult {
+    source: CursorAccountSnapshotSource,
+    account: CursorAccountSection<CursorAccountView>,
+    quota: CursorAccountSection<crate::domain::accounts::store::AccountQuota>,
+}
+
+#[derive(Debug, Default)]
+struct CursorAccountRefreshFlight {
+    gate: Arc<AsyncMutex<()>>,
+    result: Mutex<Option<CursorAccountRefreshResult>>,
+}
+
+impl CursorAccountRefreshFlight {
+    fn clear_result(&self) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn complete(
+        &self,
+        source: CursorAccountSnapshotSource,
+        account: CursorAccountSection<CursorAccountView>,
+        quota: CursorAccountSection<crate::domain::accounts::store::AccountQuota>,
+    ) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CursorAccountRefreshResult {
+            source,
+            account,
+            quota,
+        });
+    }
+
+    fn completed_result(&self) -> Option<CursorAccountRefreshResult> {
+        self.result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OllamaCloudShareProjection {
     account_email: Option<String>,
@@ -1810,6 +1870,120 @@ fn ollama_cloud_cache_keys_from_store(providers: &ProviderStore) -> BTreeSet<Oll
                 .map(|target| target.cache_key)
         })
         .collect()
+}
+
+fn cursor_account_target_from_store(
+    providers: &ProviderStore,
+    key: &ProviderKey,
+) -> Result<CursorAccountTarget, ProviderCommandError> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|stored| stored.app == key.app && stored.provider.id == key.provider_id)
+        .ok_or(ProviderCommandError::NotFound)?;
+    if stored.provider_type != ProviderType::CursorApiKey {
+        return Err(ProviderCommandError::Invalid(
+            "Provider is not a Cursor API-key Provider".to_string(),
+        ));
+    }
+    Ok(CursorAccountTarget {
+        provider_key: key.clone(),
+        provider_revision: stored.resource.revision,
+        cache_key: CursorAccountCacheKey {
+            provider_key: key.clone(),
+            credential_generation: stored.resource.credential_generation,
+        },
+    })
+}
+
+fn cursor_account_credential_from_store(
+    providers: &ProviderStore,
+    target: &CursorAccountTarget,
+) -> anyhow::Result<Result<zeroize::Zeroizing<String>, String>> {
+    let stored = providers
+        .providers
+        .iter()
+        .find(|stored| {
+            stored.app == target.provider_key.app
+                && stored.provider.id == target.provider_key.provider_id
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cursor Provider disappeared"))?;
+    let mut materialized = providers.materialize_provider_record(stored)?;
+    let result = [
+        "/settingsConfig/apiKey",
+        "/settingsConfig/auth/CURSOR_API_KEY",
+        "/settingsConfig/auth/ANTHROPIC_AUTH_TOKEN",
+        "/settingsConfig/auth/ANTHROPIC_API_KEY",
+        "/settingsConfig/auth/OPENAI_API_KEY",
+        "/settingsConfig/env/CURSOR_API_KEY",
+        "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
+        "/settingsConfig/env/ANTHROPIC_API_KEY",
+        "/settingsConfig/env/OPENAI_API_KEY",
+        "/settingsConfig/env/API_KEY",
+    ]
+    .iter()
+    .find_map(|slot| reveal_provider_credential(&materialized.provider, slot).ok())
+    .map(|value| zeroize::Zeroizing::new(value.trim().to_string()))
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "Cursor API key is not configured".to_string());
+    crate::domain::providers::credentials::zeroize_materialized_provider(
+        &mut materialized.provider,
+    );
+    Ok(result)
+}
+
+fn cursor_account_snapshot(
+    target: &CursorAccountTarget,
+    source: CursorAccountSnapshotSource,
+    account: CursorAccountSection<CursorAccountView>,
+    quota: CursorAccountSection<crate::domain::accounts::store::AccountQuota>,
+) -> CursorAccountSnapshot {
+    let mut status = cursor_account_snapshot_status(&account, &quota);
+    if status == crate::domain::providers::cursor_account::CursorAccountSnapshotStatus::Complete
+        && quota
+            .data
+            .as_ref()
+            .and_then(|quota| quota.extra_usage.as_ref())
+            .and_then(|extra| extra.get("partial"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        status = crate::domain::providers::cursor_account::CursorAccountSnapshotStatus::Partial;
+    }
+    CursorAccountSnapshot {
+        provider_key: target.provider_key.clone(),
+        provider_revision: target.provider_revision,
+        credential_generation: target.cache_key.credential_generation,
+        source,
+        status,
+        account,
+        quota,
+    }
+}
+
+fn cursor_account_cache_keys_from_store(
+    providers: &ProviderStore,
+) -> BTreeSet<CursorAccountCacheKey> {
+    providers
+        .providers
+        .iter()
+        .filter(|stored| stored.provider_type == ProviderType::CursorApiKey)
+        .filter_map(|stored| {
+            let key = ProviderKey::new(stored.app, stored.provider.id.clone()).ok()?;
+            cursor_account_target_from_store(providers, &key)
+                .ok()
+                .map(|target| target.cache_key)
+        })
+        .collect()
+}
+
+fn cursor_account_error_kind(status_code: u16, retryable: bool) -> CursorAccountErrorKind {
+    match status_code {
+        401 | 403 => CursorAccountErrorKind::Authentication,
+        429 => CursorAccountErrorKind::RateLimited,
+        _ if retryable => CursorAccountErrorKind::Transient,
+        _ => CursorAccountErrorKind::InvalidResponse,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5829,6 +6003,8 @@ impl ServerStateInner {
             ollama_cloud_cache: Mutex::new(OllamaCloudCache::default()),
             ollama_cloud_refreshes: Mutex::new(BTreeMap::new()),
             ollama_cloud_client: RwLock::new(ollama_cloud_client),
+            cursor_account_cache: Mutex::new(CursorAccountCache::default()),
+            cursor_account_refreshes: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             ollama_cloud_post_commit_refresh_enabled: std::sync::atomic::AtomicBool::new(false),
             grok_media_tasks: Mutex::new(grok_media_tasks),
@@ -7507,6 +7683,374 @@ impl ServerStateInner {
         });
     }
 
+    pub async fn cursor_account_snapshot(
+        self: &Arc<Self>,
+        provider_key: ProviderKey,
+        force_refresh: bool,
+    ) -> anyhow::Result<Result<CursorAccountSnapshot, ProviderCommandError>> {
+        for _ in 0..3 {
+            let target = {
+                let providers = self.providers.read().await;
+                match cursor_account_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            self.cursor_account_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain_current(&target.cache_key);
+
+            if !force_refresh {
+                if let Some((account, quota)) = self
+                    .cursor_account_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .fresh(&target.cache_key, now_ms_i64())
+                {
+                    return Ok(Ok(cursor_account_snapshot(
+                        &target,
+                        CursorAccountSnapshotSource::FreshCache,
+                        CursorAccountSection::available(account.data, account.observed_at_ms),
+                        CursorAccountSection::available(quota.data, quota.observed_at_ms),
+                    )));
+                }
+            }
+
+            let refresh_flight = self.cursor_account_refresh_flight(&target.cache_key);
+            let (refresh_guard, waited) = match Arc::clone(&refresh_flight.gate).try_lock_owned() {
+                Ok(guard) => (guard, false),
+                Err(_) => (Arc::clone(&refresh_flight.gate).lock_owned().await, true),
+            };
+            if waited {
+                let current = {
+                    let providers = self.providers.read().await;
+                    match cursor_account_target_from_store(&providers, &provider_key) {
+                        Ok(target) => target,
+                        Err(error) => return Ok(Err(error)),
+                    }
+                };
+                if current.cache_key != target.cache_key {
+                    drop(refresh_guard);
+                    continue;
+                }
+                if let Some(result) = refresh_flight.completed_result() {
+                    return Ok(Ok(cursor_account_snapshot(
+                        &current,
+                        result.source,
+                        result.account,
+                        result.quota,
+                    )));
+                }
+            } else {
+                refresh_flight.clear_result();
+            }
+
+            let api_key = {
+                let providers = self.providers.read().await;
+                let current = match cursor_account_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if current.cache_key != target.cache_key {
+                    drop(refresh_guard);
+                    continue;
+                }
+                match cursor_account_credential_from_store(&providers, &current)? {
+                    Ok(api_key) => api_key,
+                    Err(reason) => {
+                        self.cursor_account_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clear(&target.cache_key);
+                        let account = CursorAccountSection::unconfigured(reason.clone());
+                        let quota = CursorAccountSection::unconfigured(reason);
+                        refresh_flight.complete(
+                            CursorAccountSnapshotSource::Configuration,
+                            account.clone(),
+                            quota.clone(),
+                        );
+                        return Ok(Ok(cursor_account_snapshot(
+                            &current,
+                            CursorAccountSnapshotSource::Configuration,
+                            account,
+                            quota,
+                        )));
+                    }
+                }
+            };
+
+            let verified = self
+                .cursor_api_key_verifier
+                .verify(&self.http_client().await, api_key.as_str())
+                .await;
+            let current = {
+                let providers = self.providers.read().await;
+                match cursor_account_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            if current.cache_key != target.cache_key {
+                drop(refresh_guard);
+                continue;
+            }
+            let observed_at_ms = now_ms_i64();
+            let (source, account, quota) = match verified {
+                Ok(verified) => {
+                    let account_view = CursorAccountView {
+                        account_id: verified.account_id.clone(),
+                        email: verified.email.clone(),
+                        display_name: verified.display_name.clone(),
+                        credential_name: verified.credential_name.clone(),
+                        subscription_level: verified.subscription_level.clone(),
+                    };
+                    self.cursor_account_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert_account(
+                            target.cache_key.clone(),
+                            account_view.clone(),
+                            observed_at_ms,
+                        );
+                    let account = CursorAccountSection::available(account_view, observed_at_ms);
+                    let quota = if let Some(quota) = verified.quota.clone() {
+                        self.cursor_account_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert_quota(target.cache_key.clone(), quota.clone(), observed_at_ms);
+                        CursorAccountSection::available(quota, observed_at_ms)
+                    } else {
+                        let error = verified.dashboard_errors.first();
+                        let kind = error
+                            .map(|error| {
+                                cursor_account_error_kind(
+                                    error.status_code.unwrap_or(502),
+                                    error.retryable,
+                                )
+                            })
+                            .unwrap_or(CursorAccountErrorKind::InvalidResponse);
+                        let reason =
+                            error.map(|error| error.message.clone()).unwrap_or_else(|| {
+                                "Cursor subscription and usage information is unavailable"
+                                    .to_string()
+                            });
+                        let stale = !matches!(kind, CursorAccountErrorKind::Authentication)
+                            && error.is_some_and(|error| error.retryable)
+                            && self
+                                .cursor_account_cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .stale_quota(&target.cache_key, observed_at_ms)
+                                .is_some();
+                        if stale {
+                            let stale = self
+                                .cursor_account_cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .stale_quota(&target.cache_key, observed_at_ms)
+                                .expect("stale quota was checked");
+                            CursorAccountSection::stale(
+                                stale.data,
+                                stale.observed_at_ms,
+                                kind,
+                                reason,
+                                error.and_then(|error| error.retry_after_ms),
+                            )
+                        } else {
+                            let mut section = CursorAccountSection::error(kind, reason);
+                            section.retry_after_ms = error.and_then(|error| error.retry_after_ms);
+                            section
+                        }
+                    };
+                    let identity = CursorVerifiedIdentity {
+                        schema_version: 2,
+                        account_id: verified.account_id,
+                        principal_source: verified.principal_source,
+                        verified_at_ms: observed_at_ms,
+                        email: verified.email,
+                        display_name: verified.display_name,
+                        credential_name: verified.credential_name,
+                        subscription_level: verified.subscription_level,
+                    };
+                    self.persist_cursor_account_identity(
+                        &target.provider_key,
+                        target.cache_key.credential_generation,
+                        identity,
+                    )
+                    .await?;
+                    let source = if quota.state == CursorAccountSectionState::Stale {
+                        CursorAccountSnapshotSource::StaleCache
+                    } else {
+                        CursorAccountSnapshotSource::Live
+                    };
+                    (source, account, quota)
+                }
+                Err(error) => {
+                    let kind = cursor_account_error_kind(error.status_code, error.retryable);
+                    if matches!(kind, CursorAccountErrorKind::Authentication) {
+                        self.cursor_account_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clear(&target.cache_key);
+                    }
+                    let cache = self
+                        .cursor_account_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let stale_account = error
+                        .retryable
+                        .then(|| cache.stale_account(&target.cache_key, observed_at_ms))
+                        .flatten();
+                    let stale_quota = error
+                        .retryable
+                        .then(|| cache.stale_quota(&target.cache_key, observed_at_ms))
+                        .flatten();
+                    drop(cache);
+                    let source = if stale_account.is_some() || stale_quota.is_some() {
+                        CursorAccountSnapshotSource::StaleCache
+                    } else {
+                        CursorAccountSnapshotSource::Live
+                    };
+                    let account = stale_account.map_or_else(
+                        || CursorAccountSection::error(kind, error.message.clone()),
+                        |stale| {
+                            CursorAccountSection::stale(
+                                stale.data,
+                                stale.observed_at_ms,
+                                kind,
+                                error.message.clone(),
+                                None,
+                            )
+                        },
+                    );
+                    let quota = stale_quota.map_or_else(
+                        || CursorAccountSection::error(kind, error.message.clone()),
+                        |stale| {
+                            CursorAccountSection::stale(
+                                stale.data,
+                                stale.observed_at_ms,
+                                kind,
+                                error.message.clone(),
+                                None,
+                            )
+                        },
+                    );
+                    (source, account, quota)
+                }
+            };
+            let current = {
+                let providers = self.providers.read().await;
+                match cursor_account_target_from_store(&providers, &provider_key) {
+                    Ok(target) => target,
+                    Err(error) => return Ok(Err(error)),
+                }
+            };
+            if current.cache_key != target.cache_key {
+                drop(refresh_guard);
+                continue;
+            }
+            refresh_flight.complete(source, account.clone(), quota.clone());
+            return Ok(Ok(cursor_account_snapshot(
+                &current, source, account, quota,
+            )));
+        }
+
+        Ok(Err(ProviderCommandError::Conflict {
+            code: "provider_credential_changed",
+            message:
+                "Provider credential changed repeatedly while refreshing Cursor account information"
+                    .to_string(),
+        }))
+    }
+
+    fn cursor_account_refresh_flight(
+        &self,
+        key: &CursorAccountCacheKey,
+    ) -> Arc<CursorAccountRefreshFlight> {
+        let mut refreshes = self
+            .cursor_account_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        refreshes.retain(|_, refresh| refresh.strong_count() > 0);
+        if let Some(refresh) = refreshes.get(key).and_then(Weak::upgrade) {
+            return refresh;
+        }
+        let refresh = Arc::new(CursorAccountRefreshFlight::default());
+        refreshes.insert(key.clone(), Arc::downgrade(&refresh));
+        refresh
+    }
+
+    async fn persist_cursor_account_identity(
+        self: &Arc<Self>,
+        provider_key: &ProviderKey,
+        credential_generation: u64,
+        observed: CursorVerifiedIdentity,
+    ) -> anyhow::Result<()> {
+        let provider_key = provider_key.clone();
+        let result = self
+            .commit_provider_change_with_reference_guard(None, move |store| {
+                let Some(existing) = store.providers.iter().find(|stored| {
+                    stored.app == provider_key.app
+                        && stored.provider.id == provider_key.provider_id
+                }) else {
+                    return Err(ProviderCommandError::NotFound);
+                };
+                if existing.resource.credential_generation != credential_generation {
+                    return Err(ProviderCommandError::Conflict {
+                        code: "provider_credential_changed",
+                        message: "Cursor Provider credential changed while account information was loading"
+                            .to_string(),
+                    });
+                }
+                if existing.provider_type != ProviderType::CursorApiKey {
+                    return Err(ProviderCommandError::Invalid(
+                        "Provider is no longer a Cursor API-key Provider".to_string(),
+                    ));
+                }
+                let mut identity = observed;
+                if let Some(current) = existing.resource.cursor_verified_identity.as_ref() {
+                    if current.account_id != identity.account_id {
+                        return Err(ProviderCommandError::Conflict {
+                            code: "cc_switch_cursor_identity_conflict",
+                            message: "Cursor API key account identity changed; delete and recreate the Provider to rebind it"
+                                .to_string(),
+                        });
+                    }
+                    if current.principal_source == identity.principal_source {
+                        identity.verified_at_ms = current.verified_at_ms;
+                    }
+                    identity.email = identity.email.or_else(|| current.email.clone());
+                    identity.display_name =
+                        identity.display_name.or_else(|| current.display_name.clone());
+                    identity.credential_name = identity
+                        .credential_name
+                        .or_else(|| current.credential_name.clone());
+                    identity.subscription_level = identity
+                        .subscription_level
+                        .or_else(|| current.subscription_level.clone());
+                    if current == &identity {
+                        return Ok(((), false));
+                    }
+                }
+                let mut updated = existing.clone();
+                updated.resource.revision = updated.resource.revision.saturating_add(1);
+                updated.resource.cursor_verified_identity = Some(identity);
+                store.upsert_with_resource(
+                    updated.app,
+                    updated.provider.clone(),
+                    updated.resource,
+                );
+                Ok(((), true))
+            })
+            .await?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(ProviderCommandError::NotFound) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        }
+    }
+
     pub async fn ollama_cloud_snapshot(
         self: &Arc<Self>,
         provider_key: ProviderKey,
@@ -9124,6 +9668,7 @@ impl ServerStateInner {
             .context("compile sealed Provider runtime index before commit")?;
         let previous_ollama_cloud_cache_keys = ollama_cloud_cache_keys_from_store(&current);
         let ollama_cloud_cache_keys = ollama_cloud_cache_keys_from_store(&candidate);
+        let cursor_account_cache_keys = cursor_account_cache_keys_from_store(&candidate);
         let ollama_cloud_refresh_keys = ollama_cloud_cache_keys
             .difference(&previous_ollama_cloud_cache_keys)
             .map(|key| key.credential_source_key.clone())
@@ -9190,6 +9735,10 @@ impl ServerStateInner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain_keys(&ollama_cloud_cache_keys);
+        self.cursor_account_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain_keys(&cursor_account_cache_keys);
         if self.ollama_cloud_post_commit_refresh_is_enabled() {
             for provider_key in ollama_cloud_refresh_keys {
                 self.refresh_ollama_cloud_after_provider_commit(provider_key);
@@ -16302,6 +16851,62 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
             refresh_due_account_quotas(&state).await;
             let delay = next_account_quota_refresh_delay(&state).await;
             sleep(delay).await;
+        }
+    });
+}
+
+/// Refreshes Provider-owned Cursor API-key presentation/usage snapshots.
+/// This is deliberately separate from managed Account quota scheduling: one
+/// Provider owns one static credential and no account-pool selection occurs.
+pub fn spawn_cursor_account_refresh(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            let provider_keys = {
+                let providers = state.providers.read().await;
+                providers
+                    .providers
+                    .iter()
+                    .filter(|provider| provider.provider_type == ProviderType::CursorApiKey)
+                    .filter_map(|provider| {
+                        ProviderKey::new(provider.app, provider.provider.id.clone()).ok()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for provider_key in provider_keys {
+                match state
+                    .cursor_account_snapshot(provider_key.clone(), true)
+                    .await
+                {
+                    Ok(Ok(snapshot)) => {
+                        if matches!(
+                            snapshot.status,
+                            crate::domain::providers::cursor_account::CursorAccountSnapshotStatus::Error
+                                | crate::domain::providers::cursor_account::CursorAccountSnapshotStatus::Unconfigured
+                        ) {
+                            tracing::debug!(
+                                app = provider_key.app.as_str(),
+                                provider_id = %provider_key.provider_id,
+                                status = ?snapshot.status,
+                                "background Cursor API-key account refresh returned no usable data"
+                            );
+                        }
+                    }
+                    Ok(Err(ProviderCommandError::NotFound)) => {}
+                    Ok(Err(error)) => tracing::debug!(
+                        app = provider_key.app.as_str(),
+                        provider_id = %provider_key.provider_id,
+                        error = %error,
+                        "background Cursor API-key account refresh was skipped"
+                    ),
+                    Err(error) => tracing::warn!(
+                        app = provider_key.app.as_str(),
+                        provider_id = %provider_key.provider_id,
+                        error = %error,
+                        "background Cursor API-key account refresh failed"
+                    ),
+                }
+            }
+            sleep(Duration::from_secs(15 * 60)).await;
         }
     });
 }

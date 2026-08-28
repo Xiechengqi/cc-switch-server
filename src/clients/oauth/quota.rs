@@ -263,7 +263,17 @@ pub async fn refresh_account_quota(
         ProviderType::QoderCosy => {
             refresh_qoder_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
-        ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
+        ProviderType::CursorOAuth => {
+            refresh_cursor_dashboard_quota(
+                http,
+                account,
+                now_ms,
+                success_cooldown_ms,
+                request_timeout,
+            )
+            .await?
+        }
+        ProviderType::CursorApiKey => {
             refresh_imported_snapshot_quota(account, now_ms, success_cooldown_ms)?
         }
         ProviderType::OllamaCloud => {
@@ -3378,6 +3388,140 @@ fn refresh_imported_snapshot_quota(
     Ok(update)
 }
 
+async fn refresh_cursor_dashboard_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let access_token = account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(access_token) = access_token else {
+        // Compatibility-only path for historical imports that contain a
+        // captured usage snapshot but no usable bearer credential. New and
+        // refreshable OAuth accounts always use the live Dashboard path below.
+        let quota = parse_cursor_imported_quota(account, now_ms)?;
+        let subscription_level = quota.credential_message.clone();
+        let mut update = update_from_quota(
+            quota,
+            subscription_level.clone(),
+            None,
+            now_ms,
+            success_cooldown_ms,
+        );
+        update.subscription_level = subscription_level;
+        return Ok(update);
+    };
+    let dashboard_request = async {
+        crate::clients::oauth::cursor_dashboard::fetch_cursor_dashboard_snapshot(
+            http,
+            access_token,
+            request_timeout,
+        )
+        .await
+    };
+    let presentation_request = async {
+        crate::clients::oauth::cursor::fetch_cursor_oauth_presentation(http, access_token).await
+    };
+    let (snapshot, presentation) = tokio::join!(dashboard_request, presentation_request);
+    let presentation = presentation.ok().flatten();
+    let subscription_level = snapshot
+        .subscription_level()
+        .or_else(|| {
+            presentation
+                .as_ref()
+                .and_then(|value| value.subscription_level.clone())
+        })
+        .or_else(|| account.subscription_level.clone());
+    if !snapshot.has_data() {
+        let error = snapshot.errors.first().cloned().unwrap_or_else(|| {
+            crate::clients::oauth::cursor_dashboard::CursorDashboardError {
+                status_code: None,
+                retryable: true,
+                retry_after_ms: None,
+                message: "Cursor dashboard returned no account information".to_string(),
+            }
+        });
+        return Err(QuotaRefreshFailure {
+            status_code: match error.status_code {
+                Some(401 | 403) => 400,
+                Some(429) => 429,
+                Some(status) if status >= 500 => 502,
+                _ => 502,
+            },
+            upstream_status: error.status_code,
+            message: error.message,
+            retryable: error.retryable,
+            next_refresh_at: Some(
+                now_ms.saturating_add(
+                    error
+                        .retry_after_ms
+                        .and_then(|value| i64::try_from(value).ok())
+                        .unwrap_or(QUOTA_FAILURE_COOLDOWN_MS),
+                ),
+            ),
+            partial_update: presentation.map(|presentation| {
+                let mut profile = account.profile.clone().unwrap_or_else(|| json!({}));
+                profile["accountDisplay"] = json!({
+                    "email": presentation.email,
+                    "displayName": presentation.display_name,
+                    "credentialName": presentation.credential_name,
+                    "subscriptionLevel": presentation.subscription_level,
+                });
+                Box::new(AccountRefreshUpdate {
+                    email: profile["accountDisplay"]["email"]
+                        .as_str()
+                        .map(str::to_string),
+                    profile: Some(profile),
+                    subscription_level: subscription_level.clone(),
+                    ..Default::default()
+                })
+            }),
+        });
+    }
+
+    let safe_dashboard = snapshot.safe_profile();
+    let quota = snapshot
+        .account_quota(now_ms)
+        .unwrap_or_else(|| AccountQuota {
+            success: true,
+            credential_message: subscription_level.clone(),
+            tiers: Vec::new(),
+            extra_usage: Some(json!({
+                "source": "cursor_dashboard_api",
+                "queriedAt": now_ms,
+                "dashboard": safe_dashboard.clone(),
+                "partial": true,
+            })),
+        });
+    let mut update = update_from_quota(
+        quota,
+        subscription_level.clone(),
+        None,
+        now_ms,
+        success_cooldown_ms,
+    );
+    update.subscription_level = subscription_level;
+    let mut profile = account.profile.clone().unwrap_or_else(|| json!({}));
+    if let Some(presentation) = presentation {
+        update.email = presentation.email.clone();
+        profile["accountDisplay"] = json!({
+            "email": presentation.email,
+            "displayName": presentation.display_name,
+            "credentialName": presentation.credential_name,
+            "subscriptionLevel": presentation.subscription_level,
+        });
+    }
+    profile["cursorDashboard"] = safe_dashboard;
+    profile["cursorDashboardObservedAt"] = json!(now_ms);
+    update.profile = Some(profile);
+    Ok(update)
+}
+
 async fn refresh_ollama_cloud_quota(
     http: &reqwest::Client,
     account: &Account,
@@ -4663,6 +4807,7 @@ fn parse_cursor_imported_quota(
         .and_then(|raw| string_at(raw, &plan_paths))
         .or_else(|| string_at(&snapshot, &plan_paths))
         .and_then(|value| cursor_membership_label(&value))
+        .or_else(|| account.subscription_level.clone())
         .or_else(|| Some("Cursor".to_string()));
     let resets_at = number_at(&usage, &["/billingCycleEnd", "/billing_cycle_end"])
         .and_then(timestamp_number_to_unix_ms)
@@ -4677,7 +4822,7 @@ fn parse_cursor_imported_quota(
     };
     let limit = number_at(plan_usage, &["/limit"]).unwrap_or(0.0);
     let (name, utilization, used, limit, unit) = if limit > 0.0 {
-        let used = number_at(plan_usage, &["/used"]).or_else(|| {
+        let used = number_at(plan_usage, &["/used", "/totalSpend", "/total_spend"]).or_else(|| {
             number_at(plan_usage, &["/remaining"]).map(|remaining| (limit - remaining).max(0.0))
         });
         let utilization = number_at(plan_usage, &["/totalPercentUsed", "/total_percent_used"])
@@ -4717,7 +4862,17 @@ fn parse_cursor_imported_quota(
         }],
         extra_usage: Some(json!({
             "raw": snapshot,
-            "source": "imported_snapshot",
+            "source": if account
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.get("source"))
+                .and_then(Value::as_str)
+                == Some("cursor_dashboard_api")
+            {
+                "cursor_dashboard_api"
+            } else {
+                "imported_snapshot"
+            },
             "queriedAt": now_ms,
         })),
     })
