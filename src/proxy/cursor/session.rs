@@ -15,6 +15,7 @@ use super::agent_proto::McpToolDef;
 use super::h2_client::CursorH2Stream;
 use super::profile::CursorProtocolRail;
 use super::request_builder::ResponseToolNamespace;
+use super::response_state::CursorLocalTaskState;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -185,6 +186,10 @@ pub struct CursorSession {
     pub custom_tool_names: Vec<String>,
     pub response_tool_namespaces: Vec<ResponseToolNamespace>,
     pub semantic_items: Vec<serde_json::Value>,
+    /// Opaque local-task continuation state. This retains no prompt or tool
+    /// output and lets a parked Responses run preserve agent intent across
+    /// the tool-result round trip.
+    pub local_task_state: CursorLocalTaskState,
     /// Working directory for RequestContext ack.
     pub working_directory: String,
     /// Map: client-facing tool call id → cursor exec metadata.
@@ -226,6 +231,10 @@ struct Inner {
     sessions: RwLock<HashMap<CursorSessionKey, Arc<Mutex<CursorSession>>>>,
     response_sessions: RwLock<HashMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
     tool_call_sessions: RwLock<HashMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
+    /// Recently consumed cold-continuation identifiers. These short-lived,
+    /// scope-fenced claims close the race after a parked entry and its live
+    /// indexes have been removed but a duplicate request is still in flight.
+    continuation_claims: RwLock<HashMap<CursorScopedIndexKey, Instant>>,
     idle_ttl: Duration,
     max_sessions: usize,
 }
@@ -261,10 +270,51 @@ impl CursorSessionManager {
                 sessions: RwLock::new(HashMap::new()),
                 response_sessions: RwLock::new(HashMap::new()),
                 tool_call_sessions: RwLock::new(HashMap::new()),
+                continuation_claims: RwLock::new(HashMap::new()),
                 idle_ttl,
                 max_sessions,
             }),
         }
+    }
+
+    /// Record the identifiers consumed while atomically taking ownership of a
+    /// parked cold continuation. Claims contain only opaque response/call IDs,
+    /// never prompts, tool arguments, results, or credentials.
+    pub async fn claim_continuation_ids(&self, scope: &CursorSessionScope, raw_ids: &[String]) {
+        let now = Instant::now();
+        let mut claims = self.inner.continuation_claims.write().await;
+        claims.retain(|_, claimed_at| now.duration_since(*claimed_at) <= self.inner.idle_ttl);
+        for raw_id in raw_ids {
+            if let Some(key) = CursorScopedIndexKey::new(scope, raw_id) {
+                claims.insert(key, now);
+            }
+        }
+        let max_claims = self.inner.max_sessions.saturating_mul(16).max(64);
+        if claims.len() > max_claims {
+            let mut oldest = claims
+                .iter()
+                .map(|(key, claimed_at)| (key.clone(), *claimed_at))
+                .collect::<Vec<_>>();
+            oldest.sort_unstable_by_key(|(_, claimed_at)| *claimed_at);
+            for (key, _) in oldest.into_iter().take(claims.len() - max_claims) {
+                claims.remove(&key);
+            }
+        }
+    }
+
+    /// Check whether an exact scope/id was already consumed by another cold
+    /// continuation request. Expired claims are removed on lookup.
+    pub async fn continuation_was_claimed(
+        &self,
+        scope: &CursorSessionScope,
+        raw_ids: &[String],
+    ) -> bool {
+        let now = Instant::now();
+        let mut claims = self.inner.continuation_claims.write().await;
+        claims.retain(|_, claimed_at| now.duration_since(*claimed_at) <= self.inner.idle_ttl);
+        raw_ids.iter().any(|raw_id| {
+            CursorScopedIndexKey::new(scope, raw_id).is_some_and(|key| claims.contains_key(&key))
+        })
     }
 
     /// Try to reacquire a parked session. Returns `Some` only when the entry
@@ -339,6 +389,7 @@ impl CursorSessionManager {
             custom_tool_names: Vec::new(),
             response_tool_namespaces: Vec::new(),
             semantic_items,
+            local_task_state: CursorLocalTaskState::default(),
             working_directory,
             pending_tool_calls: HashMap::new(),
             cold_resume_completed_calls: Vec::new(),
@@ -656,6 +707,7 @@ mod tests {
             custom_tool_names: Vec::new(),
             response_tool_namespaces: Vec::new(),
             semantic_items: Vec::new(),
+            local_task_state: CursorLocalTaskState::default(),
             working_directory: String::new(),
             pending_tool_calls: HashMap::new(),
             cold_resume_completed_calls: Vec::new(),
@@ -809,6 +861,19 @@ mod tests {
                 .map(|reference| reference.key().clone()),
             Some(key_b)
         );
+    }
+
+    #[tokio::test]
+    async fn consumed_continuation_claims_are_scope_isolated() {
+        let mgr = CursorSessionManager::default();
+        let scope_a = CursorSessionScope::fixture("claim-share-a");
+        let scope_b = CursorSessionScope::fixture("claim-share-b");
+        let ids = vec!["call_same".to_string(), "resp_same".to_string()];
+
+        mgr.claim_continuation_ids(&scope_a, &ids).await;
+
+        assert!(mgr.continuation_was_claimed(&scope_a, &ids).await);
+        assert!(!mgr.continuation_was_claimed(&scope_b, &ids).await);
     }
 
     #[tokio::test]

@@ -24,6 +24,9 @@
       "response_compaction",
       "canonical_input_token_estimate",
       "verified_apikey_stable_identity",
+      "responses_tool_context_cold_resume",
+      "store_false_ephemeral_continuation",
+      "strict_client_mcp_wrapper_routing",
       "unsupported_parameter_rejection"
     ],
     "transientPrecommitRetry": "disabled_pending_separate_live_idempotency_evidence"

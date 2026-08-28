@@ -6,6 +6,6 @@
     { "name": "provider_revision_changed", "expected": "cursor_response_state_lost" },
     { "name": "rail_changed", "expected": "cursor_response_state_lost" },
     { "name": "credential_generation_changed", "expected": "cursor_response_state_lost" },
-    { "name": "store_false", "expected": "not_stored" }
+    { "name": "store_false", "expected": "ephemeral_continuation_context" }
   ]
 }

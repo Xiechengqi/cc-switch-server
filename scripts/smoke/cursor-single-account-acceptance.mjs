@@ -24,10 +24,10 @@ results.push(check("input_tokens", tokens, (body) =>
 
 const first = await invoke("/v1/responses", {
   model,
-  store: true,
+  store: false,
   input: "Reply with exactly CURSOR_ACCEPTANCE_OK",
 });
-results.push(check("responses_store", first, (body) =>
+results.push(check("responses_store_false", first, (body) =>
   body.object === "response" && typeof body.id === "string"));
 
 if (first.body?.id) {

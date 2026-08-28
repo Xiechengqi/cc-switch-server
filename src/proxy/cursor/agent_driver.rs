@@ -819,7 +819,7 @@ pub async fn forward_agentservice(
     if response_context_prepended {
         preserve_current_continuation(&mut plan, &preliminary_plan);
     }
-    let local_task_state = resolve_local_task_state(
+    let mut local_task_state = resolve_local_task_state(
         &preliminary_plan,
         current_turn_signal,
         &inherited_local_task_state,
@@ -866,18 +866,32 @@ pub async fn forward_agentservice(
         affinity_conversation_id.as_deref(),
     )
     .await?;
+    if !resolved_session.replay_items.is_empty() {
+        prepend_response_context(&mut body_value, &resolved_session.replay_items)
+            .map_err(ProxyError::bad_request)?;
+        let mut replay_plan =
+            try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
+        preserve_current_continuation(&mut replay_plan, &plan);
+        plan = replay_plan;
+        local_task_state = resolve_local_task_state(
+            &plan,
+            current_turn_signal,
+            resolved_session
+                .replay_local_task_state
+                .as_ref()
+                .unwrap_or(&inherited_local_task_state),
+        );
+        if plan.tool_results.is_empty() && local_task_state.tool_commit_required {
+            plan.local_tool_required_by_intent = true;
+        }
+    } else if let Some(replay_local_task_state) = resolved_session.replay_local_task_state.as_ref()
+    {
+        local_task_state =
+            resolve_local_task_state(&plan, current_turn_signal, replay_local_task_state);
+    }
     let mut session_key = resolved_session.key.clone();
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_agent_plan_input_tokens(&plan);
-    let response_state = (!compact)
-        .then(|| {
-            response_scope.map(|scope| CursorResponseStateContext {
-                scope,
-                store: body_value.get("store").and_then(Value::as_bool) != Some(false),
-                local_task_state: local_task_state.clone(),
-            })
-        })
-        .flatten();
     let mut auth_recovery = AuthRecoveryState::default();
     let session_open_context = CursorSessionOpenContext {
         state: &state,
@@ -896,6 +910,22 @@ pub async fn forward_agentservice(
     .await?;
     let session_entry = opened.entry;
     session_key = opened.key;
+    {
+        let mut session = session_entry.lock().await;
+        if resolved_session.parked.is_some() {
+            local_task_state =
+                resolve_local_task_state(&plan, current_turn_signal, &session.local_task_state);
+        }
+        session.local_task_state = local_task_state.clone();
+    }
+    let response_state = (!compact)
+        .then(|| {
+            response_scope.map(|scope| CursorResponseStateContext {
+                scope,
+                local_task_state: local_task_state.clone(),
+            })
+        })
+        .flatten();
 
     let model = usage_model_metadata(&adapter_request);
     let semantic_tool_choice = match (&plan.tool_choice, plan.tool_results.is_empty()) {
@@ -2520,7 +2550,6 @@ impl Drop for CursorSessionReservationGuard {
 #[derive(Clone)]
 struct CursorResponseStateContext {
     scope: CursorResponseScope,
-    store: bool,
     local_task_state: CursorLocalTaskState,
 }
 
@@ -2531,7 +2560,7 @@ fn cache_completed_response(
     semantic_items: &[Value],
     body: &[u8],
 ) {
-    let Some(context) = context.filter(|context| context.store) else {
+    let Some(context) = context else {
         return;
     };
     let Ok(response) = serde_json::from_slice::<Value>(body) else {
@@ -3221,6 +3250,36 @@ async fn resolve_session_key(
     affinity_conversation_id: Option<&str>,
 ) -> Result<ResolvedCursorSession, ProxyError> {
     if !plan.tool_results.is_empty() {
+        // Cursor's parked stream accepts Claude-style inline tool results, but
+        // Responses custom-tool continuations can remain open without another
+        // business frame. A cold-resumable Responses request carries the
+        // current call + output context; atomically snapshot the parked turn's
+        // earlier semantic items, close its exact owner, then replay the merged
+        // context on a fresh upstream conversation.
+        if plan.inbound_protocol == InboundProtocol::OpenAiResponses && plan.cold_resume_ready {
+            let closed = close_unusable_continuation_session(
+                state,
+                scope,
+                &plan.tool_results,
+                plan.previous_response_id.as_deref(),
+            )
+            .await?;
+            metrics::counter!(
+                "cursor_session_resume_total",
+                "outcome" => "cold_responses",
+                "rail" => rail.label()
+            )
+            .increment(1);
+            let (replay_items, replay_local_task_state) = match closed {
+                Some(session) => (session.semantic_items, Some(session.local_task_state)),
+                None => (Vec::new(), None),
+            };
+            return Ok(ResolvedCursorSession::with_replay_items(
+                CursorSessionKey::new(scope.clone(), new_cursor_conversation_id(rail)),
+                replay_items,
+                replay_local_task_state,
+            ));
+        }
         if plan.continuation_kind == ToolContinuationKind::PureToolResults {
             let mut candidate: Option<CursorSessionReference> = None;
             let mut all_call_ids_resolved = true;
@@ -3274,7 +3333,7 @@ async fn resolve_session_key(
             }
         }
         if plan.cold_resume_ready {
-            let prior_conversation_id = close_unusable_continuation_session(
+            let prior_session = close_unusable_continuation_session(
                 state,
                 scope,
                 &plan.tool_results,
@@ -3289,7 +3348,8 @@ async fn resolve_session_key(
             .increment(1);
             return Ok(ResolvedCursorSession::new(CursorSessionKey::new(
                 scope.clone(),
-                prior_conversation_id
+                prior_session
+                    .map(|session| session.conversation_id)
                     .or_else(|| affinity_conversation_id.map(str::to_string))
                     .or_else(|| plan.previous_response_id.clone())
                     .unwrap_or_else(|| new_cursor_conversation_id(rail)),
@@ -3342,12 +3402,25 @@ async fn resolve_session_key(
     )))
 }
 
+struct ClosedContinuationSession {
+    conversation_id: String,
+    semantic_items: Vec<Value>,
+    local_task_state: CursorLocalTaskState,
+}
+
 async fn close_unusable_continuation_session(
     state: &ServerState,
     scope: &CursorSessionScope,
     tool_results: &[super::request_builder::ToolResultBlock],
     previous_response_id: Option<&str>,
-) -> Result<Option<String>, ProxyError> {
+) -> Result<Option<ClosedContinuationSession>, ProxyError> {
+    let mut continuation_ids = tool_results
+        .iter()
+        .map(|result| result.tool_call_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(response_id) = previous_response_id {
+        continuation_ids.push(response_id.to_string());
+    }
     let mut candidate: Option<CursorSessionReference> = None;
     for result in tool_results {
         let Some(reference) = state
@@ -3386,34 +3459,47 @@ async fn close_unusable_continuation_session(
     }
     if let Some(reference) = candidate {
         let conversation_id = reference.key().conversation_id().to_string();
-        if !state
-            .cursor_sessions
-            .close_parked_resolved(&reference)
-            .await
-        {
-            let still_live = futures_util::future::join_all(tool_results.iter().map(|result| {
-                state
-                    .cursor_sessions
-                    .resolve_tool_call_id(scope, &result.tool_call_id)
-            }))
-            .await
-            .into_iter()
-            .any(|reference| reference.is_some());
-            let response_still_live = match previous_response_id {
-                Some(response_id) => state
-                    .cursor_sessions
-                    .resolve_response_id(scope, response_id)
-                    .await
-                    .is_some(),
-                None => false,
+        if let Some(entry) = state.cursor_sessions.acquire_resolved(&reference).await {
+            state
+                .cursor_sessions
+                .claim_continuation_ids(scope, &continuation_ids)
+                .await;
+            let (semantic_items, local_task_state) = {
+                let session = entry.lock().await;
+                (
+                    session.semantic_items.clone(),
+                    session.local_task_state.clone(),
+                )
             };
-            if still_live || response_still_live {
-                return Err(ProxyError::cursor_continuation_in_progress(
-                    "Cursor continuation is already being resumed by another request",
-                ));
-            }
+            state
+                .cursor_sessions
+                .release(entry, SessionState::Closed)
+                .await;
+            return Ok(Some(ClosedContinuationSession {
+                conversation_id,
+                semantic_items,
+                local_task_state,
+            }));
+        } else {
+            // This request already resolved an exact parked owner. If the
+            // atomic acquire now fails, another request may have acquired and
+            // removed its indexes between these two operations. Treat every
+            // such stale reference as in-progress for this attempt; a later
+            // retry can re-resolve from current state without opening a
+            // duplicate upstream run in the race window.
+            return Err(ProxyError::cursor_continuation_in_progress(
+                "Cursor continuation is already being resumed by another request",
+            ));
         }
-        return Ok(Some(conversation_id));
+    }
+    if state
+        .cursor_sessions
+        .continuation_was_claimed(scope, &continuation_ids)
+        .await
+    {
+        return Err(ProxyError::cursor_continuation_in_progress(
+            "Cursor continuation was already resumed by another request",
+        ));
     }
     Ok(None)
 }
@@ -3429,17 +3515,39 @@ fn new_cursor_conversation_id(rail: CursorProtocolRail) -> String {
 struct ResolvedCursorSession {
     key: CursorSessionKey,
     parked: Option<CursorSessionReference>,
+    replay_items: Vec<Value>,
+    replay_local_task_state: Option<CursorLocalTaskState>,
 }
 
 impl ResolvedCursorSession {
     fn new(key: CursorSessionKey) -> Self {
-        Self { key, parked: None }
+        Self {
+            key,
+            parked: None,
+            replay_items: Vec::new(),
+            replay_local_task_state: None,
+        }
+    }
+
+    fn with_replay_items(
+        key: CursorSessionKey,
+        replay_items: Vec<Value>,
+        replay_local_task_state: Option<CursorLocalTaskState>,
+    ) -> Self {
+        Self {
+            key,
+            parked: None,
+            replay_items,
+            replay_local_task_state,
+        }
     }
 
     fn parked(reference: CursorSessionReference) -> Self {
         Self {
             key: reference.key().clone(),
             parked: Some(reference),
+            replay_items: Vec::new(),
+            replay_local_task_state: None,
         }
     }
 }
@@ -4075,6 +4183,56 @@ mod tests {
     }
 
     #[test]
+    fn completed_store_false_turn_keeps_ephemeral_continuation_context() {
+        let state = cursor_stream_test_state("store-false-continuation");
+        let scope = CursorResponseScope::derive(CursorResponseScopeInput {
+            app: "codex",
+            provider_id: "cursor-provider",
+            provider_revision: 1,
+            runtime_fingerprint: "runtime-a",
+            rail: CursorProtocolRail::ApiKeySdk.label(),
+            protocol_revision: CursorProtocolRail::ApiKeySdk.protocol_revision(),
+            credential_identity: "credential-a",
+            share_id: Some("share-a"),
+            user_email: Some("user@example.com"),
+            workspace_id: "/workspace",
+        });
+        let context = CursorResponseStateContext {
+            scope: scope.clone(),
+            local_task_state: CursorLocalTaskState::default(),
+        };
+        let key = CursorSessionKey::new(
+            CursorSessionScope::fixture("store-false-continuation"),
+            "conversation-a",
+        );
+        let request = json!({
+            "model":"default",
+            "store":false,
+            "input":"continue"
+        });
+        assert_eq!(request["store"], false);
+
+        cache_completed_response(
+            &state,
+            Some(&context),
+            &key,
+            &[json!({"type":"message","role":"user","content":"continue"})],
+            br#"{"id":"resp_store_false","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}"#,
+        );
+
+        let cached = state
+            .cursor_completed_responses
+            .get(
+                &scope,
+                "resp_store_false",
+                crate::infra::time::now_ms() as i64,
+            )
+            .expect("store=false must retain bounded continuation context");
+        assert_eq!(cached.conversation_id, "conversation-a");
+        assert_eq!(cached.items.len(), 2);
+    }
+
+    #[test]
     fn semantic_retries_always_rotate_upstream_conversation_identity() {
         let initial = CursorSessionKey::new(
             CursorSessionScope::fixture("semantic-retry"),
@@ -4086,6 +4244,288 @@ mod tests {
         assert_eq!(retry_one.scope(), retry_two.scope());
         assert_ne!(initial.conversation_id(), retry_one.conversation_id());
         assert_ne!(retry_one.conversation_id(), retry_two.conversation_id());
+    }
+
+    #[tokio::test]
+    async fn codex_complete_tool_context_closes_parked_stream_and_uses_fresh_conversation() {
+        let state = cursor_stream_test_state("codex-cold-tool-resume");
+        let scope = CursorSessionScope::fixture("codex-cold-tool-resume");
+        let old_key = CursorSessionKey::new(scope.clone(), "parked-conversation");
+        let entry = state
+            .cursor_sessions
+            .reserve(
+                old_key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![
+                    json!({
+                        "type":"message",
+                        "role":"user",
+                        "content":"Inspect this project deeply"
+                    }),
+                    json!({
+                        "type":"custom_tool_call",
+                        "name":"exec",
+                        "call_id":"call_exec_1",
+                        "input":"text(await tools.exec_command({cmd: \"pwd\"}));"
+                    }),
+                ],
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .cursor_sessions
+            .bind_tool_call_id(&old_key, &entry, "call_exec_1")
+            .await;
+        let parked_local_task_state = CursorLocalTaskState {
+            active: true,
+            tool_commit_required: true,
+            origin_turn_digest: "origin-task".to_string(),
+            generation: 1,
+        };
+        entry.lock().await.local_task_state = parked_local_task_state.clone();
+        state
+            .cursor_sessions
+            .release(entry, SessionState::AwaitingToolResult)
+            .await;
+
+        let body = json!({
+            "model":"gpt-5.6-sol",
+            "stream":true,
+            "input":[
+                {
+                    "type":"additional_tools",
+                    "role":"developer",
+                    "tools":[{
+                        "type":"custom",
+                        "name":"exec",
+                        "format":{
+                            "type":"grammar",
+                            "syntax":"lark",
+                            "definition":"start: SOURCE\nSOURCE: /[\\s\\S]+/"
+                        }
+                    }]
+                },
+                {
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call_exec_1",
+                    "input":"text(await tools.exec_command({cmd: \"pwd\"}));"
+                },
+                {
+                    "type":"custom_tool_call_output",
+                    "call_id":"call_exec_1",
+                    "output":"/workspace\n"
+                }
+            ]
+        });
+        let plan = try_build_plan(InboundProtocol::OpenAiResponses, &body).unwrap();
+        assert!(plan.cold_resume_ready);
+        assert!(plan
+            .user_text
+            .contains("Assistant called custom tool exec (call_exec_1)"));
+        assert!(plan
+            .user_text
+            .contains("Tool result (call_exec_1): /workspace"));
+
+        let resolved = resolve_session_key(
+            &state,
+            &plan,
+            &scope,
+            CursorProtocolRail::OAuthCli,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(resolved.parked.is_none());
+        assert_ne!(resolved.key.conversation_id(), old_key.conversation_id());
+        assert_eq!(resolved.key.scope(), old_key.scope());
+        assert_eq!(resolved.replay_items.len(), 2);
+        assert_eq!(
+            resolved.replay_local_task_state,
+            Some(parked_local_task_state)
+        );
+        assert_eq!(state.cursor_sessions.size().await, 0);
+
+        let mut replay_body = body;
+        prepend_response_context(&mut replay_body, &resolved.replay_items).unwrap();
+        let mut replay_plan =
+            try_build_plan(InboundProtocol::OpenAiResponses, &replay_body).unwrap();
+        preserve_current_continuation(&mut replay_plan, &plan);
+        assert!(replay_plan
+            .user_text
+            .contains("User: Inspect this project deeply"));
+        assert_eq!(
+            replay_plan
+                .user_text
+                .matches("Assistant called custom tool exec (call_exec_1)")
+                .count(),
+            1
+        );
+        assert!(replay_plan
+            .user_text
+            .contains("Tool result (call_exec_1): /workspace"));
+    }
+
+    #[tokio::test]
+    async fn continuations_without_responses_cold_context_keep_live_resume_semantics() {
+        for (fixture, protocol, body) in [
+            (
+                "responses-live-tool-resume",
+                InboundProtocol::OpenAiResponses,
+                json!({
+                    "model":"default",
+                    "input":[{
+                        "type":"function_call_output",
+                        "call_id":"call_1",
+                        "output":"done"
+                    }]
+                }),
+            ),
+            (
+                "anthropic-live-tool-resume",
+                InboundProtocol::AnthropicMessages,
+                json!({
+                    "model":"default",
+                    "messages":[
+                        {"role":"assistant","content":[{
+                            "type":"tool_use",
+                            "id":"call_1",
+                            "name":"read",
+                            "input":{"path":"README.md"}
+                        }]},
+                        {"role":"user","content":[{
+                            "type":"tool_result",
+                            "tool_use_id":"call_1",
+                            "content":"done"
+                        }]}
+                    ]
+                }),
+            ),
+        ] {
+            let state = cursor_stream_test_state(fixture);
+            let scope = CursorSessionScope::fixture(fixture);
+            let key = CursorSessionKey::new(scope.clone(), "parked-conversation");
+            let entry = state
+                .cursor_sessions
+                .reserve(
+                    key.clone(),
+                    CursorProtocolRail::OAuthCli,
+                    HashMap::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    "/workspace".to_string(),
+                )
+                .await
+                .unwrap();
+            state
+                .cursor_sessions
+                .bind_tool_call_id(&key, &entry, "call_1")
+                .await;
+            state
+                .cursor_sessions
+                .release(entry, SessionState::AwaitingToolResult)
+                .await;
+
+            let plan = try_build_plan(protocol, &body).unwrap();
+            if protocol == InboundProtocol::OpenAiResponses {
+                assert!(!plan.cold_resume_ready);
+            } else {
+                assert!(plan.cold_resume_ready);
+            }
+            let resolved = resolve_session_key(
+                &state,
+                &plan,
+                &scope,
+                CursorProtocolRail::OAuthCli,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(resolved.key, key);
+            assert!(resolved.parked.is_some());
+            assert!(resolved.replay_items.is_empty());
+            assert_eq!(state.cursor_sessions.size().await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_continuation_never_opens_a_duplicate_run() {
+        let state = cursor_stream_test_state("concurrent-cold-continuation");
+        let scope = CursorSessionScope::fixture("concurrent-cold-continuation");
+        let key = CursorSessionKey::new(scope.clone(), "parked-conversation");
+        let entry = state
+            .cursor_sessions
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![json!({"type":"message","role":"user","content":"inspect"})],
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .cursor_sessions
+            .bind_tool_call_id(&key, &entry, "call_1")
+            .await;
+        state
+            .cursor_sessions
+            .release(entry, SessionState::AwaitingToolResult)
+            .await;
+
+        let body = json!({
+            "model":"default",
+            "input":[
+                {
+                    "type":"function_call",
+                    "name":"lookup",
+                    "call_id":"call_1",
+                    "arguments":"{\"key\":\"cursor\"}"
+                },
+                {
+                    "type":"function_call_output",
+                    "call_id":"call_1",
+                    "output":"value"
+                }
+            ]
+        });
+        let plan = try_build_plan(InboundProtocol::OpenAiResponses, &body).unwrap();
+        assert!(plan.cold_resume_ready);
+
+        let first = resolve_session_key(
+            &state,
+            &plan,
+            &scope,
+            CursorProtocolRail::OAuthCli,
+            None,
+            None,
+        )
+        .await
+        .expect("first continuation consumes the parked session");
+        assert_ne!(first.key, key);
+        assert_eq!(state.cursor_sessions.size().await, 0);
+
+        let error = resolve_session_key(
+            &state,
+            &plan,
+            &scope,
+            CursorProtocolRail::OAuthCli,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("second continuation must not open a duplicate run");
+        assert_eq!(error.error_code(), "cursor_continuation_in_progress");
+        assert_eq!(state.cursor_sessions.size().await, 0);
     }
 
     #[test]
@@ -4309,6 +4749,7 @@ mod tests {
             custom_tool_names: Vec::new(),
             response_tool_namespaces: Vec::new(),
             semantic_items: Vec::new(),
+            local_task_state: CursorLocalTaskState::default(),
             working_directory: "/workspace".to_string(),
             pending_tool_calls: HashMap::new(),
             cold_resume_completed_calls: Vec::new(),

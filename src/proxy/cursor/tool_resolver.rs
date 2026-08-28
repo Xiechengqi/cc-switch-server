@@ -4,10 +4,20 @@
 //! keys that belong to a different Claude Code tool. Resolve against the
 //! client's declared inventory before surfacing a tool_use/tool_calls block.
 
-use super::agent_proto::McpToolDef;
+use super::agent_proto::{McpToolDef, CLIENT_MCP_PROVIDER_IDENTIFIER};
 use super::tool_schema::{validate_tool_arguments, ToolSchemaError, ToolSchemaErrorKind};
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
+
+const ARGUMENT_WRAPPERS: &[&str] = &[
+    "arguments",
+    "args",
+    "input",
+    "parameters",
+    "params",
+    "targeting",
+];
+const MAX_ARGUMENT_WRAPPER_DEPTH: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedToolCall {
@@ -26,6 +36,11 @@ pub struct InvalidToolCall {
 struct ToolSpec {
     name: String,
     schema: ToolSchema,
+}
+
+struct ResolvedMcpWrapper<'a> {
+    spec: &'a ToolSpec,
+    args: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +107,30 @@ pub fn resolve_tool_call(
         }
     }
 
+    if emitted_canonical == "mcp" {
+        if let Some(routed) = resolve_client_mcp_wrapper(&specs, emitted_name, &args_obj)? {
+            return match normalize_and_validate(
+                &routed.args,
+                routed.spec,
+                &canonical_tool_name(&routed.spec.name),
+            ) {
+                Ok(Some(args)) => Ok(ResolvedToolCall {
+                    name: routed.spec.name.clone(),
+                    args,
+                }),
+                Ok(None) => Err(invalid(
+                    emitted_name,
+                    "invalid_arguments",
+                    format!(
+                        "MCP wrapper arguments do not satisfy declared tool `{}`",
+                        routed.spec.name
+                    ),
+                )),
+                Err(error) => Err(schema_invalid(emitted_name, error)),
+            };
+        }
+    }
+
     for candidate in candidate_tool_names(&emitted_canonical, &args_obj) {
         if let Some(spec) = unique_tool_by_canonical(&specs, candidate, emitted_name)? {
             match normalize_and_validate(&args_obj, spec, candidate) {
@@ -117,6 +156,114 @@ pub fn resolve_tool_call(
         "invalid_arguments",
         format!("arguments do not satisfy any declared tool schema; allowed tools: {allowed}"),
     ))
+}
+
+fn resolve_client_mcp_wrapper<'a>(
+    specs: &'a [ToolSpec],
+    emitted_name: &str,
+    args: &Map<String, Value>,
+) -> Result<Option<ResolvedMcpWrapper<'a>>, InvalidToolCall> {
+    const PROVIDER_KEYS: &[&str] = &[
+        "providerIdentifier",
+        "provider_identifier",
+        "provider",
+        "server",
+        "serverName",
+        "server_name",
+    ];
+    const TOOL_KEYS: &[&str] = &["toolName", "tool_name", "tool", "name"];
+
+    let provider = first_routing_string(args, PROVIDER_KEYS);
+    let Some((_, tool_name)) = first_routing_string(args, TOOL_KEYS) else {
+        return Ok(None);
+    };
+    if normalize_key(&tool_name) == "mcp" {
+        return Ok(None);
+    }
+    if let Some((_, provider)) = provider {
+        if normalize_key(&provider) != normalize_key(CLIENT_MCP_PROVIDER_IDENTIFIER) {
+            return Err(invalid(
+                emitted_name,
+                "undeclared_tool",
+                "MCP wrapper provider is not the declared client tool boundary",
+            ));
+        }
+    }
+
+    let matches = specs
+        .iter()
+        .filter(|spec| normalize_key(&spec.name) == normalize_key(&tool_name))
+        .collect::<Vec<_>>();
+    let spec = match matches.as_slice() {
+        [] => {
+            return Err(invalid(
+                emitted_name,
+                "undeclared_tool",
+                format!("MCP wrapper targets undeclared client tool `{tool_name}`"),
+            ))
+        }
+        [spec] => *spec,
+        _ => {
+            return Err(invalid(
+                emitted_name,
+                "ambiguous_tool",
+                format!("multiple declared tools match MCP target `{tool_name}`"),
+            ))
+        }
+    };
+
+    let mut routed = args.clone();
+    for key in PROVIDER_KEYS.iter().chain(TOOL_KEYS) {
+        if let Some(actual) = routed
+            .keys()
+            .find(|actual| normalize_key(actual) == normalize_key(key))
+            .cloned()
+        {
+            routed.remove(&actual);
+        }
+    }
+    Ok(Some(ResolvedMcpWrapper { spec, args: routed }))
+}
+
+fn first_routing_string(args: &Map<String, Value>, aliases: &[&str]) -> Option<(String, String)> {
+    first_routing_string_at_depth(args, aliases, 0)
+}
+
+fn first_routing_string_at_depth(
+    args: &Map<String, Value>,
+    aliases: &[&str],
+    depth: usize,
+) -> Option<(String, String)> {
+    let direct = aliases.iter().find_map(|alias| {
+        args.iter().find_map(|(key, value)| {
+            (normalize_key(key) == normalize_key(alias))
+                .then(|| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.trim().to_string()))
+                })
+                .flatten()
+                .filter(|(_, value)| !value.is_empty())
+        })
+    });
+    if direct.is_some() || depth >= MAX_ARGUMENT_WRAPPER_DEPTH {
+        return direct;
+    }
+    args.iter().find_map(|(key, value)| {
+        if !ARGUMENT_WRAPPERS.contains(&normalize_key(key).as_str()) {
+            return None;
+        }
+        let object = match value {
+            Value::Object(object) => Some(object.clone()),
+            Value::String(encoded) if encoded.trim_start().starts_with('{') => {
+                serde_json::from_str::<Value>(encoded)
+                    .ok()
+                    .and_then(|value| value.as_object().cloned())
+            }
+            _ => None,
+        }?;
+        first_routing_string_at_depth(&object, aliases, depth + 1)
+    })
 }
 
 fn resolve_websearch_misroute(
@@ -176,15 +323,52 @@ fn normalize_and_validate(
     spec: &ToolSpec,
     emitted_canonical: &str,
 ) -> Result<Option<Value>, ToolSchemaError> {
-    let mut normalized = normalize_arguments(args, spec, emitted_canonical);
+    let expanded = expand_argument_wrappers(args, spec);
+    let mut normalized = normalize_arguments(&expanded, spec, emitted_canonical);
     repair_glob_swapped_values(&mut normalized, spec);
-    normalize_shell_arguments(&mut normalized, args, spec);
+    normalize_shell_arguments(&mut normalized, &expanded, spec);
     let normalized = Value::Object(normalized);
     match validate_tool_arguments(&spec.schema.raw, &normalized) {
         Ok(()) => Ok(Some(normalized)),
         Err(error) if error.kind == ToolSchemaErrorKind::Validation => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn expand_argument_wrappers(args: &Map<String, Value>, spec: &ToolSpec) -> Map<String, Value> {
+    let declared = normalized_property_lookup(&spec.schema);
+    let mut current = args.clone();
+    for _ in 0..MAX_ARGUMENT_WRAPPER_DEPTH {
+        let mut changed = false;
+        let snapshot = current.clone();
+        for (key, value) in snapshot {
+            let normalized = normalize_key(&key);
+            if !ARGUMENT_WRAPPERS.contains(&normalized.as_str())
+                || declared.contains_key(&normalized)
+            {
+                continue;
+            }
+            let nested = match value {
+                Value::Object(object) => Some(object),
+                Value::String(encoded) if encoded.trim_start().starts_with('{') => {
+                    serde_json::from_str::<Value>(&encoded)
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                }
+                _ => None,
+            };
+            let Some(nested) = nested else { continue };
+            current.remove(&key);
+            for (nested_key, nested_value) in nested {
+                current.entry(nested_key).or_insert(nested_value);
+            }
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    current
 }
 
 fn normalize_arguments(
@@ -862,5 +1046,146 @@ mod tests {
         let tools = vec![tool("bash", schema.clone()), tool("shell", schema)];
         let error = resolve_tool_call(&tools, "terminal", json!({"command":"pwd"})).unwrap_err();
         assert_eq!(error.reason_code, "ambiguous_tool");
+    }
+
+    #[test]
+    fn nested_mcp_argument_wrappers_expand_only_when_not_declared_by_schema() {
+        let direct = tool(
+            "server_tool",
+            json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "query":{"type":"string"}
+                },
+                "required":["path","query"],
+                "additionalProperties":false
+            }),
+        );
+        let resolved = resolve_tool_call(
+            &[direct],
+            "server_tool",
+            json!({
+                "arguments":"{\"path\":\"src\",\"params\":{\"query\":\"TODO\"}}"
+            }),
+        )
+        .unwrap();
+        assert_eq!(resolved.args, json!({"path":"src","query":"TODO"}));
+
+        let declared_wrapper = tool(
+            "wrapped_tool",
+            json!({
+                "type":"object",
+                "properties":{
+                    "input":{
+                        "type":"object",
+                        "properties":{"value":{"type":"string"}},
+                        "required":["value"],
+                        "additionalProperties":false
+                    }
+                },
+                "required":["input"],
+                "additionalProperties":false
+            }),
+        );
+        let resolved = resolve_tool_call(
+            &[declared_wrapper],
+            "wrapped_tool",
+            json!({"input":{"value":"preserved"}}),
+        )
+        .unwrap();
+        assert_eq!(resolved.args, json!({"input":{"value":"preserved"}}));
+    }
+
+    #[test]
+    fn generic_mcp_wrapper_routes_only_to_exact_declared_client_tool() {
+        let exec = tool(
+            "exec",
+            json!({
+                "type":"object",
+                "properties":{"input":{"type":"string"}},
+                "required":["input"],
+                "additionalProperties":false
+            }),
+        );
+        let resolved = resolve_tool_call(
+            std::slice::from_ref(&exec),
+            "mcp",
+            json!({
+                "providerIdentifier":"client",
+                "toolName":"exec",
+                "args":"{\"input\":\"text(await tools.exec_command({cmd: \\\"pwd\\\"}));\"}"
+            }),
+        )
+        .unwrap();
+        assert_eq!(resolved.name, "exec");
+        assert_eq!(
+            resolved.args,
+            json!({"input":"text(await tools.exec_command({cmd: \"pwd\"}));"})
+        );
+
+        let foreign = resolve_tool_call(
+            std::slice::from_ref(&exec),
+            "mcp",
+            json!({
+                "providerIdentifier":"foreign-server",
+                "toolName":"exec",
+                "args":{"input":"pwd"}
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(foreign.reason_code, "undeclared_tool");
+
+        let unknown = resolve_tool_call(
+            &[exec],
+            "mcp",
+            json!({
+                "providerIdentifier":"client",
+                "toolName":"other",
+                "args":{}
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(unknown.reason_code, "undeclared_tool");
+
+        let nested = resolve_tool_call(
+            &[tool(
+                "exec",
+                json!({
+                    "type":"object",
+                    "properties":{"input":{"type":"string"}},
+                    "required":["input"],
+                    "additionalProperties":false
+                }),
+            )],
+            "mcp",
+            json!({
+                "targeting":{
+                    "providerIdentifier":"client",
+                    "toolName":"exec"
+                },
+                "arguments":{"input":"pwd"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(nested.name, "exec");
+        assert_eq!(nested.args, json!({"input":"pwd"}));
+
+        let declared_mcp = resolve_tool_call(
+            &[tool(
+                "mcp",
+                json!({
+                    "type":"object",
+                    "properties":{"name":{"type":"string"}},
+                    "required":["name"],
+                    "additionalProperties":false
+                }),
+            )],
+            "mcp",
+            json!({"name":"literal-client-argument"}),
+        )
+        .unwrap();
+        assert_eq!(declared_mcp.name, "mcp");
+        assert_eq!(declared_mcp.args, json!({"name":"literal-client-argument"}));
     }
 }

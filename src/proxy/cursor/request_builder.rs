@@ -87,6 +87,7 @@ pub enum LocalTaskTurnSignal {
 
 #[derive(Debug, Clone)]
 pub struct AgentRunPlan {
+    pub inbound_protocol: InboundProtocol,
     pub system_prompt: Option<String>,
     pub user_text: String,
     pub tools: Vec<McpToolDef>,
@@ -990,6 +991,7 @@ pub fn try_build_plan(protocol: InboundProtocol, body: &Value) -> Result<AgentRu
     }
 
     Ok(AgentRunPlan {
+        inbound_protocol: protocol,
         system_prompt,
         user_text,
         tools,
@@ -3103,6 +3105,10 @@ mod tests {
         let continuation = &cases[1];
         let continuation_plan =
             build_plan(InboundProtocol::OpenAiResponses, &continuation["request"]);
+        assert_eq!(
+            continuation_plan.inbound_protocol,
+            InboundProtocol::OpenAiResponses
+        );
         assert_eq!(
             continuation_plan.continuation_kind,
             ToolContinuationKind::PureToolResults

@@ -80,7 +80,7 @@ Code Agent CLI
 
 平铺文件按供应商与关注点划分，主要有 `forwarder.rs`（转发主循环）、`adapters.rs`/`transforms.rs`/`stream_transforms.rs`（协议改写）、`streaming.rs`、`retry_policy.rs`、`request_governance.rs`、`usage.rs`，以及供应商专属的 `claude_oauth.rs` `codex_models.rs` `codex_request_policy.rs` `copilot_model_map.rs` `copilot_optimizer.rs` `grok.rs` `kimi.rs`/`kimi_runtime.rs` `kiro.rs` `qoder.rs`/`qoder_runtime.rs` `deepseek.rs` 等；子目录 `cursor/`（Agent 协议桥接）、`kiro/`、`forwarder/`、`codex_instructions/`。
 
-Cursor 的 live h2 session 与 completed Responses context 是两个独立状态域。`session.rs` 仅保存可续传的 h2 writer/tool-call 映射，并对相同 Running conversation 返回冲突；`response_state.rs` 仅保存有界、规范化、无凭据的 input/output items，用于 `previous_response_id` 新开 run。二者都按 Provider、rail、runtime、credential identity、Share/user 等维度 fencing，不能互相降级或跨 scope 查找。
+Cursor 的 live h2 session 与 completed Responses context 是两个独立状态域。`session.rs` 仅保存可续传的 h2 writer/tool-call 映射，并对相同 Running conversation 返回冲突；`response_state.rs` 仅保存有界、规范化、无凭据的 input/output items，用于 `previous_response_id` 新开 run。该短期 continuation context 也适用于 `store=false`，但只存在于进程内且不形成可查询的 Responses 资源。二者都按 Provider、rail、runtime、credential identity、Share/user 等维度 fencing，不能互相降级或跨 scope 查找。
 
 `tool_schema.rs`/`tool_resolver.rs` 在客户端边界校验声明工具；required/named 请求由 `agent_driver.rs` 在业务输出提交前缓冲，最多三次同绑定 semantic attempt。它不执行工具，也不引入 Provider/账号选择或跨 rail fallback。
 
