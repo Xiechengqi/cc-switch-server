@@ -2217,19 +2217,94 @@ fn request_requires_local_tool(
         return false;
     }
     let user_turns = current_user_turns(protocol, body);
-    let Some(mut latest) = user_turns.last().map(String::as_str) else {
+    let Some(latest) = user_turns.last().map(String::as_str) else {
         return false;
     };
-    let normalized = latest.trim().to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "continue" | "continue." | "继续" | "继续。"
-    ) {
-        if let Some(previous) = user_turns.iter().rev().nth(1) {
-            latest = previous;
-        }
+    if explicitly_requests_declared_tool(latest, tools) || local_project_intent(latest) {
+        return true;
     }
-    local_project_intent(latest)
+    if !elliptical_local_followup(latest) {
+        return false;
+    }
+    // Terse agent follow-ups often omit the repository noun entirely. Walk
+    // past earlier terse turns ("details" -> "continue") and inherit only
+    // the nearest substantive user task, rather than matching any stale local
+    // task in the full conversation.
+    user_turns[..user_turns.len().saturating_sub(1)]
+        .iter()
+        .rev()
+        .find(|turn| !elliptical_local_followup(turn))
+        .is_some_and(|turn| {
+            explicitly_requests_declared_tool(turn, tools) || local_project_intent(turn)
+        })
+}
+
+fn elliptical_local_followup(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_end_matches(['.', '。', '!', '！', '?', '？'])
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "continue"
+            | "go on"
+            | "keep going"
+            | "details"
+            | "more details"
+            | "inspect"
+            | "analyze"
+            | "analyse"
+            | "review"
+            | "read"
+            | "write"
+            | "继续"
+            | "接着"
+            | "继续分析"
+            | "继续解读"
+            | "深入"
+            | "深入分析"
+            | "深入解读"
+            | "细节"
+            | "更多细节"
+            | "细节解读"
+            | "分析"
+            | "解读"
+            | "审查"
+            | "读取"
+            | "写入"
+    )
+}
+
+fn explicitly_requests_declared_tool(text: &str, tools: &[McpToolDef]) -> bool {
+    let normalized_text = normalize_tool_request_text(text);
+    tools.iter().any(|tool| {
+        let normalized_name = normalize_tool_request_text(&tool.name);
+        if normalized_name.is_empty() {
+            return false;
+        }
+        normalized_text == normalized_name
+            || [
+                format!("use{normalized_name}"),
+                format!("call{normalized_name}"),
+                format!("run{normalized_name}"),
+                format!("使用{normalized_name}"),
+                format!("调用{normalized_name}"),
+                format!("运行{normalized_name}"),
+            ]
+            .iter()
+            .any(|request| normalized_text == *request)
+    })
+}
+
+fn normalize_tool_request_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(['.', '。', '!', '！', '?', '？'])
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '`')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn current_user_turns(protocol: InboundProtocol, body: &Value) -> Vec<String> {
@@ -2661,6 +2736,65 @@ mod tests {
         let body = json!({
             "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
             "input":[{"type":"message","role":"user","content":"深入解读当前项目"}]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn responses_terse_followups_inherit_the_nearest_substantive_local_task() {
+        let body = json!({
+            "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+            "input":[
+                {"type":"message","role":"user","content":"深入解读当前项目"},
+                {"type":"message","role":"assistant","content":"我会先查看代码。"},
+                {"type":"message","role":"user","content":"细节解读"},
+                {"type":"message","role":"assistant","content":"继续梳理。"},
+                {"type":"message","role":"user","content":"继续"},
+                {"type":"message","role":"assistant","content":"继续读取。"},
+                {"type":"message","role":"user","content":"Write"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn fresh_terse_or_general_explanations_do_not_force_local_tools() {
+        for content in ["细节解读", "Explain TCP congestion control"] {
+            let body = json!({
+                "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+                "input":[{"type":"message","role":"user","content":content}]
+            });
+            let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+            assert!(!plan.local_tool_required_by_intent, "content={content}");
+        }
+
+        let superseded_local_task = json!({
+            "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+            "input":[
+                {"type":"message","role":"user","content":"深入解读当前项目"},
+                {"type":"message","role":"assistant","content":"已完成。"},
+                {"type":"message","role":"user","content":"Explain TCP congestion control"},
+                {"type":"message","role":"assistant","content":"TCP uses congestion windows."},
+                {"type":"message","role":"user","content":"continue"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &superseded_local_task);
+        assert!(!plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn an_explicit_declared_tool_request_requires_a_tool() {
+        let body = json!({
+            "input":[
+                {"type":"additional_tools","role":"developer","tools":[{
+                    "type":"custom",
+                    "name":"exec",
+                    "format":{"type":"grammar","syntax":"lark","definition":"start: SOURCE\nSOURCE: /[\\s\\S]+/"}
+                }]},
+                {"type":"message","role":"user","content":"Use `exec`."}
+            ]
         });
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
         assert!(plan.local_tool_required_by_intent);

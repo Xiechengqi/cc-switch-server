@@ -779,6 +779,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_continuation_in_progress_is_retryable_on_anthropic_surface() {
+        let response = InferenceApiError::proxy(
+            InferenceSurface::Anthropic,
+            Some("request-cursor-continuation".to_string()),
+            crate::proxy::ProxyError::cursor_continuation_in_progress(
+                "Cursor continuation is already being resumed by another request",
+            ),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-cc-switch-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("cursor_continuation_in_progress")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "cursor_continuation_in_progress");
+        assert_eq!(body["error"]["details"]["retryable"], true);
+        assert_eq!(
+            body["error"]["message"],
+            "Cursor continuation is already being resumed by another request"
+        );
+    }
+
+    #[tokio::test]
     async fn inference_concurrency_errors_use_surface_native_bodies_and_headers() {
         for (surface, expected_path, expected_value) in [
             (

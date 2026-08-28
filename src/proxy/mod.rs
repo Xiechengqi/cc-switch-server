@@ -154,6 +154,8 @@ impl ProxyError {
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const CURSOR_RESPONSE_STATE_LOST_PREFIX: &'static str = "[CURSOR_RESPONSE_STATE_LOST] ";
     const CURSOR_CONVERSATION_BUSY_PREFIX: &'static str = "[CURSOR_CONVERSATION_BUSY] ";
+    const CURSOR_CONTINUATION_IN_PROGRESS_PREFIX: &'static str =
+        "[CURSOR_CONTINUATION_IN_PROGRESS] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
     const CAPACITY_SHED_PREFIX: &'static str = "[CC_UPSTREAM_CAPACITY_SHED] ";
     const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
@@ -264,6 +266,19 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn cursor_continuation_in_progress(message: impl Into<String>) -> Self {
+        const RETRY_AFTER_SECONDS: u64 = 5;
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!(
+                "{}{RETRY_AFTER_SECONDS}]{}{}",
+                Self::RETRY_AFTER_PREFIX,
+                Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX,
+                message.into()
+            ),
+        }
+    }
+
     pub(super) fn bad_gateway(error: impl std::fmt::Display) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_GATEWAY,
@@ -316,6 +331,7 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::CURSOR_SESSION_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_RESPONSE_STATE_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_CONVERSATION_BUSY_PREFIX))
+            .or_else(|| message.strip_prefix(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
             .or_else(|| message.strip_prefix(Self::PROTOCOL_INCOMPATIBLE_PREFIX))
             .or_else(|| message.strip_prefix(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX))
@@ -415,6 +431,9 @@ impl ProxyError {
         if message.starts_with(Self::CURSOR_CONVERSATION_BUSY_PREFIX) {
             return "cursor_conversation_busy";
         }
+        if message.starts_with(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX) {
+            return "cursor_continuation_in_progress";
+        }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "cc_switch_invalid_request",
             axum::http::StatusCode::UNAUTHORIZED => "cc_switch_auth_error",
@@ -475,6 +494,9 @@ impl ProxyError {
 
     pub fn retryable(&self) -> bool {
         let message = self.message_without_retry_metadata();
+        if message.starts_with(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX) {
+            return true;
+        }
         if self.concurrency_metadata().is_some()
             || message.starts_with(Self::USER_IDENTITY_REQUIRED_PREFIX)
             || message.starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX)
@@ -770,6 +792,17 @@ mod tests {
         let busy = ProxyError::cursor_conversation_busy("running");
         assert_eq!(busy.error_code(), "cursor_conversation_busy");
         assert_eq!(busy.client_message(), "running");
+
+        let continuation =
+            ProxyError::cursor_continuation_in_progress("continuation is still running");
+        assert_eq!(continuation.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(continuation.error_code(), "cursor_continuation_in_progress");
+        assert_eq!(continuation.retry_after_seconds(), Some(5));
+        assert!(continuation.retryable());
+        assert_eq!(
+            continuation.client_message(),
+            "continuation is still running"
+        );
 
         let unsupported = ProxyError::bad_request(
             "unsupported parameter `background`: Cursor responses run synchronously",

@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use axum::body::Body;
@@ -86,6 +86,33 @@ use crate::domain::accounts::cursor_import::normalize_cursor_access_token;
 
 const MAX_CURSOR_ERROR_BODY_BYTES: usize = 8 * 1024;
 const CURSOR_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
+const CURSOR_DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+fn cursor_downstream_keepalive_frame(
+    format: super::protocol::CursorResponseFormat,
+) -> Option<Bytes> {
+    match format {
+        super::protocol::CursorResponseFormat::AnthropicMessages => Some(Bytes::from_static(
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        )),
+        super::protocol::CursorResponseFormat::OpenAiResponses
+        | super::protocol::CursorResponseFormat::OpenAiChatCompletions => {
+            Some(Bytes::from_static(b": keepalive\n\n"))
+        }
+        super::protocol::CursorResponseFormat::GeminiGenerateContent => None,
+    }
+}
+
+fn cursor_downstream_keepalive_surface(
+    format: super::protocol::CursorResponseFormat,
+) -> &'static str {
+    match format {
+        super::protocol::CursorResponseFormat::AnthropicMessages => "anthropic_messages",
+        super::protocol::CursorResponseFormat::OpenAiResponses => "responses",
+        super::protocol::CursorResponseFormat::OpenAiChatCompletions => "chat_completions",
+        super::protocol::CursorResponseFormat::GeminiGenerateContent => "other",
+    }
+}
 
 pub struct AgentServiceForwardOptions {
     pub state: ServerState,
@@ -823,19 +850,54 @@ async fn stream_response(
         let mut final_stream_status = "completed";
         let mut final_session_state = SessionState::Closed;
         let mut session_preparked = false;
+        let mut session_preclosed = false;
         let mut completed_response = false;
 
         for event in writer.start_events() {
             yield Ok::<_, std::io::Error>(Bytes::from(event));
         }
 
+        let mut downstream_keepalive = cursor_downstream_keepalive_frame(response_format)
+            .and_then(|_| super::super::downstream_keepalive::DownstreamKeepalive::new(
+                CURSOR_DOWNSTREAM_KEEPALIVE_INTERVAL,
+            ));
+        if let Some(keepalive) = downstream_keepalive.as_mut() {
+            keepalive.commit(tokio::time::Instant::now());
+        }
+
         loop {
-            let frame = match next_session_frame(&session_entry).await {
+            let frame_result = if let Some(deadline) = downstream_keepalive
+                .as_ref()
+                .and_then(super::super::downstream_keepalive::DownstreamKeepalive::deadline)
+            {
+                tokio::select! {
+                    frame = next_session_frame(&session_entry) => Some(frame),
+                    _ = tokio::time::sleep_until(deadline) => None,
+                }
+            } else {
+                Some(next_session_frame(&session_entry).await)
+            };
+            let Some(frame_result) = frame_result else {
+                let now = tokio::time::Instant::now();
+                if let Some(keepalive) = downstream_keepalive.as_mut() {
+                    keepalive.emitted(now);
+                }
+                if let Some(frame) = cursor_downstream_keepalive_frame(response_format) {
+                    crate::metrics::record_responses_downstream_keepalive(
+                        cursor_downstream_keepalive_surface(response_format),
+                    );
+                    yield Ok::<_, std::io::Error>(frame);
+                }
+                continue;
+            };
+            let frame = match frame_result {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     let error = cursor_incomplete_response_error(rail);
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
                     for event in writer.error_events(&error.message) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
@@ -849,6 +911,8 @@ async fn stream_response(
                     );
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
                     for event in writer.error_events(&error.message) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
@@ -862,6 +926,8 @@ async fn stream_response(
                 Err(error) => {
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
                     for event in writer.error_events(&error.message) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
@@ -872,6 +938,8 @@ async fn stream_response(
             if let Err(error) = handle_kv_event(&session_entry, kv_event).await {
                 final_status = error.status.as_u16();
                 final_stream_status = "failed";
+                close_failed_cursor_stream_session(&state, &session_entry).await;
+                session_preclosed = true;
                 for event in writer.error_events(&error.message) {
                     yield Ok::<_, std::io::Error>(Bytes::from(event));
                 }
@@ -884,6 +952,8 @@ async fn stream_response(
                 Err(error) => {
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
                     for event in writer.error_events(&error.message) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
@@ -903,6 +973,8 @@ async fn stream_response(
                     if let Err(error) = mark_session_business_output(&session_entry).await {
                         final_status = error.status.as_u16();
                         final_stream_status = "failed";
+                        close_failed_cursor_stream_session(&state, &session_entry).await;
+                        session_preclosed = true;
                         for event in writer.error_events(&error.message) {
                             yield Ok::<_, std::io::Error>(Bytes::from(event));
                         }
@@ -948,6 +1020,8 @@ async fn stream_response(
                 Err(error) => {
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
                     for event in writer.error_events(&error.message) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
@@ -961,6 +1035,8 @@ async fn stream_response(
                 Err(error) => {
                     final_status = error.status.as_u16();
                     final_stream_status = "failed";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
                     for event in writer.error_events(&error.message) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
@@ -1007,6 +1083,8 @@ async fn stream_response(
                         final_status = error.status.as_u16();
                         final_stream_status = "failed";
                         ended = true;
+                        close_failed_cursor_stream_session(&state, &session_entry).await;
+                        session_preclosed = true;
                         for event in writer.error_events(&error.message) {
                             yield Ok::<_, std::io::Error>(Bytes::from(event));
                         }
@@ -1028,6 +1106,10 @@ async fn stream_response(
                     )
                     .await;
                 }
+                if final_stream_status == "failed" && !session_preclosed {
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
+                }
                 for event in events {
                     yield Ok::<_, std::io::Error>(Bytes::from(event));
                 }
@@ -1046,6 +1128,8 @@ async fn stream_response(
                         if let Err(error) = mark_session_business_output(&session_entry).await {
                             final_status = error.status.as_u16();
                             final_stream_status = "failed";
+                            close_failed_cursor_stream_session(&state, &session_entry).await;
+                            session_preclosed = true;
                             for event in writer.error_events(&error.message) {
                                 yield Ok::<_, std::io::Error>(Bytes::from(event));
                             }
@@ -1062,6 +1146,8 @@ async fn stream_response(
                         final_status = error.status.as_u16();
                         final_stream_status = "failed";
                         ended = true;
+                        close_failed_cursor_stream_session(&state, &session_entry).await;
+                        session_preclosed = true;
                         for event in writer.error_events(&error.message) {
                             yield Ok::<_, std::io::Error>(Bytes::from(event));
                         }
@@ -1113,7 +1199,7 @@ async fn stream_response(
         if final_stream_status == "failed" {
             final_session_state = SessionState::Closed;
         }
-        if !session_preparked {
+        if !session_preparked && !session_preclosed {
             state
                 .cursor_sessions
                 .release(session_entry.clone(), final_session_state)
@@ -2358,6 +2444,16 @@ async fn next_session_frame(
     stream.next_frame().await
 }
 
+async fn close_failed_cursor_stream_session(
+    state: &ServerState,
+    session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
+) {
+    state
+        .cursor_sessions
+        .release(session_entry.clone(), SessionState::Closed)
+        .await;
+}
+
 async fn mark_session_business_output(
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
 ) -> Result<(), ProxyError> {
@@ -2717,7 +2813,7 @@ async fn close_unusable_continuation_session(
                 None => false,
             };
             if still_live || response_still_live {
-                return Err(ProxyError::cursor_conversation_busy(
+                return Err(ProxyError::cursor_continuation_in_progress(
                     "Cursor continuation is already being resumed by another request",
                 ));
             }
@@ -3286,6 +3382,43 @@ mod tests {
     }
 
     #[test]
+    fn cursor_keepalive_frames_match_each_downstream_surface() {
+        use super::super::protocol::CursorResponseFormat;
+
+        assert_eq!(
+            cursor_downstream_keepalive_frame(CursorResponseFormat::AnthropicMessages),
+            Some(Bytes::from_static(
+                b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+            ))
+        );
+        for format in [
+            CursorResponseFormat::OpenAiResponses,
+            CursorResponseFormat::OpenAiChatCompletions,
+        ] {
+            assert_eq!(
+                cursor_downstream_keepalive_frame(format),
+                Some(Bytes::from_static(b": keepalive\n\n"))
+            );
+        }
+        assert_eq!(
+            cursor_downstream_keepalive_frame(CursorResponseFormat::GeminiGenerateContent),
+            None
+        );
+        assert_eq!(
+            cursor_downstream_keepalive_surface(CursorResponseFormat::AnthropicMessages),
+            "anthropic_messages"
+        );
+        assert_eq!(
+            cursor_downstream_keepalive_surface(CursorResponseFormat::OpenAiResponses),
+            "responses"
+        );
+        assert_eq!(
+            cursor_downstream_keepalive_surface(CursorResponseFormat::OpenAiChatCompletions),
+            "chat_completions"
+        );
+    }
+
+    #[test]
     fn cursor_business_output_classifier_is_independent_of_deferred_wire_events() {
         assert!(!cursor_events_are_business_output(
             true, false, false, false
@@ -3508,6 +3641,77 @@ mod tests {
                 .snapshot()
                 .current(ProviderType::CursorOAuth, account_id),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_stream_closes_failed_session_before_publishing_error_event() {
+        let state = cursor_stream_test_state("stream-error-release");
+        let key = CursorSessionKey::new(
+            CursorSessionScope::fixture("cursor-stream-error-share"),
+            "cursor-stream-error-session",
+        );
+        let session_entry = state
+            .cursor_sessions
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Claude,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-stream-error-provider".to_string(),
+                name: "Cursor stream error provider".to_string(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorOAuth,
+            provider_type_id: ProviderType::CursorOAuth.as_str().to_string(),
+            resource: Default::default(),
+        };
+        let response = stream_response(
+            state.clone(),
+            stored,
+            session_entry,
+            key.clone(),
+            super::super::protocol::CursorResponseFormat::AnthropicMessages,
+            "claude-sonnet-4-6".to_string(),
+            1,
+            UsageLogContext::default(),
+            Instant::now(),
+            UsageModelMetadata::default(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(state.cursor_sessions.has(&key).await);
+        let mut body = response.into_body().into_data_stream();
+        let mut saw_error = false;
+        for _ in 0..8 {
+            let chunk = tokio::time::timeout(Duration::from_secs(1), body.next())
+                .await
+                .unwrap()
+                .expect("Cursor stream should publish its terminal error")
+                .unwrap();
+            if String::from_utf8_lossy(&chunk).contains("event: error") {
+                assert!(!state.cursor_sessions.has(&key).await);
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(
+            saw_error,
+            "Cursor stream did not publish an Anthropic error event"
         );
     }
 
