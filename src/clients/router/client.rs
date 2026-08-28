@@ -3085,13 +3085,20 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(20),
                 total_tokens: Some(30),
+                constraint_source: Some("local_intent".to_string()),
+                rejection_reason: Some("local_tool_missing".to_string()),
+                saw_text: Some(true),
+                saw_reasoning: Some(true),
+                saw_function_call: Some(false),
+                saw_custom_tool_call: Some(false),
+                upstream_conversation_generation: Some(2),
             }],
         };
 
         let encoded = serde_json::to_vec(&payload).unwrap();
         assert_eq!(
             hex::encode(sha2::Sha256::digest(encoded)),
-            "3fb028aa02ae49462857380e25a2c3aedd9ecebc2d56c857193bc58955300640"
+            "4755e0163ca89ca878003aaa74b0e94bf7bb7850783f18ac7e3d39fde369bef2"
         );
     }
 

@@ -113,6 +113,20 @@ pub struct AuditEvent {
     pub output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_text: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_function_call: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_custom_tool_call: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_conversation_generation: Option<u32>,
 }
 
 impl AuditEvent {

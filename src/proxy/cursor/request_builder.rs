@@ -68,6 +68,13 @@ pub enum ToolContinuationKind {
     MixedToolResults,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTaskTurnSignal {
+    Activate,
+    Continue,
+    Replace,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentRunPlan {
     pub system_prompt: Option<String>,
@@ -2239,6 +2246,24 @@ fn request_requires_local_tool(
         })
 }
 
+pub fn local_task_turn_signal(
+    protocol: InboundProtocol,
+    body: &Value,
+    tools: &[McpToolDef],
+) -> Option<LocalTaskTurnSignal> {
+    let user_turns = current_user_turns(protocol, body);
+    let latest = user_turns.last()?.as_str();
+    Some(
+        if explicitly_requests_declared_tool(latest, tools) || local_project_intent(latest) {
+            LocalTaskTurnSignal::Activate
+        } else if elliptical_local_followup(latest) {
+            LocalTaskTurnSignal::Continue
+        } else {
+            LocalTaskTurnSignal::Replace
+        },
+    )
+}
+
 fn elliptical_local_followup(text: &str) -> bool {
     let normalized = text
         .trim()
@@ -2292,8 +2317,7 @@ fn explicitly_requests_declared_tool(text: &str, tools: &[McpToolDef]) -> bool {
                 format!("调用{normalized_name}"),
                 format!("运行{normalized_name}"),
             ]
-            .iter()
-            .any(|request| normalized_text == *request)
+            .contains(&normalized_text)
     })
 }
 
@@ -2757,6 +2781,36 @@ mod tests {
         });
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
         assert!(plan.local_tool_required_by_intent);
+    }
+
+    #[test]
+    fn responses_turn_signal_distinguishes_activation_continuation_and_replacement() {
+        let tool = json!({
+            "type":"custom",
+            "name":"exec",
+            "format":{"type":"grammar","syntax":"lark","definition":"start: SOURCE\nSOURCE: /[\\s\\S]+/"}
+        });
+        for (content, expected) in [
+            ("深入解读当前项目", LocalTaskTurnSignal::Activate),
+            ("继续", LocalTaskTurnSignal::Continue),
+            (
+                "Explain TCP congestion control",
+                LocalTaskTurnSignal::Replace,
+            ),
+        ] {
+            let body = json!({
+                "input":[
+                    {"type":"additional_tools","role":"developer","tools":[tool.clone()]},
+                    {"type":"message","role":"user","content":content}
+                ]
+            });
+            let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+            assert_eq!(
+                local_task_turn_signal(InboundProtocol::OpenAiResponses, &body, &plan.tools),
+                Some(expected),
+                "content={content}"
+            );
+        }
     }
 
     #[test]

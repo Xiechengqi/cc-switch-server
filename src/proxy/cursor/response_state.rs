@@ -76,6 +76,7 @@ struct Key {
 struct Entry {
     items: Vec<Value>,
     conversation_id: String,
+    local_task_state: CursorLocalTaskState,
     bytes: usize,
     expires_at_ms: i64,
     access_sequence: u64,
@@ -85,6 +86,20 @@ struct Entry {
 pub struct CursorCompletedResponse {
     pub items: Vec<Value>,
     pub conversation_id: String,
+    pub local_task_state: CursorLocalTaskState,
+}
+
+/// Credential-free semantic state carried across OpenAI Responses turns.
+///
+/// This deliberately stores no prompt or tool output. `origin_turn_digest`
+/// is an opaque correlation value that lets us distinguish a continued local
+/// task from a newly activated one without retaining user text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CursorLocalTaskState {
+    pub active: bool,
+    pub tool_commit_required: bool,
+    pub origin_turn_digest: String,
+    pub generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +134,7 @@ impl CursorCompletedResponseStore {
         Some(CursorCompletedResponse {
             items: entry.items.clone(),
             conversation_id: entry.conversation_id.clone(),
+            local_task_state: entry.local_task_state.clone(),
         })
     }
 
@@ -128,6 +144,7 @@ impl CursorCompletedResponseStore {
         response_id: &str,
         conversation_id: &str,
         items: Vec<Value>,
+        local_task_state: CursorLocalTaskState,
         now_ms: i64,
     ) -> bool {
         let Some(key) = cache_key(&scope, response_id) else {
@@ -136,7 +153,14 @@ impl CursorCompletedResponseStore {
         if conversation_id.trim().is_empty() || items.is_empty() || items.len() > MAX_ITEMS {
             return false;
         }
-        let Some(bytes) = encoded_size(&items) else {
+        if local_task_state.origin_turn_digest.len() > 128 {
+            return false;
+        }
+        let Some(bytes) = encoded_size(&items).and_then(|bytes| {
+            bytes
+                .checked_add(local_task_state.origin_turn_digest.len())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CursorLocalTaskState>()))
+        }) else {
             return false;
         };
         if bytes > MAX_ENTRY_BYTES || bytes > MAX_BYTES {
@@ -172,6 +196,7 @@ impl CursorCompletedResponseStore {
             Entry {
                 items,
                 conversation_id: conversation_id.to_string(),
+                local_task_state,
                 bytes,
                 expires_at_ms: now_ms.saturating_add(TTL_MS),
                 access_sequence,
@@ -243,10 +268,18 @@ mod tests {
             "resp-a",
             "conversation-a",
             vec![json!({"type":"message","role":"user","content":"hi"})],
+            CursorLocalTaskState {
+                active: true,
+                tool_commit_required: true,
+                origin_turn_digest: "digest-a".to_string(),
+                generation: 3,
+            },
             1_000,
         ));
         let hit = store.get(&scope("generation-a"), "resp-a", 1_001).unwrap();
         assert_eq!(hit.conversation_id, "conversation-a");
+        assert_eq!(hit.local_task_state.generation, 3);
+        assert!(hit.local_task_state.tool_commit_required);
         assert!(store.get(&scope("generation-b"), "resp-a", 1_001).is_none());
         assert!(store
             .get(&scope("generation-a"), "resp-a", 1_000 + TTL_MS)
@@ -261,6 +294,7 @@ mod tests {
             "resp-too-many",
             "conversation-a",
             vec![json!(null); MAX_ITEMS + 1],
+            CursorLocalTaskState::default(),
             1_000,
         ));
         assert!(!store.insert(
@@ -268,6 +302,7 @@ mod tests {
             &"r".repeat(MAX_RESPONSE_ID_LEN + 1),
             "conversation-a",
             vec![json!({"type":"message"})],
+            CursorLocalTaskState::default(),
             1_000,
         ));
         assert!(!store.insert(
@@ -275,6 +310,7 @@ mod tests {
             "resp-empty-conversation",
             " ",
             vec![json!({"type":"message"})],
+            CursorLocalTaskState::default(),
             1_000,
         ));
     }

@@ -28,6 +28,7 @@ use crate::domain::providers::runtime::{
 };
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{TokenUsage, UsageLogContext, UsageModelMetadata};
+use crate::logging::{error_fingerprint, opaque_ref, AuditEvent};
 use crate::proxy::adapters::AdapterRequest;
 use crate::state::{AccountInFlightGuard, ServerState, ShareInFlightGuard};
 
@@ -65,13 +66,13 @@ use super::identity::{
 use super::image::load_images;
 use super::profile::CursorProtocolRail;
 use super::request_builder::{
-    estimate_agent_plan_input_tokens, prepare_response_compaction, prepend_response_context,
-    preserve_current_continuation, retry_prompt_after_invalid_tool,
+    estimate_agent_plan_input_tokens, local_task_turn_signal, prepare_response_compaction,
+    prepend_response_context, preserve_current_continuation, retry_prompt_after_invalid_tool,
     retry_prompt_after_missing_tool, try_build_plan, validate_request_contract,
     validate_tool_choice_contract, validate_tool_result_context, AgentRunPlan, ExtractedToolChoice,
-    InboundProtocol, ToolContinuationKind,
+    InboundProtocol, LocalTaskTurnSignal, ToolContinuationKind,
 };
-use super::response_state::{CursorResponseScope, CursorResponseScopeInput};
+use super::response_state::{CursorLocalTaskState, CursorResponseScope, CursorResponseScopeInput};
 use super::session::{
     CursorSession, CursorSessionKey, CursorSessionManager, CursorSessionReference,
     CursorSessionScope, CursorSessionScopeInput, PendingToolCall, SessionState,
@@ -87,6 +88,7 @@ use crate::domain::accounts::cursor_import::normalize_cursor_access_token;
 const MAX_CURSOR_ERROR_BODY_BYTES: usize = 8 * 1024;
 const CURSOR_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 const CURSOR_DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_SEMANTIC_ATTEMPTS: usize = 3;
 
 fn cursor_downstream_keepalive_frame(
     format: super::protocol::CursorResponseFormat,
@@ -219,13 +221,44 @@ enum DriveOutcome {
         body: Bytes,
         usage: TokenUsage,
         buffered_events: Vec<String>,
+        observation: SemanticAttemptObservation,
     },
     Parked {
         body: Bytes,
         usage: TokenUsage,
         buffered_events: Vec<String>,
         tool_name: String,
+        observation: SemanticAttemptObservation,
     },
+}
+
+impl DriveOutcome {
+    fn observation(&self) -> SemanticAttemptObservation {
+        match self {
+            Self::Completed { observation, .. } | Self::Parked { observation, .. } => *observation,
+        }
+    }
+}
+
+fn semantic_attempt_rejection(
+    outcome: &DriveOutcome,
+    choice: &SemanticToolConstraint,
+) -> Option<String> {
+    match (outcome, choice) {
+        (DriveOutcome::Completed { .. }, SemanticToolConstraint::LocalIntent) => {
+            Some("local_tool_missing".to_string())
+        }
+        (DriveOutcome::Completed { .. }, _) => Some("required_tool_missing".to_string()),
+        (DriveOutcome::Parked { tool_name, .. }, SemanticToolConstraint::Named(required))
+            if !tool_names_equal(tool_name, required) =>
+        {
+            Some(format!(
+                "named_tool_mismatch:{}",
+                sanitize_metric_component(tool_name)
+            ))
+        }
+        (DriveOutcome::Parked { .. }, _) => None,
+    }
 }
 
 #[derive(Clone)]
@@ -233,6 +266,444 @@ enum SemanticToolConstraint {
     Required,
     Named(String),
     LocalIntent,
+}
+
+impl SemanticToolConstraint {
+    fn source(&self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Named(_) => "named",
+            Self::LocalIntent => "local_intent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SemanticAttemptObservation {
+    saw_text: bool,
+    saw_reasoning: bool,
+    saw_function_call: bool,
+    saw_custom_tool_call: bool,
+}
+
+struct SemanticDriveSuccess {
+    outcome: DriveOutcome,
+    session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
+    session_key: CursorSessionKey,
+}
+
+fn resolve_local_task_state(
+    plan: &AgentRunPlan,
+    signal: Option<LocalTaskTurnSignal>,
+    inherited: &CursorLocalTaskState,
+) -> CursorLocalTaskState {
+    let activate = |previous: &CursorLocalTaskState,
+                    commit_required: bool,
+                    preserve_same_origin: bool| {
+        let digest = local_task_origin_digest(&plan.user_text);
+        let generation =
+            if preserve_same_origin && previous.active && previous.origin_turn_digest == digest {
+                previous.generation.max(1)
+            } else {
+                previous.generation.saturating_add(1).max(1)
+            };
+        CursorLocalTaskState {
+            active: true,
+            tool_commit_required: commit_required,
+            origin_turn_digest: digest,
+            generation,
+        }
+    };
+
+    if !plan.tool_results.is_empty() {
+        return if plan.local_tool_required_by_intent {
+            activate(inherited, false, true)
+        } else if inherited.active {
+            CursorLocalTaskState {
+                tool_commit_required: false,
+                ..inherited.clone()
+            }
+        } else {
+            CursorLocalTaskState::default()
+        };
+    }
+
+    if plan.local_tool_required_by_intent {
+        return match signal {
+            Some(LocalTaskTurnSignal::Continue) if inherited.active => CursorLocalTaskState {
+                tool_commit_required: true,
+                ..inherited.clone()
+            },
+            _ => activate(inherited, true, false),
+        };
+    }
+
+    match signal {
+        Some(LocalTaskTurnSignal::Continue) if inherited.active => CursorLocalTaskState {
+            tool_commit_required: true,
+            ..inherited.clone()
+        },
+        _ => CursorLocalTaskState::default(),
+    }
+}
+
+fn local_task_origin_digest(text: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:cursor-local-task-origin:v1\0");
+    digest.update(text.trim().as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn new_semantic_retry_session_key(
+    current: &CursorSessionKey,
+    rail: CursorProtocolRail,
+) -> CursorSessionKey {
+    CursorSessionKey::new(current.scope().clone(), new_cursor_conversation_id(rail))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cursor_tool_constraint_event(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_context: &UsageLogContext,
+    event_name: &'static str,
+    constraint: &SemanticToolConstraint,
+    attempt: usize,
+    generation: usize,
+    observation: SemanticAttemptObservation,
+    rejection_reason: Option<&str>,
+    upstream_status: Option<StatusCode>,
+) {
+    let mut event = AuditEvent::new(event_name);
+    event.request_id.clone_from(&request_context.request_id);
+    event.app = Some(stored.app.as_str().to_string());
+    event.surface = Some("openai".to_string());
+    event.operation = Some("responses".to_string());
+    event.route = Some("/v1/responses".to_string());
+    event.provider_type = Some(stored.provider_type.as_str().to_string());
+    event.provider_ref = Some(opaque_ref("provider", &stored.provider.id));
+    event.component = Some("cursor_tool_constraint".to_string());
+    event.stage = Some(
+        event_name
+            .rsplit('.')
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+    );
+    event.constraint_source = Some(constraint.source().to_string());
+    event.attempt = Some(attempt.min(u32::MAX as usize) as u32);
+    event.retry_count = Some(attempt.saturating_sub(1).min(u32::MAX as usize) as u32);
+    event.upstream_conversation_generation = Some(generation.min(u32::MAX as usize) as u32);
+    event.saw_text = Some(observation.saw_text);
+    event.saw_reasoning = Some(observation.saw_reasoning);
+    event.saw_function_call = Some(observation.saw_function_call);
+    event.saw_custom_tool_call = Some(observation.saw_custom_tool_call);
+    event.rejection_reason = rejection_reason.map(str::to_string);
+    event.upstream_status = upstream_status.map(|status| status.as_u16());
+    event.outcome = Some(
+        match event_name {
+            "cursor.tool_constraint.detected" => "detected",
+            "cursor.tool_constraint.attempt_started" => "started",
+            "cursor.tool_constraint.prose_rejected" => "rejected",
+            "cursor.tool_constraint.tool_accepted" => "accepted",
+            "cursor.tool_constraint.exhausted" => "exhausted",
+            "cursor.tool_constraint.upstream_failed" => "failed",
+            _ => "observed",
+        }
+        .to_string(),
+    );
+    if matches!(
+        event_name,
+        "cursor.tool_constraint.exhausted" | "cursor.tool_constraint.upstream_failed"
+    ) {
+        let kind = if event_name.ends_with("exhausted") {
+            "cursor_tool_constraint_exhausted"
+        } else {
+            "cursor_tool_constraint_upstream_failed"
+        };
+        event.error_code = Some(kind.to_string());
+        event.failure_kind = Some(kind.to_string());
+        event.error_fingerprint = Some(error_fingerprint("cursor_tool_constraint", kind, kind));
+        event.retryable = Some(event_name.ends_with("upstream_failed"));
+        event.retry_decision = Some(
+            if event_name.ends_with("upstream_failed") {
+                "client_retry"
+            } else {
+                "do_not_retry"
+            }
+            .to_string(),
+        );
+    }
+    state.emit_audit_event_best_effort(event);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_semantic_attempts(
+    state: &ServerState,
+    stored: &StoredProvider,
+    runtime_fingerprint: &str,
+    request_context: &UsageLogContext,
+    plan: &AgentRunPlan,
+    semantic_tool_choice: Option<SemanticToolConstraint>,
+    mut session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
+    mut session_key: CursorSessionKey,
+    response_format: super::protocol::CursorResponseFormat,
+    response_model: String,
+    input_tokens: u32,
+    timeouts: CursorH2Timeouts,
+    started: Instant,
+    mut auth_recovery: AuthRecoveryState,
+) -> Result<SemanticDriveSuccess, ProxyError> {
+    let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
+        ProxyError::bad_request("Cursor AgentService driver requires a Cursor provider")
+    })?;
+    let mut reservation_guard =
+        CursorSessionReservationGuard::new(state.cursor_sessions.clone(), session_entry.clone());
+    let mut active_plan = plan.clone();
+    let mut semantic_attempt = 1usize;
+    let mut conversation_generation = 1usize;
+    if let Some(choice) = semantic_tool_choice.as_ref() {
+        emit_cursor_tool_constraint_event(
+            state,
+            stored,
+            request_context,
+            "cursor.tool_constraint.detected",
+            choice,
+            semantic_attempt,
+            conversation_generation,
+            SemanticAttemptObservation::default(),
+            None,
+            None,
+        );
+    }
+
+    loop {
+        if let Some(choice) = semantic_tool_choice.as_ref() {
+            emit_cursor_tool_constraint_event(
+                state,
+                stored,
+                request_context,
+                "cursor.tool_constraint.attempt_started",
+                choice,
+                semantic_attempt,
+                conversation_generation,
+                SemanticAttemptObservation::default(),
+                None,
+                None,
+            );
+        }
+        let deadline = tokio::time::Instant::from_std(started + timeouts.request);
+        let outcome = match tokio::time::timeout_at(
+            deadline,
+            drive_non_stream(
+                state,
+                session_entry.clone(),
+                &session_key,
+                response_format,
+                response_model.clone(),
+                input_tokens,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                if let Some(choice) = semantic_tool_choice.as_ref() {
+                    emit_cursor_tool_constraint_event(
+                        state,
+                        stored,
+                        request_context,
+                        "cursor.tool_constraint.upstream_failed",
+                        choice,
+                        semantic_attempt,
+                        conversation_generation,
+                        SemanticAttemptObservation::default(),
+                        Some("drive_failed"),
+                        Some(error.status),
+                    );
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                let error = ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: "Cursor request exceeded its absolute request deadline".to_string(),
+                };
+                if let Some(choice) = semantic_tool_choice.as_ref() {
+                    emit_cursor_tool_constraint_event(
+                        state,
+                        stored,
+                        request_context,
+                        "cursor.tool_constraint.upstream_failed",
+                        choice,
+                        semantic_attempt,
+                        conversation_generation,
+                        SemanticAttemptObservation::default(),
+                        Some("request_deadline"),
+                        Some(error.status),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let Some(choice) = semantic_tool_choice.as_ref() else {
+            reservation_guard.disarm();
+            return Ok(SemanticDriveSuccess {
+                outcome,
+                session_entry,
+                session_key,
+            });
+        };
+        let rejection = semantic_attempt_rejection(&outcome, choice);
+        let Some(rejection) = rejection else {
+            emit_cursor_tool_constraint_event(
+                state,
+                stored,
+                request_context,
+                "cursor.tool_constraint.tool_accepted",
+                choice,
+                semantic_attempt,
+                conversation_generation,
+                outcome.observation(),
+                None,
+                Some(StatusCode::OK),
+            );
+            reservation_guard.disarm();
+            return Ok(SemanticDriveSuccess {
+                outcome,
+                session_entry,
+                session_key,
+            });
+        };
+        emit_cursor_tool_constraint_event(
+            state,
+            stored,
+            request_context,
+            "cursor.tool_constraint.prose_rejected",
+            choice,
+            semantic_attempt,
+            conversation_generation,
+            outcome.observation(),
+            Some(&rejection),
+            Some(StatusCode::OK),
+        );
+        state
+            .cursor_sessions
+            .release(session_entry.clone(), SessionState::Closed)
+            .await;
+        reservation_guard.disarm();
+        tracing::warn!(
+            rail = rail.label(),
+            attempt = semantic_attempt,
+            reason = rejection,
+            "Cursor tool-constrained attempt was discarded before client commit"
+        );
+        metrics::counter!(
+            "cursor_tool_retry_total",
+            "rail" => rail.label(),
+            "reason" => if rejection.starts_with("named_tool_mismatch") {
+                "named_tool_mismatch"
+            } else if rejection == "local_tool_missing" {
+                "local_tool_missing"
+            } else {
+                "required_tool_missing"
+            },
+            "attempt" => semantic_attempt.to_string()
+        )
+        .increment(1);
+        if semantic_attempt >= MAX_SEMANTIC_ATTEMPTS {
+            emit_cursor_tool_constraint_event(
+                state,
+                stored,
+                request_context,
+                "cursor.tool_constraint.exhausted",
+                choice,
+                semantic_attempt,
+                conversation_generation,
+                outcome.observation(),
+                Some(&rejection),
+                Some(StatusCode::BAD_GATEWAY),
+            );
+            return Err(ProxyError {
+                status: StatusCode::BAD_GATEWAY,
+                message: match choice {
+                    SemanticToolConstraint::LocalIntent => format!(
+                        "Cursor did not invoke a required local project tool after {MAX_SEMANTIC_ATTEMPTS} attempts"
+                    ),
+                    _ => format!(
+                        "Cursor did not satisfy the required tool choice after {MAX_SEMANTIC_ATTEMPTS} attempts"
+                    ),
+                },
+            });
+        }
+        semantic_attempt += 1;
+        active_plan.user_text = match choice {
+            SemanticToolConstraint::Required | SemanticToolConstraint::LocalIntent => {
+                retry_prompt_after_missing_tool(
+                    &plan.user_text,
+                    semantic_attempt,
+                    MAX_SEMANTIC_ATTEMPTS,
+                )
+            }
+            SemanticToolConstraint::Named(required) => retry_prompt_after_invalid_tool(
+                &plan.user_text,
+                &format!("the model called a tool other than required tool `{required}`"),
+                &plan
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect::<Vec<_>>(),
+                semantic_attempt,
+                MAX_SEMANTIC_ATTEMPTS,
+            ),
+        };
+        let retry_timeouts =
+            remaining_cursor_timeouts(timeouts, started.elapsed()).ok_or_else(|| ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: "Cursor semantic retry exhausted the request deadline".to_string(),
+            })?;
+        let retry_context = CursorSessionOpenContext {
+            state,
+            stored,
+            runtime_fingerprint,
+            plan: &active_plan,
+            request_context,
+            timeouts: retry_timeouts,
+        };
+        conversation_generation = conversation_generation.saturating_add(1);
+        let retry_session_key = new_semantic_retry_session_key(&session_key, rail);
+        let opened = match acquire_ready_session(
+            &retry_context,
+            &retry_session_key,
+            None,
+            &mut auth_recovery,
+        )
+        .await
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                emit_cursor_tool_constraint_event(
+                    state,
+                    stored,
+                    request_context,
+                    "cursor.tool_constraint.upstream_failed",
+                    choice,
+                    semantic_attempt,
+                    conversation_generation,
+                    SemanticAttemptObservation::default(),
+                    Some("retry_open_failed"),
+                    Some(error.status),
+                );
+                return Err(error);
+            }
+        };
+        session_entry = opened.entry;
+        session_key = opened.key;
+        reservation_guard = CursorSessionReservationGuard::new(
+            state.cursor_sessions.clone(),
+            session_entry.clone(),
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +764,8 @@ pub async fn forward_agentservice(
     }
     let preliminary_plan =
         try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
+    let current_turn_signal =
+        local_task_turn_signal(inbound_protocol, &body_value, &preliminary_plan.tools);
     let response_scope = if inbound_protocol == InboundProtocol::OpenAiResponses {
         Some(
             cursor_completed_response_scope(
@@ -308,6 +781,7 @@ pub async fn forward_agentservice(
         None
     };
     let mut completed_conversation_id = None;
+    let mut inherited_local_task_state = CursorLocalTaskState::default();
     let mut response_context_prepended = false;
     if preliminary_plan.tool_results.is_empty() {
         if let (Some(scope), Some(previous_response_id)) = (
@@ -333,6 +807,7 @@ pub async fn forward_agentservice(
                 }
             };
             completed_conversation_id = Some(previous.conversation_id.clone());
+            inherited_local_task_state = previous.local_task_state;
             prepend_response_context(&mut body_value, &previous.items)
                 .map_err(ProxyError::bad_request)?;
             response_context_prepended = true;
@@ -342,6 +817,14 @@ pub async fn forward_agentservice(
         try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
     if response_context_prepended {
         preserve_current_continuation(&mut plan, &preliminary_plan);
+    }
+    let local_task_state = resolve_local_task_state(
+        &preliminary_plan,
+        current_turn_signal,
+        &inherited_local_task_state,
+    );
+    if plan.tool_results.is_empty() && local_task_state.tool_commit_required {
+        plan.local_tool_required_by_intent = true;
     }
     validate_tool_result_context(&plan).map_err(|message| {
         ProxyError::bad_request(format!("invalid cursor tool result context: {message}"))
@@ -390,6 +873,7 @@ pub async fn forward_agentservice(
             response_scope.map(|scope| CursorResponseStateContext {
                 scope,
                 store: body_value.get("store").and_then(Value::as_bool) != Some(false),
+                local_task_state: local_task_state.clone(),
             })
         })
         .flatten();
@@ -409,7 +893,7 @@ pub async fn forward_agentservice(
         &mut auth_recovery,
     )
     .await?;
-    let mut session_entry = opened.entry;
+    let session_entry = opened.entry;
     session_key = opened.key;
 
     let model = usage_model_metadata(&adapter_request);
@@ -441,223 +925,109 @@ pub async fn forward_agentservice(
         )
         .await);
     }
-
-    let mut active_plan = plan.clone();
-    let mut semantic_attempt = 1usize;
-    const MAX_SEMANTIC_ATTEMPTS: usize = 3;
-    let drive = loop {
-        let deadline = tokio::time::Instant::from_std(started + timeouts.request);
-        let outcome = match tokio::time::timeout_at(
-            deadline,
-            drive_non_stream(
-                &state,
-                session_entry.clone(),
-                &session_key,
-                response_format,
-                response_model.clone(),
-                input_tokens,
-            ),
+    if adapter_request.stream_requested {
+        return Ok(stream_semantic_response(
+            state,
+            stored,
+            session_entry,
+            session_key,
+            plan,
+            semantic_tool_choice.expect("streaming semantic constraint was checked"),
+            runtime_fingerprint,
+            response_format,
+            response_model,
+            input_tokens,
+            request_context,
+            started,
+            model,
+            timeouts,
+            auth_recovery,
+            account_in_flight_guard,
+            share_invocation_guard,
+            response_state,
         )
-        .await
-        {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => break Err(error),
-            Err(_) => {
-                break Err(ProxyError {
-                    status: StatusCode::GATEWAY_TIMEOUT,
-                    message: "Cursor request exceeded its absolute request deadline".to_string(),
-                })
-            }
-        };
-        let Some(choice) = semantic_tool_choice.as_ref() else {
-            break Ok(outcome);
-        };
-        let rejection = match (&outcome, choice) {
-            (DriveOutcome::Completed { .. }, SemanticToolConstraint::LocalIntent) => {
-                Some("local_tool_missing".to_string())
-            }
-            (DriveOutcome::Completed { .. }, _) => Some("required_tool_missing".to_string()),
-            (DriveOutcome::Parked { tool_name, .. }, SemanticToolConstraint::Named(required))
-                if !tool_names_equal(tool_name, required) =>
-            {
-                Some(format!(
-                    "named_tool_mismatch:{}",
-                    sanitize_metric_component(tool_name)
-                ))
-            }
-            (DriveOutcome::Parked { .. }, _) => None,
-        };
-        let Some(rejection) = rejection else {
-            break Ok(outcome);
-        };
-        state
-            .cursor_sessions
-            .release(session_entry.clone(), SessionState::Closed)
-            .await;
-        tracing::warn!(
-            rail = rail.label(),
-            attempt = semantic_attempt,
-            reason = rejection,
-            "Cursor tool-constrained attempt was discarded before client commit"
-        );
-        metrics::counter!(
-            "cursor_tool_retry_total",
-            "rail" => rail.label(),
-            "reason" => if rejection.starts_with("named_tool_mismatch") {
-                "named_tool_mismatch"
-            } else if rejection == "local_tool_missing" {
-                "local_tool_missing"
-            } else {
-                "required_tool_missing"
-            },
-            "attempt" => semantic_attempt.to_string()
-        )
-        .increment(1);
-        if semantic_attempt >= MAX_SEMANTIC_ATTEMPTS {
-            break Err(ProxyError {
-                status: StatusCode::BAD_GATEWAY,
-                message: match choice {
-                    SemanticToolConstraint::LocalIntent => format!(
-                        "Cursor did not invoke a required local project tool after {MAX_SEMANTIC_ATTEMPTS} attempts"
-                    ),
-                    _ => format!(
-                        "Cursor did not satisfy the required tool choice after {MAX_SEMANTIC_ATTEMPTS} attempts"
-                    ),
-                },
-            });
-        }
-        semantic_attempt += 1;
-        active_plan.user_text = match choice {
-            SemanticToolConstraint::Required | SemanticToolConstraint::LocalIntent => {
-                retry_prompt_after_missing_tool(
-                    &plan.user_text,
-                    semantic_attempt,
-                    MAX_SEMANTIC_ATTEMPTS,
-                )
-            }
-            SemanticToolConstraint::Named(required) => retry_prompt_after_invalid_tool(
-                &plan.user_text,
-                &format!("the model called a tool other than required tool `{required}`"),
-                &plan
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.clone())
-                    .collect::<Vec<_>>(),
-                semantic_attempt,
-                MAX_SEMANTIC_ATTEMPTS,
-            ),
-        };
-        let retry_context = CursorSessionOpenContext {
-            state: &state,
-            stored: &stored,
-            runtime_fingerprint: &runtime_fingerprint,
-            plan: &active_plan,
-            request_context: &request_context,
-            timeouts: match remaining_cursor_timeouts(timeouts, started.elapsed()) {
-                Some(timeouts) => timeouts,
-                None => {
-                    break Err(ProxyError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: "Cursor semantic retry exhausted the request deadline".to_string(),
-                    })
-                }
-            },
-        };
-        let opened =
-            match acquire_ready_session(&retry_context, &session_key, None, &mut auth_recovery)
-                .await
-            {
-                Ok(opened) => opened,
-                Err(error) => break Err(error),
-            };
-        session_entry = opened.entry;
-        session_key = opened.key;
-    };
-    match drive {
-        Ok(outcome) => {
-            let (mut body, usage, buffered_events, final_state, completed) = match outcome {
-                DriveOutcome::Completed {
-                    body,
-                    usage,
-                    buffered_events,
-                } => (body, usage, buffered_events, SessionState::Closed, true),
-                DriveOutcome::Parked {
-                    body,
-                    usage,
-                    buffered_events,
-                    ..
-                } => (
-                    body,
-                    usage,
-                    buffered_events,
-                    SessionState::AwaitingToolResult,
-                    false,
-                ),
-            };
-            if completed {
-                let semantic_items = session_entry.lock().await.semantic_items.clone();
-                cache_completed_response(
-                    &state,
-                    response_state.as_ref(),
-                    &session_key,
-                    &semantic_items,
-                    &body,
-                );
-            }
-            if compact && completed {
-                body = response_compaction_body(&body)?;
-            }
-            state
-                .cursor_sessions
-                .release(session_entry.clone(), final_state)
-                .await;
-            let status_code = StatusCode::OK.as_u16();
-            log_usage(
-                &state,
-                &stored,
-                status_code,
-                started.elapsed().as_millis(),
-                model,
-                usage,
-                UsageLogContext {
-                    is_streaming: adapter_request.stream_requested,
-                    ..request_context.clone()
-                },
-            )
-            .await;
-            record_share_invocation_result(
-                &state,
-                request_context.share_id.as_deref(),
-                request_context.user_email.as_deref(),
-                usage,
-            )
-            .await;
-            record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code))
-                .await;
-            let buffered_stream_body = adapter_request
-                .stream_requested
-                .then(|| Bytes::from(buffered_events.concat()));
-            let mut response = Response::new(Body::from(buffered_stream_body.unwrap_or(body)));
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static(if adapter_request.stream_requested {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                }),
-            );
-            Ok(response)
-        }
-        Err(error) => {
-            state
-                .cursor_sessions
-                .release(session_entry.clone(), SessionState::Closed)
-                .await;
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            Err(error)
-        }
+        .await);
     }
+
+    let SemanticDriveSuccess {
+        outcome,
+        session_entry,
+        session_key,
+    } = match drive_semantic_attempts(
+        &state,
+        &stored,
+        &runtime_fingerprint,
+        &request_context,
+        &plan,
+        semantic_tool_choice,
+        session_entry,
+        session_key,
+        response_format,
+        response_model.clone(),
+        input_tokens,
+        timeouts,
+        started,
+        auth_recovery,
+    )
+    .await
+    {
+        Ok(success) => success,
+        Err(error) => {
+            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            return Err(error);
+        }
+    };
+    let (mut body, usage, final_state, completed) = match outcome {
+        DriveOutcome::Completed { body, usage, .. } => (body, usage, SessionState::Closed, true),
+        DriveOutcome::Parked { body, usage, .. } => {
+            (body, usage, SessionState::AwaitingToolResult, false)
+        }
+    };
+    if completed {
+        let semantic_items = session_entry.lock().await.semantic_items.clone();
+        cache_completed_response(
+            &state,
+            response_state.as_ref(),
+            &session_key,
+            &semantic_items,
+            &body,
+        );
+    }
+    state
+        .cursor_sessions
+        .release(session_entry.clone(), final_state)
+        .await;
+    if compact && completed {
+        body = response_compaction_body(&body)?;
+    }
+    let status_code = StatusCode::OK.as_u16();
+    log_usage(
+        &state,
+        &stored,
+        status_code,
+        started.elapsed().as_millis(),
+        model,
+        usage,
+        UsageLogContext {
+            is_streaming: false,
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        &state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
 }
 
 async fn ensure_cursor_success_status(
@@ -1215,6 +1585,209 @@ async fn stream_response(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn stream_semantic_response(
+    state: ServerState,
+    stored: StoredProvider,
+    session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
+    session_key: CursorSessionKey,
+    plan: AgentRunPlan,
+    semantic_tool_choice: SemanticToolConstraint,
+    runtime_fingerprint: String,
+    response_format: super::protocol::CursorResponseFormat,
+    response_model: String,
+    input_tokens: u32,
+    request_context: UsageLogContext,
+    started: Instant,
+    model: UsageModelMetadata,
+    timeouts: CursorH2Timeouts,
+    auth_recovery: AuthRecoveryState,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    response_state: Option<CursorResponseStateContext>,
+) -> Response {
+    let request_id = log_usage(
+        &state,
+        &stored,
+        StatusCode::OK.as_u16(),
+        started.elapsed().as_millis(),
+        model.clone(),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: true,
+            stream_status: Some("pending".to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
+    let first_token_ms_shared = Arc::new(AtomicU64::new(0));
+    let interrupted_guard = CursorStreamInterruptGuard {
+        armed: Arc::new(AtomicBool::new(true)),
+        state: state.clone(),
+        stored: stored.clone(),
+        request_id: request_id.clone(),
+        status_code: StatusCode::OK.as_u16(),
+        share_id: share_id.clone(),
+        user_email: user_email.clone(),
+        started,
+        first_token_ms: first_token_ms_shared,
+        // The semantic driver owns the active upstream reservation until it
+        // returns. The supervisor then closes or parks the returned entry
+        // before publishing buffered events, so this guard must not release
+        // the initial entry a second time.
+        session_entry: None,
+        parked_handoff: false,
+    };
+    let stream = stream! {
+        let mut interrupted_guard = interrupted_guard;
+        let mut account_in_flight_guard = account_in_flight_guard;
+        let mut share_invocation_guard = share_invocation_guard;
+        let drive = drive_semantic_attempts(
+            &state,
+            &stored,
+            &runtime_fingerprint,
+            &request_context,
+            &plan,
+            Some(semantic_tool_choice),
+            session_entry,
+            session_key,
+            response_format,
+            response_model.clone(),
+            input_tokens,
+            timeouts,
+            started,
+            auth_recovery,
+        );
+        tokio::pin!(drive);
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + CURSOR_DOWNSTREAM_KEEPALIVE_INTERVAL,
+            CURSOR_DOWNSTREAM_KEEPALIVE_INTERVAL,
+        );
+        let driven = loop {
+            tokio::select! {
+                result = &mut drive => break result,
+                _ = keepalive.tick() => {
+                    if let Some(frame) = cursor_downstream_keepalive_frame(response_format) {
+                        crate::metrics::record_responses_downstream_keepalive(
+                            cursor_downstream_keepalive_surface(response_format),
+                        );
+                        yield Ok::<_, std::io::Error>(frame);
+                    }
+                }
+            }
+        };
+
+        let (events, final_status, final_stream_status, usage) = match driven {
+            Ok(SemanticDriveSuccess {
+                outcome,
+                session_entry,
+                session_key,
+            }) => {
+                let (body, usage, events, final_state, completed) = match outcome {
+                    DriveOutcome::Completed {
+                        body,
+                        usage,
+                        buffered_events,
+                        ..
+                    } => (body, usage, buffered_events, SessionState::Closed, true),
+                    DriveOutcome::Parked {
+                        body,
+                        usage,
+                        buffered_events,
+                        ..
+                    } => (
+                        body,
+                        usage,
+                        buffered_events,
+                        SessionState::AwaitingToolResult,
+                        false,
+                    ),
+                };
+                if completed {
+                    let semantic_items = session_entry.lock().await.semantic_items.clone();
+                    cache_completed_response(
+                        &state,
+                        response_state.as_ref(),
+                        &session_key,
+                        &semantic_items,
+                        &body,
+                    );
+                }
+                state
+                    .cursor_sessions
+                    .release(session_entry, final_state)
+                    .await;
+                if !completed {
+                    interrupted_guard.hand_off_parked_session();
+                }
+                (events, StatusCode::OK.as_u16(), "completed", usage)
+            }
+            Err(error) => {
+                let mut writer = AgentSseWriter::new(
+                    response_model,
+                    response_format,
+                    input_tokens,
+                );
+                let mut events = writer.error_events(&error.message);
+                events.extend(writer.done_events());
+                (
+                    events,
+                    error.status.as_u16(),
+                    "failed",
+                    TokenUsage::default(),
+                )
+            }
+        };
+
+        for event in events {
+            yield Ok::<_, std::io::Error>(Bytes::from(event));
+        }
+
+        // A constrained attempt is intentionally buffered until it commits a
+        // real tool call. Recording the flush instant as TTFT would make the
+        // generation window effectively zero and produce meaningless TPS.
+        update_stream_usage(
+            &state,
+            &stored,
+            &request_id,
+            final_status,
+            started.elapsed().as_millis(),
+            None,
+            usage,
+            Some(final_stream_status),
+        )
+        .await;
+        record_share_invocation_result(
+            &state,
+            share_id.as_deref(),
+            user_email.as_deref(),
+            usage,
+        )
+        .await;
+        record_provider_outcome(
+            &state,
+            &stored,
+            if final_stream_status == "failed" {
+                ProviderOutcome::NetworkFailure
+            } else {
+                ProviderOutcome::from_status(final_status)
+            },
+        )
+        .await;
+        drop(account_in_flight_guard.take());
+        drop(share_invocation_guard.take());
+        interrupted_guard.disarm();
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
 async fn drive_non_stream(
     state: &ServerState,
     session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
@@ -1232,7 +1805,7 @@ async fn drive_non_stream(
         )
     };
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens)
-        .with_custom_tool_names(custom_tool_names)
+        .with_custom_tool_names(custom_tool_names.clone())
         .with_response_tool_namespaces(response_tool_namespaces);
     state
         .cursor_sessions
@@ -1241,6 +1814,7 @@ async fn drive_non_stream(
     let mut buffered_events = writer.start_events();
     let mut filter = ComposerMarkerFilter::default();
     let mut exec_dedup = ExecDedup::default();
+    let mut observation = SemanticAttemptObservation::default();
     loop {
         let Some(frame) = next_session_frame(&session_entry)
             .await
@@ -1265,6 +1839,14 @@ async fn drive_non_stream(
             ExecHandling::ToolCall(tool_call) => {
                 mark_session_business_output(&session_entry).await?;
                 let tool_name = tool_call.name.clone();
+                if custom_tool_names
+                    .iter()
+                    .any(|candidate| tool_names_equal(candidate, &tool_name))
+                {
+                    observation.saw_custom_tool_call = true;
+                } else {
+                    observation.saw_function_call = true;
+                }
                 buffered_events.extend(writer.event(&AgentEvent::ToolCall(tool_call)));
                 buffered_events.extend(writer.done_events());
                 let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
@@ -1277,12 +1859,20 @@ async fn drive_non_stream(
                     usage: writer_usage(&writer),
                     buffered_events,
                     tool_name,
+                    observation,
                 });
             }
         }
         for delta in decode_agent_server_message(&frame.payload)
             .map_err(|error| cursor_proto_error(rail, error))?
         {
+            match &delta {
+                InteractionDelta::Text(text) if !text.is_empty() => observation.saw_text = true,
+                InteractionDelta::Thinking(text) if !text.is_empty() => {
+                    observation.saw_reasoning = true
+                }
+                _ => {}
+            }
             let content_delta = cursor_delta_is_business_output(&delta);
             let had_response_content = writer.has_response_content();
             let outcome = cursor_delta_events(delta, &mut writer, &mut filter)?;
@@ -1315,6 +1905,7 @@ async fn drive_non_stream(
                         body: Bytes::from(body),
                         usage: writer_usage(&writer),
                         buffered_events,
+                        observation,
                     });
                 }
             }
@@ -1334,6 +1925,7 @@ async fn drive_non_stream(
                 body: Bytes::from(body),
                 usage: writer_usage(&writer),
                 buffered_events,
+                observation,
             });
         }
     }
@@ -1928,6 +2520,7 @@ impl Drop for CursorSessionReservationGuard {
 struct CursorResponseStateContext {
     scope: CursorResponseScope,
     store: bool,
+    local_task_state: CursorLocalTaskState,
 }
 
 fn cache_completed_response(
@@ -1957,6 +2550,7 @@ fn cache_completed_response(
         response_id,
         session_key.conversation_id(),
         items,
+        context.local_task_state.clone(),
         now,
     ) {
         tracing::warn!(
@@ -3416,6 +4010,136 @@ mod tests {
             cursor_downstream_keepalive_surface(CursorResponseFormat::OpenAiChatCompletions),
             "chat_completions"
         );
+    }
+
+    #[test]
+    fn structured_local_task_state_survives_previous_response_followups() {
+        let tool = json!({
+            "type":"custom",
+            "name":"exec",
+            "format":{"type":"grammar","syntax":"lark","definition":"start: SOURCE\nSOURCE: /[\\s\\S]+/"}
+        });
+        let initial_body = json!({
+            "input":[
+                {"type":"additional_tools","role":"developer","tools":[tool.clone()]},
+                {"type":"message","role":"user","content":"深入解读当前项目"}
+            ]
+        });
+        let initial = try_build_plan(InboundProtocol::OpenAiResponses, &initial_body).unwrap();
+        let initial_state = resolve_local_task_state(
+            &initial,
+            Some(LocalTaskTurnSignal::Activate),
+            &CursorLocalTaskState::default(),
+        );
+        assert!(initial_state.active);
+        assert!(initial_state.tool_commit_required);
+        assert_eq!(initial_state.generation, 1);
+
+        let continued_body = json!({
+            "previous_response_id":"resp_previous",
+            "input":[
+                {"type":"additional_tools","role":"developer","tools":[tool.clone()]},
+                {"type":"message","role":"user","content":"继续"}
+            ]
+        });
+        let continued = try_build_plan(InboundProtocol::OpenAiResponses, &continued_body).unwrap();
+        assert!(!continued.local_tool_required_by_intent);
+        let continued_state = resolve_local_task_state(
+            &continued,
+            Some(LocalTaskTurnSignal::Continue),
+            &initial_state,
+        );
+        assert_eq!(continued_state.generation, initial_state.generation);
+        assert_eq!(
+            continued_state.origin_turn_digest,
+            initial_state.origin_turn_digest
+        );
+        assert!(continued_state.tool_commit_required);
+
+        let replacement_body = json!({
+            "previous_response_id":"resp_previous",
+            "input":[
+                {"type":"additional_tools","role":"developer","tools":[tool]},
+                {"type":"message","role":"user","content":"Explain TCP congestion control"}
+            ]
+        });
+        let replacement =
+            try_build_plan(InboundProtocol::OpenAiResponses, &replacement_body).unwrap();
+        let replacement_state = resolve_local_task_state(
+            &replacement,
+            Some(LocalTaskTurnSignal::Replace),
+            &continued_state,
+        );
+        assert_eq!(replacement_state, CursorLocalTaskState::default());
+    }
+
+    #[test]
+    fn semantic_retries_always_rotate_upstream_conversation_identity() {
+        let initial = CursorSessionKey::new(
+            CursorSessionScope::fixture("semantic-retry"),
+            "conversation-initial",
+        );
+        let retry_one = new_semantic_retry_session_key(&initial, CursorProtocolRail::OAuthCli);
+        let retry_two = new_semantic_retry_session_key(&retry_one, CursorProtocolRail::OAuthCli);
+        assert_eq!(initial.scope(), retry_one.scope());
+        assert_eq!(retry_one.scope(), retry_two.scope());
+        assert_ne!(initial.conversation_id(), retry_one.conversation_id());
+        assert_ne!(retry_one.conversation_id(), retry_two.conversation_id());
+    }
+
+    #[test]
+    fn three_promise_only_attempts_exhaust_but_a_real_tool_commits() {
+        let promise_only = DriveOutcome::Completed {
+            body: Bytes::new(),
+            usage: TokenUsage::default(),
+            buffered_events: Vec::new(),
+            observation: SemanticAttemptObservation {
+                saw_text: true,
+                ..Default::default()
+            },
+        };
+        for attempt in 1..=MAX_SEMANTIC_ATTEMPTS {
+            assert_eq!(
+                semantic_attempt_rejection(&promise_only, &SemanticToolConstraint::LocalIntent,)
+                    .as_deref(),
+                Some("local_tool_missing"),
+                "attempt={attempt}"
+            );
+        }
+
+        let tool_call = DriveOutcome::Parked {
+            body: Bytes::new(),
+            usage: TokenUsage::default(),
+            buffered_events: Vec::new(),
+            tool_name: "exec".to_string(),
+            observation: SemanticAttemptObservation {
+                saw_custom_tool_call: true,
+                ..Default::default()
+            },
+        };
+        assert!(
+            semantic_attempt_rejection(&tool_call, &SemanticToolConstraint::LocalIntent,).is_none()
+        );
+        assert!(semantic_attempt_rejection(
+            &tool_call,
+            &SemanticToolConstraint::Named("exec".to_string()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn constrained_responses_failure_is_an_in_band_terminal_without_created_event() {
+        let mut writer = AgentSseWriter::new(
+            "gpt-5.6-sol".to_string(),
+            super::super::protocol::CursorResponseFormat::OpenAiResponses,
+            0,
+        );
+        let mut events = writer.error_events("Cursor tool constraint exhausted");
+        events.extend(writer.done_events());
+        let wire = events.concat();
+        assert!(wire.contains("event: response.failed"));
+        assert!(wire.contains("data: [DONE]"));
+        assert!(!wire.contains("event: response.created"));
     }
 
     #[test]
