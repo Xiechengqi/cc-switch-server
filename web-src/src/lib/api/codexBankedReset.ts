@@ -39,24 +39,34 @@ export interface CodexBankedResetConsumeResult {
   remainingCredits: unknown[];
 }
 
+export interface CodexBankedResetTarget {
+  accountId?: string | null;
+  providerId?: string | null;
+  expectedRevision?: number | null;
+}
+
 export async function getCodexBankedResetStatus(
-  accountId?: string | null,
+  target: CodexBankedResetTarget,
   force = false,
 ): Promise<CodexBankedResetStatus> {
   return invokeCommand<CodexBankedResetStatus>("codex_banked_reset_status", {
-    accountId: accountId || null,
+    accountId: target.accountId || null,
+    providerId: target.providerId || null,
+    expectedRevision: target.expectedRevision ?? null,
     force,
   });
 }
 
 export async function consumeCodexBankedReset(
-  accountId: string | null | undefined,
+  target: CodexBankedResetTarget,
   creditId?: string | null,
 ): Promise<CodexBankedResetConsumeResult> {
   return invokeCommand<CodexBankedResetConsumeResult>(
     "codex_banked_reset_consume",
     {
-      accountId: accountId || null,
+      accountId: target.accountId || null,
+      providerId: target.providerId || null,
+      expectedRevision: target.expectedRevision ?? null,
       creditId: creditId?.trim() || null,
     },
   );

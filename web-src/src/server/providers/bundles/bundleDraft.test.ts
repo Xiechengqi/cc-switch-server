@@ -19,6 +19,7 @@ import {
   perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
   requiresPerAppModelPolicy,
+  resolvePersistedCodexControlTarget,
   supportsPerAppModelPolicy,
   toProviderBundleWriteDraft,
   updateBundleModel,
@@ -109,6 +110,37 @@ function openAiOAuthBundle(
 }
 
 describe("Provider Bundle drafts", () => {
+  it("only exposes Codex controls for the persisted bound account", () => {
+    const bundle = openAiOAuthBundle();
+    for (const resource of Object.values(bundle.surfaces)) {
+      if (!resource) continue;
+      resource.provider.meta = {
+        ...resource.provider.meta,
+        authBinding: {
+          source: "managed_account",
+          authProvider: "codex_oauth",
+          accountId: "account-a",
+          authIdentityGeneration: 2,
+        },
+      };
+    }
+    const draft = editProviderBundleDraft(bundle);
+
+    expect(resolvePersistedCodexControlTarget(bundle, draft, false)).toEqual({
+      providerId: bundle.id,
+      expectedRevision: bundle.revision,
+      accountId: "account-a",
+    });
+    expect(
+      resolvePersistedCodexControlTarget(
+        bundle,
+        { ...draft, accountId: "account-b" },
+        false,
+      ),
+    ).toBeNull();
+    expect(resolvePersistedCodexControlTarget(bundle, draft, true)).toBeNull();
+  });
+
   it("materializes every family and every Driver option schema", () => {
     for (const family of providerRegistry.families) {
       const draft = createProviderBundleDraft(family);
@@ -952,12 +984,12 @@ describe("Provider Bundle drafts", () => {
     const draft = createDraftForSelectedFamily(
       familyById("family.custom_http")!,
     );
-    expect(customRecipeMatchesBundleDraft(draft, providerRegistry.customRecipes[0]!)).toBe(
-      true,
-    );
-    expect(draft.surfaces.find((surface) => surface.app === "claude")?.enabled).toBe(
-      true,
-    );
+    expect(
+      customRecipeMatchesBundleDraft(draft, providerRegistry.customRecipes[0]!),
+    ).toBe(true);
+    expect(
+      draft.surfaces.find((surface) => surface.app === "claude")?.enabled,
+    ).toBe(true);
     expect(
       draft.surfaces
         .filter((surface) => surface.app !== "claude")

@@ -14,21 +14,29 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { codexBankedResetApi, subscriptionApi } from "@/lib/api";
-import type { CodexBankedResetCredit, CodexBankedResetStatus } from "@/lib/api";
+import type {
+  CodexBankedResetCredit,
+  CodexBankedResetStatus,
+  CodexBankedResetTarget,
+} from "@/lib/api";
 
 interface CodexBankedResetPanelProps {
   accountId?: string | null;
   workspaceId?: string | null;
+  providerId?: string | null;
+  expectedRevision?: number | null;
 }
 
 function resetQueryKey(
-  accountId: string | null | undefined,
+  target: CodexBankedResetTarget,
   workspaceId: string | null | undefined,
 ) {
   return [
     "codex_banked_reset",
     "status",
-    accountId ?? "default-account",
+    target.providerId ?? "account-control",
+    target.expectedRevision ?? "current-revision",
+    target.accountId ?? "default-account",
     workspaceId ?? "default-workspace",
   ] as const;
 }
@@ -36,22 +44,28 @@ function resetQueryKey(
 export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
   accountId,
   workspaceId,
+  providerId,
+  expectedRevision,
 }) => {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [selectedCreditId, setSelectedCreditId] = React.useState<string>("");
   const [consumeConfirmOpen, setConsumeConfirmOpen] = React.useState(false);
 
+  const target = React.useMemo<CodexBankedResetTarget>(
+    () => ({ accountId, providerId, expectedRevision }),
+    [accountId, expectedRevision, providerId],
+  );
   const queryKey = React.useMemo(
-    () => resetQueryKey(accountId, workspaceId),
-    [accountId, workspaceId],
+    () => resetQueryKey(target, workspaceId),
+    [target, workspaceId],
   );
 
   const statusQuery = useQuery({
     queryKey,
     queryFn: async () => {
       const status = await codexBankedResetApi.getCodexBankedResetStatus(
-        accountId,
+        target,
         false,
       );
       if (workspaceId && status.workspaceId !== workspaceId) {
@@ -65,11 +79,11 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
 
   const refreshMutation = useMutation({
     mutationFn: async (target: {
-      accountId: string | null | undefined;
+      control: CodexBankedResetTarget;
       workspaceId: string | null | undefined;
     }) => {
       const status = await codexBankedResetApi.getCodexBankedResetStatus(
-        target.accountId,
+        target.control,
         true,
       );
       if (target.workspaceId && status.workspaceId !== target.workspaceId) {
@@ -79,12 +93,15 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
     },
     onSuccess: (status, target) => {
       queryClient.setQueryData(
-        resetQueryKey(
-          target.accountId,
-          status.workspaceId ?? target.workspaceId,
-        ),
+        resetQueryKey(target.control, target.workspaceId),
         status,
       );
+      if (status.workspaceId && status.workspaceId !== target.workspaceId) {
+        queryClient.setQueryData(
+          resetQueryKey(target.control, status.workspaceId),
+          status,
+        );
+      }
     },
   });
 
@@ -105,7 +122,7 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
 
   const consumeMutation = useMutation({
     mutationFn: (creditId: string) =>
-      codexBankedResetApi.consumeCodexBankedReset(accountId, creditId),
+      codexBankedResetApi.consumeCodexBankedReset(target, creditId),
     onSuccess: async (result) => {
       const success = result.code === "reset" || !result.code;
       toast[success ? "success" : "error"](consumeMessage(result.code));
@@ -167,7 +184,7 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
   };
 
   const refreshTargetsCurrentAccount =
-    (refreshMutation.variables?.accountId ?? null) === (accountId ?? null) &&
+    refreshMutation.variables?.control === target &&
     (refreshMutation.variables?.workspaceId ?? null) === (workspaceId ?? null);
   const isRefreshing =
     statusQuery.isFetching ||
@@ -194,7 +211,9 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
           variant="ghost"
           size="icon"
           className="h-8 w-8 shrink-0"
-          onClick={() => refreshMutation.mutate({ accountId, workspaceId })}
+          onClick={() =>
+            refreshMutation.mutate({ control: target, workspaceId })
+          }
           disabled={isRefreshing}
           title={t("common.refresh")}
           aria-label={t("common.refresh")}

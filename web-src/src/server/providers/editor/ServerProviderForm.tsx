@@ -22,6 +22,7 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
+import { CodexBankedResetPanel } from "@/components/providers/forms/CodexBankedResetPanel";
 import { CodexReferralPanel } from "@/components/providers/forms/CodexReferralPanel";
 import {
   ProviderPresetSelector,
@@ -287,8 +288,7 @@ export function reconcileManagedAccountBindingGeneration({
   authProvider,
   accounts,
 }: ReconcileManagedAccountBindingGenerationInput):
-  | NonNullable<ProviderMeta["authBinding"]>
-  | undefined {
+  NonNullable<ProviderMeta["authBinding"]> | undefined {
   if (
     !accountId ||
     currentBinding?.accountId !== accountId ||
@@ -2459,6 +2459,21 @@ export function ServerProviderForm({
             }
           />
         </Section>
+      ) : null}
+
+      {showCodexOptions &&
+      providerId &&
+      resource &&
+      state.accountId === resource.provider.meta?.authBinding?.accountId ? (
+        <CodexBankedResetPanel
+          accountId={state.accountId}
+          providerId={providerId}
+          expectedRevision={resource.revision}
+          workspaceId={
+            selectedManagedAccount?.selected_workspace_id ??
+            selectedManagedAccount?.workspaces?.[0]?.id
+          }
+        />
       ) : null}
 
       {showCodexOptions &&

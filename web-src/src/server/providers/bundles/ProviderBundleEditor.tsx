@@ -29,6 +29,7 @@ import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
+import { CodexBankedResetPanel } from "@/components/providers/forms/CodexBankedResetPanel";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
 import { CodexReferralPanel } from "@/components/providers/forms/CodexReferralPanel";
 import { SubdomainGeneratorButton } from "@/components/SubdomainGeneratorButton";
@@ -126,6 +127,7 @@ import {
   perAppModelPoliciesDiffer,
   providerBundleIdentityEditable,
   requiresPerAppModelPolicy,
+  resolvePersistedCodexControlTarget,
   supportsPerAppModelPolicy,
   toProviderBundleWriteDraft,
   updateBundleModel,
@@ -802,17 +804,15 @@ function BundleShareEditor({
           .map((grant) => grant.email),
         defaultPolicy: defaultUserPolicy,
       }),
-    [
-      defaultUserPolicy,
-      draft.userGrants,
-      normalizedOwnerEmail,
-    ],
+    [defaultUserPolicy, draft.userGrants, normalizedOwnerEmail],
   );
   const slugInvalid = Boolean(
     draft.subdomain.trim() && !isValidShareSlug(draft.subdomain),
   );
-  const { onChange: updateUserGrants, onUsageEditsChange: updateUserUsageEdits } =
-    bundleShareGrantHandlers(onChange);
+  const {
+    onChange: updateUserGrants,
+    onUsageEditsChange: updateUserUsageEdits,
+  } = bundleShareGrantHandlers(onChange);
   const updateDraft = (patch: Partial<ProviderBundleShareDraft>) =>
     onChange((current) => ({ ...current, ...patch }));
 
@@ -922,21 +922,31 @@ function BundleShareEditor({
           </div>
           {showGrokMedia ? (
             <div className="space-y-2 md:col-span-2">
-              <Label>{t("grokOauth.shareMediaPolicy", { defaultValue: "Share 媒体权限" })}</Label>
+              <Label>
+                {t("grokOauth.shareMediaPolicy", {
+                  defaultValue: "Share 媒体权限",
+                })}
+              </Label>
               <GrokFeatureOptions
                 values={{
-                  grokImageGenerationEnabled: draft.grokMediaPolicy.imageGenerationEnabled,
+                  grokImageGenerationEnabled:
+                    draft.grokMediaPolicy.imageGenerationEnabled,
                   grokImageEditEnabled: draft.grokMediaPolicy.imageEditEnabled,
-                  grokVideoGenerationEnabled: draft.grokMediaPolicy.videoGenerationEnabled,
+                  grokVideoGenerationEnabled:
+                    draft.grokMediaPolicy.videoGenerationEnabled,
                 }}
                 onChange={(key, enabled) => {
-                  const field = key === "grokImageGenerationEnabled"
-                    ? "imageGenerationEnabled"
-                    : key === "grokImageEditEnabled"
-                      ? "imageEditEnabled"
-                      : "videoGenerationEnabled";
+                  const field =
+                    key === "grokImageGenerationEnabled"
+                      ? "imageGenerationEnabled"
+                      : key === "grokImageEditEnabled"
+                        ? "imageEditEnabled"
+                        : "videoGenerationEnabled";
                   updateDraft({
-                    grokMediaPolicy: { ...draft.grokMediaPolicy, [field]: enabled },
+                    grokMediaPolicy: {
+                      ...draft.grokMediaPolicy,
+                      [field]: enabled,
+                    },
                   });
                 }}
               />
@@ -986,9 +996,7 @@ function BundleShareEditor({
                     }
                     size="sm"
                     className="h-7 px-2 text-xs"
-                    onClick={() =>
-                      updateDraft({ tokenLimit: String(preset) })
-                    }
+                    onClick={() => updateDraft({ tokenLimit: String(preset) })}
                   >
                     {preset.toLocaleString()}
                   </Button>
@@ -1187,6 +1195,15 @@ export function ProviderBundleEditor({
       ? driverForProfile(profile)?.driverId === "oauth.openai_codex"
       : false;
   });
+  const codexControlTarget = codexDriverOptions
+    ? resolvePersistedCodexControlTarget(bundle, draft, duplicate)
+    : null;
+  const codexControlAccount = codexControlTarget
+    ? accounts.find((account) => account.id === codexControlTarget.accountId)
+    : undefined;
+  const codexControlWorkspaceId =
+    codexControlAccount?.selected_workspace_id ??
+    codexControlAccount?.workspaces?.[0]?.id;
   const grokDriverOptions = draft.surfaces.some((surface) => {
     const profile = profileById(surface.profileId);
     return profile
@@ -2368,13 +2385,18 @@ export function ProviderBundleEditor({
                       providerId={bundle?.surfaces.codex?.provider.id}
                       values={{
                         grokImageGenerationEnabled: draft.surfaces.some(
-                          (surface) => surface.driverOptions.grokImageGenerationEnabled === true,
+                          (surface) =>
+                            surface.driverOptions.grokImageGenerationEnabled ===
+                            true,
                         ),
                         grokImageEditEnabled: draft.surfaces.some(
-                          (surface) => surface.driverOptions.grokImageEditEnabled === true,
+                          (surface) =>
+                            surface.driverOptions.grokImageEditEnabled === true,
                         ),
                         grokVideoGenerationEnabled: draft.surfaces.some(
-                          (surface) => surface.driverOptions.grokVideoGenerationEnabled === true,
+                          (surface) =>
+                            surface.driverOptions.grokVideoGenerationEnabled ===
+                            true,
                         ),
                       }}
                       onChange={setGrokDriverOption}
@@ -2382,14 +2404,20 @@ export function ProviderBundleEditor({
                   </Section>
                 ) : null}
 
-                {codexDriverOptions &&
-                persisted &&
-                draft.accountId &&
-                draft.expectedRevision != null ? (
+                {codexControlTarget ? (
+                  <CodexBankedResetPanel
+                    accountId={codexControlTarget.accountId}
+                    providerId={codexControlTarget.providerId}
+                    expectedRevision={codexControlTarget.expectedRevision}
+                    workspaceId={codexControlWorkspaceId}
+                  />
+                ) : null}
+
+                {codexControlTarget ? (
                   <Section title={t("codexReferrals.sectionTitle")}>
                     <CodexReferralPanel
-                      providerId={draft.id}
-                      expectedRevision={draft.expectedRevision}
+                      providerId={codexControlTarget.providerId}
+                      expectedRevision={codexControlTarget.expectedRevision}
                     />
                   </Section>
                 ) : null}

@@ -64,7 +64,7 @@ interface CodexOAuthSectionProps {
   websocketEnabled?: boolean;
   /** WebSocket 切换回调 */
   onWebsocketChange?: (enabled: boolean) => void;
-  /** 是否显示只读 Banked Reset 次数与到期明细面板 */
+  /** 是否显示 Banked Reset 次数、到期明细与手动消费面板 */
   showBankedResetPanel?: boolean;
 }
 

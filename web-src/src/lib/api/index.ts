@@ -91,6 +91,7 @@ export type {
   CodexBankedResetConsumeResult,
   CodexBankedResetCredit,
   CodexBankedResetStatus,
+  CodexBankedResetTarget,
 } from "./codexBankedReset";
 export type {
   CodexReferralEligibility,

@@ -143,6 +143,44 @@ export interface ProviderBundleEditorDraft {
   surfaces: BundleSurfaceEditorDraft[];
 }
 
+export function resolvePersistedCodexControlTarget(
+  bundle: ProviderBundleView | undefined,
+  draft: Pick<ProviderBundleEditorDraft, "accountId" | "expectedRevision">,
+  duplicate: boolean,
+): {
+  providerId: string;
+  expectedRevision: number;
+  accountId: string;
+} | null {
+  if (
+    !bundle ||
+    duplicate ||
+    !draft.accountId ||
+    draft.expectedRevision !== bundle.revision
+  ) {
+    return null;
+  }
+
+  const boundAccountIds = new Set(
+    Object.values(bundle.surfaces)
+      .map((resource) => resource?.provider.meta?.authBinding)
+      .flatMap((binding) =>
+        binding?.authProvider === "codex_oauth" && binding.accountId
+          ? [binding.accountId]
+          : [],
+      ),
+  );
+  if (boundAccountIds.size !== 1 || !boundAccountIds.has(draft.accountId)) {
+    return null;
+  }
+
+  return {
+    providerId: bundle.id,
+    expectedRevision: bundle.revision,
+    accountId: draft.accountId,
+  };
+}
+
 const DEFAULT_CUSTOM_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
   {
     claude: { upstreamProtocol: "anthropic_messages", authScheme: "api_key" },
@@ -446,13 +484,16 @@ function surfaceFromResource(
         configuredMeta.codexImageGenerationEnabled,
       grokImageGenerationEnabled:
         booleanOption(runtimeOptions.grokImageGenerationEnabled) ??
-        configuredMeta.grokImageGenerationEnabled ?? false,
+        configuredMeta.grokImageGenerationEnabled ??
+        false,
       grokImageEditEnabled:
         booleanOption(runtimeOptions.grokImageEditEnabled) ??
-        configuredMeta.grokImageEditEnabled ?? false,
+        configuredMeta.grokImageEditEnabled ??
+        false,
       grokVideoGenerationEnabled:
         booleanOption(runtimeOptions.grokVideoGenerationEnabled) ??
-        configuredMeta.grokVideoGenerationEnabled ?? false,
+        configuredMeta.grokVideoGenerationEnabled ??
+        false,
       codexWebsocketEnabled,
       codexResponsesKeepaliveIntervalMs:
         numberOption(runtimeOptions.codexResponsesKeepaliveIntervalMs) ??
@@ -1110,11 +1151,7 @@ export function validateProviderBundleDraftIssue(
     );
   }
   if (
-    !validateDuration(
-      draft.transport.streamFirstByteTimeoutSeconds,
-      1,
-      600,
-    )
+    !validateDuration(draft.transport.streamFirstByteTimeoutSeconds, 1, 600)
   ) {
     return issue(
       "firstByteTimeoutInvalid",
@@ -1122,9 +1159,7 @@ export function validateProviderBundleDraftIssue(
       "Provider first-byte timeout is invalid",
     );
   }
-  if (
-    !validateDuration(draft.transport.streamIdleTimeoutSeconds, 1, 3_600)
-  ) {
+  if (!validateDuration(draft.transport.streamIdleTimeoutSeconds, 1, 3_600)) {
     return issue(
       "idleTimeoutInvalid",
       "streamIdleTimeoutSeconds",
