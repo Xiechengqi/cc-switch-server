@@ -123,7 +123,7 @@ cargo build --release
 sudo install -m 0755 target/release/cc-switch-server /usr/local/bin/cc-switch-server
 ```
 
-systemd unit 位于 `deploy/cc-switch-server.service`，默认使用 `/var/lib/cc-switch-server` 作为配置目录。Docker、GitHub Actions 发布流程与生产注意事项见 [`docs/guide/deployment.md`](docs/guide/deployment.md)。
+systemd unit 位于 `deploy/cc-switch-server.service`，默认使用 `/var/lib/cc-switch-server` 作为配置目录。`main` push 自动更新双架构 `latest` Release；需要 Router 固定安装版本时，可手动执行 Commit Release workflow，以 Commit 前 7 位发布不可变 Release。Docker、完整 GitHub Actions 发布流程与生产注意事项见 [`docs/guide/deployment.md`](docs/guide/deployment.md)。
 
 ## 配置
 

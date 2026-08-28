@@ -2,6 +2,15 @@
 
 `cc-switch-server` 目标是单 binary + config dir 长期运行。
 
+## GitHub Release 通道
+
+Release CI 使用共享的 AMD64/ARM64 musl 构建流程，并为每个 binary 同时发布 `.sha256`：
+
+- `main` 每次 push 触发 `Publish latest server release`，只更新可变的 `latest` tag/Release。并发发布会串行化，发布前再次确认 Commit 仍是 `main` HEAD，避免旧任务把 `latest` 倒退。
+- `Publish immutable server commit release` 只可手动触发，输入 `main` 历史中的 7-40 位 Commit ID。工作流解析完整 SHA，以前 7 位作为 tag、Release 名称与下载版本；已有 tag/Release、7 位前缀冲突或资产不完整都会失败，绝不覆盖已有 Commit Release，也不会修改 `latest`。
+
+Router 可以继续用默认 `latest` 安装，也可以在 Settings 中选择已手动发布的 7 位 Commit Release。Commit Release 是新安装时的兼容性 pin，不改变本 Server 管理端的一键自升级策略；自升级仍从 GitHub `latest` 获取目标版本。
+
 ## 本地验证
 
 静态受限场景（不编译、不部署、不启动服务）：

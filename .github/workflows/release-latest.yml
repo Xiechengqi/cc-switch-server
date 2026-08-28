@@ -1,0 +1,150 @@
+name: Publish latest server release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-release-assets.yml
+    with:
+      ref: ${{ github.sha }}
+
+  release:
+    name: Publish latest release
+    needs: build
+    runs-on: ubuntu-latest
+    # Builds for newer commits may run in parallel, but the mutable publication
+    # itself must be serialized. Never cancel after publication has started:
+    # cancellation after deleting the old Release could leave `latest` absent.
+    # The freshness check below makes queued stale jobs exit without publishing.
+    concurrency:
+      group: cc-switch-server-latest-publish
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout published commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          find artifacts -maxdepth 2 -type f -exec cp {} release-files/ \;
+          for asset in \
+            cc-switch-server-linux-amd64 \
+            cc-switch-server-linux-amd64.sha256 \
+            cc-switch-server-linux-arm64 \
+            cc-switch-server-linux-arm64.sha256
+          do
+            test -s "release-files/${asset}" || {
+              echo "required release asset is missing or empty: ${asset}" >&2
+              exit 1
+            }
+          done
+          test "$(find release-files -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd release-files && sha256sum -c cc-switch-server-linux-amd64.sha256)
+          (cd release-files && sha256sum -c cc-switch-server-linux-arm64.sha256)
+          ls -lh release-files/
+
+      - name: Confirm this is still the newest main commit
+        id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          if [[ "${current_main}" != "${GITHUB_SHA}" ]]; then
+            echo "${GITHUB_SHA} is no longer main HEAD (${current_main}); skip stale latest publication" >&2
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release metadata
+        if: steps.freshness.outputs.fresh == 'true'
+        id: metadata
+        run: |
+          version="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+          commit_subject="$(git log -1 --format=%s)"
+          build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          echo "version=v${version}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${build_time}" >> "$GITHUB_OUTPUT"
+          {
+            echo "commit_subject<<EOF"
+            echo "${commit_subject}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete existing latest release and tag
+        if: steps.freshness.outputs.fresh == 'true'
+        run: |
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create latest tag
+        if: steps.freshness.outputs.fresh == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${GITHUB_SHA}"
+          git push -f origin latest
+
+      - name: Create complete latest draft
+        if: steps.freshness.outputs.fresh == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build (${{ steps.metadata.outputs.version }})
+          body: |
+            ## Latest automatic build
+
+            **Version**: ${{ steps.metadata.outputs.version }}
+            **Commit**: `${{ github.sha }}`
+            **Commit subject**: ${{ steps.metadata.outputs.commit_subject }}
+            **Branch**: `${{ github.ref_name }}`
+            **Build time**: `${{ steps.metadata.outputs.build_time }}`
+
+            ### Downloads
+
+            - Linux AMD64: `cc-switch-server-linux-amd64`
+            - Linux ARM64: `cc-switch-server-linux-arm64`
+            - SHA256 files are published next to each binary.
+
+            <!-- cc-switch-latest-run:${{ github.run_id }}:${{ github.run_attempt }} -->
+          files: release-files/*
+          draft: true
+          prerelease: false
+          make_latest: false
+
+      - name: Publish complete latest release
+        id: publish
+        if: steps.freshness.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit latest --draft=false --latest
+
+      - name: Clean up this run's failed latest draft
+        if: ${{ always() && steps.freshness.outputs.fresh == 'true' && steps.publish.outcome != 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          owned_draft="$(gh release view latest --json isDraft,body \
+            --jq ".isDraft and (.body | contains(\"cc-switch-latest-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}\"))" \
+            2>/dev/null || true)"
+          if [[ "${owned_draft}" == "true" ]]; then
+            gh release delete latest --yes --cleanup-tag || true
+          fi

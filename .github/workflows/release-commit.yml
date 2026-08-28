@@ -1,0 +1,197 @@
+name: Publish immutable server commit release
+run-name: Publish server commit ${{ inputs.commit_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_id:
+        description: 7-40 character commit ID from the main branch
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cc-switch-server-commit-${{ inputs.commit_id }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve and validate commit
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      short_commit: ${{ steps.resolve.outputs.short_commit }}
+    steps:
+      - name: Checkout main history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve immutable commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_COMMIT: ${{ inputs.commit_id }}
+        run: |
+          normalized="$(printf '%s' "${INPUT_COMMIT}" | tr '[:upper:]' '[:lower:]')"
+          if [[ ! "${normalized}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "commit_id must contain 7-40 hexadecimal characters" >&2
+            exit 1
+          fi
+
+          full_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${normalized}" --jq '.sha')"
+          if [[ ! "${full_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GitHub returned an invalid commit ID" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${full_commit}" origin/main; then
+            echo "${full_commit} is not part of the main branch history" >&2
+            exit 1
+          fi
+
+          short_commit="${full_commit:0:7}"
+          if git show-ref --verify --quiet "refs/tags/${short_commit}"; then
+            existing_commit="$(git rev-list -n 1 "refs/tags/${short_commit}")"
+            if [[ "${existing_commit}" == "${full_commit}" ]]; then
+              echo "release tag ${short_commit} already exists for this commit" >&2
+            else
+              echo "short commit collision: ${short_commit} already points to ${existing_commit}" >&2
+            fi
+            exit 1
+          fi
+          if gh release view "${short_commit}" >/dev/null 2>&1; then
+            echo "release ${short_commit} already exists" >&2
+            exit 1
+          fi
+
+          echo "commit=${full_commit}" >> "$GITHUB_OUTPUT"
+          echo "short_commit=${short_commit}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    uses: ./.github/workflows/_build-release-assets.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  release:
+    name: Publish immutable commit release
+    needs:
+      - resolve
+      - build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cc-switch-server-commit-release-${{ needs.resolve.outputs.short_commit }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout published commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          find artifacts -maxdepth 2 -type f -exec cp {} release-files/ \;
+          for asset in \
+            cc-switch-server-linux-amd64 \
+            cc-switch-server-linux-amd64.sha256 \
+            cc-switch-server-linux-arm64 \
+            cc-switch-server-linux-arm64.sha256
+          do
+            test -s "release-files/${asset}" || {
+              echo "required release asset is missing or empty: ${asset}" >&2
+              exit 1
+            }
+          done
+          test "$(find release-files -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd release-files && sha256sum -c cc-switch-server-linux-amd64.sha256)
+          (cd release-files && sha256sum -c cc-switch-server-linux-arm64.sha256)
+          ls -lh release-files/
+
+      - name: Collect release metadata
+        id: metadata
+        run: |
+          commit_subject="$(git log -1 --format=%s)"
+          build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "build_time=${build_time}" >> "$GITHUB_OUTPUT"
+          {
+            echo "commit_subject<<EOF"
+            echo "${commit_subject}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write immutable release notes
+        env:
+          FULL_COMMIT: ${{ needs.resolve.outputs.commit }}
+          COMMIT_SUBJECT: ${{ steps.metadata.outputs.commit_subject }}
+          BUILD_TIME: ${{ steps.metadata.outputs.build_time }}
+          RUN_MARKER: cc-switch-release-run:${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          {
+            echo '## Immutable commit build'
+            echo
+            printf '**Commit**: `%s`\n' "${FULL_COMMIT}"
+            printf '**Commit subject**: %s\n' "${COMMIT_SUBJECT}"
+            printf '**Build time**: %s\n' "${BUILD_TIME}"
+            echo
+            echo 'This release is immutable and is intended for Router-pinned Client installation.'
+            echo
+            echo '### Downloads'
+            echo
+            echo '- Linux AMD64: `cc-switch-server-linux-amd64`'
+            echo '- Linux ARM64: `cc-switch-server-linux-arm64`'
+            echo '- SHA256 files are published next to each binary.'
+            echo
+            printf '<!-- %s -->\n' "${RUN_MARKER}"
+          } > release-notes.md
+
+      # Create-only draft publication fails if the Release appeared after
+      # resolve. Assets are uploaded while the Release is private; only a
+      # complete draft is published, and a published Release is never edited.
+      - name: Create immutable commit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_COMMIT: ${{ needs.resolve.outputs.commit }}
+          SHORT_COMMIT: ${{ needs.resolve.outputs.short_commit }}
+        run: |
+          set -Eeuo pipefail
+          cleanup_failed_draft() {
+            owned_draft="$(gh release view "${SHORT_COMMIT}" --json isDraft,body \
+              --jq ".isDraft and (.body | contains(\"cc-switch-release-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}\"))" \
+              2>/dev/null || true)"
+            if [[ "${owned_draft}" == "true" ]]; then
+              # `gh release create --target` creates both the draft and its
+              # tag. Remove both so a transient upload failure can be retried.
+              gh release delete "${SHORT_COMMIT}" --yes --cleanup-tag || true
+            fi
+          }
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/${SHORT_COMMIT}")" ]]; then
+            echo "release tag ${SHORT_COMMIT} appeared while this workflow was building" >&2
+            exit 1
+          fi
+          if gh release view "${SHORT_COMMIT}" >/dev/null 2>&1; then
+            echo "release ${SHORT_COMMIT} appeared while this workflow was building" >&2
+            exit 1
+          fi
+          trap cleanup_failed_draft ERR
+          trap 'cleanup_failed_draft; exit 130' INT
+          trap 'cleanup_failed_draft; exit 143' TERM
+          gh release create "${SHORT_COMMIT}" \
+            --target "${FULL_COMMIT}" \
+            --title "${SHORT_COMMIT}" \
+            --notes-file release-notes.md \
+            --draft \
+            --latest=false
+          gh release upload "${SHORT_COMMIT}" release-files/*
+          gh release edit "${SHORT_COMMIT}" --draft=false --latest=false
+          trap - ERR INT TERM
