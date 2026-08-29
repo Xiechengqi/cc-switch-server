@@ -1210,15 +1210,16 @@ pub fn prepend_response_context(body: &mut Value, previous: &[Value]) -> Result<
             let call_id = call_id
                 .ok_or_else(|| format!("Responses {kind} item requires a non-empty call_id"))?;
             let key = (kind.to_string(), call_id.to_string());
+            let semantic_item = response_call_memory_semantic_item(item);
             if let Some(existing) = call_memory.get(&key) {
-                if existing != item {
+                if existing != &semantic_item {
                     return Err(format!(
                         "Responses continuation contains conflicting {kind} items for call_id `{call_id}`"
                     ));
                 }
                 continue;
             }
-            call_memory.insert(key, item.clone());
+            call_memory.insert(key, semantic_item);
         }
         combined.push(item.clone());
     }
@@ -1228,6 +1229,20 @@ pub fn prepend_response_context(body: &mut Value, previous: &[Value]) -> Result<
     object.insert("input".to_string(), Value::Array(combined));
     object.remove("previous_response_id");
     Ok(())
+}
+
+/// Compare Responses call memory by the fields that describe the call or its
+/// result. `id` identifies the surrounding Responses item, while `status` is
+/// API return-state metadata; Codex may echo either field even though the
+/// parked semantic snapshot intentionally stores neither. `call_id` remains
+/// part of the map key, and every other field must still match exactly.
+fn response_call_memory_semantic_item(item: &Value) -> Value {
+    let mut semantic = item.clone();
+    if let Some(object) = semantic.as_object_mut() {
+        object.remove("id");
+        object.remove("status");
+    }
+    semantic
 }
 
 pub fn prepare_response_compaction(body: &mut Value) -> Result<(), String> {
@@ -3467,6 +3482,66 @@ mod tests {
             "input":[{"type":"function_call","call_id":"call_1","name":"other","arguments":"{}"}]
         });
         assert!(prepend_response_context(&mut conflicting, &previous).is_err());
+    }
+
+    #[test]
+    fn completed_response_context_ignores_only_returned_call_item_metadata() {
+        let previous = vec![json!({
+            "type":"custom_tool_call",
+            "call_id":"tool_1",
+            "name":"exec",
+            "input":"text(await tools.exec_command({cmd: \"pwd\"}));"
+        })];
+        let mut echoed = json!({
+            "input":[
+                {
+                    "id":"ctc_server_item_1",
+                    "type":"custom_tool_call",
+                    "call_id":"tool_1",
+                    "name":"exec",
+                    "input":"text(await tools.exec_command({cmd: \"pwd\"}));",
+                    "status":"completed"
+                },
+                {
+                    "type":"custom_tool_call_output",
+                    "call_id":"tool_1",
+                    "output":"/workspace\n"
+                }
+            ]
+        });
+        prepend_response_context(&mut echoed, &previous).unwrap();
+        assert_eq!(echoed["input"].as_array().unwrap().len(), 2);
+
+        for changed in [
+            json!({
+                "id":"ctc_other",
+                "type":"custom_tool_call",
+                "call_id":"tool_1",
+                "name":"other",
+                "input":"text(await tools.exec_command({cmd: \"pwd\"}));",
+                "status":"completed"
+            }),
+            json!({
+                "id":"ctc_other",
+                "type":"custom_tool_call",
+                "call_id":"tool_1",
+                "name":"exec",
+                "input":"text(await tools.exec_command({cmd: \"ls\"}));",
+                "status":"completed"
+            }),
+            json!({
+                "id":"ctc_other",
+                "type":"custom_tool_call",
+                "call_id":"tool_1",
+                "name":"exec",
+                "input":"text(await tools.exec_command({cmd: \"pwd\"}));",
+                "status":"completed",
+                "unexpected_semantic_field":true
+            }),
+        ] {
+            let mut body = json!({"input":[changed]});
+            assert!(prepend_response_context(&mut body, &previous).is_err());
+        }
     }
 
     #[test]
