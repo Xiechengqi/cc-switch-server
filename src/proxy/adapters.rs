@@ -4235,6 +4235,46 @@ mod tests {
     }
 
     #[test]
+    fn cursor_agentservice_adapter_preserves_codex_0151_local_tool_intent() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/responses/codex_0151_namespaced_tools.json"
+        )))
+        .unwrap();
+        let body = fixture["cases"][0]["request"].clone();
+        let stored = stored_provider(AppKind::Codex, ProviderType::CursorOAuth, json!({}));
+
+        let request = cursor_agentservice_request(
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+            &stored,
+            ProxyRoute::CodexResponses,
+            None,
+        )
+        .unwrap();
+        assert!(request.stream_requested);
+        let adapted: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            adapted.pointer("/input/0/type").and_then(Value::as_str),
+            Some("additional_tools")
+        );
+        assert_eq!(
+            adapted.pointer("/input/0/id").and_then(Value::as_str),
+            Some("at_neutralized_0151")
+        );
+
+        let plan = crate::proxy::cursor::request_builder::try_build_plan(
+            crate::proxy::cursor::request_builder::InboundProtocol::OpenAiResponses,
+            &adapted,
+        )
+        .unwrap();
+        assert!(plan.local_tool_required_by_intent);
+        assert!(plan.tools.iter().any(|tool| tool.name == "functions.exec"));
+        assert!(plan.user_text.contains(
+            "toolName=\"functions.exec\"; this is the outer client's unified local execution tool"
+        ));
+    }
+
+    #[test]
     fn qoder_profiles_canonicalize_all_three_app_surfaces_to_openai_chat() {
         let cases = [
             (

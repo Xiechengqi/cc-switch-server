@@ -2490,15 +2490,24 @@ mod tests {
 
     #[test]
     fn every_ingress_tool_schema_round_trips_through_final_run_request_wire() {
-        let fixture: Value = serde_json::from_str(include_str!(concat!(
+        let codex_0144: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/cursor/responses/codex_0144_additional_tools.json"
+        )))
+        .unwrap();
+        let codex_0151: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/responses/codex_0151_namespaced_tools.json"
         )))
         .unwrap();
         let cases = vec![
             (
                 InboundProtocol::OpenAiResponses,
-                fixture["cases"][0]["request"].clone(),
+                codex_0144["cases"][0]["request"].clone(),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                codex_0151["cases"][0]["request"].clone(),
             ),
             (
                 InboundProtocol::OpenAiResponses,

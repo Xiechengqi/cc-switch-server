@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 1,
+  "source": "Neutralized Codex CLI 0.151.0-alpha.8 Responses request shape",
+  "cases": [
+    {
+      "name": "namespaced_tools_with_environment_user_turn",
+      "request": {
+        "model": "gpt-5.6-sol",
+        "stream": true,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "input": [
+          {
+            "type": "additional_tools",
+            "id": "at_neutralized_0151",
+            "role": "developer",
+            "tools": [
+              {
+                "type": "namespace",
+                "name": "functions",
+                "description": "Local orchestration tools",
+                "tools": [
+                  {
+                    "type": "custom",
+                    "name": "exec",
+                    "description": "Run JavaScript that orchestrates local tools",
+                    "format": {
+                      "type": "grammar",
+                      "syntax": "lark",
+                      "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "wait",
+                    "description": "Wait for a yielded execution cell",
+                    "strict": false,
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "cell_id": { "type": "string" },
+                        "yield_time_ms": { "type": "number" }
+                      },
+                      "required": ["cell_id"],
+                      "additionalProperties": false
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "request_user_input",
+                    "description": "Request structured user input",
+                    "strict": false,
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "questions": { "type": "array", "items": { "type": "object" } }
+                      },
+                      "required": ["questions"],
+                      "additionalProperties": false
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Team-agent coordination tools",
+                "tools": [
+                  {
+                    "type": "function",
+                    "name": "followup_task",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "target": { "type": "string" },
+                        "message": { "type": "string" }
+                      },
+                      "required": ["target", "message"],
+                      "additionalProperties": false
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "interrupt_agent",
+                    "parameters": {
+                      "type": "object",
+                      "properties": { "target": { "type": "string" } },
+                      "required": ["target"],
+                      "additionalProperties": false
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "list_agents",
+                    "parameters": {
+                      "type": "object",
+                      "properties": { "path_prefix": { "type": "string" } },
+                      "additionalProperties": false
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "send_message",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "target": { "type": "string" },
+                        "message": { "type": "string" }
+                      },
+                      "required": ["target", "message"],
+                      "additionalProperties": false
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "task_name": { "type": "string" },
+                        "message": { "type": "string" }
+                      },
+                      "required": ["task_name", "message"],
+                      "additionalProperties": false
+                    }
+                  },
+                  {
+                    "type": "function",
+                    "name": "wait_agent",
+                    "parameters": {
+                      "type": "object",
+                      "properties": { "timeout_ms": { "type": "number" } },
+                      "additionalProperties": false
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "developer",
+            "content": [
+              { "type": "input_text", "text": "Follow the repository instructions." }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<environment_context><cwd>/workspace/project</cwd></environment_context>"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              { "type": "input_text", "text": "深入解读当前项目" }
+            ]
+          }
+        ]
+      },
+      "expectedToolNames": [
+        "functions.exec",
+        "functions.wait",
+        "functions.request_user_input",
+        "collaboration.followup_task",
+        "collaboration.interrupt_agent",
+        "collaboration.list_agents",
+        "collaboration.send_message",
+        "collaboration.spawn_agent",
+        "collaboration.wait_agent"
+      ],
+      "expectedCustomToolNames": ["functions.exec"],
+      "expectedPreferredLocalTool": "functions.exec"
+    }
+  ]
+}

@@ -2255,9 +2255,7 @@ fn cursor_sdk_tool_routing_directive(tools: &[McpToolDef]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let preferred_local_route = tools
-        .iter()
-        .find(|tool| tool.tool_name.eq_ignore_ascii_case("exec"))
+    let preferred_local_route = preferred_local_execution_tool(tools)
         .map(|tool| {
             let provider = serde_json::to_string(&tool.provider_identifier)
                 .unwrap_or_else(|_| "\"client\"".to_string());
@@ -2274,6 +2272,29 @@ fn cursor_sdk_tool_routing_directive(tools: &[McpToolDef]) -> String {
          {routes}{preferred_local_route}\n\
          Do not substitute an undeclared SDK builtin, a different tool name, or prose for these routes."
     )
+}
+
+fn preferred_local_execution_tool(tools: &[McpToolDef]) -> Option<&McpToolDef> {
+    let exact_exec = |tool: &&McpToolDef| tool.tool_name.eq_ignore_ascii_case("exec");
+    let functions_exec = |tool: &&McpToolDef| {
+        tool.tool_name
+            .rsplit_once('.')
+            .is_some_and(|(namespace, leaf)| {
+                namespace.eq_ignore_ascii_case("functions") && leaf.eq_ignore_ascii_case("exec")
+            })
+    };
+    let namespaced_exec = |tool: &&McpToolDef| {
+        tool.tool_name
+            .rsplit('.')
+            .next()
+            .is_some_and(|leaf| leaf.eq_ignore_ascii_case("exec"))
+    };
+
+    tools
+        .iter()
+        .find(exact_exec)
+        .or_else(|| tools.iter().find(functions_exec))
+        .or_else(|| tools.iter().find(namespaced_exec))
 }
 
 pub fn enhance_agent_user_text(
@@ -3133,6 +3154,56 @@ mod tests {
             continuation_plan.tool_results[0].content,
             continuation["expectedOutputText"].as_str().unwrap()
         );
+    }
+
+    #[test]
+    fn codex_0151_namespaced_exec_is_preferred_for_local_project_intent() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/responses/codex_0151_namespaced_tools.json"
+        )))
+        .unwrap();
+        let case = &fixture["cases"][0];
+        let body = &case["request"];
+
+        validate_request_contract(InboundProtocol::OpenAiResponses, body, false).unwrap();
+        let plan = build_plan(InboundProtocol::OpenAiResponses, body);
+
+        assert_eq!(
+            plan.tools
+                .iter()
+                .map(|tool| Value::String(tool.name.clone()))
+                .collect::<Vec<_>>(),
+            case["expectedToolNames"].as_array().unwrap().clone()
+        );
+        assert_eq!(
+            plan.custom_tool_names
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+            case["expectedCustomToolNames"].as_array().unwrap().clone()
+        );
+        let preferred = case["expectedPreferredLocalTool"].as_str().unwrap();
+        assert!(plan.user_text.contains(&format!(
+            "prefer SDK mcp with providerIdentifier=\"client\" and toolName=\"{preferred}\""
+        )));
+        assert!(plan
+            .user_text
+            .contains("LOCAL TOOL REQUIRED FOR THE LATEST USER REQUEST"));
+        assert!(plan.local_tool_required_by_intent);
+        assert_eq!(plan.tool_choice, ExtractedToolChoice::Auto);
+        assert_eq!(
+            local_task_turn_signal(InboundProtocol::OpenAiResponses, body, &plan.tools),
+            Some(LocalTaskTurnSignal::Activate)
+        );
+        assert!(plan
+            .response_tool_namespaces
+            .contains(&ResponseToolNamespace {
+                internal_name: "functions.exec".to_string(),
+                namespace: "functions".to_string(),
+                name: "exec".to_string(),
+            }));
     }
 
     #[test]

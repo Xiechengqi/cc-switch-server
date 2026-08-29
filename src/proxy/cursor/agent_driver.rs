@@ -261,7 +261,7 @@ fn semantic_attempt_rejection(
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SemanticToolConstraint {
     Required,
     Named(String),
@@ -275,6 +275,19 @@ impl SemanticToolConstraint {
             Self::Named(_) => "named",
             Self::LocalIntent => "local_intent",
         }
+    }
+}
+
+fn semantic_tool_constraint_for_plan(plan: &AgentRunPlan) -> Option<SemanticToolConstraint> {
+    match (&plan.tool_choice, plan.tool_results.is_empty()) {
+        (ExtractedToolChoice::Required, true) => Some(SemanticToolConstraint::Required),
+        (ExtractedToolChoice::Named(name), true) => {
+            Some(SemanticToolConstraint::Named(name.clone()))
+        }
+        (_, true) if plan.local_tool_required_by_intent => {
+            Some(SemanticToolConstraint::LocalIntent)
+        }
+        _ => None,
     }
 }
 
@@ -928,16 +941,7 @@ pub async fn forward_agentservice(
         .flatten();
 
     let model = usage_model_metadata(&adapter_request);
-    let semantic_tool_choice = match (&plan.tool_choice, plan.tool_results.is_empty()) {
-        (ExtractedToolChoice::Required, true) => Some(SemanticToolConstraint::Required),
-        (ExtractedToolChoice::Named(name), true) => {
-            Some(SemanticToolConstraint::Named(name.clone()))
-        }
-        (_, true) if plan.local_tool_required_by_intent => {
-            Some(SemanticToolConstraint::LocalIntent)
-        }
-        _ => None,
-    };
+    let semantic_tool_choice = semantic_tool_constraint_for_plan(&plan);
     if adapter_request.stream_requested && semantic_tool_choice.is_none() {
         return Ok(stream_response(
             state,
@@ -4529,11 +4533,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_0151_local_project_request_selects_a_semantic_tool_constraint() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cursor/responses/codex_0151_namespaced_tools.json"
+        )))
+        .unwrap();
+        let plan = try_build_plan(
+            InboundProtocol::OpenAiResponses,
+            &fixture["cases"][0]["request"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            semantic_tool_constraint_for_plan(&plan),
+            Some(SemanticToolConstraint::LocalIntent)
+        );
+    }
+
+    #[test]
     fn three_promise_only_attempts_exhaust_but_a_real_tool_commits() {
         let promise_only = DriveOutcome::Completed {
             body: Bytes::new(),
             usage: TokenUsage::default(),
-            buffered_events: Vec::new(),
+            buffered_events: vec![
+                "先从项目根目录、README 和主要入口入手。".to_string(),
+                "继续深入探索项目结构与核心模块。".to_string(),
+            ],
             observation: SemanticAttemptObservation {
                 saw_text: true,
                 ..Default::default()
@@ -4580,6 +4606,7 @@ mod tests {
         let wire = events.concat();
         assert!(wire.contains("event: response.failed"));
         assert!(wire.contains("data: [DONE]"));
+        assert_eq!(wire.matches("data: [DONE]").count(), 1);
         assert!(!wire.contains("event: response.created"));
     }
 

@@ -19,6 +19,8 @@
     "implementedContracts": [
       "bounded_tool_schema_and_adapter",
       "required_named_precommit_retry",
+      "local_intent_precommit_retry",
+      "codex_0151_namespaced_additional_tools",
       "completed_previous_response_state",
       "same_conversation_conflict",
       "response_compaction",
